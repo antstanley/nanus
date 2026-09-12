@@ -1,0 +1,50 @@
+[package]
+name = "nanus-tui"
+description = "The interactive terminal interface for nanus: a ratatui chat view over an agent session."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "nanus-tui"
+path = "src/main.rs"
+required-features = ["runtime"]
+
+[features]
+# The view layer builds and tests without the agent runtime, so a contributor can
+# work on the interface without a working composition behind it. The binary is
+# gated on `runtime` for the same reason: an entry point that cannot run is worse
+# than no entry point.
+default = []
+# The interactive loop needs a terminal and a harness; the view layer needs neither.
+runtime = [
+    "dep:nanus-adapter-config",
+    "dep:nanus-kernel",
+    "dep:nanus-bundle",
+    "dep:nanus-domain",
+    "dep:nanus-ports",
+    "dep:tokio",
+]
+
+[dependencies]
+nanus-adapter-config = { workspace = true, optional = true }
+nanus-kernel = { workspace = true, optional = true }
+nanus-bundle = { workspace = true, optional = true }
+nanus-domain = { workspace = true, optional = true }
+nanus-ports = { workspace = true, optional = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["rt", "macros", "sync", "time"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

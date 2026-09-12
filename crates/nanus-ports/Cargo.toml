@@ -1,0 +1,28 @@
+[package]
+name = "nanus-ports"
+description = "The hexagon's boundary: the port traits nanus adapters implement and the harness consumes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# The port keys are typed by the kernel's `ServiceKey`, so this crate depends on
+# the kernel as well as on the domain: the key functions are the single place a
+# provider and a consumer agree on a capability's identity and type.
+nanus-kernel = { workspace = true }
+nanus-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

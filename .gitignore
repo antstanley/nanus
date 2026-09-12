@@ -1,0 +1,28 @@
+# Rust build artifacts.
+#
+# `target/` is machine-generated, architecture-specific, and enormous — a full workspace
+# build here is several gigabytes. Nothing in it belongs in history, and committing it
+# would make every clone unusable.
+/target/
+
+# The research scratch workspaces.
+#
+# `.research/probe/` is a throwaway Cargo workspace built to verify crate versions and
+# subprocess kill semantics; it carries its own `target/` and is not part of the product.
+# The findings it produced are kept as the reports and data beside it.
+.research/probe/
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local configuration and credentials. A harness reads its key from the environment, but
+# a stray local file must never be the thing that publishes one.
+.env
+*.local.toml
+
+# Jujutsu's working state is not tracked; `.jj/` is written by `jj git init` itself and
+# is already listed in its own ignore file, so it is named here only for clarity.
+/.jj/

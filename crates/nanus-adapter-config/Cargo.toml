@@ -1,0 +1,31 @@
+[package]
+name = "nanus-adapter-config"
+description = "The configuration adapter: one TOML schema, one precedence order, and a real migration chain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+nanus-domain = { workspace = true }
+nanus-kernel = { workspace = true }
+# The reasoning-effort vocabulary is the port's, so a config value and a request
+# field cannot drift apart; this crate adds only the serde/default wrapper.
+nanus-ports = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+etcetera = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

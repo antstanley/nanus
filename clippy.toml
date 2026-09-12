@@ -1,0 +1,22 @@
+# Clippy configuration for the nanus workspace.
+#
+# Enables pedantic-adjacent lints that are not expressible in
+# `[workspace.lints]`, notably the test-aware relaxations of the panic-family
+# lints. Each setting below states *why* it is on rather than leaving the choice
+# implicit.
+
+# Tiger Style keeps `assert!` in production and permits panicking accessors in
+# tests, where a panic is the assertion mechanism. These three settings make the
+# distinction the lint cannot see by itself: denied in production, allowed where
+# the panic *is* the test.
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# A `dbg!` left in a test is still a debugging artefact with no place in a
+# committed test suite.
+allow-dbg-in-tests = false
+
+# Tiger Style sets a hard ceiling of 100 columns; rustfmt enforces the same value.
+too-many-arguments-threshold = 6
+type-complexity-threshold = 200

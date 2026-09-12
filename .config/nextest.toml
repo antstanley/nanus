@@ -1,0 +1,18 @@
+[store]
+dir = "target/nextest"
+
+[profile.default]
+retries = 0
+fail-fast = false
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 3 }
+leak-timeout = "100ms"
+
+[profile.ci]
+retries = 2
+fail-fast = true
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "test(/e2e/)"
+threads-required = "num-cpus"

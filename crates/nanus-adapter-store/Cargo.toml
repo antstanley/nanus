@@ -1,0 +1,33 @@
+[package]
+name = "nanus-adapter-store"
+description = "The session store: an atomic, append-only JSONL session log under $NANUS_HOME."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+nanus-domain = { workspace = true }
+nanus-ports = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+etcetera = { workspace = true }
+tokio = { workspace = true }
+# `uuid` is required for time-ordered v7 session ids. The workspace pins it with
+# the `v7` feature precisely for this; `ulid` is deliberately not used because
+# `Ulid::generate` does not guarantee sort order within a millisecond.
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "nanus-bundle"
+description = "The plugin set that assembles a working nanus harness: tools, policy, session, and the agent loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+nanus-kernel = { workspace = true }
+nanus-domain = { workspace = true }
+nanus-ports = { workspace = true }
+nanus-adapter-config = { workspace = true }
+nanus-adapter-deepseek = { workspace = true }
+nanus-adapter-local = { workspace = true }
+nanus-adapter-store = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+globset = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true

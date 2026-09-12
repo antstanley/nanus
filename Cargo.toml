@@ -1,0 +1,180 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nanus-kernel",
+    "crates/nanus-domain",
+    "crates/nanus-ports",
+    "crates/nanus-adapter-deepseek",
+    "crates/nanus-adapter-local",
+    "crates/nanus-adapter-store",
+    "crates/nanus-adapter-config",
+    "crates/nanus-bundle",
+    "crates/nanus-cli",
+    "crates/nanus-tui",
+]
+default-members = ["crates/nanus-kernel"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/antstanley/nanus"
+authors = ["Nanus contributors"]
+description = "A headless CLI and TUI agent harness built on a Rust implementation of the Cordis meta-framework."
+readme = "README.md"
+keywords = ["agent", "llm", "harness", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools", "development-tools::testing"]
+
+[workspace.dependencies]
+# Internal crates.
+nanus-kernel = { path = "crates/nanus-kernel" }
+nanus-domain = { path = "crates/nanus-domain" }
+nanus-ports = { path = "crates/nanus-ports" }
+nanus-adapter-deepseek = { path = "crates/nanus-adapter-deepseek" }
+nanus-adapter-local = { path = "crates/nanus-adapter-local" }
+nanus-adapter-store = { path = "crates/nanus-adapter-store" }
+nanus-adapter-config = { path = "crates/nanus-adapter-config" }
+nanus-bundle = { path = "crates/nanus-bundle" }
+nanus-cli = { path = "crates/nanus-cli" }
+nanus-tui = { path = "crates/nanus-tui" }
+
+# Runtime and async.
+tokio = { version = "1.53", features = [
+    "rt",
+    "macros",
+    "process",
+    "io-util",
+    "fs",
+    "time",
+    "sync",
+    "signal",
+    "net",
+] }
+futures = "0.3"
+
+# Process-group signalling. Used instead of raw libc so the whole workspace keeps
+# `unsafe_code = "forbid"`: a shell tool spawns grandchildren, and only killing the
+# process group reaps them.
+nix = { version = "0.31", features = ["signal", "process"] }
+
+# Serialization.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+
+# Error handling.
+thiserror = "2.0"
+
+# HTTP. reqwest 0.13's `default-tls` already maps to rustls, and it installs its own
+# crypto provider, so no `rustls` dependency and no manual provider setup are needed.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "http2",
+    "charset",
+    "stream",
+    "system-proxy",
+] }
+
+# CLI and terminal. The ratatui facade re-exports crossterm, so a direct crossterm
+# dependency exists only for `EventStream`.
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "crossterm_0_29",
+    "all-widgets",
+    "layout-cache",
+    "macros",
+    "underline-color",
+] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Utilities.
+uuid = { version = "1.26", features = ["v4", "v7"] }
+etcetera = "0.11"
+ignore = "0.4"
+globset = "0.4"
+similar = "3.2"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+
+# Dev-dependencies.
+proptest = "1.11"
+tempfile = "3.27"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+non_ascii_idents = "warn"
+single_use_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+macro_use_extern_crate = "warn"
+meta_variable_misuse = "warn"
+missing_abi = "warn"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+# Lint *groups* are pinned to priority -1 so that an individual lint entry below
+# can override them. Without the pin, a group at the same priority as an
+# individual `allow` wins, and the allow silently does nothing.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# `missing_const_for_fn` fires on constructors that call `Rc::new`, which cannot be
+# const; the suggestion is unactionable, so the lint is off rather than suppressed
+# site by site.
+missing_const_for_fn = "allow"
+# The dependency graph pulls several majors of transitive crates; no crate in this
+# workspace can pin them, so the lint is noise.
+multiple_crate_versions = "allow"
+# The kernel is deliberately single-threaded — it holds `Rc`, and its futures are
+# local by design, which is what makes teardown order a guarantee rather than a
+# convention. `future_not_send` asks for the opposite and cannot be satisfied without
+# dismantling that property.
+future_not_send = "allow"
+# Metadata completeness is enforced by the workspace manifest rather than per crate.
+cargo_common_metadata = "allow"
+# Tiger style: no panicking accessors or unwraps in production paths.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+exit = "deny"
+# Arithmetic must be explicit about overflow: the `checked_*` and `saturating_*`
+# families are how Tiger Style asks for it, so they stay available.
+arithmetic_side_effects = "deny"
+integer_division = "deny"
+# `assert!` is the sanctioned way to state an invariant, so the panic family that
+# carries a message is exempt while bare `panic!` is not. The unwrap family is
+# exempt only in its total form, which cannot panic.
+print_stdout = "deny"
+print_stderr = "deny"
+# Deliberate style choices.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "warn"
+cognitive_complexity = "warn"
+cast_possible_truncation = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
+
+[profile.test]
+opt-level = 1
