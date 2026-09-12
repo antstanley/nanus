@@ -104,7 +104,7 @@ Requires stable Rust (pinned in [`rust-toolchain.toml`](rust-toolchain.toml)) an
 ```sh
 git clone https://github.com/antstanley/nanus.git
 cd nanus
-cargo build --release
+cargo build --release          # one binary, headless and interactive both
 
 export DEEPSEEK_API_KEY=...
 
@@ -144,25 +144,32 @@ $ nanus sessions
 
 ### Or sit in front of it
 
+Typing the program's name with a terminal starts the interface:
+
 ```sh
-cargo build --release -p nanus-tui --features runtime
 export DEEPSEEK_API_KEY=...
-./target/release/nanus-tui
+./target/release/nanus
 ```
 
-![nanus-tui reviewing a recorded conversation](docs/images/tui-session.png)
+![nanus tui reviewing a recorded conversation](docs/images/tui-session.png)
 
 *Real output, captured from the binary — not a mock-up. It is a **recorded** conversation,
 which is the point: reading a transcript needs no API key.*
 
-Every run persists its session, so the TUI doubles as a browser for what you have already
-done:
+One binary serves both. `nanus run` is the headless path and a bare `nanus` is the
+interface, but they are not two programs sharing a name — they load the same
+configuration, mount the same plugin tree, and create a session against the same
+workspace, so they cannot drift apart. Piped or redirected, a bare `nanus` prints its
+usage rather than trying to draw on something that is not a terminal.
+
+Every run persists its session, so the interface doubles as a browser for what you have
+already done:
 
 ```sh
-nanus-tui --sessions              # list what is available
-nanus-tui --session               # read the most recent one
-nanus-tui --session <id>          # read a particular one
-nanus-tui --session --scroll 50   # open fifty rows back, where the tool calls are
+nanus sessions                    # list what is available
+nanus tui --session               # read the most recent one
+nanus tui --session <id>          # read a particular one
+nanus tui --session --scroll 50   # open fifty rows back, where the tool calls are
 ```
 
 Keys, rendering choices, and why the interface is testable at all:
@@ -178,7 +185,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.1s] 534 tests run: 534 passed, 0 skipped
+Summary [2.7s] 539 tests run: 539 passed, 0 skipped
 
 $ cargo test --workspace --doc
 9 doctests passed

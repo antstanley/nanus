@@ -1,16 +1,22 @@
-//! Argument parsing and the three modes.
+//! Argument parsing and the modes.
 //!
 //! The command surface is deliberately small. A harness that grows a subcommand per
 //! feature becomes a language of its own, and every one of them is a thing a user
 //! has to learn before the tool does anything.
+//!
+//! One binary serves both the headless and the interactive use. They are not two
+//! programs that happen to share a name: they load the same configuration, mount the
+//! same composition, and create a session against the same workspace, so `nanus run`
+//! and `nanus tui` cannot drift apart about any of it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use nanus_adapter_config::NanusConfig;
 use nanus_bundle::compose::open_store;
 use nanus_bundle::{Harness, compose};
 use nanus_kernel::runtime::block_on as kernel_block_on;
+use nanus_tui::runtime::interactive;
 
 use crate::progress::StderrProgress;
 
@@ -22,7 +28,9 @@ use crate::progress::StderrProgress;
     about = "A coding agent harness",
     long_about = "A coding agent harness built on a Rust implementation of the Cordis \
                   meta-framework. Run one task and print its answer, start an interactive \
-                  session, or inspect the configuration and sessions on this machine."
+                  session, or inspect the configuration and sessions on this machine.\n\n\
+                  With no subcommand and a terminal, nanus starts the interactive \
+                  interface; with no terminal it prints this help instead."
 )]
 pub struct Args {
     /// Report reasoning and tool activity on stderr as it happens.
@@ -52,11 +60,42 @@ pub enum Command {
         task: Vec<String>,
     },
 
+    /// Start the interactive interface.
+    ///
+    /// The same thing a bare `nanus` does when it has a terminal.
+    Tui {
+        /// Read a recorded session instead of talking to a model.
+        ///
+        /// With no id the most recent session is opened. Reading needs no API key,
+        /// because the transcript is already written down.
+        // Three states, not two: the flag absent, the flag given with no id, and the
+        // flag given with an id. A single `Option` cannot say which of the last two it
+        // is, and clap parses this shape directly. A sentinel id would be worse.
+        #[allow(clippy::option_option)]
+        #[arg(long, value_name = "ID", num_args = 0..=1)]
+        session: Option<Option<String>>,
+
+        /// Open the transcript this many rows back from the end.
+        ///
+        /// Only meaningful with `--session`: a live conversation has no history to open
+        /// part way into.
+        #[arg(long, value_name = "ROWS", default_value_t = 0)]
+        scroll: u32,
+    },
+
     /// Show the effective configuration.
     Config,
 
     /// List recorded sessions, newest first.
     Sessions,
+}
+
+/// Renders the usage text.
+///
+/// Built from the same [`Args`] the parser uses, so the help a person reads and the
+/// grammar they are held to cannot disagree.
+pub fn help_text() -> String {
+    Args::command().render_help().to_string()
 }
 
 /// Parses the arguments, prepares what needs awaiting, and then finishes the work.
@@ -103,11 +142,48 @@ pub async fn prepare() -> Result<Ready, String> {
         command,
     } = args;
     let options = Options { verbose, config };
-    match command.unwrap_or(Command::Config) {
+    let command = match command {
+        Some(command) => command,
+        // A bare `nanus` is the interface: someone who types the program's name and
+        // nothing else wants the program, not a summary of its grammar.
+        None if interactive() => Command::Tui {
+            session: None,
+            scroll: 0,
+        },
+        // Redirected or piped there is no screen to draw on, and starting a
+        // full-screen interface there would either fail or hang. Saying what the
+        // program can do is the useful answer, and it is not a failure: nothing was
+        // asked for and the question was answered.
+        None => {
+            print!("{}", help_text());
+            return Ok(Ready::Done);
+        }
+    };
+    // The interface needs a terminal, and saying so here rather than letting the drawing
+    // library discover it is the difference between a clear message and an abort: taking
+    // a screen that is not there panics. Checked before anything is composed or opened,
+    // so the answer does not depend on whether an API key happens to be configured.
+    if matches!(command, Command::Tui { .. }) && !interactive() {
+        return Err(String::from(
+            "the interactive interface needs a terminal; \
+             `nanus run <task>` and `nanus sessions` work without one",
+        ));
+    }
+    match command {
         Command::Run { task } => prepare_run(&options, &task).await,
         // Showing the configuration prints and is finished.
         Command::Config => show_config(&options).map(|()| Ready::Done),
         Command::Sessions => prepare_list().await,
+        // Reading a recorded session needs no model, so it opens the store rather than
+        // composing a harness — which is what lets it work without an API key.
+        Command::Tui {
+            session: Some(id),
+            scroll,
+        } => prepare_view(id, scroll).await,
+        Command::Tui {
+            session: None,
+            scroll: _,
+        } => prepare_tui(&options).await,
     }
 }
 
@@ -133,6 +209,22 @@ pub enum Ready {
         /// The store to read from.
         store: nanus_ports::StoreHandle,
     },
+    /// A composition is built but not mounted, for the interactive interface.
+    Tui {
+        /// The adapters, ready to mount.
+        pending: Box<compose::Pending>,
+        /// The workspace a session is created against.
+        workspace: PathBuf,
+    },
+    /// A recorded session is loaded and ready to be shown.
+    View {
+        /// The store the session was read from.
+        store: nanus_ports::StoreHandle,
+        /// The session to show, or the most recent one.
+        id: Option<String>,
+        /// Rows to scroll back from the end when it opens.
+        scroll_back: u32,
+    },
 }
 
 /// Completes the work [`prepare`] set up, synchronously.
@@ -153,6 +245,12 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             verbose,
         } => run_turn(*pending, &workspace, &prompt, verbose),
         Ready::List { store } => print_sessions(&store),
+        Ready::Tui { pending, workspace } => run_tui(*pending, &workspace),
+        Ready::View {
+            store,
+            id,
+            scroll_back,
+        } => nanus_tui::runtime::view(&store, id.as_deref(), scroll_back),
     }
 }
 
@@ -188,6 +286,56 @@ async fn prepare_run(args: &Options, task: &[String]) -> Result<Ready, String> {
     })
 }
 
+/// Awaits the adapters the interactive interface needs.
+///
+/// Separate from [`prepare_run`] only in what it returns: the same configuration, the
+/// same composition, and the same workspace. That is the point of one binary — the two
+/// modes cannot disagree about where a session belongs.
+async fn prepare_tui(args: &Options) -> Result<Ready, String> {
+    let config = load(args)?;
+    let pending = compose(&config).await.map_err(|error| error.to_string())?;
+    let workspace = compose::workspace_root(&config).map_err(|error| error.to_string())?;
+    Ok(Ready::Tui {
+        pending: Box::new(pending),
+        workspace,
+    })
+}
+
+/// Awaits the session store for reading a recorded session.
+///
+/// No harness is composed and no key is read: a transcript that has already been
+/// written down is just a file.
+async fn prepare_view(id: Option<String>, scroll_back: u32) -> Result<Ready, String> {
+    let store = open_store().await.map_err(|error| error.to_string())?;
+    Ok(Ready::View {
+        store,
+        id,
+        scroll_back,
+    })
+}
+
+/// Mounts a harness and hands the terminal to the interface.
+///
+/// Synchronous, and deliberately so: the half that must not be inside a runtime.
+fn run_tui(pending: compose::Pending, workspace: &Path) -> Result<(), String> {
+    let harness = pending.start().map_err(|error| error.to_string())?;
+    match nanus_tui::runtime::run(&harness, workspace) {
+        // The interface tears the composition down itself when its loop ends, so
+        // shutting it down again here would be doing it twice.
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A failure can leave the loop before that teardown runs, and the
+            // composition owns reaping whatever tools it started. An orphaned child
+            // process outliving the interface would be a worse outcome than the error
+            // that caused it, so it is reaped here.
+            if let Err(failed) = finish_harness(&harness) {
+                tracing::warn!(%failed, "the composition did not shut down cleanly");
+            }
+            Err(error.to_string())
+        }
+    }
+}
+
 /// Mounts a harness and runs one turn, synchronously.
 ///
 /// Prints the answer on stdout and nothing else, persists the session, and tears the
@@ -195,7 +343,7 @@ async fn prepare_run(args: &Options, task: &[String]) -> Result<Ready, String> {
 /// kernel's `block_on` from nesting inside a runtime.
 fn run_turn(
     pending: compose::Pending,
-    workspace: &std::path::Path,
+    workspace: &Path,
     prompt: &str,
     verbose: bool,
 ) -> Result<(), String> {
@@ -343,13 +491,74 @@ mod tests {
     }
 
     #[test]
-    fn no_subcommand_defaults_to_showing_the_configuration() {
+    fn no_subcommand_is_left_for_the_terminal_to_resolve() {
+        // A bare `nanus` parses to *no* command rather than to one: whether it starts
+        // the interface or prints the usage depends on there being a terminal, and that
+        // is not something a parser should be deciding.
         let args = Args::try_parse_from(["nanus"]);
         assert!(args.is_ok());
         let Ok(args) = args else {
             return;
         };
         assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn the_tui_takes_an_optional_session_id() {
+        let Ok(live) = Args::try_parse_from(["nanus", "tui"]) else {
+            panic!("a bare `tui` should parse");
+        };
+        let Some(Command::Tui { session, scroll }) = live.command else {
+            panic!("expected the tui command");
+        };
+        assert_eq!(session, None, "no --session means a live conversation");
+        assert_eq!(scroll, 0);
+
+        let Ok(recent) = Args::try_parse_from(["nanus", "tui", "--session"]) else {
+            panic!("--session without an id should parse");
+        };
+        let Some(Command::Tui { session, .. }) = recent.command else {
+            panic!("expected the tui command");
+        };
+        // The outer `Some` is the flag having been given; the inner one is the id,
+        // which is absent and therefore means "the most recent session".
+        assert_eq!(session, Some(None));
+
+        let Ok(named) = Args::try_parse_from(["nanus", "tui", "--session", "01a09558"]) else {
+            panic!("--session with an id should parse");
+        };
+        let Some(Command::Tui { session, .. }) = named.command else {
+            panic!("expected the tui command");
+        };
+        assert_eq!(session, Some(Some(String::from("01a09558"))));
+    }
+
+    #[test]
+    fn a_flag_following_an_optional_value_is_not_swallowed_by_it() {
+        // `--session --scroll 50` is the documented way to open the most recent session
+        // part way back, and reading `--scroll` as the session id would break it.
+        let Ok(args) = Args::try_parse_from(["nanus", "tui", "--session", "--scroll", "50"]) else {
+            panic!("--session followed by --scroll should parse");
+        };
+        let Some(Command::Tui { session, scroll }) = args.command else {
+            panic!("expected the tui command");
+        };
+        assert_eq!(session, Some(None));
+        assert_eq!(scroll, 50);
+    }
+
+    #[test]
+    fn the_usage_text_advertises_every_mode() {
+        let help = help_text();
+        for mode in ["run", "tui", "config", "sessions"] {
+            assert!(help.contains(mode), "the help omits {mode}:\n{help}");
+        }
+        // The default is the surprising part, so it has to be stated rather than left
+        // for a user to discover by typing the program's name.
+        assert!(
+            help.contains("interactive"),
+            "the help omits the default:\n{help}"
+        );
     }
 
     #[test]

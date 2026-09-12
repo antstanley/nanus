@@ -40,6 +40,6 @@ pub mod view;
 pub mod runtime;
 
 pub use buffer::{InputBuffer, KeyOutcome};
-pub use replay::transcript_of;
+pub use replay::{recording_of, transcript_of};
 pub use transcript::{Entry, EntryKind, Role, Transcript};
 pub use view::{Theme, ViewState};

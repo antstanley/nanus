@@ -7,10 +7,16 @@ without a network.
 
 ```
                           ┌──────────────────────────────────┐
-                          │    nanus-cli      nanus-tui      │  entry points
-                          └────────────────┬─────────────────┘
-                                           │
-                          ┌────────────────▼─────────────────┐
+                          │            nanus-cli             │  one binary:
+                          │   run · tui · config · sessions  │  headless and
+                          └───────┬──────────────────┬───────┘  interactive
+                                  │                  │
+                                  │        ┌─────────▼─────────┐
+                                  │        │    nanus-tui      │  the interface,
+                                  │        │  view · replay    │  as a library
+                                  │        └─────────┬─────────┘
+                                  │                  │
+                          ┌───────▼──────────────────▼───────┐
                           │          nanus-bundle            │  composition:
                           │   toolset · agent loop · wiring  │  what exists, and
                           └────────────────┬─────────────────┘  how it finds itself
@@ -45,7 +51,8 @@ without a network.
 | [`nanus-adapter-store`](../crates/nanus-adapter-store) | Atomic JSONL session persistence with time-ordered ids. |
 | [`nanus-adapter-config`](../crates/nanus-adapter-config) | TOML configuration with a real migration. |
 | [`nanus-bundle`](../crates/nanus-bundle) | The toolset, the agent loop, and the one place that names concrete adapters. |
-| [`nanus-cli`](../crates/nanus-cli) · [`nanus-tui`](../crates/nanus-tui) | A headless entry point and a ratatui interface. |
+| [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary, and the only entry point: `run` and `tui` both live here, because two binaries would mean two argument parsers, two configuration loads, and two answers to which workspace a session belongs to. |
+| [`nanus-tui`](../crates/nanus-tui) | The ratatui interface as a library: the view, the input buffer, replay of a recorded session, and the terminal event loop behind a `runtime` feature. It is a library rather than a program, so there is exactly one thing to run. |
 
 ## How the two halves fit
 

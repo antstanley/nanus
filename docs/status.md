@@ -7,7 +7,7 @@ are distinctions worth keeping.
 |---|---|
 | Kernel, domain, ports, all four adapters | complete |
 | Toolset, agent loop, composition | complete |
-| CLI and TUI | complete |
+| CLI and TUI | complete, and one binary: `nanus` is headless or interactive depending on how it is invoked |
 | Live path (streaming, tool calls, results fed back) | **verified against the real API** |
 | Interactive TUI | view layer tested headlessly; raw-mode input needs a real terminal |
 
@@ -15,6 +15,7 @@ Composing a harness is `compose(&config).await` for the adapters, then
 `Pending::start()` outside the runtime for the kernel — the two phases exist because
 `block_on` cannot be called from inside a runtime, and the split is enforced by types
 rather than by remembering.
+
 ## Known limits
 
 - **Live tool calling was verified by inspection, not replay.** The framing replayed in
@@ -25,7 +26,9 @@ rather than by remembering.
   is the only file involved.
 - **The TUI has no automated end-to-end test.** Raw mode needs a real terminal, so key
   handling and the alternate screen are exercised by hand. The view layer is covered
-  headlessly against ratatui's `TestBackend`, which is where the logic lives.
+  headlessly against ratatui's `TestBackend`, which is where the logic lives. The part
+  that *is* checked automatically is the refusal: `ratatui::init` panics rather than
+  returning when there is no terminal, so the terminal is verified before it is taken.
 - **DeepSeek is the only provider.** The `LlmPort` seam is real and a second adapter
   would be a single file, but none exists yet.
 - **The sandbox is reported, not OS-enforced.** `nanus-adapter-local` checks the working

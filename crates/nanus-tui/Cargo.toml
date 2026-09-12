@@ -11,16 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[[bin]]
-name = "nanus-tui"
-path = "src/main.rs"
-required-features = ["runtime"]
-
 [features]
 # The view layer builds and tests without the agent runtime, so a contributor can
-# work on the interface without a working composition behind it. The binary is
-# gated on `runtime` for the same reason: an entry point that cannot run is worse
-# than no entry point.
+# work on the interface without a working composition behind it. Leaving the feature
+# off keeps the view layer free of tokio and of the adapter crates; the `nanus`
+# binary switches it on, because an interface nobody can reach is not an interface.
 default = []
 # The interactive loop needs a terminal and a harness; the view layer needs neither.
 runtime = [

@@ -14,11 +14,35 @@ use nanus_domain::{Session, SessionEvent};
 
 use crate::transcript::{Entry, Role, Transcript};
 
-/// Builds a transcript from a recorded session.
+/// Builds a transcript from a session's event log.
+///
+/// This is the conversation and nothing else: no introduction is added, because a live
+/// conversation has no need of a banner announcing what the reader is already in the
+/// middle of.
 #[must_use]
 pub fn transcript_of(session: &Session) -> Transcript {
+    build(session, None)
+}
+
+/// Builds a transcript from a *recorded* session, introduced by a one-line header.
+///
+/// Someone reading a session they were not present for needs to know what they are
+/// looking at, and the header — title, directory, event count — is that. It belongs to
+/// reading a recording rather than to the conversation, which is why the live interface
+/// does not use it: a conversation that had just started would otherwise open by
+/// announcing itself as `recorded session · <untitled> · 0 events`, which is simply
+/// untrue.
+#[must_use]
+pub fn recording_of(session: &Session) -> Transcript {
+    build(session, Some(header(session)))
+}
+
+/// Folds the event log into a transcript, optionally introduced by `banner`.
+fn build(session: &Session, banner: Option<String>) -> Transcript {
     let mut transcript = Transcript::new();
-    transcript.push(Entry::notice(header(session)));
+    if let Some(banner) = banner {
+        transcript.push(Entry::notice(banner));
+    }
     for event in session.log().events() {
         apply(&mut transcript, event);
     }
@@ -177,13 +201,21 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_session_still_has_a_header() {
+    fn an_empty_recording_still_has_a_header() {
         let session = session_with(Vec::new());
-        let transcript = transcript_of(&session);
+        let transcript = recording_of(&session);
         // A blank screen would look like a failure to load.
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript.entries()[0].role(), Role::Harness);
         assert!(transcript.entries()[0].text().contains("/tmp/workspace"));
+    }
+
+    #[test]
+    fn a_live_transcript_has_no_header() {
+        // The live interface uses this one, so a conversation that had just started must
+        // not open by claiming to be a recording of itself.
+        let session = session_with(Vec::new());
+        assert!(transcript_of(&session).is_empty());
     }
 
     #[test]
@@ -197,8 +229,8 @@ mod tests {
         }]);
         let transcript = transcript_of(&session);
         let roles: Vec<Role> = transcript.entries().iter().map(Entry::role).collect();
-        // Header, then reasoning, then the answer.
-        assert_eq!(roles, vec![Role::Harness, Role::Reasoning, Role::Assistant]);
+        // Reasoning first, then the answer: a reader needs to tell the two apart.
+        assert_eq!(roles, vec![Role::Reasoning, Role::Assistant]);
     }
 
     #[test]
@@ -211,8 +243,8 @@ mod tests {
             interrupted: false,
         }]);
         let transcript = transcript_of(&session);
-        // Only the header: an absent field is not an empty entry.
-        assert_eq!(transcript.len(), 1);
+        // An absent field is not an empty entry.
+        assert!(transcript.is_empty());
     }
 
     #[test]
@@ -230,16 +262,16 @@ mod tests {
             },
         ]);
         let transcript = transcript_of(&session);
-        assert_eq!(transcript.len(), 3);
+        assert_eq!(transcript.len(), 2);
         // The call carries its name and arguments.
         assert!(matches!(
-            transcript.entries()[1].kind(),
+            transcript.entries()[0].kind(),
             crate::transcript::EntryKind::ToolCall { name, .. } if name == "glob"
         ));
         // And the result carries the same name, so a reader can tell which call it
         // answers without tracking ids.
         assert!(matches!(
-            transcript.entries()[2].kind(),
+            transcript.entries()[1].kind(),
             crate::transcript::EntryKind::ToolResult { name, is_error: false, .. } if name == "glob"
         ));
     }
@@ -260,7 +292,7 @@ mod tests {
         ]);
         let transcript = transcript_of(&session);
         assert!(matches!(
-            transcript.entries()[2].kind(),
+            transcript.entries()[1].kind(),
             crate::transcript::EntryKind::ToolResult { is_error: true, .. }
         ));
     }
@@ -275,9 +307,9 @@ mod tests {
             is_error: false,
         }]);
         let transcript = transcript_of(&session);
-        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript.len(), 1);
         assert!(matches!(
-            transcript.entries()[1].kind(),
+            transcript.entries()[0].kind(),
             crate::transcript::EntryKind::ToolResult { name, .. } if name == "tool"
         ));
     }
@@ -293,8 +325,8 @@ mod tests {
                 reason: TurnEndReason::Completed,
             },
         ]);
-        // Only the header.
-        assert_eq!(transcript_of(&session).len(), 1);
+        // Structural events say nothing the entries themselves do not already show.
+        assert!(transcript_of(&session).is_empty());
     }
 
     #[test]

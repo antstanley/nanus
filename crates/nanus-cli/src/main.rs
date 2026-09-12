@@ -1,7 +1,8 @@
 //! The `nanus` binary.
 //!
-//! One entry point, three modes, and a deliberate agreement with the reference
-//! harness about what a *headless* run means:
+//! One entry point, and one program behind it. Typing `nanus` with a terminal starts
+//! the interactive interface; every other invocation is headless, and a headless run
+//! keeps a deliberate agreement with the reference harness about what that means:
 //!
 //! - **stdout carries the answer and nothing else.** Not the reasoning, not the
 //!   tool calls, not a progress line. A harness whose output is a program's input
@@ -13,6 +14,13 @@
 //! - **Reasoning is streamed to stderr while it happens.** A model that thinks for
 //!   a minute in silence looks broken, and a user deserves to see progress without
 //!   that progress contaminating the answer.
+//!
+//! The interface is not a second program bolted on: it is reached through the same
+//! binary, reads the same configuration, and creates its session against the same
+//! workspace, so `nanus run` and `nanus tui` cannot drift apart about any of it.
+//!
+//! Piped or redirected, a bare `nanus` prints its usage rather than trying to draw on
+//! something that is not a terminal.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

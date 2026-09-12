@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.1s] 520 tests run: 520 passed, 0 skipped
+Summary [2.7s] 539 tests run: 539 passed, 0 skipped
 
 $ cargo test --workspace --doc
 9 doctests passed
@@ -38,10 +38,11 @@ truncated mid-frame, and the request carrying all seven schemas.
 resulting session log inspected: a four-step turn with tool calls, results fed back, and
 per-step token accounting.
 
-## Two bugs found by verification rather than by reasoning
+## Four bugs found by verification rather than by reasoning
 
-Both were found *because* the live path was exercised, and both are now pinned by tests.
-They are recorded because a project claiming rigour should show what rigour caught.
+All four were found *because* the thing was exercised rather than read, and all four are
+now pinned by tests. They are recorded because a project claiming rigour should show what
+rigour caught.
 
 **The `[DONE]` sentinel silently dropped every tool call.** The end-of-stream sentinel
 ended the byte-reading loop without closing the accumulator — and the accumulator is what
@@ -55,6 +56,22 @@ default, and the matcher tested absolute paths — so `*.rs` matched at every de
 bare pattern matched *everything*. `*.rs` and `**/*.rs` were indistinguishable, which
 meant a model could not express "top level only". Now `*.rs` is the root level,
 `**/*.rs` is every depth, and `src/*.rs` stops at the separator.
+
+**The interface aborted when there was no terminal.** `ratatui::init` panics rather than
+returning an error, so `nanus tui --session | cat` died from inside the drawing library
+with exit 134 and a message about a device it could not configure. Found by capturing the
+screenshot, which meant running the binary through `tmux` and then, by accident, outside
+it. The terminal is now verified before it is taken, and the refusal is a pure function of
+whether a terminal exists — so the guard is tested without a test that would itself take
+over a terminal.
+
+**A live conversation announced itself as a recording.** The transcript builder prefixed
+every session with a header, so a conversation that had just started opened by saying
+`recorded session · <untitled> · 0 events` — false, and stale the moment the first turn
+arrived. Found by running a bare `nanus` in a real terminal to check that the merged
+binary started the interface. A header belongs to reading a recording; a live conversation
+needs none, because the reader is already in it. Building that banner is now a property of
+the recording, not of the session.
 
 That second one was found by a model, in a live run, which then warned the user about it
 in its answer. Which is the point of building a harness small enough to reason about.

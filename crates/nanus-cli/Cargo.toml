@@ -17,6 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 nanus-bundle = { workspace = true }
+# The interface is a library the entry point drives, not a second program. Two
+# binaries would mean two argument parsers, two ways to load a configuration, and two
+# answers to which workspace a session belongs to.
+nanus-tui = { workspace = true, features = ["runtime"] }
 nanus-kernel = { workspace = true }
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }

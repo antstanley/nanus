@@ -26,13 +26,9 @@
 //! | `Ctrl+L` | clear the transcript |
 //! | `Ctrl+C` / `Ctrl+D` | quit |
 
-// `list_sessions` prints rather than draws, and that is deliberate: a list is not a
-// conversation, and taking over the terminal to show five lines would be worse than
-// letting the shell keep them. The rest of this module draws.
-#![allow(clippy::print_stdout)]
-
 use core::future::Future;
-use std::io;
+use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -194,41 +190,16 @@ pub trait SessionSource {
     }
 }
 
-/// Lists the recorded sessions, newest first.
-///
-/// Printed rather than drawn: a list is not a conversation, and taking over the terminal
-/// to show five lines would be worse than letting the shell keep them.
-///
-/// # Errors
-///
-/// Returns a message when the store cannot be read.
-pub fn list_sessions(store: &nanus_ports::StoreHandle) -> Result<(), String> {
-    let listed = block_on(store.list()).map_err(|error| error.to_string())?;
-    if listed.is_empty() {
-        return Err(String::from("no sessions recorded"));
-    }
-    for summary in listed {
-        let title = summary.title.unwrap_or_else(|| String::from("<untitled>"));
-        println!(
-            "{}  {:>4} events  {}  {title}",
-            summary.id.as_str(),
-            summary.event_count,
-            summary.cwd
-        );
-    }
-    Ok(())
-}
-
 /// Opens a recorded session for reading.
 ///
 /// With no id, the most recent session is opened, which is what a bare
-/// `nanus-tui --session` should mean.
+/// `nanus tui --session` means.
 ///
 /// # Errors
 ///
-/// Returns a message when the store cannot be read or the session does not exist. A
-/// missing id is reported with the list of ids that do exist, because "no such session"
-/// alone leaves a user guessing at a uuid they mistyped.
+/// Returns a message when the store cannot be read or the session does not exist. An id
+/// that does not exist is only reported as missing — `nanus sessions` is what lists the
+/// ones that do, so a mistyped uuid is worth checking against it.
 pub fn view(
     store: &nanus_ports::StoreHandle,
     id: Option<&str>,
@@ -302,15 +273,32 @@ impl SessionSource for Recording {
     }
 }
 
-/// Runs the interactive interface against `harness`.
+/// Whether there is a terminal to draw on and a keyboard to read.
+///
+/// Both ends are checked, because the interface needs both. `is_terminal` rather than a
+/// `tty` call, which keeps the workspace's `unsafe` ban intact and avoids a
+/// platform-specific branch.
+///
+/// This is asked *before* the terminal is taken, because taking one that is not there
+/// does not fail politely: `ratatui::init` panics, so a piped invocation would abort
+/// with a message about the drawing library rather than about the missing terminal.
+#[must_use]
+pub fn interactive() -> bool {
+    io::stdout().is_terminal() && io::stdin().is_terminal()
+}
+
+/// Runs the interactive interface against `harness`, in `workspace`.
+///
+/// The workspace is passed in rather than read from the current directory, so that the
+/// interface and a headless `nanus run` agree about which directory a session belongs
+/// to when the configuration names one.
 ///
 /// # Errors
 ///
 /// Returns an error when the terminal cannot be put into raw mode or an event cannot
 /// be read. The terminal is restored either way.
-pub fn run(harness: &Harness) -> io::Result<()> {
-    let workspace = std::env::current_dir()?;
-    let session = harness.new_session(&workspace);
+pub fn run(harness: &Harness, workspace: &Path) -> io::Result<()> {
+    let session = harness.new_session(workspace);
     let source = Live { harness, session };
     run_source(&source)
 }
@@ -335,6 +323,24 @@ impl SessionSource for Live<'_> {
     }
 }
 
+/// Refuses to take a terminal that is not there.
+///
+/// A pure function of whether a terminal exists, so the decision can be tested without
+/// one — and, more importantly, without a test that would take over the terminal when the
+/// suite happens to be run from one.
+///
+/// # Errors
+///
+/// Returns the message a user sees when there is nowhere to draw.
+fn require_terminal(present: bool) -> io::Result<()> {
+    if present {
+        return Ok(());
+    }
+    Err(io::Error::other(
+        "the interactive interface needs a terminal on stdin and stdout",
+    ))
+}
+
 /// Runs the interface for any [`SessionSource`].
 ///
 /// # Errors
@@ -342,11 +348,22 @@ impl SessionSource for Live<'_> {
 /// Returns an error when the terminal cannot be put into raw mode or an event cannot be
 /// read. The terminal is restored either way.
 pub fn run_source(source: &dyn SessionSource) -> io::Result<()> {
+    // Checked here as well as by the caller, because this is the function that takes the
+    // terminal. A guard in the caller protects the paths that exist today; this protects
+    // the ones added later, and it is the last point at which the answer is still an
+    // error rather than a panic.
+    require_terminal(interactive())?;
     let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
     // The transcript comes from the session itself, so a recorded one looks exactly like
-    // the live conversation it was: same event log, same rendering.
-    view.transcript = crate::replay::transcript_of(source.session());
+    // the live conversation it was: same event log, same rendering. The one difference is
+    // the header, which belongs to a recording and to nothing else.
+    let viewing_only = source.runner().is_none();
+    view.transcript = if viewing_only {
+        crate::replay::recording_of(source.session())
+    } else {
+        crate::replay::transcript_of(source.session())
+    };
     view.tokens_used = u64::from(source.session().usage_totals().total_tokens());
     // A conversation opens at its end, where the answer is. The viewport has to be
     // recorded first, because "the bottom" depends on how many rows exist and how many
@@ -355,7 +372,6 @@ pub fn run_source(source: &dyn SessionSource) -> io::Result<()> {
     // Opening at the end, or part way back from it: the offset is applied on the first
     // render, when the viewport it is measured against is known.
     view.pending_scroll_back = Some(source.initial_scroll());
-    let viewing_only = source.runner().is_none();
     if viewing_only {
         view.status = String::from("viewing a recorded session · Ctrl-C quits");
     }
@@ -381,7 +397,7 @@ pub fn run_source(source: &dyn SessionSource) -> io::Result<()> {
                         // interface does not have. Saying so beats silently discarding
                         // what the user typed.
                         view.transcript.push(Entry::notice(
-                            "this is a recorded session; start nanus-tui without --session to continue it",
+                            "this is a recorded session; start `nanus tui` without --session to continue it",
                         ));
                         view.scroll_to_bottom();
                         continue;
@@ -775,5 +791,19 @@ mod tests {
         for index in 0..64 {
             progress.text(&format!("delta {index}"));
         }
+    }
+
+    #[test]
+    fn the_interface_refuses_a_terminal_that_is_not_there() {
+        // `ratatui::init` panics rather than returning when there is no terminal, so a
+        // piped invocation used to abort with a message about the drawing library. The
+        // refusal is what turns that into an error a person can read.
+        let refused = require_terminal(false);
+        assert!(refused.is_err(), "a missing terminal must be refused");
+        let Err(error) = refused else {
+            return;
+        };
+        assert!(error.to_string().contains("terminal"), "{error}");
+        assert!(require_terminal(true).is_ok(), "a terminal is accepted");
     }
 }

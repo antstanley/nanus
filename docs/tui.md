@@ -1,51 +1,62 @@
 # The interface
 
-Two front ends, one harness. The headless CLI is what you script, and the TUI is what you
-sit in front of. Neither is a wrapper around the other: both compose the same plugin tree
-and drive the same agent loop, so a tool that works in one works in the other.
+One binary, one harness. `nanus run` is the headless path you script, and `nanus tui` is
+the interface you sit in front of. Neither is a wrapper around the other: both compose the
+same plugin tree, load the same configuration, and drive the same agent loop, so a tool
+that works in one works in the other.
 
-![nanus-tui showing a recorded conversation](images/tui-session.png)
+![nanus tui showing a recorded conversation](images/tui-session.png)
 
 *Real output, captured from the binary with `tmux capture-pane` — not a mock-up. The
 conversation is a recorded session, which is why it can be shown without a key.*
 
-## Starting the TUI
+## Starting it
 
-The TUI is built behind a feature, so it is one flag away from a plain `cargo build`:
+There is nothing to enable: a plain release build has the interface in it.
 
 ```sh
-cargo build --release -p nanus-tui --features runtime
+cargo build --release
 
 # Talk to a model in the current directory.
-./target/release/nanus-tui
+export DEEPSEEK_API_KEY=...
+./target/release/nanus
 ```
+
+A bare `nanus` **is** the interface when there is a terminal, which is the whole point of
+one binary: the thing you type to get help and the thing you type to get a prompt are the
+same word. `nanus tui` is the explicit spelling, for when you want to be sure or when the
+default would be ambiguous.
 
 It needs `DEEPSEEK_API_KEY`, because it composes a harness on start.
 
-```sh
-export DEEPSEEK_API_KEY=...
-./target/release/nanus-tui
-```
+Without a terminal — piped, redirected, in a script — a bare `nanus` prints its usage
+instead. It does not try to draw on something that is not a screen, and it does not fail:
+nothing was asked for, and it answered.
 
 ### Or read a conversation you already had
 
 The useful part: reading a transcript needs no credential at all, because it is already
-written down. Every run persists its session, so the TUI doubles as a browser for them.
+written down. Every run persists its session, so the interface doubles as a browser for
+them.
 
 ```sh
-nanus-tui --sessions              # list what is available
-nanus-tui --session               # read the most recent one
-nanus-tui --session <id>          # read a particular one
-nanus-tui --session --scroll 50   # open fifty rows back from the end
+nanus sessions                    # list what is available
+nanus tui --session               # read the most recent one
+nanus tui --session <id>          # read a particular one
+nanus tui --session --scroll 50   # open fifty rows back from the end
 ```
 
 `--scroll` matters more than it sounds. A conversation opens at its end, where the answer
 is; the middle is where the reasoning and the tool calls are, and that is usually what you
 want to look at when asking *why* the agent did something.
 
-In a recorded session the composer still works, and submitting tells you to start
-`nanus-tui` without `--session` rather than silently discarding what you typed. Adding a
-turn to a finished transcript would need a model this mode deliberately does not have.
+In a recorded session the composer still works, and submitting tells you to start `nanus`
+without `--session` rather than silently discarding what you typed. Adding a turn to a
+finished transcript would need a model this mode deliberately does not have.
+
+A recording also opens with a header naming the session — title, directory, event count —
+because a reader who was not there needs to know what they are looking at. A live
+conversation gets no such header: the person is already in it.
 
 ## Keys
 
