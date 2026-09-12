@@ -104,6 +104,14 @@ pub struct ViewState {
     pub status: String,
     /// Styling.
     pub theme: Theme,
+    /// Rows to scroll back from the end on the next render, if a caller asked for it.
+    ///
+    /// Deferred rather than applied immediately because "48 rows back from the end"
+    /// cannot be honoured until the viewport is known: applying it before the first
+    /// render leaves the offset above the maximum, and the next render clamps it back to
+    /// the top.
+    pub pending_scroll_back: Option<u32>,
+
     /// The transcript area the view last drew into, if it has drawn.
     ///
     /// Recorded because "the bottom" is not a constant: it depends on how many rows
@@ -123,6 +131,7 @@ impl Default for ViewState {
             tokens_used: 0,
             status: "ready".to_owned(),
             theme: Theme::default(),
+            pending_scroll_back: None,
             last_viewport: None,
         }
     }
@@ -139,6 +148,23 @@ impl std::fmt::Debug for ViewState {
             .field("tokens_used", &self.tokens_used)
             .finish_non_exhaustive()
     }
+}
+
+/// Splits `text` into one styled line per source line, indented by `depth`.
+///
+/// A `Line` holds spans, not paragraphs: an embedded newline inside a span is rendered
+/// literally rather than breaking the line. Anything multi-line therefore has to be split
+/// before it reaches the widget.
+fn indented(text: &str, depth: usize, style: Style) -> Vec<Line<'static>> {
+    let pad = " ".repeat(depth);
+    let lines: Vec<Line<'static>> = text
+        .split('\n')
+        .map(|line| Line::from(Span::styled(format!("{pad}{line}"), style)))
+        .collect();
+    if lines.is_empty() {
+        return vec![Line::from(Span::styled(pad, style))];
+    }
+    lines
 }
 
 impl ViewState {
@@ -248,24 +274,28 @@ impl ViewState {
     pub fn lines_for(&self, entry: &Entry) -> Vec<Line<'static>> {
         let style = self.theme.style_for_entry(entry);
         match entry.kind() {
-            EntryKind::ToolCall { name, arguments } => vec![
-                Line::from(vec![
+            EntryKind::ToolCall { name, arguments } => {
+                let mut lines = vec![Line::from(vec![
                     Span::styled("⚙ ", style),
                     Span::styled(format!("{name}("), style.add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(Span::styled(format!("  {arguments}"), style)),
-                Line::from(Span::styled(")", style)),
-            ],
+                ])];
+                lines.extend(indented(arguments, 2, style));
+                lines.push(Line::from(Span::styled(")", style)));
+                lines
+            }
             EntryKind::ToolResult {
                 name,
                 is_error,
                 content,
             } => {
                 let marker = if *is_error { "✗" } else { "✓" };
-                vec![
-                    Line::from(Span::styled(format!("{marker} {name}"), style)),
-                    Line::from(Span::styled(format!("  {content}"), style)),
-                ]
+                let mut lines = vec![Line::from(Span::styled(format!("{marker} {name}"), style))];
+                // A result is multi-line by nature — a `read` returns a file. `Line` does
+                // not break on `\n`, so each source line becomes its own `Line`; joining
+                // them would render the newlines as control characters, which is what a
+                // transcript full of `^J` was.
+                lines.extend(indented(content, 2, style));
+                lines
             }
             EntryKind::Notice => {
                 vec![Line::from(Span::styled(
@@ -295,9 +325,15 @@ impl ViewState {
     }
 
     /// Builds the header line naming the role.
+    ///
+    /// A notice has no header: it is the interface speaking, and a role heading would
+    /// suggest otherwise.
     #[must_use]
     pub fn header_for(&self, entry: &Entry) -> Line<'static> {
         let style = self.theme.style_for_entry(entry);
+        if matches!(entry.kind(), EntryKind::Notice) {
+            return Line::from(Span::styled("──", style));
+        }
         Line::from(Span::styled(format!("── {} ", entry.role().label()), style))
     }
 
@@ -331,6 +367,16 @@ impl ViewState {
         }
         if let Some(body) = chunks.get(1) {
             self.last_viewport = Some((body.width, body.height));
+            // A deferred scroll is applied now, while the viewport it is relative to is
+            // in hand, and only once.
+            if let Some(back) = self.pending_scroll_back.take() {
+                self.scroll_to_bottom();
+                // `saturating_neg` rather than a unary minus: a scroll of `i32::MIN`
+                // would overflow on negation, and the workspace treats wrapping
+                // arithmetic as a defect.
+                let delta = i32::try_from(back).unwrap_or(i32::MAX).saturating_neg();
+                self.scroll_by(delta, body.height, body.width);
+            }
             self.clamp_scroll(body.height, body.width);
             self.render_transcript(frame, *body);
         }
@@ -743,5 +789,65 @@ mod tests {
         }
         let failure = Entry::tool_result("read", true, "x");
         assert_eq!(theme.style_for_entry(&failure), theme.error);
+    }
+}
+
+#[cfg(test)]
+mod colour_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+
+    use super::*;
+    use crate::transcript::{Entry, Role};
+
+    /// The colours the rendered cells actually carry.
+    ///
+    /// This asserts on the *buffer*, not on the theme, because the question is whether
+    /// styling survives rendering. A theme that is correct in isolation and never applied
+    /// is a defect that reading the theme would never reveal.
+    #[test]
+    fn roles_are_rendered_in_their_theme_colours() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::User, "a question"));
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "an answer"));
+        state
+            .transcript
+            .push(Entry::prose(Role::Reasoning, "a thought"));
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("a test terminal always builds");
+        let drawn = terminal.draw(|frame| state.render(frame));
+        assert!(drawn.is_ok());
+
+        let theme = Theme::default();
+        let buffer = terminal.backend().buffer();
+        // `Style::fg` is already an `Option<Color>`, so it is compared directly rather
+        // than unwrapped: an unset colour must not match a theme colour.
+        let carries = |wanted: Option<Color>| {
+            (0..buffer.area.height).any(|row| {
+                (0..buffer.area.width).any(|column| {
+                    buffer.cell((column, row)).is_some_and(|cell| {
+                        !cell.symbol().trim().is_empty() && cell.style().fg == wanted
+                    })
+                })
+            })
+        };
+
+        // Each role's colour must appear somewhere. Without this a reader could not tell
+        // a question from an answer without reading the labels.
+        assert!(carries(theme.user.fg), "the user's colour is rendered");
+        assert!(
+            carries(theme.assistant.fg),
+            "the assistant's colour is rendered"
+        );
+        assert!(
+            carries(theme.reasoning.fg),
+            "the reasoning colour is rendered"
+        );
     }
 }

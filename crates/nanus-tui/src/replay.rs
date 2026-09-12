@@ -1,0 +1,365 @@
+//! Turning a recorded session into something a human can read.
+//!
+//! A session log is written for a model: it is the exact sequence of facts a request is
+//! derived from, including audit records like `tool/call` that never reach the wire. A
+//! transcript is what a person reads instead — the same events, but with the model's
+//! reasoning distinguished from its answer, tool calls paired with their results, and
+//! step boundaries folded away.
+//!
+//! The two are deliberately different views of one source. Nothing here invents content:
+//! every entry comes from an event, so a transcript cannot drift from the log it was
+//! built from.
+
+use nanus_domain::{Session, SessionEvent};
+
+use crate::transcript::{Entry, Role, Transcript};
+
+/// Builds a transcript from a recorded session.
+#[must_use]
+pub fn transcript_of(session: &Session) -> Transcript {
+    let mut transcript = Transcript::new();
+    transcript.push(Entry::notice(header(session)));
+    for event in session.log().events() {
+        apply(&mut transcript, event);
+    }
+    // The last entry may still be marked streaming, which would draw a cursor on a
+    // finished conversation.
+    transcript.settle_tail();
+    transcript
+}
+
+/// Renders the one-line header a session starts with.
+fn header(session: &Session) -> String {
+    let title = session
+        .title()
+        .unwrap_or_else(|| String::from("<untitled>"));
+    // One line, prefixed so it reads as a banner rather than as something the model said.
+    format!(
+        "recorded session · {title} · {} · {} events",
+        session.cwd(),
+        session.event_count()
+    )
+}
+
+/// Folds one event into the transcript.
+///
+/// `TurnStart`, `TurnEnd`, `StepStart` and `StepEnd` are deliberately skipped. They are
+/// structural rather than informational: a reader cares what the model did, not where the
+/// loop drew its step boundaries, and printing them would triple the length of every
+/// transcript to say nothing the entries themselves do not already show.
+fn apply(transcript: &mut Transcript, event: &SessionEvent) {
+    match event {
+        SessionEvent::UserMessage { text } => {
+            transcript.push(Entry::prose(Role::User, text.clone()));
+        }
+        SessionEvent::AssistantMessage {
+            text,
+            reasoning,
+            interrupted,
+            ..
+        } => {
+            // Reasoning first, because that is the order it was produced in and the order
+            // a reader wants it: what the model thought, then what it concluded.
+            if let Some(reasoning) = reasoning.as_deref().filter(|text| !text.is_empty()) {
+                transcript.push(Entry::prose(Role::Reasoning, reasoning));
+            }
+            if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
+                // A recorded message is settled: it is not still arriving.
+                transcript.push(Entry::prose(Role::Assistant, text));
+            } else if *interrupted {
+                // A step cut short mid-stream produced no text; saying so is better than
+                // rendering nothing, which would look like the model simply stopped.
+                transcript.push(Entry::notice("(the response was cut short)"));
+            }
+        }
+        SessionEvent::ToolCall {
+            name, arguments, ..
+        } => {
+            transcript.push(Entry::tool_call(
+                name.as_str().to_owned(),
+                render_arguments(arguments),
+            ));
+        }
+        SessionEvent::ToolResult {
+            content, is_error, ..
+        } => {
+            // The result is paired with the call it answers by position, which is what
+            // the log guarantees: a result is appended immediately after its call.
+            let name = last_tool_name(transcript).unwrap_or_else(|| String::from("tool"));
+            transcript.push(Entry::tool_result(name, *is_error, summarise(content)));
+        }
+        SessionEvent::TurnStart { .. }
+        | SessionEvent::TurnEnd { .. }
+        | SessionEvent::StepStart { .. }
+        | SessionEvent::StepEnd { .. } => {}
+    }
+}
+
+/// Renders tool arguments as compact JSON.
+fn render_arguments(arguments: &serde_json::Value) -> String {
+    // Single-line and unwrapped: an entry's own rendering decides how to fit it, and a
+    // pretty-printed object would occupy a screen per call.
+    arguments.to_string()
+}
+
+/// Returns the name of the most recent tool call, for pairing a result with its call.
+fn last_tool_name(transcript: &Transcript) -> Option<String> {
+    transcript
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.kind() {
+            crate::transcript::EntryKind::ToolCall { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+}
+
+/// Shortens a tool result to something worth showing in a transcript.
+///
+/// Tool output is unbounded — a `read` returns a whole file — so a transcript shows its
+/// shape rather than its contents: the first few lines, and how much was left. The full
+/// text is in the session log, which is the source of truth for details.
+#[must_use]
+pub fn summarise(content: &str) -> String {
+    /// How many lines a transcript shows before summarising.
+    const MAX_LINES: usize = 8;
+    /// How many characters a single line may occupy.
+    const MAX_LINE: usize = 120;
+
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return String::from("(no output)");
+    }
+    let mut rendered: Vec<String> = lines
+        .iter()
+        .take(MAX_LINES)
+        .map(|line| truncate(line, MAX_LINE))
+        .collect();
+    let shown = rendered.len();
+    if lines.len() > shown {
+        rendered.push(format!(
+            "… {} more lines",
+            lines.len().saturating_sub(shown)
+        ));
+    }
+    rendered.join("\n")
+}
+
+/// Truncates `text` to at most `max` bytes, on a character boundary.
+fn truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}…", text.get(..end).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use nanus_domain::{Session, SessionEvent, SessionId, ToolCallId, ToolName, TurnEndReason};
+    use serde_json::json;
+
+    use super::*;
+
+    fn session_with(events: Vec<SessionEvent>) -> Session {
+        let mut session = Session::new(SessionId::new("replay"), 0, "/tmp/workspace");
+        for event in events {
+            session.append(event);
+        }
+        session
+    }
+
+    fn name(raw: &str) -> ToolName {
+        ToolName::new(raw).unwrap_or_else(|error| panic!("test tool {raw}: {error}"))
+    }
+
+    #[test]
+    fn an_empty_session_still_has_a_header() {
+        let session = session_with(Vec::new());
+        let transcript = transcript_of(&session);
+        // A blank screen would look like a failure to load.
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript.entries()[0].role(), Role::Harness);
+        assert!(transcript.entries()[0].text().contains("/tmp/workspace"));
+    }
+
+    #[test]
+    fn reasoning_is_shown_before_the_answer() {
+        let session = session_with(vec![SessionEvent::AssistantMessage {
+            text: Some("the answer".to_owned()),
+            reasoning: Some("the thinking".to_owned()),
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+        }]);
+        let transcript = transcript_of(&session);
+        let roles: Vec<Role> = transcript.entries().iter().map(Entry::role).collect();
+        // Header, then reasoning, then the answer.
+        assert_eq!(roles, vec![Role::Harness, Role::Reasoning, Role::Assistant]);
+    }
+
+    #[test]
+    fn an_empty_reasoning_or_text_field_produces_no_entry() {
+        let session = session_with(vec![SessionEvent::AssistantMessage {
+            text: None,
+            reasoning: Some(String::new()),
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+        }]);
+        let transcript = transcript_of(&session);
+        // Only the header: an absent field is not an empty entry.
+        assert_eq!(transcript.len(), 1);
+    }
+
+    #[test]
+    fn a_tool_call_and_its_result_are_paired() {
+        let session = session_with(vec![
+            SessionEvent::ToolCall {
+                call_id: ToolCallId::new("c1"),
+                name: name("glob"),
+                arguments: json!({ "pattern": "**/*.rs" }),
+            },
+            SessionEvent::ToolResult {
+                call_id: ToolCallId::new("c1"),
+                content: "a.rs\nb.rs".to_owned(),
+                is_error: false,
+            },
+        ]);
+        let transcript = transcript_of(&session);
+        assert_eq!(transcript.len(), 3);
+        // The call carries its name and arguments.
+        assert!(matches!(
+            transcript.entries()[1].kind(),
+            crate::transcript::EntryKind::ToolCall { name, .. } if name == "glob"
+        ));
+        // And the result carries the same name, so a reader can tell which call it
+        // answers without tracking ids.
+        assert!(matches!(
+            transcript.entries()[2].kind(),
+            crate::transcript::EntryKind::ToolResult { name, is_error: false, .. } if name == "glob"
+        ));
+    }
+
+    #[test]
+    fn a_failed_tool_result_is_marked() {
+        let session = session_with(vec![
+            SessionEvent::ToolCall {
+                call_id: ToolCallId::new("c1"),
+                name: name("read"),
+                arguments: json!({ "file_path": "missing.txt" }),
+            },
+            SessionEvent::ToolResult {
+                call_id: ToolCallId::new("c1"),
+                content: "read: missing.txt does not exist".to_owned(),
+                is_error: true,
+            },
+        ]);
+        let transcript = transcript_of(&session);
+        assert!(matches!(
+            transcript.entries()[2].kind(),
+            crate::transcript::EntryKind::ToolResult { is_error: true, .. }
+        ));
+    }
+
+    #[test]
+    fn a_result_with_no_preceding_call_still_renders() {
+        // A log truncated to start mid-call is malformed but must not panic: the result
+        // is rendered under a generic name.
+        let session = session_with(vec![SessionEvent::ToolResult {
+            call_id: ToolCallId::new("orphan"),
+            content: "dangling".to_owned(),
+            is_error: false,
+        }]);
+        let transcript = transcript_of(&session);
+        assert_eq!(transcript.len(), 2);
+        assert!(matches!(
+            transcript.entries()[1].kind(),
+            crate::transcript::EntryKind::ToolResult { name, .. } if name == "tool"
+        ));
+    }
+
+    #[test]
+    fn structural_events_do_not_become_entries() {
+        let session = session_with(vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::StepStart { turn: 1, step: 1 },
+            SessionEvent::StepEnd { turn: 1, step: 1 },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                reason: TurnEndReason::Completed,
+            },
+        ]);
+        // Only the header.
+        assert_eq!(transcript_of(&session).len(), 1);
+    }
+
+    #[test]
+    fn an_interrupted_turn_with_no_text_says_so() {
+        let session = session_with(vec![SessionEvent::AssistantMessage {
+            text: None,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: true,
+        }]);
+        let transcript = transcript_of(&session);
+        assert!(
+            transcript
+                .entries()
+                .iter()
+                .any(|entry| entry.text().contains("cut short"))
+        );
+    }
+
+    #[test]
+    fn a_long_tool_result_is_summarised_with_a_count() {
+        let content: String = (0..50).fold(String::new(), |mut acc, i| {
+            let _ = core::fmt::Write::write_fmt(&mut acc, format_args!("line {i}\n"));
+            acc
+        });
+        let rendered = summarise(&content);
+        assert!(rendered.contains("line 0"), "{rendered}");
+        assert!(rendered.contains("42 more lines"), "{rendered}");
+        assert!(!rendered.contains("line 49"), "the tail is not shown");
+    }
+
+    #[test]
+    fn a_short_result_is_shown_whole() {
+        assert_eq!(summarise("one\ntwo"), "one\ntwo");
+        assert_eq!(summarise(""), "(no output)");
+    }
+
+    #[test]
+    fn a_long_line_is_truncated_on_a_character_boundary() {
+        let content = "é".repeat(200);
+        let rendered = summarise(&content);
+        assert!(rendered.ends_with('…'));
+        // The retained prefix must be a real prefix, which a byte-wise cut would not
+        // guarantee for multi-byte text.
+        assert!(content.starts_with(rendered.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn arguments_are_rendered_on_one_line() {
+        let rendered = render_arguments(&json!({ "a": 1, "b": [2, 3] }));
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("\"a\":1"));
+    }
+
+    #[test]
+    fn a_replayed_transcript_has_no_streaming_tail() {
+        let session = session_with(vec![SessionEvent::AssistantMessage {
+            text: Some("done".to_owned()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+        }]);
+        // A cursor on a finished conversation would suggest it was still arriving.
+        assert!(!transcript_of(&session).is_streaming());
+    }
+}

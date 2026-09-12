@@ -32,6 +32,7 @@
 #![allow(unreachable_pub)]
 
 pub mod buffer;
+pub mod replay;
 pub mod transcript;
 pub mod view;
 
@@ -39,5 +40,6 @@ pub mod view;
 pub mod runtime;
 
 pub use buffer::{InputBuffer, KeyOutcome};
+pub use replay::transcript_of;
 pub use transcript::{Entry, EntryKind, Role, Transcript};
 pub use view::{Theme, ViewState};

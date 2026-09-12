@@ -1619,6 +1619,7 @@ dependencies = [
  "nanus-ports",
  "proptest",
  "ratatui",
+ "serde_json",
  "tokio",
  "tracing",
 ]

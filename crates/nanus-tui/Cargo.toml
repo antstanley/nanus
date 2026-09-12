@@ -27,7 +27,6 @@ runtime = [
     "dep:nanus-adapter-config",
     "dep:nanus-kernel",
     "dep:nanus-bundle",
-    "dep:nanus-domain",
     "dep:nanus-ports",
     "dep:tokio",
 ]
@@ -36,10 +35,11 @@ runtime = [
 nanus-adapter-config = { workspace = true, optional = true }
 nanus-kernel = { workspace = true, optional = true }
 nanus-bundle = { workspace = true, optional = true }
-nanus-domain = { workspace = true, optional = true }
+nanus-domain = { workspace = true }
 nanus-ports = { workspace = true, optional = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["rt", "macros", "sync", "time"] }
 

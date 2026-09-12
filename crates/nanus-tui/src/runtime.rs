@@ -26,6 +26,12 @@
 //! | `Ctrl+L` | clear the transcript |
 //! | `Ctrl+C` / `Ctrl+D` | quit |
 
+// `list_sessions` prints rather than draws, and that is deliberate: a list is not a
+// conversation, and taking over the terminal to show five lines would be worse than
+// letting the shell keep them. The rest of this module draws.
+#![allow(clippy::print_stdout)]
+
+use core::future::Future;
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
@@ -150,6 +156,152 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Where the interface gets its conversation from.
+///
+/// Two implementations, and the difference is the whole reason this trait exists: a
+/// composed harness can *run* a turn, and a recorded session cannot. Keeping that apart
+/// means browsing a transcript neither needs an API key nor pretends to be able to talk
+/// to a model.
+pub trait SessionSource {
+    /// The session to display.
+    fn session(&self) -> &Session;
+
+    /// The runner that can extend it, when there is one.
+    ///
+    /// `None` means the interface is reading rather than driving: a submission is
+    /// refused with an explanation instead of being silently dropped.
+    fn runner(&self) -> Option<&Rc<AgentRunner>> {
+        None
+    }
+
+    /// Rows to scroll back from the end when the interface opens.
+    ///
+    /// A conversation opens at its end, which is where the answer is; a reader who wants
+    /// to show or review the *middle* of one — the reasoning and the tool calls — needs a
+    /// way to start there rather than scrolling by hand.
+    fn initial_scroll(&self) -> u32 {
+        0
+    }
+
+    /// Releases whatever the source owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when teardown fails. The interface has already been restored by
+    /// the time this runs, so a failure is reported rather than fatal.
+    fn shutdown(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Lists the recorded sessions, newest first.
+///
+/// Printed rather than drawn: a list is not a conversation, and taking over the terminal
+/// to show five lines would be worse than letting the shell keep them.
+///
+/// # Errors
+///
+/// Returns a message when the store cannot be read.
+pub fn list_sessions(store: &nanus_ports::StoreHandle) -> Result<(), String> {
+    let listed = block_on(store.list()).map_err(|error| error.to_string())?;
+    if listed.is_empty() {
+        return Err(String::from("no sessions recorded"));
+    }
+    for summary in listed {
+        let title = summary.title.unwrap_or_else(|| String::from("<untitled>"));
+        println!(
+            "{}  {:>4} events  {}  {title}",
+            summary.id.as_str(),
+            summary.event_count,
+            summary.cwd
+        );
+    }
+    Ok(())
+}
+
+/// Opens a recorded session for reading.
+///
+/// With no id, the most recent session is opened, which is what a bare
+/// `nanus-tui --session` should mean.
+///
+/// # Errors
+///
+/// Returns a message when the store cannot be read or the session does not exist. A
+/// missing id is reported with the list of ids that do exist, because "no such session"
+/// alone leaves a user guessing at a uuid they mistyped.
+pub fn view(
+    store: &nanus_ports::StoreHandle,
+    id: Option<&str>,
+    scroll_back: u32,
+) -> Result<(), String> {
+    let store = Rc::clone(store);
+    let requested = id.map(str::to_owned);
+    let session = block_on(async move {
+        let chosen = match requested {
+            Some(raw) => Some(nanus_domain::SessionId::new(raw)),
+            None => store
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .max_by_key(|summary| summary.last_event_at_ms)
+                .map(|summary| summary.id),
+        };
+        let Some(id) = chosen else {
+            return Err(String::from("no sessions recorded; run a task first"));
+        };
+        store.load(&id).await.map_err(|error| error.to_string())
+    })?;
+    let recording = Recording {
+        session,
+        scroll_back,
+    };
+    run_source(&recording).map_err(|error| error.to_string())
+}
+
+/// Drives a future to completion on the kernel runtime.
+///
+/// The view path is synchronous and `main` has already entered the runtime, so this is
+/// `block_on` on the same thread rather than a second runtime.
+fn block_on<F: Future>(future: F) -> F::Output {
+    nanus_kernel::runtime::block_on(future)
+}
+
+/// A recorded session, opened for reading.
+pub struct Recording {
+    session: Session,
+    /// Rows to scroll back from the end when the interface opens.
+    scroll_back: u32,
+}
+
+impl Recording {
+    /// Wraps a recorded session, opening at its end.
+    #[must_use]
+    pub const fn new(session: Session) -> Self {
+        Self {
+            session,
+            scroll_back: 0,
+        }
+    }
+
+    /// Opens `rows` back from the end, for reviewing the middle of a conversation.
+    #[must_use]
+    pub const fn scrolled_back(mut self, rows: u32) -> Self {
+        self.scroll_back = rows;
+        self
+    }
+}
+
+impl SessionSource for Recording {
+    fn session(&self) -> &Session {
+        &self.session
+    }
+
+    fn initial_scroll(&self) -> u32 {
+        self.scroll_back
+    }
+}
+
 /// Runs the interactive interface against `harness`.
 ///
 /// # Errors
@@ -157,19 +309,59 @@ impl Drop for TerminalGuard {
 /// Returns an error when the terminal cannot be put into raw mode or an event cannot
 /// be read. The terminal is restored either way.
 pub fn run(harness: &Harness) -> io::Result<()> {
-    let mut guard = TerminalGuard::enter();
     let workspace = std::env::current_dir()?;
     let session = harness.new_session(&workspace);
+    let source = Live { harness, session };
+    run_source(&source)
+}
+
+/// A live harness plus the session the interface is driving.
+struct Live<'a> {
+    harness: &'a Harness,
+    session: Session,
+}
+
+impl SessionSource for Live<'_> {
+    fn session(&self) -> &Session {
+        &self.session
+    }
+
+    fn runner(&self) -> Option<&Rc<AgentRunner>> {
+        Some(&self.harness.runner)
+    }
+
+    fn shutdown(&self) -> Result<(), String> {
+        self.harness.shutdown().map_err(|error| error.to_string())
+    }
+}
+
+/// Runs the interface for any [`SessionSource`].
+///
+/// # Errors
+///
+/// Returns an error when the terminal cannot be put into raw mode or an event cannot be
+/// read. The terminal is restored either way.
+pub fn run_source(source: &dyn SessionSource) -> io::Result<()> {
+    let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
-    view.transcript.push(Entry::notice(format!(
-        "workspace {} · model {} · {} tools",
-        workspace.display(),
-        harness.llm.model(),
-        harness.tool_count()
-    )));
+    // The transcript comes from the session itself, so a recorded one looks exactly like
+    // the live conversation it was: same event log, same rendering.
+    view.transcript = crate::replay::transcript_of(source.session());
+    view.tokens_used = u64::from(source.session().usage_totals().total_tokens());
+    // A conversation opens at its end, where the answer is. The viewport has to be
+    // recorded first, because "the bottom" depends on how many rows exist and how many
+    // the terminal shows — without this the offset stays zero and the reader is left at
+    // the beginning of the conversation.
+    // Opening at the end, or part way back from it: the offset is applied on the first
+    // render, when the viewport it is measured against is known.
+    view.pending_scroll_back = Some(source.initial_scroll());
+    let viewing_only = source.runner().is_none();
+    if viewing_only {
+        view.status = String::from("viewing a recorded session · Ctrl-C quits");
+    }
 
     let (sender, mut receiver) = mpsc::channel::<Update>(256);
-    let runner: Rc<AgentRunner> = Rc::clone(&harness.runner);
+    let runner: Option<Rc<AgentRunner>> = source.runner().map(Rc::clone);
 
     loop {
         guard.terminal().draw(|frame| view.render(frame))?;
@@ -184,12 +376,22 @@ pub fn run(harness: &Harness) -> io::Result<()> {
             match handle_key(key, &mut view) {
                 Outcome::Quit => break,
                 Outcome::Submit(prompt) => {
+                    let Some(runner) = runner.as_ref() else {
+                        // Submitting in a recorded session would need a model this
+                        // interface does not have. Saying so beats silently discarding
+                        // what the user typed.
+                        view.transcript.push(Entry::notice(
+                            "this is a recorded session; start nanus-tui without --session to continue it",
+                        ));
+                        view.scroll_to_bottom();
+                        continue;
+                    };
                     // The transcript is seeded here, where the mutable view lives.
                     view.transcript
                         .push(Entry::prose(Role::User, prompt.clone()));
                     view.begin_turn(1);
                     view.scroll_to_bottom();
-                    spawn_turn(&runner, &session, prompt, &sender);
+                    spawn_turn(runner, source.session(), prompt, &sender);
                 }
                 Outcome::Continue => {}
             }
@@ -204,7 +406,7 @@ pub fn run(harness: &Harness) -> io::Result<()> {
 
     // A shutdown that fails still exits: the terminal has already been restored by the
     // guard, and the run is over.
-    if let Err(error) = harness.shutdown() {
+    if let Err(error) = source.shutdown() {
         tracing::warn!(%error, "the composition did not shut down cleanly");
     }
     Ok(())

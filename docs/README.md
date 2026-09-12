@@ -3,6 +3,14 @@
 The [README](../README.md) is the front door: what `nanus` is, why it exists, and how to
 run it. Everything below is the detail behind that pitch.
 
+## [The interface](tui.md)
+
+Starting the TUI, browsing a recorded session without an API key, the key bindings, and the
+rendering choices — dimmed reasoning, paired tool calls, summarised output. Includes a
+captured screenshot.
+
+Start here if you want to see it working.
+
 ## [Design decisions](design.md)
 
 One section per deliberate choice — safe Rust as a hard constraint, the seven-tool

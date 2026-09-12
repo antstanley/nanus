@@ -123,7 +123,50 @@ export DEEPSEEK_API_KEY=...
 The exit code is part of the contract: `0` only for a completed turn, non-zero otherwise,
 so a script can tell a finished run from a failed one without parsing output.
 
-The interactive interface is `nanus-tui --features runtime`.
+Those two need no key at all, which makes them the fastest way to see what the harness
+thinks it is:
+
+```console
+$ nanus config
+model: deepseek-flash
+max tokens: 8192
+reasoning effort: Medium
+approval policy: Ask
+sandbox mode: ReadOnly
+max steps per turn: 32
+workspace root: <the current directory>
+api key: not set
+
+$ nanus sessions
+01a09558-9f82-720e-960b-8a587e072667  25 events  /Volumes/.../nanus  Use the glob tool to list the top-level Rust files…
+01a0954e-4241-76e3-9316-d6b3a88e823f   6 events  /Volumes/.../nanus  Say hi
+```
+
+### Or sit in front of it
+
+```sh
+cargo build --release -p nanus-tui --features runtime
+export DEEPSEEK_API_KEY=...
+./target/release/nanus-tui
+```
+
+![nanus-tui reviewing a recorded conversation](docs/images/tui-session.png)
+
+*Real output, captured from the binary — not a mock-up. It is a **recorded** conversation,
+which is the point: reading a transcript needs no API key.*
+
+Every run persists its session, so the TUI doubles as a browser for what you have already
+done:
+
+```sh
+nanus-tui --sessions              # list what is available
+nanus-tui --session               # read the most recent one
+nanus-tui --session <id>          # read a particular one
+nanus-tui --session --scroll 50   # open fifty rows back, where the tool calls are
+```
+
+Keys, rendering choices, and why the interface is testable at all:
+[**docs/tui.md**](docs/tui.md).
 
 ### Is it any good?
 
