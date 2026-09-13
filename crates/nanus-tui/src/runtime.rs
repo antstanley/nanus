@@ -766,9 +766,16 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 fn stopping_notice(reason: &TurnEnd, step: u32) -> Option<String> {
     match reason {
         TurnEnd::Completed => None,
-        TurnEnd::MaxSteps => Some(format!(
-            "the turn stopped at its step budget after {step} steps, so the work is unfinished"
-        )),
+        TurnEnd::MaxSteps => {
+            // A budget that ended after one step is not "after 1 steps", and the notice
+            // is read by a person who did not configure the number and has no reason to
+            // expect a template that forgot.
+            let noun = if step == 1 { "step" } else { "steps" };
+            Some(format!(
+                "the turn stopped at its step budget after {step} {noun}, so the work is \
+                 unfinished"
+            ))
+        }
         TurnEnd::MaxTokens => Some(String::from(
             "the turn stopped at the model's token ceiling, so the answer is cut off",
         )),
@@ -1445,6 +1452,14 @@ mod tests {
             stopping_notice(&TurnEnd::Completed, 3),
             None,
             "a turn that finished has nothing to explain"
+        );
+        // The count is read by a person, so a budget that ended after one step does not
+        // say "after 1 steps".
+        let one = stopping_notice(&TurnEnd::MaxSteps, 1);
+        assert!(
+            one.as_deref()
+                .is_some_and(|text| text.contains("after 1 step,")),
+            "{one:?}"
         );
     }
 
