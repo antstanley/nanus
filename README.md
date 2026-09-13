@@ -4,11 +4,11 @@
 
 **A coding agent you can take apart.**
 
-Ten crates of safe Rust. A seven-tool toolset. Every part of it — the model adapter,
+Eleven crates of safe Rust. A seven-tool toolset. Every part of it — the model adapter,
 the tool registry, the session log, the permission policy, and the agent loop itself —
 is a plugin you can remove, replace, or write yourself.
 
-[![tests](https://img.shields.io/badge/tests-520%20passing-brightgreen)](docs/testing.md)
+[![tests](https://img.shields.io/badge/tests-605%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
@@ -104,7 +104,7 @@ Requires stable Rust (pinned in [`rust-toolchain.toml`](rust-toolchain.toml)) an
 ```sh
 git clone https://github.com/antstanley/nanus.git
 cd nanus
-cargo build --release          # one binary, headless and interactive both
+cargo build --release --workspace   # two binaries: the core, and the interface
 
 export DEEPSEEK_API_KEY=...
 
@@ -114,10 +114,20 @@ export DEEPSEEK_API_KEY=...
 # See the reasoning and every tool call as it happens.
 ./target/release/nanus --verbose run "Find the TODO comments and group them by file."
 
+# An agent that outlives the shell that started it.
+./target/release/nanus service start
+./target/release/nanus service status
+./target/release/nanus service stop
+
 # No key needed for either of these.
 ./target/release/nanus config      # the effective configuration
 ./target/release/nanus sessions    # transcripts of everything you have run
 ```
+
+Three modes, one agent. `run` keeps it for a turn, `tui` for as long as the interface is
+open, and `service` until you stop it — and the interface is always a client, over a
+local socket, whether the agent beside it is one this shell started or one that has been
+up since boot.
 
 **stdout carries the answer and nothing else.** Reasoning and tool activity go to stderr.
 The exit code is part of the contract: `0` only for a completed turn, non-zero otherwise,
@@ -135,6 +145,8 @@ approval policy: Ask
 sandbox mode: ReadOnly
 max steps per turn: 32
 workspace root: <the current directory>
+service socket: /Users/you/.config/nanus/run/agent.sock
+service log: /Users/you/.config/nanus/nanus-service.log
 api key: not set
 
 $ nanus sessions
@@ -156,11 +168,19 @@ export DEEPSEEK_API_KEY=...
 *Real output, captured from the binary — not a mock-up. It is a **recorded** conversation,
 which is the point: reading a transcript needs no API key.*
 
-One binary serves both. `nanus run` is the headless path and a bare `nanus` is the
-interface, but they are not two programs sharing a name — they load the same
-configuration, mount the same plugin tree, and create a session against the same
-workspace, so they cannot drift apart. Piped or redirected, a bare `nanus` prints its
-usage rather than trying to draw on something that is not a terminal.
+The core starts an agent for this shell, then runs the interface **as a separate
+program** and serves it over a local socket. Two binaries, because the interface is the
+part that grows and the core is the part that must not: `nanus` does not link `nanus-tui`
+at all, so a change to the rendering cannot change what a script runs. Piped or
+redirected, a bare `nanus` prints its usage rather than trying to draw on something that
+is not a terminal.
+
+The same interface reaches an agent that was started somewhere else:
+
+```sh
+nanus service start     # an agent that outlives the shell
+nanus tui --connect     # sit in front of it
+```
 
 Every run persists its session, so the interface doubles as a browser for what you have
 already done:
@@ -185,10 +205,10 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.0s] 560 tests run: 560 passed, 0 skipped
+Summary [3.4s] 605 tests run: 605 passed, 0 skipped
 
 $ cargo test --workspace --doc
-9 doctests passed
+10 doctests passed
 ```
 
 `unsafe` appears nowhere — every crate forbids it *and* the workspace denies it, because

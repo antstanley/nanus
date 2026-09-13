@@ -23,7 +23,8 @@ should read the relevant page before changing a subsystem:
 | [`docs/testing.md`](docs/testing.md) | Adding tests or wondering what "verified" means here. |
 | [`docs/status.md`](docs/status.md) | Depending on something; includes known limits. |
 | [`docs/style.md`](docs/style.md) | Writing any Rust. |
-| [`docs/tui.md`](docs/tui.md) | Changing the interface. |
+| [`docs/tui.md`](docs/tui.md) | Changing the interface, or the link between it and the core. |
+| [`docs/service.md`](docs/service.md) | Changing how an agent is started, detached, or stopped. |
 | [`SAFETY.md`](SAFETY.md) | Anything that reads files, runs programs, or handles secrets. |
 
 There is also [`cordis-mechanisms-report.md`](cordis-mechanisms-report.md), a long
@@ -32,12 +33,13 @@ instructions.
 
 ## Repository layout
 
-Ten crates in a Cargo workspace. Dependencies point **inward**; this is enforced
+Eleven crates in a Cargo workspace. Dependencies point **inward**; this is enforced
 by the manifests, not by review. `nanus-domain` has no `tokio`, no `reqwest`, and
 no filesystem, so agent decisions can be tested without a network.
 
 ```
-nanus-cli ─▶ nanus-tui
+nanus-cli ──▶ nanus-link ◀── nanus-tui
+    │                           │
     └─────▶ nanus-bundle ─▶ adapters (deepseek, local, store, config)
                     │               │
                     ▼               ▼
@@ -46,6 +48,11 @@ nanus-cli ─▶ nanus-tui
                     ▼
               nanus-domain  (pure: no tokio, no HTTP, no I/O)
 ```
+
+The arrow between `nanus-cli` and `nanus-tui` is a **socket**, not a call, and it is
+the one place in this repository where a dependency is deliberately absent: the core
+does not link the interface, and `nanus-tui` does not link the agent loop. See
+`docs/architecture.md` for why, and `docs/tui.md#the-link` for the protocol.
 
 | Crate | Owns |
 |---|---|
@@ -57,8 +64,9 @@ nanus-cli ─▶ nanus-tui
 | `crates/nanus-adapter-store` | Atomic JSONL session persistence with time-ordered ids. |
 | `crates/nanus-adapter-config` | TOML configuration with a real migration chain. |
 | `crates/nanus-bundle` | The toolset, the agent loop, and the **only** place that names concrete adapters. |
-| `crates/nanus-cli` | The `nanus` binary: `run`, `tui`, `config`, `sessions`. |
-| `crates/nanus-tui` | The ratatui interface as a library (view, input buffer, replay, event loop). |
+| `crates/nanus-link` | The local link: the frame vocabulary, the Unix-socket client, and (behind the `server` feature) the half that serves an agent. This is the only thing the core and the interface share. |
+| `crates/nanus-cli` | The `nanus` binary: `run`, `service`, `config`, `sessions`, and the shell-scoped agent behind `tui`. **It does not depend on `nanus-tui`.** |
+| `crates/nanus-tui` | The interface, as its own binary (`nanus-tui`) plus a library: view, input buffer, replay, and the event loop. It depends on the link client and the session store, and on no adapter, toolset, or agent loop. |
 
 ## Toolchain and setup
 
@@ -83,8 +91,10 @@ cargo clippy --workspace --all-targets --all-features
 cargo nextest run --workspace --all-features
 cargo test --workspace --doc
 
-# Build the single binary (headless and interactive are the same program).
-cargo build --release
+# Build both binaries: the core (`nanus`) and the interface (`nanus-tui`).
+# `--workspace` is required: `default-members` is the kernel alone, so a bare
+# `cargo build --release` produces neither program.
+cargo build --release --workspace
 
 # Run a subset while iterating.
 cargo nextest run -p nanus-bundle
@@ -94,7 +104,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 560 tests, 9 doctests, 0 clippy warnings. If you change
+The current baseline is 605 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -106,16 +116,26 @@ cargo run -p nanus-cli -- run "Summarise this repository."
 cargo run -p nanus-cli -- --verbose run "Find the TODO comments."
 cargo run -p nanus-cli -- config       # no key needed
 cargo run -p nanus-cli -- sessions     # no key needed
+cargo run -p nanus-cli -- tui          # needs a terminal; runs the interface binary
+cargo run -p nanus-cli -- service start --foreground   # serves until Ctrl-C
 ```
+
+`nanus tui` runs `nanus-tui` **from beside the core binary** — under `cargo run`
+that is `target/debug/nanus-tui`, which is why a workspace build is enough to try
+it. `NANUS_TUI` overrides the path. It is never looked up on `PATH`.
 
 Contract to preserve:
 
 - **stdout is the answer and nothing else.** Reasoning and tool activity go to
   stderr.
-- **Exit code is meaningful:** `0` only for a completed turn; a failed run or an
-  exhausted step budget is non-zero.
-- A bare `nanus` starts the TUI when there is a terminal and prints usage when
+- **Exit code is meaningful:** `0` only for a completed turn, a clean interface
+  exit, or a service that started; a failed run, an exhausted step budget, or a
+  `service status` with nothing listening is non-zero.
+- A bare `nanus` starts the interface when there is a terminal and prints usage when
   there is not. It never panics on a missing terminal.
+- **A `Done` frame means the session is already on disk.** The link server records
+  before it answers, exactly as `nanus run` persists before it prints. Do not
+  reorder those two.
 
 ## Configuration and environment
 
@@ -197,10 +217,15 @@ in types:
 
 This is why `nanus-cli` has `prepare()` (async) and `finish()` (sync), and why
 `main` calls `block_on(cli::prepare()).and_then(cli::finish)`. If you add code
-that mounts a kernel or calls `block_on`, keep it in the synchronous half. The
-same rule applies to the TUI: the turn is driven with `block_on_local`, because
-the kernel's state is `Rc`-shared and its futures are `!Send`, so `tokio::spawn`
-cannot carry them.
+that mounts a kernel or calls `block_on`, keep it in the synchronous half.
+
+The second staging rule is about *local* tasks. Serving an agent — to an interface
+over the link, or as a service — spawns `!Send` work, because the kernel's state is
+`Rc`-shared, so `tokio::spawn` cannot carry it. That work needs `block_on_local`,
+which enters a `LocalSet` *and* runs the runtime: `spawn_local` panics outside a
+local set, and a set that is merely entered never polls what it spawned. Both
+halves have bitten this repository in production, so treat them as rules rather
+than advice.
 
 ## Invariants that are enforced by tests
 
@@ -222,6 +247,13 @@ design docs too.
 - **Temporal composability:** unloading a plugin reverts its effects in reverse
   order. `nanus-kernel/tests/composition.rs` asserts the revert order, not just
   the end state.
+- **The core does not depend on the interface.** `nanus-cli` has no dependency on
+  `nanus-tui`, and `nanus-tui` has none on `nanus-bundle`. The manifests enforce
+  it, so adding one is a deliberate architectural change rather than a quick fix.
+- **The link's frame vocabulary is the interface's only view of a turn.** A new
+  thing an interface must show is a new `Frame` variant, which means a change to
+  `nanus-link` and to the server that produces it — not a new field smuggled
+  through an existing one.
 
 ## How to make common changes
 
@@ -253,6 +285,25 @@ unload. See `nanus-kernel/src/lib.rs` for a worked doctest.
 **Write a new adapter.** Keep vendor errors inside the crate: define a crate
 error `enum` with `From` impls and expose only port types. No `unsafe`, no
 `unwrap` in production paths.
+
+**Change what the interface can show.** Add a variant to `nanus_link::protocol::Frame`,
+produce it from the server's `LinkProgress` (or from `serve_connection` for
+something outside a turn), and handle it in `nanus_tui::runtime::apply`. The
+compiler will point at all three: the enum match in `apply` is exhaustive, so a
+new frame cannot be silently ignored. Add a round-trip case to the protocol test
+and a case to the `apply` test.
+
+**Change how an agent is started.** The three modes differ by *lifetime*, not by
+agent, and they all end in `nanus_link::server::serve` or `Harness::run_turn`. A
+new mode should reuse one of those. If it needs a third, that is a design
+decision worth writing down in `docs/design.md` first — the point of the current
+shape is that there is one code path that runs a turn for someone to watch.
+
+**Change the interface's transport.** `nanus-link` is the only thing the two
+binaries share. Anything that talks to an agent goes through `nanus_link::Client`,
+and the server half is behind the `server` feature so the interface never links
+it. If a change makes the interface depend on the agent loop, stop: that is the
+split being undone.
 
 ## Safety
 

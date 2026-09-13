@@ -1,20 +1,35 @@
 # Status
 
-Working, end to end. Progress is honest rather than flattering — the last two rows
-are distinctions worth keeping.
+Working, end to end. Progress is honest rather than flattering — the last section is
+limits worth knowing before you depend on something.
 
 | | |
 |---|---|
 | Kernel, domain, ports, all four adapters | complete |
 | Toolset, agent loop, composition | complete |
-| CLI and TUI | complete, and one binary: `nanus` is headless or interactive depending on how it is invoked |
+| Core CLI: `run`, `config`, `sessions` | complete |
+| The interface, as its own binary | view layer tested headlessly; raw-mode input needs a real terminal |
+| The local link between them | protocol, client, and server; tested over real sockets with a scripted model |
+| `nanus service` | `start` (detached and `--foreground`), `stop`, `status`; detached lifetime verified by hand |
 | Live path (streaming, tool calls, results fed back) | **verified against the real API** |
-| Interactive TUI | view layer tested headlessly; raw-mode input needs a real terminal |
 
 Composing a harness is `compose(&config).await` for the adapters, then
 `Pending::start()` outside the runtime for the kernel — the two phases exist because
 `block_on` cannot be called from inside a runtime, and the split is enforced by types
 rather than by remembering.
+
+## The three modes
+
+| Mode | Agent lifetime | Reached by |
+|---|---|---|
+| `nanus run <task>` | until the turn completes | stdout |
+| `nanus` / `nanus tui` | the interface's | `nanus-tui --link <socket>` |
+| `nanus service` | until stopped | `<nanus home>/run/agent.sock` |
+
+The agent is the same object in all three. What differs is a lifetime and a transport, and
+the transport is the same one in all three — so there is one code path that runs a turn
+for an interface to watch, rather than one for "the interface we linked" and another for
+"the interface over there".
 
 ## Known limits
 
@@ -27,11 +42,23 @@ rather than by remembering.
 - **The TUI has no automated end-to-end test.** Raw mode needs a real terminal, so the
   alternate screen and the drawing itself are exercised by hand. What *is* covered
   automatically are the parts that can be: key handling, scrolling and wrapping against
-  ratatui's `TestBackend`; a submitted prompt driven to an answer against a scripted
-  model; and the refusal of a missing terminal, since `ratatui::init` panics rather than
-  returning when there is no terminal to take. Submitting a prompt was broken from the
-  first commit until it was first typed into — see
-  [the bugs verification found](testing.md#six-bugs-found-by-verification-rather-than-by-reasoning).
+  ratatui's `TestBackend`; frames from the link landing in the right entries; the refusal
+  of a missing terminal, since `ratatui::init` panics rather than returning when there is
+  no terminal to take; and the link itself, over real sockets in a temporary directory
+  with a scripted model (`crates/nanus-link/tests/link.rs`). Submitting a prompt was broken
+  from the first commit until it was first typed into — see
+  [the bugs verification found](testing.md#the-bugs-verification-found).
+- **The link is Unix-only and trusts its peer.** A Unix domain socket in the user's own
+  nanus home, `0600` inside a `0700` directory. No remote mode, no Windows (the workspace
+  already depends on `nix` for process groups), and no defence against a process already
+  running as the same user — such a process can read the workspace and the session log
+  regardless. See [the service page](service.md#known-limits).
+- **A connection is a conversation.** Reconnecting starts a new session; resuming a named
+  session over the link is not implemented. The transcript of the old one is on disk, and
+  `nanus tui --session` reads it.
+- **One agent, one thread.** A service serves several clients and their turns interleave
+  cooperatively, because the kernel is single-threaded and its futures are not `Send`.
+  Concurrency is not parallelism, and there is no worker pool.
 - **DeepSeek is the only provider.** The `LlmPort` seam is real and a second adapter
   would be a single file, but none exists yet.
 - **The sandbox is reported, not OS-enforced.** `nanus-adapter-local` checks the working
@@ -57,3 +84,8 @@ split is enforced by types — `Pending` is the seam that makes the ordering a c
 fact rather than a convention someone has to remember. Getting it wrong produced
 "cannot start a runtime from within a runtime" on every command, which is how it was
 found.
+
+The same rule shapes the interface and the service, with one addition: a turn that an
+interface is watching is a `!Send` local task, so it needs `block_on_local`, which enters
+a `LocalSet` *and* runs the runtime. Entering a local set without running it leaves every
+spawned task un-polled, which looks exactly like a hung agent.

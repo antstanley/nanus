@@ -1,14 +1,29 @@
 //! Argument parsing and the modes.
 //!
-//! The command surface is deliberately small. A harness that grows a subcommand per
-//! feature becomes a language of its own, and every one of them is a thing a user
-//! has to learn before the tool does anything.
+//! ## The three modes
 //!
-//! One binary serves both the headless and the interactive use. They are not two
-//! programs that happen to share a name: they load the same configuration, mount the
-//! same composition, and create a session against the same workspace, so `nanus run`
-//! and `nanus tui` cannot drift apart about any of it.
+//! | Mode | What it is |
+//! |---|---|
+//! | `nanus run <task>` | One prompt, one answer on stdout, exit. |
+//! | `nanus tui` (or a bare `nanus`) | An agent scoped to this shell, and the interface to talk to it. |
+//! | `nanus service` | An agent that outlives the shell that started it. |
+//!
+//! ## What this binary is not
+//!
+//! It is not the interface. It hosts an agent, and for the interactive mode it runs the
+//! interface as a separate program and serves that program over a local socket. Two
+//! decades of terminal interfaces have taught the same lesson — an interface grows — and
+//! the core that a script invokes is the last thing that should grow with it. So the
+//! split is enforced by the manifest: `nanus-cli` does not depend on `nanus-tui` at all,
+//! and could not call into it if it wanted to.
+//!
+//! ## What the modes share
+//!
+//! Everything that matters: one configuration loader, one composition, one answer to which
+//! workspace a session belongs to. `run`, `tui`, and `service` differ in how long the
+//! agent lives, not in what the agent is.
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -16,7 +31,7 @@ use nanus_adapter_config::NanusConfig;
 use nanus_bundle::compose::open_store;
 use nanus_bundle::{Harness, compose};
 use nanus_kernel::runtime::block_on as kernel_block_on;
-use nanus_tui::runtime::interactive;
+use std::ffi::OsString;
 
 use crate::progress::StderrProgress;
 
@@ -27,8 +42,8 @@ use crate::progress::StderrProgress;
     version,
     about = "A coding agent harness",
     long_about = "A coding agent harness built on a Rust implementation of the Cordis \
-                  meta-framework. Run one task and print its answer, start an interactive \
-                  session, or inspect the configuration and sessions on this machine.\n\n\
+                  meta-framework. Run one task and print its answer, sit in front of the \
+                  interactive interface, or run an agent as a service.\n\n\
                   With no subcommand and a terminal, nanus starts the interactive \
                   interface; with no terminal it prints this help instead."
 )]
@@ -62,9 +77,11 @@ pub enum Command {
 
     /// Start the interactive interface.
     ///
-    /// The same thing a bare `nanus` does when it has a terminal.
+    /// The same thing a bare `nanus` does when it has a terminal. The interface is a
+    /// separate program; this one runs an agent for the shell and hands it over.
+    #[command(visible_alias = "ui")]
     Tui {
-        /// Read a recorded session instead of talking to a model.
+        /// Read a recorded session instead of talking to an agent.
         ///
         /// With no id the most recent session is opened. Reading needs no API key,
         /// because the transcript is already written down.
@@ -81,6 +98,27 @@ pub enum Command {
         /// part way into.
         #[arg(long, value_name = "ROWS", default_value_t = 0)]
         scroll: u32,
+
+        /// Talk to the agent a `nanus service` is running instead of starting one.
+        #[arg(long, conflicts_with = "session")]
+        connect: bool,
+
+        /// Connect to a service listening on this socket instead of the configured one.
+        ///
+        /// Only meaningful with `--connect`, and the way to reach a second service that
+        /// was started with its own `--socket`.
+        #[arg(long, value_name = "PATH", requires = "connect")]
+        socket: Option<PathBuf>,
+    },
+
+    /// Run the agent as a long-running service.
+    ///
+    /// The agent outlives the shell that started it: it detaches into a session of its
+    /// own and answers on a socket only this user can reach.
+    Service {
+        /// What to do with the service.
+        #[command(subcommand)]
+        action: ServiceAction,
     },
 
     /// Show the effective configuration.
@@ -90,12 +128,65 @@ pub enum Command {
     Sessions,
 }
 
+/// What to do with the service.
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Start the service.
+    ///
+    /// Detached by default, so it survives the shell. `--foreground` runs it here, which
+    /// is what a supervisor such as systemd wants.
+    Start {
+        /// Run in this terminal instead of detaching.
+        #[arg(long)]
+        foreground: bool,
+
+        /// Internal: marks the child that `start` spawned, which detaches itself.
+        ///
+        /// Hidden because it is an instruction from a parent rather than a choice for a
+        /// person: running it by hand detaches a service from the terminal that asked.
+        #[arg(long, hide = true)]
+        detached: bool,
+
+        /// Listen on this socket instead of the configured one.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+
+        /// Write the detached service's output here instead of the default log.
+        #[arg(long, value_name = "PATH")]
+        log: Option<PathBuf>,
+    },
+
+    /// Ask a running service to stop.
+    Stop {
+        /// The socket the service is listening on.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+
+    /// Report whether a service is running, and what it is.
+    Status {
+        /// The socket the service is listening on.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+}
+
 /// Renders the usage text.
 ///
 /// Built from the same [`Args`] the parser uses, so the help a person reads and the
 /// grammar they are held to cannot disagree.
 pub fn help_text() -> String {
     Args::command().render_help().to_string()
+}
+
+/// Whether there is a terminal to hand to the interface.
+///
+/// Asked here, before anything is composed or started, so the answer does not depend on
+/// whether an API key happens to be configured — and so a piped `nanus tui` fails with a
+/// sentence about a terminal rather than by starting an agent for nobody.
+#[must_use]
+pub fn interactive() -> bool {
+    std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
 }
 
 /// Parses the arguments, prepares what needs awaiting, and then finishes the work.
@@ -124,8 +215,6 @@ pub async fn prepare() -> Result<Ready, String> {
             // is printed and treated as done.
             let rendered = error.render().to_string();
             print!("{rendered}");
-            // A help or version request is a successful outcome with nothing left to
-            // do; a usage error is a failure.
             return if error.use_stderr() {
                 Err(String::from("invalid arguments"))
             } else {
@@ -141,7 +230,10 @@ pub async fn prepare() -> Result<Ready, String> {
         config,
         command,
     } = args;
-    let options = Options { verbose, config };
+    let options = Options {
+        verbose,
+        config: config.clone(),
+    };
     let command = match command {
         Some(command) => command,
         // A bare `nanus` is the interface: someone who types the program's name and
@@ -149,6 +241,8 @@ pub async fn prepare() -> Result<Ready, String> {
         None if interactive() => Command::Tui {
             session: None,
             scroll: 0,
+            connect: false,
+            socket: None,
         },
         // Redirected or piped there is no screen to draw on, and starting a
         // full-screen interface there would either fail or hang. Saying what the
@@ -174,16 +268,13 @@ pub async fn prepare() -> Result<Ready, String> {
         // Showing the configuration prints and is finished.
         Command::Config => show_config(&options).map(|()| Ready::Done),
         Command::Sessions => prepare_list().await,
-        // Reading a recorded session needs no model, so it opens the store rather than
-        // composing a harness — which is what lets it work without an API key.
         Command::Tui {
-            session: Some(id),
+            session,
             scroll,
-        } => prepare_view(id, scroll).await,
-        Command::Tui {
-            session: None,
-            scroll: _,
-        } => prepare_tui(&options).await,
+            connect,
+            socket,
+        } => prepare_tui(&options, session, scroll, connect, socket).await,
+        Command::Service { action } => prepare_service(&options, action).await,
     }
 }
 
@@ -209,28 +300,44 @@ pub enum Ready {
         /// The store to read from.
         store: nanus_ports::StoreHandle,
     },
-    /// A composition is built but not mounted, for the interactive interface.
+    /// A composition is built for a shell-scoped agent the interface will talk to.
     Tui {
         /// The adapters, ready to mount.
         pending: Box<compose::Pending>,
         /// The workspace a session is created against.
         workspace: PathBuf,
     },
-    /// A recorded session is loaded and ready to be shown.
-    View {
-        /// The store the session was read from.
-        store: nanus_ports::StoreHandle,
-        /// The session to show, or the most recent one.
-        id: Option<String>,
-        /// Rows to scroll back from the end when it opens.
-        scroll_back: u32,
+    /// The interface needs no agent: it was asked to read a transcript.
+    Spawn {
+        /// The arguments to hand the interface program.
+        arguments: Vec<OsString>,
+    },
+    /// Serve an agent until a signal or a client asks it to stop.
+    Serve {
+        /// The adapters, ready to mount.
+        pending: Box<compose::Pending>,
+        /// The workspace a session is created against.
+        workspace: PathBuf,
+        /// The socket to listen on.
+        socket: PathBuf,
+    },
+    /// Ask a running service to stop.
+    Stop {
+        /// The socket that service is listening on.
+        socket: PathBuf,
+    },
+    /// Report whether a service is running.
+    Status {
+        /// The socket that service would be listening on.
+        socket: PathBuf,
     },
 }
 
 /// Completes the work [`prepare`] set up, synchronously.
 ///
-/// Deliberately **not** `async`: every step here either mounts a kernel or drives the
-/// agent loop with `block_on`, and both are illegal inside a runtime.
+/// Deliberately **not** `async`: every step here either mounts a kernel, drives the agent
+/// loop with `block_on`, or runs a child that owns the terminal. All of those are
+/// illegal or pointless inside a runtime.
 ///
 /// # Errors
 ///
@@ -245,12 +352,15 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             verbose,
         } => run_turn(*pending, &workspace, &prompt, verbose),
         Ready::List { store } => print_sessions(&store),
-        Ready::Tui { pending, workspace } => run_tui(*pending, &workspace),
-        Ready::View {
-            store,
-            id,
-            scroll_back,
-        } => nanus_tui::runtime::view(&store, id.as_deref(), scroll_back),
+        Ready::Tui { pending, workspace } => crate::tui::attached(*pending, &workspace),
+        Ready::Spawn { arguments } => crate::tui::alone(&arguments),
+        Ready::Serve {
+            pending,
+            workspace,
+            socket,
+        } => crate::service::serve(*pending, &workspace, &socket),
+        Ready::Stop { socket } => crate::service::stop(&socket),
+        Ready::Status { socket } => crate::service::status(&socket),
     }
 }
 
@@ -286,53 +396,98 @@ async fn prepare_run(args: &Options, task: &[String]) -> Result<Ready, String> {
     })
 }
 
-/// Awaits the adapters the interactive interface needs.
+/// Decides how the interface will be started.
 ///
-/// Separate from [`prepare_run`] only in what it returns: the same configuration, the
-/// same composition, and the same workspace. That is the point of one binary — the two
-/// modes cannot disagree about where a session belongs.
-async fn prepare_tui(args: &Options) -> Result<Ready, String> {
+/// Reading a transcript and talking to an agent are different enough to be different
+/// paths, and only one of them needs anything composed: a session that has already been
+/// written down is a file, so `--session` composes no agent and reads no key.
+// The three-state session flag is the parser's shape, carried here unchanged rather than
+// flattened and re-derived: a `Some(None)` means "the most recent", and collapsing it to
+// `None` on the way in would silently turn that into "no session at all".
+#[allow(clippy::option_option)]
+async fn prepare_tui(
+    args: &Options,
+    session: Option<Option<String>>,
+    scroll: u32,
+    connect: bool,
+    socket: Option<PathBuf>,
+) -> Result<Ready, String> {
     let config = load(args)?;
-    let pending = compose(&config).await.map_err(|error| error.to_string())?;
-    let workspace = compose::workspace_root(&config).map_err(|error| error.to_string())?;
-    Ok(Ready::Tui {
-        pending: Box::new(pending),
-        workspace,
-    })
-}
-
-/// Awaits the session store for reading a recorded session.
-///
-/// No harness is composed and no key is read: a transcript that has already been
-/// written down is just a file.
-async fn prepare_view(id: Option<String>, scroll_back: u32) -> Result<Ready, String> {
-    let store = open_store().await.map_err(|error| error.to_string())?;
-    Ok(Ready::View {
-        store,
-        id,
-        scroll_back,
-    })
-}
-
-/// Mounts a harness and hands the terminal to the interface.
-///
-/// Synchronous, and deliberately so: the half that must not be inside a runtime.
-fn run_tui(pending: compose::Pending, workspace: &Path) -> Result<(), String> {
-    let harness = pending.start().map_err(|error| error.to_string())?;
-    match nanus_tui::runtime::run(&harness, workspace) {
-        // The interface tears the composition down itself when its loop ends, so
-        // shutting it down again here would be doing it twice.
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // A failure can leave the loop before that teardown runs, and the
-            // composition owns reaping whatever tools it started. An orphaned child
-            // process outliving the interface would be a worse outcome than the error
-            // that caused it, so it is reaped here.
-            if let Err(failed) = finish_harness(&harness) {
-                tracing::warn!(%failed, "the composition did not shut down cleanly");
-            }
-            Err(error.to_string())
+    if let Some(id) = session {
+        let mut arguments: Vec<OsString> = vec![OsString::from("--session")];
+        if let Some(id) = id {
+            arguments.push(OsString::from(id));
         }
+        if scroll > 0 {
+            // Omitted when zero, because `--scroll 0` is the default and a needless
+            // argument in the interface's own command line is a needless thing to read
+            // in `ps`.
+            arguments.push(OsString::from("--scroll"));
+            arguments.push(OsString::from(scroll.to_string()));
+        }
+        return Ok(Ready::Spawn { arguments });
+    }
+    if !connect {
+        let pending = compose(&config).await.map_err(|error| error.to_string())?;
+        let workspace = compose::workspace_root(&config).map_err(|error| error.to_string())?;
+        return Ok(Ready::Tui {
+            pending: Box::new(pending),
+            workspace,
+        });
+    }
+    // Connecting to a service needs no composition here: the agent is already running,
+    // and this process is only going to hand its socket to the interface.
+    let socket = crate::service::socket_path(&config, socket.as_deref())?;
+    // Asked before the interface starts, so the answer is a sentence naming the fix rather
+    // than an empty screen, and so no terminal is taken for an interface that would have
+    // nothing to talk to.
+    if let Err(error) = nanus_link::Client::connect(&socket).await {
+        return Err(format!("{error}\nstart one with `nanus service start`"));
+    }
+    Ok(Ready::Spawn {
+        arguments: vec![OsString::from("--link"), OsString::from(socket.as_os_str())],
+    })
+}
+
+/// Decides what the service subcommand should do.
+async fn prepare_service(args: &Options, action: ServiceAction) -> Result<Ready, String> {
+    let config = load(args)?;
+    match action {
+        ServiceAction::Start {
+            foreground,
+            detached,
+            socket,
+            log,
+        } => {
+            let options = crate::service::Options {
+                foreground,
+                detached,
+                socket,
+                log,
+                config_file: args.config.clone(),
+            };
+            match crate::service::start(&config, &options).await? {
+                crate::service::Start::Started { socket } => {
+                    println!("nanus: service listening on {}", socket.display());
+                    Ok(Ready::Done)
+                }
+                crate::service::Start::Serve {
+                    pending,
+                    workspace,
+                    socket,
+                } => Ok(Ready::Serve {
+                    pending,
+                    workspace,
+                    socket,
+                }),
+            }
+        }
+        ServiceAction::Stop { socket } => Ok(Ready::Stop {
+            socket: crate::service::socket_path(&config, socket.as_deref())?,
+        }),
+        ServiceAction::Status { socket } => Ok(Ready::Status {
+            socket: crate::service::socket_path(&config, socket.as_deref())?,
+        }),
     }
 }
 
@@ -414,8 +569,26 @@ fn show_config(args: &Options) -> Result<(), String> {
     println!("max steps per turn: {}", config.max_steps_per_turn);
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("workspace root: {}", workspace_display(&config));
+    // Resolved rather than echoed: the socket is a path a user will paste into a command
+    // or a supervisor, and a default spelled `<the nanus home>/…` is not one.
+    println!(
+        "service socket: {}",
+        resolved(&crate::service::socket_path(&config, None))
+    );
+    println!(
+        "service log: {}",
+        resolved(&crate::service::log_path(&config, None))
+    );
     println!("api key: {key}");
     Ok(())
+}
+
+/// Renders a resolved path, or names the home when it cannot be resolved.
+fn resolved(path: &Result<PathBuf, String>) -> String {
+    path.as_ref().map_or_else(
+        |_| String::from("<the nanus home> is unavailable"),
+        |path| path.display().to_string(),
+    )
 }
 
 /// Renders the configured workspace root, or the default.
@@ -503,31 +676,49 @@ mod tests {
         assert!(args.command.is_none());
     }
 
+    /// Extracts the `tui` subcommand.
+    fn tui(argv: &[&str]) -> Command {
+        let parsed = Args::try_parse_from(argv);
+        assert!(parsed.is_ok(), "{argv:?} should parse: {parsed:?}");
+        let Ok(parsed) = parsed else {
+            panic!("checked above");
+        };
+        let Some(command) = parsed.command else {
+            panic!("expected a command");
+        };
+        command
+    }
+
+    #[test]
+    fn ui_is_an_alias_for_tui() {
+        // The interface is the thing most people want, and both spellings mean it.
+        let by_alias = tui(&["nanus", "ui"]);
+        let by_name = tui(&["nanus", "tui"]);
+        assert!(matches!(by_alias, Command::Tui { .. }));
+        assert!(matches!(by_name, Command::Tui { .. }));
+    }
+
     #[test]
     fn the_tui_takes_an_optional_session_id() {
-        let Ok(live) = Args::try_parse_from(["nanus", "tui"]) else {
-            panic!("a bare `tui` should parse");
-        };
-        let Some(Command::Tui { session, scroll }) = live.command else {
+        let Some(Command::Tui {
+            session, scroll, ..
+        }) = Some(tui(&["nanus", "tui"]))
+        else {
             panic!("expected the tui command");
         };
         assert_eq!(session, None, "no --session means a live conversation");
         assert_eq!(scroll, 0);
 
-        let Ok(recent) = Args::try_parse_from(["nanus", "tui", "--session"]) else {
-            panic!("--session without an id should parse");
-        };
-        let Some(Command::Tui { session, .. }) = recent.command else {
+        let Some(Command::Tui { session, .. }) = Some(tui(&["nanus", "tui", "--session"])) else {
             panic!("expected the tui command");
         };
         // The outer `Some` is the flag having been given; the inner one is the id,
         // which is absent and therefore means "the most recent session".
         assert_eq!(session, Some(None));
 
-        let Ok(named) = Args::try_parse_from(["nanus", "tui", "--session", "01a09558"]) else {
-            panic!("--session with an id should parse");
-        };
-        let Some(Command::Tui { session, .. }) = named.command else {
+        let Some(Command::Tui { session, .. }) =
+            Some(tui(&["nanus", "tui", "--session", "01a09558"]))
+        else {
             panic!("expected the tui command");
         };
         assert_eq!(session, Some(Some(String::from("01a09558"))));
@@ -537,10 +728,10 @@ mod tests {
     fn a_flag_following_an_optional_value_is_not_swallowed_by_it() {
         // `--session --scroll 50` is the documented way to open the most recent session
         // part way back, and reading `--scroll` as the session id would break it.
-        let Ok(args) = Args::try_parse_from(["nanus", "tui", "--session", "--scroll", "50"]) else {
-            panic!("--session followed by --scroll should parse");
-        };
-        let Some(Command::Tui { session, scroll }) = args.command else {
+        let Some(Command::Tui {
+            session, scroll, ..
+        }) = Some(tui(&["nanus", "tui", "--session", "--scroll", "50"]))
+        else {
             panic!("expected the tui command");
         };
         assert_eq!(session, Some(None));
@@ -548,9 +739,71 @@ mod tests {
     }
 
     #[test]
+    fn connecting_to_a_service_and_reading_a_session_are_mutually_exclusive() {
+        // They are different modes, not two settings: one talks to an agent and the
+        // other deliberately has none.
+        assert!(Args::try_parse_from(["nanus", "tui", "--connect", "--session"]).is_err());
+        assert!(Args::try_parse_from(["nanus", "tui", "--connect"]).is_ok());
+    }
+
+    #[test]
+    fn a_socket_is_only_meaningful_when_connecting() {
+        // `nanus tui` binds its own socket for the agent it starts, so a `--socket`
+        // without `--connect` is a request that cannot be honoured. Refusing it is
+        // better than ignoring it.
+        assert!(Args::try_parse_from(["nanus", "tui", "--socket", "/tmp/s"]).is_err());
+        let connected = Args::try_parse_from(["nanus", "tui", "--connect", "--socket", "/tmp/s"]);
+        assert!(connected.is_ok(), "{connected:?}");
+        let Ok(connected) = connected else { return };
+        let Some(Command::Tui {
+            socket, connect, ..
+        }) = connected.command
+        else {
+            panic!("expected the tui command");
+        };
+        assert!(connect);
+        assert_eq!(socket, Some(PathBuf::from("/tmp/s")));
+    }
+
+    #[test]
+    fn the_service_takes_a_start_stop_and_status() {
+        let started = Args::try_parse_from(["nanus", "service", "start", "--foreground"]);
+        assert!(started.is_ok(), "{started:?}");
+        let Ok(started) = started else { return };
+        let Some(Command::Service {
+            action: ServiceAction::Start { foreground, .. },
+        }) = started.command
+        else {
+            panic!("expected a service start");
+        };
+        assert!(foreground);
+
+        assert!(Args::try_parse_from(["nanus", "service", "stop"]).is_ok());
+        assert!(Args::try_parse_from(["nanus", "service", "status", "--socket", "/tmp/s"]).is_ok());
+    }
+
+    #[test]
+    fn a_service_with_no_action_is_a_usage_error() {
+        // `nanus service` on its own would otherwise have to guess, and guessing between
+        // "start" and "status" is how a typo becomes a running daemon.
+        assert!(Args::try_parse_from(["nanus", "service"]).is_err());
+    }
+
+    #[test]
+    fn the_hidden_detach_flag_is_accepted_but_not_advertised() {
+        // The parent passes it; a person reading the help should not be invited to.
+        assert!(Args::try_parse_from(["nanus", "service", "start", "--detached"]).is_ok());
+        assert!(
+            !help_text().contains("--detached"),
+            "the internal flag is hidden:\n{}",
+            help_text()
+        );
+    }
+
+    #[test]
     fn the_usage_text_advertises_every_mode() {
         let help = help_text();
-        for mode in ["run", "tui", "config", "sessions"] {
+        for mode in ["run", "tui", "ui", "service", "config", "sessions"] {
             assert!(help.contains(mode), "the help omits {mode}:\n{help}");
         }
         // The default is the surprising part, so it has to be stated rather than left
@@ -590,5 +843,17 @@ mod tests {
     fn the_workspace_display_names_the_default_rather_than_showing_nothing() {
         let config = NanusConfig::default();
         assert!(workspace_display(&config).contains("current directory"));
+    }
+
+    #[test]
+    fn a_resolved_path_is_shown_and_an_unresolvable_one_is_named() {
+        // The configuration prints paths a user will paste into a command, so a default
+        // has to be shown resolved rather than as a placeholder, and a failure to resolve
+        // has to say so rather than print nothing.
+        assert_eq!(
+            resolved(&Ok(PathBuf::from("/tmp/agent.sock"))),
+            "/tmp/agent.sock"
+        );
+        assert!(resolved(&Err(String::from("no home"))).contains("nanus home"));
     }
 }

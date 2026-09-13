@@ -11,10 +11,10 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.0s] 560 tests run: 560 passed, 0 skipped
+Summary [3.4s] 605 tests run: 605 passed, 0 skipped
 
 $ cargo test --workspace --doc
-9 doctests passed
+10 doctests passed
 ```
 
 ## The tests that matter most
@@ -34,15 +34,26 @@ tool-call reassembly is exercised over a real connection with a real HTTP client
 than against a mock stream. It covers a tool call split across three frames, a response
 truncated mid-frame, and the request carrying all seven schemas.
 
+**The link, over real sockets.**
+[`crates/nanus-link/tests/link.rs`](../crates/nanus-link/tests/link.rs) binds real sockets
+in a temporary directory and drives a **scripted** model through a whole turn: the
+handshake, a streamed answer, the ending, and the session on disk — plus the parts most
+likely to be wrong and least likely to be covered by a unit test, which are the negatives.
+Two connections get two sessions. A `status` request changes nothing. A `shutdown` request
+stops a server that has no other stop condition, which is the test that would hang rather
+than fail if the protocol were ignored. A socket left by a dead process is replaced, its
+permissions are the owner's alone, and connecting to one nobody serves names the path
+rather than reporting a syscall.
+
 **The live path.** The harness has been run against the real DeepSeek API and the
 resulting session log inspected: a four-step turn with tool calls, results fed back, and
 per-step token accounting.
 
-## Six bugs found by verification rather than by reasoning
+## The bugs verification found
 
-All six were found *because* the thing was exercised rather than read, and all six are now
-pinned by tests. They are recorded because a project claiming rigour should show what
-rigour caught.
+All of them were found *because* the thing was exercised rather than read, and all of them
+are now pinned by tests. They are recorded because a project claiming rigour should show
+what rigour caught.
 
 **The `[DONE]` sentinel silently dropped every tool call.** The end-of-stream sentinel
 ended the byte-reading loop without closing the accumulator — and the accumulator is what

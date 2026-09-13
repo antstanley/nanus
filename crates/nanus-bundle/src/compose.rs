@@ -79,11 +79,7 @@ impl Harness {
     /// Starts a new session.
     #[must_use]
     pub fn new_session(&self, workspace: &std::path::Path) -> Session {
-        Session::new(
-            nanus_adapter_store::new_session_id(),
-            self.clock.now_ms(),
-            workspace.display().to_string(),
-        )
+        new_session(&self.clock, workspace)
     }
 
     /// Tears the composition down, reverting every plugin's effects.
@@ -230,6 +226,22 @@ pub async fn open_store() -> Result<StoreHandle, BundleError> {
         .await
         .map_err(|error| BundleError::session(error.to_string()))?;
     Ok(store.handle())
+}
+
+/// Starts a session against `workspace`: a fresh id, the current time, and where it
+/// belongs.
+///
+/// A free function rather than only a method on [`Harness`], because the three facts it
+/// needs are not the harness's alone. An agent served over a link starts sessions too,
+/// and it must start them the same way: a transcript that depended on which door a
+/// session came through would not be a transcript of the agent.
+#[must_use]
+pub fn new_session(clock: &ClockHandle, workspace: &std::path::Path) -> Session {
+    Session::new(
+        nanus_adapter_store::new_session_id(),
+        clock.now_ms(),
+        workspace.display().to_string(),
+    )
 }
 
 /// Returns the workspace root a run is confined to.

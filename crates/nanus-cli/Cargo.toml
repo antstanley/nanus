@@ -1,6 +1,6 @@
 [package]
 name = "nanus-cli"
-description = "The headless nanus entry point: run one task, print the answer, exit."
+description = "The nanus core binary: run one task, serve a long-running agent, or start the interface."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,15 +17,18 @@ path = "src/main.rs"
 
 [dependencies]
 nanus-bundle = { workspace = true }
-# The interface is a library the entry point drives, not a second program. Two
-# binaries would mean two argument parsers, two ways to load a configuration, and two
-# answers to which workspace a session belongs to.
-nanus-tui = { workspace = true, features = ["runtime"] }
+# The interface is a separate program, so this binary reaches it through the local link
+# and by running it — never by linking it. That is what keeps the core small enough to
+# read, and what lets the interface grow without the thing a script runs growing with it.
+nanus-link = { workspace = true, features = ["server"] }
 nanus-kernel = { workspace = true }
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }
 nanus-adapter-config = { workspace = true }
 nanus-adapter-deepseek = { workspace = true }
+# `setsid`, so a detached service survives the shell that started it. A safe wrapper
+# rather than a raw syscall, because the workspace forbids `unsafe` everywhere.
+nix = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

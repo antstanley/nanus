@@ -60,6 +60,30 @@ local decision, and it means what it says.
 - Session transcripts are stored under `$NANUS_HOME/sessions/`. A transcript
   contains everything the model saw and produced, including any secret it read.
 
+## The agent's socket
+
+An agent serving an interface — or a service — listens on a Unix domain socket under
+`$NANUS_HOME/run/`. The socket is created `0600` inside a `0700` directory, so only
+your user can connect to it, and it is a local socket: nothing listens on an address
+and no packet reaches a network interface.
+
+The trust boundary is *processes running as you*, and it is worth being precise about
+what that means. A program that can connect to the socket can send a prompt to an
+agent that reads and writes files and runs programs with your permissions. Such a
+program could already do all of those things itself — it runs as you — so the socket
+grants it no new capability. What it does grant is *plausible deniability*: work done
+through the socket is recorded in the session log under a session the agent created,
+not under the caller's name. Treat the log as the record of what was asked, and
+remember that anything running as you could have added to it.
+
+Two consequences worth stating plainly:
+
+- **A service is reachable by anything running as you, for as long as it runs.** Stop
+  it when you are done, or run it under a supervisor that does.
+- **Nothing about a service is remote.** There is no port, no TLS, and no
+  authentication, because there is no remote mode to secure. Do not add one by
+  forwarding the socket.
+
 ## Prompt injection
 
 A harness that reads files and fetches content will eventually read text written by

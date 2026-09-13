@@ -1,9 +1,9 @@
 # The interface
 
-One binary, one harness. `nanus run` is the headless path you script, and `nanus tui` is
-the interface you sit in front of. Neither is a wrapper around the other: both compose the
-same plugin tree, load the same configuration, and drive the same agent loop, so a tool
-that works in one works in the other.
+The interface is its own program. `nanus tui` starts an agent for the shell it was run
+in and then runs `nanus-tui` against it; `nanus-tui` on its own connects to whatever
+`nanus service` is running. Either way the interface is a client, and the agent can be a
+process beside it or one that has been up since boot.
 
 ![nanus tui showing a recorded conversation](images/tui-session.png)
 
@@ -12,32 +12,76 @@ conversation is a recorded session, which is why it can be shown without a key.*
 
 ## Starting it
 
-There is nothing to enable: a plain release build has the interface in it.
-
 ```sh
-cargo build --release
+cargo build --release          # builds both binaries
 
 # Talk to a model in the current directory.
 export DEEPSEEK_API_KEY=...
 ./target/release/nanus
 ```
 
-A bare `nanus` **is** the interface when there is a terminal, which is the whole point of
-one binary: the thing you type to get help and the thing you type to get a prompt are the
-same word. `nanus tui` is the explicit spelling, for when you want to be sure or when the
-default would be ambiguous.
+A bare `nanus` **is** `nanus tui` when there is a terminal. `nanus tui` and `nanus ui` are
+the explicit spellings, for when you want to be sure or when the default would be
+ambiguous.
 
-It needs `DEEPSEEK_API_KEY`, because it composes a harness on start.
+That command composes an agent, binds a socket only your user can reach, and runs the
+interface as a child process with the terminal inherited. When the interface exits, the
+agent is torn down and the socket removed — so an agent started this way lives exactly as
+long as the interface does, and a tool it started never outlives the screen it was
+started from.
 
 Without a terminal — piped, redirected, in a script — a bare `nanus` prints its usage
 instead. It does not try to draw on something that is not a screen, and it does not fail:
 nothing was asked for, and it answered.
 
-### Or read a conversation you already had
+## Where the agent is
 
-The useful part: reading a transcript needs no credential at all, because it is already
-written down. Every run persists its session, so the interface doubles as a browser for
-them.
+| Command | The agent |
+|---|---|
+| `nanus` / `nanus tui` | Started by `nanus`, for this shell. Exits with the interface. |
+| `nanus tui --connect` | Already running: whatever `nanus service` started. |
+| `nanus-tui` (bare) | The same service socket as `--connect`. |
+| `nanus-tui --link PATH` | Whatever is listening at `PATH`, which is how `nanus tui` hands one over. |
+| `nanus tui --session` | None. A recording is a file, and reading it needs no agent. |
+
+The two binaries are installed together and the core looks for the interface *beside
+itself*, never on `PATH`: a `PATH` lookup would happily run one version's interface
+against another version's protocol. `NANUS_TUI` overrides the path for a build layout
+neither can predict.
+
+## The link
+
+A Unix domain socket in `<nanus home>/run/`. One frame per line of JSON, both directions.
+
+It is a socket rather than shared memory because **there is no safe in-process channel
+between two processes**: sharing memory across a `fork` needs `mmap` and `unsafe`, and
+this workspace forbids `unsafe` everywhere. The socket is the local equivalent — the
+kernel copies bytes between two file descriptors and no packet reaches a network
+interface. There is no port and nothing listening on an address, the run directory is
+`0700` and the socket `0600`, and the reachable set is therefore "processes already
+running as you", which can read the workspace and the session log anyway.
+
+The protocol is deliberately tiny: a client sends a prompt, a status request, or a
+shutdown, and the agent answers with the handshake and then with the same progress
+callbacks the agent loop already reports — text, reasoning, a step boundary, a tool
+starting and finishing, usage, and the ending. Nothing an interface *might* want is in
+it; anything else an interface needs about a conversation, the session log already holds.
+
+**A connection is a conversation.** The agent creates a session when a client connects
+and records it as the turn completes, so multi-turn work is a matter of sending another
+prompt on the same connection, and an interface that reconnects gets a new session
+because it asked for one. That is also what makes the lifetimes work: the agent for a
+shell is the agent on one connection, and when the connection closes there is nobody left
+to serve.
+
+**The session is recorded before the ending is sent.** A client that has seen the answer
+is holding one whose transcript is already on disk, which is the same contract `nanus run`
+keeps with its own stdout.
+
+## Or read a conversation you already had
+
+Reading a transcript needs no credential at all, because it is already written down.
+Every run persists its session, so the interface doubles as a browser for them.
 
 ```sh
 nanus sessions                    # list what is available
@@ -54,7 +98,7 @@ count in lines would put the end of a long conversation out of reach.
 
 In a recorded session the composer still works, and submitting tells you to start `nanus`
 without `--session` rather than silently discarding what you typed. Adding a turn to a
-finished transcript would need a model this mode deliberately does not have.
+finished transcript would need an agent this mode deliberately does not have.
 
 A recording also opens with a header naming the session — title, directory, event count —
 because a reader who was not there needs to know what they are looking at. A live
@@ -118,6 +162,9 @@ asserted against ratatui's `TestBackend` in a headless test — including that e
 colour actually reaches the rendered cells, which is not something reading the theme would
 reveal.
 
-Raw-mode input and the alternate screen need a real terminal, so those are exercised by
-hand rather than in CI. That is the honest limit, and it is why the logic lives in the view
-layer instead of the loop.
+The link is tested the same way, with a real socket in a temporary directory and a scripted
+model on the other end: a prompt, a streamed answer, a session on disk, a status reply, a
+shutdown request, and the negatives — a socket nobody is listening on, a stale socket file,
+a peer that says something that is not a frame. What no automated test can do is *take a
+terminal*, so raw-mode input and the alternate screen are exercised by hand. That is the
+honest limit, and it is why the logic lives in the view layer instead of the loop.

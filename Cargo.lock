@@ -1559,8 +1559,9 @@ dependencies = [
  "nanus-bundle",
  "nanus-domain",
  "nanus-kernel",
+ "nanus-link",
  "nanus-ports",
- "nanus-tui",
+ "nix 0.31.3",
  "proptest",
  "serde_json",
  "thiserror 2.0.20",
@@ -1595,6 +1596,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanus-link"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "nanus-adapter-local",
+ "nanus-adapter-store",
+ "nanus-bundle",
+ "nanus-domain",
+ "nanus-kernel",
+ "nanus-ports",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nanus-ports"
 version = "0.1.0"
 dependencies = [
@@ -1612,12 +1632,13 @@ dependencies = [
 name = "nanus-tui"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "crossterm",
  "futures",
- "nanus-adapter-config",
- "nanus-bundle",
+ "nanus-adapter-store",
  "nanus-domain",
  "nanus-kernel",
+ "nanus-link",
  "nanus-ports",
  "proptest",
  "ratatui",

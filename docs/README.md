@@ -5,11 +5,21 @@ run it. Everything below is the detail behind that pitch.
 
 ## [The interface](tui.md)
 
-Starting the interface, browsing a recorded session without an API key, the key bindings,
-and the rendering choices — dimmed reasoning, paired tool calls, summarised output.
-Includes a captured screenshot.
+Starting the interface, how it reaches an agent, browsing a recorded session without an
+API key, the key bindings, and the rendering choices — dimmed reasoning, paired tool
+calls, summarised output. Includes a captured screenshot, and the frame vocabulary and
+trust boundary of the local link.
 
 Start here if you want to see it working.
+
+## [The service](service.md)
+
+An agent that outlives the shell: starting it detached or under a supervisor, stopping it
+without a signal, the socket and log it uses, and what a second service on one machine
+looks like. Also the limits — a service is local, Unix-only, and trusts the user it runs
+as.
+
+Start here if you want an agent that is still there tomorrow.
 
 ## [Design decisions](design.md)
 
@@ -23,15 +33,17 @@ Start here if you are deciding whether to use this.
 
 ## [Architecture](architecture.md)
 
-The crate graph, the inward-pointing dependency rule, what each crate owns, and how the
-kernel's two halves — revertible effects and reactive coeffects — fit together.
+The crate graph, the inward-pointing dependency rule, what each crate owns, why the
+interface is a separate program rather than a library, and how the kernel's two halves —
+revertible effects and reactive coeffects — fit together.
 
 Start here if you are going to read or change the code.
 
 ## [Testing and verification](testing.md)
 
-The four quality gates and their current output, the two tests that matter most, and an
-honest account of the six bugs that verification found rather than reasoning.
+The four quality gates and their current output, the tests that matter most — including
+the link driven over real sockets — and an honest account of the bugs that verification
+found rather than reasoning.
 
 Start here if you want to know whether any of this is true.
 

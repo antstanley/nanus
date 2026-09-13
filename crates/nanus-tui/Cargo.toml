@@ -1,6 +1,6 @@
 [package]
 name = "nanus-tui"
-description = "The interactive terminal interface for nanus: a ratatui chat view over an agent session."
+description = "The interactive terminal interface for nanus: a ratatui chat view over an agent reached through the local link."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,31 +11,40 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[[bin]]
+name = "nanus-tui"
+path = "src/main.rs"
+# The program is the runtime half plus the view, so it needs the feature that pulls in
+# the terminal, the link, and the session store.
+required-features = ["runtime"]
+
 [features]
-# The view layer builds and tests without the agent runtime, so a contributor can
-# work on the interface without a working composition behind it. Leaving the feature
-# off keeps the view layer free of tokio and of the adapter crates; the `nanus`
-# binary switches it on, because an interface nobody can reach is not an interface.
-default = []
-# The interactive loop needs a terminal and a harness; the view layer needs neither.
+# The interface is a program now, so the runtime is on by default: `cargo build` has to
+# produce something a person can run. Leaving it off still builds the view layer alone,
+# with no tokio, no link, and no store — which is what a contributor changing the
+# rendering wants, and what keeps the view testable without an agent anywhere near it.
+default = ["runtime"]
+# The interactive loop: a terminal, a link to an agent, and the session store.
 runtime = [
-    "dep:nanus-adapter-config",
+    "dep:clap",
+    "dep:futures",
+    "dep:nanus-adapter-store",
     "dep:nanus-kernel",
-    "dep:nanus-bundle",
+    "dep:nanus-link",
     "dep:nanus-ports",
     "dep:tokio",
-    "dep:futures",
 ]
 
 [dependencies]
-nanus-adapter-config = { workspace = true, optional = true }
+nanus-adapter-store = { workspace = true, optional = true }
 nanus-kernel = { workspace = true, optional = true }
-nanus-bundle = { workspace = true, optional = true }
-nanus-domain = { workspace = true }
+nanus-link = { workspace = true, optional = true }
 nanus-ports = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+nanus-domain = { workspace = true }
 ratatui = { workspace = true }
 # Only for `StreamExt`, which turns crossterm's `EventStream` into something that can be
-# awaited alongside the turn's progress. The rest of the crate needs nothing from it.
+# awaited alongside the agent's frames. The rest of the crate needs nothing from it.
 futures = { workspace = true, optional = true }
 crossterm = { workspace = true }
 serde_json = { workspace = true }

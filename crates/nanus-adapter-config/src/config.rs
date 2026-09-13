@@ -127,6 +127,17 @@ pub struct NanusConfig {
     pub system_prompt: Option<String>,
     /// An override for the workspace root the tools are confined to.
     pub workspace_root: Option<PathBuf>,
+    /// The socket a `nanus service` listens on.
+    ///
+    /// Defaults to `<nanus home>/run/agent.sock`, which is also the path a client
+    /// computes, so a service and the interface that talks to it never have to exchange
+    /// it. Setting it is for running two services on one machine.
+    pub service_socket: Option<PathBuf>,
+    /// Where a detached `nanus service` writes its output.
+    ///
+    /// A detached process has no terminal, so without this its diagnostics go nowhere at
+    /// all. Defaults to `<nanus home>/nanus-service.log`.
+    pub service_log: Option<PathBuf>,
 }
 
 impl Default for NanusConfig {
@@ -142,6 +153,8 @@ impl Default for NanusConfig {
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             system_prompt: None,
             workspace_root: None,
+            service_socket: None,
+            service_log: None,
         }
     }
 }

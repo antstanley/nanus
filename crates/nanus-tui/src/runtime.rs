@@ -1,17 +1,25 @@
-//! The interactive loop: a terminal, the keyboard, and a running harness.
+//! The interactive loop: a terminal, the keyboard, and a link to an agent.
 //!
-//! This module is behind the `runtime` feature because it is the only part of the
-//! crate that needs a terminal and an agent. Everything the interface *shows* lives in
+//! This module is behind the `runtime` feature because it is the only part of the crate
+//! that needs a terminal and an agent. Everything the interface *shows* lives in
 //! [`crate::view`] and is tested against a headless backend; what lives here is the
-//! plumbing that connects it to a real keyboard and a real model.
+//! plumbing that connects it to a real keyboard and a real agent.
+//!
+//! ## The interface does not own the agent
+//!
+//! The interface is a client. It reads an agent's frames and sends it prompts over the
+//! local link, and it has no idea whether the agent on the other end is a process the
+//! `nanus` binary started alongside it or a service that has been running since boot.
+//! That is the whole point of the split: the rich interface and the small core only have
+//! to agree about one page of protocol.
 //!
 //! ## The event loop's shape
 //!
 //! Terminal applications fail in two ways that matter. The first is a panic that
 //! leaves the terminal in raw mode with the alternate screen up, which is why the
 //! terminal is restored in a guard rather than at the end of the function. The second
-//! is blocking on a key while the model is streaming, which is why the keyboard and
-//! the agent are two tasks and the interface redraws on either.
+//! is blocking on a key while the agent is streaming, which is why the keyboard and
+//! the link are two sources and the interface redraws on either.
 //!
 //! ## Keys
 //!
@@ -29,12 +37,12 @@
 use core::future::Future;
 use std::io::{self, IsTerminal};
 use std::path::Path;
-use std::rc::Rc;
 
 use crossterm::event::EventStream;
 use futures::StreamExt as _;
-use nanus_bundle::{AgentRunner, Harness, Progress};
-use nanus_domain::{Session, ToolName, Usage};
+use nanus_domain::{Session, SessionId};
+use nanus_link::Client;
+use nanus_link::protocol::{Frame, Request};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -47,76 +55,8 @@ use crate::view::ViewState;
 /// Rows scrolled per `PageUp` or `PageDown`.
 const PAGE_ROWS: i32 = 10;
 
-/// A message from the agent to the interface.
-#[derive(Debug)]
-enum Update {
-    /// A turn finished, with the answer and how it ended.
-    Done(Result<String, String>),
-    /// The agent produced progress.
-    Event(AgentEvent),
-}
-
-/// One piece of progress from the agent.
-#[derive(Debug)]
-enum AgentEvent {
-    /// Model text arrived.
-    Text(String),
-    /// Model reasoning arrived.
-    Reasoning(String),
-    /// A step began.
-    Step(u32),
-    /// A tool started.
-    Tool(String),
-    /// A tool finished.
-    ToolDone(String, bool),
-    /// Usage was reported.
-    Usage(Usage),
-}
-
-/// Bridges the loop's synchronous [`Progress`] callbacks to an async channel.
-///
-/// The loop runs the agent on the same thread as the interface, so the channel is a
-/// queue rather than a thread boundary. A full queue drops progress rather than
-/// blocking the agent: an interface that cannot keep up must not slow the work down.
-struct ChannelProgress {
-    sender: mpsc::Sender<Update>,
-}
-
-impl Progress for ChannelProgress {
-    fn text(&mut self, delta: &str) {
-        self.send(AgentEvent::Text(delta.to_owned()));
-    }
-
-    fn reasoning(&mut self, delta: &str) {
-        self.send(AgentEvent::Reasoning(delta.to_owned()));
-    }
-
-    fn step_started(&mut self, step: u32) {
-        self.send(AgentEvent::Step(step));
-    }
-
-    fn tool_started(&mut self, name: &ToolName) {
-        self.send(AgentEvent::Tool(name.as_str().to_owned()));
-    }
-
-    fn tool_finished(&mut self, name: &ToolName, is_error: bool) {
-        self.send(AgentEvent::ToolDone(name.as_str().to_owned(), is_error));
-    }
-
-    fn usage(&mut self, usage: &Usage) {
-        self.send(AgentEvent::Usage(*usage));
-    }
-}
-
-impl ChannelProgress {
-    /// Queues one event, dropping it when the interface is behind.
-    fn send(&self, event: AgentEvent) {
-        if self.sender.try_send(Update::Event(event)).is_err() {
-            // Falling behind is a rendering problem, not a work problem.
-            tracing::trace!("the interface is behind; dropping a progress event");
-        }
-    }
-}
+/// How many frames may be queued from the agent before the interface falls behind.
+const FRAME_BUFFER: usize = 256;
 
 /// Restores the terminal when it goes out of scope.
 ///
@@ -149,21 +89,12 @@ impl Drop for TerminalGuard {
 
 /// Where the interface gets its conversation from.
 ///
-/// Two implementations, and the difference is the whole reason this trait exists: a
-/// composed harness can *run* a turn, and a recorded session cannot. Keeping that apart
-/// means browsing a transcript neither needs an API key nor pretends to be able to talk
-/// to a model.
+/// Two implementations, and the difference is the whole reason this trait exists: an
+/// agent can *run* a turn, and a recorded session cannot. Keeping that apart means
+/// browsing a transcript neither needs an agent nor pretends to be able to talk to one.
 pub trait SessionSource {
     /// The session to display.
     fn session(&self) -> &Session;
-
-    /// The runner that can extend it, when there is one.
-    ///
-    /// `None` means the interface is reading rather than driving: a submission is
-    /// refused with an explanation instead of being silently dropped.
-    fn runner(&self) -> Option<&Rc<AgentRunner>> {
-        None
-    }
 
     /// Rows to scroll back from the end when the interface opens.
     ///
@@ -173,6 +104,26 @@ pub trait SessionSource {
     fn initial_scroll(&self) -> u32 {
         0
     }
+
+    /// Whether a prompt can be sent.
+    ///
+    /// `false` means the interface is reading rather than driving: a submission is
+    /// refused with an explanation instead of being silently dropped.
+    fn accepts_prompts(&self) -> bool {
+        false
+    }
+
+    /// Starts whatever background work the source needs, inside the interface's task set.
+    ///
+    /// Called once, after the event loop's own channel exists and before the first frame
+    /// is drawn. A source with nothing to start does nothing, which is why this has a
+    /// default. It takes `&mut self` because starting the work means *handing over* the
+    /// connection: the transport belongs to a task from here on, not to the source.
+    fn attach(&mut self, _frames: &mpsc::Sender<Frame>) {}
+
+    /// Sends one prompt. Progress arrives on the channel [`SessionSource::attach`] was
+    /// given.
+    fn submit(&mut self, _prompt: String) {}
 
     /// Releases whatever the source owns.
     ///
@@ -187,8 +138,8 @@ pub trait SessionSource {
 
 /// Opens a recorded session for reading.
 ///
-/// With no id, the most recent session is opened, which is what a bare
-/// `nanus tui --session` means.
+/// With no id, the most recent session is opened, which is what `nanus tui --session`
+/// means.
 ///
 /// # Errors
 ///
@@ -200,11 +151,11 @@ pub fn view(
     id: Option<&str>,
     scroll_back: u32,
 ) -> Result<(), String> {
-    let store = Rc::clone(store);
+    let store = std::rc::Rc::clone(store);
     let requested = id.map(str::to_owned);
     let session = block_on(async move {
         let chosen = match requested {
-            Some(raw) => Some(nanus_domain::SessionId::new(raw)),
+            Some(raw) => Some(SessionId::new(raw)),
             None => store
                 .list()
                 .await
@@ -218,17 +169,14 @@ pub fn view(
         };
         store.load(&id).await.map_err(|error| error.to_string())
     })?;
-    let recording = Recording {
-        session,
-        scroll_back,
-    };
-    run_source(&recording).map_err(|error| error.to_string())
+    let mut recording = Recording::new(session).scrolled_back(scroll_back);
+    run_source(&mut recording).map_err(|error| error.to_string())
 }
 
 /// Drives a future to completion on the kernel runtime.
 ///
-/// The view path is synchronous and `main` has already entered the runtime, so this is
-/// `block_on` on the same thread rather than a second runtime.
+/// The setup path is synchronous and the process has already entered the runtime, so this
+/// is `block_on` on the same thread rather than a second runtime.
 fn block_on<F: Future>(future: F) -> F::Output {
     nanus_kernel::runtime::block_on(future)
 }
@@ -268,6 +216,125 @@ impl SessionSource for Recording {
     }
 }
 
+/// A live conversation, held by an agent on the other end of the link.
+///
+/// The connection is made once, when the interface starts, and it *is* the conversation:
+/// the agent creates a session for it and every prompt sent over it joins that session.
+/// The interface therefore never names a session — it holds one.
+pub struct Remote {
+    session: Session,
+    client: Option<Client>,
+    requests: mpsc::UnboundedSender<Request>,
+    pending: Option<mpsc::UnboundedReceiver<Request>>,
+}
+
+impl Remote {
+    /// Connects to the agent listening at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when nothing is listening or the peer does not open with a
+    /// handshake. The message is already user-facing, so it is not wrapped again.
+    pub async fn connect(path: &Path) -> Result<Self, String> {
+        let client = Client::connect(path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let info = client.info().clone();
+        // The interface never shows a live session's creation time — a conversation the
+        // reader is in needs no header announcing it — so the timestamp is the epoch and
+        // the recorded path, which does show one, reads it from the store instead.
+        let session = Session::new(SessionId::new(info.session), 0, info.workspace);
+        let (requests, pending) = mpsc::unbounded_channel();
+        Ok(Self {
+            session,
+            client: Some(client),
+            requests,
+            pending: Some(pending),
+        })
+    }
+}
+
+impl SessionSource for Remote {
+    fn session(&self) -> &Session {
+        &self.session
+    }
+
+    fn accepts_prompts(&self) -> bool {
+        true
+    }
+
+    fn attach(&mut self, frames: &mpsc::Sender<Frame>) {
+        let (Some(client), Some(requests)) = (self.client.take(), self.pending.take()) else {
+            // Attaching twice is a caller's mistake, not a reason to take the terminal
+            // down: the interface still works, it just cannot submit.
+            tracing::warn!("the link was attached more than once; prompts will not be sent");
+            return;
+        };
+        let frames = frames.clone();
+        tokio::task::spawn_local(async move { pump(client, requests, frames).await });
+    }
+
+    fn submit(&mut self, prompt: String) {
+        if self
+            .requests
+            .send(Request::Prompt { text: prompt })
+            .is_err()
+        {
+            // The only way this fails is that the transport task is gone, which means the
+            // agent closed the link. Saying so beats a prompt that vanishes.
+            tracing::warn!("the link is closed; the prompt was not sent");
+        }
+    }
+}
+
+/// Moves requests to the agent and frames back, for as long as the connection lasts.
+///
+/// One task rather than a task per prompt, because the connection *is* the conversation:
+/// a second connection would be a second session.
+async fn pump(
+    mut client: Client,
+    mut requests: mpsc::UnboundedReceiver<Request>,
+    frames: mpsc::Sender<Frame>,
+) {
+    while let Some(request) = requests.recv().await {
+        if let Err(error) = client.send(&request).await {
+            report(&frames, error.to_string()).await;
+            return;
+        }
+        if !matches!(request, Request::Prompt { .. }) {
+            continue;
+        }
+        loop {
+            match client.next().await {
+                Ok(Some(frame)) => {
+                    let last = frame.is_end_of_turn();
+                    // A receiver that has gone away means the interface is closing, so
+                    // there is nobody left to tell.
+                    if frames.send(frame).await.is_err() {
+                        return;
+                    }
+                    if last {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    report(&frames, String::from("the agent closed the link")).await;
+                    return;
+                }
+                Err(error) => {
+                    report(&frames, error.to_string()).await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Tells the interface that the conversation ended, when it is still there to hear it.
+async fn report(frames: &mpsc::Sender<Frame>, message: String) {
+    let _ignored = frames.send(Frame::Failed { message }).await;
+}
+
 /// Whether there is a terminal to draw on and a keyboard to read.
 ///
 /// Both ends are checked, because the interface needs both. `is_terminal` rather than a
@@ -280,42 +347,6 @@ impl SessionSource for Recording {
 #[must_use]
 pub fn interactive() -> bool {
     io::stdout().is_terminal() && io::stdin().is_terminal()
-}
-
-/// Runs the interactive interface against `harness`, in `workspace`.
-///
-/// The workspace is passed in rather than read from the current directory, so that the
-/// interface and a headless `nanus run` agree about which directory a session belongs
-/// to when the configuration names one.
-///
-/// # Errors
-///
-/// Returns an error when the terminal cannot be put into raw mode or an event cannot
-/// be read. The terminal is restored either way.
-pub fn run(harness: &Harness, workspace: &Path) -> io::Result<()> {
-    let session = harness.new_session(workspace);
-    let source = Live { harness, session };
-    run_source(&source)
-}
-
-/// A live harness plus the session the interface is driving.
-struct Live<'a> {
-    harness: &'a Harness,
-    session: Session,
-}
-
-impl SessionSource for Live<'_> {
-    fn session(&self) -> &Session {
-        &self.session
-    }
-
-    fn runner(&self) -> Option<&Rc<AgentRunner>> {
-        Some(&self.harness.runner)
-    }
-
-    fn shutdown(&self) -> Result<(), String> {
-        self.harness.shutdown().map_err(|error| error.to_string())
-    }
 }
 
 /// Refuses to take a terminal that is not there.
@@ -342,51 +373,56 @@ fn require_terminal(present: bool) -> io::Result<()> {
 ///
 /// Returns an error when the terminal cannot be put into raw mode or an event cannot be
 /// read. The terminal is restored either way.
-pub fn run_source(source: &dyn SessionSource) -> io::Result<()> {
+pub fn run_source(source: &mut dyn SessionSource) -> io::Result<()> {
     // Checked here as well as by the caller, because this is the function that takes the
     // terminal. A guard in the caller protects the paths that exist today; this protects
     // the ones added later, and it is the last point at which the answer is still an
     // error rather than a panic.
     require_terminal(interactive())?;
-    // The loop runs on the kernel runtime with a local task set, because a submitted
-    // prompt becomes a `!Send` local task: the agent's state is `Rc`-shared and the kernel
-    // is single-threaded, so `tokio::spawn` cannot carry it. `spawn_local` is both legal
-    // and *driven* only inside a local set, and a set that is merely entered never polls
-    // what it spawned — so the set has to own the `block_on`.
-    let outcome = nanus_kernel::runtime::block_on_local(event_loop(source));
-    // Torn down outside the runtime: shutting the composition down drives its own
+    // The loop runs on the kernel runtime with a local task set, because the transport is
+    // a local task: it holds an `Rc`-shared kernel and its futures are not `Send`, so
+    // `tokio::spawn` cannot carry it. `spawn_local` is both legal and *driven* only inside
+    // a local set, and a set that is merely entered never polls what it spawned — so the
+    // set has to own the `block_on`.
+    let outcome = nanus_kernel::runtime::block_on_local(async {
+        let (frames, receiver) = mpsc::channel::<Frame>(FRAME_BUFFER);
+        // Attached inside the task set, so the transport it starts is polled by the same
+        // set that runs the loop.
+        source.attach(&frames);
+        event_loop(source, receiver).await
+    });
+    // Torn down outside the runtime: shutting a composition down drives its own
     // `block_on`, which cannot be nested inside a running one. A shutdown that fails still
     // exits — the terminal has already been restored by the guard, and the run is over.
     if let Err(error) = source.shutdown() {
-        tracing::warn!(%error, "the composition did not shut down cleanly");
+        tracing::warn!(%error, "the source did not shut down cleanly");
     }
     outcome
 }
 
-/// The event loop: draw, then wait for a keystroke or for the turn to make progress.
+/// The event loop: draw, then wait for a keystroke or for the agent to say something.
 ///
-/// Asynchronous rather than a blocking poll for input, and that is the whole point. A
-/// turn runs as a local task on this same thread, so waiting synchronously for a key — or
-/// sleeping for a redraw tick — would stop the model's stream from being polled at all.
-/// The interface would show a frozen turn and then deliver the entire answer at once,
-/// which is exactly the freeze the local task exists to prevent.
-async fn event_loop(source: &dyn SessionSource) -> io::Result<()> {
+/// Asynchronous rather than a blocking poll for input, and that is the whole point. The
+/// link is a local task on this same thread, so waiting synchronously for a key — or
+/// sleeping for a redraw tick — would stop the agent's frames from being read at all. The
+/// interface would show a frozen turn and then deliver the entire answer at once, which
+/// is exactly the freeze the local task exists to prevent.
+async fn event_loop(
+    source: &mut dyn SessionSource,
+    mut frames: mpsc::Receiver<Frame>,
+) -> io::Result<()> {
     let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
     // The transcript comes from the session itself, so a recorded one looks exactly like
     // the live conversation it was: same event log, same rendering. The one difference is
     // the header, which belongs to a recording and to nothing else.
-    let viewing_only = source.runner().is_none();
+    let viewing_only = !source.accepts_prompts();
     view.transcript = if viewing_only {
         crate::replay::recording_of(source.session())
     } else {
         crate::replay::transcript_of(source.session())
     };
     view.tokens_used = u64::from(source.session().usage_totals().total_tokens());
-    // A conversation opens at its end, where the answer is. The viewport has to be
-    // recorded first, because "the bottom" depends on how many rows exist and how many
-    // the terminal shows — without this the offset stays zero and the reader is left at
-    // the beginning of the conversation.
     // Opening at the end, or part way back from it: the offset is applied on the first
     // render, when the viewport it is measured against is known.
     view.pending_scroll_back = Some(source.initial_scroll());
@@ -394,15 +430,13 @@ async fn event_loop(source: &dyn SessionSource) -> io::Result<()> {
         view.status = String::from("viewing a recorded session · Ctrl-C quits");
     }
 
-    let (sender, mut receiver) = mpsc::channel::<Update>(256);
-    let runner: Option<Rc<AgentRunner>> = source.runner().map(Rc::clone);
     let mut events = EventStream::new();
 
     loop {
         guard.terminal().draw(|frame| view.render(frame))?;
         // Redrawn after every wake-up rather than on a timer: the interface has no
-        // animation, so every reason to redraw is either a keystroke or progress from the
-        // turn, and both arrive here. A tick would only add idle wake-ups.
+        // animation, so every reason to redraw is either a keystroke or a frame from the
+        // agent, and both arrive here. A tick would only add idle wake-ups.
         tokio::select! {
             event = events.next() => {
                 let Some(event) = event else {
@@ -420,8 +454,8 @@ async fn event_loop(source: &dyn SessionSource) -> io::Result<()> {
                 match handle_key(key, &mut view) {
                     Outcome::Quit => break,
                     Outcome::Submit(prompt) => {
-                        let Some(runner) = runner.as_ref() else {
-                            // Submitting in a recorded session would need a model this
+                        if !source.accepts_prompts() {
+                            // Submitting in a recorded session would need an agent this
                             // interface does not have. Saying so beats silently discarding
                             // what the user typed.
                             view.transcript.push(Entry::notice(
@@ -429,28 +463,28 @@ async fn event_loop(source: &dyn SessionSource) -> io::Result<()> {
                             ));
                             view.scroll_to_bottom();
                             continue;
-                        };
+                        }
                         // The transcript is seeded here, where the mutable view lives.
                         view.transcript
                             .push(Entry::prose(Role::User, prompt.clone()));
                         view.begin_turn(1);
                         view.scroll_to_bottom();
-                        spawn_turn(runner, source.session(), prompt, &sender);
+                        source.submit(prompt);
                     }
                     Outcome::Continue => {}
                 }
             }
-            update = receiver.recv() => {
-                // The sender is cloned into every turn and lives in this scope, so it
-                // cannot be dropped while the loop runs.
-                let Some(update) = update else {
+            frame = frames.recv() => {
+                // The sender is cloned into the transport task and lives as long as it
+                // does, so a closed channel means the transport ended; the loop keeps
+                // drawing, because a reader may still be scrolling.
+                let Some(frame) = frame else {
                     continue;
                 };
-                apply(update, &mut view);
-                // Progress arrives in bursts — one message per streamed fragment — and
-                // each redraw costs a full frame, so the queue is emptied before the next
-                // one.
-                drain_updates(&mut receiver, &mut view);
+                apply(frame, &mut view);
+                // Frames arrive in bursts — one per streamed fragment — and each redraw
+                // costs a full frame, so the queue is emptied before the next one.
+                drain_frames(&mut frames, &mut view);
             }
         }
     }
@@ -546,86 +580,109 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     }
 }
 
-/// Starts a turn and streams its progress into the view.
-///
-/// The turn runs as a local task so the interface keeps responding: a model that takes
-/// thirty seconds must not freeze the keyboard.
-fn spawn_turn(
-    runner: &Rc<AgentRunner>,
-    session: &Session,
-    prompt: String,
-    sender: &mpsc::Sender<Update>,
-) {
-    let runner = Rc::clone(runner);
-    let mut session = session.clone();
-    let sender = sender.clone();
-    tokio::task::spawn_local(async move {
-        let mut progress = ChannelProgress {
-            sender: sender.clone(),
-        };
-        let outcome = runner.run_turn(&mut session, &prompt, &mut progress).await;
-        let message = match outcome {
-            Ok(result) => Ok(result.answer),
-            Err(error) => Err(error.to_string()),
-        };
-        // A receiver that has gone away means the interface is closing, so the failure
-        // is not worth reporting.
-        let _ignored = sender.send(Update::Done(message)).await;
-    });
-}
-
-/// Applies one update to the view.
-fn apply(update: Update, view: &mut ViewState) {
-    match update {
-        Update::Done(Ok(answer)) => {
-            view.transcript.push(Entry::prose(Role::Assistant, answer));
-            view.end_turn();
-            view.scroll_to_bottom();
-        }
-        Update::Done(Err(message)) => {
-            view.transcript.push(Entry::notice(message));
-            view.end_turn();
-        }
-        Update::Event(AgentEvent::Text(delta)) => {
+/// Applies one frame from the agent to the view.
+fn apply(frame: Frame, view: &mut ViewState) {
+    match frame {
+        Frame::Text { delta } => {
             view.transcript
                 .append_stream(Role::Assistant, &delta, false);
             view.scroll_to_bottom();
         }
-        Update::Event(AgentEvent::Reasoning(delta)) => {
+        Frame::Reasoning { delta } => {
             view.transcript
                 .append_stream(Role::Reasoning, &delta, false);
             view.scroll_to_bottom();
         }
-        Update::Event(AgentEvent::Step(step)) => view.begin_turn(step),
-        Update::Event(AgentEvent::Tool(name)) => {
+        Frame::Step { step } => view.begin_turn(step),
+        Frame::Tool { name } => {
             view.transcript.push(Entry::tool_call(name, ""));
         }
-        Update::Event(AgentEvent::ToolDone(name, is_error)) => {
+        Frame::ToolDone { name, error } => {
             view.transcript
-                .push(Entry::tool_result(name, is_error, "done"));
+                .push(Entry::tool_result(name, error, "done"));
         }
-        Update::Event(AgentEvent::Usage(usage)) => {
-            view.add_tokens(usage.total_tokens());
+        Frame::Usage { tokens } => view.add_tokens(tokens),
+        Frame::Done { answer } => {
+            view.transcript.push(Entry::prose(Role::Assistant, answer));
+            view.end_turn();
+            view.scroll_to_bottom();
         }
+        Frame::Failed { message } => {
+            view.transcript.push(Entry::notice(message));
+            view.end_turn();
+        }
+        // Frames that describe the connection rather than the conversation. The interface
+        // learned what it needed from the handshake before it drew anything, and a `Bye`
+        // is the transport's business, not the transcript's.
+        Frame::Ready(_) | Frame::Status(_) | Frame::Bye => {}
     }
 }
 
-/// Applies every already-queued update to the view, without waiting.
-fn drain_updates(receiver: &mut mpsc::Receiver<Update>, view: &mut ViewState) {
-    while let Ok(update) = receiver.try_recv() {
-        apply(update, view);
+/// Applies every already-queued frame to the view, without waiting.
+fn drain_frames(frames: &mut mpsc::Receiver<Frame>, view: &mut ViewState) {
+    while let Ok(frame) = frames.try_recv() {
+        apply(frame, view);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nanus_domain::{AgentConfig, SessionId, ToolRegistry};
-    use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream};
+    use nanus_domain::SessionId;
 
     use super::*;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn session() -> Session {
+        Session::new(SessionId::new("tui-test"), 0, "/tmp")
+    }
+
+    /// A source that answers from a script, with no socket and no agent.
+    ///
+    /// The scripted *agent* is on the other side of the link and is tested where the
+    /// server lives; what this covers is the half that lives here: that a prompt reaches
+    /// the transport, and that the frames a transport produces land in the right places in
+    /// the view.
+    struct Scripted {
+        session: Session,
+        requests: std::rc::Rc<std::cell::RefCell<Vec<Request>>>,
+        script: Vec<Frame>,
+    }
+
+    impl Scripted {
+        fn new(script: Vec<Frame>) -> Self {
+            Self {
+                session: session(),
+                requests: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                script,
+            }
+        }
+    }
+
+    impl SessionSource for Scripted {
+        fn session(&self) -> &Session {
+            &self.session
+        }
+
+        fn accepts_prompts(&self) -> bool {
+            true
+        }
+
+        fn attach(&mut self, frames: &mpsc::Sender<Frame>) {
+            // Delivered immediately rather than spawned, so the test has no task set and
+            // no timing to get wrong.
+            for frame in &self.script {
+                assert!(frames.try_send(frame.clone()).is_ok());
+            }
+        }
+
+        fn submit(&mut self, prompt: String) {
+            self.requests
+                .borrow_mut()
+                .push(Request::Prompt { text: prompt });
+        }
     }
 
     #[test]
@@ -760,19 +817,26 @@ mod tests {
     }
 
     #[test]
-    fn streaming_progress_lands_in_the_transcript() {
-        let (sender, mut receiver) = mpsc::channel::<Update>(8);
-        let mut progress = ChannelProgress { sender };
-        progress.step_started(2);
-        progress.text("hello");
-        progress.reasoning("thinking");
-        progress.usage(&Usage::default());
-
+    fn streamed_answer_frames_land_in_the_transcript() {
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
         let mut view = ViewState::new();
-        drain_updates(&mut receiver, &mut view);
-        // The step and usage events update status; the two deltas land as entries with
+        for frame in [
+            Frame::Step { step: 2 },
+            Frame::Reasoning {
+                delta: "thinking".to_owned(),
+            },
+            Frame::Text {
+                delta: "hello".to_owned(),
+            },
+            Frame::Usage { tokens: 12 },
+        ] {
+            assert!(sender.try_send(frame).is_ok());
+        }
+        drain_frames(&mut receiver, &mut view);
+        // The step and usage frames update status; the two deltas land as entries with
         // distinct roles, which is what lets a reader tell them apart.
         assert!(view.busy);
+        assert_eq!(view.tokens_used, 12);
         assert!(
             view.transcript
                 .entries()
@@ -790,15 +854,17 @@ mod tests {
 
     #[test]
     fn a_finished_turn_settles_the_stream_and_closes_the_turn() {
-        let (sender, mut receiver) = mpsc::channel::<Update>(8);
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
         let mut view = ViewState::new();
         view.begin_turn(1);
         assert!(
             sender
-                .try_send(Update::Done(Ok("answer".to_owned())))
+                .try_send(Frame::Done {
+                    answer: "answer".to_owned()
+                })
                 .is_ok()
         );
-        drain_updates(&mut receiver, &mut view);
+        drain_frames(&mut receiver, &mut view);
         assert!(!view.busy);
         assert!(!view.transcript.is_streaming());
         let last = view.transcript.entries().last();
@@ -807,15 +873,17 @@ mod tests {
 
     #[test]
     fn a_failed_turn_is_reported_as_a_notice() {
-        let (sender, mut receiver) = mpsc::channel::<Update>(8);
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
         let mut view = ViewState::new();
         view.begin_turn(1);
         assert!(
             sender
-                .try_send(Update::Done(Err("boom".to_owned())))
+                .try_send(Frame::Failed {
+                    message: "boom".to_owned()
+                })
                 .is_ok()
         );
-        drain_updates(&mut receiver, &mut view);
+        drain_frames(&mut receiver, &mut view);
         assert!(!view.busy);
         assert!(
             view.transcript
@@ -826,20 +894,25 @@ mod tests {
     }
 
     #[test]
-    fn tool_events_become_transcript_entries() {
-        let (sender, mut receiver) = mpsc::channel::<Update>(8);
+    fn tool_frames_become_transcript_entries() {
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
         let mut view = ViewState::new();
         assert!(
             sender
-                .try_send(Update::Event(AgentEvent::Tool("read".to_owned())))
+                .try_send(Frame::Tool {
+                    name: "read".to_owned()
+                })
                 .is_ok()
         );
         assert!(
             sender
-                .try_send(Update::Event(AgentEvent::ToolDone("read".to_owned(), true)))
+                .try_send(Frame::ToolDone {
+                    name: "read".to_owned(),
+                    error: true
+                })
                 .is_ok()
         );
-        drain_updates(&mut receiver, &mut view);
+        drain_frames(&mut receiver, &mut view);
         assert_eq!(view.transcript.len(), 2);
         assert!(matches!(
             view.transcript.entries().first().map(Entry::kind),
@@ -848,14 +921,78 @@ mod tests {
     }
 
     #[test]
+    fn connection_frames_do_not_reach_the_transcript() {
+        // The handshake and a `Bye` are about the link, not about the conversation. A
+        // reader must not find them in the middle of an answer.
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        for frame in [
+            Frame::Bye,
+            Frame::Status(nanus_link::protocol::AgentInfo {
+                session: "s".to_owned(),
+                workspace: "/tmp".to_owned(),
+                model: "m".to_owned(),
+                tools: 0,
+            }),
+        ] {
+            assert!(sender.try_send(frame).is_ok());
+        }
+        drain_frames(&mut receiver, &mut view);
+        assert!(view.transcript.is_empty());
+    }
+
+    #[test]
     fn a_full_queue_drops_progress_rather_than_blocking() {
         // The channel is bounded, so a slow interface cannot apply backpressure to the
-        // agent. Sending past the bound must not panic.
-        let (sender, _receiver) = mpsc::channel::<Update>(1);
-        let mut progress = ChannelProgress { sender };
+        // agent. Filling it must not panic.
+        let (sender, _receiver) = mpsc::channel::<Frame>(1);
         for index in 0..64 {
-            progress.text(&format!("delta {index}"));
+            let _ = sender.try_send(Frame::Text {
+                delta: format!("delta {index}"),
+            });
         }
+    }
+
+    #[test]
+    fn a_submitted_prompt_reaches_the_source() {
+        let mut source = Scripted::new(Vec::new());
+        source.submit("do the thing".to_owned());
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            [Request::Prompt {
+                text: "do the thing".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn attaching_a_scripted_source_queues_its_frames() {
+        // The property the event loop depends on: `attach` is what puts frames on the
+        // channel, and it runs before the first draw.
+        let (frames, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut source = Scripted::new(vec![Frame::Done {
+            answer: "answered".to_owned(),
+        }]);
+        source.attach(&frames);
+        assert_eq!(
+            receiver.try_recv().ok(),
+            Some(Frame::Done {
+                answer: "answered".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_recording_does_not_accept_prompts() {
+        // The negative half of the submission guard, and the reason the interface can
+        // tell a reader from a driver without asking the agent.
+        let recording = Recording::new(session());
+        assert!(!recording.accepts_prompts());
+        assert_eq!(recording.initial_scroll(), 0);
+        assert_eq!(
+            Recording::new(session()).scrolled_back(50).initial_scroll(),
+            50
+        );
     }
 
     #[test]
@@ -872,57 +1009,12 @@ mod tests {
         assert!(require_terminal(true).is_ok(), "a terminal is accepted");
     }
 
-    /// A model that answers once with fixed text.
-    struct ScriptedLlm;
-
-    impl LlmPort for ScriptedLlm {
-        fn model(&self) -> &'static str {
-            "scripted"
-        }
-
-        fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
-            Box::pin(futures::stream::iter(vec![
-                LlmEvent::TextDelta("hello back".to_owned()),
-                LlmEvent::Finished {
-                    reason: FinishReason::Stop,
-                },
-            ]))
-        }
-    }
-
-    /// A runner whose model replies without a network.
-    fn scripted_runner() -> AgentRunner {
-        let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(ScriptedLlm));
-        let config = AgentConfig::new(4, 1, "scripted", 4096)
-            .unwrap_or_else(|error| panic!("valid config: {error}"));
-        AgentRunner::new(llm, Rc::new(ToolRegistry::new()), "you are a test", config)
-            .unwrap_or_else(|error| panic!("valid runner: {error}"))
-    }
-
     #[test]
-    fn a_submitted_prompt_is_driven_to_an_answer() {
-        // The regression this pins, which nothing covered: submitting a prompt calls
-        // `spawn_turn`, which spawns a `!Send` local task. `spawn_local` panics outside a
-        // `LocalSet`, and a set that is only entered never polls what it spawned. The
-        // first keystroke in a real terminal was therefore the first time this code had
-        // ever run — and it aborted the process.
-        let runner = Rc::new(scripted_runner());
-        let session = Session::new(SessionId::new("tui-turn"), 0, "/tmp");
-        let (sender, mut receiver) = mpsc::channel::<Update>(16);
-        let answer = nanus_kernel::runtime::block_on_local(async {
-            spawn_turn(&runner, &session, "hello".to_owned(), &sender);
-            loop {
-                match receiver.recv().await {
-                    Some(Update::Done(result)) => break result,
-                    // Streamed progress arrives first and is not the answer.
-                    Some(_) => {}
-                    None => panic!("the turn ended without a result"),
-                }
-            }
-        });
-        match answer {
-            Ok(text) => assert_eq!(text, "hello back"),
-            Err(error) => panic!("the turn failed: {error}"),
-        }
+    fn connecting_to_a_socket_nobody_is_serving_is_an_error_rather_than_a_panic() {
+        let missing = Path::new("/definitely/not/a/socket");
+        let outcome = block_on(Remote::connect(missing));
+        assert!(outcome.is_err(), "a missing socket is refused");
+        let Err(error) = outcome else { return };
+        assert!(error.contains("/definitely/not/a/socket"), "{error}");
     }
 }

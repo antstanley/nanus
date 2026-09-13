@@ -1,0 +1,39 @@
+[package]
+name = "nanus-link"
+description = "The local link between a nanus interface and a nanus agent: the wire protocol, the socket transport, and the client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# The serving half. An interface needs only the client, and keeping the split at a
+# feature boundary is what lets the TUI binary build without the agent loop, the
+# toolset, or any adapter: it links the protocol and the client, and nothing else.
+server = ["dep:nanus-bundle", "dep:nanus-domain", "dep:nanus-ports"]
+
+[dependencies]
+nanus-bundle = { workspace = true, optional = true }
+nanus-domain = { workspace = true, optional = true }
+nanus-ports = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+nanus-adapter-local = { workspace = true }
+nanus-adapter-store = { workspace = true }
+nanus-kernel = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

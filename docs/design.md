@@ -87,6 +87,43 @@ supported ids are `deepseek-flash` and `deepseek-v4-pro`, at
 Retired ids are deliberately **not** offered as aliases. Silently mapping a retired name
 onto a new model would change a user's output without telling them, and a test asserts
 the retired names do not resolve.
+
+### One agent, three lifetimes
+
+The agent is the same object whether it is answering one prompt, serving an interface, or
+running as a service. What differs is how long it lives and how it is reached — and the
+reach is the same in all three cases, because the interface is always a client. That is
+what keeps the modes from becoming three agent implementations that agree until they do
+not: there is one code path that runs a turn for someone to watch.
+
+| Mode | Lifetime | Reach |
+|---|---|---|
+| `run` | one turn | stdout, in the same process |
+| `tui` | the interface's | a socket, for a local task |
+| `service` | until stopped | the same socket, for a process |
+
+The service is not a special case of the interface, and the interface is not a special
+case of the one-shot run. They are three answers to "how long", on top of one answer to
+"what".
+
+### The interface is a program, not a library
+
+The core does not link the interface, and that is enforced by the manifest rather than by
+intention: `nanus-cli` has no dependency on `nanus-tui`, and could not call into it if it
+wanted to. The cost is a protocol and a socket. The benefit is that the part which grows —
+the interface — grows in its own address space, with its own dependency set, at its own
+rate, while the part a boot script starts and a person audits stays small enough to read.
+
+The alternative was measured before it was rejected: an earlier revision had one binary
+that did both, which is genuinely simpler, and it put `ratatui`, `crossterm`, and the
+whole view layer in the dependency set of `nanus run`. That trade is worth making once,
+deliberately, rather than discovering it later as "why is our CLI 40 MB".
+
+The socket is a [local link](../docs/tui.md#the-link): one frame per line of JSON over a
+Unix domain socket, `0600` inside a `0700` directory. There is no safe *in-process* channel
+between two processes — sharing memory across a `fork` needs `mmap` and `unsafe`, and this
+workspace forbids `unsafe` everywhere — so a domain socket is what "in memory" reduces to
+when the two ends are two programs.
 ## The two halves, and why they are the mechanism
 
 The kernel provides *spatiotemporal composability*. The two words are worth unpacking,

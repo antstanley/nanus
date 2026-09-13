@@ -9,6 +9,7 @@ members = [
     "crates/nanus-adapter-store",
     "crates/nanus-adapter-config",
     "crates/nanus-bundle",
+    "crates/nanus-link",
     "crates/nanus-cli",
     "crates/nanus-tui",
 ]
@@ -21,7 +22,7 @@ rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/antstanley/nanus"
 authors = ["Nanus contributors"]
-description = "A headless CLI and TUI agent harness built on a Rust implementation of the Cordis meta-framework."
+description = "A coding agent harness in safe Rust: one small core that runs a task, serves an interface, or runs as a service, on a Rust implementation of the Cordis meta-framework."
 readme = "README.md"
 keywords = ["agent", "llm", "harness", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools", "development-tools::testing"]
@@ -36,6 +37,7 @@ nanus-adapter-local = { path = "crates/nanus-adapter-local" }
 nanus-adapter-store = { path = "crates/nanus-adapter-store" }
 nanus-adapter-config = { path = "crates/nanus-adapter-config" }
 nanus-bundle = { path = "crates/nanus-bundle" }
+nanus-link = { path = "crates/nanus-link" }
 nanus-cli = { path = "crates/nanus-cli" }
 nanus-tui = { path = "crates/nanus-tui" }
 
