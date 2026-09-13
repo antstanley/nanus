@@ -21,7 +21,7 @@
 //! | `Alt+Enter` | insert a newline |
 //! | `Backspace` / `Delete` | delete a character |
 //! | `Ctrl+W` | delete a word |
-//! | `Up` / `Down` | browse submitted prompts |
+//! | `Up` / `Down` | move between lines, then browse submitted prompts |
 //! | `PageUp` / `PageDown` | scroll the transcript |
 //! | `Ctrl+L` | clear the transcript |
 //! | `Ctrl+C` / `Ctrl+D` | quit |
@@ -519,11 +519,18 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             Outcome::Continue
         }
         KeyCode::Up => {
-            view.input.history_previous();
+            // Inside a multi-line prompt an arrow moves between lines; only from the
+            // top line does it browse history, which is what keeps the common
+            // single-line case behaving exactly as it did.
+            if !view.input.move_line_up() {
+                view.input.history_previous();
+            }
             Outcome::Continue
         }
         KeyCode::Down => {
-            view.input.history_next();
+            if !view.input.move_line_down() {
+                view.input.history_next();
+            }
             Outcome::Continue
         }
         KeyCode::PageUp => {
@@ -711,6 +718,27 @@ mod tests {
         assert_eq!(view.input.text(), "first");
         let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
         assert!(view.input.is_empty());
+    }
+
+    #[test]
+    fn up_and_down_move_between_lines_before_history() {
+        let mut view = ViewState::new();
+        view.input.insert_str("one");
+        let _ = handle_key(key(KeyCode::Enter, KeyModifiers::ALT), &mut view);
+        view.input.insert_str("two");
+        assert_eq!(view.input.cursor_line_col(), (1, 3));
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut view);
+        assert_eq!(
+            view.input.cursor_line_col(),
+            (0, 3),
+            "Up moves a line first"
+        );
+        // The top line is the end of the upward walk, so the next press falls back to
+        // history rather than wrapping; the history is empty here.
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.input.cursor_line_col(), (0, 3));
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.input.cursor_line_col(), (1, 3), "Down returns");
     }
 
     #[test]

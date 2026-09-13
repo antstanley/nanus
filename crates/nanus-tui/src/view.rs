@@ -74,6 +74,18 @@ impl Theme {
     }
 }
 
+/// How many rows the composer grows to before it scrolls to follow the cursor.
+///
+/// A prompt longer than this stays editable; the window moves so the line being
+/// typed is the one on screen.
+const MAX_COMPOSER_ROWS: u16 = 6;
+
+/// The rows the composer's border adds around its text.
+const COMPOSER_BORDER_ROWS: u16 = 2;
+
+/// The columns the composer's border adds around its text.
+const COMPOSER_BORDER_COLS: u16 = 2;
+
 /// What the interface is currently showing.
 ///
 /// ## The scroll convention
@@ -352,12 +364,18 @@ impl ViewState {
     /// transcript.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        // The composer grows with the prompt, so a multi-line one is visible rather
+        // than clipped to a single row. The transcript keeps a floor of three rows so
+        // that a tall composer cannot squeeze the conversation out entirely.
+        let composer = self
+            .composer_rows(area.width.saturating_sub(COMPOSER_BORDER_COLS))
+            .saturating_add(COMPOSER_BORDER_ROWS);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(3),
-                Constraint::Length(3),
+                Constraint::Length(composer),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -511,24 +529,106 @@ impl ViewState {
 
     /// Renders the composer.
     fn render_input(&self, frame: &mut Frame<'_>, area: Rect) {
-        let prompt = if self.busy { "… " } else { "› " };
-        let prompt_style = if self.busy {
-            self.theme.busy
-        } else {
-            self.theme.user
-        };
-        let line = Line::from(vec![
-            Span::styled(prompt, prompt_style),
-            Span::styled(self.input.text_before_cursor(), Style::default()),
-            Span::styled("▏", Style::default().add_modifier(Modifier::REVERSED)),
-            Span::styled(self.input.text_after_cursor(), Style::default()),
-        ]);
+        let inner = area.width.saturating_sub(COMPOSER_BORDER_COLS);
+        // The viewport is the height actually granted, not the one asked for: when the
+        // terminal is short the layout gives the composer less than `composer_rows`, and
+        // a window sized from the request would scroll the caret just off the bottom.
+        let visible = area.height.saturating_sub(COMPOSER_BORDER_ROWS);
+        let composer = self.composer_layout(inner);
+        // The window follows the caret, keeping it on the last row it can when the
+        // prompt is taller than the composer.
+        let caret = u16::try_from(composer.caret_row).unwrap_or(u16::MAX);
+        let offset = caret.saturating_sub(visible.saturating_sub(1));
         let block = Block::default().borders(Borders::ALL).title(" message ");
+        // No `Wrap`: the rows are already wrapped, and asking the renderer to wrap them
+        // again would re-break lines the layout has counted — which is how the caret's
+        // row and the drawn row drifted apart in the first place.
         frame.render_widget(
-            Paragraph::new(line).block(block).wrap(Wrap { trim: false }),
+            Paragraph::new(composer.lines(self))
+                .block(block)
+                .scroll((offset, 0)),
             area,
         );
     }
+
+    /// Lays the composer out into display rows, and says which row holds the caret.
+    ///
+    /// Wrapping is done here rather than left to the renderer, and that is the point of
+    /// this function. The row a character lands on is what decides whether the composer
+    /// has to scroll, and a renderer's wrapper breaks at word boundaries: a word that
+    /// does not fit starts a new row instead of filling the one before it. Counting
+    /// characters cannot see that, so the estimate came out a row short exactly when a
+    /// long word was pushed down — leaving the caret one row below the window, which is
+    /// what a user typing a long line sees. Owning the wrap makes the caret's row a fact
+    /// rather than a guess.
+    fn composer_layout(&self, inner_width: u16) -> ComposerLayout {
+        let usable = usize::from(inner_width.max(1));
+        let (cursor_line, cursor_column) = self.input.cursor_line_col();
+        let prompt = Self::prompt(self.busy).to_owned();
+        let indent = " ".repeat(Self::PROMPT_WIDTH);
+        let mut rows: Vec<ComposerRow> = Vec::new();
+        let mut caret_row = 0;
+        let mut caret_column = 0;
+        for (index, text) in self.input.lines().iter().enumerate() {
+            let prefix = if index == 0 {
+                prompt.clone()
+            } else {
+                indent.clone()
+            };
+            // The prefix takes room on the line's first row only; the rows a line wraps
+            // into start at the left edge, so they get the full width.
+            let first = usable.saturating_sub(Self::PROMPT_WIDTH).max(1);
+            let wrapped = wrap_words(text, first, usable);
+            if index == cursor_line {
+                let (row, column) = caret_position(&wrapped, cursor_column);
+                caret_row = rows.len().saturating_add(row);
+                caret_column = column;
+            }
+            for (offset, (line, _, _)) in wrapped.into_iter().enumerate() {
+                rows.push(ComposerRow {
+                    prefix: if offset == 0 {
+                        prefix.clone()
+                    } else {
+                        String::new()
+                    },
+                    text: line,
+                });
+            }
+        }
+        if rows.is_empty() {
+            // An empty prompt is still one blank row to put the caret on.
+            rows.push(ComposerRow {
+                prefix: prompt,
+                text: String::new(),
+            });
+        }
+        ComposerLayout {
+            rows,
+            caret_row,
+            caret_column,
+        }
+    }
+
+    /// Returns how many display rows the composer occupies, capped at
+    /// [`MAX_COMPOSER_ROWS`], at the given inner width.
+    ///
+    /// The composer grows with the prompt so an explicit newline is visible, and stops
+    /// at the cap so a long one cannot squeeze the conversation away; past the cap the
+    /// window follows the caret instead.
+    fn composer_rows(&self, inner_width: u16) -> u16 {
+        let rows = self.composer_layout(inner_width).rows.len();
+        u16::try_from(rows)
+            .unwrap_or(u16::MAX)
+            .clamp(1, MAX_COMPOSER_ROWS)
+    }
+
+    /// The prompt drawn before the composer's first line.
+    fn prompt(busy: bool) -> &'static str {
+        if busy { "… " } else { "› " }
+    }
+
+    /// The columns the prompt occupies, which is also the continuation indent.
+    const PROMPT_WIDTH: usize = 2;
 
     /// Renders the status line.
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -554,6 +654,155 @@ impl ViewState {
         };
         frame.render_widget(Paragraph::new(Line::from(vec![busy, step, usage])), area);
     }
+}
+
+/// The composer laid out for drawing: its rows, and where the caret sits among them.
+struct ComposerLayout {
+    /// One entry per display row, in the order they are drawn.
+    rows: Vec<ComposerRow>,
+    /// The index of the row holding the caret.
+    caret_row: usize,
+    /// The caret's column within that row's text, with the prefix already excluded.
+    caret_column: usize,
+}
+
+/// One display row of the composer.
+struct ComposerRow {
+    /// The prompt or the continuation indent drawn before the text.
+    ///
+    /// Empty on the rows a long line wraps into, which start at the left edge.
+    prefix: String,
+    /// The row's text, without the caret.
+    text: String,
+}
+
+impl ComposerLayout {
+    /// Builds the rows as drawable lines, cutting the caret's row around the caret.
+    fn lines(&self, view: &ViewState) -> Vec<Line<'static>> {
+        let prompt_style = if view.busy {
+            view.theme.busy
+        } else {
+            view.theme.user
+        };
+        let mut lines = Vec::with_capacity(self.rows.len());
+        for (index, row) in self.rows.iter().enumerate() {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if !row.prefix.is_empty() {
+                spans.push(Span::styled(row.prefix.clone(), prompt_style));
+            }
+            if index == self.caret_row {
+                let characters: Vec<char> = row.text.chars().collect();
+                // A caret at the end of a full row belongs after its last character,
+                // which is a column one past the text rather than inside it.
+                let column = self.caret_column.min(characters.len());
+                let before: String = characters.iter().take(column).collect();
+                let after: String = characters.iter().skip(column).collect();
+                spans.push(Span::styled(before, Style::default()));
+                spans.push(Span::styled(
+                    "▏",
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(Span::styled(after, Style::default()));
+            } else {
+                spans.push(Span::styled(row.text.clone(), Style::default()));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines
+    }
+}
+
+/// Wraps one source line into display rows at the given widths.
+///
+/// Greedy and word-aware: a row takes words while they fit, a word longer than the row
+/// is hard-broken, and the whitespace a break lands on is dropped. Each row carries the
+/// range of source characters it covers, so the caret can be placed on the row it
+/// actually belongs to rather than on one inferred from its index.
+///
+/// The first row is narrower than the rest, because the prompt or indent is drawn once
+/// at the start of the line and the rows it wraps into begin at the left edge.
+///
+/// Characters are counted, not display columns, matching the estimate the transcript
+/// uses: a wide character can therefore make a row one column wider than intended, which
+/// the terminal clips rather than mislays. Wrapping here rather than leaving it to the
+/// renderer is what makes the row count exact; see [`ViewState::composer_layout`].
+fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<(String, usize, usize)> {
+    let mut rows: Vec<(String, usize, usize)> = Vec::new();
+    let mut row: Vec<char> = Vec::new();
+    let mut sources: Vec<usize> = Vec::new();
+    let mut breaks: Option<usize> = None;
+    let mut capacity = first.max(1);
+
+    for (source, character) in text.chars().enumerate() {
+        if row.len() >= capacity {
+            // The row is full. Break at the last space when there is one, so the word
+            // that did not fit starts the next row whole instead of being split.
+            let split = match breaks {
+                Some(position) if position > 0 => position,
+                _ => row.len(),
+            };
+            rows.push((
+                row.iter().take(split).collect(),
+                sources.first().copied().unwrap_or(source),
+                sources
+                    .get(split.saturating_sub(1))
+                    .map_or(source, |last| last.saturating_add(1)),
+            ));
+            // The space the break lands on belongs to no row, which is why the ranges
+            // can have a gap in them.
+            let keep_from = if split < row.len() {
+                split.saturating_add(1)
+            } else {
+                split
+            };
+            row = row.iter().skip(keep_from).copied().collect();
+            sources = sources.iter().skip(keep_from).copied().collect();
+            capacity = rest.max(1);
+            breaks = row.iter().rposition(|character| character.is_whitespace());
+        }
+        if character.is_whitespace() {
+            breaks = Some(row.len());
+        }
+        row.push(character);
+        sources.push(source);
+    }
+
+    if !row.is_empty() {
+        let start = sources.first().copied().unwrap_or(0);
+        rows.push((
+            row.into_iter().collect(),
+            start,
+            sources.last().map_or(start, |last| last.saturating_add(1)),
+        ));
+    }
+    if rows.is_empty() {
+        // An empty line is still a row to put the caret on.
+        rows.push((String::new(), 0, 0));
+    }
+    rows
+}
+
+/// Returns the row and column that the source character `caret` lands on.
+///
+/// A caret in whitespace that a break dropped belongs to the row it was dropped from,
+/// at that row's end, which is where the next keystroke would appear. Testing that the
+/// caret is *inside* a row's range, rather than merely before its end, is what stops the
+/// row after the gap from claiming it: the ranges are not contiguous, so "before the
+/// end" is also true of a caret sitting in the space between two of them.
+fn caret_position(rows: &[(String, usize, usize)], caret: usize) -> (usize, usize) {
+    let mut fallback = (0, 0);
+    for (index, (text, start, end)) in rows.iter().enumerate() {
+        if caret >= *start && caret < *end {
+            return (
+                index,
+                caret.saturating_sub(*start).min(text.chars().count()),
+            );
+        }
+        if *end <= caret {
+            fallback = (index, text.chars().count());
+        }
+    }
+    fallback
 }
 
 #[cfg(test)]
@@ -849,6 +1098,164 @@ mod tests {
         assert!(
             text.contains("a▏b"),
             "the caret sits between the two halves"
+        );
+    }
+
+    #[test]
+    fn the_composer_grows_with_its_lines_and_stops_at_the_cap() {
+        let mut state = ViewState::new();
+        assert_eq!(
+            state.composer_rows(40),
+            1,
+            "an empty prompt is one blank line"
+        );
+        state.input.insert_str("a\nb");
+        assert_eq!(state.composer_rows(40), 2, "a newline adds a row");
+        for _ in 0..20 {
+            state.input.insert('\n');
+        }
+        assert_eq!(
+            state.composer_rows(40),
+            MAX_COMPOSER_ROWS,
+            "a tall prompt stops growing so the conversation keeps its room"
+        );
+    }
+
+    #[test]
+    fn wrapping_breaks_at_a_space_rather_than_inside_a_word() {
+        let rows = wrap_words("alpha beta", 6, 6);
+        let texts: Vec<&str> = rows.iter().map(|(text, _, _)| text.as_str()).collect();
+        assert_eq!(texts, ["alpha", "beta"]);
+        // The space a break lands on belongs to neither row, so the second row starts
+        // one character later than the first one ends.
+        assert_eq!(
+            rows.first().map(|(_, start, end)| (*start, *end)),
+            Some((0, 5))
+        );
+        assert_eq!(
+            rows.get(1).map(|(_, start, end)| (*start, *end)),
+            Some((6, 10))
+        );
+    }
+
+    #[test]
+    fn a_word_longer_than_a_row_is_broken_across_rows() {
+        let rows = wrap_words("abcdefgh", 3, 3);
+        let texts: Vec<&str> = rows.iter().map(|(text, _, _)| text.as_str()).collect();
+        assert_eq!(texts, ["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn an_empty_line_is_still_one_row() {
+        let rows = wrap_words("", 10, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(caret_position(&rows, 0), (0, 0));
+    }
+
+    #[test]
+    fn the_caret_follows_the_row_its_character_wrapped_onto() {
+        let rows = wrap_words("alpha beta", 6, 6);
+        assert_eq!(caret_position(&rows, 2), (0, 2), "inside the first word");
+        // The space the break dropped: the caret is drawn at the end of the row it was
+        // dropped from, which is where the next keystroke will appear.
+        assert_eq!(caret_position(&rows, 5), (0, 5));
+        assert_eq!(
+            caret_position(&rows, 6),
+            (1, 0),
+            "the second row's first column"
+        );
+        assert_eq!(
+            caret_position(&rows, 10),
+            (1, 4),
+            "past the end is the last row"
+        );
+    }
+
+    #[test]
+    fn the_caret_of_a_long_word_is_on_its_last_row() {
+        // Two hundred characters at thirty-eight columns is five full rows and ten
+        // characters over, so the caret at the end belongs on row five. This is the case
+        // the estimate got wrong: a renderer that breaks a long word onto a fresh row
+        // instead of filling the one before it puts that character on row six, and the
+        // caret ends up one row below the composer's window.
+        let text = "x".repeat(200);
+        let rows = wrap_words(&text, 38, 38);
+        assert_eq!(rows.len(), 6, "five full rows and a short one");
+        assert_eq!(caret_position(&rows, 200), (5, 10));
+    }
+
+    #[test]
+    fn the_composer_grows_with_a_wrapped_line_not_just_a_newline() {
+        let mut state = ViewState::new();
+        // No newline, but far more text than the width holds: the row count is rows,
+        // so wrapping counts the same as an explicit break.
+        state.input = InputBuffer::with_text(&"x".repeat(200));
+        let rows = state.composer_rows(40);
+        assert_eq!(rows, MAX_COMPOSER_ROWS, "a wrapped line grows the composer");
+        // And the caret at the end of that one long line is still on screen, which is
+        // what a line-based offset got wrong.
+        let text = rendered(&mut state, 40, 12);
+        assert!(
+            text.contains('▏'),
+            "the caret must stay visible when its line wraps"
+        );
+    }
+
+    #[test]
+    fn the_composer_scrolls_to_the_caret_of_a_wrapped_line() {
+        let mut state = ViewState::new();
+        let mut text = "y".repeat(500);
+        text.push_str("\nlast");
+        state.input = InputBuffer::with_text(&text);
+        let drawn = rendered(&mut state, 40, 12);
+        // `with_text` leaves the caret at the end of the text, which is on the line
+        // after a very tall wrapped one. The caret can only be on screen if the window
+        // has scrolled, and it has to be *at* the caret rather than one row short of it:
+        // the row a long word wraps onto is not the row a character count predicts.
+        assert!(
+            drawn.contains("last▏"),
+            "the caret's line is visible: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_composer_draws_every_line() {
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("first\nsecond");
+        let text = rendered(&mut state, 40, 12);
+        // An embedded newline must break the row rather than being drawn literally.
+        assert!(text.contains("first"));
+        assert!(text.contains("second"));
+    }
+
+    #[test]
+    fn the_caret_is_drawn_on_the_line_it_is_on() {
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("ab\ncd");
+        state.input.move_home();
+        let text = rendered(&mut state, 40, 12);
+        assert!(text.contains("ab"), "the first line is drawn");
+        assert!(
+            text.contains("▏cd"),
+            "the caret is on the second line, before its text"
+        );
+    }
+
+    #[test]
+    fn a_tall_composer_scrolls_to_follow_the_cursor() {
+        let prompt = (0..8)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text(&prompt);
+        let text = rendered(&mut state, 40, 20);
+        // The cursor is at the end, so the window has scrolled past the first line to
+        // keep the line being typed on screen.
+        assert!(text.contains("line 7"), "the cursor's line is visible");
+        assert!(
+            !text.contains("line 0"),
+            "the window followed the cursor off the top"
         );
     }
 

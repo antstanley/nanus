@@ -10,6 +10,14 @@
 //! Every cursor position is a count of `char`s, never a byte offset. A byte cursor
 //! is what turns typing an accented letter into a panic on a non-boundary slice,
 //! and no amount of care at the call site fixes a buffer whose model is wrong.
+//!
+//! ## Lines, not a single row
+//!
+//! The composer holds a newline like any other character, so a prompt can span
+//! several lines. The cursor is still one character index into the whole text; the
+//! line-oriented operations ([`InputBuffer::move_line_up`],
+//! [`InputBuffer::move_home`]) derive their line from it rather than storing a
+//! second, easily-desynchronised position.
 
 use core::fmt;
 
@@ -125,6 +133,85 @@ impl InputBuffer {
         &self.history
     }
 
+    /// Returns the text split into display lines, without their newlines.
+    ///
+    /// A trailing newline yields a final empty line, so the cursor can sit on the
+    /// blank line a user opened with `Alt+Enter`.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        self.text().split('\n').map(str::to_owned).collect()
+    }
+
+    /// Returns how many display lines the text occupies.
+    ///
+    /// Always at least one: an empty composer is one blank line, not zero.
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        let newlines = self
+            .text
+            .iter()
+            .filter(|character| **character == '\n')
+            .count();
+        newlines.saturating_add(1)
+    }
+
+    /// Returns `true` when the text contains a newline.
+    #[must_use]
+    pub fn is_multiline(&self) -> bool {
+        self.text.contains(&'\n')
+    }
+
+    /// Returns the cursor's line and its column within that line.
+    ///
+    /// The column counts `char`s from the start of the line, matching the character
+    /// cursor the rest of the buffer uses.
+    #[must_use]
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let mut line: usize = 0;
+        let mut column: usize = 0;
+        for (index, character) in self.text.iter().enumerate() {
+            if index >= self.cursor {
+                break;
+            }
+            if *character == '\n' {
+                line = line.saturating_add(1);
+                column = 0;
+            } else {
+                column = column.saturating_add(1);
+            }
+        }
+        (line, column)
+    }
+
+    /// Returns the character index at which `line` begins.
+    ///
+    /// A line past the end yields the text length, so callers clamp rather than
+    /// index out of bounds.
+    fn line_start(&self, line: usize) -> usize {
+        let mut current = 0;
+        for (index, character) in self.text.iter().enumerate() {
+            if current == line {
+                return index;
+            }
+            if *character == '\n' {
+                current = current.saturating_add(1);
+            }
+        }
+        self.text.len()
+    }
+
+    /// Returns how many characters `line` holds before its newline.
+    fn line_length(&self, line: usize) -> usize {
+        let mut length: usize = 0;
+        for character in self.text.iter().skip(self.line_start(line)) {
+            if *character == '\n' {
+                break;
+            }
+            length = length.saturating_add(1);
+        }
+        length
+    }
+
     /// Inserts a character at the cursor.
     pub fn insert(&mut self, character: char) {
         // A newline in the composer is ordinary text; the caller decides whether a
@@ -183,14 +270,50 @@ impl InputBuffer {
         }
     }
 
-    /// Moves the cursor to the start of the text.
-    pub const fn move_home(&mut self) {
-        self.cursor = 0;
+    /// Moves the cursor to the start of the current line.
+    ///
+    /// Line-relative rather than document-relative, which is what every editor does
+    /// and what a multi-line composer needs: `Home` on the second line belongs at the
+    /// second line's start, not at the top of the prompt.
+    pub fn move_home(&mut self) {
+        let (line, _) = self.cursor_line_col();
+        self.cursor = self.line_start(line);
     }
 
-    /// Moves the cursor to the end of the text.
+    /// Moves the cursor to the end of the current line.
     pub fn move_end(&mut self) {
-        self.cursor = self.text.len();
+        let (line, _) = self.cursor_line_col();
+        self.cursor = self.line_start(line).saturating_add(self.line_length(line));
+    }
+
+    /// Moves the cursor up a line, keeping its column where the line allows.
+    ///
+    /// Returns whether it moved; `false` means the cursor was already on the first
+    /// line, which is why a caller can fall back to history browsing.
+    pub fn move_line_up(&mut self) -> bool {
+        let (line, column) = self.cursor_line_col();
+        if line == 0 {
+            return false;
+        }
+        let target = line.saturating_sub(1);
+        let column = column.min(self.line_length(target));
+        self.cursor = self.line_start(target).saturating_add(column);
+        true
+    }
+
+    /// Moves the cursor down a line, keeping its column where the line allows.
+    ///
+    /// Returns whether it moved; `false` means the cursor was already on the last
+    /// line.
+    pub fn move_line_down(&mut self) -> bool {
+        let (line, column) = self.cursor_line_col();
+        let target = line.saturating_add(1);
+        if target >= self.line_count() {
+            return false;
+        }
+        let column = column.min(self.line_length(target));
+        self.cursor = self.line_start(target).saturating_add(column);
+        true
     }
 
     /// Deletes from the cursor back to the start of the current word.
@@ -597,5 +720,90 @@ mod tests {
         assert!(buffer.is_empty());
         // The history is not the draft, so clearing the draft must not lose it.
         assert_eq!(buffer.history(), ["kept".to_owned()]);
+    }
+
+    #[test]
+    fn a_newline_splits_the_text_into_lines() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("one");
+        buffer.insert('\n');
+        buffer.insert_str("two");
+        assert_eq!(buffer.line_count(), 2);
+        assert!(buffer.is_multiline());
+        assert_eq!(buffer.lines(), ["one".to_owned(), "two".to_owned()]);
+        // A single-line buffer is the common case and is not reported as multi-line.
+        let single = InputBuffer::with_text("one");
+        assert!(!single.is_multiline());
+        assert_eq!(single.line_count(), 1);
+    }
+
+    #[test]
+    fn a_trailing_newline_leaves_a_blank_line_for_the_cursor() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("line\n");
+        assert_eq!(buffer.line_count(), 2);
+        // The cursor sits on the blank line the newline opened, which is where the
+        // next keystroke lands.
+        assert_eq!(buffer.cursor_line_col(), (1, 0));
+        assert_eq!(buffer.lines(), ["line".to_owned(), String::new()]);
+    }
+
+    #[test]
+    fn the_cursor_line_and_column_track_newlines() {
+        let mut buffer = InputBuffer::with_text("ab\ncde");
+        assert_eq!(buffer.cursor_line_col(), (1, 3));
+        buffer.move_home();
+        assert_eq!(buffer.cursor_line_col(), (1, 0));
+        // `Home` and `End` are line-relative, so the top of the prompt is a separate
+        // move rather than where `Home` returns to.
+        buffer.move_line_up();
+        assert_eq!(buffer.cursor_line_col(), (0, 0));
+        buffer.move_end();
+        assert_eq!(buffer.cursor_line_col(), (0, 2));
+        assert!(buffer.move_line_down());
+        assert_eq!(buffer.cursor_line_col(), (1, 2));
+        assert!(!buffer.move_line_down(), "the last line is the floor");
+        assert!(buffer.move_line_up(), "moving back up is possible");
+    }
+
+    #[test]
+    fn moving_between_lines_keeps_the_column_where_it_fits() {
+        let mut buffer = InputBuffer::with_text("abcd\nxy");
+        // `with_text` leaves the cursor at the end of the last line; `Home` is
+        // line-relative, so reaching column two of the *first* line takes a line move.
+        buffer.move_home();
+        buffer.move_line_up();
+        buffer.move_right();
+        buffer.move_right();
+        assert_eq!(buffer.cursor_line_col(), (0, 2));
+        assert!(buffer.move_line_down());
+        assert_eq!(buffer.cursor_line_col(), (1, 2));
+        assert!(buffer.move_line_up());
+        assert_eq!(buffer.cursor_line_col(), (0, 2));
+    }
+
+    #[test]
+    fn a_short_line_clamps_the_column() {
+        let mut buffer = InputBuffer::with_text("xy\nabcdef");
+        buffer.move_end();
+        assert_eq!(buffer.cursor_line_col(), (1, 6));
+        assert!(buffer.move_line_up());
+        // The first line holds only two characters, so the cursor cannot keep its
+        // column of six.
+        assert_eq!(buffer.cursor_line_col(), (0, 2));
+        // The top of the buffer is the end of the upward walk.
+        assert!(!buffer.move_line_up());
+    }
+
+    #[test]
+    fn deleting_within_a_multiline_draft_does_not_panic() {
+        let mut buffer = InputBuffer::with_text("ab\ncd");
+        buffer.move_home();
+        buffer.move_line_up();
+        buffer.move_end();
+        // Backspace removes the `b`, leaving the newline and the second line intact.
+        assert!(buffer.backspace());
+        assert_eq!(buffer.text(), "a\ncd");
+        assert_eq!(buffer.line_count(), 2);
     }
 }

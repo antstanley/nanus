@@ -68,10 +68,29 @@ conversation gets no such header: the person is already in it.
 | `Alt+Enter` | newline |
 | `Ctrl+W` | delete the previous word |
 | `Ctrl+L` | clear the transcript |
-| `Up` / `Down` | browse submitted prompts |
+| `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll the transcript |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
 | `Ctrl+C` / `Ctrl+D` / `Esc` | quit |
+
+## The composer
+
+`Enter` sends and `Alt+Enter` starts a new line, so a prompt can be a paragraph rather
+than a sentence. `Up` and `Down` move between those lines, and only from the top line do
+they browse submitted prompts, which is what keeps the single-line case behaving exactly
+as it did.
+
+The composer grows with the prompt up to six rows and then scrolls to keep the line being
+typed on screen, so a long prompt stays editable without squeezing the conversation out
+of the terminal.
+
+Its wrapping is done here rather than left to the drawing library, and that is deliberate.
+The row a character lands on is what decides whether the composer has to scroll, and a
+word-boundary wrapper moves a word that does not fit onto a new row instead of filling
+the one before it. Counting characters cannot see that, so the caret came out one row
+below the window on exactly the prompts long enough to need the scroll. Owning the wrap
+makes the caret's row a fact the interface knows rather than an estimate it hopes is
+right.
 
 ## What it shows, and why
 
