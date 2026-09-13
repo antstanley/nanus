@@ -55,6 +55,34 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Returns the same theme with every colour removed, for a terminal that asked for
+    /// none.
+    ///
+    /// `NO_COLOR` is honoured by not *asking* for colour, rather than by asking and
+    /// letting the backend drop it. The backend writes a colour change as one command
+    /// covering the foreground *and* the background, and when crossterm is suppressing
+    /// colour that command degenerates to a bare `ESC[;m`, which is not "no colour" but a
+    /// full SGR reset — so it clears the attributes set for the same cell just before it.
+    /// The caret is a reversed cell, so under a colour theme it was the caret that
+    /// vanished whenever it landed on a coloured prompt prefix. A theme with no colour in
+    /// it has no colour command to degenerate, and every modifier survives.
+    ///
+    /// The modifiers are kept exactly as the colour theme has them: this is that theme
+    /// with its colours taken out, not a second design. Roles that were told apart only
+    /// by colour are no longer told apart, which is what asking for no colour means.
+    #[must_use]
+    pub const fn monochrome() -> Self {
+        Self {
+            user: Style::new().add_modifier(Modifier::BOLD),
+            assistant: Style::new(),
+            reasoning: Style::new().add_modifier(Modifier::ITALIC),
+            tool: Style::new(),
+            notice: Style::new(),
+            error: Style::new().add_modifier(Modifier::BOLD),
+            busy: Style::new(),
+        }
+    }
+
     /// Returns the style for a role.
     #[must_use]
     pub const fn style_for(&self, role: Role) -> Style {
@@ -726,7 +754,10 @@ impl ViewState {
             if index == cursor_line {
                 let (row, column) = caret_position(&wrapped, cursor_column);
                 caret_row = rows.len().saturating_add(row);
-                caret_column = column;
+                // Only a line's first row carries the prefix, and it is drawn inside the
+                // row's width rather than beside it, so the caret's column has to include
+                // it to mean a cell on the screen.
+                caret_column = column.saturating_add(if row == 0 { Self::PROMPT_WIDTH } else { 0 });
             }
             for (offset, (line, _, _)) in wrapped.into_iter().enumerate() {
                 rows.push(ComposerRow {
@@ -740,11 +771,33 @@ impl ViewState {
             }
         }
         if rows.is_empty() {
-            // An empty prompt is still one blank row to put the caret on.
+            // An empty prompt is still one blank row to put the caret on, and the caret
+            // sits after the prompt rather than inside it.
             rows.push(ComposerRow {
                 prefix: prompt,
                 text: String::new(),
             });
+            caret_row = 0;
+            caret_column = Self::PROMPT_WIDTH;
+        }
+        // A caret with no cell to be drawn in. A row that is exactly full has no column
+        // past its last character, so the caret had nothing to reverse and the cursor
+        // vanished for the keystroke in which a prompt crossed a row boundary. A
+        // terminal wraps the cursor onto the next line and so does this: the caret
+        // becomes the first cell of the following row — the continuation indent, or a
+        // row added for it when the caret was already on the last one.
+        if caret_column >= usable {
+            let next = caret_row.saturating_add(1);
+            caret_row = if next < rows.len() {
+                next
+            } else {
+                rows.push(ComposerRow {
+                    prefix: String::new(),
+                    text: String::new(),
+                });
+                rows.len().saturating_sub(1)
+            };
+            caret_column = 0;
         }
         ComposerLayout {
             rows,
@@ -826,7 +879,12 @@ struct ComposerLayout {
     rows: Vec<ComposerRow>,
     /// The index of the row holding the caret.
     caret_row: usize,
-    /// The caret's column within that row's text, with the prefix already excluded.
+    /// The caret's column counted from the start of that row, **prefix included**.
+    ///
+    /// Row-relative rather than text-relative because the caret can be on the prefix:
+    /// a caret at the end of a row that is exactly full has no column inside the row's
+    /// text to sit on, and belongs at the start of the next row — which begins with the
+    /// continuation indent.
     caret_column: usize,
 }
 
@@ -851,36 +909,30 @@ impl ComposerLayout {
         let mut lines = Vec::with_capacity(self.rows.len());
         for (index, row) in self.rows.iter().enumerate() {
             let mut spans: Vec<Span<'static>> = Vec::new();
-            if !row.prefix.is_empty() {
-                spans.push(Span::styled(row.prefix.clone(), prompt_style));
-            }
-            if index == self.caret_row {
-                let characters: Vec<char> = row.text.chars().collect();
-                // A caret at the end of a row belongs after its last character, which is
-                // a column one past the text rather than inside it.
-                let column = self.caret_column.min(characters.len());
-                let before: String = characters.iter().take(column).collect();
-                let after: String = characters.iter().skip(column.saturating_add(1)).collect();
-                spans.push(Span::styled(before, Style::default()));
-                // The caret is a *style on the cell it is over*, not a glyph in a cell of
-                // its own. Drawn as a glyph it took a column, so every character after it
-                // slid one place to the right whenever the cursor moved — which reads as
-                // the cursor displacing the text it is moving across, and is worst
-                // exactly where a caret is most useful: in the middle of a word being
-                // corrected. Reversing the cell leaves the text where the user put it.
-                //
-                // Past the last character there is no cell to reverse, so the caret
-                // becomes one: a block in the space the next character will occupy.
-                let under: String = characters
-                    .get(column)
-                    .map_or_else(|| String::from(" "), char::to_string);
-                spans.push(Span::styled(
-                    under,
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ));
-                spans.push(Span::styled(after, Style::default()));
+            let prefix_width = row.prefix.chars().count();
+            let caret_here = index == self.caret_row;
+            if caret_here && self.caret_column < prefix_width {
+                // The caret is on the indent. That is where a caret at the end of a full
+                // row lands: the character after it is the first of the *next* line, and
+                // the insertion point is before that line's indent, not on its text.
+                push_caret_run(&mut spans, &row.prefix, self.caret_column, prompt_style);
+                if !row.text.is_empty() {
+                    spans.push(Span::styled(row.text.clone(), Style::default()));
+                }
             } else {
-                spans.push(Span::styled(row.text.clone(), Style::default()));
+                if !row.prefix.is_empty() {
+                    spans.push(Span::styled(row.prefix.clone(), prompt_style));
+                }
+                if caret_here {
+                    push_caret_run(
+                        &mut spans,
+                        &row.text,
+                        self.caret_column.saturating_sub(prefix_width),
+                        Style::default(),
+                    );
+                } else {
+                    spans.push(Span::styled(row.text.clone(), Style::default()));
+                }
             }
             lines.push(Line::from(spans));
         }
@@ -958,6 +1010,29 @@ fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<(String, usize, usiz
     rows
 }
 
+/// Pushes `run` as spans with the caret drawn *in* the cell it is over.
+///
+/// The caret is a style on a cell rather than a glyph in a cell of its own: a glyph
+/// takes a column and pushes the rest of the row along, so moving the cursor through a
+/// word looked like editing it. A column past the end of the run has no cell to reverse,
+/// so the caret becomes one — a block in the space the next character will occupy.
+fn push_caret_run(spans: &mut Vec<Span<'static>>, run: &str, column: usize, style: Style) {
+    let characters: Vec<char> = run.chars().collect();
+    let at = column.min(characters.len());
+    let before: String = characters.iter().take(at).collect();
+    let under: String = characters
+        .get(at)
+        .map_or_else(|| String::from(" "), char::to_string);
+    let after: String = characters.iter().skip(at.saturating_add(1)).collect();
+    if !before.is_empty() {
+        spans.push(Span::styled(before, style));
+    }
+    spans.push(Span::styled(under, style.add_modifier(Modifier::REVERSED)));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, style));
+    }
+}
+
 /// Returns the row and column that the source character `caret` lands on.
 ///
 /// A caret in whitespace that a break dropped belongs to the row it was dropped from,
@@ -993,24 +1068,29 @@ mod tests {
         draw_with_caret(state, width, height).0
     }
 
+    /// Where the caret was drawn: the cell, and the character in it.
+    ///
+    /// A named type rather than a tuple because the tests assert on all three parts and
+    /// `caret.row` says which is which.
+    struct Caret {
+        row: u16,
+        column: u16,
+        symbol: String,
+    }
+
     /// Draws the view, returning the rendered text and the cell the caret is drawn on.
     ///
     /// The caret is a *style* rather than a glyph, so a test that looked only at the text
-    /// could not tell whether one was drawn at all. The row comes back with the symbol
-    /// because "the caret is on screen" is only half of what the tests need to say; "on
-    /// the right row, over the right character" is the other half.
-    fn draw_with_caret(
-        state: &mut ViewState,
-        width: u16,
-        height: u16,
-    ) -> (String, Option<(u16, String)>) {
+    /// could not tell whether one was drawn at all. Where it landed comes back too,
+    /// because "the caret is on screen" is only half of what the tests need to say.
+    fn draw_with_caret(state: &mut ViewState, width: u16, height: u16) -> (String, Option<Caret>) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("a test terminal always builds");
         let drawn = terminal.draw(|frame| state.render(frame));
         assert!(drawn.is_ok(), "rendering must not fail");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
-        let mut caret: Option<(u16, String)> = None;
+        let mut caret: Option<Caret> = None;
         for row in 0..buffer.area.height {
             for column in 0..buffer.area.width {
                 let Some(cell) = buffer.cell((column, row)) else {
@@ -1019,7 +1099,11 @@ mod tests {
                 };
                 text.push_str(cell.symbol());
                 if caret.is_none() && cell.style().add_modifier.contains(Modifier::REVERSED) {
-                    caret = Some((row, cell.symbol().to_owned()));
+                    caret = Some(Caret {
+                        row,
+                        column,
+                        symbol: cell.symbol().to_owned(),
+                    });
                 }
             }
             text.push('\n');
@@ -1319,15 +1403,111 @@ mod tests {
             !text.contains('▏'),
             "no caret glyph is drawn at all: {text}"
         );
-        let (caret_row, symbol) = caret.expect("the caret is drawn");
-        assert_eq!(symbol, "b", "over the character after the insertion point");
+        let caret = caret.expect("the caret is drawn");
         assert_eq!(
-            usize::from(caret_row),
+            caret.symbol, "b",
+            "over the character after the insertion point"
+        );
+        assert_eq!(
+            usize::from(caret.row),
             text.lines()
                 .position(|line| line.contains("ab"))
                 .expect("the composer's row is drawn"),
             "on the row the text is drawn on"
         );
+    }
+
+    #[test]
+    fn a_caret_at_the_end_of_a_full_row_is_drawn_on_the_next_one() {
+        // The gap this closes: a row that is exactly full has no column past its last
+        // character, so there was nothing to reverse and the cursor simply vanished for
+        // the one keystroke in which a prompt crossed a row boundary.
+        let mut state = ViewState::new();
+        // A forty-column terminal inside the composer's borders leaves thirty-eight
+        // columns, two of which the prompt takes on the first row: thirty-six characters
+        // fill it exactly.
+        state.input = InputBuffer::with_text(&"x".repeat(36));
+        let (text, caret) = draw_with_caret(&mut state, 40, 12);
+        let caret = caret.expect("the caret is drawn even when its row is full");
+        assert_eq!(caret.symbol, " ", "a block where the next character goes");
+        assert_eq!(caret.column, 1, "at the left edge of the row it wrapped to");
+        let text_row = text
+            .lines()
+            .position(|line| line.contains("xxxx"))
+            .expect("the text is drawn");
+        assert_eq!(
+            usize::from(caret.row),
+            text_row.saturating_add(1),
+            "on the row after the text: {text}"
+        );
+    }
+
+    #[test]
+    fn a_caret_at_the_end_of_a_full_line_moves_to_the_next_lines_indent() {
+        // The same rule in the middle of a prompt. The character after the caret belongs
+        // to the *next* line, so the caret belongs before that line's indent — not over
+        // the first character of its text, which is what column zero of the next row
+        // would mean if the caret's column ignored the prefix.
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text(&format!("{}\nsecond", "x".repeat(36)));
+        // To the end of the first line: home to its start, up a line, then along it.
+        state.input.move_home();
+        assert!(state.input.move_line_up(), "the caret moves up a line");
+        state.input.move_end();
+        assert_eq!(
+            state.input.cursor_line_col(),
+            (0, 36),
+            "at the end of a full row"
+        );
+
+        let (text, caret) = draw_with_caret(&mut state, 40, 12);
+        let caret = caret.expect("the caret is drawn");
+        assert_eq!(
+            caret.symbol, " ",
+            "on the indent's first cell, not on the text"
+        );
+        assert_eq!(caret.column, 1, "the inner left edge");
+        let row = text
+            .lines()
+            .position(|line| line.contains("second"))
+            .expect("the second line is drawn");
+        assert_eq!(
+            usize::from(caret.row),
+            row,
+            "on the row the next line begins on, before its text: {text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_composer_puts_the_caret_after_the_prompt() {
+        // The empty prompt takes the fallback path, and it is the case that catches a
+        // caret column read as row-relative: without the prefix counted, the caret sat on
+        // the `›` itself.
+        let mut state = ViewState::new();
+        let (text, caret) = draw_with_caret(&mut state, 60, 12);
+        assert!(text.contains('›'), "the prompt is drawn: {text}");
+        let caret = caret.expect("the caret is drawn");
+        assert_eq!(caret.symbol, " ", "a block after the prompt");
+        assert_eq!(
+            caret.column, 3,
+            "one border, one inner column, two of prompt"
+        );
+    }
+
+    #[test]
+    fn the_composer_does_not_change_height_as_a_prompt_crosses_a_full_row() {
+        // The caret's row is added when a prompt fills its row exactly, so the height has
+        // to be the same on both sides of that boundary. Otherwise the composer would
+        // flicker a row taller for the single keystroke that lands on it.
+        let rows = |length: usize| {
+            let mut state = ViewState::new();
+            // Thirty-eight columns, as a forty-column terminal leaves inside the borders.
+            state.input = InputBuffer::with_text(&"x".repeat(length));
+            state.composer_rows(38)
+        };
+        assert_eq!(rows(35), 1, "one short of filling the row");
+        assert_eq!(rows(36), 2, "exactly full: the caret gets a row of its own");
+        assert_eq!(rows(37), 2, "and the next character wraps into that row");
     }
 
     #[test]
@@ -1338,7 +1518,11 @@ mod tests {
         state.input = InputBuffer::with_text("ab");
         let (text, caret) = draw_with_caret(&mut state, 60, 12);
         assert!(text.contains("ab"), "{text}");
-        assert_eq!(caret.map(|(_, symbol)| symbol), Some(String::from(" ")));
+        assert_eq!(
+            caret.map(|caret| caret.symbol),
+            Some(String::from(" ")),
+            "a block in the space the next character goes in"
+        );
     }
 
     #[test]
@@ -1362,7 +1546,7 @@ mod tests {
         // And the caret did move: six steps of `move_left` visit six cells.
         let cells: Vec<Option<String>> = drawn
             .iter()
-            .map(|(_, caret)| caret.as_ref().map(|(_, symbol)| symbol.clone()))
+            .map(|(_, caret)| caret.as_ref().map(|caret| caret.symbol.clone()))
             .collect();
         assert_eq!(
             cells,
@@ -1662,7 +1846,7 @@ mod tests {
             drawn.contains("last"),
             "the caret's line is visible: {drawn}"
         );
-        let caret_row = caret.expect("the caret is drawn").0;
+        let caret_row = caret.expect("the caret is drawn").row;
         let last_row = drawn
             .lines()
             .position(|line| line.contains("last"))
@@ -1692,10 +1876,13 @@ mod tests {
         let (text, caret) = draw_with_caret(&mut state, 40, 12);
         assert!(text.contains("ab"), "the first line is drawn");
         assert!(text.contains("cd"), "and the second, undisplaced");
-        let (caret_row, symbol) = caret.expect("the caret is drawn");
-        assert_eq!(symbol, "c", "over the first character of the second line");
+        let caret = caret.expect("the caret is drawn");
         assert_eq!(
-            usize::from(caret_row),
+            caret.symbol, "c",
+            "over the first character of the second line"
+        );
+        assert_eq!(
+            usize::from(caret.row),
             text.lines()
                 .position(|line| line.contains("cd"))
                 .expect("the second line is drawn"),
@@ -1755,6 +1942,46 @@ mod tests {
         );
         let failure = Entry::tool_result("read", true, "x");
         assert_eq!(theme.style_for_entry(&failure), theme.error);
+    }
+
+    /// The caret is a modifier, so it has to survive a theme chosen for `NO_COLOR`: the
+    /// point of that theme is that the caret is still drawn when the terminal asked for
+    /// no colour, and a test that only checked the colours could not say so.
+    #[test]
+    fn the_caret_is_still_drawn_in_the_monochrome_theme() {
+        let mut state = ViewState::new();
+        state.theme = Theme::monochrome();
+        state.input.insert_str("hi");
+        let (_, caret) = draw_with_caret(&mut state, 60, 12);
+        let caret = caret.expect("the caret is drawn without colour too");
+        assert_eq!(caret.symbol, " ");
+    }
+
+    /// The monochrome theme exists so that a terminal which asked for no colour still
+    /// gets a caret, and the way it manages that is by *asking for none*. The colour
+    /// assertion is the one that earns its keep: a single `fg` left behind is enough for
+    /// the backend to emit the command that clears the reversal.
+    #[test]
+    fn the_monochrome_theme_asks_for_no_colour_and_keeps_the_modifiers() {
+        let colour = Theme::default();
+        let mono = Theme::monochrome();
+        let pairs = [
+            (colour.user, mono.user),
+            (colour.assistant, mono.assistant),
+            (colour.reasoning, mono.reasoning),
+            (colour.tool, mono.tool),
+            (colour.notice, mono.notice),
+            (colour.error, mono.error),
+            (colour.busy, mono.busy),
+        ];
+        for (colour, mono) in pairs {
+            assert_eq!(mono.fg, None, "no foreground colour is asked for");
+            assert_eq!(mono.bg, None, "no background colour is asked for");
+            assert_eq!(
+                mono.add_modifier, colour.add_modifier,
+                "bold and italic still mark the roles the colour theme marked"
+            );
+        }
     }
 }
 

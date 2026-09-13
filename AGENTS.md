@@ -105,7 +105,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 649 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 656 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -147,6 +147,10 @@ Contract to preserve:
   **never** stored in `NanusConfig`, serialised, or rendered by `Debug`.
 - `NANUS_HOME` — override the session-store home. Sessions live under
   `$NANUS_HOME/sessions/` (default: the platform config dir).
+- `NO_COLOR` — when set to anything non-empty, the interface renders with no colour at all
+  (keeping bold and italic) rather than letting the backend drop the colours: the command
+  that would have carried a colour to a cell collapses into a reset when colour is
+  suppressed, and it takes the caret's reversal with it. See `docs/tui.md`.
 
 ## Conventions you must follow
 

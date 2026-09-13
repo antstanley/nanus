@@ -194,13 +194,25 @@ corrected. Moving the cursor through `corvid` now leaves the word drawn identica
 position, with only the reversed cell moving. Past the last character there is nothing to
 reverse, so the caret becomes one cell: a block where the next keystroke will land.
 
-One case has nowhere to put it. When a row is *exactly* full and the caret is at its end,
-there is no cell one past the last character, so the cursor is invisible for the keystroke in
-which a prompt crosses a row boundary. A terminal moves the cursor to a fresh line there;
-here that would mean letting the caret sit on the continuation indent, which is a cell the
-row model does not have — a row holds text, and the prefix is drawn beside it. Left as a
-known gap rather than half-fixed, because the arithmetic that places the caret has been wrong
-twice already and this case is cosmetic and lasts one keystroke.
+A row that is exactly full has no column past its last character either, and the caret used
+to have no cell to reverse anywhere — it vanished for the keystroke in which a prompt crossed
+a row boundary. A terminal moves the cursor onto the next line there, and so does this: the
+caret becomes the first cell of the following row, which is the continuation indent when
+there is more text below, and a new row when the caret was already on the last one. That is
+the cell the next character will occupy, because a character typed at the end of a full row
+wraps onto a row of its own — so the block is drawn where the text will appear, not merely
+somewhere visible.
+
+The reversal is a *modifier*, which matters because of `NO_COLOR`. The backend sets a cell's
+colours in one command covering foreground and background, and when crossterm is suppressing
+colour that command degenerates to a bare `ESC[;m` — not "no colour" but a full SGR reset,
+which clears the modifiers set for the same cell immediately before it. Under the colour
+theme the caret was therefore invisible whenever it landed on a coloured prompt prefix, while
+staying visible over the text beside it. A terminal that sets `NO_COLOR` (to anything
+non-empty) now gets `Theme::monochrome`, which is the colour theme with the colours taken
+out and the modifiers kept, so there is no colour command left to degenerate. The decision
+belongs where the environment is read, in the runtime, rather than in the view: a view that
+consulted the environment would render differently in whichever test inherited the variable.
 
 Its wrapping is done here rather than left to the drawing library, and that is deliberate.
 The row a character lands on is what decides whether the composer has to scroll, and a

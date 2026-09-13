@@ -37,6 +37,7 @@
 //! | `Ctrl+C` / `Ctrl+D` | quit |
 
 use core::future::Future;
+use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 
@@ -53,10 +54,21 @@ use ratatui::crossterm::event::{
 use tokio::sync::mpsc;
 
 use crate::transcript::{Entry, Role};
-use crate::view::ViewState;
+use crate::view::{Theme, ViewState};
 
 /// Rows scrolled per `PageUp` or `PageDown`.
 const PAGE_ROWS: i32 = 10;
+
+/// Whether the terminal asked for no colour.
+///
+/// The convention is "present and not empty": an unset variable is not a request and
+/// neither is one set to the empty string, so the environment cannot ask by accident.
+/// Taking the value as an argument rather than reading it here is what makes the rule
+/// testable — tests cannot set an environment variable, and reading it in the test module
+/// would make every other test's behaviour depend on the machine it runs on.
+fn no_color_requested(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
 
 /// How many frames may be queued from the agent before the interface falls behind.
 const FRAME_BUFFER: usize = 256;
@@ -533,6 +545,12 @@ async fn event_loop(
 ) -> io::Result<()> {
     let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
+    // Chosen here, at the boundary with the terminal, rather than inside the view: the
+    // environment is a property of this run, and a view built with one would render
+    // differently in a test that happened to inherit `NO_COLOR` from whatever ran it.
+    if no_color_requested(std::env::var_os("NO_COLOR").as_deref()) {
+        view.theme = Theme::monochrome();
+    }
     // The transcript comes from the session itself, so a recorded one looks exactly like
     // the live conversation it was: same event log, same rendering. The one difference is
     // the header, which belongs to a recording and to nothing else.
@@ -808,6 +826,18 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// `NO_COLOR` is `present and not empty`, and the empty case is the one that matters:
+    /// a variable exported with no value is a common accident in a shell startup file, and
+    /// treating it as a request would silently strip the interface's colours for someone
+    /// who never asked.
+    #[test]
+    fn no_color_counts_when_it_is_present_and_not_empty() {
+        assert!(no_color_requested(Some(OsStr::new("1"))));
+        assert!(no_color_requested(Some(OsStr::new("anything at all"))));
+        assert!(!no_color_requested(Some(OsStr::new(""))));
+        assert!(!no_color_requested(None));
     }
 
     fn session() -> Session {
