@@ -105,7 +105,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 633 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 643 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -308,6 +308,15 @@ fixed `name` file inside the session's directory — content, never a path compo
 — so a name cannot climb out of the store. Do not put a name in the domain's
 `Session`: the domain's id is already documented as a store key, and a name is the
 same kind of decision.
+
+**Change what the interface draws or scrolls.** The offset convention in
+`crates/nanus-tui/src/view.rs` is the trap that produced a real bug: `scroll_offset`
+counts rows skipped from the **top**, so `0` is the oldest content, `max_scroll()` is
+the newest, and a **positive delta moves toward the newest**. Two doc comments and the
+Page-Up mapping all said the opposite, so Page-Up scrolled forward and — from the bottom,
+where a live conversation sits — clamped and did nothing. Everything that appends to the
+conversation calls `ViewState::follow`, not `scroll_to_bottom`, so a reader who has
+scrolled away is not dragged back by the next streamed token.
 
 **Change how a session is opened.** `nanus_link::server::Registry` resolves a
 reference — live by name, live by id, then the store — and `Held` is what an agent

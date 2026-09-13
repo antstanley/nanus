@@ -126,22 +126,46 @@ conversation gets no such header: the person is already in it.
 | Key | Effect |
 |---|---|
 | `Enter` | submit |
-| `Alt+Enter` | newline |
+| `Alt+Enter` / `Shift+Enter` | newline |
 | `Ctrl+W` | delete the previous word |
+| `Ctrl+T` | summarise runs of tool calls |
+| `Ctrl+R` | summarise runs of reasoning |
 | `Ctrl+L` | clear the transcript |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
-| `PageUp` / `PageDown` | scroll the transcript |
+| `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
 | `Ctrl+C` / `Ctrl+D` / `Esc` | quit |
 
+`Shift+Enter` depends on the terminal, and that is worth stating plainly rather than
+leaving as a surprise. A terminal in its default mode sends *one byte* for `Enter`, and it
+is the same byte whether or not Shift is held: `Shift+Enter` is not a key a program is told
+about, it is a key that arrives as `Enter`. Terminals that implement the
+[kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) can say
+otherwise, so the interface asks for it when the terminal answers that it speaks it — and
+does not ask when it does not, because a terminal that does not understand the request may
+print the escape sequence instead. `Alt+Enter` is the spelling that works everywhere, which
+is why it is documented first.
+
+## Scrolling back
+
+The conversation follows the newest output until you scroll away from it, and follows
+again when you scroll back to the bottom. There is no key to press to resume and none to
+remember: `PageUp` means "I am reading something", and coming back down means "carry on".
+
+That rule exists because the alternative is unusable. Every streamed token used to pull the
+view to the bottom, so a reader who scrolled up during a turn was dragged back down on the
+next one — and from the bottom of a live conversation, where the view always sits, `PageUp`
+was also adding to an offset that counts rows skipped from the *top*, so it clamped and
+appeared to do nothing at all. Both are fixed, and both directions are pinned by tests.
+
 ## The composer
 
-`Enter` sends and `Alt+Enter` starts a new line, so a prompt can be a paragraph rather
-than a sentence. `Up` and `Down` move between those lines, and only from the top line do
-they browse submitted prompts, which is what keeps the single-line case behaving exactly
-as it did.
+`Enter` sends and `Alt+Enter` — or `Shift+Enter`, where the terminal reports it — starts a
+new line, so a prompt can be a paragraph rather than a sentence. `Up` and `Down` move
+between those lines, and only from the top line do they browse submitted prompts, which is
+what keeps the single-line case behaving exactly as it did.
 
-The composer grows with the prompt up to six rows and then scrolls to keep the line being
+The composer grows with the prompt up to five rows and then scrolls to keep the line being
 typed on screen, so a long prompt stays editable without squeezing the conversation out
 of the terminal.
 
@@ -153,10 +177,28 @@ below the window on exactly the prompts long enough to need the scroll. Owning t
 makes the caret's row a fact the interface knows rather than an estimate it hopes is
 right.
 
+## Summarising what is not the answer
+
+Two toggles fold the parts of a turn that are *about* the work rather than the work itself:
+
+| Key | Folds |
+|---|---|
+| `Ctrl+T` | runs of consecutive tool calls into `── 2 tool calls · bash, read` |
+| `Ctrl+R` | runs of reasoning into `── thinking · 1 part · 822 characters` |
+
+Two things make this useful rather than lossy. **A run is summarised, not each entry**: six
+tool calls in a row are one thought the model had, and six collapsed lines would be as noisy
+as the six lines they replaced — while two tool calls with an answer between them are two
+runs, because they are two thoughts. And **the summary keeps what a reader scanning for a
+problem needs**: how many calls, which tools, and whether any failed. The status line names
+what is folded, so a toggle is never a mystery about why the transcript looks short.
+
 ## What it shows, and why
 
-**Reasoning is dimmed and italic; the answer is not.** They are different things, and a
-reader scanning for the answer should be able to skip the thinking without reading it.
+**The answer is white; everything that is not the answer is marked.** Reasoning is dimmed
+and italic, tool activity is yellow, notices are blue — so a reader scanning for the answer
+can skip the thinking without reading it, and the thing they came for is not competing with
+a colour of its own.
 
 **Tool calls are paired with their results.** A call renders as `⚙ name(args)` and its
 result as `✓ name` or `✗ name`, so a failure is visible at a glance rather than being

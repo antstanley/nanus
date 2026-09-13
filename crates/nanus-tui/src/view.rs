@@ -37,7 +37,10 @@ impl Default for Theme {
             user: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-            assistant: Style::default().fg(Color::Green),
+            // White rather than a colour: the answer is the thing a reader came for, and
+            // the roles that are *not* the answer are the ones that should be marked. A
+            // colour here competes with the transcript instead of settling it.
+            assistant: Style::default().fg(Color::White),
             // Reasoning is dimmed deliberately: it is not the answer, and a reader
             // scanning for the answer should be able to skip it.
             reasoning: Style::default()
@@ -78,7 +81,7 @@ impl Theme {
 ///
 /// A prompt longer than this stays editable; the window moves so the line being
 /// typed is the one on screen.
-const MAX_COMPOSER_ROWS: u16 = 6;
+const MAX_COMPOSER_ROWS: u16 = 5;
 
 /// The rows the composer's border adds around its text.
 const COMPOSER_BORDER_ROWS: u16 = 2;
@@ -106,6 +109,12 @@ pub struct ViewState {
     pub input: InputBuffer,
     /// Rows scrolled off the top.
     pub scroll_offset: u32,
+    /// Whether new output should drag the view to the bottom.
+    ///
+    /// `false` once the reader has scrolled away from the bottom, and `true` again when
+    /// they scroll back to it. Without this a turn in progress is unreadable: every
+    /// streamed token would yank the view down while somebody was reading further up.
+    pub following: bool,
     /// `true` while a turn is open.
     pub busy: bool,
     /// The current step within the open turn.
@@ -114,6 +123,10 @@ pub struct ViewState {
     pub tokens_used: u64,
     /// What the model is currently doing, for the status line.
     pub status: String,
+    /// Whether runs of tool calls are drawn as one summary line.
+    pub collapse_tools: bool,
+    /// Whether runs of model reasoning are drawn as one summary line.
+    pub collapse_reasoning: bool,
     /// What to call the session in the title bar, when the interface is in one.
     ///
     /// A live conversation is a conversation *with something*, and once sessions can be
@@ -145,10 +158,13 @@ impl Default for ViewState {
             transcript: Transcript::new(),
             input: InputBuffer::new(),
             scroll_offset: 0,
+            following: true,
             busy: false,
             step: 0,
             tokens_used: 0,
             status: "ready".to_owned(),
+            collapse_tools: false,
+            collapse_reasoning: false,
             label: None,
             theme: Theme::default(),
             pending_scroll_back: None,
@@ -163,6 +179,7 @@ impl std::fmt::Debug for ViewState {
             .field("transcript", &self.transcript)
             .field("input", &self.input)
             .field("scroll_offset", &self.scroll_offset)
+            .field("following", &self.following)
             .field("busy", &self.busy)
             .field("step", &self.step)
             .field("tokens_used", &self.tokens_used)
@@ -196,10 +213,14 @@ impl ViewState {
 
     /// Adjusts the scroll offset by `rows`, clamping to the visible range.
     ///
-    /// `rows` is a **delta on [`ViewState::scroll_offset`]**, which counts rows
-    /// scrolled off the top: positive reveals older content, negative reveals newer
-    /// content. A key handler therefore passes `+rows_per_page` for Page-Up and
-    /// `-rows_per_page` for Page-Down.
+    /// `rows` is a **delta on [`ViewState::scroll_offset`]**, which counts rows skipped
+    /// from the top of the transcript: **positive moves toward the newest content** and
+    /// negative moves back toward the oldest. A key handler therefore passes a negative
+    /// delta for Page-Up and a positive one for Page-Down.
+    ///
+    /// This paragraph used to say the opposite, and the key handler believed it, so
+    /// Page-Up scrolled *forward* — from the bottom of a conversation, where a live one
+    /// always is, it clamped and appeared to do nothing at all.
     ///
     /// Scrolling past either end clamps, so the newest entry ends up flush with the
     /// bottom rather than the view scrolling into blank space.
@@ -223,9 +244,26 @@ impl ViewState {
         .clamp(0, maximum.max(0));
         let maximum_unsigned = u32::try_from(maximum.max(0)).unwrap_or(0);
         self.scroll_offset = u32::try_from(moved).unwrap_or(maximum_unsigned);
+        // Following is a consequence of where the reader is, not a separate command:
+        // scrolling away from the bottom stops new output dragging the view, and
+        // scrolling back to it resumes. That makes Page-Down a way to catch up rather
+        // than a key that has to be pressed after every turn.
+        self.following = self.scroll_offset >= maximum_unsigned;
         // Postcondition: the offset never exceeds the scrollable range, so a render
         // cannot look past the end of the transcript.
         assert!(self.scroll_offset <= maximum_unsigned);
+    }
+
+    /// Follows the newest output, unless the reader has scrolled away from it.
+    ///
+    /// Everything that appends to the conversation calls this rather than
+    /// [`ViewState::scroll_to_bottom`]: a reader who has scrolled up is reading
+    /// something, and dragging them back down on the next streamed token is how a
+    /// transcript becomes unreadable while a turn is running.
+    pub fn follow(&mut self) {
+        if self.following {
+            self.scroll_to_bottom();
+        }
     }
 
     /// Scrolls so the newest entry is visible.
@@ -233,6 +271,9 @@ impl ViewState {
     /// A no-op before the first render, because the offset that means "the bottom"
     /// depends on a viewport this view has not been given yet.
     pub fn scroll_to_bottom(&mut self) {
+        // Set before the early return, so a caller that scrolls before the first render
+        // still records the intent to follow.
+        self.following = true;
         let Some((_width, height)) = self.last_viewport else {
             return;
         };
@@ -241,8 +282,10 @@ impl ViewState {
     }
 
     /// Scrolls to the beginning of the conversation.
-    pub const fn scroll_to_top(&mut self) {
+    pub fn scroll_to_top(&mut self) {
         self.scroll_offset = 0;
+        // At the top by definition, so new output must not drag the reader away.
+        self.following = false;
     }
 
     /// Returns the largest valid scroll offset for the last drawn viewport.
@@ -357,7 +400,10 @@ impl ViewState {
         Line::from(Span::styled(format!("── {} ", entry.role().label()), style))
     }
 
-    /// Scrolls toward older content by `rows`, which is what a `PageUp` does.
+    /// Scrolls by `rows`: negative toward older content, positive toward newer.
+    ///
+    /// A `PageUp` passes a negative delta, which is what "back" means when the offset
+    /// counts rows off the top.
     pub fn scroll(&mut self, rows: i32) {
         // The viewport is whatever the last render measured; before the first render
         // there is nothing to scroll.
@@ -447,14 +493,94 @@ impl ViewState {
     #[must_use]
     pub fn transcript_lines(&self) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
-        for entry in self.transcript.entries() {
+        let entries = self.transcript.entries();
+        let mut index = 0;
+        while let Some(entry) = entries.get(index) {
+            // A *run* is what gets summarised, not each entry: six tool calls in a row
+            // are one thought the model had, and six collapsed lines would be as noisy
+            // as the six lines they replaced.
+            if self.collapse_tools && entry.role() == Role::Tool {
+                let run = Self::run_length(entries, index, Role::Tool);
+                lines.push(self.tool_summary(&entries[index..index.saturating_add(run)]));
+                lines.push(Line::from(""));
+                index = index.saturating_add(run);
+                continue;
+            }
+            if self.collapse_reasoning && entry.role() == Role::Reasoning {
+                let run = Self::run_length(entries, index, Role::Reasoning);
+                lines.push(self.reasoning_summary(&entries[index..index.saturating_add(run)]));
+                lines.push(Line::from(""));
+                index = index.saturating_add(run);
+                continue;
+            }
             lines.push(self.header_for(entry));
             lines.extend(self.lines_for(entry));
             // A blank row between entries, so two consecutive messages do not read
             // as one paragraph.
             lines.push(Line::from(""));
+            index = index.saturating_add(1);
         }
         lines
+    }
+
+    /// Counts the entries from `start` that carry `role`, consecutively.
+    fn run_length(entries: &[Entry], start: usize, role: Role) -> usize {
+        entries
+            .iter()
+            .skip(start)
+            .take_while(|entry| entry.role() == role)
+            .count()
+            .max(1)
+    }
+
+    /// Draws a run of tool activity as one line.
+    ///
+    /// The line keeps the two things a reader scanning for a problem needs — how much
+    /// happened, and whether any of it failed — and drops the part that is only wanted
+    /// when reading closely, which is what the toggle is for.
+    fn tool_summary(&self, run: &[Entry]) -> Line<'static> {
+        let mut calls: usize = 0;
+        let mut failures: usize = 0;
+        let mut names: Vec<&str> = Vec::new();
+        for entry in run {
+            match entry.kind() {
+                EntryKind::ToolCall { name, .. } => {
+                    calls = calls.saturating_add(1);
+                    if !names.contains(&name.as_str()) {
+                        names.push(name.as_str());
+                    }
+                }
+                EntryKind::ToolResult { is_error, .. } => {
+                    if *is_error {
+                        failures = failures.saturating_add(1);
+                    }
+                }
+                EntryKind::Text | EntryKind::Notice => {}
+            }
+        }
+        let plural = if calls == 1 { "call" } else { "calls" };
+        let failures = if failures > 0 {
+            format!(" · {failures} failed")
+        } else {
+            String::new()
+        };
+        Line::from(Span::styled(
+            format!("── {calls} tool {plural} · {}{failures}", names.join(", ")),
+            self.theme.tool,
+        ))
+    }
+
+    /// Draws a run of reasoning as one line.
+    fn reasoning_summary(&self, run: &[Entry]) -> Line<'static> {
+        let characters: usize = run.iter().map(|entry| entry.text().chars().count()).sum();
+        let parts = if run.len() == 1 { "part" } else { "parts" };
+        Line::from(Span::styled(
+            format!(
+                "── thinking · {} {parts} · {characters} characters",
+                run.len()
+            ),
+            self.theme.reasoning,
+        ))
     }
 
     /// Renders the conversation.
@@ -670,7 +796,27 @@ impl ViewState {
         } else {
             Span::raw("")
         };
-        frame.render_widget(Paragraph::new(Line::from(vec![busy, step, usage])), area);
+        // What is collapsed, so a reader who toggled something (or inherited a toggle
+        // from an earlier keypress) can see why the transcript looks the way it does.
+        let collapsed = if self.collapse_tools || self.collapse_reasoning {
+            let mut what: Vec<&str> = Vec::new();
+            if self.collapse_tools {
+                what.push("tools");
+            }
+            if self.collapse_reasoning {
+                what.push("thinking");
+            }
+            Span::styled(
+                format!("  ·  summarized: {}", what.join(" and ")),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Span::raw("")
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![busy, step, usage, collapsed])),
+            area,
+        );
     }
 }
 
@@ -993,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_down_reaches_the_newest_entry() {
+    fn scrolling_forward_reaches_the_newest_entry() {
         let entries: Vec<Entry> = (0..30)
             .map(|index| Entry::prose(Role::User, format!("entry {index}")))
             .collect();
@@ -1003,22 +1149,27 @@ mod tests {
         drop(rendered(&mut state, 40, 20));
         assert_eq!(state.scroll_offset, 0, "the beginning is shown first");
 
-        // Step toward newer content the way a key handler would.
+        // At the top there is nowhere older to go, so a backward step clamps.
         state.scroll_by(-4, 16, 40);
-        let after_one = state.scroll_offset;
-        assert_eq!(after_one, 0, "already at the newest content, so clamped");
+        assert_eq!(state.scroll_offset, 0, "already at the oldest content");
 
-        // Step toward older content, then back.
+        // Forward, toward the newest.
         state.scroll_by(4, 16, 40);
-        let after_up = state.scroll_offset;
-        assert_eq!(after_up, 4, "one step of four rows");
+        assert_eq!(state.scroll_offset, 4, "one step of four rows");
+        let text = rendered(&mut state, 40, 20);
+        assert!(
+            text.contains("entry 1") || text.contains("entry 2"),
+            "the view moved on from the first entry: {text}"
+        );
 
+        // And enough forward steps reach the end.
         for _ in 0..40 {
-            state.scroll_by(-4, 16, 40);
+            state.scroll_by(4, 16, 40);
         }
         assert_eq!(
-            state.scroll_offset, 0,
-            "stepping down returns to the newest content"
+            state.scroll_offset,
+            state.max_scroll(),
+            "stepping forward reaches the newest content"
         );
     }
 
@@ -1127,6 +1278,175 @@ mod tests {
             text.contains("a▏b"),
             "the caret sits between the two halves"
         );
+    }
+
+    /// A transcript long enough to scroll, one row per entry.
+    fn a_long_conversation(count: usize) -> ViewState {
+        let mut state = ViewState::new();
+        for index in 0..count {
+            state
+                .transcript
+                .push(Entry::prose(Role::User, format!("line {index}")));
+        }
+        state
+    }
+
+    #[test]
+    fn the_composer_stops_at_five_rows_and_the_window_follows_the_caret() {
+        // Five rows: a prompt worth writing gets room, and past that the conversation
+        // keeps its share of the screen.
+        let mut state = ViewState::new();
+        state
+            .input
+            .insert_str("alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot");
+        assert_eq!(
+            state.composer_rows(40),
+            5,
+            "six lines are drawn in five rows"
+        );
+        // The caret is on the last line, so the window has scrolled to it: the first
+        // line is the one that fell off, and the line being typed is still on screen.
+        let text = rendered(&mut state, 40, 24);
+        assert!(
+            text.contains("foxtrot"),
+            "the caret's line is drawn: {text}"
+        );
+        assert!(
+            !text.contains("alpha"),
+            "the first line scrolled off: {text}"
+        );
+    }
+
+    #[test]
+    fn scrolling_up_stops_the_newest_output_dragging_the_view() {
+        // The bug this pins: every streamed token called `scroll_to_bottom`, so a reader
+        // who scrolled up during a turn was pulled back down on the next token. A
+        // transcript cannot be read while it is being written unless scrolling away is
+        // respected.
+        let mut state = a_long_conversation(200);
+        let _ = rendered(&mut state, 60, 20);
+        state.scroll_to_bottom();
+        state.scroll_to_bottom();
+        let bottom = state.scroll_offset;
+        assert!(bottom > 0, "the conversation is longer than the viewport");
+        assert!(state.following, "a reader at the bottom is following");
+
+        // A negative delta is what a Page-Up asks the runtime for.
+        state.scroll(-10);
+        let scrolled = state.scroll_offset;
+        assert!(scrolled < bottom, "Page-Up moved back through the history");
+        assert!(!state.following, "and stopped following");
+
+        // New output arrives while the reader is looking further up.
+        state
+            .transcript
+            .append_stream(Role::Assistant, "a new token", false);
+        state.follow();
+        assert_eq!(
+            state.scroll_offset, scrolled,
+            "the reader was left where they were"
+        );
+
+        // Scrolling back to the bottom resumes following, so no key has to be remembered.
+        for _ in 0..8 {
+            state.scroll(10);
+        }
+        assert!(state.following, "back at the bottom, following again");
+        state
+            .transcript
+            .append_stream(Role::Assistant, "another", false);
+        state.follow();
+        assert_eq!(
+            state.max_scroll(),
+            state.scroll_offset,
+            "and the newest line is in view"
+        );
+    }
+
+    #[test]
+    fn scrolling_to_the_top_does_not_follow() {
+        // The other end of the same rule: the top is not the bottom.
+        let mut state = a_long_conversation(200);
+        let _ = rendered(&mut state, 60, 20);
+        state.scroll_to_top();
+        assert!(!state.following);
+        state.follow();
+        assert_eq!(state.scroll_offset, 0, "the view stayed at the top");
+    }
+
+    #[test]
+    fn a_run_of_tool_calls_is_one_line_when_summarized() {
+        let mut state = state_with(vec![
+            Entry::prose(Role::User, "do the thing"),
+            Entry::tool_call("read", "{}"),
+            Entry::tool_result("read", false, "contents"),
+            Entry::tool_call("grep", "{}"),
+            Entry::tool_result("grep", true, "no match"),
+            Entry::prose(Role::Assistant, "done"),
+        ]);
+        // Off by default: the detail is what a reader asked for by running a tool.
+        let plain = rendered(&mut state, 80, 24);
+        assert!(plain.contains("read"), "the call is drawn in full: {plain}");
+        assert!(plain.contains("contents"), "and its result");
+
+        state.collapse_tools = true;
+        let folded = rendered(&mut state, 80, 24);
+        assert!(
+            folded.contains("2 tool calls"),
+            "the run is counted: {folded}"
+        );
+        assert!(folded.contains("read, grep"), "and named: {folded}");
+        assert!(
+            folded.contains("1 failed"),
+            "and failures survive: {folded}"
+        );
+        // The point of folding: the detail is gone.
+        assert!(
+            !folded.contains("contents"),
+            "the output is hidden: {folded}"
+        );
+        // And a reader can see the toggle is on.
+        assert!(folded.contains("summarized: tools"), "{folded}");
+        // What was *not* asked for is untouched.
+        assert!(folded.contains("do the thing"));
+        assert!(folded.contains("done"));
+    }
+
+    #[test]
+    fn a_run_of_reasoning_is_one_line_when_summarized() {
+        let mut state = state_with(vec![Entry::prose(Role::Reasoning, "weighing options")]);
+        let plain = rendered(&mut state, 80, 24);
+        assert!(plain.contains("weighing options"));
+
+        state.collapse_reasoning = true;
+        let folded = rendered(&mut state, 80, 24);
+        assert!(
+            folded.contains("thinking · 1 part · 16 characters"),
+            "the run is sized: {folded}"
+        );
+        assert!(!folded.contains("weighing options"), "{folded}");
+        assert!(folded.contains("summarized: thinking"), "{folded}");
+    }
+
+    #[test]
+    fn only_sequential_runs_are_summarized() {
+        // "Sequential" is the whole of it: two tool calls with an answer between them are
+        // two thoughts, and folding them into one line would misrepresent the turn.
+        let mut state = state_with(vec![
+            Entry::tool_call("read", "{}"),
+            Entry::tool_result("read", false, "one"),
+            Entry::prose(Role::Assistant, "a sentence between them"),
+            Entry::tool_call("write", "{}"),
+            Entry::tool_result("write", false, "two"),
+        ]);
+        state.collapse_tools = true;
+        let folded = rendered(&mut state, 80, 24);
+        assert_eq!(
+            folded.matches("1 tool call ·").count(),
+            2,
+            "two runs of one: {folded}"
+        );
+        assert!(folded.contains("a sentence between them"), "{folded}");
     }
 
     #[test]
@@ -1311,6 +1631,14 @@ mod tests {
             // monochrome-scanned transcript.
             assert!(style != Style::default() || role == Role::Harness);
         }
+        // The answer is white, as asked for. Checked on the style rather than on a
+        // capture, because a terminal that already draws in white emits no escape for
+        // it and the rendering looks identical either way.
+        assert_eq!(
+            Theme::default().assistant.fg,
+            Some(Color::White),
+            "the model's answer is drawn in white"
+        );
         let failure = Entry::tool_result("read", true, "x");
         assert_eq!(theme.style_for_entry(&failure), theme.error);
     }

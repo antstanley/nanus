@@ -26,11 +26,13 @@
 //! | Key | Effect |
 //! |---|---|
 //! | `Enter` | submit the composer |
-//! | `Alt+Enter` | insert a newline |
+//! | `Alt+Enter` / `Shift+Enter` | insert a newline |
 //! | `Backspace` / `Delete` | delete a character |
 //! | `Ctrl+W` | delete a word |
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
 //! | `PageUp` / `PageDown` | scroll the transcript |
+//! | `Ctrl+T` | summarise runs of tool calls |
+//! | `Ctrl+R` | summarise runs of reasoning |
 //! | `Ctrl+L` | clear the transcript |
 //! | `Ctrl+C` / `Ctrl+D` | quit |
 
@@ -66,14 +68,24 @@ const FRAME_BUFFER: usize = 256;
 /// — the failure that makes a TUI feel broken even after it is fixed.
 struct TerminalGuard {
     terminal: DefaultTerminal,
+    /// Whether the keyboard protocol was asked for, so it is only given back if it was.
+    enhanced: bool,
 }
 
 impl TerminalGuard {
-    /// Enters raw mode and the alternate screen.
+    /// Enters raw mode, the alternate screen, and — where the terminal supports it — the
+    /// keyboard protocol that reports modifiers.
+    ///
+    /// A terminal in its default mode sends one byte for `Enter`, and it is the same byte
+    /// whether or not Shift is held: `Shift+Enter` is not a key a program is told about,
+    /// it is a key that arrives as `Enter`. Terminals that implement the kitty keyboard
+    /// protocol can say otherwise, so the protocol is requested when the terminal
+    /// answers that it speaks it, and not requested when it does not — a terminal that
+    /// does not understand the request may print the escape sequence instead.
     fn enter() -> Self {
-        Self {
-            terminal: ratatui::init(),
-        }
+        let terminal = ratatui::init();
+        let enhanced = enable_keyboard_protocol();
+        Self { terminal, enhanced }
     }
 
     /// Returns the terminal to draw into.
@@ -84,7 +96,48 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.enhanced {
+            // Given back before the screen is restored, so the shell that inherits the
+            // terminal does not inherit a keyboard mode it never asked for.
+            use crossterm::event::PopKeyboardEnhancementFlags;
+            let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         ratatui::restore();
+    }
+}
+
+/// Asks the terminal to report key modifiers, if it can.
+///
+/// Returns whether the request was made. Anything that goes wrong — a terminal that does
+/// not answer, a write that fails — leaves the interface exactly as it was before the
+/// feature existed, which is why this is a best-effort upgrade rather than a requirement.
+fn enable_keyboard_protocol() -> bool {
+    use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+
+    match crossterm::terminal::supports_keyboard_enhancement() {
+        Ok(true) => {
+            // `DISAMBIGUATE_ESCAPE_CODES` is the flag that makes `Shift+Enter` its own
+            // key rather than another `Enter`. The others are deliberately not asked for:
+            // reporting key *release* would double every keystroke, and reporting
+            // alternate keys would make `Ctrl+T` arrive as something else on keyboards
+            // with dead keys.
+            let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+            match crossterm::execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, "the keyboard protocol could not be enabled");
+                    false
+                }
+            }
+        }
+        Ok(false) => {
+            tracing::debug!("this terminal does not report key modifiers");
+            false
+        }
+        Err(error) => {
+            tracing::debug!(%error, "the keyboard protocol could not be queried");
+            false
+        }
     }
 }
 
@@ -573,6 +626,7 @@ enum Outcome {
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         KeyCode::Char('c' | 'd') if control => Outcome::Quit,
         KeyCode::Char('l') if control => {
@@ -583,7 +637,19 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.input.delete_word();
             Outcome::Continue
         }
-        KeyCode::Enter if alt => {
+        KeyCode::Char('t') if control => {
+            view.collapse_tools = !view.collapse_tools;
+            Outcome::Continue
+        }
+        KeyCode::Char('r') if control => {
+            view.collapse_reasoning = !view.collapse_reasoning;
+            Outcome::Continue
+        }
+        // Shift+Enter reaches here only from a terminal that reports it as distinct from
+        // Enter — see `TerminalGuard::enter`. Elsewhere it is the same byte, and a newline
+        // in a prompt is not worth breaking the submit key for, so `Alt+Enter` stays the
+        // spelling that always works.
+        KeyCode::Enter if alt || shift => {
             view.input.insert('\n');
             Outcome::Continue
         }
@@ -636,11 +702,14 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             Outcome::Continue
         }
         KeyCode::PageUp => {
-            view.scroll(PAGE_ROWS);
+            // Back in time. The offset counts rows skipped from the top, so older content
+            // is *less* offset — and this was the other way round, which is why Page-Up
+            // did nothing at all from the bottom of a conversation.
+            view.scroll(-PAGE_ROWS);
             Outcome::Continue
         }
         KeyCode::PageDown => {
-            view.scroll(-PAGE_ROWS);
+            view.scroll(PAGE_ROWS);
             Outcome::Continue
         }
         KeyCode::Esc => Outcome::Quit,
@@ -654,19 +723,21 @@ fn apply(frame: Frame, view: &mut ViewState) {
         Frame::Text { delta } => {
             view.transcript
                 .append_stream(Role::Assistant, &delta, false);
-            view.scroll_to_bottom();
+            view.follow();
         }
         Frame::Reasoning { delta } => {
             view.transcript
                 .append_stream(Role::Reasoning, &delta, false);
-            view.scroll_to_bottom();
+            view.follow();
         }
         Frame::User { text } => {
             // Somebody else's prompt in a session this interface is watching: the
             // reader needs to see the question before the answer.
             view.transcript.push(Entry::prose(Role::User, text));
             view.begin_turn(1);
-            view.scroll_to_bottom();
+            // Somebody else's prompt is not a reason to drag a reader who is looking
+            // further up: they are reading, and this is not their action.
+            view.follow();
         }
         Frame::Step { step } => view.begin_turn(step),
         Frame::Tool { name } => {
@@ -680,7 +751,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
         Frame::Done { answer } => {
             view.transcript.push(Entry::prose(Role::Assistant, answer));
             view.end_turn();
-            view.scroll_to_bottom();
+            view.follow();
         }
         Frame::Failed { message } => {
             view.transcript.push(Entry::notice(message));
@@ -802,6 +873,111 @@ mod tests {
             Outcome::Continue
         ));
         assert_eq!(view.input.text(), "line\n");
+    }
+
+    #[test]
+    fn shift_enter_starts_a_new_line_and_plain_enter_still_submits() {
+        // Shift+Enter only arrives as itself from a terminal that reports modifiers; the
+        // point of the test is that when it does, it does the thing a person expects
+        // rather than submitting half a prompt.
+        let mut view = ViewState::new();
+        view.input.insert_str("line");
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT), &mut view),
+            Outcome::Continue
+        ));
+        assert_eq!(view.input.text(), "line\n");
+
+        view.input.insert_str("more");
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view),
+            Outcome::Submit(prompt) if prompt == "line\nmore"
+        ));
+    }
+
+    #[test]
+    fn ctrl_t_and_ctrl_r_toggle_the_summaries() {
+        let mut view = ViewState::new();
+        assert!(!view.collapse_tools);
+        assert!(!view.collapse_reasoning);
+
+        let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &mut view);
+        assert!(view.collapse_tools, "Ctrl-T summarizes tool runs");
+        assert!(!view.collapse_reasoning, "and nothing else");
+        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+        assert!(view.collapse_reasoning, "Ctrl-R summarizes thinking");
+
+        // Both toggles go back off, and the letters alone are still characters.
+        let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &mut view);
+        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+        assert!(!view.collapse_tools);
+        assert!(!view.collapse_reasoning);
+        let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.input.text(), "t", "a bare letter is still text");
+    }
+
+    #[test]
+    fn page_up_moves_back_through_the_conversation() {
+        // The bug this pins: the offset counts rows skipped from the top, and Page-Up was
+        // adding to it. From the bottom — where a live conversation always is — that
+        // clamped, so Page-Up did nothing at all and scrolling back looked broken.
+        let mut view = ViewState::new();
+        for index in 0..200 {
+            view.transcript
+                .push(Entry::prose(Role::User, format!("entry {index}")));
+        }
+        // Any scroll tells the view what it is scrolling inside; twenty rows of
+        // conversation is the shape of a small terminal.
+        view.scroll_by(0, 20, 60);
+        view.scroll_to_bottom();
+        let bottom = view.scroll_offset;
+        assert!(bottom > 0, "the conversation is longer than the viewport");
+
+        let _ = handle_key(key(KeyCode::PageUp, KeyModifiers::NONE), &mut view);
+        let after_up = view.scroll_offset;
+        assert!(
+            after_up < bottom,
+            "Page-Up went back: {after_up} < {bottom}"
+        );
+        assert!(!view.following, "and stopped following the newest output");
+
+        let _ = handle_key(key(KeyCode::PageDown, KeyModifiers::NONE), &mut view);
+        assert!(
+            view.scroll_offset > after_up,
+            "Page-Down came forward again"
+        );
+    }
+
+    #[test]
+    fn streamed_output_does_not_drag_a_reader_who_scrolled_back() {
+        // The end-to-end version of the rule: a turn in progress must not fight the
+        // reader. Every streamed frame used to call `scroll_to_bottom`, so scrolling back
+        // during a turn was impossible — the next token pulled the view down again.
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        for index in 0..200 {
+            view.transcript
+                .push(Entry::prose(Role::User, format!("entry {index}")));
+        }
+        view.scroll_by(0, 20, 60);
+        view.scroll_to_bottom();
+        let _ = handle_key(key(KeyCode::PageUp, KeyModifiers::NONE), &mut view);
+        let reading = view.scroll_offset;
+
+        for delta in ["a new ", "token ", "arrives"] {
+            assert!(
+                sender
+                    .try_send(Frame::Text {
+                        delta: delta.to_owned()
+                    })
+                    .is_ok()
+            );
+        }
+        drain_frames(&mut receiver, &mut view);
+        assert_eq!(
+            view.scroll_offset, reading,
+            "the reader was left where they were while the model kept talking"
+        );
     }
 
     #[test]
