@@ -627,21 +627,26 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // The control bindings match either case, and that is not tidiness. A terminal that
+    // reports modifiers reports the *character* its modifier state produces, so with Caps
+    // Lock on `Ctrl+C` arrives as `Char('C')` with CONTROL. Matching only the lowercase
+    // form left the interface impossible to quit and the toggles dead — the same mistake
+    // as reading a key without asking what the modifiers did to it.
     match key.code {
-        KeyCode::Char('c' | 'd') if control => Outcome::Quit,
-        KeyCode::Char('l') if control => {
+        KeyCode::Char('c' | 'C' | 'd' | 'D') if control => Outcome::Quit,
+        KeyCode::Char('l' | 'L') if control => {
             view.transcript.clear();
             Outcome::Continue
         }
-        KeyCode::Char('w') if control => {
+        KeyCode::Char('w' | 'W') if control => {
             view.input.delete_word();
             Outcome::Continue
         }
-        KeyCode::Char('t') if control => {
+        KeyCode::Char('t' | 'T') if control => {
             view.collapse_tools = !view.collapse_tools;
             Outcome::Continue
         }
-        KeyCode::Char('r') if control => {
+        KeyCode::Char('r' | 'R') if control => {
             view.collapse_reasoning = !view.collapse_reasoning;
             Outcome::Continue
         }
@@ -659,7 +664,7 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         // protocol above does not help there: the terminal is not reporting a key at all,
         // it is typing a character. Ctrl+J has meant "new line" since readline, so this is
         // the same binding twice over rather than a special case.
-        KeyCode::Char('j') if control => {
+        KeyCode::Char('j' | 'J') if control => {
             view.input.insert('\n');
             Outcome::Continue
         }
@@ -931,6 +936,72 @@ mod tests {
         kitty.input.insert_str("line");
         let _ = handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT), &mut kitty);
         assert_eq!(kitty.input.text(), view.input.text());
+    }
+
+    #[test]
+    fn a_control_binding_works_whatever_case_the_terminal_reports() {
+        // Reported by injecting what Caps Lock produces once the keyboard protocol is on:
+        // the terminal reports the character its modifier state makes, so `Ctrl+C` arrives
+        // as `Char('C')` with CONTROL. Matching only lowercase left the interface
+        // impossible to quit.
+        for character in ['c', 'C', 'd', 'D'] {
+            let mut view = ViewState::new();
+            assert!(
+                matches!(
+                    handle_key(
+                        key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                        &mut view
+                    ),
+                    Outcome::Quit
+                ),
+                "Ctrl+{character} quits"
+            );
+        }
+
+        // And the toggles, which were equally dead in the shifted case.
+        for character in ['t', 'T'] {
+            let mut view = ViewState::new();
+            let _ = handle_key(
+                key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                &mut view,
+            );
+            assert!(view.collapse_tools, "Ctrl+{character} toggles tools");
+        }
+        for character in ['r', 'R'] {
+            let mut view = ViewState::new();
+            let _ = handle_key(
+                key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                &mut view,
+            );
+            assert!(view.collapse_reasoning, "Ctrl+{character} toggles thinking");
+        }
+        for character in ['j', 'J'] {
+            let mut view = ViewState::new();
+            let _ = handle_key(
+                key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                &mut view,
+            );
+            assert_eq!(view.input.text(), "\n", "Ctrl+{character} starts a line");
+        }
+    }
+
+    #[test]
+    fn a_shifted_character_is_inserted_as_the_terminal_sent_it() {
+        // A terminal that reports key modifiers attaches SHIFT to the *characters* those
+        // modifiers produce: `?` arrives as `Char('?')` with SHIFT rather than as a bare
+        // `?`. That is the shape that breaks a keymap comparing whole key events — a
+        // binding written `<?>` stops firing while `Shift-?>` keeps working, which is
+        // ratatui/templates#26 — and it is not a problem here, because the handler reads
+        // the key *code* and ignores the modifiers when inserting text. The terminal has
+        // already decided which character the key produced.
+        let mut view = ViewState::new();
+        for character in ['?', '!', '@', '#', 'A'] {
+            let _ = handle_key(
+                key(KeyCode::Char(character), KeyModifiers::SHIFT),
+                &mut view,
+            );
+        }
+        assert_eq!(view.input.text(), "?!@#A");
     }
 
     #[test]

@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.4s] 645 tests run: 645 passed, 0 skipped
+Summary [2.9s] 647 tests run: 647 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
@@ -163,3 +163,20 @@ Two changes, one line each: `Ctrl+J` starts a line, and a character with Control
 longer text. Alt is deliberately not guarded the same way, because on many terminals an
 Option or Alt press arrives as `Alt+<letter>` on its way to producing a character, and
 swallowing those would stop some keyboards typing at all.
+
+The same investigation turned up a hazard this interface happens to avoid, and it is worth
+recording because the next binding may not. A terminal that reports modifiers attaches
+`SHIFT` to the characters those modifiers produce: `?` arrives as `Char('?')` *with*
+`SHIFT`. A binding that compares whole key events then fails for exactly the keys someone
+tests by pressing them, while `Shift-?` works — [ratatui/templates#26][shift-issue]. The key
+handler here reads the key *code* and ignores modifiers when inserting text, so typing is
+unaffected, and there is now a test that fails if that stops being true.
+
+Asking the same question of the *control* bindings found one that was wrong, by injecting
+the bytes a terminal sends for `Ctrl+C` with Caps Lock on: `Char('C')` with `CONTROL`.
+Nothing happened — with the keyboard protocol enabled, the interface could not be quit and
+its toggles were dead for anyone typing in capitals. The bindings now match either case.
+Injection is what made this visible: the parsed event was already in hand, and the question
+"what does the modifier do to the character" had simply not been asked of it.
+
+[shift-issue]: https://github.com/ratatui/templates/issues/26

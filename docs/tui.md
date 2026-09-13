@@ -153,6 +153,16 @@ conversation gets no such header: the person is already in it.
 
 `Alt+Enter` is the spelling that works regardless, which is why it is documented first.
 
+A related hazard worth knowing before adding a binding of your own: **a terminal that
+reports modifiers attaches `SHIFT` to the characters those modifiers produce.** `?` arrives
+as `Char('?')` *with* `SHIFT`, not as a bare `?`. A binding that compares whole key events
+therefore fails for exactly the keys a person tests by pressing them — `!`, `?`, `#` —
+while `Shift-?` works, which is [ratatui/templates#26][shift-issue]. This interface reads
+the key *code* and ignores the modifiers when inserting text, so typing is unaffected; a
+new binding should do the same, and there is a test that fails if it does not.
+
+[shift-issue]: https://github.com/ratatui/templates/issues/26
+
 ## Scrolling back
 
 The conversation follows the newest output until you scroll away from it, and follows
