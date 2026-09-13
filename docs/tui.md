@@ -186,6 +186,22 @@ The composer grows with the prompt up to five rows and then scrolls to keep the 
 typed on screen, so a long prompt stays editable without squeezing the conversation out
 of the terminal.
 
+The caret is a **style on the cell it is over**, not a glyph in a cell of its own. Drawn as
+a glyph it took a column of its own, so every character after it slid one place to the right
+whenever the cursor moved — which reads as the cursor displacing the text it is moving
+across, and is worst exactly where a caret is most useful: in the middle of a word being
+corrected. Moving the cursor through `corvid` now leaves the word drawn identically at every
+position, with only the reversed cell moving. Past the last character there is nothing to
+reverse, so the caret becomes one cell: a block where the next keystroke will land.
+
+One case has nowhere to put it. When a row is *exactly* full and the caret is at its end,
+there is no cell one past the last character, so the cursor is invisible for the keystroke in
+which a prompt crosses a row boundary. A terminal moves the cursor to a fresh line there;
+here that would mean letting the caret sit on the continuation indent, which is a cell the
+row model does not have — a row holds text, and the prefix is drawn beside it. Left as a
+known gap rather than half-fixed, because the arithmetic that places the caret has been wrong
+twice already and this case is cosmetic and lasts one keystroke.
+
 Its wrapping is done here rather than left to the drawing library, and that is deliberate.
 The row a character lands on is what decides whether the composer has to scroll, and a
 word-boundary wrapper moves a word that does not fit onto a new row instead of filling

@@ -856,14 +856,26 @@ impl ComposerLayout {
             }
             if index == self.caret_row {
                 let characters: Vec<char> = row.text.chars().collect();
-                // A caret at the end of a full row belongs after its last character,
-                // which is a column one past the text rather than inside it.
+                // A caret at the end of a row belongs after its last character, which is
+                // a column one past the text rather than inside it.
                 let column = self.caret_column.min(characters.len());
                 let before: String = characters.iter().take(column).collect();
-                let after: String = characters.iter().skip(column).collect();
+                let after: String = characters.iter().skip(column.saturating_add(1)).collect();
                 spans.push(Span::styled(before, Style::default()));
+                // The caret is a *style on the cell it is over*, not a glyph in a cell of
+                // its own. Drawn as a glyph it took a column, so every character after it
+                // slid one place to the right whenever the cursor moved — which reads as
+                // the cursor displacing the text it is moving across, and is worst
+                // exactly where a caret is most useful: in the middle of a word being
+                // corrected. Reversing the cell leaves the text where the user put it.
+                //
+                // Past the last character there is no cell to reverse, so the caret
+                // becomes one: a block in the space the next character will occupy.
+                let under: String = characters
+                    .get(column)
+                    .map_or_else(|| String::from(" "), char::to_string);
                 spans.push(Span::styled(
-                    "▏",
+                    under,
                     Style::default().add_modifier(Modifier::REVERSED),
                 ));
                 spans.push(Span::styled(after, Style::default()));
@@ -978,20 +990,41 @@ mod tests {
 
     /// Renders `state` into a test terminal and returns the buffer as text.
     fn rendered(state: &mut ViewState, width: u16, height: u16) -> String {
+        draw_with_caret(state, width, height).0
+    }
+
+    /// Draws the view, returning the rendered text and the cell the caret is drawn on.
+    ///
+    /// The caret is a *style* rather than a glyph, so a test that looked only at the text
+    /// could not tell whether one was drawn at all. The row comes back with the symbol
+    /// because "the caret is on screen" is only half of what the tests need to say; "on
+    /// the right row, over the right character" is the other half.
+    fn draw_with_caret(
+        state: &mut ViewState,
+        width: u16,
+        height: u16,
+    ) -> (String, Option<(u16, String)>) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("a test terminal always builds");
         let drawn = terminal.draw(|frame| state.render(frame));
         assert!(drawn.is_ok(), "rendering must not fail");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
+        let mut caret: Option<(u16, String)> = None;
         for row in 0..buffer.area.height {
             for column in 0..buffer.area.width {
-                let cell = buffer.cell((column, row));
-                text.push_str(cell.map_or(" ", ratatui::buffer::Cell::symbol));
+                let Some(cell) = buffer.cell((column, row)) else {
+                    text.push(' ');
+                    continue;
+                };
+                text.push_str(cell.symbol());
+                if caret.is_none() && cell.style().add_modifier.contains(Modifier::REVERSED) {
+                    caret = Some((row, cell.symbol().to_owned()));
+                }
             }
             text.push('\n');
         }
-        text
+        (text, caret)
     }
 
     fn state_with(entries: Vec<Entry>) -> ViewState {
@@ -1268,15 +1301,80 @@ mod tests {
     }
 
     #[test]
-    fn the_composer_shows_the_cursor_position() {
+    fn the_composer_shows_the_cursor_position_without_moving_the_text() {
+        // The bug this pins: the caret was drawn as a glyph in a column of its own, so
+        // every character after it slid one place right whenever the cursor moved. In the
+        // middle of a word being corrected that reads as the cursor displacing the text
+        // it is moving across.
         let mut state = ViewState::new();
         state.input = InputBuffer::with_text("ab");
         state.input.move_home();
         state.input.move_right();
-        let text = rendered(&mut state, 60, 12);
+        let (text, caret) = draw_with_caret(&mut state, 60, 12);
         assert!(
-            text.contains("a▏b"),
-            "the caret sits between the two halves"
+            text.contains("ab"),
+            "the letters stay where they were: {text}"
+        );
+        assert!(
+            !text.contains('▏'),
+            "no caret glyph is drawn at all: {text}"
+        );
+        let (caret_row, symbol) = caret.expect("the caret is drawn");
+        assert_eq!(symbol, "b", "over the character after the insertion point");
+        assert_eq!(
+            usize::from(caret_row),
+            text.lines()
+                .position(|line| line.contains("ab"))
+                .expect("the composer's row is drawn"),
+            "on the row the text is drawn on"
+        );
+    }
+
+    #[test]
+    fn the_caret_past_the_last_character_is_a_block_where_the_next_one_goes() {
+        // There is no character to reverse at the end of a prompt, so the caret becomes
+        // one cell: a block in the space the next keystroke will occupy.
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("ab");
+        let (text, caret) = draw_with_caret(&mut state, 60, 12);
+        assert!(text.contains("ab"), "{text}");
+        assert_eq!(caret.map(|(_, symbol)| symbol), Some(String::from(" ")));
+    }
+
+    #[test]
+    fn moving_the_cursor_through_a_word_never_changes_where_the_letters_are() {
+        // The property behind the report, stated directly: the drawn text is the same
+        // wherever the cursor is. Only the reversed cell moves.
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("corvid");
+        let mut drawn = Vec::new();
+        for _ in 0..=6 {
+            let (text, caret) = draw_with_caret(&mut state, 60, 12);
+            drawn.push((text, caret));
+            state.input.move_left();
+        }
+        for (index, (text, _)) in drawn.iter().enumerate() {
+            assert!(
+                text.contains("corvid"),
+                "the word is intact with the cursor {index} steps from the end: {text}"
+            );
+        }
+        // And the caret did move: six steps of `move_left` visit six cells.
+        let cells: Vec<Option<String>> = drawn
+            .iter()
+            .map(|(_, caret)| caret.as_ref().map(|(_, symbol)| symbol.clone()))
+            .collect();
+        assert_eq!(
+            cells,
+            vec![
+                Some(String::from(" ")),
+                Some(String::from("d")),
+                Some(String::from("i")),
+                Some(String::from("v")),
+                Some(String::from("r")),
+                Some(String::from("o")),
+                Some(String::from("c")),
+            ]
         );
     }
 
@@ -1542,10 +1640,10 @@ mod tests {
         assert_eq!(rows, MAX_COMPOSER_ROWS, "a wrapped line grows the composer");
         // And the caret at the end of that one long line is still on screen, which is
         // what a line-based offset got wrong.
-        let text = rendered(&mut state, 40, 12);
+        let (text, caret) = draw_with_caret(&mut state, 40, 12);
         assert!(
-            text.contains('▏'),
-            "the caret must stay visible when its line wraps"
+            caret.is_some(),
+            "the caret must stay visible when its line wraps: {text}"
         );
     }
 
@@ -1555,14 +1653,24 @@ mod tests {
         let mut text = "y".repeat(500);
         text.push_str("\nlast");
         state.input = InputBuffer::with_text(&text);
-        let drawn = rendered(&mut state, 40, 12);
+        let (drawn, caret) = draw_with_caret(&mut state, 40, 12);
         // `with_text` leaves the caret at the end of the text, which is on the line
         // after a very tall wrapped one. The caret can only be on screen if the window
         // has scrolled, and it has to be *at* the caret rather than one row short of it:
         // the row a long word wraps onto is not the row a character count predicts.
         assert!(
-            drawn.contains("last▏"),
+            drawn.contains("last"),
             "the caret's line is visible: {drawn}"
+        );
+        let caret_row = caret.expect("the caret is drawn").0;
+        let last_row = drawn
+            .lines()
+            .position(|line| line.contains("last"))
+            .expect("the wrapped tail is drawn");
+        assert_eq!(
+            usize::from(caret_row),
+            last_row,
+            "the caret is on the row with the text it follows: {drawn}"
         );
     }
 
@@ -1581,11 +1689,17 @@ mod tests {
         let mut state = ViewState::new();
         state.input = InputBuffer::with_text("ab\ncd");
         state.input.move_home();
-        let text = rendered(&mut state, 40, 12);
+        let (text, caret) = draw_with_caret(&mut state, 40, 12);
         assert!(text.contains("ab"), "the first line is drawn");
-        assert!(
-            text.contains("▏cd"),
-            "the caret is on the second line, before its text"
+        assert!(text.contains("cd"), "and the second, undisplaced");
+        let (caret_row, symbol) = caret.expect("the caret is drawn");
+        assert_eq!(symbol, "c", "over the first character of the second line");
+        assert_eq!(
+            usize::from(caret_row),
+            text.lines()
+                .position(|line| line.contains("cd"))
+                .expect("the second line is drawn"),
+            "on the row that line is drawn on"
         );
     }
 
