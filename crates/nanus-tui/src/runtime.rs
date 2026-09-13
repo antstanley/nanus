@@ -30,24 +30,19 @@ use core::future::Future;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Duration;
 
+use crossterm::event::EventStream;
+use futures::StreamExt as _;
 use nanus_bundle::{AgentRunner, Harness, Progress};
 use nanus_domain::{Session, ToolName, Usage};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use tokio::sync::mpsc;
 
 use crate::transcript::{Entry, Role};
 use crate::view::ViewState;
-
-/// How long to wait for a terminal event before redrawing.
-///
-/// A short poll keeps streaming text visible without spinning: the loop wakes often
-/// enough to paint a delta and rarely enough to stay idle.
-const TICK: Duration = Duration::from_millis(50);
 
 /// Rows scrolled per `PageUp` or `PageDown`.
 const PAGE_ROWS: i32 = 10;
@@ -353,6 +348,29 @@ pub fn run_source(source: &dyn SessionSource) -> io::Result<()> {
     // the ones added later, and it is the last point at which the answer is still an
     // error rather than a panic.
     require_terminal(interactive())?;
+    // The loop runs on the kernel runtime with a local task set, because a submitted
+    // prompt becomes a `!Send` local task: the agent's state is `Rc`-shared and the kernel
+    // is single-threaded, so `tokio::spawn` cannot carry it. `spawn_local` is both legal
+    // and *driven* only inside a local set, and a set that is merely entered never polls
+    // what it spawned — so the set has to own the `block_on`.
+    let outcome = nanus_kernel::runtime::block_on_local(event_loop(source));
+    // Torn down outside the runtime: shutting the composition down drives its own
+    // `block_on`, which cannot be nested inside a running one. A shutdown that fails still
+    // exits — the terminal has already been restored by the guard, and the run is over.
+    if let Err(error) = source.shutdown() {
+        tracing::warn!(%error, "the composition did not shut down cleanly");
+    }
+    outcome
+}
+
+/// The event loop: draw, then wait for a keystroke or for the turn to make progress.
+///
+/// Asynchronous rather than a blocking poll for input, and that is the whole point. A
+/// turn runs as a local task on this same thread, so waiting synchronously for a key — or
+/// sleeping for a redraw tick — would stop the model's stream from being polled at all.
+/// The interface would show a frozen turn and then deliver the entire answer at once,
+/// which is exactly the freeze the local task exists to prevent.
+async fn event_loop(source: &dyn SessionSource) -> io::Result<()> {
     let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
     // The transcript comes from the session itself, so a recorded one looks exactly like
@@ -378,52 +396,63 @@ pub fn run_source(source: &dyn SessionSource) -> io::Result<()> {
 
     let (sender, mut receiver) = mpsc::channel::<Update>(256);
     let runner: Option<Rc<AgentRunner>> = source.runner().map(Rc::clone);
+    let mut events = EventStream::new();
 
     loop {
         guard.terminal().draw(|frame| view.render(frame))?;
-        if event::poll(TICK)? {
-            let TerminalEvent::Key(key) = event::read()? else {
-                continue;
-            };
-            // Windows reports both press and release; only a press is a keystroke.
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match handle_key(key, &mut view) {
-                Outcome::Quit => break,
-                Outcome::Submit(prompt) => {
-                    let Some(runner) = runner.as_ref() else {
-                        // Submitting in a recorded session would need a model this
-                        // interface does not have. Saying so beats silently discarding
-                        // what the user typed.
-                        view.transcript.push(Entry::notice(
-                            "this is a recorded session; start `nanus tui` without --session to continue it",
-                        ));
-                        view.scroll_to_bottom();
-                        continue;
-                    };
-                    // The transcript is seeded here, where the mutable view lives.
-                    view.transcript
-                        .push(Entry::prose(Role::User, prompt.clone()));
-                    view.begin_turn(1);
-                    view.scroll_to_bottom();
-                    spawn_turn(runner, source.session(), prompt, &sender);
+        // Redrawn after every wake-up rather than on a timer: the interface has no
+        // animation, so every reason to redraw is either a keystroke or progress from the
+        // turn, and both arrive here. A tick would only add idle wake-ups.
+        tokio::select! {
+            event = events.next() => {
+                let Some(event) = event else {
+                    // The event stream ended, which means there is no keyboard left to
+                    // read. Leaving is the only sensible answer.
+                    break;
+                };
+                let TerminalEvent::Key(key) = event? else {
+                    continue;
+                };
+                // Windows reports both press and release; only a press is a keystroke.
+                if key.kind != KeyEventKind::Press {
+                    continue;
                 }
-                Outcome::Continue => {}
+                match handle_key(key, &mut view) {
+                    Outcome::Quit => break,
+                    Outcome::Submit(prompt) => {
+                        let Some(runner) = runner.as_ref() else {
+                            // Submitting in a recorded session would need a model this
+                            // interface does not have. Saying so beats silently discarding
+                            // what the user typed.
+                            view.transcript.push(Entry::notice(
+                                "this is a recorded session; start `nanus tui` without --session to continue it",
+                            ));
+                            view.scroll_to_bottom();
+                            continue;
+                        };
+                        // The transcript is seeded here, where the mutable view lives.
+                        view.transcript
+                            .push(Entry::prose(Role::User, prompt.clone()));
+                        view.begin_turn(1);
+                        view.scroll_to_bottom();
+                        spawn_turn(runner, source.session(), prompt, &sender);
+                    }
+                    Outcome::Continue => {}
+                }
+            }
+            update = receiver.recv() => {
+                // The sender is cloned into every turn and lives in this scope, so it
+                // cannot be dropped while the loop runs.
+                let Some(update) = update else {
+                    continue;
+                };
+                apply(update, &mut view);
+                // Progress arrives in bursts — one message per streamed fragment — and
+                // each redraw costs a full frame, so the queue is emptied before the next
+                // one.
+                drain_updates(&mut receiver, &mut view);
             }
         }
-        drain_updates(&mut receiver, &mut view);
-        if !view.busy {
-            // Nothing is streaming, so the loop can wait for a key rather than
-            // redrawing on every tick.
-            drain_updates(&mut receiver, &mut view);
-        }
-    }
-
-    // A shutdown that fails still exits: the terminal has already been restored by the
-    // guard, and the run is over.
-    if let Err(error) = source.shutdown() {
-        tracing::warn!(%error, "the composition did not shut down cleanly");
     }
     Ok(())
 }
@@ -538,46 +567,54 @@ fn spawn_turn(
     });
 }
 
-/// Applies every queued update to the view.
+/// Applies one update to the view.
+fn apply(update: Update, view: &mut ViewState) {
+    match update {
+        Update::Done(Ok(answer)) => {
+            view.transcript.push(Entry::prose(Role::Assistant, answer));
+            view.end_turn();
+            view.scroll_to_bottom();
+        }
+        Update::Done(Err(message)) => {
+            view.transcript.push(Entry::notice(message));
+            view.end_turn();
+        }
+        Update::Event(AgentEvent::Text(delta)) => {
+            view.transcript
+                .append_stream(Role::Assistant, &delta, false);
+            view.scroll_to_bottom();
+        }
+        Update::Event(AgentEvent::Reasoning(delta)) => {
+            view.transcript
+                .append_stream(Role::Reasoning, &delta, false);
+            view.scroll_to_bottom();
+        }
+        Update::Event(AgentEvent::Step(step)) => view.begin_turn(step),
+        Update::Event(AgentEvent::Tool(name)) => {
+            view.transcript.push(Entry::tool_call(name, ""));
+        }
+        Update::Event(AgentEvent::ToolDone(name, is_error)) => {
+            view.transcript
+                .push(Entry::tool_result(name, is_error, "done"));
+        }
+        Update::Event(AgentEvent::Usage(usage)) => {
+            view.add_tokens(usage.total_tokens());
+        }
+    }
+}
+
+/// Applies every already-queued update to the view, without waiting.
 fn drain_updates(receiver: &mut mpsc::Receiver<Update>, view: &mut ViewState) {
     while let Ok(update) = receiver.try_recv() {
-        match update {
-            Update::Done(Ok(answer)) => {
-                view.transcript.push(Entry::prose(Role::Assistant, answer));
-                view.end_turn();
-                view.scroll_to_bottom();
-            }
-            Update::Done(Err(message)) => {
-                view.transcript.push(Entry::notice(message));
-                view.end_turn();
-            }
-            Update::Event(AgentEvent::Text(delta)) => {
-                view.transcript
-                    .append_stream(Role::Assistant, &delta, false);
-                view.scroll_to_bottom();
-            }
-            Update::Event(AgentEvent::Reasoning(delta)) => {
-                view.transcript
-                    .append_stream(Role::Reasoning, &delta, false);
-                view.scroll_to_bottom();
-            }
-            Update::Event(AgentEvent::Step(step)) => view.begin_turn(step),
-            Update::Event(AgentEvent::Tool(name)) => {
-                view.transcript.push(Entry::tool_call(name, ""));
-            }
-            Update::Event(AgentEvent::ToolDone(name, is_error)) => {
-                view.transcript
-                    .push(Entry::tool_result(name, is_error, "done"));
-            }
-            Update::Event(AgentEvent::Usage(usage)) => {
-                view.add_tokens(usage.total_tokens());
-            }
-        }
+        apply(update, view);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use nanus_domain::{AgentConfig, SessionId, ToolRegistry};
+    use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream};
+
     use super::*;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -805,5 +842,59 @@ mod tests {
         };
         assert!(error.to_string().contains("terminal"), "{error}");
         assert!(require_terminal(true).is_ok(), "a terminal is accepted");
+    }
+
+    /// A model that answers once with fixed text.
+    struct ScriptedLlm;
+
+    impl LlmPort for ScriptedLlm {
+        fn model(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+            Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta("hello back".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ]))
+        }
+    }
+
+    /// A runner whose model replies without a network.
+    fn scripted_runner() -> AgentRunner {
+        let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(ScriptedLlm));
+        let config = AgentConfig::new(4, 1, "scripted", 4096)
+            .unwrap_or_else(|error| panic!("valid config: {error}"));
+        AgentRunner::new(llm, Rc::new(ToolRegistry::new()), "you are a test", config)
+            .unwrap_or_else(|error| panic!("valid runner: {error}"))
+    }
+
+    #[test]
+    fn a_submitted_prompt_is_driven_to_an_answer() {
+        // The regression this pins, which nothing covered: submitting a prompt calls
+        // `spawn_turn`, which spawns a `!Send` local task. `spawn_local` panics outside a
+        // `LocalSet`, and a set that is only entered never polls what it spawned. The
+        // first keystroke in a real terminal was therefore the first time this code had
+        // ever run — and it aborted the process.
+        let runner = Rc::new(scripted_runner());
+        let session = Session::new(SessionId::new("tui-turn"), 0, "/tmp");
+        let (sender, mut receiver) = mpsc::channel::<Update>(16);
+        let answer = nanus_kernel::runtime::block_on_local(async {
+            spawn_turn(&runner, &session, "hello".to_owned(), &sender);
+            loop {
+                match receiver.recv().await {
+                    Some(Update::Done(result)) => break result,
+                    // Streamed progress arrives first and is not the answer.
+                    Some(_) => {}
+                    None => panic!("the turn ended without a result"),
+                }
+            }
+        });
+        match answer {
+            Ok(text) => assert_eq!(text, "hello back"),
+            Err(error) => panic!("the turn failed: {error}"),
+        }
     }
 }

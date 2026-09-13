@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::buffer::InputBuffer;
-use crate::transcript::{Entry, EntryKind, Role, Transcript};
+use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_rows};
 
 /// Colours and emphasis for each role.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -424,19 +424,89 @@ impl ViewState {
     /// Renders the conversation.
     fn render_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
         let lines = self.transcript_lines();
-        let offset = usize::try_from(self.scroll_offset).unwrap_or(usize::MAX);
-        let start = offset.min(lines.len());
-        let visible = lines.into_iter().skip(start);
+        let heights = Self::line_heights(&lines, area.width);
+        let (start, padding) = Self::window(&heights, self.scroll_offset, area.height);
+        // Blank rows above the tail, so the newest line sits at the bottom of the
+        // viewport rather than floating in the middle of it.
+        let blanks = core::iter::repeat_with(|| Line::from(""))
+            .take(usize::try_from(padding).unwrap_or(usize::MAX));
+        let visible = blanks.chain(lines.into_iter().skip(start));
         let paragraph = Paragraph::new(Text::from_iter(visible))
             .block(Block::default().borders(Borders::NONE))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
 
-    /// Returns how many rows the whole transcript renders to.
+    /// The display rows each rendered line occupies at `width`.
+    fn line_heights(lines: &[Line<'static>], width: u16) -> Vec<u32> {
+        let usable = width.max(1);
+        lines
+            .iter()
+            .map(|line| wrap_rows(u32::try_from(line.width()).unwrap_or(u32::MAX), usable))
+            .collect()
+    }
+
+    /// Picks the lines to draw for a scroll offset measured in display rows.
+    ///
+    /// Returns the first line to draw and how many blank rows to draw above it.
+    ///
+    /// The offset is in rows because that is what a reader scrolls, and the renderer
+    /// draws whole lines — but a line that wraps covers more than one row, so the two
+    /// are not interchangeable. Treating one as the other is what put the newest
+    /// content permanently below the fold: `scroll_to_bottom` computed an offset in
+    /// rows from a total counted in lines, so every wrapped line made the bottom
+    /// unreachable by exactly the rows it wrapped into.
+    ///
+    /// At the end of the transcript the window is anchored to the bottom. A last line
+    /// that wraps cannot be drawn in part, so padding the top is the only way to keep
+    /// the newest row — the one the reader scrolled to — on screen.
+    fn window(heights: &[u32], offset: u32, height: u16) -> (usize, u32) {
+        let available = u32::from(height);
+        let total = heights.iter().copied().fold(0_u32, u32::saturating_add);
+
+        // The line the offset lands inside, and the rows before it.
+        let mut before = 0_u32;
+        let mut start = heights.len();
+        for (index, rows) in heights.iter().enumerate() {
+            if before.saturating_add(*rows) > offset {
+                start = index;
+                break;
+            }
+            before = before.saturating_add(*rows);
+        }
+
+        let anchored = offset > 0 && offset.saturating_add(available) >= total;
+        if !anchored {
+            return (start, 0);
+        }
+        // Walk back from the end taking whole lines while they fit.
+        let mut used = 0_u32;
+        let mut anchor = heights.len();
+        for (index, rows) in heights.iter().enumerate().rev() {
+            if used.saturating_add(*rows) > available {
+                break;
+            }
+            used = used.saturating_add(*rows);
+            anchor = index;
+        }
+        (anchor, available.saturating_sub(used))
+    }
+
+    /// Returns how many display rows the whole transcript renders to.
+    ///
+    /// Rows rather than lines, because every scroll bound in this type is compared
+    /// against a viewport measured in rows. The width comes from the last render, which
+    /// is also the only width these bounds are ever used at.
     #[must_use]
     pub fn transcript_rows(&self) -> u32 {
-        u32::try_from(self.transcript_lines().len()).unwrap_or(u32::MAX)
+        let Some((width, _)) = self.last_viewport else {
+            return 0;
+        };
+        let lines = self.transcript_lines();
+        Self::line_heights(&lines, width)
+            .iter()
+            .copied()
+            .fold(0_u32, u32::saturating_add)
     }
 
     /// Renders the composer.
@@ -624,6 +694,25 @@ mod tests {
         assert!(text.contains("entry 0"), "the beginning is shown");
         assert!(!text.contains("entry 29"), "the end is off-screen");
         assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn a_notice_appended_to_a_long_conversation_is_visible() {
+        // Opening a recorded session scrolls a long transcript to its end. Submitting
+        // into one appends a notice and scrolls again, and that notice is the only
+        // feedback the user gets, so it has to land on screen rather than below it.
+        let entries: Vec<Entry> = (0..30)
+            .map(|index| Entry::prose(Role::User, format!("{} entry-{index}", "x".repeat(300))))
+            .collect();
+        let mut state = state_with(entries);
+        // What the recorded view does: open at the end.
+        state.pending_scroll_back = Some(0);
+        drop(rendered(&mut state, 40, 20));
+
+        state.transcript.push(Entry::notice("SENTINEL NOTICE"));
+        state.scroll_to_bottom();
+        let text = rendered(&mut state, 40, 20);
+        assert!(text.contains("SENTINEL NOTICE"), "{text}");
     }
 
     #[test]

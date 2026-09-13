@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [2.7s] 539 tests run: 539 passed, 0 skipped
+Summary [2.5s] 542 tests run: 542 passed, 0 skipped
 
 $ cargo test --workspace --doc
 9 doctests passed
@@ -38,10 +38,10 @@ truncated mid-frame, and the request carrying all seven schemas.
 resulting session log inspected: a four-step turn with tool calls, results fed back, and
 per-step token accounting.
 
-## Four bugs found by verification rather than by reasoning
+## Six bugs found by verification rather than by reasoning
 
-All four were found *because* the thing was exercised rather than read, and all four are
-now pinned by tests. They are recorded because a project claiming rigour should show what
+All six were found *because* the thing was exercised rather than read, and all six are now
+pinned by tests. They are recorded because a project claiming rigour should show what
 rigour caught.
 
 **The `[DONE]` sentinel silently dropped every tool call.** The end-of-stream sentinel
@@ -72,6 +72,26 @@ arrived. Found by running a bare `nanus` in a real terminal to check that the me
 binary started the interface. A header belongs to reading a recording; a live conversation
 needs none, because the reader is already in it. Building that banner is now a property of
 the recording, not of the session.
+
+**Submitting a prompt aborted the process.** The turn runs as a local task, because the
+kernel's state is `Rc`-shared and its futures are not `Send` — `tokio::spawn` cannot carry
+them, so `spawn_local` is the only option, and it panics outside a `LocalSet`. Nothing had
+ever entered one. The code dated from the first commit and had never executed: every test
+covered the view, none covered the turn, and the interface had only ever been *read from*.
+Reported by the first person to type into it. The loop is now driven by `block_on_local`,
+which enters a local set *and* runs the runtime so the spawned task is polled — entering
+alone would leave the task un-polled — and the loop is async, because awaiting a keystroke
+synchronously would stall the very turn the local task exists to keep moving. A test now
+submits a prompt against a scripted model and waits for the answer.
+
+**The newest line could not be scrolled to.** A scroll offset counts display rows: a
+reader scrolls rows, and the viewport is measured in rows. The transcript was counted in
+logical *lines*, and the renderer wraps. Every wrapped line therefore put the bottom out of
+reach by exactly the rows it wrapped into — so opening a session stopped short of its end,
+and a notice appended to a long transcript landed below the fold, invisible. Both units are
+now rows, and the tail is anchored to the bottom of the viewport, since a wrapped final
+line cannot be drawn in part. Found by fixing the bug above and then noticing that the
+feedback it produced was not on screen.
 
 That second one was found by a model, in a live run, which then warned the user about it
 in its answer. Which is the point of building a harness small enough to reason about.

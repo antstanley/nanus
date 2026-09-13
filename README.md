@@ -185,7 +185,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [2.7s] 539 tests run: 539 passed, 0 skipped
+Summary [2.5s] 542 tests run: 542 passed, 0 skipped
 
 $ cargo test --workspace --doc
 9 doctests passed

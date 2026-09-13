@@ -24,6 +24,7 @@ runtime = [
     "dep:nanus-bundle",
     "dep:nanus-ports",
     "dep:tokio",
+    "dep:futures",
 ]
 
 [dependencies]
@@ -33,6 +34,9 @@ nanus-bundle = { workspace = true, optional = true }
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true, optional = true }
 ratatui = { workspace = true }
+# Only for `StreamExt`, which turns crossterm's `EventStream` into something that can be
+# awaited alongside the turn's progress. The rest of the crate needs nothing from it.
+futures = { workspace = true, optional = true }
 crossterm = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

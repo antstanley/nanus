@@ -48,7 +48,9 @@ nanus tui --session --scroll 50   # open fifty rows back from the end
 
 `--scroll` matters more than it sounds. A conversation opens at its end, where the answer
 is; the middle is where the reasoning and the tool calls are, and that is usually what you
-want to look at when asking *why* the agent did something.
+want to look at when asking *why* the agent did something. The count is in display rows,
+which is what the viewport is measured in — a line that wraps occupies several rows, so a
+count in lines would put the end of a long conversation out of reach.
 
 In a recorded session the composer still works, and submitting tells you to start `nanus`
 without `--session` rather than silently discarding what you typed. Adding a turn to a

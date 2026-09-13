@@ -24,11 +24,14 @@ rather than by remembering.
   that the live API's tool-call frames match the replay byte for byte; if they differ,
   [`crates/nanus-adapter-deepseek/src/wire.rs`](../crates/nanus-adapter-deepseek/src/wire.rs)
   is the only file involved.
-- **The TUI has no automated end-to-end test.** Raw mode needs a real terminal, so key
-  handling and the alternate screen are exercised by hand. The view layer is covered
-  headlessly against ratatui's `TestBackend`, which is where the logic lives. The part
-  that *is* checked automatically is the refusal: `ratatui::init` panics rather than
-  returning when there is no terminal, so the terminal is verified before it is taken.
+- **The TUI has no automated end-to-end test.** Raw mode needs a real terminal, so the
+  alternate screen and the drawing itself are exercised by hand. What *is* covered
+  automatically are the parts that can be: key handling, scrolling and wrapping against
+  ratatui's `TestBackend`; a submitted prompt driven to an answer against a scripted
+  model; and the refusal of a missing terminal, since `ratatui::init` panics rather than
+  returning when there is no terminal to take. Submitting a prompt was broken from the
+  first commit until it was first typed into — see
+  [the bugs verification found](testing.md#six-bugs-found-by-verification-rather-than-by-reasoning).
 - **DeepSeek is the only provider.** The `LlmPort` seam is real and a second adapter
   would be a single file, but none exists yet.
 - **The sandbox is reported, not OS-enforced.** `nanus-adapter-local` checks the working

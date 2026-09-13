@@ -31,7 +31,7 @@ Start here if you are going to read or change the code.
 ## [Testing and verification](testing.md)
 
 The four quality gates and their current output, the two tests that matter most, and an
-honest account of the four bugs that verification found rather than reasoning.
+honest account of the six bugs that verification found rather than reasoning.
 
 Start here if you want to know whether any of this is true.
 

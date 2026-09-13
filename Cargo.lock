@@ -1613,6 +1613,7 @@ name = "nanus-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "futures",
  "nanus-adapter-config",
  "nanus-bundle",
  "nanus-domain",

@@ -242,18 +242,33 @@ impl Entry {
 /// under-counted; the renderer still wraps them correctly, and the only cost is that
 /// a row estimate can be one too small. Over-counting would leave a visible blank
 /// row, so rounding *down* is the safer error.
-fn wrap_count(text: &str, width: u16) -> u32 {
-    // Precondition: a zero width would divide by zero.
-    assert!(width >= 1, "a wrap width is at least one column");
-    let columns = u32::from(width);
-    let characters = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
-    if characters == 0 {
-        // An empty paragraph still occupies the row it is drawn on.
+///
+/// Shared with the view, which needs the same estimate to turn a scroll offset
+/// measured in rows into the line index a renderer can actually skip to.
+pub(crate) fn wrap_count(text: &str, width: u16) -> u32 {
+    // An empty paragraph still occupies the row it is drawn on.
+    if text.is_empty() {
         return 1;
     }
-    // Ceiling division without the overflow a `+ columns - 1` would risk.
-    let full = characters.checked_div(columns).unwrap_or(0);
-    let remainder = characters.checked_rem(columns).unwrap_or(1);
+    let columns = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
+    wrap_rows(columns, width)
+}
+
+/// Counts the display rows `columns` columns of text need at `width` columns.
+///
+/// The same estimate as [`wrap_count`], for a caller that has already measured its
+/// text — a rendered line knows its own width, and counting its characters again to
+/// learn the same number would be work for nothing.
+pub(crate) fn wrap_rows(columns: u32, width: u16) -> u32 {
+    // Precondition: a zero width would divide by zero.
+    assert!(width >= 1, "a wrap width is at least one column");
+    if columns == 0 {
+        return 1;
+    }
+    let usable = u32::from(width);
+    // Ceiling division without the overflow a `+ usable - 1` would risk.
+    let full = columns.checked_div(usable).unwrap_or(0);
+    let remainder = columns.checked_rem(usable).unwrap_or(1);
     if remainder == 0 {
         full.max(1)
     } else {
