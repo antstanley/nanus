@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [2.8s] 643 tests run: 643 passed, 0 skipped
+Summary [3.4s] 645 tests run: 645 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
@@ -139,3 +139,27 @@ The lesson both times was the same, and it is about tests rather than code: a re
 test is only a regression test if it fails against the code it was written for. Each of
 these was checked by reverting the fix and watching the test fail — and two of the four
 did not, which is how the tests got rewritten.
+
+## The bug a terminal found
+
+One more, reported from a real terminal rather than found by anything here, and worth
+recording because the cause was a whole class of defect rather than a typo.
+
+**`Shift+Enter` typed a `j`.** On Ghostty, `shift+enter` is bound to *send a newline* — the
+terminal types a line feed instead of reporting a key, so no keyboard protocol is involved.
+In raw mode a line feed is `Ctrl+J`, and terminals report control bytes as `Ctrl+<letter>`.
+The interface's key handler ended in a catch-all that inserted any character and looked at
+no modifiers, so `Ctrl+J` inserted `j`. The same arm was inserting a letter for *every*
+control key it had not claimed: `Ctrl+K` typed `k`, and `Ctrl+H` typed `h` for a byte that
+is also backspace.
+
+The reproduction was a two-line experiment rather than a guess: inject the bytes into a
+running interface with `tmux send-keys -H` and watch what appears, and inject them into a
+program that prints crossterm's parsed events to see the code and modifiers behind each.
+Control bytes `0x0A`, `0x0B`, and `0x08` came back as `Char('j')`, `Char('k')`, and
+`Char('h')`, each with `CONTROL` — which is exactly what was on screen.
+
+Two changes, one line each: `Ctrl+J` starts a line, and a character with Control held is no
+longer text. Alt is deliberately not guarded the same way, because on many terminals an
+Option or Alt press arrives as `Alt+<letter>` on its way to producing a character, and
+swallowing those would stop some keyboards typing at all.

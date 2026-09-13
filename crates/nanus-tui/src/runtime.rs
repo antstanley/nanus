@@ -653,11 +653,28 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.input.insert('\n');
             Outcome::Continue
         }
+        // `Ctrl+J` is a line feed, and a line feed is what a terminal sends when
+        // `Shift+Enter` is bound to "insert a newline" rather than to a key — which is how
+        // Ghostty is configured by default, and why the request for the kitty keyboard
+        // protocol above does not help there: the terminal is not reporting a key at all,
+        // it is typing a character. Ctrl+J has meant "new line" since readline, so this is
+        // the same binding twice over rather than a special case.
+        KeyCode::Char('j') if control => {
+            view.input.insert('\n');
+            Outcome::Continue
+        }
         // An empty composer is not an error; it just does nothing.
         KeyCode::Enter => view
             .input
             .submit()
             .map_or(Outcome::Continue, Outcome::Submit),
+        // A character with Control held is not text. Terminals report control bytes as
+        // `Ctrl+<letter>`, so without the guard every unbound control key typed its
+        // letter — Ctrl+J inserted a `j`, Ctrl+K a `k`, and Ctrl+H an `h` for what is
+        // also backspace. Alt is deliberately *not* guarded: on many terminals an
+        // Option/Alt press arrives as `Alt+<letter>` on its way to producing a character,
+        // and swallowing those would stop some keyboards typing at all.
+        KeyCode::Char(_) if control => Outcome::Continue,
         KeyCode::Char(character) => {
             view.input.insert(character);
             Outcome::Continue
@@ -893,6 +910,50 @@ mod tests {
             handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view),
             Outcome::Submit(prompt) if prompt == "line\nmore"
         ));
+    }
+
+    #[test]
+    fn a_line_feed_starts_a_new_line_however_the_terminal_spells_it() {
+        // The reported bug: on Ghostty, `Shift+Enter` is bound to "send a newline", so the
+        // terminal types a line feed rather than reporting a key. In raw mode crossterm
+        // reports a line feed as `Ctrl+J` — which the catch-all arm then inserted as the
+        // letter `j`. Both spellings now mean the same thing.
+        let mut view = ViewState::new();
+        view.input.insert_str("line");
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Continue
+        ));
+        assert_eq!(view.input.text(), "line\n");
+
+        // And the kitty encoding of the same key, which some terminals do send.
+        let mut kitty = ViewState::new();
+        kitty.input.insert_str("line");
+        let _ = handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT), &mut kitty);
+        assert_eq!(kitty.input.text(), view.input.text());
+    }
+
+    #[test]
+    fn an_unbound_control_key_types_nothing() {
+        // The wider half of the same defect. Terminals report control bytes 0x01-0x1A as
+        // `Ctrl+<letter>`, so the catch-all arm was typing a letter for every control key
+        // the interface did not claim: Ctrl+K inserted `k`, and Ctrl+H inserted `h` for a
+        // byte that is also backspace.
+        let mut view = ViewState::new();
+        for character in ['k', 'h', 'j', 'p', 'z'] {
+            let _ = handle_key(
+                key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                &mut view,
+            );
+        }
+        assert_eq!(view.input.text(), "\n", "only Ctrl+J did anything");
+
+        // The other direction: an unmodified letter is still text, and so is one with Alt,
+        // which some keyboards use on the way to producing a character.
+        let mut plain = ViewState::new();
+        let _ = handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE), &mut plain);
+        let _ = handle_key(key(KeyCode::Char('a'), KeyModifiers::ALT), &mut plain);
+        assert_eq!(plain.input.text(), "ka");
     }
 
     #[test]

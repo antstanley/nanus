@@ -126,7 +126,7 @@ conversation gets no such header: the person is already in it.
 | Key | Effect |
 |---|---|
 | `Enter` | submit |
-| `Alt+Enter` / `Shift+Enter` | newline |
+| `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
 | `Ctrl+W` | delete the previous word |
 | `Ctrl+T` | summarise runs of tool calls |
 | `Ctrl+R` | summarise runs of reasoning |
@@ -136,15 +136,22 @@ conversation gets no such header: the person is already in it.
 | `Left` / `Right`, `Home` / `End` | move the cursor |
 | `Ctrl+C` / `Ctrl+D` / `Esc` | quit |
 
-`Shift+Enter` depends on the terminal, and that is worth stating plainly rather than
-leaving as a surprise. A terminal in its default mode sends *one byte* for `Enter`, and it
-is the same byte whether or not Shift is held: `Shift+Enter` is not a key a program is told
-about, it is a key that arrives as `Enter`. Terminals that implement the
-[kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) can say
-otherwise, so the interface asks for it when the terminal answers that it speaks it — and
-does not ask when it does not, because a terminal that does not understand the request may
-print the escape sequence instead. `Alt+Enter` is the spelling that works everywhere, which
-is why it is documented first.
+`Shift+Enter` needs a word, because how it reaches a program is not what you would expect.
+**It is not one key.** Two different things can happen when you press it:
+
+- **The terminal types a character.** A line feed, `0x0A`. This is what
+  [Ghostty](https://ghostty.org) does by default: `shift+enter` is bound to "send a
+  newline" rather than reported as a key, so nothing about key protocols is involved — the
+  terminal is typing at you. In raw mode a line feed *is* `Ctrl+J`, so the interface treats
+  `Ctrl+J` as a newline. That is what it has meant since readline, so it is one binding
+  rather than a special case.
+- **The terminal reports a key**, if it speaks the
+  [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) and the
+  interface asks for it. The interface asks when the terminal answers that it speaks it,
+  and does not ask when it does not — a terminal that does not understand the request may
+  print the escape sequence instead. Then `Shift+Enter` arrives as itself.
+
+`Alt+Enter` is the spelling that works regardless, which is why it is documented first.
 
 ## Scrolling back
 
