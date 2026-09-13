@@ -114,6 +114,13 @@ pub struct ViewState {
     pub tokens_used: u64,
     /// What the model is currently doing, for the status line.
     pub status: String,
+    /// What to call the session in the title bar, when the interface is in one.
+    ///
+    /// A live conversation is a conversation *with something*, and once sessions can be
+    /// resumed that something has a name worth showing: two terminals can be attached to
+    /// two different sessions, and a reader should be able to tell which is which without
+    /// scrolling back to the first prompt.
+    pub label: Option<String>,
     /// Styling.
     pub theme: Theme,
     /// Rows to scroll back from the end on the next render, if a caller asked for it.
@@ -142,6 +149,7 @@ impl Default for ViewState {
             step: 0,
             tokens_used: 0,
             status: "ready".to_owned(),
+            label: None,
             theme: Theme::default(),
             pending_scroll_back: None,
             last_viewport: None,
@@ -381,7 +389,7 @@ impl ViewState {
             .split(area);
 
         if let Some(title) = chunks.first() {
-            Self::render_title(frame, *title);
+            Self::render_title(frame, *title, self.label.as_deref());
         }
         if let Some(body) = chunks.get(1) {
             self.last_viewport = Some((body.width, body.height));
@@ -408,15 +416,25 @@ impl ViewState {
 
     /// Renders the title bar.
     ///
-    /// Associated rather than a method: the title bar is the same in every state, so
-    /// taking `self` would suggest a dependence that does not exist.
-    fn render_title(frame: &mut Frame<'_>, area: Rect) {
-        let title = Span::styled("nanus", Style::default().add_modifier(Modifier::BOLD));
-        let hint = Span::styled(
+    /// Associated rather than a method: the title bar shows the same things in every
+    /// state, so taking `self` would suggest a dependence that does not exist. The session
+    /// label is passed in because it is the one part that varies.
+    fn render_title(frame: &mut Frame<'_>, area: Rect, label: Option<&str>) {
+        let mut spans = vec![Span::styled(
+            "nanus",
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if let Some(label) = label {
+            spans.push(Span::styled(
+                format!("  ·  {label}"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        spans.push(Span::styled(
             "  ·  Enter sends · Alt+Enter newline · Ctrl-C quits",
             Style::default().fg(Color::DarkGray),
-        );
-        frame.render_widget(Paragraph::new(Line::from(vec![title, hint])), area);
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Builds every line the transcript renders to, oldest first.
@@ -845,6 +863,16 @@ mod tests {
         assert!(text.contains("nanus"));
         assert!(text.contains("ready"));
         assert!(text.contains("message"));
+    }
+
+    #[test]
+    fn a_named_session_is_shown_in_the_title_bar() {
+        // Which conversation this is matters once several can be resumed: two terminals
+        // can be attached to two sessions, and the title bar is how a reader tells.
+        let mut state = ViewState::new();
+        assert!(!rendered(&mut state, 60, 12).contains("the-glob-bug"));
+        state.label = Some("the-glob-bug".to_owned());
+        assert!(rendered(&mut state, 60, 12).contains("the-glob-bug"));
     }
 
     #[test]

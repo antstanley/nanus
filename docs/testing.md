@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.4s] 605 tests run: 605 passed, 0 skipped
+Summary [3.6s] 629 tests run: 629 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
@@ -34,16 +34,20 @@ tool-call reassembly is exercised over a real connection with a real HTTP client
 than against a mock stream. It covers a tool call split across three frames, a response
 truncated mid-frame, and the request carrying all seven schemas.
 
-**The link, over real sockets.**
+**The link and its sessions, over real sockets.**
 [`crates/nanus-link/tests/link.rs`](../crates/nanus-link/tests/link.rs) binds real sockets
-in a temporary directory and drives a **scripted** model through a whole turn: the
-handshake, a streamed answer, the ending, and the session on disk — plus the parts most
-likely to be wrong and least likely to be covered by a unit test, which are the negatives.
-Two connections get two sessions. A `status` request changes nothing. A `shutdown` request
-stops a server that has no other stop condition, which is the test that would hang rather
-than fail if the protocol were ignored. A socket left by a dead process is replaced, its
-permissions are the owner's alone, and connecting to one nobody serves names the path
-rather than reporting a syscall.
+in a temporary directory and drives a **scripted** model through whole turns: the
+handshake, the attachment, a streamed answer, the ending, and the session on disk — plus the
+parts most likely to be wrong and least likely to be covered by a unit test, which are the
+negatives. A name another session holds is refused and creates nothing. Attaching to a
+session that was never held loads it from the store. A **turn finishes after the client
+that asked for it leaves**, and a second client that joins sees the ending. Two clients on
+one session both see the turn, and the one that did not ask is told what was asked. A second
+prompt while a turn runs is refused rather than queued. A `status` request opens no session
+at all. A `shutdown` request stops a server that has no other stop condition, which is the
+test that would hang rather than fail if the protocol were ignored. A socket left by a dead
+process is replaced, its permissions are the owner's alone, and connecting to one nobody
+serves names the path rather than reporting a syscall.
 
 **The live path.** The harness has been run against the real DeepSeek API and the
 resulting session log inspected: a four-step turn with tool calls, results fed back, and

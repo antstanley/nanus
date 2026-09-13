@@ -38,8 +38,34 @@ pub trait StorePort {
     /// Removes a session.
     ///
     /// Deleting a session that is not there is not an error: the caller asked
-    /// for it to be gone, and it is.
+    /// for it to be gone, and it is. Any name it was known by goes with it, so a
+    /// later session cannot inherit an alias for something that no longer exists.
     fn delete<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<()>>;
+
+    /// Records `name` as another way to reach an existing session.
+    ///
+    /// A name is an alias for a store key, not part of the session: the domain's
+    /// id is opaque and the store decides what a key looks like, and a
+    /// human-typable key is the same kind of decision. So naming a session does
+    /// not rewrite it, and a session that is renamed keeps its identity.
+    ///
+    /// Setting the name a session already has is not an error. Setting a name
+    /// another session already holds is: silently moving an alias would make a
+    /// script resume someone else's conversation.
+    fn name<'a>(&'a self, id: &'a SessionId, name: &'a str) -> LocalBoxFuture<'a, StoreResult<()>>;
+
+    /// Resolves a name to the session it aliases.
+    ///
+    /// `None` is not an error: a name that nobody has taken is the ordinary
+    /// state of a name a user is about to choose.
+    fn resolve<'a>(&'a self, name: &'a str) -> LocalBoxFuture<'a, StoreResult<Option<SessionId>>>;
+
+    /// Returns the name a session answers to.
+    ///
+    /// The other direction of [`StorePort::resolve`], because both directions are
+    /// asked: a session is *resumed* by name, and an agent that has just loaded a
+    /// session by id needs to know what a person calls it.
+    fn name_of<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<Option<String>>>;
 
     /// Returns the harness's home directory, creating it if needed.
     fn home(&self) -> LocalBoxFuture<'_, StoreResult<PathBuf>>;
@@ -70,6 +96,11 @@ pub struct SessionSummary {
     pub event_count: u64,
     /// A title derived from its first human turn.
     pub title: Option<String>,
+    /// The name a user gave it, if any.
+    ///
+    /// Distinct from the title, which is derived from what was said: a title is
+    /// what a session is *about*, and a name is what a person calls it.
+    pub name: Option<String>,
 }
 
 /// Why a store operation failed.
@@ -97,6 +128,24 @@ pub enum StoreError {
         id: String,
         /// The rendered failure.
         message: String,
+    },
+
+    /// A name that is not usable as an alias.
+    #[error("{name:?} is not a usable session name: {reason}")]
+    InvalidName {
+        /// The name that was rejected.
+        name: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+
+    /// Another session already answers to that name.
+    #[error("the name {name:?} already belongs to session {id}")]
+    NameTaken {
+        /// The contested name.
+        name: String,
+        /// The session that already holds it.
+        id: String,
     },
 
     /// The harness home could not be determined or created.
@@ -129,6 +178,7 @@ mod tests {
             last_event_at_ms: 20,
             event_count: 7,
             title: Some("first turn".to_owned()),
+            name: Some("glob-bug".to_owned()),
         };
         let encoded = serde_json::to_value(&summary);
         assert!(encoded.is_ok());
@@ -152,6 +202,7 @@ mod tests {
             last_event_at_ms: 2,
             event_count: 0,
             title: None,
+            name: Some("nightly".to_owned()),
         };
         let encoded = serde_json::to_string(&summary).unwrap_or_default();
         let decoded: Result<SessionSummary, _> = serde_json::from_str(&encoded);

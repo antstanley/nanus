@@ -4,9 +4,19 @@
 //!
 //! ```text
 //! <home>/sessions/<encoded-session-id>/session.jsonl
+//! <home>/sessions/<encoded-session-id>/name           (optional)
 //! ```
 //!
 //! `<home>` is `$NANUS_HOME` when set, and `<config dir>/nanus` otherwise.
+//!
+//! ## Why a name is a file beside the session rather than a field in it
+//!
+//! A name is an alias for a store key, and the domain says the store decides what
+//! a key looks like. Keeping it in the session directory means naming never
+//! rewrites a log, a renamed session keeps its identity, deleting a session takes
+//! its name with it, and there is no shared table for two writers to lose. The
+//! cost is that resolving a name reads a directory, which is the same walk
+//! [`StorePort::list`] already does.
 //!
 //! ## Why the directory name is encoded
 //!
@@ -29,6 +39,7 @@
 //! damaged still lists with correct identity fields, and one unreadable session
 //! never hides the others.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +59,18 @@ const SESSIONS_DIR: &str = "sessions";
 
 /// The file name of one session's log.
 const SESSION_FILE: &str = "session.jsonl";
+
+/// The file, beside a session's log, that holds the name a user gave it.
+///
+/// A fixed file name inside the session's own directory, so a name is *content*
+/// and never a path component: no name can escape the directory it lives in.
+const NAME_FILE: &str = "name";
+
+/// The longest session name accepted.
+///
+/// Not a security boundary — a name is content, not a path — but a bound, because
+/// a name is typed by a person and printed in a listing.
+const MAX_NAME_CHARS: usize = 128;
 
 /// How many characters of the first human turn become a session title.
 const TITLE_MAX_CHARS: usize = 72;
@@ -165,6 +188,15 @@ impl JsonlStore {
         Ok(self.session_dir(id)?.join(SESSION_FILE))
     }
 
+    /// Returns the path of the file that holds one session's name.
+    ///
+    /// # Errors
+    ///
+    /// As [`JsonlStore::session_dir`].
+    pub fn name_file(&self, id: &SessionId) -> StoreResult<PathBuf> {
+        Ok(self.session_dir(id)?.join(NAME_FILE))
+    }
+
     /// Writes `session` atomically, replacing any existing log for its id.
     async fn save_blocking(&self, session: &Session) -> StoreResult<()> {
         let dir = self.session_dir(session.id())?;
@@ -213,6 +245,91 @@ impl JsonlStore {
             .map_err(|source| io_error(&dir, &source))
     }
 
+    /// Records `name` for `id`, refusing a name another session already holds.
+    async fn name_blocking(&self, id: &SessionId, name: &str) -> StoreResult<()> {
+        validate_name(name)?;
+        // The session has to exist before it can be named. An alias for a session
+        // that is not there is a promise this store cannot keep, and the caller
+        // that made it would rather hear about it now.
+        let log = self.session_file(id)?;
+        if !fs::try_exists(&log).await.unwrap_or(false) {
+            return Err(not_found(id));
+        }
+        for (other, held) in self.session_names().await? {
+            if other != *id && held == name {
+                return Err(StoreError::NameTaken {
+                    name: name.to_owned(),
+                    id: other.as_str().to_owned(),
+                });
+            }
+        }
+        // Written atomically and last, so a failure leaves the previous name — or
+        // no name — rather than half of one.
+        write_atomic(&self.name_file(id)?, &format!("{name}\n")).await
+    }
+
+    /// Resolves a name to the session that answers to it.
+    async fn resolve_blocking(&self, name: &str) -> StoreResult<Option<SessionId>> {
+        if validate_name(name).is_err() {
+            // A name that could never have been recorded is held by nobody, so the
+            // answer is "no session" rather than an error: the question has a true
+            // answer, and a caller checking whether a name is free wants it.
+            return Ok(None);
+        }
+        // Lowest id wins when two directories somehow hold one name. The store
+        // never writes two, and a store edited by hand should still answer the
+        // same way twice.
+        Ok(self
+            .session_names()
+            .await?
+            .into_iter()
+            .filter(|(_, held)| held == name)
+            .map(|(id, _)| id)
+            .min())
+    }
+
+    /// Returns the name one session answers to.
+    async fn name_of_blocking(&self, id: &SessionId) -> StoreResult<Option<String>> {
+        Ok(self.session_names().await?.remove(id))
+    }
+
+    /// Reads every session's name, in one walk of the store.
+    async fn session_names(&self) -> StoreResult<BTreeMap<SessionId, String>> {
+        let root = self.sessions_root();
+        let mut entries = match fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(source) => return Err(io_error(&root, &source)),
+        };
+        let mut names = BTreeMap::new();
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(source) => {
+                    tracing::warn!(%source, "stopped reading session names after a read error");
+                    break;
+                }
+            };
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(encoded) = dir.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let Some(id) = decode_id(encoded) else {
+                continue;
+            };
+            if let Some(name) = read_name(&dir).await {
+                names.insert(id, name);
+            }
+        }
+        Ok(names)
+    }
+
     /// Lists every session, newest first.
     ///
     /// A session whose header is unreadable is skipped with a warning rather than
@@ -245,7 +362,7 @@ impl JsonlStore {
                 tracing::warn!(dir = %dir.display(), "skipping a session with an undecodable name");
                 continue;
             };
-            match summarize(&dir.join(SESSION_FILE), &id).await {
+            match summarize(&dir, &id).await {
                 Ok(summary) => summaries.push(summary),
                 Err(error) => tracing::warn!(%error, "skipping an unreadable session"),
             }
@@ -275,6 +392,18 @@ impl StorePort for JsonlStore {
 
     fn delete<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<()>> {
         Box::pin(async move { self.delete_blocking(id).await })
+    }
+
+    fn name<'a>(&'a self, id: &'a SessionId, name: &'a str) -> LocalBoxFuture<'a, StoreResult<()>> {
+        Box::pin(async move { self.name_blocking(id, name).await })
+    }
+
+    fn resolve<'a>(&'a self, name: &'a str) -> LocalBoxFuture<'a, StoreResult<Option<SessionId>>> {
+        Box::pin(async move { self.resolve_blocking(name).await })
+    }
+
+    fn name_of<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<Option<String>>> {
+        Box::pin(async move { self.name_of_blocking(id).await })
     }
 
     fn home(&self) -> LocalBoxFuture<'_, StoreResult<PathBuf>> {
@@ -329,10 +458,11 @@ fn corrupt(id: &SessionId, error: &SessionError) -> StoreError {
 /// The header is parsed strictly — a bad header is an error — while the body is
 /// parsed only for the two fields the summary needs, and a damaged body degrades
 /// those fields rather than failing the listing.
-async fn summarize(path: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
-    let metadata = fs::metadata(path)
+async fn summarize(dir: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
+    let path = dir.join(SESSION_FILE);
+    let metadata = fs::metadata(&path)
         .await
-        .map_err(|source| io_error(path, &source))?;
+        .map_err(|source| io_error(&path, &source))?;
     let last_event_at_ms = metadata
         .modified()
         .ok()
@@ -340,9 +470,9 @@ async fn summarize(path: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         });
-    let file = fs::File::open(path)
+    let file = fs::File::open(&path)
         .await
-        .map_err(|source| io_error(path, &source))?;
+        .map_err(|source| io_error(&path, &source))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut number: u64 = 0;
@@ -354,7 +484,7 @@ async fn summarize(path: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
         let read = reader
             .read_line(&mut line)
             .await
-            .map_err(|source| io_error(path, &source))?;
+            .map_err(|source| io_error(&path, &source))?;
         if read == 0 {
             break;
         }
@@ -394,7 +524,52 @@ async fn summarize(path: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
         last_event_at_ms,
         event_count,
         title,
+        name: read_name(dir).await,
     })
+}
+
+/// Reads one session's name, if it has one.
+///
+/// Best-effort by design: an unreadable or unusable name file costs a naming
+/// convenience and never the session, so the failure is reported and the session
+/// is listed as unnamed rather than hidden.
+async fn read_name(dir: &Path) -> Option<String> {
+    let path = dir.join(NAME_FILE);
+    match fs::read_to_string(&path).await {
+        Ok(raw) => {
+            let trimmed = raw.trim_end_matches(['\n', '\r']);
+            if validate_name(trimmed).is_ok() {
+                return Some(trimmed.to_owned());
+            }
+            tracing::warn!(path = %path.display(), "ignoring a session name that is not usable");
+            None
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            tracing::warn!(%source, path = %path.display(), "could not read a session name");
+            None
+        }
+    }
+}
+
+/// Checks that `name` can be an alias for a session.
+fn validate_name(name: &str) -> StoreResult<()> {
+    let reject = |reason: &str| {
+        Err(StoreError::InvalidName {
+            name: name.to_owned(),
+            reason: reason.to_owned(),
+        })
+    };
+    if name.trim().is_empty() {
+        return reject("it is empty");
+    }
+    if name.chars().count() > MAX_NAME_CHARS {
+        return reject("it is longer than 128 characters");
+    }
+    if name.chars().any(char::is_control) {
+        return reject("it contains a control character");
+    }
+    Ok(())
 }
 
 /// Parses and checks one header line.

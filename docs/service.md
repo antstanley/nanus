@@ -67,25 +67,34 @@ nanus: asked the service at /Users/you/.config/nanus/run/agent.sock to stop
 nanus: no agent is listening at /Users/you/.config/nanus/run/agent.sock: No such file or directory (os error 2)
 ```
 
-The `session` in that output is the status connection's own; sessions are per connection,
-and a status request does not create one on disk.
+The `session` lines are the conversations the service is **holding open**: whether each is
+running a turn, how many clients are attached, and how many events it has. Asking the
+question creates none of them.
 
 ## Talking to it
 
 An interface either connects to it explicitly or simply finds it:
 
 ```sh
-nanus tui --connect    # the explicit spelling
-nanus-tui              # a bare interface connects to the service by default
+nanus tui --connect                    # the explicit spelling
+nanus-tui                              # a bare interface connects to the service by default
+nanus tui --connect --resume nightly   # attach to a conversation it is already holding
 ```
 
-Both reach the same socket. Nothing else has to know the service exists: it is an agent
-on a socket, and the interface speaks the same [link](tui.md#the-link) it uses for an
+All three reach the same socket. Nothing else has to know the service exists: it is an
+agent on a socket, and the interface speaks the same [link](tui.md#the-link) it uses for an
 agent a shell started.
 
-More than one client can be connected at once — that is the point of a service — and each
-gets its own session. Turns interleave on the agent's single thread, because the kernel is
-single-threaded by design and there is exactly one model and one toolset.
+**A service holds its sessions open**, which is what makes it more than a way to run the
+same agent twice. A conversation survives the terminal that started it, a turn survives the
+client that asked for it, and several clients can watch one session at once — each prompt
+goes to every view, and each answer does too. A session is still one turn at a time, so a
+prompt to a busy one is refused rather than queued. See [sessions](sessions.md).
+
+The agent holds a bounded number of conversations and lets idle ones go when it needs room;
+a session that is running or has a client attached is never dropped. Turns that are running
+do interleave on the agent's single thread, because the kernel is single-threaded by design
+and there is exactly one model and one toolset.
 
 ## Configuration
 
@@ -126,6 +135,8 @@ configuration file and select the file with `--config`.
   the same user can connect — and a process running as that user can already read the
   workspace and the session log. The frame-size cap is about not handing unbounded
   *parsing* to a confused peer, not about defending against a hostile one.
-- **Reconnecting is a new conversation.** A client that loses its connection starts a new
-  session, because a session belongs to a connection. Resuming a named session over the
-  link is not implemented; the transcript is on disk and `nanus tui --session` reads it.
+- **A session is not locked.** Two agents can be told to resume the same conversation, and
+  the second save wins. Attaching to a live session is the supported way to share one.
+- **A name rename reaches a held session late.** The store is updated immediately and
+  resolving the new name works; a listing of held sessions can show the old one until the
+  agent next opens it.

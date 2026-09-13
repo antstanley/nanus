@@ -12,6 +12,14 @@ trust boundary of the local link.
 
 Start here if you want to see it working.
 
+## [Sessions](sessions.md)
+
+What a conversation is on disk, how it is named and renamed, how it is resumed, and what
+it means to attach to one that is still running. Includes the store layout, the frames
+involved, and the limits — a session is not locked, so two writers can lose a turn.
+
+Start here if you want to come back to work tomorrow.
+
 ## [The service](service.md)
 
 An agent that outlives the shell: starting it detached or under a supervisor, stopping it

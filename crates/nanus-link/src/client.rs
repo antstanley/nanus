@@ -22,7 +22,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::error::{LinkError, LinkResult};
-use crate::protocol::{AgentInfo, Frame, Request, encode};
+use crate::protocol::{AgentInfo, Frame, Request, SessionInfo, encode};
 use crate::wire::read_message;
 
 /// A connection to an agent.
@@ -106,6 +106,84 @@ impl Client {
         read_message::<Frame, _>(&mut self.reader).await
     }
 
+    /// Asks the agent to start a session and attach this client to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Agent`] when the agent refuses — a name that is already taken
+    /// is the ordinary reason — and [`LinkError::Protocol`] when the reply is not an
+    /// attachment.
+    pub async fn start(&mut self, name: Option<String>) -> LinkResult<SessionInfo> {
+        self.send(&Request::New { name }).await?;
+        self.attached().await
+    }
+
+    /// Asks the agent to attach this client to an existing session.
+    ///
+    /// The reference is a name or an id; the agent prefers a session it is already
+    /// holding to one on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Agent`] when nothing answers to the reference, and
+    /// [`LinkError::Protocol`] when the reply is not an attachment.
+    pub async fn attach(&mut self, session: &str) -> LinkResult<SessionInfo> {
+        self.send(&Request::Attach {
+            session: session.to_owned(),
+        })
+        .await?;
+        self.attached().await
+    }
+
+    /// Asks the agent which sessions it is holding open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Protocol`] when the reply is not a listing and
+    /// [`LinkError::Closed`] when the agent hung up instead of answering.
+    pub async fn sessions(&mut self) -> LinkResult<Vec<SessionInfo>> {
+        self.send(&Request::Sessions).await?;
+        match self.next().await? {
+            Some(Frame::Sessions { held }) => Ok(held),
+            Some(other) => Err(LinkError::protocol(format!(
+                "expected a listing, got {other:?}"
+            ))),
+            None => Err(LinkError::Closed),
+        }
+    }
+
+    /// Reads the reply to a `New` or an `Attach`.
+    async fn attached(&mut self) -> LinkResult<SessionInfo> {
+        match self.next().await? {
+            Some(Frame::Attached(info)) => Ok(info),
+            // A refusal is the agent answering the question rather than a broken link, so
+            // it keeps its own message instead of being reported as a protocol failure.
+            Some(Frame::Failed { message }) => Err(LinkError::agent(message)),
+            Some(other) => Err(LinkError::protocol(format!(
+                "expected an attachment, got {other:?}"
+            ))),
+            None => Err(LinkError::Closed),
+        }
+    }
+
+    /// Splits the connection into a reader and a sender.
+    ///
+    /// A client that both watches a session and sends to it has to do both at once — a
+    /// prompt sent while frames are still arriving must not stop the frames — and a
+    /// single value cannot be borrowed mutably by two futures in one `select!`. Splitting
+    /// is what makes the two directions independent, which is also how they are.
+    #[must_use]
+    pub fn split(self) -> (ClientReader, ClientSender) {
+        (
+            ClientReader {
+                reader: self.reader,
+            },
+            ClientSender {
+                writer: self.writer,
+            },
+        )
+    }
+
     /// Asks the agent to describe itself.
     ///
     /// # Errors
@@ -137,10 +215,47 @@ impl Client {
     }
 }
 
+/// The reading half of a connection.
+pub struct ClientReader {
+    reader: BufReader<OwnedReadHalf>,
+}
+
+impl ClientReader {
+    /// Reads the next frame, or `None` when the agent closed the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Io`] when the read fails and [`LinkError::Protocol`] when
+    /// the line is not a frame.
+    pub async fn next(&mut self) -> LinkResult<Option<Frame>> {
+        read_message::<Frame, _>(&mut self.reader).await
+    }
+}
+
+/// The writing half of a connection.
+pub struct ClientSender {
+    writer: OwnedWriteHalf,
+}
+
+impl ClientSender {
+    /// Sends one request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Io`] when the write fails.
+    pub async fn send(&mut self, request: &Request) -> LinkResult<()> {
+        let mut line = encode(request)?;
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+}
+
 impl core::fmt::Debug for Client {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Client")
-            .field("session", &self.info.session)
+            .field("workspace", &self.info.workspace)
             .field("model", &self.info.model)
             .finish_non_exhaustive()
     }
@@ -173,6 +288,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_split_connection_reads_and_writes_independently() {
+        // What the split is for: a client watching a session can send while frames are
+        // still arriving, which a single borrow of one value cannot express.
+        let (agent, client) = pair();
+        let mut agent = agent;
+        let mut line = encode(&Frame::Ready(AgentInfo {
+            workspace: "/work".to_owned(),
+            model: "scripted".to_owned(),
+            tools: 0,
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        line.push('\n');
+        let written = agent.write_all(line.as_bytes()).await;
+        assert!(written.is_ok(), "the peer writes");
+
+        let opened = Client::open(client).await;
+        assert!(opened.is_ok(), "{opened:?}");
+        let Ok(client) = opened else { return };
+        let (mut reader, mut sender) = client.split();
+
+        let sent = sender
+            .send(&Request::Prompt {
+                text: "hello".to_owned(),
+            })
+            .await;
+        assert!(sent.is_ok(), "{sent:?}");
+        // The peer reads the request it was sent and answers.
+        let mut echoed = String::new();
+        let read = {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut buffered = BufReader::new(&mut agent);
+            buffered.read_line(&mut echoed).await
+        };
+        assert!(read.is_ok(), "the peer reads");
+        assert!(echoed.contains("hello"), "{echoed}");
+        // And the reader is still usable, which is the point. The peer is closed first,
+        // so the next read is the end of the stream rather than a wait for a frame that
+        // is never coming.
+        drop(agent);
+        assert_eq!(reader.next().await.ok().flatten(), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_attachment_keeps_the_agents_message() {
+        // The agent answering "no" is not a broken link, and a caller has to be able to
+        // tell the two apart: one is a name somebody else has, the other is a bug.
+        let (agent, client) = pair();
+        let mut agent = agent;
+        let mut script = String::new();
+        for frame in [
+            Frame::Ready(AgentInfo {
+                workspace: "/work".to_owned(),
+                model: "scripted".to_owned(),
+                tools: 0,
+            }),
+            Frame::Failed {
+                message: "the name \"taken\" already belongs to session 01a0".to_owned(),
+            },
+        ] {
+            let mut line = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
+            line.push('\n');
+            script.push_str(&line);
+        }
+        let written = agent.write_all(script.as_bytes()).await;
+        assert!(written.is_ok(), "the peer writes");
+
+        let opened = Client::open(client).await;
+        assert!(opened.is_ok(), "{opened:?}");
+        let Ok(mut client) = opened else { return };
+        let attached = client.start(Some("taken".to_owned())).await;
+        match attached {
+            Err(LinkError::Agent(message)) => assert!(message.contains("taken"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_peer_that_hangs_up_before_its_handshake_is_a_closed_error() {
         let (agent, client) = pair();
         drop(agent);
@@ -184,7 +376,6 @@ mod tests {
     async fn a_handshake_is_kept_as_the_agents_description() {
         let (agent, client) = pair();
         let info = AgentInfo {
-            session: "01a09558".to_owned(),
             workspace: "/work".to_owned(),
             model: "deepseek-flash".to_owned(),
             tools: 7,

@@ -10,6 +10,8 @@ limits worth knowing before you depend on something.
 | Core CLI: `run`, `config`, `sessions` | complete |
 | The interface, as its own binary | view layer tested headlessly; raw-mode input needs a real terminal |
 | The local link between them | protocol, client, and server; tested over real sockets with a scripted model |
+| Named, resumable sessions | names in the store, `--name` / `--resume` on `run` and `tui`, `nanus sessions name` |
+| Sessions held open by an agent | listed by `nanus service status`, attached to by `--resume`, watched by several clients at once |
 | `nanus service` | `start` (detached and `--foreground`), `stop`, `status`; detached lifetime verified by hand |
 | Live path (streaming, tool calls, results fed back) | **verified against the real API** |
 
@@ -53,9 +55,15 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   already depends on `nix` for process groups), and no defence against a process already
   running as the same user — such a process can read the workspace and the session log
   regardless. See [the service page](service.md#known-limits).
-- **A connection is a conversation.** Reconnecting starts a new session; resuming a named
-  session over the link is not implemented. The transcript of the old one is on disk, and
-  `nanus tui --session` reads it.
+- **A session is not locked.** `nanus run --resume x` and a service holding `x` are two
+  writers on one log, and the second save wins. Attaching to a live session is the
+  supported way to share one, and it is what the interface does.
+- **A session is held in memory while an agent holds it.** Bounded at 32 idle sessions,
+  least-recently-used first, and never at the cost of a running turn or an attached
+  client. A session that is let go is still on disk and reloads on the next attach.
+- **A client that attaches mid-turn sees the rest of it.** The frames before it went to
+  clients that were already there. The transcript is still whole — the store is where
+  history comes from — but a watcher joining late has a gap until the turn ends.
 - **One agent, one thread.** A service serves several clients and their turns interleave
   cooperatively, because the kernel is single-threaded and its futures are not `Send`.
   Concurrency is not parallelism, and there is no worker pool.

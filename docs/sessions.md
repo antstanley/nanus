@@ -1,0 +1,147 @@
+# Sessions
+
+A session is the conversation. It is written down as it happens, it can be given a name,
+and it can be picked up again — by a later command, by another terminal, or by a client
+that attaches to an agent that is still in the middle of it.
+
+```sh
+nanus run --name nightly "summarise what changed today"
+nanus sessions                                  # list, with names
+nanus tui --resume nightly                      # continue it
+nanus sessions name project-x 01a09a98…         # or rename it later
+```
+
+## What a session is
+
+An append-only log of events — turns, messages, tool calls and their results — plus the
+identity of the conversation: a store key, a creation time, and the directory it ran in.
+It is the only copy. Everything a client shows is derived from it, which is why the agent
+records before it answers and why a transcript is reproducible rather than reconstructed.
+
+```text
+<nanus home>/
+  sessions/
+    01a09a98-d8c4-73d7-b11d-638077efeeca/
+      session.jsonl      the conversation
+      name               "nightly"           (optional)
+```
+
+The key is a time-ordered uuid, so a directory listing sorts by creation. The name is a
+separate file beside the log, and that is deliberate:
+
+- **A name is an alias, not identity.** The domain says a session id is a store key and
+  the store decides what a key looks like. A human-typable second key is the same kind of
+  decision, so naming a session never rewrites it and renaming keeps its identity.
+- **No shared table.** A file per session means two writers cannot lose each other's
+  aliases, and deleting a session takes its name with it rather than leaving an alias
+  pointing at nothing.
+- **A name is content, never a path.** It lives inside the session's own directory under a
+  fixed file name, so no name can climb out of the store.
+
+## Naming
+
+A name is how a session is found again, so it is taken for good: starting a second session
+with a name that is already held is refused, not moved. Silently reassigning an alias would
+make `--resume nightly` open somebody else's conversation.
+
+```console
+$ nanus run --name nightly "…"
+$ nanus run --name nightly "…"
+nanus: the name "nightly" already belongs to session 01a09a98-d8c4-73d7-b11d-638077efeeca
+```
+
+The name is claimed *before* the turn runs, so a refused name costs a sentence rather than
+a turn, and leaves no unnamed session behind as the evidence of it.
+
+Renaming releases the old name:
+
+```sh
+nanus sessions name project-x 01a09a98-d8c4-73d7-b11d-638077efeeca
+```
+
+A session can be renamed while an agent is holding it. The rename is durable immediately,
+and the agent picks up the new name the next time it opens the session — a listing of
+*held* sessions can show the name it was opened under until then. Resuming by the new name
+works straight away, because resolving a reference falls through to the store.
+
+## Resuming
+
+| Command | What it does |
+|---|---|
+| `nanus tui --resume <name\|id>` | Opens the interface on an existing conversation. |
+| `nanus run --resume <name\|id> <task>` | Adds one turn to it and exits. |
+| `nanus tui --connect --resume <name\|id>` | The same, against an agent that is already running. |
+
+The reference is a name or a session id, and a name wins if both could match: a name is the
+human-facing key, so a session somebody named is the one they meant.
+
+Resuming is not read-only. It continues the conversation, which means it writes to the same
+log — and a session is not locked. Resuming a session that another agent is holding open,
+or that a `nanus service` is serving, is two writers on one file: the last save wins and the
+other turn is lost. The safe way to continue a live conversation is to attach to it, below.
+
+Reading without continuing is `nanus tui --session`, which needs no agent and no key,
+because a transcript that has already been written down is just a file.
+
+## Live sessions
+
+An agent holds its sessions open. A `nanus service` therefore has a set of conversations
+that are *running*, and a client can attach to one instead of starting its own:
+
+```console
+$ nanus service status
+socket: /Users/you/.config/nanus/run/agent.sock
+model: deepseek-flash
+tools: 7
+workspace: /Users/you/code/project
+session: 01a09a9d-8aa2-7736-86a6-7c6d3dedaa7a  shared-work  idle  2 attached  3 events
+```
+
+- **A session outlives its clients.** The agent keeps holding a conversation after the
+  terminal that opened it exits. That is what makes `--resume` reach the same session
+  rather than a stale copy of it.
+- **A turn outlives the client that asked for it.** The turn runs in its own task, owned
+  by the session, so closing a terminal mid-turn no longer abandons the work.
+- **A session is one conversation with many views.** Every attached client sees the same
+  frames: prompts from other clients, streamed answers, tool calls, and the ending. Two
+  terminals can watch one conversation.
+- **One turn at a time.** A session's log can only be written by one turn, so a prompt to
+  a busy session is refused with a message rather than queued — the model has not seen the
+  first answer yet, and pretending otherwise would reorder the conversation.
+
+A client that attaches mid-turn sees the rest of that turn rather than all of it, because
+the frames before it went out to clients that were already there. Its transcript is still
+whole: the agent records the turn, and the store is where a client reads history.
+
+The agent holds at most [`MAX_HELD_SESSIONS`](../crates/nanus-link/src/server.rs) open, and
+lets the least recently used *idle* one go when it needs room. The bound yields to the work:
+a session that is running a turn or has a client attached is never dropped, even if that
+means holding more. A session that is let go is still on disk, and attaching to it again
+loads it.
+
+## What travels over the link
+
+A session is the agent's; a client's view of it is a handful of frames.
+
+| Frame | Meaning |
+|---|---|
+| `Ready` | What the agent is — workspace, model, tool count. |
+| `Attached` | Which session this connection is now a view of. |
+| `Sessions` | The sessions the agent is holding. |
+| `User` | Somebody asked something, sent to every view but the one that asked. |
+| `Text`, `Reasoning`, `Step`, `Tool`, `ToolDone`, `Usage` | The turn, as it happens. |
+| `Done`, `Failed` | How it ended. |
+
+Deliberately not a session log. A client that wants the conversation reads it from the
+store, where it is already durable, rather than receiving a second copy over a socket that
+would then be a second source of truth.
+
+## Known limits
+
+- **No locking.** Two agents can be told to resume the same session, and the second save
+  wins. Attaching to a live session is the supported way to share one.
+- **No deletion in the interface.** `StorePort::delete` exists and `nanus sessions` does
+  not expose it yet, so removing a session means removing its directory.
+- **Names are flat and case-sensitive.** `Nightly` and `nightly` are two names, and there
+  is no namespacing.
+- **A name is per store, not per machine.** `$NANUS_HOME` decides which names exist.

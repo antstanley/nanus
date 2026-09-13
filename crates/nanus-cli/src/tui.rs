@@ -17,6 +17,7 @@
 //!   means in practice: closing the interface closes the agent, and there is no orphan
 //!   holding a tool process open.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -76,7 +77,7 @@ pub fn resolve_binary() -> Result<PathBuf, String> {
 ///
 /// Returns a message when the composition fails to mount, the socket cannot be bound, the
 /// interface cannot be started, or it exits non-zero.
-pub fn attached(pending: Pending, workspace: &Path) -> Result<(), String> {
+pub fn attached(pending: Pending, workspace: &Path, arguments: &[OsString]) -> Result<(), String> {
     let binary = resolve_binary()?;
     let socket = attached_socket(&crate::service::home()?, std::process::id());
     let harness = pending.start().map_err(|error| error.to_string())?;
@@ -91,7 +92,7 @@ pub fn attached(pending: Pending, workspace: &Path) -> Result<(), String> {
             Ok(listener) => listener,
             Err(error) => return (Err(error.to_string()), None),
         };
-        let mut child = match spawn(&binary, &socket) {
+        let mut child = match spawn(&binary, &socket, arguments) {
             Ok(child) => child,
             Err(error) => return (Err(error), None),
         };
@@ -124,7 +125,7 @@ pub fn attached(pending: Pending, workspace: &Path) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns a message when the interface cannot be started or exits non-zero.
-pub fn alone(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+pub fn alone(arguments: &[OsString]) -> Result<(), String> {
     let binary = resolve_binary()?;
     let status = std::process::Command::new(&binary)
         .args(arguments)
@@ -136,13 +137,22 @@ pub fn alone(arguments: &[std::ffi::OsString]) -> Result<(), String> {
 }
 
 /// Starts the interface against the agent listening at `socket`.
-fn spawn(binary: &Path, socket: &Path) -> Result<tokio::process::Child, String> {
+///
+/// `arguments` is what the interface was told about which conversation to open; the
+/// socket is this function's business and the choice is not, so the two are passed
+/// together rather than merged above.
+fn spawn(
+    binary: &Path,
+    socket: &Path,
+    arguments: &[OsString],
+) -> Result<tokio::process::Child, String> {
     // Killed if this process gives up on it: an interface talking to an agent that no
     // longer exists would connect to nothing and look broken. `kill_on_drop` covers the
     // paths that exit early, and the ordinary path has already reaped the child.
     tokio::process::Command::new(binary)
         .arg("--link")
         .arg(socket)
+        .args(arguments)
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", binary.display()))

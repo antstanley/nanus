@@ -25,6 +25,7 @@ should read the relevant page before changing a subsystem:
 | [`docs/style.md`](docs/style.md) | Writing any Rust. |
 | [`docs/tui.md`](docs/tui.md) | Changing the interface, or the link between it and the core. |
 | [`docs/service.md`](docs/service.md) | Changing how an agent is started, detached, or stopped. |
+| [`docs/sessions.md`](docs/sessions.md) | Changing what a session is, how it is named, or who holds it. |
 | [`SAFETY.md`](SAFETY.md) | Anything that reads files, runs programs, or handles secrets. |
 
 There is also [`cordis-mechanisms-report.md`](cordis-mechanisms-report.md), a long
@@ -104,7 +105,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 605 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 629 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -254,6 +255,13 @@ design docs too.
   thing an interface must show is a new `Frame` variant, which means a change to
   `nanus-link` and to the server that produces it — not a new field smuggled
   through an existing one.
+- **A session is the agent's, and a connection is a view of one.** The client sends
+  `New` or `Attach` before it can prompt, the server owns the session afterwards,
+  and a turn runs in its own task so it outlives the client that asked for it. A
+  change that puts a session back inside a connection undoes resuming and watching.
+- **A name is an alias for a store key, and one session has one name.** Naming is
+  refused rather than moved when the name is held, and the alias lives in the
+  session's own directory (`name`), so it cannot be lost with a shared table.
 
 ## How to make common changes
 
@@ -292,6 +300,20 @@ something outside a turn), and handle it in `nanus_tui::runtime::apply`. The
 compiler will point at all three: the enum match in `apply` is exhaustive, so a
 new frame cannot be silently ignored. Add a round-trip case to the protocol test
 and a case to the `apply` test.
+
+**Change what a session is or how it is named.** `nanus-ports::StorePort` is the
+boundary: `resolve` reads a name, `name` records one, `name_of` reads the reverse,
+and `SessionSummary` carries the name into a listing. The adapter stores it as a
+fixed `name` file inside the session's directory — content, never a path component
+— so a name cannot climb out of the store. Do not put a name in the domain's
+`Session`: the domain's id is already documented as a store key, and a name is the
+same kind of decision.
+
+**Change how a session is opened.** `nanus_link::server::Registry` resolves a
+reference — live by name, live by id, then the store — and `Held` is what an agent
+holds open. Everything a listing or an attachment shows is cached beside the
+session (`Headline`, `name`, `busy`, `viewers`) precisely so that nothing but a
+turn ever borrows the session itself.
 
 **Change how an agent is started.** The three modes differ by *lifetime*, not by
 agent, and they all end in `nanus_link::server::serve` or `Harness::run_turn`. A

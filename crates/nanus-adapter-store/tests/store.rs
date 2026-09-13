@@ -445,3 +445,197 @@ proptest::proptest! {
         }).expect("round trip");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Names.
+//
+// A name is an alias for a store key, and the tests are mostly about the ways an
+// alias goes wrong: taken, reused, freed, or made unusable.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_named_session_resolves_by_its_name() {
+    let (_dir, store) = store().await;
+    let saved = session("session-1", 10, &["hello"]);
+    store.save(&saved).await.expect("save");
+    store
+        .name(saved.id(), "the-glob-bug")
+        .await
+        .expect("name is recorded");
+
+    assert_eq!(
+        store.resolve("the-glob-bug").await.expect("resolve"),
+        Some(saved.id().clone())
+    );
+    // And the listing shows it, so a person can see what a session is called
+    // without resolving every name in turn.
+    let listed = store.list().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed.first().and_then(|summary| summary.name.clone()),
+        Some("the-glob-bug".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_sessions_name_can_be_read_back_from_its_id() {
+    // The other direction matters as much as the first: an agent that has just loaded a
+    // session by id has to be able to say what a person calls it.
+    let (_dir, store) = store().await;
+    let saved = session("session-1", 10, &["hello"]);
+    store.save(&saved).await.expect("save");
+    assert_eq!(store.name_of(saved.id()).await.expect("read"), None);
+    store.name(saved.id(), "glob-bug").await.expect("name");
+    assert_eq!(
+        store.name_of(saved.id()).await.expect("read"),
+        Some("glob-bug".to_owned())
+    );
+    // And an id nobody has is not an error either.
+    assert_eq!(
+        store
+            .name_of(&SessionId::new("never-saved"))
+            .await
+            .expect("read"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn naming_a_session_that_is_not_stored_is_not_found() {
+    let (_dir, store) = store().await;
+    let error = store
+        .name(&SessionId::new("never-saved"), "a-name")
+        .await
+        .expect_err("an alias for nothing is refused");
+    match error {
+        StoreError::NotFound { id } => assert_eq!(id, "never-saved"),
+        other => panic!("expected NotFound, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn a_name_another_session_holds_is_refused() {
+    let (_dir, store) = store().await;
+    let first = session("session-1", 10, &["one"]);
+    let second = session("session-2", 20, &["two"]);
+    store.save(&first).await.expect("save");
+    store.save(&second).await.expect("save");
+    store.name(first.id(), "shared").await.expect("first name");
+
+    // The direction that matters: silently moving an alias would make a script
+    // resume somebody else's conversation.
+    let error = store
+        .name(second.id(), "shared")
+        .await
+        .expect_err("a taken name is refused");
+    match error {
+        StoreError::NameTaken { name, id } => {
+            assert_eq!(name, "shared");
+            assert_eq!(id, "session-1");
+        }
+        other => panic!("expected NameTaken, got {other}"),
+    }
+    assert_eq!(
+        store.resolve("shared").await.expect("resolve"),
+        Some(first.id().clone()),
+        "the original holder keeps it"
+    );
+}
+
+#[tokio::test]
+async fn a_session_can_be_renamed_and_the_old_name_is_released() {
+    let (_dir, store) = store().await;
+    let one = session("session-1", 10, &["one"]);
+    let two = session("session-2", 20, &["two"]);
+    store.save(&one).await.expect("save");
+    store.save(&two).await.expect("save");
+    store.name(one.id(), "first-name").await.expect("name");
+    store.name(one.id(), "second-name").await.expect("rename");
+
+    assert_eq!(store.resolve("first-name").await.expect("resolve"), None);
+    assert_eq!(
+        store.resolve("second-name").await.expect("resolve"),
+        Some(one.id().clone())
+    );
+    // Setting the name a session already has is a rename to itself, not a
+    // collision with itself.
+    store
+        .name(one.id(), "second-name")
+        .await
+        .expect("idempotent");
+    // And the released name is free for somebody else.
+    store.name(two.id(), "first-name").await.expect("reuse");
+    assert_eq!(
+        store.resolve("first-name").await.expect("resolve"),
+        Some(two.id().clone())
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_name_is_refused() {
+    let (_dir, store) = store().await;
+    let saved = session("session-1", 10, &["hello"]);
+    store.save(&saved).await.expect("save");
+
+    let too_long = "x".repeat(200);
+    let with_control = "line\nbreak";
+    for bad in ["", "   ", too_long.as_str(), with_control] {
+        let outcome = store.name(saved.id(), bad).await;
+        assert!(
+            matches!(outcome, Err(StoreError::InvalidName { .. })),
+            "{bad:?} must be refused, got {outcome:?}"
+        );
+        // The other direction: a refused name leaves nothing behind.
+        assert_eq!(store.resolve(bad).await.expect("resolve"), None);
+    }
+}
+
+#[tokio::test]
+async fn resolving_a_name_nobody_has_is_none_rather_than_an_error() {
+    // The ordinary state of a name a user is about to choose.
+    let (_dir, store) = store().await;
+    assert_eq!(store.resolve("unused").await.expect("resolve"), None);
+    // Including a name that could never have been taken.
+    assert_eq!(store.resolve("").await.expect("resolve"), None);
+}
+
+#[tokio::test]
+async fn deleting_a_session_frees_its_name() {
+    let (_dir, store) = store().await;
+    let saved = session("session-1", 10, &["hello"]);
+    store.save(&saved).await.expect("save");
+    store.name(saved.id(), "temporary").await.expect("name");
+    store.delete(saved.id()).await.expect("delete");
+
+    assert_eq!(store.resolve("temporary").await.expect("resolve"), None);
+    // A name that outlived its session would make a later session inherit an
+    // alias for something that no longer exists.
+    let replacement = session("session-2", 20, &["other"]);
+    store.save(&replacement).await.expect("save");
+    store
+        .name(replacement.id(), "temporary")
+        .await
+        .expect("the freed name is usable");
+}
+
+#[tokio::test]
+async fn a_name_that_is_not_readable_leaves_the_session_unnamed() {
+    let (dir, store) = store().await;
+    let saved = session("session-1", 10, &["hello"]);
+    store.save(&saved).await.expect("save");
+    store.name(saved.id(), "good-name").await.expect("name");
+
+    // A name is a convenience, never the session: a damaged one must cost the
+    // alias and not the log.
+    std::fs::write(store.name_file(saved.id()).expect("path"), "bad\u{7}name\n").expect("write");
+    assert_eq!(store.resolve("good-name").await.expect("resolve"), None);
+    let loaded = store.load(saved.id()).await.expect("the session survives");
+    assert_eq!(loaded.event_count(), saved.event_count());
+    let listed = store.list().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed.first().and_then(|summary| summary.name.clone()),
+        None
+    );
+    drop(dir);
+}

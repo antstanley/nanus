@@ -43,6 +43,7 @@ use futures::StreamExt as _;
 use nanus_domain::{Session, SessionId};
 use nanus_link::Client;
 use nanus_link::protocol::{Frame, Request};
+use nanus_ports::StoreHandle;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -96,6 +97,14 @@ pub trait SessionSource {
     /// The session to display.
     fn session(&self) -> &Session;
 
+    /// What to call the session in the title bar, when it has a name worth showing.
+    ///
+    /// `None` is the ordinary case for a recording, which announces itself with a banner
+    /// instead, and for a live conversation the agent did not name.
+    fn label(&self) -> Option<&str> {
+        None
+    }
+
     /// Rows to scroll back from the end when the interface opens.
     ///
     /// A conversation opens at its end, which is where the answer is; a reader who wants
@@ -146,11 +155,7 @@ pub trait SessionSource {
 /// Returns a message when the store cannot be read or the session does not exist. An id
 /// that does not exist is only reported as missing — `nanus sessions` is what lists the
 /// ones that do, so a mistyped uuid is worth checking against it.
-pub fn view(
-    store: &nanus_ports::StoreHandle,
-    id: Option<&str>,
-    scroll_back: u32,
-) -> Result<(), String> {
+pub fn view(store: &StoreHandle, id: Option<&str>, scroll_back: u32) -> Result<(), String> {
     let store = std::rc::Rc::clone(store);
     let requested = id.map(str::to_owned);
     let session = block_on(async move {
@@ -216,37 +221,65 @@ impl SessionSource for Recording {
     }
 }
 
+/// What the interface was asked to talk to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// A new session, recorded under `name` if one was given.
+    New {
+        /// The name to record it under, if any.
+        name: Option<String>,
+    },
+    /// A session that already exists, named by a name or an id.
+    Resume(String),
+}
+
 /// A live conversation, held by an agent on the other end of the link.
 ///
-/// The connection is made once, when the interface starts, and it *is* the conversation:
-/// the agent creates a session for it and every prompt sent over it joins that session.
-/// The interface therefore never names a session — it holds one.
+/// The interface does not own the session — the agent does, and this is one view of it.
+/// That is what makes a resume possible: the conversation is loaded from the store as it
+/// is already written down, the connection is attached to it, and everything after that
+/// arrives as frames.
 pub struct Remote {
     session: Session,
+    label: String,
     client: Option<Client>,
     requests: mpsc::UnboundedSender<Request>,
     pending: Option<mpsc::UnboundedReceiver<Request>>,
 }
 
 impl Remote {
-    /// Connects to the agent listening at `path`.
+    /// Connects to the agent listening at `path` and attaches to `target`.
     ///
     /// # Errors
     ///
-    /// Returns a message when nothing is listening or the peer does not open with a
-    /// handshake. The message is already user-facing, so it is not wrapped again.
-    pub async fn connect(path: &Path) -> Result<Self, String> {
-        let client = Client::connect(path)
+    /// Returns a message when nothing is listening, the agent refuses the session, or the
+    /// store cannot be read. The message is already user-facing, so it is not wrapped
+    /// again.
+    pub async fn connect(path: &Path, store: &StoreHandle, target: Target) -> Result<Self, String> {
+        let mut client = Client::connect(path)
             .await
             .map_err(|error| error.to_string())?;
-        let info = client.info().clone();
-        // The interface never shows a live session's creation time — a conversation the
-        // reader is in needs no header announcing it — so the timestamp is the epoch and
-        // the recorded path, which does show one, reads it from the store instead.
-        let session = Session::new(SessionId::new(info.session), 0, info.workspace);
+        let agent = client.info().clone();
+        let attached = match target {
+            Target::New { name } => client.start(name).await,
+            Target::Resume(reference) => client.attach(&reference).await,
+        }
+        .map_err(|error| error.to_string())?;
+        let id = SessionId::new(&attached.session);
+        // The conversation as it is already written down. A session being resumed has a
+        // log; a new one has none, and a session with no events is the same thing as a
+        // session the store has never seen — which is why a miss is not an error here.
+        let session = match store.load(&id).await {
+            Ok(session) => session,
+            // A live session never shows a creation time — the reader is in it — so the
+            // timestamp is the epoch and the recorded path reads a real one.
+            Err(_) => Session::new(id, 0, agent.workspace),
+        };
+        let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
         let (requests, pending) = mpsc::unbounded_channel();
         Ok(Self {
             session,
+            label,
             client: Some(client),
             requests,
             pending: Some(pending),
@@ -254,9 +287,21 @@ impl Remote {
     }
 }
 
+/// The first few characters of a session id, for a title bar.
+///
+/// A uuid is too long to draw and too wide to read, and eight characters is what the
+/// session listing shows and what a person copies.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 impl SessionSource for Remote {
     fn session(&self) -> &Session {
         &self.session
+    }
+
+    fn label(&self) -> Option<&str> {
+        Some(&self.label)
     }
 
     fn accepts_prompts(&self) -> bool {
@@ -289,41 +334,46 @@ impl SessionSource for Remote {
 
 /// Moves requests to the agent and frames back, for as long as the connection lasts.
 ///
-/// One task rather than a task per prompt, because the connection *is* the conversation:
-/// a second connection would be a second session.
+/// One task, reading and writing at once. Reading *continuously* rather than only after a
+/// prompt is the whole point: a connection is a view of a session now, so a client that
+/// only listened while it had a question would miss everything the other clients did —
+/// which is exactly what watching a running session means.
 async fn pump(
-    mut client: Client,
+    client: Client,
     mut requests: mpsc::UnboundedReceiver<Request>,
     frames: mpsc::Sender<Frame>,
 ) {
-    while let Some(request) = requests.recv().await {
-        if let Err(error) = client.send(&request).await {
-            report(&frames, error.to_string()).await;
-            return;
-        }
-        if !matches!(request, Request::Prompt { .. }) {
-            continue;
-        }
-        loop {
-            match client.next().await {
-                Ok(Some(frame)) => {
-                    let last = frame.is_end_of_turn();
-                    // A receiver that has gone away means the interface is closing, so
-                    // there is nobody left to tell.
-                    if frames.send(frame).await.is_err() {
-                        return;
-                    }
-                    if last {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    report(&frames, String::from("the agent closed the link")).await;
+    // Split, because the two directions run at once and one borrow cannot serve both.
+    let (mut reader, mut sender) = client.split();
+    loop {
+        tokio::select! {
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    // Every sender is gone, which means the interface is closing.
                     return;
-                }
-                Err(error) => {
+                };
+                if let Err(error) = sender.send(&request).await {
                     report(&frames, error.to_string()).await;
                     return;
+                }
+            }
+            frame = reader.next() => {
+                match frame {
+                    Ok(Some(frame)) => {
+                        // A receiver that has gone away means the interface is closing, so
+                        // there is nobody left to tell.
+                        if frames.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        report(&frames, String::from("the agent closed the link")).await;
+                        return;
+                    }
+                    Err(error) => {
+                        report(&frames, error.to_string()).await;
+                        return;
+                    }
                 }
             }
         }
@@ -426,6 +476,7 @@ async fn event_loop(
     // Opening at the end, or part way back from it: the offset is applied on the first
     // render, when the viewport it is measured against is known.
     view.pending_scroll_back = Some(source.initial_scroll());
+    view.label = source.label().map(str::to_owned);
     if viewing_only {
         view.status = String::from("viewing a recorded session · Ctrl-C quits");
     }
@@ -593,6 +644,13 @@ fn apply(frame: Frame, view: &mut ViewState) {
                 .append_stream(Role::Reasoning, &delta, false);
             view.scroll_to_bottom();
         }
+        Frame::User { text } => {
+            // Somebody else's prompt in a session this interface is watching: the
+            // reader needs to see the question before the answer.
+            view.transcript.push(Entry::prose(Role::User, text));
+            view.begin_turn(1);
+            view.scroll_to_bottom();
+        }
         Frame::Step { step } => view.begin_turn(step),
         Frame::Tool { name } => {
             view.transcript.push(Entry::tool_call(name, ""));
@@ -612,9 +670,13 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.end_turn();
         }
         // Frames that describe the connection rather than the conversation. The interface
-        // learned what it needed from the handshake before it drew anything, and a `Bye`
-        // is the transport's business, not the transcript's.
-        Frame::Ready(_) | Frame::Status(_) | Frame::Bye => {}
+        // learned what it needed from the handshake and the attachment before it drew
+        // anything, and a `Bye` is the transport's business, not the transcript's.
+        Frame::Ready(_)
+        | Frame::Attached(_)
+        | Frame::Sessions { .. }
+        | Frame::Status(_)
+        | Frame::Bye => {}
     }
 }
 
@@ -817,6 +879,26 @@ mod tests {
     }
 
     #[test]
+    fn another_clients_prompt_lands_in_the_transcript_as_the_user() {
+        // Watching a session means seeing both sides of it: an answer to a question the
+        // reader never saw is unreadable.
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        assert!(
+            sender
+                .try_send(Frame::User {
+                    text: "somebody else asked".to_owned()
+                })
+                .is_ok()
+        );
+        drain_frames(&mut receiver, &mut view);
+        let first = view.transcript.entries().first();
+        assert_eq!(first.map(Entry::text), Some("somebody else asked"));
+        assert_eq!(first.map(Entry::role), Some(Role::User));
+        assert!(view.busy, "a turn is running");
+    }
+
+    #[test]
     fn streamed_answer_frames_land_in_the_transcript() {
         let (sender, mut receiver) = mpsc::channel::<Frame>(8);
         let mut view = ViewState::new();
@@ -928,8 +1010,15 @@ mod tests {
         let mut view = ViewState::new();
         for frame in [
             Frame::Bye,
-            Frame::Status(nanus_link::protocol::AgentInfo {
+            Frame::Attached(nanus_link::protocol::SessionInfo {
                 session: "s".to_owned(),
+                name: None,
+                title: None,
+                events: 0,
+                busy: false,
+                viewers: 1,
+            }),
+            Frame::Status(nanus_link::protocol::AgentInfo {
                 workspace: "/tmp".to_owned(),
                 model: "m".to_owned(),
                 tools: 0,
@@ -1012,9 +1101,22 @@ mod tests {
     #[test]
     fn connecting_to_a_socket_nobody_is_serving_is_an_error_rather_than_a_panic() {
         let missing = Path::new("/definitely/not/a/socket");
-        let outcome = block_on(Remote::connect(missing));
+        let store = nanus_kernel::runtime::block_on(open_store_for_test());
+        let outcome = block_on(Remote::connect(missing, &store, Target::New { name: None }));
         assert!(outcome.is_err(), "a missing socket is refused");
         let Err(error) = outcome else { return };
         assert!(error.contains("/definitely/not/a/socket"), "{error}");
+    }
+
+    /// A store that is never read, for a test that only wants a connection refused.
+    async fn open_store_for_test() -> StoreHandle {
+        // `NANUS_HOME` is read by the resolver; the temporary directory is what keeps a
+        // test from touching the real one.
+        let home = std::env::temp_dir().join("nanus-tui-test-store");
+        let built = nanus_adapter_store::JsonlStore::new(home).await;
+        built.map_or_else(
+            |error| panic!("a store in the temporary directory: {error}"),
+            nanus_adapter_store::JsonlStore::handle,
+        )
     }
 }

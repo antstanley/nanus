@@ -106,6 +106,25 @@ The service is not a special case of the interface, and the interface is not a s
 case of the one-shot run. They are three answers to "how long", on top of one answer to
 "what".
 
+### A session belongs to the agent, not to the connection
+
+The first version made a connection *be* a conversation: connect, and you had a session.
+It was pleasant and it made the lifetimes fall out — close the interface, close the agent —
+but it also meant a conversation could not be reached twice. Resuming was reading, and a
+session an agent was still holding was unreachable, because nothing could name it.
+
+Now the agent owns sessions and a connection is a view of one. A client says `new` or
+`attach`, the agent keeps holding the session after that client leaves, and a turn runs in
+its own task so it outlives the terminal that asked for it. The costs are real: one turn at
+a time per session, a client that attaches mid-turn missing the frames already sent, and a
+registry that has to bound itself. The benefit is that a conversation is a thing rather
+than an event, which is what makes naming, resuming, and watching the same feature.
+
+Sessions are also deliberately *not* streamed over the link. A client that wants the
+conversation reads it from the store, where it is already durable, rather than receiving a
+second copy that would make the socket a second source of truth. The link carries what
+happened, not what was.
+
 ### The interface is a program, not a library
 
 The core does not link the interface, and that is enforced by the manifest rather than by

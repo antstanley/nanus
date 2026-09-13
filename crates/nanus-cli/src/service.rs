@@ -351,17 +351,34 @@ pub fn stop(socket: &Path) -> Result<(), String> {
 /// Returns a message when nothing is listening or the reply cannot be read. Not running is
 /// a failure rather than a plain answer, so a script can branch on the exit code.
 pub fn status(socket: &Path) -> Result<(), String> {
-    let info = block_on(async {
+    let (info, held) = block_on(async {
         let mut client = Client::connect(socket)
             .await
             .map_err(|error| error.to_string())?;
-        client.ask_status().await.map_err(|error| error.to_string())
+        let info = client
+            .ask_status()
+            .await
+            .map_err(|error| error.to_string())?;
+        let held = client.sessions().await.map_err(|error| error.to_string())?;
+        Ok::<_, String>((info, held))
     })?;
     println!("socket: {}", socket.display());
     println!("model: {}", info.model);
     println!("tools: {}", info.tools);
     println!("workspace: {}", info.workspace);
-    println!("session: {}", info.session);
+    if held.is_empty() {
+        println!("sessions: none held");
+    }
+    for session in held {
+        // The name when it has one, the id otherwise: a listing that hid the id would
+        // make an unnamed session impossible to resume.
+        let name = session.name.unwrap_or_else(|| session.session.clone());
+        let state = if session.busy { "running" } else { "idle" };
+        println!(
+            "session: {}  {name}  {state}  {} attached  {} events",
+            session.session, session.viewers, session.events
+        );
+    }
     Ok(())
 }
 

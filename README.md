@@ -8,7 +8,7 @@ Eleven crates of safe Rust. A seven-tool toolset. Every part of it — the model
 the tool registry, the session log, the permission policy, and the agent loop itself —
 is a plugin you can remove, replace, or write yourself.
 
-[![tests](https://img.shields.io/badge/tests-605%20passing-brightgreen)](docs/testing.md)
+[![tests](https://img.shields.io/badge/tests-629%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
@@ -119,6 +119,10 @@ export DEEPSEEK_API_KEY=...
 ./target/release/nanus service status
 ./target/release/nanus service stop
 
+# Come back to a conversation tomorrow, by name.
+./target/release/nanus run --name nightly "summarise what changed today"
+./target/release/nanus tui --resume nightly
+
 # No key needed for either of these.
 ./target/release/nanus config      # the effective configuration
 ./target/release/nanus sessions    # transcripts of everything you have run
@@ -128,6 +132,10 @@ Three modes, one agent. `run` keeps it for a turn, `tui` for as long as the inte
 open, and `service` until you stop it — and the interface is always a client, over a
 local socket, whether the agent beside it is one this shell started or one that has been
 up since boot.
+
+A conversation is a thing rather than an event. Name it, come back to it, or attach to it
+while an agent is still in the middle of it — and watch from a second terminal, because
+every client on a session sees the same turn.
 
 **stdout carries the answer and nothing else.** Reasoning and tool activity go to stderr.
 The exit code is part of the contract: `0` only for a completed turn, non-zero otherwise,
@@ -205,7 +213,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.4s] 605 tests run: 605 passed, 0 skipped
+Summary [3.6s] 629 tests run: 629 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed

@@ -8,6 +8,14 @@
 //! | `nanus tui` (or a bare `nanus`) | An agent scoped to this shell, and the interface to talk to it. |
 //! | `nanus service` | An agent that outlives the shell that started it. |
 //!
+//! ## Sessions
+//!
+//! A session is the conversation, and it is written down whether it was started by a run,
+//! an interface, or a service. `--name` records one under a name, `--resume` continues
+//! one, and `nanus sessions` lists them. The name is an alias for the store key, so a
+//! session keeps its identity through a rename, and a name is refused rather than moved
+//! when another session already answers to it.
+//!
 //! ## What this binary is not
 //!
 //! It is not the interface. It hosts an agent, and for the interactive mode it runs the
@@ -70,6 +78,22 @@ pub struct Args {
 pub enum Command {
     /// Run one task, print its answer, and exit.
     Run {
+        /// Record the session under this name.
+        ///
+        /// A name is how a session is found again, so it is taken for good: starting a
+        /// second session with a name that is already held is an error rather than a
+        /// silent second meaning for the same word.
+        #[arg(long, value_name = "NAME", conflicts_with = "resume")]
+        name: Option<String>,
+
+        /// Continue a session instead of starting one.
+        ///
+        /// The reference is a name or a session id. This is a second writer on the
+        /// conversation: a session a `nanus service` is holding open is not locked, so
+        /// resuming one that is live elsewhere is a way to lose a turn.
+        #[arg(long, value_name = "NAME|ID")]
+        resume: Option<String>,
+
         /// The task, as one or more words.
         #[arg(required = true, value_name = "TASK")]
         task: Vec<String>,
@@ -109,6 +133,18 @@ pub enum Command {
         /// was started with its own `--socket`.
         #[arg(long, value_name = "PATH", requires = "connect")]
         socket: Option<PathBuf>,
+
+        /// Continue a session instead of starting one.
+        ///
+        /// The reference is a name or a session id. The agent prefers a session it is
+        /// already holding to one on disk, so resuming a conversation somebody is in the
+        /// middle of joins it.
+        #[arg(long, value_name = "NAME|ID", conflicts_with = "session")]
+        resume: Option<String>,
+
+        /// Record a new session under this name.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["session", "resume"])]
+        name: Option<String>,
     },
 
     /// Run the agent as a long-running service.
@@ -125,7 +161,26 @@ pub enum Command {
     Config,
 
     /// List recorded sessions, newest first.
-    Sessions,
+    Sessions {
+        /// What to do with them other than listing.
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
+}
+
+/// What to do with recorded sessions.
+#[derive(Debug, Subcommand)]
+pub enum SessionsAction {
+    /// Record a name for an existing session.
+    ///
+    /// Naming a session that already has one renames it, and the old name is released:
+    /// one session has one name, and a name has one session.
+    Name {
+        /// The name to record.
+        name: String,
+        /// The session to record it for: an id, or a name it already answers to.
+        session: String,
+    },
 }
 
 /// What to do with the service.
@@ -243,6 +298,8 @@ pub async fn prepare() -> Result<Ready, String> {
             scroll: 0,
             connect: false,
             socket: None,
+            resume: None,
+            name: None,
         },
         // Redirected or piped there is no screen to draw on, and starting a
         // full-screen interface there would either fail or hang. Saying what the
@@ -264,16 +321,18 @@ pub async fn prepare() -> Result<Ready, String> {
         ));
     }
     match command {
-        Command::Run { task } => prepare_run(&options, &task).await,
+        Command::Run { task, resume, name } => prepare_run(&options, &task, resume, name).await,
         // Showing the configuration prints and is finished.
         Command::Config => show_config(&options).map(|()| Ready::Done),
-        Command::Sessions => prepare_list().await,
+        Command::Sessions { action } => prepare_sessions(action).await,
         Command::Tui {
             session,
             scroll,
             connect,
             socket,
-        } => prepare_tui(&options, session, scroll, connect, socket).await,
+            resume,
+            name,
+        } => prepare_tui(&options, session, scroll, connect, socket, resume, name).await,
         Command::Service { action } => prepare_service(&options, action).await,
     }
 }
@@ -294,11 +353,24 @@ pub enum Ready {
         prompt: String,
         /// Whether to report progress on stderr.
         verbose: bool,
+        /// The session to continue, when one was named.
+        resume: Option<String>,
+        /// The name to record a new session under.
+        name: Option<String>,
     },
     /// The session store is open and its contents are ready to read.
     List {
         /// The store to read from.
         store: nanus_ports::StoreHandle,
+    },
+    /// A name is ready to be recorded against a session.
+    Name {
+        /// The store that holds both.
+        store: nanus_ports::StoreHandle,
+        /// The name to record.
+        name: String,
+        /// The session to record it for.
+        session: String,
     },
     /// A composition is built for a shell-scoped agent the interface will talk to.
     Tui {
@@ -306,6 +378,8 @@ pub enum Ready {
         pending: Box<compose::Pending>,
         /// The workspace a session is created against.
         workspace: PathBuf,
+        /// What to tell the interface beyond which socket to use.
+        arguments: Vec<OsString>,
     },
     /// The interface needs no agent: it was asked to read a transcript.
     Spawn {
@@ -350,9 +424,27 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             workspace,
             prompt,
             verbose,
-        } => run_turn(*pending, &workspace, &prompt, verbose),
+            resume,
+            name,
+        } => run_turn(
+            *pending,
+            &workspace,
+            &prompt,
+            verbose,
+            resume.as_deref(),
+            name.as_deref(),
+        ),
         Ready::List { store } => print_sessions(&store),
-        Ready::Tui { pending, workspace } => crate::tui::attached(*pending, &workspace),
+        Ready::Name {
+            store,
+            name,
+            session,
+        } => record_name(&store, &name, &session),
+        Ready::Tui {
+            pending,
+            workspace,
+            arguments,
+        } => crate::tui::attached(*pending, &workspace, &arguments),
         Ready::Spawn { arguments } => crate::tui::alone(&arguments),
         Ready::Serve {
             pending,
@@ -376,13 +468,35 @@ fn load(args: &Options) -> Result<NanusConfig, String> {
 }
 
 /// Awaits the adapters one task needs.
-async fn prepare_run(args: &Options, task: &[String]) -> Result<Ready, String> {
+async fn prepare_run(
+    args: &Options,
+    task: &[String],
+    resume: Option<String>,
+    name: Option<String>,
+) -> Result<Ready, String> {
     let config = load(args)?;
     let prompt = task.join(" ");
     if prompt.trim().is_empty() {
         return Err(String::from(
             "the task is empty; pass the work to do, for example: nanus run \"summarize this repository\"",
         ));
+    }
+
+    // A name is claimed before anything is built or run. Checking here rather than after
+    // the turn means a name somebody else holds costs a sentence instead of a turn, and
+    // leaves no unnamed session behind as the evidence of it.
+    if let Some(asked) = &name {
+        let store = open_store().await.map_err(|error| error.to_string())?;
+        if let Some(existing) = store
+            .resolve(asked)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "the name {asked:?} already belongs to session {}",
+                existing.as_str()
+            ));
+        }
     }
 
     // Awaiting here runs inside the runtime, which is the only place awaiting is legal.
@@ -393,6 +507,8 @@ async fn prepare_run(args: &Options, task: &[String]) -> Result<Ready, String> {
         workspace,
         prompt,
         verbose: args.verbose,
+        resume,
+        name,
     })
 }
 
@@ -404,15 +520,18 @@ async fn prepare_run(args: &Options, task: &[String]) -> Result<Ready, String> {
 // The three-state session flag is the parser's shape, carried here unchanged rather than
 // flattened and re-derived: a `Some(None)` means "the most recent", and collapsing it to
 // `None` on the way in would silently turn that into "no session at all".
-#[allow(clippy::option_option)]
+#[allow(clippy::option_option, clippy::too_many_arguments)]
 async fn prepare_tui(
     args: &Options,
     session: Option<Option<String>>,
     scroll: u32,
     connect: bool,
     socket: Option<PathBuf>,
+    resume: Option<String>,
+    name: Option<String>,
 ) -> Result<Ready, String> {
     let config = load(args)?;
+    // Reading a transcript needs no agent and no key, so that mode stops here.
     if let Some(id) = session {
         let mut arguments: Vec<OsString> = vec![OsString::from("--session")];
         if let Some(id) = id {
@@ -427,12 +546,15 @@ async fn prepare_tui(
         }
         return Ok(Ready::Spawn { arguments });
     }
+    // Which conversation, carried through to the interface's own command line.
+    let choice = conversation(resume, name);
     if !connect {
         let pending = compose(&config).await.map_err(|error| error.to_string())?;
         let workspace = compose::workspace_root(&config).map_err(|error| error.to_string())?;
         return Ok(Ready::Tui {
             pending: Box::new(pending),
             workspace,
+            arguments: choice,
         });
     }
     // Connecting to a service needs no composition here: the agent is already running,
@@ -444,9 +566,21 @@ async fn prepare_tui(
     if let Err(error) = nanus_link::Client::connect(&socket).await {
         return Err(format!("{error}\nstart one with `nanus service start`"));
     }
-    Ok(Ready::Spawn {
-        arguments: vec![OsString::from("--link"), OsString::from(socket.as_os_str())],
-    })
+    let mut arguments = vec![OsString::from("--link"), OsString::from(socket.as_os_str())];
+    arguments.extend(choice);
+    Ok(Ready::Spawn { arguments })
+}
+
+/// Builds the interface's instruction about which conversation to open.
+///
+/// Empty means a new, unnamed session, which is what the interface does when it is told
+/// nothing.
+fn conversation(resume: Option<String>, name: Option<String>) -> Vec<OsString> {
+    match (resume, name) {
+        (Some(reference), _) => vec![OsString::from("--resume"), OsString::from(reference)],
+        (None, Some(name)) => vec![OsString::from("--name"), OsString::from(name)],
+        (None, None) => Vec::new(),
+    }
 }
 
 /// Decides what the service subcommand should do.
@@ -501,18 +635,29 @@ fn run_turn(
     workspace: &Path,
     prompt: &str,
     verbose: bool,
+    resume: Option<&str>,
+    name: Option<&str>,
 ) -> Result<(), String> {
     let harness = pending.start().map_err(|error| error.to_string())?;
-    let mut session = harness.new_session(workspace);
+    // The session is resolved here rather than in `prepare`, because resolving it needs
+    // the store the composition has just opened and loading it is a blocking call.
+    let mut session = match resume {
+        Some(reference) => load_session(&harness, reference)?,
+        None => harness.new_session(workspace),
+    };
     let mut reporter = StderrProgress::new(verbose, verbose);
 
-    let outcome = kernel_block_on(harness.runner.run_turn(&mut session, prompt, &mut reporter))
-        .map_err(|error| error.to_string())?;
+    let outcome = kernel_block_on(harness.runner.run_turn(&mut session, prompt, &mut reporter));
 
-    // The session is persisted before the answer is printed: a caller that redirects
-    // stdout and loses the process should still find the transcript.
-    kernel_block_on(record(&harness, &session))?;
+    // Recorded whatever the turn did, and before anything is printed: a caller that
+    // redirects stdout and loses the process should still find the transcript, and a turn
+    // that *failed* is exactly the one worth being able to resume — what the model said
+    // before it failed is what the next attempt has to work from.
+    let recorded = record_after(&harness, &session, name);
     finish_harness(&harness)?;
+    recorded?;
+
+    let outcome = outcome.map_err(|error| error.to_string())?;
 
     // A trailing newline is the only decoration stdout gets, and it is there so the
     // answer is a line.
@@ -527,6 +672,62 @@ fn run_turn(
     // A run that did not complete is a failed run, and the reason goes to stderr so
     // stdout stays exactly the answer.
     Err(format!("the run did not complete: {:?}", outcome.reason))
+}
+
+/// Saves the session, and records its name when one was asked for.
+///
+/// One step rather than two because both are about the session being durable before the
+/// caller is told anything, and because a named session that failed still has a name.
+fn record_after(
+    harness: &Harness,
+    session: &nanus_domain::Session,
+    name: Option<&str>,
+) -> Result<(), String> {
+    kernel_block_on(record(harness, session))?;
+    let Some(name) = name else {
+        return Ok(());
+    };
+    // After the save, because a name is an alias for a session that has to exist for the
+    // alias to mean anything.
+    kernel_block_on(harness.store.name(session.id(), name))
+        .map_err(|error| format!("the session could not be named: {error}"))
+}
+
+/// Loads the session a reference names.
+///
+/// Driven with `block_on` from the synchronous half, because the caller is outside the
+/// runtime by the time it runs.
+fn load_session(harness: &Harness, reference: &str) -> Result<nanus_domain::Session, String> {
+    let id = resolve_id(&harness.store, reference)?;
+    kernel_block_on(harness.store.load(&id)).map_err(|error| error.to_string())
+}
+
+/// Resolves a reference that may be a name or a session id.
+///
+/// A name is tried first, because a name is the human-facing key: a session that both a
+/// name and an id could refer to is one somebody named.
+fn resolve_id(
+    store: &nanus_ports::StoreHandle,
+    reference: &str,
+) -> Result<nanus_domain::SessionId, String> {
+    match kernel_block_on(store.resolve(reference)) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => Ok(nanus_domain::SessionId::new(reference)),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Records a name against an existing session.
+fn record_name(
+    store: &nanus_ports::StoreHandle,
+    name: &str,
+    reference: &str,
+) -> Result<(), String> {
+    let id = resolve_id(store, reference)?;
+    kernel_block_on(store.name(&id, name)).map_err(|error| error.to_string())?;
+    // Naming an absent session fails above, so reaching here means both ends exist.
+    println!("nanus: session {} is now called {name:?}", id.as_str());
+    Ok(())
 }
 
 /// Persists the session, reporting a failure rather than losing it silently.
@@ -601,11 +802,18 @@ fn workspace_display(config: &NanusConfig) -> String {
 
 /// Awaits the session store, which needs no model.
 ///
-/// No harness is composed: reading a transcript needs no model, so the command works
+/// No harness is composed: listing and naming sessions needs no model, so both work
 /// without a configured key.
-async fn prepare_list() -> Result<Ready, String> {
+async fn prepare_sessions(action: Option<SessionsAction>) -> Result<Ready, String> {
     let store = open_store().await.map_err(|error| error.to_string())?;
-    Ok(Ready::List { store })
+    match action {
+        None => Ok(Ready::List { store }),
+        Some(SessionsAction::Name { name, session }) => Ok(Ready::Name {
+            store,
+            name,
+            session,
+        }),
+    }
 }
 
 /// Prints the recorded sessions, newest first.
@@ -622,8 +830,13 @@ fn print_sessions(store: &nanus_ports::StoreHandle) -> Result<(), String> {
     }
     for summary in listed {
         let title = summary.title.unwrap_or_else(|| String::from("<untitled>"));
+        // The name is what a session is resumed by, so it goes first when there is one:
+        // the id is what a script uses and the name is what a person types.
+        let name = summary
+            .name
+            .map_or_else(String::new, |name| format!("[{name}]  "));
         println!(
-            "{}  {} events  {}  {title}",
+            "{}  {name}{} events  {}  {title}",
             summary.id.as_str(),
             summary.event_count,
             summary.cwd
@@ -643,10 +856,96 @@ mod tests {
         let Ok(args) = args else {
             return;
         };
-        let Some(Command::Run { task }) = args.command else {
+        let Some(Command::Run { task, resume, name }) = args.command else {
             panic!("expected a run command");
         };
         assert_eq!(task, vec!["summarize", "this", "repo"]);
+        assert_eq!(resume, None, "no --resume means a new session");
+        assert_eq!(name, None, "no --name means an unnamed session");
+    }
+
+    #[test]
+    fn the_run_takes_a_name_and_a_resume_but_not_both() {
+        let named = Args::try_parse_from(["nanus", "run", "--name", "nightly", "do it"]);
+        assert!(named.is_ok(), "{named:?}");
+        let Ok(named) = named else { return };
+        let Some(Command::Run { name, resume, .. }) = named.command else {
+            panic!("expected a run command");
+        };
+        assert_eq!(name.as_deref(), Some("nightly"));
+        assert_eq!(resume, None);
+
+        let resumed = Args::try_parse_from(["nanus", "run", "--resume", "nightly", "do it"]);
+        assert!(resumed.is_ok(), "{resumed:?}");
+        // Naming and resuming are different intents for one conversation: one starts a
+        // session and the other continues one, so asking for both is a mistake worth
+        // refusing rather than a precedence rule to remember.
+        assert!(
+            Args::try_parse_from(["nanus", "run", "--name", "a", "--resume", "b", "x"]).is_err()
+        );
+    }
+
+    #[test]
+    fn the_interface_takes_a_name_and_a_resume() {
+        let named = tui(&["nanus", "tui", "--name", "nightly"]);
+        let Some(Command::Tui { name, resume, .. }) = Some(named) else {
+            panic!("expected the tui command");
+        };
+        assert_eq!(name.as_deref(), Some("nightly"));
+        assert_eq!(resume, None);
+
+        let resumed = tui(&["nanus", "tui", "--resume", "nightly"]);
+        let Some(Command::Tui { name, resume, .. }) = Some(resumed) else {
+            panic!("expected the tui command");
+        };
+        assert_eq!(resume.as_deref(), Some("nightly"));
+        assert_eq!(name, None);
+
+        assert!(Args::try_parse_from(["nanus", "tui", "--name", "a", "--resume", "b"]).is_err());
+        // Reading a transcript starts no session, so there is nothing to name or resume.
+        assert!(Args::try_parse_from(["nanus", "tui", "--session", "--name", "a"]).is_err());
+        assert!(Args::try_parse_from(["nanus", "tui", "--session", "--resume", "a"]).is_err());
+    }
+
+    #[test]
+    fn the_conversation_the_interface_is_told_about_is_one_instruction() {
+        // The interface is a separate program, so what it is asked for travels as its own
+        // command line. Empty means a new unnamed session, which is what it does anyway.
+        assert!(conversation(None, None).is_empty());
+        assert_eq!(
+            conversation(Some("nightly".to_owned()), None),
+            vec![OsString::from("--resume"), OsString::from("nightly")]
+        );
+        assert_eq!(
+            conversation(None, Some("nightly".to_owned())),
+            vec![OsString::from("--name"), OsString::from("nightly")]
+        );
+    }
+
+    #[test]
+    fn the_sessions_command_lists_by_default_and_can_name() {
+        let listed = Args::try_parse_from(["nanus", "sessions"]);
+        assert!(listed.is_ok(), "{listed:?}");
+        let Ok(listed) = listed else { return };
+        let Some(Command::Sessions { action }) = listed.command else {
+            panic!("expected the sessions command");
+        };
+        assert!(action.is_none(), "no action means the listing");
+
+        let named = Args::try_parse_from(["nanus", "sessions", "name", "nightly", "01a09558"]);
+        assert!(named.is_ok(), "{named:?}");
+        let Ok(named) = named else { return };
+        let Some(Command::Sessions {
+            action: Some(SessionsAction::Name { name, session }),
+        }) = named.command
+        else {
+            panic!("expected a name action");
+        };
+        assert_eq!(name, "nightly");
+        assert_eq!(session, "01a09558");
+
+        // Both ends are required: a name with nothing to name is not a command.
+        assert!(Args::try_parse_from(["nanus", "sessions", "name", "nightly"]).is_err());
     }
 
     #[test]

@@ -44,6 +44,18 @@ nothing was asked for, and it answered.
 | `nanus-tui --link PATH` | Whatever is listening at `PATH`, which is how `nanus tui` hands one over. |
 | `nanus tui --session` | None. A recording is a file, and reading it needs no agent. |
 
+And which conversation it opens:
+
+| Flag | What it opens |
+|---|---|
+| `--name X` | A new session recorded under `X`. |
+| `--resume X` | An existing session, by name or id — the live one if the agent is holding it. |
+| neither | A new, unnamed session. |
+
+The session's name is shown in the title bar, because two terminals can be attached to two
+different conversations and a reader should be able to tell which is which. See
+[sessions](sessions.md) for what resuming and attaching mean.
+
 The two binaries are installed together and the core looks for the interface *beside
 itself*, never on `PATH`: a `PATH` lookup would happily run one version's interface
 against another version's protocol. `NANUS_TUI` overrides the path for a build layout
@@ -61,18 +73,23 @@ interface. There is no port and nothing listening on an address, the run directo
 `0700` and the socket `0600`, and the reachable set is therefore "processes already
 running as you", which can read the workspace and the session log anyway.
 
-The protocol is deliberately tiny: a client sends a prompt, a status request, or a
-shutdown, and the agent answers with the handshake and then with the same progress
-callbacks the agent loop already reports — text, reasoning, a step boundary, a tool
-starting and finishing, usage, and the ending. Nothing an interface *might* want is in
-it; anything else an interface needs about a conversation, the session log already holds.
+The protocol is deliberately tiny. A client says what it wants — start a session, attach
+to one, list the ones the agent is holding, ask a question, send a prompt, stop — and the
+agent answers with its handshake, the attachment, and then the same progress callbacks the
+agent loop already reports: text, reasoning, a step boundary, a tool starting and
+finishing, usage, and the ending. Nothing an interface *might* want is in it; anything
+else an interface needs about a conversation, the session log already holds.
 
-**A connection is a conversation.** The agent creates a session when a client connects
-and records it as the turn completes, so multi-turn work is a matter of sending another
-prompt on the same connection, and an interface that reconnects gets a new session
-because it asked for one. That is also what makes the lifetimes work: the agent for a
-shell is the agent on one connection, and when the connection closes there is nobody left
-to serve.
+**A connection is a view of a session, not a session.** The agent owns the conversation,
+so it survives the connection that opened it, and a client joins one with `--resume`.
+Several clients can be attached at once and all see the same frames, which is what makes
+watching a running conversation possible. One turn runs at a time, because a turn owns the
+log — a prompt to a busy session is refused rather than queued. [Sessions](sessions.md) is
+the whole of it.
+
+**Nothing about the conversation travels twice.** The link carries what *happened*; the
+history a client shows comes from the store, where it is already durable. A socket that
+also carried the log would be a second source of truth for something that has one.
 
 **The session is recorded before the ending is sent.** A client that has seen the answer
 is holding one whose transcript is already on disk, which is the same contract `nanus run`

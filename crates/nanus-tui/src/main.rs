@@ -15,6 +15,11 @@
 //! started for the shell. `--session` needs no agent at all, because a transcript that
 //! has already been written down is just a file.
 //!
+//! `--resume` continues a conversation that already exists, by name or by id, and
+//! `--name` starts one under a name. Either way the *agent* owns the session: the
+//! interface attaches to it, reads its history from the store, and streams what happens
+//! next.
+//!
 //! A bare `nanus-tui` is therefore the "connect to the long-running agent" mode, and the
 //! whole of it: nothing about this program knows or cares how the agent was started.
 
@@ -33,7 +38,7 @@ use clap::Parser;
 use nanus_adapter_store::{JsonlStore, resolve_home};
 use nanus_link::paths::service_socket;
 use nanus_ports::StoreHandle;
-use nanus_tui::runtime::{Remote, run_source, view};
+use nanus_tui::runtime::{Remote, Target, run_source, view};
 
 /// The interactive nanus interface.
 #[derive(Debug, Parser)]
@@ -52,6 +57,21 @@ struct Args {
     /// Talk to the agent listening at this socket.
     #[arg(long, value_name = "PATH", conflicts_with = "session")]
     link: Option<PathBuf>,
+
+    /// Continue a session instead of starting one.
+    ///
+    /// The reference is a name or a session id, and the agent prefers a session it is
+    /// already holding to one on disk — so resuming a conversation somebody is in the
+    /// middle of joins it rather than opening a second copy.
+    #[arg(long, value_name = "NAME|ID", conflicts_with = "session")]
+    resume: Option<String>,
+
+    /// Record a new session under this name.
+    ///
+    /// A name is how a session is found again, and it is taken for good: starting a
+    /// second session with a name that is already held is refused.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["session", "resume"])]
+    name: Option<String>,
 
     /// Read a recorded session instead of talking to an agent.
     ///
@@ -94,12 +114,21 @@ fn main() -> ExitCode {
 /// Returns a rendered message for any failure: a store that will not open, a session
 /// that does not exist, an agent that is not listening, or a terminal that is not there.
 fn run(args: &Args) -> Result<(), String> {
+    // One store for both modes: a recording is loaded from it, and a live conversation
+    // reads its history out of it — the agent owns the session, but the store is where
+    // what it has already said is written down.
+    let store = block_on(open_store())?;
     if let Some(requested) = &args.session {
-        let store = block_on(open_store())?;
         return view(&store, requested.as_deref(), args.scroll);
     }
     let socket = args.socket()?;
-    let mut remote = block_on(Remote::connect(&socket)).map_err(|error| {
+    let target = args.resume.as_ref().map_or_else(
+        || Target::New {
+            name: args.name.clone(),
+        },
+        |reference| Target::Resume(reference.clone()),
+    );
+    let mut remote = block_on(Remote::connect(&socket, &store, target)).map_err(|error| {
         if args.link.is_some() {
             error
         } else {

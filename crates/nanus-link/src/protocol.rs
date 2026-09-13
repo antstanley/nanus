@@ -2,12 +2,27 @@
 //!
 //! ## Why a vocabulary this small
 //!
-//! An interface needs exactly two things from an agent: what it is, and what happened
-//! while a turn ran. So the protocol has two shapes — a request the client sends and a
-//! frame the agent sends back — and the frames are a one-to-one transcription of the
-//! agent loop's [`nanus_bundle::Progress`] callbacks plus the handshake and the ending.
-//! Nothing an interface might *want* is here; anything an interface can learn about the
-//! conversation, the session log already holds.
+//! An interface needs three things from an agent: what it is, which session it is
+//! talking about, and what happened while a turn ran. So the protocol has two shapes —
+//! a request the client sends and a frame the agent sends back — and the frames are a
+//! one-to-one transcription of the agent loop's [`nanus_bundle::Progress`] callbacks
+//! plus the handshake, the attachment, and the ending. Nothing an interface might
+//! *want* is here; anything an interface can learn about the conversation, the session
+//! log already holds.
+//!
+//! ## Why attaching is explicit
+//!
+//! A connection used to be a conversation: connect, and you had a session. That is a
+//! pleasant default and it made the lifetimes work, but it left no way to say *which*
+//! conversation you wanted — so a session could be resumed only by reading it, and a
+//! session an agent was holding open could not be reached at all. Now the handshake
+//! describes the agent, `Request::New` and `Request::Attach` choose a session, and
+//! everything else happens in the session the connection is attached to.
+//!
+//! The cost is one extra round trip and one more state for a client to be in. The
+//! benefit is that `status` and `shutdown` no longer create a session just to ask a
+//! question, and a session is something with an identity rather than something a
+//! connection happens to be holding.
 //!
 //! ## Why lines of JSON
 //!
@@ -32,16 +47,39 @@ use crate::error::{LinkError, LinkResult};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
+    /// Start a session and attach this connection to it.
+    ///
+    /// Replaces whatever the connection was attached to. Naming it is optional, and a
+    /// name that is already taken is refused rather than moved: an alias silently
+    /// reassigned would make a resume open somebody else's conversation.
+    New {
+        /// The name to record it under, if any.
+        name: Option<String>,
+    },
+
+    /// Attach to a session that already exists.
+    ///
+    /// The reference is a name or an id. The agent prefers a session it is already
+    /// holding — so attaching to a running conversation joins it rather than loading a
+    /// stale copy — and falls back to the store, which is what makes a session resumed
+    /// after the agent restarted the same session.
+    Attach {
+        /// The name or id to attach to.
+        session: String,
+    },
+
     /// Run one turn and stream its progress.
     ///
-    /// The turn joins whatever session this connection is already holding, so a second
-    /// prompt continues the conversation. A connection *is* a conversation: that is why
-    /// the session id is not in the request and why a client that reconnects starts a
-    /// new one.
+    /// The turn joins the session this connection is attached to, and every client
+    /// attached to that session sees it: a session is the conversation, and a
+    /// connection is one view of it.
     Prompt {
         /// The prompt text.
         text: String,
     },
+
+    /// List the sessions the agent is holding open.
+    Sessions,
 
     /// Describe the agent without changing anything.
     Status,
@@ -56,9 +94,35 @@ pub enum Request {
 pub enum Frame {
     /// The first frame on every connection, sent before anything is asked.
     ///
-    /// A client that knows the session id and the model before it sends a prompt can
-    /// show them, and a client that gets no `Ready` knows it is not talking to an agent.
+    /// It describes the *agent*, not a session: a client that gets no `Ready` knows it
+    /// is not talking to an agent, and a client that only wants to ask a question does
+    /// not have to create a conversation to do it.
     Ready(AgentInfo),
+
+    /// This connection is attached to a session.
+    ///
+    /// Sent in reply to `New` and `Attach`, and it is the point at which a client knows
+    /// which conversation it is in.
+    Attached(SessionInfo),
+
+    /// A reply to [`Request::Sessions`].
+    ///
+    /// A named field rather than a newtype, because an internally tagged enum cannot
+    /// carry a bare sequence: the tag and the payload have to be one JSON object.
+    Sessions {
+        /// The sessions the agent is holding, most recently used first.
+        held: Vec<SessionInfo>,
+    },
+
+    /// Somebody asked something in this session.
+    ///
+    /// Sent to every client attached to the session except the one that asked, which has
+    /// already put its own words on screen. Without it a watcher would see answers to
+    /// questions it never saw, which is precisely the conversation being unreadable.
+    User {
+        /// The prompt text.
+        text: String,
+    },
 
     /// More of the model's answer.
     Text {
@@ -131,14 +195,37 @@ impl Frame {
 /// What an agent says about itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct AgentInfo {
-    /// The session this connection is recording into.
-    pub session: String,
     /// The workspace the agent's tools are confined to.
     pub workspace: String,
     /// The model id the agent will call.
     pub model: String,
     /// How many tools the agent exposes.
     pub tools: usize,
+}
+
+/// What an agent says about one session.
+///
+/// Deliberately a summary rather than the session: a client that wants the conversation
+/// reads it from the store, where it is already durable. Sending a log down the link
+/// would make the socket a second source of truth for something that already has one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct SessionInfo {
+    /// The session's store key.
+    pub session: String,
+    /// The name a user gave it, if any.
+    pub name: Option<String>,
+    /// A title derived from its first human turn, if it has one yet.
+    pub title: Option<String>,
+    /// How many events it holds.
+    pub events: u64,
+    /// Whether a turn is running in it.
+    ///
+    /// A client that attaches to a busy session sees the rest of the turn rather than
+    /// all of it, because the frames have already gone out. Its transcript is still
+    /// whole: the agent records the turn, and the store is where a client reads history.
+    pub busy: bool,
+    /// How many clients are attached.
+    pub viewers: usize,
 }
 
 /// Encodes a value as one line of JSON, **without** the terminating newline.
@@ -171,10 +258,20 @@ mod tests {
 
     fn info() -> AgentInfo {
         AgentInfo {
-            session: "01a09558".to_owned(),
             workspace: "/work".to_owned(),
             model: "deepseek-flash".to_owned(),
             tools: 7,
+        }
+    }
+
+    fn session_info() -> SessionInfo {
+        SessionInfo {
+            session: "01a09558".to_owned(),
+            name: Some("the-glob-bug".to_owned()),
+            title: Some("fix the glob bug".to_owned()),
+            events: 12,
+            busy: false,
+            viewers: 2,
         }
     }
 
@@ -182,6 +279,14 @@ mod tests {
     fn a_round_trip_preserves_every_frame() {
         let frames = [
             Frame::Ready(info()),
+            Frame::Attached(session_info()),
+            Frame::Sessions {
+                held: vec![session_info()],
+            },
+            Frame::Sessions { held: Vec::new() },
+            Frame::User {
+                text: "what is this".to_owned(),
+            },
             Frame::Text {
                 delta: "hello".to_owned(),
             },
@@ -218,9 +323,17 @@ mod tests {
     #[test]
     fn a_round_trip_preserves_every_request() {
         let requests = [
+            Request::New {
+                name: Some("the-glob-bug".to_owned()),
+            },
+            Request::New { name: None },
+            Request::Attach {
+                session: "the-glob-bug".to_owned(),
+            },
             Request::Prompt {
                 text: "do the thing".to_owned(),
             },
+            Request::Sessions,
             Request::Status,
             Request::Shutdown,
         ];
