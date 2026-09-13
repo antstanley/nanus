@@ -385,8 +385,17 @@ async fn progress_reports_every_step_and_tool() {
             self.steps.push(step);
         }
 
-        fn tool_started(&mut self, name: &ToolName) {
-            self.tools.push(name.as_str().to_owned());
+        fn tool_started(&mut self, name: &ToolName, arguments: &serde_json::Value) {
+            // The path is what makes a tool call readable, so it is part of what the loop
+            // is expected to report rather than something a listener has to look up.
+            self.tools.push(format!(
+                "{} {}",
+                name.as_str(),
+                arguments
+                    .get("file_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            ));
         }
     }
 
@@ -407,7 +416,9 @@ async fn progress_reports_every_step_and_tool() {
     let outcome = runner.run_turn(&mut session, "go", &mut recorder).await;
     assert!(outcome.is_ok());
     assert_eq!(recorder.steps, vec![1, 2]);
-    assert_eq!(recorder.tools, vec!["write".to_owned()]);
+    // The reported call names the file it wrote, not only the tool, because that is what
+    // an interface has to show to be worth reading.
+    assert_eq!(recorder.tools, vec!["write p.txt".to_owned()]);
     assert_eq!(recorder.text, "finished");
 }
 

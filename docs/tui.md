@@ -76,9 +76,15 @@ running as you", which can read the workspace and the session log anyway.
 The protocol is deliberately tiny. A client says what it wants — start a session, attach
 to one, list the ones the agent is holding, ask a question, send a prompt, stop — and the
 agent answers with its handshake, the attachment, and then the same progress callbacks the
-agent loop already reports: text, reasoning, a step boundary, a tool starting and
-finishing, usage, and the ending. Nothing an interface *might* want is in it; anything
-else an interface needs about a conversation, the session log already holds.
+agent loop already reports: text, reasoning, a step boundary, a tool starting and its
+arguments, a tool finishing, usage, and the ending. Nothing an interface *might* want is in
+it; anything else an interface needs about a conversation, the session log already holds.
+
+The tool frame carries the arguments because a name is not enough to draw a call. `read`
+says nothing a reader can use and `read` of one file says everything, and the half of the
+turn that says *what the agent is doing* cannot be recovered anywhere else while a turn is
+running: the session log has the arguments, but a client watching a turn is not reading the
+log as it is written.
 
 **The ending says why the turn ended, not only that it did.** A turn can stop for reasons
 that are not the model finishing — it can run out of steps, hit its token ceiling, be
@@ -252,6 +258,50 @@ runs, because they are two thoughts. And **the summary keeps what a reader scann
 problem needs**: how many calls, which tools, and whether any failed. The status line names
 what is folded, so a toggle is never a mystery about why the transcript looks short.
 
+## One line for the machinery, by default
+
+The two parts of a turn that are *about* the work rather than the work itself are drawn as
+one line each:
+
+```text
+── thinking · the glob is anchored to the wrong directory, so let me check the caller
+⚙ Read File · crates/nanus-bundle/src/tools/glob.rs
+✓ read
+  <the file, first few lines and a count>
+```
+
+**A tool call is one line, naming the tool and what it is acting on.** `⚙ Read File ·
+crates/nanus-bundle/src/tools/glob.rs` says what `⚙ read({"file_path":…})` said, in words,
+without the argument block. The argument the line reports is the one the tool acts on — the
+file for `read`, `write`, `edit` and `read_image`, the pattern for `glob` and `grep`, the
+command for `bash` — and a tool the interface has not been told about keeps its own name
+rather than being shown under a guess. A multi-line command shows its first line and says
+so. Nothing is invented: every field comes from the arguments the model sent, which is why
+the link's `Tool` frame carries them.
+
+**A thinking segment is one line, and it is the newest one.** As the model writes, the line
+either grows or is replaced, so what a reader sees is the sentence the model is in the
+middle of — and a cursor sits at its end while the segment is still arriving. Its earlier
+paragraphs are not drawn at all; `Ctrl+R` is not a substitute for that, because it folds a
+whole run into a count rather than showing the live end of it.
+
+**Neither line wraps, and neither carries a blank row of its own.** A line too long for the
+terminal is clipped from the front, keeping its label and the *end* of what it is acting on —
+`⚙ Read File · …tools/glob.rs` — because the newest words are the ones that say what is
+happening now. And a tool's call sits directly against its result: no `── tool` heading
+repeating what the line already said, and no blank row between the two, which is what makes
+a turn's machinery read as a block. What still separates one piece of tool activity from the
+next is the blank row every *other* entry is followed by — that row belongs to the prose
+above it, not to the call below it.
+
+**`tui_detail = "full"` is the way back.** The setting in the
+[configuration file](../crates/nanus-adapter-config) — `compact` by default, `full` for the
+whole argument block and the whole thinking segment — is read by the interface itself, from
+the same file the core reads, so `nanus tui`, a bare `nanus-tui` against a service, and
+`nanus tui --session` all draw the same transcript. It sits in the file rather than on a key
+because it is a standing preference rather than something to toggle mid-turn; the two
+`Ctrl` toggles below remain the way to fold runs away entirely.
+
 ## What it shows, and why
 
 **The answer is white; everything that is not the answer is marked.** Reasoning is dimmed
@@ -259,9 +309,9 @@ and italic, tool activity is yellow, notices are blue — so a reader scanning f
 can skip the thinking without reading it, and the thing they came for is not competing with
 a colour of its own.
 
-**Tool calls are paired with their results.** A call renders as `⚙ name(args)` and its
-result as `✓ name` or `✗ name`, so a failure is visible at a glance rather than being
-buried in output.
+**Tool calls are paired with their results.** A call renders as `⚙ name · what it is doing`
+and its result as `✓ name` or `✗ name`, so a failure is visible at a glance rather than
+being buried in output.
 
 **Long tool output is summarised with a count.** A `read` can return thousands of lines;
 the transcript shows the first few and says how many were left, because the full text is

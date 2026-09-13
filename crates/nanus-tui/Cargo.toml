@@ -28,6 +28,7 @@ default = ["runtime"]
 runtime = [
     "dep:clap",
     "dep:futures",
+    "dep:nanus-adapter-config",
     "dep:nanus-adapter-store",
     "dep:nanus-kernel",
     "dep:nanus-link",
@@ -36,6 +37,10 @@ runtime = [
 ]
 
 [dependencies]
+# The interface's own display preferences live in the configuration file the core reads,
+# so the two programs cannot disagree about how a transcript is drawn. The view layer does
+# not link it: the setting is read where the environment is, in the runtime.
+nanus-adapter-config = { workspace = true, optional = true }
 nanus-adapter-store = { workspace = true, optional = true }
 nanus-kernel = { workspace = true, optional = true }
 nanus-link = { workspace = true, optional = true }

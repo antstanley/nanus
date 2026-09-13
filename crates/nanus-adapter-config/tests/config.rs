@@ -13,7 +13,7 @@ use std::path::Path;
 
 use nanus_adapter_config::{
     CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN, DEFAULT_MAX_TOKENS,
-    DEFAULT_MODEL, NanusConfig, ReasoningEffort, api_key,
+    DEFAULT_MODEL, NanusConfig, ReasoningEffort, TuiDetail, api_key,
 };
 use nanus_domain::{ApprovalPolicy, SandboxMode};
 
@@ -75,6 +75,11 @@ fn the_built_in_defaults_are_the_documented_ones() {
     );
     assert_eq!(config.approval_policy, ApprovalPolicy::Ask);
     assert_eq!(config.sandbox_mode, SandboxMode::ReadOnly);
+    assert_eq!(
+        config.tui_detail,
+        TuiDetail::Compact,
+        "a transcript is compact unless the reader asked otherwise"
+    );
     assert_eq!(config.config_version, CONFIG_VERSION);
     assert!(config.system_prompt.is_none());
     assert!(config.workspace_root.is_none());
@@ -160,6 +165,34 @@ fn the_permission_and_effort_spellings_parse() {
     assert_eq!(config.reasoning_effort.as_wire(), "minimal");
     assert_eq!(config.approval_policy, ApprovalPolicy::Never);
     assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+}
+
+#[test]
+fn the_interface_detail_spelling_round_trips() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "tui_detail = \"full\"\n").expect("seed");
+    let config = NanusConfig::load(Some(&path)).expect("load");
+    assert_eq!(config.tui_detail, TuiDetail::Full);
+    assert_eq!(config.tui_detail.as_str(), "full");
+    assert_eq!(config.tui_detail.to_string(), "full");
+    // The spelling a save writes is the spelling a load reads, so the setting survives a
+    // round trip rather than only the first load.
+    let written = dir.path().join("written.toml");
+    config.save(Some(&written)).expect("save");
+    let reloaded = NanusConfig::load(Some(&written)).expect("reload");
+    assert_eq!(reloaded.tui_detail, TuiDetail::Full);
+}
+
+#[test]
+fn an_unknown_detail_spelling_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "tui_detail = \"verbose\"\n").expect("seed");
+    assert!(
+        NanusConfig::load(Some(&path)).is_err(),
+        "a typo must not silently select a rendering the reader did not ask for"
+    );
 }
 
 #[test]

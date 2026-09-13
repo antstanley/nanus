@@ -43,6 +43,7 @@ use std::path::Path;
 
 use crossterm::event::EventStream;
 use futures::StreamExt as _;
+use nanus_adapter_config::{NanusConfig, TuiDetail};
 use nanus_domain::{Session, SessionId};
 use nanus_link::Client;
 use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
@@ -53,6 +54,7 @@ use ratatui::crossterm::event::{
 };
 use tokio::sync::mpsc;
 
+use crate::compact::Detail;
 use crate::transcript::{Entry, Role};
 use crate::view::{Theme, ViewState};
 
@@ -68,6 +70,43 @@ const PAGE_ROWS: i32 = 10;
 /// would make every other test's behaviour depend on the machine it runs on.
 fn no_color_requested(value: Option<&OsStr>) -> bool {
     value.is_some_and(|value| !value.is_empty())
+}
+
+/// Reads the interface's display preference from the configuration.
+///
+/// Here, at the boundary with the terminal, rather than inside the view, for the reason
+/// [`no_color_requested`] is a function of a value rather than of the environment: the view
+/// is a pure function of a transcript and a composer, and one that opened a file would
+/// render differently in a test that happened to inherit a configuration from whatever
+/// machine ran it.
+///
+/// The file is the same one the core reads, resolved the same way — the explicit path is
+/// not a parameter because the interface is a separate process, given the socket and the
+/// conversation and nothing else, and `NANUS_CONFIG` and the platform location reach both
+/// programs equally.
+///
+/// # Errors
+///
+/// A configuration that exists and cannot be read is an error rather than a default. It is
+/// the same file the core refuses to start on, and silently drawing a transcript the reader
+/// did not ask for would be the wrong kind of silence.
+fn configured_detail() -> io::Result<Detail> {
+    NanusConfig::load(None)
+        .map(|config| detail_from(config.tui_detail))
+        .map_err(|error| io::Error::other(format!("the configuration could not be read: {error}")))
+}
+
+/// Maps the configured spelling onto the rendering it selects.
+///
+/// Two enums rather than one because the configuration adapter cannot see the interface —
+/// it sits *below* it, and the view layer must keep building without the runtime — so the
+/// mapping belongs here, in the process that is both. It is an exhaustive match, so a
+/// rendering the configuration grows is a build error until this decides what it means.
+const fn detail_from(configured: TuiDetail) -> Detail {
+    match configured {
+        TuiDetail::Compact => Detail::Compact,
+        TuiDetail::Full => Detail::Full,
+    }
 }
 
 /// How many frames may be queued from the agent before the interface falls behind.
@@ -543,8 +582,12 @@ async fn event_loop(
     source: &mut dyn SessionSource,
     mut frames: mpsc::Receiver<Frame>,
 ) -> io::Result<()> {
+    // Read before the terminal is taken, so a configuration that cannot be read is a
+    // sentence on stderr rather than an abort with a screen already in raw mode.
+    let detail = configured_detail()?;
     let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
+    view.detail = detail;
     // Chosen here, at the boundary with the terminal, rather than inside the view: the
     // environment is a property of this run, and a view built with one would render
     // differently in a test that happened to inherit `NO_COLOR` from whatever ran it.
@@ -809,8 +852,17 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.follow();
         }
         Frame::Step { step } => view.begin_turn(step),
-        Frame::Tool { name } => {
-            view.transcript.push(Entry::tool_call(name, ""));
+        Frame::Tool { name, arguments } => {
+            // Rendered once, here, because a transcript entry holds a *rendered* form: what
+            // a reader sees is the view's decision, and the wire's job is to carry what the
+            // model sent. A frame from an agent that predates the arguments decodes to
+            // `null`, which is "nothing to show" rather than the word `null` — the compact
+            // line is then the tool alone.
+            let arguments = match arguments {
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            view.transcript.push(Entry::tool_call(name, arguments));
         }
         Frame::ToolDone { name, error } => {
             view.transcript
@@ -879,6 +931,7 @@ mod tests {
     use nanus_ports::StorePort as _;
 
     use super::*;
+    use crate::transcript::EntryKind;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1567,7 +1620,8 @@ mod tests {
         assert!(
             sender
                 .try_send(Frame::Tool {
-                    name: "read".to_owned()
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({"file_path": "src/view.rs"}),
                 })
                 .is_ok()
         );
@@ -1581,10 +1635,50 @@ mod tests {
         );
         drain_frames(&mut receiver, &mut view);
         assert_eq!(view.transcript.len(), 2);
-        assert!(matches!(
-            view.transcript.entries().first().map(Entry::kind),
-            Some(crate::transcript::EntryKind::ToolCall { .. })
-        ));
+        let Some(EntryKind::ToolCall {
+            name, arguments, ..
+        }) = view.transcript.entries().first().map(Entry::kind)
+        else {
+            panic!("a tool call entry: {:?}", view.transcript.entries());
+        };
+        assert_eq!(name, "read");
+        // What the call is acting on has to reach the entry, because that is the half a
+        // reader cannot get anywhere else: the session log has it, but a client watching a
+        // turn is not reading the log as it is written.
+        assert!(arguments.contains("src/view.rs"), "{arguments}");
+    }
+
+    #[test]
+    fn a_tool_frame_without_arguments_is_the_tool_alone() {
+        // What an agent that predates the field sends. The entry says nothing about the
+        // call's arguments, and the compact line is the tool's name rather than the word
+        // `null` — which is what the frame carries for "the sender did not say".
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        assert!(
+            sender
+                .try_send(Frame::Tool {
+                    name: "glob".to_owned(),
+                    arguments: serde_json::Value::Null,
+                })
+                .is_ok()
+        );
+        drain_frames(&mut receiver, &mut view);
+        let Some(EntryKind::ToolCall { arguments, .. }) =
+            view.transcript.entries().first().map(Entry::kind)
+        else {
+            panic!("a tool call entry: {:?}", view.transcript.entries());
+        };
+        assert!(arguments.is_empty(), "{arguments}");
+    }
+
+    #[test]
+    fn the_configured_detail_selects_the_rendering() {
+        // Both directions, because the point of the setting is that one spelling reverts
+        // the default and the other is the default.
+        assert_eq!(detail_from(TuiDetail::Compact), Detail::Compact);
+        assert_eq!(detail_from(TuiDetail::Full), Detail::Full);
+        assert_eq!(Detail::default(), detail_from(TuiDetail::default()));
     }
 
     #[test]

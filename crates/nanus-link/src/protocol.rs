@@ -187,6 +187,17 @@ pub enum Frame {
     Tool {
         /// The tool's name.
         name: String,
+        /// The arguments the model sent, as JSON.
+        ///
+        /// Carried so an interface can say what the call *is* — which file it reads,
+        /// which command it runs — rather than only which tool it is, which is the part a
+        /// reader cannot get anywhere else: the session log has the arguments, but a
+        /// client that is watching a turn is not reading the log as it is written.
+        ///
+        /// Defaulted to null on the way in, so a frame from an agent that predates the
+        /// field still decodes and renders as the name alone.
+        #[serde(default)]
+        arguments: serde_json::Value,
     },
 
     /// A tool finished.
@@ -385,6 +396,7 @@ mod tests {
             Frame::Step { step: 2 },
             Frame::Tool {
                 name: "read".to_owned(),
+                arguments: serde_json::json!({"file_path": "src/main.rs"}),
             },
             Frame::ToolDone {
                 name: "read".to_owned(),
@@ -496,6 +508,22 @@ mod tests {
                 cache_hit_tokens: 0,
                 cache_miss_tokens: 0,
                 duration_ms: 0,
+            })
+        );
+    }
+
+    /// The arguments were added to a frame that used to carry only a tool's name. A
+    /// client talking to an agent that predates them must read the frame rather than fail
+    /// on it, and an absent call is a call that says nothing about what it is doing — the
+    /// name alone — rather than a protocol error.
+    #[test]
+    fn a_tool_frame_from_an_older_agent_still_decodes() {
+        let decoded = decode::<Frame>(r#"{"frame":"tool","name":"read"}"#);
+        assert_eq!(
+            decoded.ok(),
+            Some(Frame::Tool {
+                name: "read".to_owned(),
+                arguments: serde_json::Value::Null,
             })
         );
     }

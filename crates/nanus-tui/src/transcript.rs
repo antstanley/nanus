@@ -211,10 +211,17 @@ impl Entry {
         self.streaming = false;
     }
 
-    /// Returns the number of lines the entry occupies at `width` columns.
+    /// Returns the number of lines the entry occupies at `width` columns in the **full**
+    /// rendering.
     ///
     /// The view needs this before rendering so it can scroll without measuring the
     /// buffer, and an entry's height must be computable from the entry alone.
+    ///
+    /// The full rendering is named deliberately: the compact form the interface draws by
+    /// default is one line for a tool call and one for a thinking segment, so this is the
+    /// height of what `tui_detail = "full"` shows rather than of what is on screen. The
+    /// view measures the lines it actually draws instead of asking here, which is why the
+    /// two cannot drift.
     #[must_use]
     pub fn height_at(&self, width: u16) -> u16 {
         let usable = width.max(1);

@@ -71,7 +71,10 @@ impl Progress for StderrProgress {
         self.heading_written = false;
     }
 
-    fn tool_started(&mut self, name: &ToolName) {
+    fn tool_started(&mut self, name: &ToolName, _arguments: &serde_json::Value) {
+        // The arguments are available and deliberately unused: this reporter names the
+        // tool for someone watching a run, and the interface is where a call is turned
+        // into a sentence about what the agent is doing.
         if self.tools {
             Self::note(&format!("nanus: running {name}"));
         }
@@ -106,7 +109,7 @@ mod tests {
         reporter.reasoning("thinking");
         reporter.text("answer");
         reporter.step_started(1);
-        reporter.tool_started(&tool());
+        reporter.tool_started(&tool(), &serde_json::Value::Null);
         reporter.tool_finished(&tool(), false);
         reporter.usage(&Usage::default());
     }
@@ -117,7 +120,7 @@ mod tests {
         reporter.step_started(1);
         reporter.reasoning("a");
         reporter.reasoning("b");
-        reporter.tool_started(&tool());
+        reporter.tool_started(&tool(), &serde_json::Value::Null);
         reporter.tool_finished(&tool(), true);
         reporter.usage(&Usage::default());
         reporter.text("ignored");

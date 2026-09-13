@@ -67,7 +67,7 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 | `crates/nanus-bundle` | The toolset, the agent loop, and the **only** place that names concrete adapters. |
 | `crates/nanus-link` | The local link: the frame vocabulary, the Unix-socket client, and (behind the `server` feature) the half that serves an agent. This is the only thing the core and the interface share. |
 | `crates/nanus-cli` | The `nanus` binary: `run`, `service`, `config`, `sessions`, and the shell-scoped agent behind `tui`. **It does not depend on `nanus-tui`.** |
-| `crates/nanus-tui` | The interface, as its own binary (`nanus-tui`) plus a library: view, input buffer, replay, and the event loop. It depends on the link client and the session store, and on no adapter, toolset, or agent loop. |
+| `crates/nanus-tui` | The interface, as its own binary (`nanus-tui`) plus a library: view, input buffer, replay, and the event loop. It depends on the link client, the session store, and the configuration file it reads its own display preferences from — and on no toolset, provider adapter, or agent loop. |
 
 ## Toolchain and setup
 
@@ -143,6 +143,10 @@ Contract to preserve:
 - Config file: `<platform config dir>/nanus/config.toml` (flat TOML, every field
   defaulted, `config_version` for migrations).
 - `NANUS_CONFIG` — override the config file path.
+- `tui_detail` — how much of a tool call and a thinking segment the interface draws:
+  `compact` (the default) is one line each, `full` is the whole argument block and the whole
+  reasoning segment. The interface reads it itself, from the same file the core reads, so
+  the setting reaches every way the interface is started. See `docs/tui.md`.
 - `DEEPSEEK_API_KEY` — provider key. Read from the environment on each use; it is
   **never** stored in `NanusConfig`, serialised, or rendered by `Debug`.
 - `NANUS_HOME` — override the session-store home. Sessions live under

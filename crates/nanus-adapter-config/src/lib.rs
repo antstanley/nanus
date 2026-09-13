@@ -47,6 +47,6 @@ mod error;
 pub use config::{
     API_KEY_ENV, CONFIG_ENV, CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS,
     DEFAULT_MAX_STEPS_PER_TURN, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, NanusConfig, ReasoningEffort,
-    api_key,
+    TuiDetail, api_key,
 };
 pub use error::ConfigError;

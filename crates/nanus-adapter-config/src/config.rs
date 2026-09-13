@@ -102,6 +102,48 @@ impl core::fmt::Display for ReasoningEffort {
     }
 }
 
+/// How much of a tool call and a thinking segment the interface shows.
+///
+/// The interface draws the parts of a turn that are *about* the work rather than the work
+/// itself as one line each — which tool is called and what it is doing, and the newest
+/// line of the model's thinking — because a transcript that spells out every argument
+/// block and every paragraph of reasoning buries the answer a reader came for. This
+/// setting asks for the whole of them instead.
+///
+/// One setting rather than two, and named for both halves deliberately: they are the same
+/// preference about the same thing, and a user who wants the argument blocks wants the
+/// reasoning paragraphs too. Someone who wants neither still has the interface's own
+/// `Ctrl+T` and `Ctrl+R`, which fold runs of them away entirely.
+///
+/// An enum rather than a string so an unknown spelling is a startup error rather than a
+/// silent default, exactly as the reasoning effort is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiDetail {
+    /// One line per tool call, and the newest line of a thinking segment.
+    #[default]
+    Compact,
+    /// The whole tool call, its arguments included, and the whole thinking segment.
+    Full,
+}
+
+impl TuiDetail {
+    /// Returns the spelling the configuration file uses.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl core::fmt::Display for TuiDetail {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The whole of nanus's durable configuration.
 ///
 /// `#[serde(default)]` is at the *struct* level, so a file that sets one field
@@ -130,6 +172,8 @@ pub struct NanusConfig {
     pub max_steps_per_turn: u32,
     /// How many tool calls may run at once.
     pub max_parallel_tools: u32,
+    /// How much of a tool call and a thinking segment the interface draws.
+    pub tui_detail: TuiDetail,
     /// An override for the built-in system prompt.
     pub system_prompt: Option<String>,
     /// An override for the workspace root the tools are confined to.
@@ -158,6 +202,7 @@ impl Default for NanusConfig {
             sandbox_mode: SandboxMode::default(),
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            tui_detail: TuiDetail::default(),
             system_prompt: None,
             workspace_root: None,
             service_socket: None,

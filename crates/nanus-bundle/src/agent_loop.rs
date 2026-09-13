@@ -85,7 +85,11 @@ pub trait Progress {
     fn step_started(&mut self, _step: u32) {}
 
     /// A tool is about to run.
-    fn tool_started(&mut self, _name: &ToolName) {}
+    ///
+    /// The arguments come with the name because knowing *which* tool ran is often not
+    /// knowing what happened: `edit` says nothing, and `edit` on `view.rs` says
+    /// everything. A listener that only wants the name ignores the second parameter.
+    fn tool_started(&mut self, _name: &ToolName, _arguments: &serde_json::Value) {}
 
     /// A tool finished.
     fn tool_finished(&mut self, _name: &ToolName, _is_error: bool) {}
@@ -351,7 +355,7 @@ impl AgentRunner {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            progress.tool_started(&call.name);
+            progress.tool_started(&call.name, &call.arguments);
             let result = self.tools.execute(call.clone()).await;
             let is_error = !result.outcome.is_success();
             progress.tool_finished(&call.name, is_error);

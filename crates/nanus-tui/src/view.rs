@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::buffer::InputBuffer;
+use crate::compact::{self, Detail};
 use crate::stats::Throughput;
 use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_rows};
 
@@ -161,6 +162,15 @@ pub struct ViewState {
     pub collapse_tools: bool,
     /// Whether runs of model reasoning are drawn as one summary line.
     pub collapse_reasoning: bool,
+    /// How much of a tool call and a thinking segment the transcript draws.
+    ///
+    /// [`Detail::Compact`] — the default — is one line each: which tool is doing what, and
+    /// the newest line of the model's thinking. [`Detail::Full`] is the whole call,
+    /// arguments and all, and the whole thinking segment, which is what the interface drew
+    /// before the compact form existed and what `tui_detail = "full"` asks for. The
+    /// setting lives in the configuration file rather than behind a key because it is a
+    /// standing preference rather than something to toggle mid-turn.
+    pub detail: Detail,
     /// What to call the session in the title bar, when the interface is in one.
     ///
     /// A live conversation is a conversation *with something*, and once sessions can be
@@ -200,6 +210,7 @@ impl Default for ViewState {
             status: "ready".to_owned(),
             collapse_tools: false,
             collapse_reasoning: false,
+            detail: Detail::default(),
             label: None,
             theme: Theme::default(),
             pending_scroll_back: None,
@@ -536,15 +547,20 @@ impl ViewState {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Builds every line the transcript renders to, oldest first.
+    /// Builds every line the transcript renders to, oldest first, at `width` columns.
     ///
     /// Rendering works on *lines* rather than entries so that the visible window is
     /// computed from the exact set of rows being drawn. Slicing by estimated
     /// per-entry heights drifts whenever an estimate and the renderer disagree, and
     /// the drift shows up as the newest line being clipped — the one line a reader
     /// most wants.
+    ///
+    /// The width is taken rather than looked up because the compact form clips to it, and
+    /// a line that is clipped has to be clipped to the width it will be *drawn* at: a
+    /// paragraph that wrapped would be more rows than the one line it promises, and the
+    /// scroll arithmetic is built on these heights.
     #[must_use]
-    pub fn transcript_lines(&self) -> Vec<Line<'static>> {
+    pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let entries = self.transcript.entries();
         let mut index = 0;
@@ -566,7 +582,31 @@ impl ViewState {
                 index = index.saturating_add(run);
                 continue;
             }
-            lines.push(self.header_for(entry));
+            // The compact form draws the two things that are *about* the work as one row
+            // each, with no heading and no blank row of their own: that is what "no space
+            // above or below" comes to, and it is what makes a turn's machinery read as a
+            // block rather than as a wall of paragraphs with gaps in it. A reader who wants
+            // the argument blocks and the whole of the reasoning asks for
+            // [`Detail::Full`].
+            if self.detail == Detail::Compact {
+                if let EntryKind::ToolCall { name, arguments } = entry.kind() {
+                    lines.push(self.compact_tool_line(name, arguments, width));
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                if entry.role() == Role::Reasoning {
+                    lines.push(self.compact_thinking_line(entry, width));
+                    index = index.saturating_add(1);
+                    continue;
+                }
+            }
+            // A tool's heading is dropped in the compact form, for a result as well as for
+            // a call: `✓ read` already says which tool this was, and the heading only
+            // answers a question nobody asked. Its *output* stays — that is the outcome of
+            // the call, and losing it would lose the failures with it.
+            if self.detail != Detail::Compact || entry.role() != Role::Tool {
+                lines.push(self.header_for(entry));
+            }
             lines.extend(self.lines_for(entry));
             // A blank row between entries, so two consecutive messages do not read
             // as one paragraph.
@@ -584,6 +624,22 @@ impl ViewState {
             .take_while(|entry| entry.role() == role)
             .count()
             .max(1)
+    }
+
+    /// Draws a tool call as the single line that says what it is and what it is doing.
+    ///
+    /// The phrasing is [`crate::compact`]'s business, not the view's: which argument a tool
+    /// is acting on is knowledge about the toolset, and the view's job is only to style the
+    /// line and to place it.
+    fn compact_tool_line(&self, name: &str, arguments: &str, width: u16) -> Line<'static> {
+        let text = compact::tool_line(name, arguments, width);
+        Line::from(Span::styled(text, self.theme.tool))
+    }
+
+    /// Draws a thinking segment as its newest line.
+    fn compact_thinking_line(&self, entry: &Entry, width: u16) -> Line<'static> {
+        let text = compact::thinking_line(entry.text(), entry.is_streaming(), width);
+        Line::from(Span::styled(text, self.theme.reasoning))
     }
 
     /// Draws a run of tool activity as one line.
@@ -638,7 +694,7 @@ impl ViewState {
 
     /// Renders the conversation.
     fn render_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
-        let lines = self.transcript_lines();
+        let lines = self.transcript_lines(area.width);
         let heights = Self::line_heights(&lines, area.width);
         let (start, padding) = Self::window(&heights, self.scroll_offset, area.height);
         // Blank rows above the tail, so the newest line sits at the bottom of the
@@ -717,7 +773,7 @@ impl ViewState {
         let Some((width, _)) = self.last_viewport else {
             return 0;
         };
-        let lines = self.transcript_lines();
+        let lines = self.transcript_lines(width);
         Self::line_heights(&lines, width)
             .iter()
             .copied()
@@ -1237,11 +1293,106 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_renders_its_name_and_arguments() {
+    fn a_tool_call_is_one_line_saying_what_it_is_doing() {
         let mut state = state_with(vec![Entry::tool_call("read", "{\"file_path\":\"a.txt\"}")]);
         let text = rendered(&mut state, 70, 12);
-        assert!(text.contains("read"));
-        assert!(text.contains("file_path"));
+        assert!(text.contains("⚙ Read File · a.txt"), "{text}");
+        // The arguments are not spelled out: that is the whole of what the compact form
+        // drops, and a reader who wants them asks for `tui_detail = "full"`.
+        assert!(!text.contains("file_path"), "{text}");
+    }
+
+    #[test]
+    fn a_compact_tool_call_occupies_exactly_one_row() {
+        // The row count is the claim, not the text: `transcript_lines` is what both the
+        // renderer and the scroll arithmetic measure, so one line here is one row there.
+        let mut state = state_with(vec![
+            Entry::tool_call("edit", "{\"file_path\":\"a.rs\"}"),
+            Entry::tool_call("bash", "{\"command\":\"cargo test\"}"),
+        ]);
+        let lines = state.transcript_lines(70);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        // No blank row above or below either of them, so consecutive calls are adjacent.
+        assert!(lines.iter().all(|line| line.width() > 0), "{lines:?}");
+
+        state.detail = Detail::Full;
+        let full = state.transcript_lines(70);
+        assert!(full.len() > 2, "the full form is taller: {full:?}");
+        assert!(
+            full.iter()
+                .any(|line| line.to_string().contains("file_path")),
+            "{full:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_thinking_segment_is_drawn_as_its_newest_line() {
+        let mut state = state_with(vec![Entry::prose(Role::Reasoning, "first\nsecond\nthird")]);
+        let text = rendered(&mut state, 70, 12);
+        assert!(text.contains("── thinking · third"), "{text}");
+        assert!(!text.contains("first"), "{text}");
+
+        // And the full form still draws the whole segment, which is what the setting
+        // reverts to.
+        state.detail = Detail::Full;
+        let text = rendered(&mut state, 70, 12);
+        assert!(text.contains("first"), "{text}");
+        assert!(text.contains("third"), "{text}");
+    }
+
+    #[test]
+    fn a_thinking_line_follows_the_deltas_as_they_arrive() {
+        // This is the scrolling: the line is the newest one, so each delta changes what is
+        // drawn rather than adding to a paragraph.
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .append_stream(Role::Reasoning, "checking the caller", false);
+        let before = rendered(&mut state, 70, 12);
+        state
+            .transcript
+            .append_stream(Role::Reasoning, "\nand the glob itself", false);
+        let after = rendered(&mut state, 70, 12);
+        assert!(before.contains("checking the caller"), "{before}");
+        assert!(after.contains("and the glob itself"), "{after}");
+        assert!(!after.contains("checking the caller"), "{after}");
+
+        // The cursor stays on the line while it is still arriving.
+        assert!(after.contains('▌'), "{after}");
+    }
+
+    #[test]
+    fn the_compact_lines_are_drawn_in_their_roles_colours() {
+        // The style is the view's business, and the compact form must not lose it: a
+        // one-line thinking entry is still dimmed, and a call is still tool-coloured.
+        let mut state = state_with(vec![
+            Entry::prose(Role::Reasoning, "considering"),
+            Entry::tool_call("read", "{\"file_path\":\"a.txt\"}"),
+        ]);
+        let text = rendered(&mut state, 70, 12);
+        assert!(text.contains("considering"), "{text}");
+        assert!(text.contains("Read File"), "{text}");
+    }
+
+    #[test]
+    fn a_tool_call_and_its_result_sit_against_each_other() {
+        let mut state = state_with(vec![
+            Entry::tool_call("read", "{\"file_path\":\"a.txt\"}"),
+            Entry::tool_result("read", false, "content"),
+        ]);
+        let rows: Vec<String> = rendered(&mut state, 70, 12)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let call = rows
+            .iter()
+            .position(|row| row.contains("Read File"))
+            .expect("the call is drawn");
+        assert!(
+            rows.get(call.saturating_add(1))
+                .is_some_and(|row| row.contains('✓')),
+            "the result follows immediately: {rows:?}"
+        );
     }
 
     #[test]

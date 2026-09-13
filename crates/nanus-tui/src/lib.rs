@@ -21,6 +21,9 @@
 //!   apart at a glance.
 //! - **Tool calls and their results**, so a reader can see what the agent *did*, not
 //!   only what it said.
+//! - **One line for the machinery, by default**: a tool call is a single line naming the
+//!   tool and what it is acting on, and a thinking segment is the newest line of itself.
+//!   See [`compact`], and [`Detail::Full`] for the whole of both.
 //! - **Live status**: whether a turn is open, which step it is on, and the token
 //!   usage of the session so far.
 
@@ -32,6 +35,7 @@
 #![allow(unreachable_pub)]
 
 pub mod buffer;
+pub mod compact;
 pub mod replay;
 pub mod stats;
 pub mod transcript;
@@ -41,6 +45,7 @@ pub mod view;
 pub mod runtime;
 
 pub use buffer::{InputBuffer, KeyOutcome};
+pub use compact::Detail;
 pub use replay::{recording_of, transcript_of};
 pub use stats::Throughput;
 pub use transcript::{Entry, EntryKind, Role, Transcript};

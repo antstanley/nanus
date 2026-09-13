@@ -98,6 +98,46 @@ impl LlmPort for RelentlessLlm {
     }
 }
 
+/// A model that asks for one tool, with arguments, and then answers.
+///
+/// The arguments are the point of this double. A call's *name* was all the link used to
+/// carry, and a name is not enough to draw a call: an interface that cannot say which file
+/// a `read` is reading can only say that something is happening.
+struct OneToolLlm {
+    /// The step the model is on, so the second request answers instead of calling again.
+    step: std::cell::Cell<u32>,
+}
+
+impl LlmPort for OneToolLlm {
+    fn model(&self) -> &'static str {
+        "one-tool"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        let step = self.step.get();
+        self.step.set(step.saturating_add(1));
+        if step > 0 {
+            return Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta("finished".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ]));
+        }
+        Box::pin(futures::stream::iter(vec![
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("call_1")),
+                name: Some(ToolName::new("nowhere").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: r#"{"file_path":"src/main.rs"}"#.to_owned(),
+            },
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]))
+    }
+}
+
 /// Builds an agent over a store in `dir`, and returns the store alongside it.
 fn scripted_agent(dir: &Path) -> (Agent, StoreHandle) {
     agent_over(dir, Rc::new(Box::new(ScriptedLlm)), "scripted")
@@ -281,6 +321,64 @@ fn a_turn_that_runs_out_of_steps_says_so() {
         steps, 4,
         "it stopped at the budget the agent was built with, so the reason is about the \
          budget rather than about the model"
+    );
+}
+
+/// The defect this closes: a tool frame carried the tool's *name* and nothing else, so an
+/// interface could say that something was running but never what — `read` of which file,
+/// `bash` running which command. The arguments are in the session log, but a client
+/// watching a turn is not reading the log as it is written, so the frame is where they have
+/// to cross.
+#[test]
+fn a_tool_frame_carries_what_the_call_is_acting_on() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(OneToolLlm {
+            step: std::cell::Cell::new(0),
+        })),
+        "one-tool",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "look at the file".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    let call = frames.iter().find_map(|frame| match frame {
+        Frame::Tool { name, arguments } => Some((name.as_str(), arguments)),
+        _ => None,
+    });
+    let (name, arguments) = call.expect("the call reaches the client before it runs");
+    assert_eq!(name, "nowhere");
+    assert_eq!(
+        arguments
+            .get("file_path")
+            .and_then(serde_json::Value::as_str),
+        Some("src/main.rs"),
+        "the arguments travel with the call: {arguments}"
     );
 }
 

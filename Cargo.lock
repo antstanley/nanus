@@ -1635,6 +1635,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "nanus-adapter-config",
  "nanus-adapter-store",
  "nanus-domain",
  "nanus-kernel",

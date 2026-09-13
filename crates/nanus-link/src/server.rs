@@ -570,9 +570,10 @@ impl Progress for Broadcast<'_> {
         self.push(&Frame::Step { step });
     }
 
-    fn tool_started(&mut self, name: &ToolName) {
+    fn tool_started(&mut self, name: &ToolName, arguments: &serde_json::Value) {
         self.push(&Frame::Tool {
             name: name.as_str().to_owned(),
+            arguments: arguments.clone(),
         });
     }
 
