@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::buffer::InputBuffer;
+use crate::stats::Throughput;
 use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_rows};
 
 /// Colours and emphasis for each role.
@@ -114,6 +115,9 @@ const MAX_COMPOSER_ROWS: u16 = 5;
 /// The rows the composer's border adds around its text.
 const COMPOSER_BORDER_ROWS: u16 = 2;
 
+/// The rows the transcript keeps whatever else wants them.
+const TRANSCRIPT_FLOOR: u16 = 3;
+
 /// The columns the composer's border adds around its text.
 const COMPOSER_BORDER_COLS: u16 = 2;
 
@@ -149,6 +153,8 @@ pub struct ViewState {
     pub step: u32,
     /// Total tokens the session has used.
     pub tokens_used: u64,
+    /// How fast the model has been going, for the line under the composer.
+    pub stats: Throughput,
     /// What the model is currently doing, for the status line.
     pub status: String,
     /// Whether runs of tool calls are drawn as one summary line.
@@ -190,6 +196,7 @@ impl Default for ViewState {
             busy: false,
             step: 0,
             tokens_used: 0,
+            stats: Throughput::default(),
             status: "ready".to_owned(),
             collapse_tools: false,
             collapse_reasoning: false,
@@ -447,17 +454,32 @@ impl ViewState {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         // The composer grows with the prompt, so a multi-line one is visible rather
-        // than clipped to a single row. The transcript keeps a floor of three rows so
-        // that a tall composer cannot squeeze the conversation out entirely.
+        // than clipped to a single row. The transcript keeps a floor of rows so that a
+        // tall composer cannot squeeze the conversation out entirely.
         let composer = self
             .composer_rows(area.width.saturating_sub(COMPOSER_BORDER_COLS))
             .saturating_add(COMPOSER_BORDER_ROWS);
+        // The throughput line is the first thing to give up its row when there are not
+        // enough: a terminal too short for everything should cost the reader a number
+        // they can live without, not the row they are typing on. Everything else here
+        // has a floor it keeps, and this is measured against those floors rather than
+        // against the terminal alone, so it cannot be granted a row that the composer
+        // needed. The chunk stays in the layout at zero height so that the rows below it
+        // do not move.
+        let stats = u16::from(
+            area.height
+                >= 1_u16
+                    .saturating_add(TRANSCRIPT_FLOOR)
+                    .saturating_add(composer)
+                    .saturating_add(2),
+        );
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Min(3),
+                Constraint::Min(TRANSCRIPT_FLOOR),
                 Constraint::Length(composer),
+                Constraint::Length(stats),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -483,7 +505,10 @@ impl ViewState {
         if let Some(input) = chunks.get(2) {
             self.render_input(frame, *input);
         }
-        if let Some(status) = chunks.get(3) {
+        if let Some(stats) = chunks.get(3) {
+            self.render_stats(frame, *stats);
+        }
+        if let Some(status) = chunks.get(4) {
             self.render_status(frame, *status);
         }
     }
@@ -828,6 +853,39 @@ impl ViewState {
     const PROMPT_WIDTH: usize = 2;
 
     /// Renders the status line.
+    /// Renders the throughput line, directly under the composer.
+    ///
+    /// Its own row rather than more of the status line: the status line is about the
+    /// turn in progress and answers "what is happening", while these are the model's
+    /// running numbers and answer "how is it going". Crowding them together would push
+    /// whichever the reader wanted off the end of a narrow terminal.
+    ///
+    /// A number that has not been measured is drawn as a dash. Zero is a measurement —
+    /// it says the model generated nothing — and showing it for "no request has finished
+    /// yet" would be a claim rather than a blank.
+    fn render_stats(&self, frame: &mut Frame<'_>, area: Rect) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let show = |value: Option<u64>| {
+            value.map_or_else(|| String::from("\u{2014}"), |number| number.to_string())
+        };
+        let percent = self
+            .stats
+            .cache_hit_percent()
+            .map_or_else(|| String::from("\u{2014}"), |number| format!("{number}%"));
+        let line = Line::from(vec![
+            Span::styled(format!("cache hit {percent}"), dim),
+            Span::styled(
+                format!("  \u{b7}  last {} tok/s", show(self.stats.last_rate())),
+                dim,
+            ),
+            Span::styled(
+                format!("  \u{b7}  avg {} tok/s", show(self.stats.average_rate())),
+                dim,
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
         let busy = if self.busy {
             Span::styled(format!("● {}", self.status), self.theme.busy)
@@ -1220,6 +1278,75 @@ mod tests {
         state.add_tokens(1200);
         let text = rendered(&mut state, 60, 12);
         assert!(text.contains("1200 tokens"));
+    }
+
+    /// The three numbers asked for, on a row of their own between the composer and the
+    /// status line. The position is the assertion that matters: the same line drawn
+    /// anywhere else would read as being about something else.
+    #[test]
+    fn the_throughput_line_is_drawn_under_the_composer() {
+        let mut state = ViewState::new();
+        state.stats.record(300, 900, 100, 2_000);
+        let text = rendered(&mut state, 60, 14);
+        assert!(text.contains("cache hit 90%"), "{text}");
+        assert!(text.contains("last 150 tok/s"), "{text}");
+        assert!(text.contains("avg 150 tok/s"), "{text}");
+        let rows: Vec<&str> = text.lines().collect();
+        let composer = rows
+            .iter()
+            .position(|row| row.contains("message"))
+            .expect("the composer is drawn");
+        let throughput = rows
+            .iter()
+            .position(|row| row.contains("cache hit"))
+            .expect("the stats are drawn");
+        let status = rows
+            .iter()
+            .position(|row| row.contains("ready"))
+            .expect("the status line is drawn");
+        assert!(
+            composer < throughput && throughput < status,
+            "composer {composer}, stats {throughput}, status {status}:\n{text}"
+        );
+    }
+
+    /// Nothing measured is drawn as a dash rather than as a zero. A zero is a
+    /// measurement — it says the model generated nothing — and a reader whose first
+    /// request has not finished has not been told that.
+    #[test]
+    fn the_throughput_line_shows_a_dash_for_what_it_has_not_measured() {
+        let mut state = ViewState::new();
+        let text = rendered(&mut state, 60, 14);
+        assert!(text.contains("cache hit \u{2014}"), "{text}");
+        assert!(text.contains("last \u{2014} tok/s"), "{text}");
+        assert!(text.contains("avg \u{2014} tok/s"), "{text}");
+        assert!(
+            !text.contains("cache hit 0%"),
+            "not a zero it never measured"
+        );
+    }
+
+    /// The throughput line gives up its row before the composer gives up one of its own.
+    /// A terminal with rows to spare shows both; one without shows the row the reader is
+    /// typing on, which is the one thing on this screen they cannot do without.
+    #[test]
+    fn the_throughput_line_yields_its_row_to_the_composer() {
+        let mut state = ViewState::new();
+        state.stats.record(300, 900, 100, 2_000);
+        // Nine rows is the least that holds the title, the transcript's floor, an empty
+        // composer, the throughput line, and the status line.
+        let roomy = rendered(&mut state, 60, 9);
+        assert!(roomy.contains("cache hit 90%"), "rows to spare: {roomy}");
+        assert!(roomy.contains('›'), "and the composer too: {roomy}");
+        let cramped = rendered(&mut state, 60, 8);
+        assert!(
+            !cramped.contains("tok/s"),
+            "the stats go without: {cramped}"
+        );
+        assert!(
+            cramped.contains('›'),
+            "the composer keeps its row: {cramped}"
+        );
     }
 
     #[test]

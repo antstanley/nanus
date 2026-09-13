@@ -33,6 +33,7 @@
 
 pub mod buffer;
 pub mod replay;
+pub mod stats;
 pub mod transcript;
 pub mod view;
 
@@ -41,5 +42,6 @@ pub mod runtime;
 
 pub use buffer::{InputBuffer, KeyOutcome};
 pub use replay::{recording_of, transcript_of};
+pub use stats::Throughput;
 pub use transcript::{Entry, EntryKind, Role, Transcript};
 pub use view::{Theme, ViewState};

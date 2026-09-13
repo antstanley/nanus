@@ -40,11 +40,11 @@ use std::future::Future;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{AgentRunner, Harness, Progress};
-use nanus_domain::{Session, SessionId, ToolName, Usage};
+use nanus_domain::{Session, SessionId, ToolName, TurnEndReason, Usage};
 use nanus_ports::{ClockHandle, StoreHandle};
 use tokio::io::BufReader;
 use tokio::net::unix::OwnedWriteHalf;
@@ -53,7 +53,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinSet;
 
 use crate::error::{LinkError, LinkResult};
-use crate::protocol::{AgentInfo, Frame, Request, SessionInfo};
+use crate::protocol::{AgentInfo, Frame, Request, SessionInfo, TurnEnd};
 use crate::wire::{read_request, write_frame};
 
 /// How many frames may be queued to one client before progress is dropped.
@@ -428,6 +428,30 @@ impl Registry {
     }
 }
 
+/// Translates the domain's turn-end reason into the link's own vocabulary.
+///
+/// The match is exhaustive on purpose: a reason added to the domain has to be a compile
+/// error here, because the alternative is a turn that ends for a reason the interface
+/// cannot be told about, and an interface that cannot be told draws it as a completed
+/// turn. That failure is the one this field exists to prevent.
+impl From<&TurnEndReason> for TurnEnd {
+    fn from(reason: &TurnEndReason) -> Self {
+        match reason {
+            TurnEndReason::Completed => Self::Completed,
+            TurnEndReason::Aborted { reason } => Self::Aborted {
+                reason: reason.clone(),
+            },
+            TurnEndReason::Blocked => Self::Blocked,
+            TurnEndReason::Error { message } => Self::Error {
+                message: message.clone(),
+            },
+            TurnEndReason::MaxTokens => Self::MaxTokens,
+            TurnEndReason::MaxSteps => Self::MaxSteps,
+            TurnEndReason::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
 /// Runs one turn in a held session and tells everyone watching.
 ///
 /// The session is borrowed for the whole turn, which is why exactly one turn may run at a
@@ -441,7 +465,10 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
     let outcome = {
         // Scoped rather than dropped: the bridge borrows the session only for as long as
         // the turn runs, so a frame it queues cannot overtake the ending.
-        let mut progress = Broadcast { held };
+        let mut progress = Broadcast {
+            held,
+            started: None,
+        };
         agent
             .runner()
             .run_turn(&mut session, &text, &mut progress)
@@ -449,9 +476,13 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
     };
 
     let ending = match outcome {
+        // The reason travels with the ending. A turn that closed at its step budget is
+        // not a completed turn, and only the reason says so: without it the interface
+        // draws the last thing the model happened to say as though it were an answer.
         Ok(result) => match agent.record(&session).await {
             Ok(()) => Frame::Done {
                 answer: result.answer,
+                reason: TurnEnd::from(&result.reason),
             },
             Err(error) => Frame::Failed {
                 message: format!("the session could not be recorded: {error}"),
@@ -482,6 +513,15 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
 struct Broadcast<'a> {
     /// The session whose viewers are watching.
     held: &'a Held,
+    /// When the step now running issued its request, if one is in flight.
+    ///
+    /// The loop reports a step starting and then a usage record when the request
+    /// finishes, and the difference is the request's *active* time: tool calls run after
+    /// usage is reported, and the idle between turns never enters it. The instant is
+    /// taken here rather than in the loop because the frame that carries the duration is
+    /// produced here, which keeps the loop's [`Progress`] contract about what happened
+    /// rather than about how long it took.
+    started: Option<Instant>,
 }
 
 impl Broadcast<'_> {
@@ -526,6 +566,7 @@ impl Progress for Broadcast<'_> {
     }
 
     fn step_started(&mut self, step: u32) {
+        self.started = Some(Instant::now());
         self.push(&Frame::Step { step });
     }
 
@@ -543,8 +584,21 @@ impl Progress for Broadcast<'_> {
     }
 
     fn usage(&mut self, usage: &Usage) {
+        // The request's active time, taken from the step that issued it. A usage record
+        // that arrives with no step before it cannot be timed, and reports zero rather
+        // than a duration measured from some other request's start. `as_millis` is a
+        // `u128`; a request that ran for longer than a `u64` of milliseconds did not
+        // happen, so the conversion saturates rather than failing the frame.
+        let duration_ms = self
+            .started
+            .take()
+            .map_or(0, |started| started.elapsed().as_millis());
         self.push(&Frame::Usage {
             tokens: usage.total_tokens(),
+            completion_tokens: usage.completion_tokens,
+            cache_hit_tokens: usage.cache_hit_tokens,
+            cache_miss_tokens: usage.cache_miss_tokens,
+            duration_ms: u64::try_from(duration_ms).unwrap_or(u64::MAX),
         });
     }
 }
@@ -841,7 +895,11 @@ async fn start_turn(
     // Everyone else is told what was asked, before the turn can queue anything. The
     // client that asked already has its own words on screen and is skipped, which is
     // what keeps the prompt from appearing twice in its transcript.
-    Broadcast { held }.push_except(viewer, &Frame::User { text: text.clone() });
+    let progress = Broadcast {
+        held,
+        started: None,
+    };
+    progress.push_except(viewer, &Frame::User { text: text.clone() });
     held.touched.set(registry.stamp());
     // Two handles: one for the task to own, one to hand the task to. Building the future
     // before borrowing the task set is what keeps the move of the first out of the

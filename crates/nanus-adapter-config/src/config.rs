@@ -36,7 +36,14 @@ pub const DEFAULT_MODEL: &str = "deepseek-flash";
 pub const DEFAULT_MAX_TOKENS: u32 = 8_192;
 
 /// The step budget for one turn used when the configuration names none.
-pub const DEFAULT_MAX_STEPS_PER_TURN: u32 = 32;
+///
+/// A hundred and twenty-eight rather than the original thirty-two, because thirty-two
+/// was measured against real work and lost: the first non-trivial task this harness was
+/// given — add three counters to the interface, touching two crates — spent twenty-seven
+/// of its thirty-two steps reading before it made a single edit, and the turn closed
+/// mid-change. The budget exists to bound a runaway loop, and a bound that a normal task
+/// hits is not bounding a runaway; it is bounding the task.
+pub const DEFAULT_MAX_STEPS_PER_TURN: u32 = 128;
 
 /// The tool-concurrency budget used when the configuration names none.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: u32 = 4;

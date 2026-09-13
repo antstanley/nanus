@@ -377,6 +377,28 @@ impl Transcript {
         }
     }
 
+    /// Settles the turn's final text into the transcript, without drawing it twice.
+    ///
+    /// The answer arrives twice on purpose: once as it streamed, delta by delta, and once
+    /// whole in the frame that ends the turn, so a client that attached late or lost a
+    /// delta still ends up with it. When the tail already holds exactly that text the two
+    /// are the same words, and appending the second copy draws the answer twice — once
+    /// where it was written and once after everything that came later. Settling the entry
+    /// that is already there is what makes the frame a reconciliation rather than a
+    /// repetition.
+    pub fn settle_with(&mut self, role: Role, text: &str) {
+        let already_said = self
+            .entries
+            .last()
+            .is_some_and(|entry| entry.role() == role && entry.text() == text);
+        // An empty answer is not worth an entry of its own, and a turn with nothing to
+        // say still has a stream to settle.
+        if !already_said && !text.is_empty() {
+            self.push(Entry::prose(role, text));
+        }
+        self.settle_tail();
+    }
+
     /// Removes every entry.
     pub fn clear(&mut self) {
         self.entries.clear();

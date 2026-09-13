@@ -80,6 +80,20 @@ agent loop already reports: text, reasoning, a step boundary, a tool starting an
 finishing, usage, and the ending. Nothing an interface *might* want is in it; anything
 else an interface needs about a conversation, the session log already holds.
 
+**The ending says why the turn ended, not only that it did.** A turn can stop for reasons
+that are not the model finishing — it can run out of steps, hit its token ceiling, be
+interrupted, be refused by a policy, or fail — and one frame covers all of them because
+the interface has to show what the model said *and* say what happened. It did not always:
+the ending meant "the turn is over", so a turn that closed at its step budget arrived
+looking exactly like a completed one, the last thing the model had said was drawn as its
+conclusion, and the reader was left to work out from the silence that the work had been
+cut off. `nanus run` had always called that a failed run and exited non-zero; the link is
+where the same fact reaches a person watching, and it now carries it. The reason is the
+link's own vocabulary rather than the domain's, because a bare client does not link the
+domain — see the `server` feature in
+[the manifest](../crates/nanus-link/Cargo.toml) — and the server's translation is an
+exhaustive match, so a reason the domain grows cannot quietly fail to cross.
+
 **A connection is a view of a session, not a session.** The agent owns the conversation,
 so it survives the connection that opened it, and a client joins one with `--resume`.
 Several clients can be attached at once and all see the same frames, which is what makes
@@ -257,6 +271,48 @@ in the session log where it belongs.
 log by the same renderer — [the replay module](../crates/nanus-tui/src/replay.rs) folds
 `SessionEvent`s into transcript entries and nothing invents content — so what you see
 browsing is what you saw live.
+
+**A turn that stopped early says so, in words.** When the ending is not a completion the
+transcript gets a notice naming the reason — `the turn stopped at its step budget after 32
+steps, so the work is unfinished`, or the model's token ceiling, or the failure — instead
+of the last thing the model happened to say being offered as its conclusion. The sentence
+is written by the interface rather than sent by the agent, because it is the interface's
+job to phrase what a reader sees, and every reason gets its own phrasing rather than a
+generic one: `max_steps` is a label, not an explanation.
+
+**The answer is drawn once.** It arrives twice on purpose — streamed in deltas as it was
+generated, and whole in the frame that ends the turn, so that a client which attached late
+or lost a delta still ends up with it. The interface reconciles rather than appends: when
+the streaming tail already holds exactly that text it is settled instead of being followed
+by a second copy. Appending drew every completed turn's answer twice, once where it was
+written and once after everything the turn did afterwards.
+
+**Three numbers under the composer** are the model's, not the session's:
+
+| | |
+|---|---|
+| `cache hit 96%` | the share of the session's prompt tokens the provider served from its cache |
+| `last 41 tok/s` | how fast the last request generated tokens |
+| `avg 38 tok/s` | how fast the session's requests have generated, on average |
+
+Both rates are measured against **active request time** — the time a request spent in
+flight, reported by the agent one request at a time — rather than wall-clock time, so a
+session that sat idle overnight or spent five minutes inside a tool has the same average
+as one that ran its requests back to back. A rate that includes waiting measures the
+person waiting. They count *generated* tokens rather than the whole request: the prompt is
+mostly cache hits, so a prompt-inclusive rate would mostly report how large the context
+had grown, and the cache share is already the number for that side.
+
+The line gives up its row before the composer gives up one of its own: on a terminal too
+short for everything, a number the reader can live without is what should go, not the row
+they are typing on.
+
+The average is over the session's totals rather than the mean of its per-request rates,
+because a mean of rates is only an average when every request took the same time. The
+arithmetic is whole numbers with `checked_*`, for the workspace's reasons, and a number
+that has not been measured is drawn as a dash: zero is a measurement — it says the model
+generated nothing — and showing it for "no request has finished yet" would be a claim
+rather than a blank.
 
 ## Why the interface is testable
 

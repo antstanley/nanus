@@ -24,8 +24,10 @@ use futures::StreamExt as _;
 use nanus_adapter_local::SystemClock;
 use nanus_adapter_store::JsonlStore;
 use nanus_bundle::AgentRunner;
-use nanus_domain::{AgentConfig, Session, SessionEvent, SessionId, ToolRegistry};
-use nanus_link::protocol::{Frame, Request, SessionInfo};
+use nanus_domain::{
+    AgentConfig, Session, SessionEvent, SessionId, ToolCallId, ToolName, ToolRegistry,
+};
+use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
 use nanus_link::server::{Agent, Parts};
 use nanus_link::{Client, LinkError};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, StoreHandle};
@@ -66,6 +68,33 @@ impl LlmPort for SlowLlm {
                 reason: FinishReason::Stop,
             }])),
         )
+    }
+}
+
+/// A model that never stops asking for a tool, so a turn runs until something stops it.
+///
+/// The registry it is given is empty, which is enough: a call to a tool that is not
+/// registered comes back as a failed *result*, which is the model's information rather
+/// than a broken loop, so the turn keeps taking steps until the budget ends it.
+struct RelentlessLlm;
+
+impl LlmPort for RelentlessLlm {
+    fn model(&self) -> &'static str {
+        "relentless"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        Box::pin(futures::stream::iter(vec![
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("call_1")),
+                name: Some(ToolName::new("nowhere").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{}".to_owned(),
+            },
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]))
     }
 }
 
@@ -135,7 +164,15 @@ fn text_of(frames: &[Frame]) -> String {
 /// The answer a stream ended with, if it ended well.
 fn answer_of(frames: &[Frame]) -> Option<&str> {
     frames.iter().find_map(|frame| match frame {
-        Frame::Done { answer } => Some(answer.as_str()),
+        Frame::Done { answer, .. } => Some(answer.as_str()),
+        _ => None,
+    })
+}
+
+/// Why a stream's turn ended, when it ended with an outcome rather than a failure.
+fn reason_of(frames: &[Frame]) -> Option<&TurnEnd> {
+    frames.iter().find_map(|frame| match frame {
+        Frame::Done { reason, .. } => Some(reason),
         _ => None,
     })
 }
@@ -179,6 +216,11 @@ fn a_prompt_streams_an_answer_and_records_the_session() {
     assert_eq!(attached.name, None, "an unnamed session has no name");
     assert_eq!(text_of(&frames), "hello back");
     assert_eq!(answer_of(&frames), Some("hello back"));
+    assert_eq!(
+        reason_of(&frames),
+        Some(&TurnEnd::Completed),
+        "a turn that answered says so"
+    );
 
     // The contract the server keeps: by the time a client has seen the ending, the
     // session is already written down.
@@ -187,6 +229,58 @@ fn a_prompt_streams_an_answer_and_records_the_session() {
     assert!(
         listed.first().is_some_and(|row| row.event_count > 0),
         "the turn left events behind: {listed:?}"
+    );
+}
+
+/// The defect this closes: a turn that closed at its step budget reached the interface
+/// looking exactly like one that had finished, because the ending said only that the turn
+/// was over. `nanus run` had always called that a failed run; the link had no way to say
+/// it at all.
+#[test]
+fn a_turn_that_runs_out_of_steps_says_so() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(RelentlessLlm)), "relentless");
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (frames, steps) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "keep going".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        let steps = frames
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Step { .. }))
+            .count();
+        (frames, steps)
+    });
+
+    assert_eq!(
+        reason_of(&frames),
+        Some(&TurnEnd::MaxSteps),
+        "the ending says why the turn stopped, not just that it did"
+    );
+    assert_eq!(
+        steps, 4,
+        "it stopped at the budget the agent was built with, so the reason is about the \
+         budget rather than about the model"
     );
 }
 

@@ -38,10 +38,51 @@
 //! named error rather than a silent misparse, and a log of the exchange can be read by
 //! a person. The cost is a few bytes per frame on a socket that is not the bottleneck.
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{LinkError, LinkResult};
+
+/// The reason a `Done` frame carries when the sender did not say one.
+///
+/// A serde default rather than an `Option` because every turn has a reason, and an agent
+/// too old to send one only ever ended turns the way a completed turn ends.
+fn completed_reason() -> TurnEnd {
+    TurnEnd::Completed
+}
+
+/// Why a turn ended.
+///
+/// This crate's own vocabulary rather than the domain's turn-end reason, even though the
+/// two say the same thing. A bare client does not link the domain — the two halves of the
+/// link are split at a feature boundary so that an interface gets the frames and the
+/// socket and nothing else — and the protocol is what such a client compiles against. The
+/// server translates, and the translation is an exhaustive match, so a reason the domain
+/// grows cannot quietly fail to cross the link.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnEnd {
+    /// The model finished and nothing was owed.
+    Completed,
+    /// A human stopped the turn.
+    Aborted {
+        /// The recorded reason.
+        reason: String,
+    },
+    /// A policy refused to continue.
+    Blocked,
+    /// The harness failed.
+    Error {
+        /// The rendered failure.
+        message: String,
+    },
+    /// The model hit its output ceiling.
+    MaxTokens,
+    /// The turn hit its step budget.
+    MaxSteps,
+    /// The turn was interrupted.
+    Interrupted,
+}
 
 /// What a client asks an agent to do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -157,15 +198,63 @@ pub enum Frame {
     },
 
     /// Usage was reported for the request that just completed.
+    ///
+    /// Everything here describes *one* model request rather than the session: an
+    /// interface accumulates what it needs, and a session's own totals are already in
+    /// the log. It carries the prompt-cache counters, the generated count, and the
+    /// request's active time because the two rates an interface shows — tokens per
+    /// second for the request, and the share of the prompt that was cached — are about
+    /// this request's accounting and this request's clock.
     Usage {
-        /// Tokens the request used, which an interface accumulates rather than replaces.
+        /// Tokens the request used, prompt and completion, which an interface
+        /// accumulates rather than replaces.
         tokens: u32,
+        /// Tokens the model generated, which is what a rate is measured against.
+        ///
+        /// Sent rather than left to be derived from `tokens` minus the cache counters,
+        /// because a provider that reports no cache accounting would make that
+        /// subtraction return the whole request as generation.
+        #[serde(default)]
+        completion_tokens: u32,
+        /// The share of the request's prompt served from the provider's cache.
+        ///
+        /// Defaulted on the way in so a frame from an agent that predates these fields
+        /// still decodes: a missing counter is zero rather than a protocol failure.
+        #[serde(default)]
+        cache_hit_tokens: u32,
+        /// The share of the request's prompt that missed the provider's cache.
+        #[serde(default)]
+        cache_miss_tokens: u32,
+        /// How long the request was in flight, in active milliseconds.
+        ///
+        /// Active rather than elapsed: it starts when the request is issued and ends
+        /// when its stream does, so a rate computed from it excludes the idle time
+        /// between turns and the tool time *within* one.
+        #[serde(default)]
+        duration_ms: u64,
     },
 
-    /// The turn finished.
+    /// The turn ended, whatever the outcome.
+    ///
+    /// One frame rather than a success variant and a failure variant, because "the model
+    /// ran out of steps with the work half done" is neither: the interface has to show
+    /// what the model said *and* say why it stopped, and the reason is what tells it
+    /// which of those it is looking at.
+    ///
+    /// Carrying the reason is the point of the field. This frame used to mean "the turn
+    /// finished", so a turn that closed at its step budget arrived looking exactly like a
+    /// completed one: the last thing the model had said was drawn as the final answer,
+    /// the status line went back to ready, and nothing said the work had been cut off.
+    /// `nanus run` had always called that a failed run; the link had no way to.
     Done {
-        /// The model's final answer for this turn.
+        /// The model's final answer for this turn, empty when it produced none.
         answer: String,
+        /// Why the turn ended.
+        ///
+        /// Defaulted to [`TurnEnd::Completed`] on the way in, so a frame from an agent
+        /// that predates the field decodes as it always did.
+        #[serde(default = "completed_reason")]
+        reason: TurnEnd,
     },
 
     /// The turn failed.
@@ -301,9 +390,20 @@ mod tests {
                 name: "read".to_owned(),
                 error: true,
             },
-            Frame::Usage { tokens: 1234 },
+            Frame::Usage {
+                tokens: 1234,
+                completion_tokens: 90,
+                cache_hit_tokens: 900,
+                cache_miss_tokens: 100,
+                duration_ms: 2500,
+            },
             Frame::Done {
                 answer: "done".to_owned(),
+                reason: TurnEnd::Completed,
+            },
+            Frame::Done {
+                answer: String::new(),
+                reason: TurnEnd::MaxSteps,
             },
             Frame::Failed {
                 message: "boom".to_owned(),
@@ -382,11 +482,77 @@ mod tests {
         assert!(decode::<Request>("").is_err());
     }
 
+    /// The cache counters and the active time were added to a frame that used to carry
+    /// only a token count. A client talking to an agent that predates them must read the
+    /// frame rather than fail on it, and an absent counter is zero.
+    #[test]
+    fn a_usage_frame_from_an_older_agent_still_decodes() {
+        let decoded = decode::<Frame>(r#"{"frame":"usage","tokens":42}"#);
+        assert_eq!(
+            decoded.ok(),
+            Some(Frame::Usage {
+                tokens: 42,
+                completion_tokens: 0,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
+                duration_ms: 0,
+            })
+        );
+    }
+
+    /// The ending used to say only that the turn had finished, so an agent too old to
+    /// carry a reason can only have meant the one reason that used to be unsayable
+    /// because it was the only possibility. Reading it as anything else would turn an
+    /// old agent's success into a failure notice.
+    #[test]
+    fn a_done_frame_from_an_older_agent_ends_a_completed_turn() {
+        let decoded = decode::<Frame>(r#"{"frame":"done","answer":"hi"}"#);
+        assert_eq!(
+            decoded.ok(),
+            Some(Frame::Done {
+                answer: "hi".to_owned(),
+                reason: TurnEnd::Completed,
+            })
+        );
+    }
+
+    /// The reason is the whole point of the field, so a frame that carries one must
+    /// survive the round trip with it intact: a `max_steps` ending that decoded as
+    /// `completed` would put the interface back where it started.
+    #[test]
+    fn an_ending_keeps_the_reason_it_was_sent_with() {
+        let reasons = [
+            TurnEnd::Completed,
+            TurnEnd::MaxSteps,
+            TurnEnd::MaxTokens,
+            TurnEnd::Interrupted,
+            TurnEnd::Blocked,
+            TurnEnd::Aborted {
+                reason: "the human stopped it".to_owned(),
+            },
+            TurnEnd::Error {
+                message: "the model call failed".to_owned(),
+            },
+        ];
+        for reason in reasons {
+            let frame = Frame::Done {
+                answer: "half an answer".to_owned(),
+                reason: reason.clone(),
+            };
+            let encoded = encode(&frame);
+            assert!(encoded.is_ok(), "a frame with a reason encodes: {reason:?}");
+            let Ok(encoded) = encoded else { return };
+            let decoded = decode::<Frame>(&encoded);
+            assert_eq!(decoded.ok(), Some(frame), "the reason survives: {reason:?}");
+        }
+    }
+
     #[test]
     fn only_done_and_failed_end_a_turn() {
         assert!(
             Frame::Done {
-                answer: String::new()
+                answer: String::new(),
+                reason: TurnEnd::Completed,
             }
             .is_end_of_turn()
         );

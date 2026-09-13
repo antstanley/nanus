@@ -45,7 +45,7 @@ use crossterm::event::EventStream;
 use futures::StreamExt as _;
 use nanus_domain::{Session, SessionId};
 use nanus_link::Client;
-use nanus_link::protocol::{Frame, Request, SessionInfo};
+use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
 use nanus_ports::{StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -757,6 +757,28 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     }
 }
 
+/// What to tell the reader when a turn stopped without finishing, if it did.
+///
+/// `None` means the turn completed and the text it produced is the answer. Everything
+/// else is a sentence for the transcript, and every variant is named rather than
+/// rendered from a generic reason: "the model hit its output ceiling, so the answer is
+/// cut off" is the fact a reader needs, and a bare `max_tokens` is not.
+fn stopping_notice(reason: &TurnEnd, step: u32) -> Option<String> {
+    match reason {
+        TurnEnd::Completed => None,
+        TurnEnd::MaxSteps => Some(format!(
+            "the turn stopped at its step budget after {step} steps, so the work is unfinished"
+        )),
+        TurnEnd::MaxTokens => Some(String::from(
+            "the turn stopped at the model's token ceiling, so the answer is cut off",
+        )),
+        TurnEnd::Interrupted => Some(String::from("the turn was interrupted")),
+        TurnEnd::Aborted { reason } => Some(format!("the turn was stopped: {reason}")),
+        TurnEnd::Blocked => Some(String::from("the turn was blocked by a policy")),
+        TurnEnd::Error { message } => Some(format!("the turn failed: {message}")),
+    }
+}
+
 /// Applies one frame from the agent to the view.
 fn apply(frame: Frame, view: &mut ViewState) {
     match frame {
@@ -787,9 +809,36 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.transcript
                 .push(Entry::tool_result(name, error, "done"));
         }
-        Frame::Usage { tokens } => view.add_tokens(tokens),
-        Frame::Done { answer } => {
-            view.transcript.push(Entry::prose(Role::Assistant, answer));
+        Frame::Usage {
+            tokens,
+            completion_tokens,
+            cache_hit_tokens,
+            cache_miss_tokens,
+            duration_ms,
+        } => {
+            view.add_tokens(tokens);
+            view.stats.record(
+                completion_tokens,
+                cache_hit_tokens,
+                cache_miss_tokens,
+                duration_ms,
+            );
+        }
+        // A turn that stopped early is not a turn that finished, and the reason is the
+        // only thing that says which one this is. Drawing the answer either way is how a
+        // turn that ran out of steps came to look like a completed one: the last thing
+        // the model happened to say was put on screen as its conclusion, and the reader
+        // was left to work out from the silence that the work had been cut off.
+        Frame::Done { answer, reason } => {
+            if let Some(notice) = stopping_notice(&reason, view.step) {
+                view.transcript.settle_tail();
+                view.transcript.push(Entry::notice(notice));
+            } else {
+                // Reconciliation rather than a second copy: the answer already streamed
+                // in delta by delta, and settling that entry is what stops the same
+                // paragraph being drawn twice.
+                view.transcript.settle_with(Role::Assistant, &answer);
+            }
             view.end_turn();
             view.follow();
         }
@@ -1268,7 +1317,13 @@ mod tests {
             Frame::Text {
                 delta: "hello".to_owned(),
             },
-            Frame::Usage { tokens: 12 },
+            Frame::Usage {
+                tokens: 12,
+                completion_tokens: 9,
+                cache_hit_tokens: 800,
+                cache_miss_tokens: 200,
+                duration_ms: 1_000,
+            },
         ] {
             assert!(sender.try_send(frame).is_ok());
         }
@@ -1300,7 +1355,8 @@ mod tests {
         assert!(
             sender
                 .try_send(Frame::Done {
-                    answer: "answer".to_owned()
+                    answer: "answer".to_owned(),
+                    reason: TurnEnd::Completed,
                 })
                 .is_ok()
         );
@@ -1309,6 +1365,162 @@ mod tests {
         assert!(!view.transcript.is_streaming());
         let last = view.transcript.entries().last();
         assert!(last.is_some_and(|entry| entry.text() == "answer"));
+    }
+
+    /// The defect this closes: the ending used to say only that a turn was over, so a
+    /// turn that ran out of steps was drawn exactly like one that had finished — the last
+    /// thing the model said became the answer, and the reader was left to notice the work
+    /// had stopped.
+    #[test]
+    fn a_turn_that_stops_at_its_budget_is_reported_rather_than_dressed_as_an_answer() {
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        view.begin_turn(7);
+        for frame in [
+            Frame::Text {
+                delta: "now I will edit the server".to_owned(),
+            },
+            Frame::Done {
+                answer: "now I will edit the server".to_owned(),
+                reason: TurnEnd::MaxSteps,
+            },
+        ] {
+            assert!(sender.try_send(frame).is_ok());
+        }
+        drain_frames(&mut receiver, &mut view);
+
+        assert!(!view.busy, "the turn is over");
+        let last = view.transcript.entries().last();
+        assert_eq!(last.map(Entry::role), Some(Role::Harness), "a notice");
+        assert!(
+            last.is_some_and(|entry| entry.text().contains("step budget")),
+            "the notice names the budget: {:?}",
+            last.map(Entry::text)
+        );
+        assert!(
+            last.is_some_and(|entry| entry.text().contains('7')),
+            "and how far it got: {:?}",
+            last.map(Entry::text)
+        );
+        let said = view
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| entry.text() == "now I will edit the server")
+            .count();
+        assert_eq!(said, 1, "the narration is not also offered as the answer");
+    }
+
+    /// The other half of the same field: a reason that is not about the budget still has
+    /// to reach the reader, and the sentence has to be about that reason.
+    #[test]
+    fn every_reason_a_turn_can_stop_for_is_said_in_words() {
+        let cases = [
+            (TurnEnd::MaxTokens, "token ceiling"),
+            (TurnEnd::Interrupted, "interrupted"),
+            (TurnEnd::Blocked, "policy"),
+            (
+                TurnEnd::Aborted {
+                    reason: "the human said stop".to_owned(),
+                },
+                "the human said stop",
+            ),
+            (
+                TurnEnd::Error {
+                    message: "the model call failed".to_owned(),
+                },
+                "the model call failed",
+            ),
+        ];
+        for (reason, expected) in cases {
+            let notice = stopping_notice(&reason, 3);
+            assert!(
+                notice
+                    .as_deref()
+                    .is_some_and(|text| text.contains(expected)),
+                "{reason:?} is reported as {notice:?}, which does not mention {expected:?}"
+            );
+        }
+        assert_eq!(
+            stopping_notice(&TurnEnd::Completed, 3),
+            None,
+            "a turn that finished has nothing to explain"
+        );
+    }
+
+    /// The answer arrives twice — streamed and then whole in the ending — and the
+    /// interface used to draw both, so every completed turn finished with the same
+    /// paragraph repeated.
+    #[test]
+    fn a_streamed_answer_is_settled_rather_than_repeated() {
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        for frame in [
+            Frame::Text {
+                delta: "the answer".to_owned(),
+            },
+            Frame::Done {
+                answer: "the answer".to_owned(),
+                reason: TurnEnd::Completed,
+            },
+        ] {
+            assert!(sender.try_send(frame).is_ok());
+        }
+        drain_frames(&mut receiver, &mut view);
+
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(said, vec!["the answer"], "drawn once, not twice");
+        assert!(!view.transcript.is_streaming(), "and settled");
+    }
+
+    /// The frame still carries the answer whole, so a client whose deltas never arrived
+    /// ends up with it. Reconciling must not turn into dropping.
+    #[test]
+    fn an_answer_that_never_streamed_is_still_shown() {
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        assert!(
+            sender
+                .try_send(Frame::Done {
+                    answer: "never streamed".to_owned(),
+                    reason: TurnEnd::Completed,
+                })
+                .is_ok()
+        );
+        drain_frames(&mut receiver, &mut view);
+
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(said, vec!["never streamed"]);
+    }
+
+    /// What the throughput line is fed from: one frame per request, carrying the
+    /// counters that request reported and how long it was in flight.
+    #[test]
+    fn usage_frames_feed_the_throughput_line() {
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        assert!(
+            sender
+                .try_send(Frame::Usage {
+                    tokens: 1_212,
+                    completion_tokens: 300,
+                    cache_hit_tokens: 900,
+                    cache_miss_tokens: 100,
+                    duration_ms: 2_000,
+                })
+                .is_ok()
+        );
+        drain_frames(&mut receiver, &mut view);
+
+        assert_eq!(
+            view.tokens_used, 1_212,
+            "the running total still accumulates"
+        );
+        assert_eq!(view.stats.last_rate(), Some(150));
+        assert_eq!(view.stats.average_rate(), Some(150));
+        assert_eq!(view.stats.cache_hit_percent(), Some(90));
     }
 
     #[test]
@@ -1419,12 +1631,14 @@ mod tests {
         let (frames, mut receiver) = mpsc::channel::<Frame>(8);
         let mut source = Scripted::new(vec![Frame::Done {
             answer: "answered".to_owned(),
+            reason: TurnEnd::Completed,
         }]);
         source.attach(&frames);
         assert_eq!(
             receiver.try_recv().ok(),
             Some(Frame::Done {
-                answer: "answered".to_owned()
+                answer: "answered".to_owned(),
+                reason: TurnEnd::Completed,
             })
         );
     }

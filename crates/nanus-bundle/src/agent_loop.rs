@@ -100,6 +100,23 @@ pub struct Silent;
 
 impl Progress for Silent {}
 
+/// Appends the turn's step budget to a system prompt.
+///
+/// The budget is a property of the run rather than of the prose, so it is stated here
+/// rather than written into the default prompt: a prompt the user configured gets the
+/// same sentence, and the number the model reads cannot drift from the number the
+/// turn machine enforces. It is stated at all because the first turn to hit the ceiling
+/// did so while exploring — nothing had told the model there was one, so pacing was
+/// never a decision it could make.
+fn with_step_budget(prompt: &str, budget: u32) -> String {
+    format!(
+        "{prompt}\n\nYou have a budget of {budget} steps for a turn, where a step is one \
+         model request together with the tool calls that follow it. The turn ends when the \
+         budget runs out, wherever the work has got to, so spend the early steps finding \
+         out what you need and the rest making the change."
+    )
+}
+
 /// Runs turns against a session.
 ///
 /// The runner owns no state between calls beyond the session it is given, so a
@@ -141,7 +158,10 @@ impl AgentRunner {
             .map_err(|error| BundleError::Config(error.to_string()))?;
         // Precondition: a runner with no tools can still be useful, so an empty
         // registry is allowed; a prompt larger than the configured ceiling is not.
-        let system_prompt = system_prompt.into();
+        // The ceiling is checked against the assembled prompt rather than the caller's
+        // part of it: the sentence below is sent too, and it counts.
+        let system_prompt: String = system_prompt.into();
+        let system_prompt = with_step_budget(&system_prompt, config.max_steps_per_turn);
         assert!(
             system_prompt.len() <= config.system_prompt_max,
             "the system prompt fits its configured ceiling"
@@ -591,6 +611,58 @@ mod tests {
 
     fn runner(llm: Rc<Box<dyn LlmPort>>, tools: Rc<ToolRegistry>) -> Option<AgentRunner> {
         AgentRunner::new(llm, tools, "you are a test", config()).ok()
+    }
+
+    /// The budget is enforced by the turn machine and was, until it bit, invisible to the
+    /// model it was enforced against. A turn that spends its last steps still exploring is
+    /// a turn that was never told it had a last step.
+    #[test]
+    fn the_system_prompt_states_the_budget_it_will_be_held_to() {
+        let prompt = with_step_budget("you are a test", 128);
+        assert!(
+            prompt.starts_with("you are a test"),
+            "the prompt a caller configured is kept, not replaced: {prompt}"
+        );
+        assert!(
+            prompt.contains("128"),
+            "the budget is stated as a number: {prompt}"
+        );
+        assert!(
+            prompt.contains("step"),
+            "and what a step is, since the number alone is not actionable: {prompt}"
+        );
+        // Read from the argument rather than written into the prose: a hard-coded
+        // hundred and twenty-eight would satisfy the assertions above.
+        assert!(with_step_budget("", 7).contains('7'));
+    }
+
+    /// The ceiling is checked against the prompt the model will actually be sent, which
+    /// is the one the runner assembled rather than the one the caller passed. Checking
+    /// first and appending afterwards would let a prompt that just fits go out over the
+    /// limit the configuration set.
+    #[test]
+    #[should_panic(expected = "the system prompt fits its configured ceiling")]
+    fn a_prompt_that_only_fits_without_the_budget_sentence_is_refused() {
+        let budget = with_step_budget("", 4).len();
+        let fits = "x".repeat(4_096_usize.saturating_sub(budget));
+        assert!(
+            AgentRunner::new(
+                ScriptedLlm::handle(Vec::new()),
+                Rc::new(ToolRegistry::new()),
+                fits.clone(),
+                config(),
+            )
+            .is_ok(),
+            "a prompt that fits with the sentence is accepted"
+        );
+        // One byte more, and the rejection has to be about the ceiling rather than
+        // about the caller's part of the prompt.
+        let _ = AgentRunner::new(
+            ScriptedLlm::handle(Vec::new()),
+            Rc::new(ToolRegistry::new()),
+            format!("{fits}x"),
+            config(),
+        );
     }
 
     #[tokio::test]
