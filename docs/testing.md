@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.6s] 629 tests run: 629 passed, 0 skipped
+Summary [3.1s] 633 tests run: 633 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
@@ -43,8 +43,10 @@ negatives. A name another session holds is refused and creates nothing. Attachin
 session that was never held loads it from the store. A **turn finishes after the client
 that asked for it leaves**, and a second client that joins sees the ending. Two clients on
 one session both see the turn, and the one that did not ask is told what was asked. A second
-prompt while a turn runs is refused rather than queued. A `status` request opens no session
-at all. A `shutdown` request stops a server that has no other stop condition, which is the
+prompt while a turn runs is refused rather than queued. A client that attaches again leaves
+no stale viewer behind — on either path, `new` or `attach` — and a session opened while
+every other one is in use is never the one let go. A `status` request opens no session at
+all. A `shutdown` request stops a server that has no other stop condition, which is the
 test that would hang rather than fail if the protocol were ignored. A socket left by a dead
 process is replaced, its permissions are the owner's alone, and connecting to one nobody
 serves names the path rather than reporting a syscall.
@@ -110,3 +112,30 @@ feedback it produced was not on screen.
 
 That second one was found by a model, in a live run, which then warned the user about it
 in its answer. Which is the point of building a harness small enough to reason about.
+
+## The bugs a structured review found
+
+Two more came out of reviewing the session work line by line rather than running it, and
+both are the kind that a green suite cannot see because nothing in the shipped clients
+reaches them:
+
+**Attaching again left the old session subscribed.** A connection that moved from one
+session to another dropped its `(viewer, session)` pair without unsubscribing. The session
+it left kept queueing its frames into a client that was watching something else — one
+conversation's words in another's transcript — and, because it still counted as attached,
+could never be let go. Both ways of moving had it, and both are now tested separately,
+because fixing one arm of a two-arm bug is exactly the mistake the first version of the
+test made: it exercised `new` and passed against a build with `attach` still broken.
+
+**A session could evict itself.** Room was made for a new session *after* it was in the
+registry, so when every other held session was in use the newcomer was the only eviction
+candidate and was dropped immediately. The client was then handed a conversation the agent
+no longer held — invisible to a listing, unreachable by a second client, and loaded a
+second time by anyone who tried. Reaching it needs every other session attached, which is
+why the first version of *that* test also proved nothing: the oldest idle session is
+evicted first, so the test has to fill the registry before opening one more.
+
+The lesson both times was the same, and it is about tests rather than code: a regression
+test is only a regression test if it fails against the code it was written for. Each of
+these was checked by reverting the fix and watching the test fail — and two of the four
+did not, which is how the tests got rewritten.

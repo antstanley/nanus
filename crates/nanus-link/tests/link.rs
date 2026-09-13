@@ -25,7 +25,7 @@ use nanus_adapter_local::SystemClock;
 use nanus_adapter_store::JsonlStore;
 use nanus_bundle::AgentRunner;
 use nanus_domain::{AgentConfig, Session, SessionEvent, SessionId, ToolRegistry};
-use nanus_link::protocol::{Frame, Request};
+use nanus_link::protocol::{Frame, Request, SessionInfo};
 use nanus_link::server::{Agent, Parts};
 use nanus_link::{Client, LinkError};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, StoreHandle};
@@ -541,6 +541,128 @@ fn a_second_prompt_while_a_turn_runs_is_refused() {
             Frame::Failed { message } if message.contains("already running")
         )),
         "the second prompt is refused while the first runs: {seen:?}"
+    );
+}
+
+#[test]
+fn re_attaching_leaves_no_stale_viewer_behind() {
+    // The bug this pins: attaching again dropped the old `(viewer, session)` pair without
+    // unsubscribing. The session being left kept queueing its frames into a client that
+    // was watching something else, and — because it still counted as attached — could
+    // never be let go, so an idle conversation was pinned in memory for the life of the
+    // agent. Both ways of moving (`new` and `attach`) had it, so both are exercised.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (first, second, held) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+
+        // Move by `new`: two conversations on one connection.
+        let first = client.start(None).await.expect("a session starts");
+        let second = client.start(None).await.expect("a second session starts");
+        let after_new = client.sessions().await.expect("the agent lists");
+
+        // Move back by `attach`: the other way of leaving a session.
+        let _back = client.attach(&first.session).await.expect("it reattaches");
+        let after_attach = client.sessions().await.expect("the agent lists");
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        (first, second, (after_new, after_attach))
+    });
+
+    let (after_new, after_attach) = held;
+    let viewers_of = |listing: &[SessionInfo], id: &str| {
+        listing
+            .iter()
+            .find(|session| session.session == id)
+            .map_or_else(
+                || panic!("{id} is not held: {listing:?}"),
+                |found| found.viewers,
+            )
+    };
+
+    // Leaving by `new`: the session left behind has nobody attached.
+    assert_eq!(
+        viewers_of(&after_new, &first.session),
+        0,
+        "the first session was left: {after_new:?}"
+    );
+    assert_eq!(viewers_of(&after_new, &second.session), 1);
+
+    // Leaving by `attach`: the same, and the one gone back to has exactly one view.
+    assert_eq!(
+        viewers_of(&after_attach, &second.session),
+        0,
+        "the second session was left: {after_attach:?}"
+    );
+    assert_eq!(viewers_of(&after_attach, &first.session), 1);
+}
+
+#[test]
+fn the_session_being_opened_is_never_the_one_let_go() {
+    // The bug this pins: room was made *after* the newcomer was in the map, so a session
+    // opened while every other one was in use evicted itself. The client was then handed
+    // a conversation the agent no longer held — invisible to a listing, unreachable by a
+    // second client, and loaded a second time by anyone who tried.
+    //
+    // Reaching it takes every other held session being in use, because otherwise the
+    // least recently used *idle* one is evicted first and the newcomer is never a
+    // candidate. So each of them has a client attached.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (last, held) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+
+        let mut clients = Vec::new();
+        let mut last = String::new();
+        for _ in 0..=nanus_link::server::MAX_HELD_SESSIONS {
+            let mut client = Client::connect(&socket_for_client)
+                .await
+                .expect("the agent answers");
+            last = client.start(None).await.expect("a session starts").session;
+            // Held open: a session with a client attached is never an eviction candidate.
+            clients.push(client);
+        }
+        let held = clients
+            .first_mut()
+            .expect("there is at least one client")
+            .sessions()
+            .await
+            .expect("the agent lists");
+
+        let _ = stop_tx.send(());
+        drop(clients);
+        serving.await.expect("joined").expect("clean");
+        (last, held)
+    });
+
+    assert!(
+        held.iter().any(|session| session.session == last),
+        "the session just opened is still held: {last} not in {} sessions",
+        held.len()
+    );
+    // The bound yields to the work rather than dropping a conversation somebody is in.
+    assert!(
+        held.len() > nanus_link::server::MAX_HELD_SESSIONS,
+        "every session is in use, so none could be let go: {} held",
+        held.len()
     );
 }
 

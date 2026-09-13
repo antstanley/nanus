@@ -70,7 +70,7 @@ const ENDING_TIMEOUT: Duration = Duration::from_secs(2);
 /// A service runs for weeks, and every session it holds is a conversation in memory.
 /// The bound yields to the work rather than the other way round: a session that is busy
 /// or has a client attached is never let go, even if that means holding more than this.
-const MAX_HELD_SESSIONS: usize = 32;
+pub const MAX_HELD_SESSIONS: usize = 32;
 
 /// An agent a link can serve.
 ///
@@ -290,9 +290,15 @@ impl Registry {
         next
     }
 
-    /// Holds a session open, letting an idle one go if the agent holds too many.
+    /// Holds a session open, letting idle ones go if the agent holds too many.
     fn hold(&self, session: Session, name: Option<String>) -> Rc<Held> {
         let id = session.id().clone();
+        // Room is made *before* the newcomer is in the map, so that the session being
+        // opened can never be the one let go. A client would otherwise be handed a
+        // conversation the agent no longer held: nothing else could attach to it, a
+        // second client would load a second copy of it, and the two would overwrite each
+        // other's log.
+        self.evict_idle(1);
         let entry = Rc::new(Held {
             id: id.clone(),
             headline: RefCell::new(Headline::default()),
@@ -304,7 +310,6 @@ impl Registry {
         });
         entry.refresh(&entry.session.borrow());
         self.held.borrow_mut().insert(id, Rc::clone(&entry));
-        self.evict_idle();
         entry
     }
 
@@ -395,9 +400,14 @@ impl Registry {
     }
 
     /// Lets idle sessions go until the agent is holding no more than it should.
-    fn evict_idle(&self) {
+    ///
+    /// `incoming` is how many sessions the caller is about to add. Counting them before
+    /// they exist is what keeps the newcomer out of the candidate set — an eviction
+    /// policy that can evict the thing it was called to make room for is worse than one
+    /// that overshoots its bound.
+    fn evict_idle(&self, incoming: usize) {
         loop {
-            if self.held.borrow().len() <= MAX_HELD_SESSIONS {
+            if self.held.borrow().len().saturating_add(incoming) <= MAX_HELD_SESSIONS {
                 return;
             }
             let candidate = {
@@ -686,14 +696,14 @@ async fn serve_connection(
     while let Some(request) = read_request(&mut reader).await? {
         match request {
             Request::New { name } => {
-                drop(watching.take());
+                release(&mut watching);
                 match new_session_of(&registry, name).await {
                     Ok(held) => watching = Some(attach(&registry, &held, &frames).await),
                     Err(message) => send(&frames, Frame::Failed { message }).await,
                 }
             }
             Request::Attach { session } => {
-                drop(watching.take());
+                release(&mut watching);
                 match registry.open_reference(&session).await {
                     Ok(held) => watching = Some(attach(&registry, &held, &frames).await),
                     Err(message) => send(&frames, Frame::Failed { message }).await,
@@ -724,15 +734,27 @@ async fn serve_connection(
 
     // Unsubscribed before the queue is dropped, so the session stops holding a sender
     // that can no longer be read.
-    if let Some((viewer, held)) = watching {
-        held.unview(viewer);
-    }
+    release(&mut watching);
     drop(frames);
     match writer.await {
         Ok(outcome) => outcome,
         Err(error) => Err(LinkError::agent(format!(
             "the link writer did not finish: {error}"
         ))),
+    }
+}
+
+/// Detaches a connection from the session it was watching.
+///
+/// Called both when the connection ends and *before* it attaches to another session, and
+/// the second call site is the one that is easy to forget. Letting a stale viewer stand
+/// does two wrong things at once: the session being left keeps queueing its frames into a
+/// client that is now watching something else — which would put one conversation's words
+/// in another's transcript — and it can never be let go while that viewer counts as
+/// attached, so an idle session is pinned in memory for the life of the agent.
+fn release(watching: &mut Option<(u64, Rc<Held>)>) {
+    if let Some((viewer, held)) = watching.take() {
+        held.unview(viewer);
     }
 }
 

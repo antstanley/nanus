@@ -153,16 +153,26 @@ impl Client {
     }
 
     /// Reads the reply to a `New` or an `Attach`.
+    ///
+    /// Frames from the session this client is *leaving* are discarded rather than
+    /// reported as a protocol failure. A client that attaches again on a live connection
+    /// is walking away from a conversation that may still be talking, and those frames
+    /// belong to the session it has just left — the reply it is waiting for is the only
+    /// thing it can act on. A freshly opened connection cannot receive them at all, so
+    /// the discard never happens in the ordinary path.
     async fn attached(&mut self) -> LinkResult<SessionInfo> {
-        match self.next().await? {
-            Some(Frame::Attached(info)) => Ok(info),
-            // A refusal is the agent answering the question rather than a broken link, so
-            // it keeps its own message instead of being reported as a protocol failure.
-            Some(Frame::Failed { message }) => Err(LinkError::agent(message)),
-            Some(other) => Err(LinkError::protocol(format!(
-                "expected an attachment, got {other:?}"
-            ))),
-            None => Err(LinkError::Closed),
+        loop {
+            match self.next().await? {
+                Some(Frame::Attached(info)) => return Ok(info),
+                // A refusal is the agent answering the question rather than a broken link,
+                // so it keeps its own message instead of being reported as a protocol
+                // failure.
+                Some(Frame::Failed { message }) => return Err(LinkError::agent(message)),
+                Some(other) => {
+                    tracing::debug!(frame = ?other, "discarding a frame from the session being left");
+                }
+                None => return Err(LinkError::Closed),
+            }
         }
     }
 
@@ -328,6 +338,49 @@ mod tests {
         // is never coming.
         drop(agent);
         assert_eq!(reader.next().await.ok().flatten(), None);
+    }
+
+    #[tokio::test]
+    async fn a_frame_from_the_session_being_left_is_discarded() {
+        // A client that attaches again on a live connection is walking away from a
+        // conversation that may still be talking. Those frames are not a protocol error,
+        // and the reply the client is waiting for is the only thing it can act on.
+        let (agent, client) = pair();
+        let mut agent = agent;
+        let mut script = String::new();
+        for frame in [
+            Frame::Ready(AgentInfo {
+                workspace: "/work".to_owned(),
+                model: "scripted".to_owned(),
+                tools: 0,
+            }),
+            Frame::Text {
+                delta: "from the session being left".to_owned(),
+            },
+            Frame::Attached(SessionInfo {
+                session: "01a09558".to_owned(),
+                name: None,
+                title: None,
+                events: 0,
+                busy: false,
+                viewers: 1,
+            }),
+        ] {
+            let mut line = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
+            line.push('\n');
+            script.push_str(&line);
+        }
+        let written = agent.write_all(script.as_bytes()).await;
+        assert!(written.is_ok(), "the peer writes");
+
+        let opened = Client::open(client).await;
+        assert!(opened.is_ok(), "{opened:?}");
+        let Ok(mut client) = opened else { return };
+        let attached = client.start(None).await;
+        assert_eq!(
+            attached.ok().map(|info| info.session),
+            Some("01a09558".to_owned())
+        );
     }
 
     #[tokio::test]

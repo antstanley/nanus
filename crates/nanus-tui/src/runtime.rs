@@ -42,8 +42,8 @@ use crossterm::event::EventStream;
 use futures::StreamExt as _;
 use nanus_domain::{Session, SessionId};
 use nanus_link::Client;
-use nanus_link::protocol::{Frame, Request};
-use nanus_ports::StoreHandle;
+use nanus_link::protocol::{Frame, Request, SessionInfo};
+use nanus_ports::{StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -265,16 +265,7 @@ impl Remote {
             Target::Resume(reference) => client.attach(&reference).await,
         }
         .map_err(|error| error.to_string())?;
-        let id = SessionId::new(&attached.session);
-        // The conversation as it is already written down. A session being resumed has a
-        // log; a new one has none, and a session with no events is the same thing as a
-        // session the store has never seen — which is why a miss is not an error here.
-        let session = match store.load(&id).await {
-            Ok(session) => session,
-            // A live session never shows a creation time — the reader is in it — so the
-            // timestamp is the epoch and the recorded path reads a real one.
-            Err(_) => Session::new(id, 0, agent.workspace),
-        };
+        let session = history(store, &attached, &agent.workspace).await;
         let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
         let (requests, pending) = mpsc::unbounded_channel();
         Ok(Self {
@@ -293,6 +284,32 @@ impl Remote {
 /// session listing shows and what a person copies.
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+/// Reads the conversation a client has attached to.
+///
+/// The history comes from the store rather than down the link, and the two ways that can
+/// go wrong are different things:
+///
+/// - **Nothing is stored under that key.** A brand-new session, which is not a failure at
+///   all: it is a conversation that has not said anything yet.
+/// - **Something is stored and cannot be read.** A damaged log, or an unreadable
+///   directory. The client can still talk, so it is given an empty conversation rather
+///   than refused — but it is *reported*, because quietly showing an empty transcript for
+///   a session that has history would misrepresent the conversation the reader is in.
+///
+/// A live session never shows a creation time — the reader is in it — so the timestamp is
+/// the epoch and the recorded path reads a real one.
+async fn history(store: &StoreHandle, attached: &SessionInfo, workspace: &str) -> Session {
+    let id = SessionId::new(&attached.session);
+    match store.load(&id).await {
+        Ok(session) => session,
+        Err(StoreError::NotFound { .. }) => Session::new(id, 0, workspace),
+        Err(error) => {
+            tracing::warn!(%error, "the recorded history could not be read");
+            Session::new(id, 0, workspace)
+        }
+    }
 }
 
 impl SessionSource for Remote {
@@ -689,7 +706,10 @@ fn drain_frames(frames: &mut mpsc::Receiver<Frame>, view: &mut ViewState) {
 
 #[cfg(test)]
 mod tests {
+    use nanus_adapter_store::JsonlStore;
     use nanus_domain::SessionId;
+    // `save` and `session_dir` live on different types: the port and the concrete adapter.
+    use nanus_ports::StorePort as _;
 
     use super::*;
 
@@ -1010,7 +1030,7 @@ mod tests {
         let mut view = ViewState::new();
         for frame in [
             Frame::Bye,
-            Frame::Attached(nanus_link::protocol::SessionInfo {
+            Frame::Attached(SessionInfo {
                 session: "s".to_owned(),
                 name: None,
                 title: None,
@@ -1099,6 +1119,64 @@ mod tests {
     }
 
     #[test]
+    fn a_history_read_distinguishes_nothing_stored_from_something_unreadable() {
+        // Two ways reading a conversation's history can go wrong, and they are different
+        // things:
+        //
+        //   - nothing is stored: a new session, which is not a failure at all;
+        //   - something is stored and cannot be read: a damaged log.
+        //
+        // Both fall back to an empty conversation, and that is the *policy* this pins — a
+        // damaged transcript must not become a refusal to start. The difference between
+        // them is a log line, which a behavioural test cannot see; what it can see is that
+        // the session's identity survives, so a reader is still in the right conversation
+        // rather than silently shown an empty one under a different name.
+        let home = std::env::temp_dir().join(format!("nanus-tui-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = block_on(JsonlStore::new(&home)).expect("a store in the temporary directory");
+
+        let recorded = SessionId::new("recorded");
+        let mut saved = Session::new(recorded, 1, "/work");
+        saved.append(nanus_domain::SessionEvent::UserMessage {
+            text: "hello".to_owned(),
+        });
+        block_on(store.save(&saved)).expect("save");
+
+        // The damaged log is written before the store is shared, because `handle` consumes
+        // it and `session_dir` is the concrete type's own answer to where a log lives.
+        let damaged = SessionId::new("damaged");
+        let dir = JsonlStore::session_dir(&store, &damaged).expect("a session directory");
+        std::fs::create_dir_all(&dir).expect("the directory");
+        std::fs::write(dir.join("session.jsonl"), "not a session at all\n").expect("a damaged log");
+        let store = store.handle();
+
+        let info = |session: &str| SessionInfo {
+            session: session.to_owned(),
+            name: None,
+            title: None,
+            events: 0,
+            busy: false,
+            viewers: 1,
+        };
+
+        let read = block_on(history(&store, &info("recorded"), "/work"));
+        assert_eq!(read.event_count(), 1, "a recorded log comes back whole");
+
+        let fresh = block_on(history(&store, &info("never-saved"), "/work"));
+        assert_eq!(fresh.event_count(), 0, "nothing stored is an empty session");
+        assert_eq!(fresh.id().as_str(), "never-saved");
+        assert_eq!(fresh.cwd(), "/work");
+
+        let broken = block_on(history(&store, &info("damaged"), "/work"));
+        assert_eq!(broken.event_count(), 0, "a damaged log reads as empty");
+        assert_eq!(
+            broken.id().as_str(),
+            "damaged",
+            "and it is still the session the client attached to"
+        );
+    }
+
+    #[test]
     fn connecting_to_a_socket_nobody_is_serving_is_an_error_rather_than_a_panic() {
         let missing = Path::new("/definitely/not/a/socket");
         let store = nanus_kernel::runtime::block_on(open_store_for_test());
@@ -1113,10 +1191,10 @@ mod tests {
         // `NANUS_HOME` is read by the resolver; the temporary directory is what keeps a
         // test from touching the real one.
         let home = std::env::temp_dir().join("nanus-tui-test-store");
-        let built = nanus_adapter_store::JsonlStore::new(home).await;
+        let built = JsonlStore::new(home).await;
         built.map_or_else(
             |error| panic!("a store in the temporary directory: {error}"),
-            nanus_adapter_store::JsonlStore::handle,
+            JsonlStore::handle,
         )
     }
 }
