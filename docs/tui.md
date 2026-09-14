@@ -86,6 +86,14 @@ turn that says *what the agent is doing* cannot be recovered anywhere else while
 running: the session log has the arguments, but a client watching a turn is not reading the
 log as it is written.
 
+**A turn can be stopped by a client, because the turn is not the client's.** It runs in a
+task the agent owns, in a session the agent holds, so that closing a terminal does not
+abandon a turn — and the same design is why a client cannot simply *drop* one. The client
+sends an `interrupt` request and the agent asks the turn to stop, which is the only party
+that can: the agent is what holds the `&mut Session` the turn is writing. Nothing is sent
+back, because a turn that stops ends with the ending frame it always ends with, and a client
+that asked to stop a session which was not busy has asked for something already true.
+
 **The ending says why the turn ended, not only that it did.** A turn can stop for reasons
 that are not the model finishing — it can run out of steps, hit its token ceiling, be
 interrupted, be refused by a policy, or fail — and one frame covers all of them because
@@ -152,7 +160,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
-| `Ctrl+C` / `Esc` | cancel the prompt; press again on an empty one to quit |
+| `Ctrl+C` / `Esc` | stop the running turn; then cancel the prompt; then quit |
 | `Ctrl+D` | quit |
 | `Ctrl+R` | reverse-search submitted prompts |
 | `Ctrl+O` | switch between the one-line form and the whole of a tool call |
@@ -179,11 +187,24 @@ edited; `Enter` takes it and sends it; `Ctrl+C` abandons the search and gives ba
 was being typed. Matching ignores case, because a prompt is prose and a search that could
 not see `Refactor` when asked for `refactor` reads as broken rather than strict.
 
-**`Ctrl+C` cancels before it quits.** A key that means "stop" should not be able to lose a
-prompt somebody is halfway through writing, so the first press gives the prompt back empty
-and the second — with nothing left to cancel — leaves. `Esc` does the same. What this
-*cannot* do is interrupt a turn that is running: the link has no request for it, and a
-reader who wants one wants a protocol change rather than a keybinding.
+**`Ctrl+C` and `Esc` stop what is happening, in the order a reader means it.** A turn in
+flight is stopped first, because that is the thing happening now and the thing a reader
+pressing "stop" is looking at. With nothing running the key reaches the prompt, and only an
+empty prompt leaves — a key that means "stop" should not be able to lose a prompt somebody
+is halfway through writing. `Esc` and `Ctrl+C` are the same key here for the same reason:
+what a reader wants stopped is whatever is happening, and the key should not need reading
+the screen first.
+
+Stopping a turn is a *request*, not a keystroke. The turn belongs to the session rather
+than to the terminal: it runs in a task the agent owns, so that closing a window does not
+abandon it — and the same design means a window cannot end it either. The interface sends
+`interrupt` and says `stopping` until the agent answers; the turn then closes with the
+reason it always closes with, `interrupted`, and the transcript says so. The turn stops at
+the next point where stopping is safe, which is between steps and between the tokens of a
+model response — so what the model has already said is kept, while a tool call it was part
+way through naming is dropped rather than recorded as one that ran. A tool that is *already
+executing* finishes first: the tool contract has no way to cancel one, and a `bash` command
+that would not stop is a process to kill rather than a turn to interrupt.
 
 **`Ctrl+O` is the same choice `tui_detail` makes**, reachable without editing a file and
 restarting, because which form a reader wants depends on what they are doing at that moment
@@ -196,7 +217,6 @@ rather than on how they started.
 Claude Code's mode has more bindings than this interface has things to bind them to, and
 inventing a purpose for a key would be worse than leaving it alone:
 
-- **Interrupting a turn** (`Esc`) needs a request the link does not have.
 - **Permission modes** (`Shift+Tab`) — approvals are the agent's policy, set in
   configuration, and this interface has no dialog to switch them from.
 - **Model switching** (`Alt+P`) and **extended thinking** (`Alt+T`) are agent-side
@@ -206,8 +226,32 @@ inventing a purpose for a key would be worse than leaving it alone:
 - **`?` for a key list** is not implemented: the composer needs `?` to be a `?`, and
   swallowing it on an empty prompt is a cost this interface is not willing to pay for a
   list that is one `Ctrl+L` away from being off screen anyway. This table is that list.
-- **Vim mode**, slash commands, `@` mentions and `!` bash mode are input *modes* rather
-  than shortcuts, and each is a feature in its own right.
+- **Vim mode**, `@` mentions and `!` bash mode are input *modes* rather than shortcuts, and
+  each is a feature in its own right. Slash commands have begun — see below.
+
+### Commands
+
+A line whose first word opens with `/` is a command, and the interface answers it rather
+than sending it to the model. Two exist:
+
+| Command | Effect |
+|---|---|
+| `/exit` | leave the interface |
+| `/quit` | the same command under its other name |
+
+Nothing else is a command yet, and an unrecognised one is not sent to the model: it is
+named in the transcript along with the commands that do exist, because a typo should say so
+rather than spend tokens answering a question nobody asked. The cost of the convention is
+that a prompt opening with a path — `/etc/hosts is wrong` — is read as a command attempt
+and named as one. That is the trade every interface with this convention makes.
+
+**Leaving takes the agent with it, unless the agent is a service.** `nanus tui` starts an
+agent whose lifetime is the interface's: the core serves until the interface exits and then
+shuts the composition down, which is what "scoped to the shell session" means. A bare
+`nanus-tui` attached to a `nanus service` is a *client* of something with its own lifetime,
+so leaving it stops nothing but the interface — which is the difference between closing a
+window and stopping a server. A turn still running when the interface leaves is abandoned
+rather than finished: the agent aborts it, and an aborted turn is not recorded.
 
 `Shift+Enter` needs a word, because how it reaches a program is not what you would expect.
 **It is not one key.** Two different things can happen when you press it:

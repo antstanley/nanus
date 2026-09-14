@@ -32,7 +32,7 @@
 //! | `Enter` | submit the composer |
 //! | `\` + `Enter` | insert a newline, which no terminal can misreport |
 //! | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | insert a newline |
-//! | `Ctrl+C` / `Esc` | cancel the composer; again on an empty one to quit |
+//! | `Ctrl+C` / `Esc` | stop the running turn; then cancel the composer; then quit |
 //! | `Ctrl+D` | quit |
 //! | `Ctrl+R` | reverse-search the submitted prompts |
 //! | `Ctrl+O` | switch between the one-line and full forms |
@@ -44,6 +44,10 @@
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
 //! | `PageUp` / `PageDown` | scroll the transcript |
 //! | `Left` / `Right`, `Home` / `End` | move the cursor |
+//!
+//! A line whose first word opens with `/` is a command the interface answers itself:
+//! `/exit` and `/quit` leave, and anything else is named as unrecognised rather than sent
+//! to the model. See [`crate::command`].
 //!
 //! [cc-keys]: https://code.claude.com/docs/en/interactive-mode
 
@@ -65,6 +69,7 @@ use ratatui::crossterm::event::{
 };
 use tokio::sync::mpsc;
 
+use crate::command::{Command, Submission, submission_of};
 use crate::compact::Detail;
 use crate::transcript::{Entry, Role};
 use crate::view::{Theme, ViewState};
@@ -248,6 +253,12 @@ pub trait SessionSource {
     /// Sends one prompt. Progress arrives on the channel [`SessionSource::attach`] was
     /// given.
     fn submit(&mut self, _prompt: String) {}
+
+    /// Asks the agent to stop the turn running in this session.
+    ///
+    /// A default of doing nothing: a source that cannot run a turn — a recording — has
+    /// nothing to stop, and the interface never asks one to.
+    fn interrupt(&mut self) {}
 
     /// Releases whatever the source owns.
     ///
@@ -452,14 +463,21 @@ impl SessionSource for Remote {
     }
 
     fn submit(&mut self, prompt: String) {
-        if self
-            .requests
-            .send(Request::Prompt { text: prompt })
-            .is_err()
-        {
+        self.send(Request::Prompt { text: prompt });
+    }
+
+    fn interrupt(&mut self) {
+        self.send(Request::Interrupt);
+    }
+}
+
+impl Remote {
+    /// Hands one request to the transport task.
+    fn send(&self, request: Request) {
+        if self.requests.send(request).is_err() {
             // The only way this fails is that the transport task is gone, which means the
-            // agent closed the link. Saying so beats a prompt that vanishes.
-            tracing::warn!("the link is closed; the prompt was not sent");
+            // agent closed the link. Saying so beats a request that vanishes.
+            tracing::warn!("the link is closed; the request was not sent");
         }
     }
 }
@@ -646,23 +664,30 @@ async fn event_loop(
                 }
                 match handle_key(key, &mut view) {
                     Outcome::Quit => break,
+                    Outcome::Interrupt => {
+                        // The turn ends when the agent says it did, with a frame carrying
+                        // the reason — so this only says what has been asked for, and the
+                        // transcript gets the ending it would have got anyway.
+                        view.status = String::from("stopping");
+                        source.interrupt();
+                    }
                     Outcome::Submit(prompt) => {
-                        if !source.accepts_prompts() {
-                            // Submitting in a recorded session would need an agent this
-                            // interface does not have. Saying so beats silently discarding
-                            // what the user typed.
-                            view.transcript.push(Entry::notice(
-                                "this is a recorded session; start `nanus tui` without --session to continue it",
-                            ));
-                            view.scroll_to_bottom();
-                            continue;
+                        match route_submission(prompt, source.accepts_prompts()) {
+                            Routed::Leave => break,
+                            Routed::Say(message) => {
+                                view.transcript.push(Entry::notice(message));
+                                view.scroll_to_bottom();
+                            }
+                            Routed::Send(prompt) => {
+                                // The transcript is seeded here, where the mutable view
+                                // lives.
+                                view.transcript
+                                    .push(Entry::prose(Role::User, prompt.clone()));
+                                view.begin_turn(1);
+                                view.scroll_to_bottom();
+                                source.submit(prompt);
+                            }
                         }
-                        // The transcript is seeded here, where the mutable view lives.
-                        view.transcript
-                            .push(Entry::prose(Role::User, prompt.clone()));
-                        view.begin_turn(1);
-                        view.scroll_to_bottom();
-                        source.submit(prompt);
                     }
                     Outcome::Continue => {}
                 }
@@ -684,6 +709,43 @@ async fn event_loop(
     Ok(())
 }
 
+/// What the event loop should do with a submitted line.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Routed {
+    /// Send it to the model.
+    Send(String),
+    /// Leave the interface.
+    Leave,
+    /// Say this in the transcript instead.
+    Say(String),
+}
+
+/// Routes a submitted line: the interface's own commands first, then whether the source can
+/// take a prompt at all.
+///
+/// Commands are answered before the source is consulted, which is what makes them work in
+/// every mode: a recorded session cannot be talked to, and `/exit` still has to leave it.
+fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
+    match submission_of(&prompt) {
+        Submission::Run(Command::Exit) => Routed::Leave,
+        Submission::Unknown(name) => Routed::Say(format!(
+            "no such command: {name} — this interface knows {}",
+            Command::NAMES.join(" and ")
+        )),
+        Submission::Prompt => {
+            if accepts_prompts {
+                Routed::Send(prompt)
+            } else {
+                // Submitting in a recorded session would need an agent this interface does
+                // not have. Saying so beats silently discarding what the user typed.
+                Routed::Say(String::from(
+                    "this is a recorded session; start `nanus tui` without --session to continue it",
+                ))
+            }
+        }
+    }
+}
+
 /// What a keystroke asked for.
 enum Outcome {
     /// Keep going.
@@ -692,6 +754,8 @@ enum Outcome {
     Quit,
     /// Send this prompt.
     Submit(String),
+    /// Ask the agent to stop the turn that is running.
+    Interrupt,
 }
 
 /// Applies one keystroke to the view.
@@ -721,10 +785,9 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     // interface impossible to quit and the toggles dead — the same mistake as reading a key
     // without asking what the modifiers did to it.
     match key.code {
-        // Cancel before quitting. A turn cannot be interrupted — the link has no request
-        // for it — so what a reader can stop is their own input, and the first press gives
-        // that back empty rather than throwing away a session over a half-written prompt.
-        KeyCode::Char('c' | 'C') => cancel_or_quit(view),
+        // Stop what is happening, in the order a reader means it: the turn if one is
+        // running, then the prompt, then the session.
+        KeyCode::Char('c' | 'C') => stop_or_cancel_or_quit(view),
         KeyCode::Char('d' | 'D') => Outcome::Quit,
         KeyCode::Char('l' | 'L') => {
             view.transcript.clear();
@@ -872,20 +935,25 @@ fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.scroll(PAGE_ROWS);
             Outcome::Continue
         }
-        // The same two-step exit as `Ctrl+C`: a prompt half written is worth more than the
-        // keystroke saved by leaving on the first press.
-        KeyCode::Esc => cancel_or_quit(view),
+        // The same key as `Ctrl+C`, for the same reason: what a reader wants stopped is
+        // whatever is happening now, and the key should not need reading the screen first.
+        KeyCode::Esc => stop_or_cancel_or_quit(view),
         _ => Outcome::Continue,
     }
 }
 
-/// Cancels what is in the composer, or leaves when there is nothing to cancel.
+/// Stops the turn that is running, or cancels the prompt, or leaves.
 ///
-/// The two-step exit the interface this mirrors uses, and the reason is that a key meaning
-/// "stop" should not be able to lose a prompt somebody spent a minute writing: the first
-/// press gives the prompt back empty, and the second one — with nothing left to cancel —
-/// leaves.
-fn cancel_or_quit(view: &mut ViewState) -> Outcome {
+/// Three meanings on one key, in the order a reader means them. A turn in flight is what
+/// the key stops first, because that is the thing happening now and the thing a reader
+/// pressing "stop" is looking at — and stopping it is a request to the agent rather than a
+/// keystroke, since the turn belongs to the session and not to this terminal. With nothing
+/// running the key reaches the prompt, and only an empty prompt leaves, which is what keeps
+/// a key meaning "stop" from throwing away what somebody spent a minute writing.
+fn stop_or_cancel_or_quit(view: &mut ViewState) -> Outcome {
+    if view.busy {
+        return Outcome::Interrupt;
+    }
     if view.input.is_empty() {
         return Outcome::Quit;
     }
@@ -1362,6 +1430,79 @@ mod tests {
 
     /// The two-step exit: a key that means "stop" must not be able to lose a prompt that
     /// somebody is halfway through writing.
+    /// The stop key means the thing that is happening now: with a turn running it asks the
+    /// agent to stop, and only with nothing running does it reach the prompt and the
+    /// session.
+    #[test]
+    fn the_stop_key_stops_a_running_turn_before_it_touches_the_prompt() {
+        let mut view = ViewState::new();
+        view.input.insert_str("half a thought");
+        view.begin_turn(3);
+
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Interrupt
+        ));
+        assert_eq!(
+            view.input.text(),
+            "half a thought",
+            "the prompt is not what the key was for"
+        );
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Interrupt
+        ));
+
+        // With the turn over the same key falls back, in the same order as before.
+        view.end_turn();
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(view.input.is_empty(), "the second press cancels the prompt");
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Quit
+        ));
+    }
+
+    /// `/exit` and `/quit` are the same command, they work even where a prompt cannot be
+    /// sent, and anything else that opens with a slash is named rather than sent.
+    #[test]
+    fn slash_commands_are_the_interfaces_business() {
+        for leaving in ["/exit", "/quit"] {
+            assert_eq!(
+                route_submission(String::from(leaving), true),
+                Routed::Leave,
+                "{leaving} leaves"
+            );
+            assert_eq!(
+                route_submission(String::from(leaving), false),
+                Routed::Leave,
+                "{leaving} leaves a recording too, where no prompt can be sent"
+            );
+        }
+
+        let Routed::Say(message) = route_submission(String::from("/quitx"), true) else {
+            panic!("a typo is answered rather than sent to the model");
+        };
+        assert!(message.contains("/quitx"), "it names the typo: {message}");
+        assert!(
+            message.contains("/exit") && message.contains("/quit"),
+            "and the commands that exist: {message}"
+        );
+
+        // Prose is prose, and a prompt in a recording is refused rather than dropped.
+        assert_eq!(
+            route_submission(String::from("hello"), true),
+            Routed::Send(String::from("hello"))
+        );
+        let Routed::Say(message) = route_submission(String::from("hello"), false) else {
+            panic!("a recording cannot take a prompt");
+        };
+        assert!(message.contains("recorded session"), "{message}");
+    }
+
     #[test]
     fn ctrl_c_cancels_the_input_before_it_quits() {
         let mut view = ViewState::new();

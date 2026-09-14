@@ -218,6 +218,14 @@ struct Held {
     viewers: RefCell<Vec<(u64, mpsc::Sender<Frame>)>>,
     /// Whether a turn is running. One at a time, because a turn owns the session.
     busy: Cell<bool>,
+    /// Whether the running turn has been asked to stop.
+    ///
+    /// A flag the turn reads rather than a notification it waits on, because there is
+    /// nothing for a queued signal to say that the flag does not: the turn looks between
+    /// steps and between the tokens of a response, and either it has been asked to stop or
+    /// it has not. Cleared when a turn starts, so a request that arrived a moment after the
+    /// last turn ended cannot stop the next one before it begins.
+    stop: Cell<bool>,
     /// When it was last used, for letting an idle session go.
     touched: Cell<u64>,
 }
@@ -306,6 +314,7 @@ impl Registry {
             name,
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),
+            stop: Cell::new(false),
             touched: Cell::new(self.stamp()),
         });
         entry.refresh(&entry.session.borrow());
@@ -584,6 +593,10 @@ impl Progress for Broadcast<'_> {
         });
     }
 
+    fn cancelled(&self) -> bool {
+        self.held.stop.get()
+    }
+
     fn usage(&mut self, usage: &Usage) {
         // The request's active time, taken from the step that issued it. A usage record
         // that arrives with no step before it cannot be timed, and reports zero rather
@@ -774,6 +787,21 @@ async fn serve_connection(
                     send(&frames, Frame::Failed { message }).await;
                 }
             }
+            Request::Interrupt => {
+                if let Some((_, held)) = &watching {
+                    // Only the turn that is running is asked, and only if one is: an
+                    // interrupt with nothing to interrupt is not an error, it is a client
+                    // that pressed the key a moment after the turn ended.
+                    if held.busy.get() {
+                        held.stop.set(true);
+                    }
+                } else {
+                    let message = String::from(
+                        "this connection is not attached to a session; send `new` or `attach` first",
+                    );
+                    send(&frames, Frame::Failed { message }).await;
+                }
+            }
             Request::Sessions => {
                 let held = registry.listing();
                 send(&frames, Frame::Sessions { held }).await;
@@ -886,6 +914,9 @@ async fn start_turn(
     frames: &mpsc::Sender<Frame>,
     viewer: u64,
 ) {
+    // Cleared before the turn can read it, so a request aimed at the last turn cannot
+    // stop this one before it has taken a step.
+    held.stop.set(false);
     if held.busy.replace(true) {
         let message = String::from(
             "a turn is already running in this session; wait for it to finish or start another session",

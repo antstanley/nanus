@@ -138,6 +138,36 @@ impl LlmPort for OneToolLlm {
     }
 }
 
+/// The same, but slow enough that a client can act while the turn is genuinely in flight.
+///
+/// A scripted stream that never awaits completes in one poll, so a test that waited for a
+/// frame before interrupting would find the turn already over — which is a fact about the
+/// script rather than about the interrupt.
+struct SlowRelentlessLlm;
+
+impl LlmPort for SlowRelentlessLlm {
+    fn model(&self) -> &'static str {
+        "slow-relentless"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        Box::pin(
+            futures::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                LlmEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some(ToolCallId::new("call_1")),
+                    name: Some(ToolName::new("nowhere").unwrap_or_else(|_| unreachable!("valid"))),
+                    arguments_delta: "{}".to_owned(),
+                }
+            })
+            .chain(futures::stream::iter(vec![LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            }])),
+        )
+    }
+}
+
 /// Builds an agent over a store in `dir`, and returns the store alongside it.
 fn scripted_agent(dir: &Path) -> (Agent, StoreHandle) {
     agent_over(dir, Rc::new(Box::new(ScriptedLlm)), "scripted")
@@ -270,6 +300,118 @@ fn a_prompt_streams_an_answer_and_records_the_session() {
         listed.first().is_some_and(|row| row.event_count > 0),
         "the turn left events behind: {listed:?}"
     );
+}
+
+/// The whole point of the request: a turn that would otherwise run to its budget stops
+/// when a client asks it to, and everyone watching is told why it stopped.
+///
+/// `RelentlessLlm` never stops asking for tools, so without the interrupt this turn ends
+/// at the step budget — which is what makes the assertion about the *reason* meaningful.
+#[test]
+fn an_interrupt_stops_the_turn_that_is_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(SlowRelentlessLlm)),
+        "slow-relentless",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "keep going".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        // A step has to be *running* for there to be something to stop, and the turn's
+        // frames are the only evidence that it is.
+        let mut frames = Vec::new();
+        while let Some(frame) = client.next().await.expect("frames are readable") {
+            let started = matches!(frame, Frame::Step { .. });
+            frames.push(frame);
+            if started {
+                break;
+            }
+        }
+        client
+            .send(&Request::Interrupt)
+            .await
+            .expect("the interrupt is sent");
+        frames.extend(turn_frames(&mut client).await);
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    assert_eq!(
+        reason_of(&frames),
+        Some(&TurnEnd::Interrupted),
+        "the turn stopped because it was asked to, not because it ran out: {frames:?}"
+    );
+    let steps = frames
+        .iter()
+        .filter(|frame| matches!(frame, Frame::Step { .. }))
+        .count();
+    assert_eq!(steps, 1, "and it stopped in the step it was in");
+}
+
+/// An interrupt with nothing to interrupt is not an error: it is a client that pressed the
+/// key a moment after the turn ended, and the session is left exactly as it was.
+#[test]
+fn an_interrupt_with_no_turn_running_changes_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Interrupt)
+            .await
+            .expect("the interrupt is sent");
+        // The next request still works, which is what "nothing happened" means from the
+        // client's side: a refused interrupt would have ended the connection.
+        client
+            .send(&Request::Prompt {
+                text: "say hello".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    assert_eq!(reason_of(&frames), Some(&TurnEnd::Completed));
+    let listed = nanus_kernel::runtime::block_on(store.list()).expect("the store lists");
+    assert_eq!(listed.len(), 1, "the session is untouched");
 }
 
 /// The defect this closes: a turn that closed at its step budget reached the interface

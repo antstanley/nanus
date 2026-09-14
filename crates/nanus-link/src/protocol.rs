@@ -119,6 +119,19 @@ pub enum Request {
         text: String,
     },
 
+    /// Stop the turn running in the session this connection is attached to.
+    ///
+    /// A *request* rather than a keystroke because the turn is not the client's: it runs
+    /// in a task the agent owns, in a session the agent holds, so that it outlives the
+    /// terminal that asked for it. A client closing its window does not stop the turn, and
+    /// neither should a client that merely stops wanting it — this is how it says so.
+    ///
+    /// Nothing is sent back. A turn that stops ends with the ending frame it always ends
+    /// with, carrying [`TurnEnd::Interrupted`], and there is nothing an acknowledgement
+    /// could add: a client that asked to stop a session which was not busy has asked for
+    /// something that is already true.
+    Interrupt,
+
     /// List the sessions the agent is holding open.
     Sessions,
 

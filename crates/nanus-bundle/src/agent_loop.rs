@@ -96,6 +96,20 @@ pub trait Progress {
 
     /// Usage was reported.
     fn usage(&mut self, _usage: &Usage) {}
+
+    /// Whether the turn should stop.
+    ///
+    /// Asked between steps and between the tokens of a model response, so a driver that
+    /// wants the turn to stop is heard at the next point where stopping is safe rather than
+    /// at the end of the step budget. Defaults to `false`: a driver with no opinion — a
+    /// script running one turn to completion — does not have to say so.
+    ///
+    /// This is the loop's only question rather than a listener callback like the rest,
+    /// because the driver is the only thing that can answer it: whether a turn is still
+    /// wanted is a fact about the caller, not about the turn.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// A [`Progress`] that ignores everything, for a caller that wants none.
@@ -209,10 +223,18 @@ impl AgentRunner {
         let mut answer = String::new();
         let mut steps = 0_u32;
         loop {
-            let step = steps.saturating_add(1);
-            steps = step;
-            progress.step_started(step);
-            let step_outcome = self.run_step(session, turn, step, progress).await?;
+            // A stop asked for between steps is taken here, before another request is
+            // issued. The machine owns the mapping from a step outcome to a recorded
+            // reason, so this goes through it rather than writing the reason into the log
+            // directly — one vocabulary for why a turn ended, wherever that happens.
+            let step_outcome = if progress.cancelled() {
+                StepOutcome::Interrupted
+            } else {
+                let step = steps.saturating_add(1);
+                steps = step;
+                progress.step_started(step);
+                self.run_step(session, turn, step, progress).await?
+            };
             let decision = machine.decide(session.log(), &step_outcome);
             // The machine owns the mapping from a decision to a recorded reason, so
             // the two vocabularies cannot drift.
@@ -271,10 +293,15 @@ impl AgentRunner {
             reasoning: non_empty(&assembled.reasoning),
             tool_calls: assembled.calls.clone(),
             usage: assembled.usage,
-            interrupted: false,
+            interrupted: assembled.interrupted,
         });
 
-        let step_outcome = if assembled.calls.is_empty() {
+        // An interrupted step is *interrupted*, not a step that called tools: what the
+        // model was part way through asking for was never run, and running it would do
+        // work the reader has just asked to stop.
+        let step_outcome = if assembled.interrupted {
+            StepOutcome::Interrupted
+        } else if assembled.calls.is_empty() {
             if assembled.finish == FinishReason::Length {
                 StepOutcome::MaxTokens
             } else {
@@ -311,6 +338,21 @@ impl AgentRunner {
 
         let mut assembled = Assembled::default();
         while let Some(event) = stream.next().await {
+            // A stop asked for while the model is streaming is taken at the next token
+            // rather than at the end of the response: waiting out a long answer to a
+            // question nobody wants answered any more is the whole thing the reader is
+            // trying to avoid. What the model has already said is kept and marked
+            // interrupted, because a conversation that forgets words the reader watched
+            // arrive is worse than one that keeps them — but the tool calls it was part way
+            // through naming are *dropped*: a call in the log with no result to answer it
+            // would be replayed as one that ran, and the next request would be refused for
+            // a call nothing ever answered.
+            if progress.cancelled() {
+                assembled.interrupted = true;
+                assembled.calls.clear();
+                assembled.partial.clear();
+                break;
+            }
             match event {
                 LlmEvent::TextDelta(delta) => {
                     progress.text(&delta);
@@ -447,6 +489,8 @@ struct Assembled {
     /// from one whose usage never arrived.
     usage: Option<Usage>,
     partial: Vec<PartialCall>,
+    /// Whether the stream was cut short by a stop request rather than finishing.
+    interrupted: bool,
 }
 
 impl Default for Assembled {
@@ -460,6 +504,7 @@ impl Default for Assembled {
             finish: FinishReason::Stop,
             usage: None,
             partial: Vec::new(),
+            interrupted: false,
         }
     }
 }
@@ -667,6 +712,154 @@ mod tests {
             format!("{fits}x"),
             config(),
         );
+    }
+
+    /// A driver whose answer to "should this turn stop?" the test decides.
+    #[derive(Default)]
+    struct Switch {
+        stop: std::cell::Cell<bool>,
+    }
+
+    impl Switch {
+        fn stop(&self) {
+            self.stop.set(true);
+        }
+    }
+
+    impl Progress for Switch {
+        fn cancelled(&self) -> bool {
+            self.stop.get()
+        }
+    }
+
+    /// A driver that asks for the turn to stop as soon as the model has said anything,
+    /// which is how a stop lands in the middle of a response rather than between steps.
+    #[derive(Default)]
+    struct StopAfterFirstWord {
+        stop: std::cell::Cell<bool>,
+    }
+
+    impl StopAfterFirstWord {
+        fn stop(&self) {
+            self.stop.set(true);
+        }
+    }
+
+    impl Progress for StopAfterFirstWord {
+        fn cancelled(&self) -> bool {
+            self.stop.get()
+        }
+
+        fn text(&mut self, _delta: &str) {
+            self.stop();
+        }
+    }
+
+    /// A stop asked for before a step is issued takes effect there: no request is made, and
+    /// the turn closes with the reason the machine records for it rather than with the
+    /// budget or a failure.
+    #[tokio::test]
+    async fn a_stop_asked_for_between_steps_closes_the_turn() {
+        let llm = ScriptedLlm::handle(vec![vec![LlmEvent::TextDelta("never asked".to_owned())]]);
+        let Some(runner) = runner(Rc::clone(&llm), Rc::new(ToolRegistry::new())) else {
+            return;
+        };
+        let mut session = session();
+        let mut progress = Switch::default();
+        progress.stop();
+
+        let outcome = runner.run_turn(&mut session, "hi", &mut progress).await;
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else { return };
+        assert_eq!(outcome.reason, TurnEndReason::Interrupted);
+        assert_eq!(outcome.steps, 0, "no step was taken");
+        assert_eq!(outcome.answer, "");
+        // The turn is closed in the log, so a resumed session does not find it open.
+        assert_eq!(
+            session.log().last_turn_end(),
+            Some(&TurnEndReason::Interrupted)
+        );
+    }
+
+    /// A stop that lands while the model is streaming is taken at the next token: what has
+    /// been said is kept and marked interrupted, and the tool calls the model was part way
+    /// through naming are dropped, because a call with no result to answer it would be
+    /// replayed as one that ran.
+    #[tokio::test]
+    async fn a_stop_during_a_response_keeps_the_words_and_drops_the_calls() {
+        let llm = ScriptedLlm::handle(vec![vec![
+            LlmEvent::TextDelta("half a sentence".to_owned()),
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("c1")),
+                name: Some(ToolName::new("echo").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{\"x\":1}".to_owned(),
+            },
+            LlmEvent::TextDelta("and more".to_owned()),
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]]);
+        let Some(runner) = runner(Rc::clone(&llm), registry_with_echo()) else {
+            return;
+        };
+        let mut session = session();
+        let mut progress = StopAfterFirstWord::default();
+
+        let outcome = runner.run_turn(&mut session, "hi", &mut progress).await;
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else { return };
+        assert_eq!(outcome.reason, TurnEndReason::Interrupted);
+        assert_eq!(
+            outcome.steps, 1,
+            "the step that was running is the one it stopped in"
+        );
+        assert_eq!(
+            outcome.answer, "half a sentence",
+            "what the model said before the stop is the answer"
+        );
+
+        // The conversation that would be sent next: the words are there, and the call that
+        // was never run is not.
+        let messages = session.derive_messages();
+        let assistant = messages
+            .iter()
+            .rev()
+            .find(|message| !message.tool_calls().is_empty() || message.text().is_some());
+        assert!(
+            assistant.is_some_and(|message| message.tool_calls().is_empty()),
+            "an unrun call must not be replayed as one that ran: {messages:?}"
+        );
+        assert!(
+            session.log().events().iter().any(|event| matches!(
+                event,
+                SessionEvent::AssistantMessage {
+                    interrupted: true,
+                    ..
+                }
+            )),
+            "and the step says it was cut short rather than ending on its own"
+        );
+    }
+
+    /// The other direction: a driver that never asks to stop does not stop the turn. The
+    /// default answer is `false`, so a script that runs one turn to completion needs no
+    /// opinion about stopping at all.
+    #[tokio::test]
+    async fn a_driver_with_no_opinion_lets_the_turn_finish() {
+        let llm = ScriptedLlm::handle(vec![
+            vec![LlmEvent::TextDelta("done".to_owned())],
+            vec![LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            }],
+        ]);
+        let Some(runner) = runner(llm, Rc::new(ToolRegistry::new())) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner.run_turn(&mut session, "hi", &mut Silent).await;
+        assert!(outcome.is_ok());
+        assert!(outcome.is_ok_and(|outcome| outcome.reason == TurnEndReason::Completed));
     }
 
     #[tokio::test]
