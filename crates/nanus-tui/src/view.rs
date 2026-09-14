@@ -334,6 +334,19 @@ impl ViewState {
         self.following = false;
     }
 
+    /// Switches between the one-line form and the whole of a tool call and a thinking
+    /// segment.
+    ///
+    /// The same choice the configuration file makes with `tui_detail`, reachable without
+    /// editing a file and restarting: which of the two a reader wants depends on what they
+    /// are doing at that moment, not on how they started the interface.
+    pub const fn toggle_detail(&mut self) {
+        self.detail = match self.detail {
+            Detail::Compact => Detail::Full,
+            Detail::Full => Detail::Compact,
+        };
+    }
+
     /// Returns the largest valid scroll offset for the last drawn viewport.
     #[must_use]
     pub fn max_scroll(&self) -> u32 {
@@ -540,8 +553,10 @@ impl ViewState {
                 Style::default().fg(Color::Cyan),
             ));
         }
+        // The three keys a reader cannot guess: how to send, how to break a line, and how
+        // to find something they typed an hour ago. The rest are in docs/tui.md.
         spans.push(Span::styled(
-            "  ·  Enter sends · Alt+Enter newline · Ctrl-C quits",
+            "  ·  Enter sends · Alt+Enter newline · Ctrl+R search · Ctrl+O verbose",
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -590,7 +605,23 @@ impl ViewState {
             // [`Detail::Full`].
             if self.detail == Detail::Compact {
                 if let EntryKind::ToolCall { name, arguments } = entry.kind() {
-                    lines.push(self.compact_tool_line(name, arguments, width));
+                    let state = Self::tool_state(entries, index, name);
+                    lines.push(self.compact_tool_line(state, name, arguments, width));
+                    index = index.saturating_add(1);
+                    continue;
+                }
+                // The call's line carries the outcome, so a result that answers one
+                // contributes only what the tool *said*. In the live view it says nothing
+                // — the frame has no room for output — and the call is then exactly the one
+                // line the compact form promises.
+                if Self::answers_call_before(entries, index) {
+                    let EntryKind::ToolResult { content, .. } = entry.kind() else {
+                        unreachable!("only a result answers a call")
+                    };
+                    if !content.is_empty() {
+                        lines.extend(indented(content, 2, self.theme.style_for_entry(entry)));
+                        lines.push(Line::from(""));
+                    }
                     index = index.saturating_add(1);
                     continue;
                 }
@@ -600,10 +631,8 @@ impl ViewState {
                     continue;
                 }
             }
-            // A tool's heading is dropped in the compact form, for a result as well as for
-            // a call: `✓ read` already says which tool this was, and the heading only
-            // answers a question nobody asked. Its *output* stays — that is the outcome of
-            // the call, and losing it would lose the failures with it.
+            // A tool's heading is dropped in the compact form: the call's own line already
+            // names the tool, and the heading only answers a question nobody asked.
             if self.detail != Detail::Compact || entry.role() != Role::Tool {
                 lines.push(self.header_for(entry));
             }
@@ -614,6 +643,51 @@ impl ViewState {
             index = index.saturating_add(1);
         }
         lines
+    }
+
+    /// Returns how the call at `index` ended, as far as the transcript knows.
+    ///
+    /// Adjacency is the pairing: a result is appended immediately after the call it
+    /// answers, which is what the session log guarantees by construction and what the link
+    /// does by sending one `Tool` and then one `ToolDone`. A call with no result after it
+    /// is still running, which is a state the line has to be able to show — a call that
+    /// looked finished while it was running would be a worse lie than a missing mark.
+    fn tool_state(entries: &[Entry], index: usize, name: &str) -> compact::ToolState {
+        let result = entries.get(index.saturating_add(1)).map(Entry::kind);
+        match result {
+            Some(EntryKind::ToolResult {
+                name: result_name,
+                is_error,
+                ..
+            }) if result_name == name => {
+                if *is_error {
+                    compact::ToolState::Failed
+                } else {
+                    compact::ToolState::Ok
+                }
+            }
+            _ => compact::ToolState::Running,
+        }
+    }
+
+    /// Returns whether the entry at `index` is the result of the call before it.
+    ///
+    /// The other half of [`ViewState::tool_state`]: this is the result asking whether its
+    /// mark is already on the line above, so that it does not draw a second one.
+    fn answers_call_before(entries: &[Entry], index: usize) -> bool {
+        let Some(previous) = index
+            .checked_sub(1)
+            .and_then(|previous| entries.get(previous))
+        else {
+            return false;
+        };
+        match (previous.kind(), entries.get(index).map(Entry::kind)) {
+            (
+                EntryKind::ToolCall { name: call, .. },
+                Some(EntryKind::ToolResult { name: result, .. }),
+            ) => call == result,
+            _ => false,
+        }
     }
 
     /// Counts the entries from `start` that carry `role`, consecutively.
@@ -631,8 +705,14 @@ impl ViewState {
     /// The phrasing is [`crate::compact`]'s business, not the view's: which argument a tool
     /// is acting on is knowledge about the toolset, and the view's job is only to style the
     /// line and to place it.
-    fn compact_tool_line(&self, name: &str, arguments: &str, width: u16) -> Line<'static> {
-        let text = compact::tool_line(name, arguments, width);
+    fn compact_tool_line(
+        &self,
+        state: compact::ToolState,
+        name: &str,
+        arguments: &str,
+        width: u16,
+    ) -> Line<'static> {
+        let text = compact::tool_line(state, name, arguments, width);
         Line::from(Span::styled(text, self.theme.tool))
     }
 
@@ -943,6 +1023,18 @@ impl ViewState {
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
+        // A running search takes the line: the composer is showing a match rather than the
+        // reader's draft, and without the query on screen there is nothing to say what is
+        // being searched for or why the text changed.
+        if let Some((query, matched)) = self.input.search_query() {
+            let tail = if matched { "" } else { " (no match)" };
+            let line = Line::from(Span::styled(
+                format!("(reverse-i-search)`{query}'{tail}"),
+                self.theme.busy,
+            ));
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let busy = if self.busy {
             Span::styled(format!("● {}", self.status), self.theme.busy)
         } else {
@@ -1374,8 +1466,10 @@ mod tests {
         assert!(text.contains("Read File"), "{text}");
     }
 
+    /// The compact form's one-line promise: the call and how it went are a single row, and
+    /// the result contributes only what the tool said.
     #[test]
-    fn a_tool_call_and_its_result_sit_against_each_other() {
+    fn a_tool_call_and_its_result_are_one_line() {
         let mut state = state_with(vec![
             Entry::tool_call("read", "{\"file_path\":\"a.txt\"}"),
             Entry::tool_result("read", false, "content"),
@@ -1389,10 +1483,55 @@ mod tests {
             .position(|row| row.contains("Read File"))
             .expect("the call is drawn");
         assert!(
-            rows.get(call.saturating_add(1))
-                .is_some_and(|row| row.contains('✓')),
-            "the result follows immediately: {rows:?}"
+            rows.get(call).is_some_and(|row| row.contains('✓')),
+            "the outcome is on the call's own line: {rows:?}"
         );
+        assert!(
+            rows.get(call).is_some_and(|row| row.contains("a.txt")),
+            "and so is what it acted on: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("Read File")).count(),
+            1,
+            "the tool is named once, not once per entry: {rows:?}"
+        );
+        assert!(
+            rows.get(call.saturating_add(1))
+                .is_some_and(|row| row.contains("content")),
+            "the tool's own output follows it: {rows:?}"
+        );
+    }
+
+    /// The live view is the case that made this one line rather than three: the frame that
+    /// ends a call carries no output, so the call's line is the whole of it — and the
+    /// placeholder the interface used to invent under it is gone.
+    #[test]
+    fn a_live_tool_call_is_one_line() {
+        let mut state = state_with(vec![
+            Entry::tool_call("read", "{\"file_path\":\"src/view.rs\"}"),
+            Entry::tool_result("read", false, ""),
+        ]);
+        let text = rendered(&mut state, 70, 12);
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("Read File")).count(),
+            1,
+            "one line for the call: {text}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.trim() == "done"),
+            "and nothing said under it: {text}"
+        );
+    }
+
+    /// A call with no result yet is running, and the line has to say so: a call drawn as
+    /// finished while it is still running is a worse lie than no mark at all.
+    #[test]
+    fn a_call_still_running_is_marked_as_running() {
+        let mut state = state_with(vec![Entry::tool_call("read", "{\"file_path\":\"a.txt\"}")]);
+        let text = rendered(&mut state, 70, 12);
+        assert!(text.contains("⚙ Read File · a.txt"), "{text}");
+        assert!(!text.contains('✓'), "nothing has finished: {text}");
     }
 
     #[test]
@@ -1421,6 +1560,29 @@ mod tests {
         let text = rendered(&mut state, 60, 12);
         assert!(text.contains("ready"));
         assert!(text.contains('○'));
+    }
+
+    /// A running search takes the status line, because the composer is showing a match
+    /// rather than the reader's draft: without the query there is nothing on screen
+    /// saying what is being searched for or why the text changed.
+    #[test]
+    fn the_status_line_shows_a_running_search() {
+        let mut state = ViewState::new();
+        state.input.insert_str("an earlier prompt");
+        assert!(state.input.submit().is_some());
+        state.input.search_start();
+        for character in "earl".chars() {
+            state.input.search_push(character);
+        }
+        let text = rendered(&mut state, 80, 12);
+        assert!(text.contains("reverse-i-search"), "{text}");
+        assert!(text.contains("earl"), "{text}");
+        assert!(text.contains("an earlier prompt"), "and the match: {text}");
+
+        // The other half: a query that found nothing says so rather than looking stalled.
+        state.input.search_push('z');
+        let text = rendered(&mut state, 80, 12);
+        assert!(text.contains("no match"), "{text}");
     }
 
     #[test]

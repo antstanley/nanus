@@ -45,6 +45,29 @@ pub struct InputBuffer {
     /// The text that was being typed before history browsing began, so leaving the
     /// history restores it rather than discarding the user's work.
     draft: String,
+    /// What the last kill removed, which `Ctrl+Y` puts back.
+    ///
+    /// One slot rather than a ring: a composer is not an editor, and the second-most
+    /// recent kill is not a thing anybody reaches for while writing a prompt.
+    killed: String,
+    /// The reverse search through the history, while one is running.
+    search: Option<Search>,
+}
+
+/// A reverse search through the submitted history.
+///
+/// Held by the composer rather than by the key handler because what it does is *replace
+/// the composer's text* with a match and put it back when cancelled — that is the
+/// composer's business, and a caller that owned the search would have to reach into the
+/// text to do it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Search {
+    /// What has been typed into the search so far.
+    query: String,
+    /// Where the current match sits in the history, when the query found one.
+    matched: Option<usize>,
+    /// What the composer held when the search began, restored when it is cancelled.
+    draft: String,
 }
 
 impl fmt::Debug for InputBuffer {
@@ -67,6 +90,8 @@ impl InputBuffer {
             history: Vec::new(),
             history_index: None,
             draft: String::new(),
+            killed: String::new(),
+            search: None,
         }
     }
 
@@ -81,6 +106,8 @@ impl InputBuffer {
             history: Vec::new(),
             history_index: None,
             draft: String::new(),
+            killed: String::new(),
+            search: None,
         }
     }
 
@@ -440,6 +467,248 @@ impl InputBuffer {
         self.cursor = self.text.len();
     }
 
+    /// Breaks the line where a trailing backslash is, which is the multiline escape.
+    ///
+    /// Returns whether it did. `\` followed by Enter means "break the line" in every
+    /// terminal, which is the one spelling that needs no terminal cooperation at all — no
+    /// keyboard protocol, no setup, no distinction between Enter and Shift+Enter.
+    pub fn break_line_after_escape(&mut self) -> bool {
+        if self.character_before(self.cursor) != Some('\\') {
+            return false;
+        }
+        self.cursor = self.cursor.saturating_sub(1);
+        self.text.remove(self.cursor);
+        self.insert('\n');
+        true
+    }
+
+    /// Deletes from the cursor to the end of the line, remembering what it removed.
+    ///
+    /// Line-relative rather than document-relative: a prompt is several lines often
+    /// enough that "delete to the end" has to mean the end of the line the cursor is on,
+    /// which is what every editor with this binding does.
+    ///
+    /// Returns whether anything was removed.
+    pub fn kill_to_end(&mut self) -> bool {
+        let end = {
+            let (line, _) = self.cursor_line_col();
+            self.line_start(line).saturating_add(self.line_length(line))
+        };
+        if end <= self.cursor {
+            return false;
+        }
+        let removed: String = self.text.drain(self.cursor..end).collect();
+        self.killed = removed;
+        self.leave_history();
+        true
+    }
+
+    /// Deletes the line the cursor is on, remembering what it removed.
+    ///
+    /// The newline that ends the line stays: removing it would join two lines the reader
+    /// did not ask to join, and on the last line it would leave nothing to have deleted.
+    ///
+    /// Returns whether anything was removed.
+    pub fn kill_line(&mut self) -> bool {
+        let (line, _) = self.cursor_line_col();
+        let start = self.line_start(line);
+        let end = start.saturating_add(self.line_length(line));
+        if start == end {
+            return false;
+        }
+        let removed: String = self.text.drain(start..end).collect();
+        self.killed = removed;
+        self.cursor = start;
+        self.leave_history();
+        true
+    }
+
+    /// Inserts what the last kill removed, at the cursor.
+    ///
+    /// Returns whether there was anything to put back.
+    pub fn yank(&mut self) -> bool {
+        if self.killed.is_empty() {
+            return false;
+        }
+        let killed = self.killed.clone();
+        self.insert_str(&killed);
+        true
+    }
+
+    /// Moves the cursor back to the start of the word before it.
+    ///
+    /// The same idea as [`InputBuffer::delete_word`], and deliberately: the two are used
+    /// together, and a cursor that stopped somewhere other than where a delete would have
+    /// started would make `Alt+B` then `Ctrl+W` delete a different word from the one the
+    /// reader moved to.
+    pub fn move_word_left(&mut self) {
+        while self.cursor > 0
+            && self
+                .character_before(self.cursor)
+                .is_some_and(char::is_whitespace)
+        {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+        while self.cursor > 0
+            && self
+                .character_before(self.cursor)
+                .is_some_and(|character| !character.is_whitespace())
+        {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+    }
+
+    /// Moves the cursor to the end of the word it is in or before.
+    pub fn move_word_right(&mut self) {
+        let length = self.text.len();
+        while self.cursor < length
+            && self
+                .character_at(self.cursor)
+                .is_some_and(char::is_whitespace)
+        {
+            self.cursor = self.cursor.saturating_add(1);
+        }
+        while self.cursor < length
+            && self
+                .character_at(self.cursor)
+                .is_some_and(|character| !character.is_whitespace())
+        {
+            self.cursor = self.cursor.saturating_add(1);
+        }
+    }
+
+    /// Returns the character just before `index`, if there is one.
+    fn character_before(&self, index: usize) -> Option<char> {
+        self.text.get(index.saturating_sub(1)).copied()
+    }
+
+    /// Returns the character at `index`, if there is one.
+    fn character_at(&self, index: usize) -> Option<char> {
+        self.text.get(index).copied()
+    }
+
+    /// Returns `true` while a reverse search is running.
+    #[must_use]
+    pub const fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Returns the search query and whether it has found anything, for a status line.
+    #[must_use]
+    pub fn search_query(&self) -> Option<(&str, bool)> {
+        self.search
+            .as_ref()
+            .map(|search| (search.query.as_str(), search.matched.is_some()))
+    }
+
+    /// Starts a reverse search, remembering the draft to restore if it is cancelled.
+    pub fn search_start(&mut self) {
+        if self.search.is_some() {
+            return;
+        }
+        self.search = Some(Search {
+            query: String::new(),
+            matched: None,
+            draft: self.text(),
+        });
+        self.search_refind();
+    }
+
+    /// Adds a character to the search query.
+    pub fn search_push(&mut self, character: char) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        search.query.push(character);
+        self.search_refind();
+    }
+
+    /// Removes the last character from the search query.
+    ///
+    /// Returns whether there was one: on an empty query there is nothing to delete, which
+    /// is how a caller knows that a further Backspace is the reader trying to leave.
+    pub fn search_backspace(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        if search.query.pop().is_none() {
+            return false;
+        }
+        self.search_refind();
+        true
+    }
+
+    /// Steps to the next older match.
+    pub fn search_older(&mut self) {
+        let Some(from) = self.search.as_ref().and_then(|search| search.matched) else {
+            self.search_refind();
+            return;
+        };
+        // Walking past the oldest match stands still rather than emptying the composer.
+        // The reader has reached the end of what matches, and taking the last match away
+        // would be a worse answer to "older" than keeping it — which is what a test found
+        // this doing before it was written this way.
+        let older = from.checked_sub(1).and_then(|older| self.find_match(older));
+        if let (Some(found), Some(search)) = (older, self.search.as_mut()) {
+            search.matched = Some(found);
+        }
+        self.show_match();
+    }
+
+    /// Ends the search, keeping the match the composer is now showing.
+    pub fn search_accept(&mut self) {
+        self.search = None;
+        self.leave_history();
+    }
+
+    /// Ends the search and puts back what the composer held when it began.
+    pub fn search_cancel(&mut self) {
+        let Some(search) = self.search.take() else {
+            return;
+        };
+        self.set_text(&search.draft);
+    }
+
+    /// Finds the newest match for the current query and shows it.
+    fn search_refind(&mut self) {
+        let newest = self.history.len().checked_sub(1);
+        let found = newest.and_then(|newest| self.find_match(newest));
+        if let Some(search) = self.search.as_mut() {
+            search.matched = found;
+        }
+        self.show_match();
+    }
+
+    /// Shows the current match, or the draft when the query found nothing.
+    ///
+    /// The draft rather than the last match, because the reader is looking at a search
+    /// that failed and what they will get back if they cancel is the useful thing to see.
+    fn show_match(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let shown = search
+            .matched
+            .and_then(|index| self.history.get(index).cloned())
+            .unwrap_or_else(|| search.draft.clone());
+        self.set_text(&shown);
+    }
+
+    /// Returns the newest history entry at or before `from` that contains the query.
+    ///
+    /// Case-insensitive, because a prompt is prose: a reader searching for "refactor"
+    /// means the entry that says "Refactor", and a search that could not see it would
+    /// look broken rather than strict.
+    fn find_match(&self, from: usize) -> Option<usize> {
+        let needle = self.search.as_ref()?.query.to_lowercase();
+        self.history
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, entry)| *index <= from && entry.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+    }
+
     /// Leaves history browsing, keeping the current text.
     ///
     /// Editing a recalled entry means the user is composing something new, so
@@ -452,6 +721,191 @@ impl InputBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_to_end_removes_the_rest_of_the_line_and_remembers_it() {
+        let mut buffer = InputBuffer::with_text("keep this and drop that");
+        for _ in 0.."keep this and drop that".len() - "keep this ".len() {
+            buffer.move_left();
+        }
+        assert!(buffer.kill_to_end());
+        assert_eq!(buffer.text(), "keep this ");
+        assert!(buffer.yank());
+        assert_eq!(
+            buffer.text(),
+            "keep this and drop that",
+            "yank puts it back"
+        );
+    }
+
+    /// A kill stops at the line's end rather than the buffer's, because a prompt is
+    /// several lines often enough that the difference is visible.
+    #[test]
+    fn kill_to_end_stops_at_the_end_of_the_line() {
+        let mut buffer = InputBuffer::with_text("one\ntwo\nthree");
+        buffer.move_home();
+        buffer.move_line_up();
+        assert!(buffer.kill_to_end());
+        assert_eq!(buffer.text(), "one\n\nthree");
+    }
+
+    #[test]
+    fn kill_line_removes_the_line_the_cursor_is_on() {
+        let mut buffer = InputBuffer::with_text("one\ntwo\nthree");
+        buffer.move_home();
+        buffer.move_line_up();
+        assert!(buffer.kill_line());
+        assert_eq!(buffer.text(), "one\n\nthree");
+        assert_eq!(buffer.cursor_line_col(), (1, 0), "the cursor stays put");
+        // The line is already gone: a second press has nothing to delete.
+        assert!(!buffer.kill_line());
+    }
+
+    #[test]
+    fn a_yank_with_nothing_killed_does_nothing() {
+        let mut buffer = InputBuffer::with_text("abc");
+        assert!(!buffer.yank());
+        assert_eq!(buffer.text(), "abc");
+    }
+
+    /// The pairing that matters: a cursor moved by `Alt+B` is where `Ctrl+W` starts
+    /// deleting, so the two keys act on the same word.
+    #[test]
+    fn word_movement_lands_where_a_word_delete_starts() {
+        let mut moved = InputBuffer::with_text("one two three");
+        moved.move_word_left();
+        let mut deleted = InputBuffer::with_text("one two three");
+        deleted.delete_word();
+        assert_eq!(moved.cursor(), deleted.cursor());
+        assert_eq!(moved.text(), "one two three");
+
+        moved.move_word_left();
+        assert_eq!(moved.cursor(), "one ".len());
+        moved.move_word_right();
+        assert_eq!(moved.cursor(), "one two".len());
+    }
+
+    #[test]
+    fn word_movement_stops_at_the_ends_of_the_text() {
+        let mut buffer = InputBuffer::with_text("   ");
+        buffer.move_word_left();
+        assert_eq!(buffer.cursor(), 0);
+        buffer.move_word_right();
+        assert_eq!(buffer.cursor(), 3);
+        let mut empty = InputBuffer::new();
+        empty.move_word_left();
+        empty.move_word_right();
+        assert_eq!(empty.cursor(), 0);
+    }
+
+    #[test]
+    fn a_backslash_before_enter_breaks_the_line() {
+        let mut buffer = InputBuffer::with_text("first \\");
+        assert!(buffer.break_line_after_escape());
+        assert_eq!(buffer.text(), "first \n", "the backslash is consumed");
+        // Without one, the caller is free to treat Enter as a submission.
+        assert!(!buffer.break_line_after_escape());
+    }
+
+    /// The search walks the history newest-first, which is what makes repeated `Ctrl+R`
+    /// mean "older" rather than "another".
+    #[test]
+    fn a_reverse_search_finds_the_newest_match_and_walks_back() {
+        let mut buffer = InputBuffer::new();
+        for entry in ["cargo test", "cargo fmt", "git status"] {
+            buffer.insert_str(entry);
+            assert!(buffer.submit().is_some());
+        }
+        buffer.search_start();
+        assert_eq!(
+            buffer.text(),
+            "git status",
+            "the newest entry to start with"
+        );
+        buffer.search_push('c');
+        buffer.search_push('a');
+        buffer.search_push('r');
+        assert_eq!(buffer.text(), "cargo fmt");
+        buffer.search_older();
+        assert_eq!(
+            buffer.text(),
+            "cargo test",
+            "and further back on a second press"
+        );
+        buffer.search_older();
+        assert_eq!(buffer.text(), "cargo test", "and stops at the oldest match");
+    }
+
+    /// Matching is case-insensitive: a prompt is prose, and a search that could not see
+    /// "Refactor" when asked for "refactor" would read as broken rather than strict.
+    #[test]
+    fn a_search_ignores_case() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("Refactor the parser");
+        assert!(buffer.submit().is_some());
+        buffer.search_start();
+        for character in "refactor".chars() {
+            buffer.search_push(character);
+        }
+        assert_eq!(buffer.text(), "Refactor the parser");
+        assert_eq!(buffer.search_query(), Some(("refactor", true)));
+    }
+
+    #[test]
+    fn a_search_that_matches_nothing_says_so_and_keeps_the_draft() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("something else");
+        assert!(buffer.submit().is_some());
+        buffer.insert_str("half a thought");
+        buffer.search_start();
+        buffer.search_push('z');
+        assert_eq!(buffer.search_query(), Some(("z", false)));
+        assert_eq!(
+            buffer.text(),
+            "half a thought",
+            "the draft, not a stale match"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_search_gives_back_what_was_being_typed() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("an earlier prompt");
+        assert!(buffer.submit().is_some());
+        buffer.insert_str("in progress");
+        buffer.search_start();
+        assert_eq!(
+            buffer.text(),
+            "an earlier prompt",
+            "the search shows the match"
+        );
+        buffer.search_cancel();
+        assert!(!buffer.is_searching());
+        assert_eq!(buffer.text(), "in progress");
+    }
+
+    #[test]
+    fn accepting_a_search_keeps_the_match_and_leaves_the_search() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("an earlier prompt");
+        assert!(buffer.submit().is_some());
+        buffer.search_start();
+        buffer.search_accept();
+        assert!(!buffer.is_searching());
+        assert_eq!(buffer.text(), "an earlier prompt");
+    }
+
+    #[test]
+    fn backspace_stops_at_an_empty_query() {
+        let mut buffer = InputBuffer::new();
+        buffer.insert_str("an earlier prompt");
+        assert!(buffer.submit().is_some());
+        buffer.search_start();
+        buffer.search_push('e');
+        assert!(buffer.search_backspace(), "there was a character to remove");
+        assert!(!buffer.search_backspace(), "and then there was not");
+        assert!(buffer.is_searching(), "which is the caller's cue to leave");
+    }
 
     #[test]
     fn typing_inserts_at_the_cursor() {

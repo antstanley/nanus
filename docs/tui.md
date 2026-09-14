@@ -143,18 +143,71 @@ conversation gets no such header: the person is already in it.
 
 ## Keys
 
+The bindings follow [Claude Code's interactive mode][cc-keys] where this interface has the
+machinery to honour them, so that a reader arriving from there does not have to learn a
+second set. Where it does not, the divergence is named rather than papered over.
+
 | Key | Effect |
 |---|---|
 | `Enter` | submit |
+| `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
-| `Ctrl+W` | delete the previous word |
+| `Ctrl+C` / `Esc` | cancel the prompt; press again on an empty one to quit |
+| `Ctrl+D` | quit |
+| `Ctrl+R` | reverse-search submitted prompts |
+| `Ctrl+O` | switch between the one-line form and the whole of a tool call |
 | `Ctrl+T` | summarise runs of tool calls |
-| `Ctrl+R` | summarise runs of reasoning |
+| `Ctrl+E` | summarise runs of reasoning |
+| `Ctrl+K` | delete to the end of the line |
+| `Ctrl+U` | delete the line |
+| `Ctrl+Y` | put back what `Ctrl+K` or `Ctrl+U` deleted |
+| `Ctrl+W` | delete the previous word |
+| `Alt+B` / `Alt+F` | move the cursor a word back / forward |
 | `Ctrl+L` | clear the transcript |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
-| `Ctrl+C` / `Ctrl+D` / `Esc` | quit |
+
+**`Ctrl+R` searches the history** rather than toggling anything, because that is what it is
+in every interface that has one — including the one these bindings are modelled on, where
+the same key does the same thing. The thinking summary moved to `Ctrl+E` to make room. The
+search takes over the composer and the status line: what you type narrows the query rather
+than editing the prompt, the composer shows the match, and the status line says
+`(reverse-i-search)\`query'`. `Ctrl+R` again walks to older matches and stops at the oldest
+one rather than emptying the screen; `Tab` or `Esc` takes the match and leaves it to be
+edited; `Enter` takes it and sends it; `Ctrl+C` abandons the search and gives back whatever
+was being typed. Matching ignores case, because a prompt is prose and a search that could
+not see `Refactor` when asked for `refactor` reads as broken rather than strict.
+
+**`Ctrl+C` cancels before it quits.** A key that means "stop" should not be able to lose a
+prompt somebody is halfway through writing, so the first press gives the prompt back empty
+and the second — with nothing left to cancel — leaves. `Esc` does the same. What this
+*cannot* do is interrupt a turn that is running: the link has no request for it, and a
+reader who wants one wants a protocol change rather than a keybinding.
+
+**`Ctrl+O` is the same choice `tui_detail` makes**, reachable without editing a file and
+restarting, because which form a reader wants depends on what they are doing at that moment
+rather than on how they started.
+
+[cc-keys]: https://code.claude.com/docs/en/interactive-mode
+
+### What is deliberately missing
+
+Claude Code's mode has more bindings than this interface has things to bind them to, and
+inventing a purpose for a key would be worse than leaving it alone:
+
+- **Interrupting a turn** (`Esc`) needs a request the link does not have.
+- **Permission modes** (`Shift+Tab`) — approvals are the agent's policy, set in
+  configuration, and this interface has no dialog to switch them from.
+- **Model switching** (`Alt+P`) and **extended thinking** (`Alt+T`) are agent-side
+  decisions with no request to carry them.
+- **Background tasks** (`Ctrl+B`) — there are none to background.
+- **Pasting an image** (`Ctrl+V`) would need clipboard access this program does not have.
+- **`?` for a key list** is not implemented: the composer needs `?` to be a `?`, and
+  swallowing it on an empty prompt is a cost this interface is not willing to pay for a
+  list that is one `Ctrl+L` away from being off screen anyway. This table is that list.
+- **Vim mode**, slash commands, `@` mentions and `!` bash mode are input *modes* rather
+  than shortcuts, and each is a feature in its own right.
 
 `Shift+Enter` needs a word, because how it reaches a program is not what you would expect.
 **It is not one key.** Two different things can happen when you press it:
@@ -265,13 +318,14 @@ one line each:
 
 ```text
 ── thinking · the glob is anchored to the wrong directory, so let me check the caller
-⚙ Read File · crates/nanus-bundle/src/tools/glob.rs
-✓ read
+✓ Read File · crates/nanus-bundle/src/tools/glob.rs
   <the file, first few lines and a count>
 ```
 
-**A tool call is one line, naming the tool and what it is acting on.** `⚙ Read File ·
-crates/nanus-bundle/src/tools/glob.rs` says what `⚙ read({"file_path":…})` said, in words,
+**A tool call is one line, naming the tool, what it is acting on, and how it went.** The
+line is marked `⚙` while the call is running, `✓` when it finished and `✗` when it reported
+a failure, so the outcome is on the call rather than on a second line under it. `✓ Read File
+· crates/nanus-bundle/src/tools/glob.rs` says what `⚙ read({"file_path":…})` said, in words,
 without the argument block. The argument the line reports is the one the tool acts on — the
 file for `read`, `write`, `edit` and `read_image`, the pattern for `glob` and `grep`, the
 command for `bash` — and a tool the interface has not been told about keeps its own name
@@ -279,28 +333,35 @@ rather than being shown under a guess. A multi-line command shows its first line
 so. Nothing is invented: every field comes from the arguments the model sent, which is why
 the link's `Tool` frame carries them.
 
+**The outcome is on the call's line because there is nowhere else for it to go.** A live
+transcript draws one line per call and no output — the frame that ends a call says only that
+it is over and whether it failed, because a tool's output is in the session log — so the
+call and its mark have to be the same row. A replayed transcript draws the same line and then
+the output beneath it, summarised to its first few lines and a count.
+
 **A thinking segment is one line, and it is the newest one.** As the model writes, the line
 either grows or is replaced, so what a reader sees is the sentence the model is in the
 middle of — and a cursor sits at its end while the segment is still arriving. Its earlier
-paragraphs are not drawn at all; `Ctrl+R` is not a substitute for that, because it folds a
+paragraphs are not drawn at all; `Ctrl+E` is not a substitute for that, because it folds a
 whole run into a count rather than showing the live end of it.
 
 **Neither line wraps, and neither carries a blank row of its own.** A line too long for the
 terminal is clipped from the front, keeping its label and the *end* of what it is acting on —
-`⚙ Read File · …tools/glob.rs` — because the newest words are the ones that say what is
+`✓ Read File · …tools/glob.rs` — because the newest words are the ones that say what is
 happening now. And a tool's call sits directly against its result: no `── tool` heading
-repeating what the line already said, and no blank row between the two, which is what makes
-a turn's machinery read as a block. What still separates one piece of tool activity from the
-next is the blank row every *other* entry is followed by — that row belongs to the prose
-above it, not to the call below it.
+repeating what the line already said, and no row for the result's own name, which the call's
+line has already carried along with its outcome. What still separates one piece of tool
+activity from the next is the blank row every *other* entry is followed by — that row belongs
+to the prose above it, not to the call below it.
 
-**`tui_detail = "full"` is the way back.** The setting in the
+**`Ctrl+O`, or `tui_detail = "full"`, is the way back.** The setting in the
 [configuration file](../crates/nanus-adapter-config) — `compact` by default, `full` for the
 whole argument block and the whole thinking segment — is read by the interface itself, from
 the same file the core reads, so `nanus tui`, a bare `nanus-tui` against a service, and
-`nanus tui --session` all draw the same transcript. It sits in the file rather than on a key
-because it is a standing preference rather than something to toggle mid-turn; the two
-`Ctrl` toggles below remain the way to fold runs away entirely.
+`nanus tui --session` all draw the same transcript. The file holds the standing preference
+and `Ctrl+O` toggles it for the session, because which of the two a reader wants depends on
+what they are doing at that moment as much as on how they started; the two `Ctrl` summary
+toggles remain the way to fold runs away entirely.
 
 ## What it shows, and why
 

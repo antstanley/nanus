@@ -23,18 +23,29 @@
 //!
 //! ## Keys
 //!
+//! The set follows [Claude Code's interactive mode][cc-keys] where this interface has
+//! something to bind, so a reader arriving from there does not have to learn a second set.
+//! `docs/tui.md` lists what is deliberately absent and why.
+//!
 //! | Key | Effect |
 //! |---|---|
 //! | `Enter` | submit the composer |
-//! | `Alt+Enter` / `Shift+Enter` | insert a newline |
+//! | `\` + `Enter` | insert a newline, which no terminal can misreport |
+//! | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | insert a newline |
+//! | `Ctrl+C` / `Esc` | cancel the composer; again on an empty one to quit |
+//! | `Ctrl+D` | quit |
+//! | `Ctrl+R` | reverse-search the submitted prompts |
+//! | `Ctrl+O` | switch between the one-line and full forms |
+//! | `Ctrl+T` / `Ctrl+E` | summarise runs of tool calls / of reasoning |
+//! | `Ctrl+K` / `Ctrl+U` / `Ctrl+Y` | delete to the line's end / the line / put it back |
+//! | `Ctrl+W` / `Alt+B` / `Alt+F` | delete a word / move a word back / forward |
+//! | `Ctrl+L` | clear the transcript |
 //! | `Backspace` / `Delete` | delete a character |
-//! | `Ctrl+W` | delete a word |
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
 //! | `PageUp` / `PageDown` | scroll the transcript |
-//! | `Ctrl+T` | summarise runs of tool calls |
-//! | `Ctrl+R` | summarise runs of reasoning |
-//! | `Ctrl+L` | clear the transcript |
-//! | `Ctrl+C` / `Ctrl+D` | quit |
+//! | `Left` / `Right`, `Home` / `End` | move the cursor |
+//!
+//! [cc-keys]: https://code.claude.com/docs/en/interactive-mode
 
 use core::future::Future;
 use std::ffi::OsStr;
@@ -685,62 +696,128 @@ enum Outcome {
 
 /// Applies one keystroke to the view.
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    // The control bindings match either case, and that is not tidiness. A terminal that
-    // reports modifiers reports the *character* its modifier state produces, so with Caps
-    // Lock on `Ctrl+C` arrives as `Char('C')` with CONTROL. Matching only the lowercase
-    // form left the interface impossible to quit and the toggles dead — the same mistake
-    // as reading a key without asking what the modifiers did to it.
+    // A running search rewrites what every key means: the composer is showing a match
+    // rather than the reader's own text, so typing extends the *query* and the keys that
+    // would normally edit the prompt end the search instead. Routing it before anything
+    // else keeps the two meanings from being interleaved.
+    if view.input.is_searching() {
+        return handle_search_key(key, view);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return handle_control_key(key, view);
+    }
+    handle_plain_key(key, view)
+}
+
+/// Routes a key with Control held.
+///
+/// Its own function for two reasons. These bindings are the ones a terminal is most likely
+/// to report oddly — see the note on case below — and they are all one key, one effect,
+/// with no fallthrough into text editing, which is what keeps the ordinary handler readable.
+fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    // These match either case, and that is not tidiness. A terminal that reports modifiers
+    // reports the *character* its modifier state produces, so with Caps Lock on `Ctrl+C`
+    // arrives as `Char('C')` with CONTROL. Matching only the lowercase form left the
+    // interface impossible to quit and the toggles dead — the same mistake as reading a key
+    // without asking what the modifiers did to it.
     match key.code {
-        KeyCode::Char('c' | 'C' | 'd' | 'D') if control => Outcome::Quit,
-        KeyCode::Char('l' | 'L') if control => {
+        // Cancel before quitting. A turn cannot be interrupted — the link has no request
+        // for it — so what a reader can stop is their own input, and the first press gives
+        // that back empty rather than throwing away a session over a half-written prompt.
+        KeyCode::Char('c' | 'C') => cancel_or_quit(view),
+        KeyCode::Char('d' | 'D') => Outcome::Quit,
+        KeyCode::Char('l' | 'L') => {
             view.transcript.clear();
             Outcome::Continue
         }
-        KeyCode::Char('w' | 'W') if control => {
+        // Verbose output, which is the same toggle the configuration file sets: the
+        // one-line form for a reader skimming, the whole call for a reader studying it.
+        KeyCode::Char('o' | 'O') => {
+            view.toggle_detail();
+            Outcome::Continue
+        }
+        KeyCode::Char('k' | 'K') => {
+            view.input.kill_to_end();
+            Outcome::Continue
+        }
+        KeyCode::Char('u' | 'U') => {
+            view.input.kill_line();
+            Outcome::Continue
+        }
+        KeyCode::Char('y' | 'Y') => {
+            view.input.yank();
+            Outcome::Continue
+        }
+        KeyCode::Char('w' | 'W') => {
             view.input.delete_word();
             Outcome::Continue
         }
-        KeyCode::Char('t' | 'T') if control => {
+        KeyCode::Char('t' | 'T') => {
             view.collapse_tools = !view.collapse_tools;
             Outcome::Continue
         }
-        KeyCode::Char('r' | 'R') if control => {
+        // `Ctrl+E` rather than `Ctrl+R`: `Ctrl+R` is the reverse history search, which is
+        // what it is in every interface that has one, including the one this mirrors.
+        KeyCode::Char('e' | 'E') => {
             view.collapse_reasoning = !view.collapse_reasoning;
             Outcome::Continue
         }
-        // Shift+Enter reaches here only from a terminal that reports it as distinct from
-        // Enter — see `TerminalGuard::enter`. Elsewhere it is the same byte, and a newline
-        // in a prompt is not worth breaking the submit key for, so `Alt+Enter` stays the
-        // spelling that always works.
-        KeyCode::Enter if alt || shift => {
-            view.input.insert('\n');
+        KeyCode::Char('r' | 'R') => {
+            view.input.search_start();
             Outcome::Continue
         }
         // `Ctrl+J` is a line feed, and a line feed is what a terminal sends when
         // `Shift+Enter` is bound to "insert a newline" rather than to a key — which is how
         // Ghostty is configured by default, and why the request for the kitty keyboard
-        // protocol above does not help there: the terminal is not reporting a key at all,
-        // it is typing a character. Ctrl+J has meant "new line" since readline, so this is
-        // the same binding twice over rather than a special case.
-        KeyCode::Char('j' | 'J') if control => {
+        // protocol does not help there: the terminal is not reporting a key at all, it is
+        // typing a character. Ctrl+J has meant "new line" since readline, so this is the
+        // same binding twice over rather than a special case.
+        KeyCode::Char('j' | 'J') => {
             view.input.insert('\n');
             Outcome::Continue
         }
+        // A character with Control held is not text. Terminals report control bytes as
+        // `Ctrl+<letter>`, so without this arm every unbound control key typed its letter:
+        // Ctrl+K inserted a `k`, and Ctrl+H an `h` for what is also backspace.
+        KeyCode::Char(_) => Outcome::Continue,
+        _ => handle_plain_key(key, view),
+    }
+}
+
+/// Routes a key with no Control held: text, movement, and the keys that send.
+fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        // Shift+Enter reaches here only from a terminal that reports it as distinct from
+        // Enter — see `TerminalGuard::enter`. Elsewhere it is the same byte, and a newline
+        // in a prompt is not worth breaking the submit key for, so `Alt+Enter` and `Ctrl+J`
+        // stay the spellings that always work.
+        KeyCode::Enter if alt || shift => {
+            view.input.insert('\n');
+            Outcome::Continue
+        }
+        // A backslash before Enter breaks the line: the one spelling that needs no terminal
+        // cooperation at all, which is what makes it worth having beside the ones that do.
+        KeyCode::Enter if view.input.break_line_after_escape() => Outcome::Continue,
         // An empty composer is not an error; it just does nothing.
         KeyCode::Enter => view
             .input
             .submit()
             .map_or(Outcome::Continue, Outcome::Submit),
-        // A character with Control held is not text. Terminals report control bytes as
-        // `Ctrl+<letter>`, so without the guard every unbound control key typed its
-        // letter — Ctrl+J inserted a `j`, Ctrl+K a `k`, and Ctrl+H an `h` for what is
-        // also backspace. Alt is deliberately *not* guarded: on many terminals an
-        // Option/Alt press arrives as `Alt+<letter>` on its way to producing a character,
-        // and swallowing those would stop some keyboards typing at all.
-        KeyCode::Char(_) if control => Outcome::Continue,
+        // Word-wise movement, matching the marks the shell and every readline do, so that
+        // `Alt+B` and then `Ctrl+W` delete the word the cursor just moved to. Alt is
+        // deliberately not swallowed for other letters: on many terminals an Option/Alt
+        // press arrives as `Alt+<letter>` on its way to producing a character, and eating
+        // those would stop some keyboards typing at all.
+        KeyCode::Char('b' | 'B') if alt => {
+            view.input.move_word_left();
+            Outcome::Continue
+        }
+        KeyCode::Char('f' | 'F') if alt => {
+            view.input.move_word_right();
+            Outcome::Continue
+        }
         KeyCode::Char(character) => {
             view.input.insert(character);
             Outcome::Continue
@@ -795,7 +872,73 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.scroll(PAGE_ROWS);
             Outcome::Continue
         }
-        KeyCode::Esc => Outcome::Quit,
+        // The same two-step exit as `Ctrl+C`: a prompt half written is worth more than the
+        // keystroke saved by leaving on the first press.
+        KeyCode::Esc => cancel_or_quit(view),
+        _ => Outcome::Continue,
+    }
+}
+
+/// Cancels what is in the composer, or leaves when there is nothing to cancel.
+///
+/// The two-step exit the interface this mirrors uses, and the reason is that a key meaning
+/// "stop" should not be able to lose a prompt somebody spent a minute writing: the first
+/// press gives the prompt back empty, and the second one — with nothing left to cancel —
+/// leaves.
+fn cancel_or_quit(view: &mut ViewState) -> Outcome {
+    if view.input.is_empty() {
+        return Outcome::Quit;
+    }
+    view.input.clear();
+    Outcome::Continue
+}
+
+/// Routes a key while a reverse history search is running.
+///
+/// Every binding here is about the search rather than about the prompt, because the
+/// composer is showing a match: editing keys that reached the text would be editing
+/// history, which is not what a reader searching it is doing.
+fn handle_search_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        // Enter takes the match and sends it. A search that has found the prompt you were
+        // looking for has done its job, and the thing you want next is to run it.
+        KeyCode::Enter => {
+            view.input.search_accept();
+            view.input
+                .submit()
+                .map_or(Outcome::Continue, Outcome::Submit)
+        }
+        // Tab and Esc take the match and leave it in the composer to be edited, which is
+        // the other half of the same idea.
+        KeyCode::Tab | KeyCode::Esc => {
+            view.input.search_accept();
+            Outcome::Continue
+        }
+        // Repeated `Ctrl+R` walks further back through the matches.
+        KeyCode::Char('r' | 'R') if control => {
+            view.input.search_older();
+            Outcome::Continue
+        }
+        // `Ctrl+C` abandons the search and gives back what was being typed: the cancel
+        // that means "forget this", as opposed to the accept that means "use it".
+        KeyCode::Char('c' | 'C') if control => {
+            view.input.search_cancel();
+            Outcome::Continue
+        }
+        KeyCode::Char(character) if !control && !alt => {
+            view.input.search_push(character);
+            Outcome::Continue
+        }
+        KeyCode::Backspace => {
+            // Backspace with an empty query leaves the search rather than deleting
+            // nothing for ever, which is what makes the key safe to lean on.
+            if !view.input.search_backspace() {
+                view.input.search_cancel();
+            }
+            Outcome::Continue
+        }
         _ => Outcome::Continue,
     }
 }
@@ -865,8 +1008,12 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.transcript.push(Entry::tool_call(name, arguments));
         }
         Frame::ToolDone { name, error } => {
-            view.transcript
-                .push(Entry::tool_result(name, error, "done"));
+            // No content, because the frame carries none: a tool's output is in the
+            // session log, and this frame says only that the call is over and how it
+            // went. A placeholder here used to put the word "done" under every tool call
+            // in a live transcript — a line of screen saying nothing — and with the
+            // outcome moved onto the call's own line it would have said it twice.
+            view.transcript.push(Entry::tool_result(name, error, ""));
         }
         Frame::Usage {
             tokens,
@@ -1083,7 +1230,10 @@ mod tests {
         // the terminal reports the character its modifier state makes, so `Ctrl+C` arrives
         // as `Char('C')` with CONTROL. Matching only lowercase left the interface
         // impossible to quit.
-        for character in ['c', 'C', 'd', 'D'] {
+        // `Ctrl+D` leaves outright; `Ctrl+C` cancels first, so an empty composer is the
+        // state in which it quits — which is what makes the two keys different rather
+        // than two spellings of one.
+        for character in ['d', 'D'] {
             let mut view = ViewState::new();
             assert!(
                 matches!(
@@ -1096,6 +1246,19 @@ mod tests {
                 "Ctrl+{character} quits"
             );
         }
+        for character in ['c', 'C'] {
+            let mut view = ViewState::new();
+            assert!(
+                matches!(
+                    handle_key(
+                        key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                        &mut view
+                    ),
+                    Outcome::Quit
+                ),
+                "Ctrl+{character} quits when there is nothing to cancel"
+            );
+        }
 
         // And the toggles, which were equally dead in the shifted case.
         for character in ['t', 'T'] {
@@ -1106,13 +1269,21 @@ mod tests {
             );
             assert!(view.collapse_tools, "Ctrl+{character} toggles tools");
         }
-        for character in ['r', 'R'] {
+        for character in ['e', 'E'] {
             let mut view = ViewState::new();
             let _ = handle_key(
                 key(KeyCode::Char(character), KeyModifiers::CONTROL),
                 &mut view,
             );
             assert!(view.collapse_reasoning, "Ctrl+{character} toggles thinking");
+        }
+        for character in ['o', 'O'] {
+            let mut view = ViewState::new();
+            let _ = handle_key(
+                key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                &mut view,
+            );
+            assert_eq!(view.detail, Detail::Full, "Ctrl+{character} is verbose");
         }
         for character in ['j', 'J'] {
             let mut view = ViewState::new();
@@ -1167,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_and_ctrl_r_toggle_the_summaries() {
+    fn ctrl_t_and_ctrl_e_toggle_the_summaries() {
         let mut view = ViewState::new();
         assert!(!view.collapse_tools);
         assert!(!view.collapse_reasoning);
@@ -1175,16 +1346,216 @@ mod tests {
         let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &mut view);
         assert!(view.collapse_tools, "Ctrl-T summarizes tool runs");
         assert!(!view.collapse_reasoning, "and nothing else");
-        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
-        assert!(view.collapse_reasoning, "Ctrl-R summarizes thinking");
+        // `Ctrl+E`, because `Ctrl+R` is the history search — see
+        // `ctrl_r_searches_the_history_it_does_not_toggle_thinking`.
+        let _ = handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut view);
+        assert!(view.collapse_reasoning, "Ctrl-E summarizes thinking");
 
         // Both toggles go back off, and the letters alone are still characters.
         let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &mut view);
-        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+        let _ = handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut view);
         assert!(!view.collapse_tools);
         assert!(!view.collapse_reasoning);
         let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE), &mut view);
         assert_eq!(view.input.text(), "t", "a bare letter is still text");
+    }
+
+    /// The two-step exit: a key that means "stop" must not be able to lose a prompt that
+    /// somebody is halfway through writing.
+    #[test]
+    fn ctrl_c_cancels_the_input_before_it_quits() {
+        let mut view = ViewState::new();
+        view.input.insert_str("half a thought");
+        assert!(
+            matches!(
+                handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+                Outcome::Continue
+            ),
+            "the first press cancels"
+        );
+        assert!(
+            view.input.is_empty(),
+            "and the prompt is gone, not the session"
+        );
+        assert!(
+            matches!(
+                handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+                Outcome::Quit
+            ),
+            "the second one, with nothing left to cancel, leaves"
+        );
+    }
+
+    /// `Esc` cancels on the same terms. It used to leave on the first press, which is the
+    /// one thing a reader with a half-written prompt does not want it to do.
+    #[test]
+    fn escape_cancels_the_input_before_it_quits() {
+        let mut view = ViewState::new();
+        view.input.insert_str("half a thought");
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(view.input.is_empty());
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Quit
+        ));
+    }
+
+    /// `Ctrl+R` is the history search here because it is the history search everywhere
+    /// else, including in the interface this set of bindings is modelled on. The thinking
+    /// toggle moved to `Ctrl+E` rather than the other way round.
+    #[test]
+    fn ctrl_r_searches_the_history_it_does_not_toggle_thinking() {
+        let mut view = ViewState::new();
+        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+        assert!(view.input.is_searching(), "Ctrl-R starts a search");
+        assert!(!view.collapse_reasoning, "and leaves the summaries alone");
+
+        view.input.search_cancel();
+        let _ = handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut view);
+        assert!(view.collapse_reasoning, "Ctrl-E is the thinking toggle");
+        assert!(!view.input.is_searching());
+    }
+
+    /// While a search is running the composer is showing a match, so the keys that would
+    /// edit a prompt have to mean something else — and the ones that end the search have
+    /// to be reachable without leaving the interface by accident.
+    #[test]
+    fn a_search_takes_the_keyboard_until_it_is_finished() {
+        let mut view = ViewState::new();
+        view.input.insert_str("an earlier prompt");
+        assert!(view.input.submit().is_some());
+
+        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+        assert_eq!(view.input.text(), "an earlier prompt", "the newest match");
+
+        // Typing narrows the search rather than editing the prompt.
+        let _ = handle_key(key(KeyCode::Char('z'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.input.search_query(), Some(("z", false)));
+        assert_eq!(view.input.text(), "", "the draft, since nothing matched");
+
+        // `Esc` takes the match rather than quitting, which is the whole reason the search
+        // is routed before the ordinary bindings.
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(!view.input.is_searching());
+
+        // And with the search over, an empty composer means `Esc` quits again.
+        view.input.clear();
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Quit
+        ));
+    }
+
+    /// Enter during a search takes the match and sends it: the search has found the prompt
+    /// the reader wanted, and the next thing they want is to run it.
+    #[test]
+    fn enter_during_a_search_submits_the_match() {
+        let mut view = ViewState::new();
+        view.input.insert_str("run the tests");
+        assert!(view.input.submit().is_some());
+        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+        let Outcome::Submit(text) = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view)
+        else {
+            panic!("Enter during a search submits the match");
+        };
+        assert_eq!(text, "run the tests");
+        assert!(!view.input.is_searching());
+    }
+
+    /// `Ctrl+C` during a search abandons it rather than clearing the prompt or quitting:
+    /// "forget this search" is what the key means while one is running.
+    #[test]
+    fn ctrl_c_cancels_a_search_rather_than_quitting() {
+        let mut view = ViewState::new();
+        view.input.insert_str("an earlier prompt");
+        assert!(view.input.submit().is_some());
+        view.input.insert_str("in progress");
+        let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Continue
+        ));
+        assert!(!view.input.is_searching());
+        assert_eq!(view.input.text(), "in progress", "the draft came back");
+    }
+
+    /// `Ctrl+O` is the same choice the configuration file makes, reachable at the keyboard:
+    /// a reader who wants the whole call wants it now, not after a restart.
+    #[test]
+    fn ctrl_o_switches_between_the_one_line_and_full_forms() {
+        let mut view = ViewState::new();
+        assert_eq!(
+            view.detail,
+            Detail::Compact,
+            "the default is the short form"
+        );
+        let _ = handle_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL), &mut view);
+        assert_eq!(view.detail, Detail::Full);
+        let _ = handle_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL), &mut view);
+        assert_eq!(view.detail, Detail::Compact);
+    }
+
+    #[test]
+    fn ctrl_k_ctrl_u_and_ctrl_y_edit_the_line_and_put_it_back() {
+        let mut view = ViewState::new();
+        view.input.insert_str("keep this and drop that");
+        for _ in 0.."drop that".len() {
+            let _ = handle_key(key(KeyCode::Left, KeyModifiers::NONE), &mut view);
+        }
+        let _ = handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut view);
+        assert_eq!(view.input.text(), "keep this and ");
+        let _ = handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &mut view);
+        assert_eq!(
+            view.input.text(),
+            "keep this and drop that",
+            "yank restores it"
+        );
+
+        let _ = handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &mut view);
+        assert_eq!(view.input.text(), "", "Ctrl-U takes the line");
+        let _ = handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &mut view);
+        assert_eq!(view.input.text(), "keep this and drop that");
+    }
+
+    #[test]
+    fn alt_b_and_alt_f_move_the_cursor_by_word() {
+        let mut view = ViewState::new();
+        view.input.insert_str("one two three");
+        let _ = handle_key(key(KeyCode::Char('b'), KeyModifiers::ALT), &mut view);
+        assert_eq!(
+            view.input.cursor(),
+            "one two ".len(),
+            "at the start of the word before the cursor"
+        );
+        let _ = handle_key(key(KeyCode::Char('f'), KeyModifiers::ALT), &mut view);
+        assert_eq!(view.input.cursor(), "one two three".len());
+        // The bare letters stay text, which is what keeps an Alt-less terminal usable.
+        let _ = handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.input.text(), "one two threeb");
+    }
+
+    /// The multiline escape that needs no terminal cooperation: `\` then Enter.
+    #[test]
+    fn a_backslash_before_enter_breaks_the_line_instead_of_sending() {
+        let mut view = ViewState::new();
+        view.input.insert_str("first \\");
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert_eq!(view.input.text(), "first \n");
+        // Without the backslash, Enter still sends.
+        view.input.insert_str("second");
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view),
+            Outcome::Submit(_)
+        ));
     }
 
     #[test]

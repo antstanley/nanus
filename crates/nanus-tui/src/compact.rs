@@ -41,8 +41,33 @@ pub enum Detail {
     Full,
 }
 
-/// The glyph a tool call is marked with.
-const TOOL_MARKER: &str = "⚙";
+/// How a tool call ended, which is what its line is marked with.
+///
+/// The mark lives on the call's line because in this form the call gets one line and no
+/// other: the outcome has to be on it or it is nowhere. The three glyphs are the ones the
+/// full form already uses, so switching forms does not mean learning a second vocabulary
+/// for the same fact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolState {
+    /// The call is running: no result answers it yet.
+    Running,
+    /// The call finished and reported success.
+    Ok,
+    /// The call finished and reported a failure.
+    Failed,
+}
+
+impl ToolState {
+    /// Returns the glyph this state is marked with.
+    #[must_use]
+    pub const fn mark(self) -> &'static str {
+        match self {
+            Self::Running => "⚙",
+            Self::Ok => "✓",
+            Self::Failed => "✗",
+        }
+    }
+}
 
 /// What a thinking line is prefixed with, so the dimmed line is not mistaken for the
 /// answer.
@@ -70,10 +95,10 @@ pub fn tool_label(name: &str) -> &str {
 
 /// Builds the single line a tool call occupies at `width` columns.
 #[must_use]
-pub fn tool_line(name: &str, arguments: &str, width: u16) -> String {
+pub fn tool_line(state: ToolState, name: &str, arguments: &str, width: u16) -> String {
     let label = tool_label(name);
     let action = action_of(name, arguments);
-    one_line(&format!("{TOOL_MARKER} {label}"), " · ", &action, width)
+    one_line(&format!("{} {label}", state.mark()), " · ", &action, width)
 }
 
 /// Builds the single line a thinking segment occupies at `width` columns.
@@ -206,15 +231,40 @@ mod tests {
 
     #[test]
     fn a_tool_call_says_what_it_is_and_what_it_is_acting_on() {
-        let line = tool_line("read", r#"{"file_path":"src/view.rs","offset":1}"#, 80);
+        let line = tool_line(
+            ToolState::Running,
+            "read",
+            r#"{"file_path":"src/view.rs","offset":1}"#,
+            80,
+        );
         assert_eq!(line, "⚙ Read File · src/view.rs");
-        let line = tool_line("edit", r#"{"file_path":"a.rs","old_string":"x"}"#, 80);
+        let line = tool_line(
+            ToolState::Running,
+            "edit",
+            r#"{"file_path":"a.rs","old_string":"x"}"#,
+            80,
+        );
         assert_eq!(line, "⚙ Edit File · a.rs");
-        let line = tool_line("write", r#"{"file_path":"b.rs","content":"x"}"#, 80);
+        let line = tool_line(
+            ToolState::Running,
+            "write",
+            r#"{"file_path":"b.rs","content":"x"}"#,
+            80,
+        );
         assert_eq!(line, "⚙ Write File · b.rs");
-        let line = tool_line("bash", r#"{"command":"cargo test --workspace"}"#, 80);
+        let line = tool_line(
+            ToolState::Running,
+            "bash",
+            r#"{"command":"cargo test --workspace"}"#,
+            80,
+        );
         assert_eq!(line, "⚙ Bash · cargo test --workspace");
-        let line = tool_line("grep", r#"{"pattern":"follow","path":"src"}"#, 80);
+        let line = tool_line(
+            ToolState::Running,
+            "grep",
+            r#"{"pattern":"follow","path":"src"}"#,
+            80,
+        );
         assert_eq!(line, "⚙ Grep · follow");
     }
 
@@ -222,7 +272,12 @@ mod tests {
     fn a_tool_the_interface_does_not_know_keeps_its_own_name() {
         // A guess would be worse than a raw name: the line would claim the call reads a
         // file when it does something else entirely.
-        let line = tool_line("fetch", r#"{"url":"https://example.com"}"#, 80);
+        let line = tool_line(
+            ToolState::Running,
+            "fetch",
+            r#"{"url":"https://example.com"}"#,
+            80,
+        );
         assert!(line.starts_with("⚙ fetch"), "{line}");
         assert!(line.contains("example.com"), "{line}");
     }
@@ -230,20 +285,32 @@ mod tests {
     #[test]
     fn a_call_with_no_arguments_is_the_tool_alone() {
         // `null` is what a frame from an agent that predates the arguments decodes to.
-        assert_eq!(tool_line("read", "", 80), "⚙ Read File");
-        assert_eq!(tool_line("read", "null", 80), "⚙ Read File");
-        assert_eq!(tool_line("read", "{}", 80), "⚙ Read File");
+        assert_eq!(tool_line(ToolState::Running, "read", "", 80), "⚙ Read File");
+        assert_eq!(
+            tool_line(ToolState::Running, "read", "null", 80),
+            "⚙ Read File"
+        );
+        assert_eq!(
+            tool_line(ToolState::Running, "read", "{}", 80),
+            "⚙ Read File"
+        );
     }
 
     #[test]
     fn only_the_first_line_of_a_command_is_shown() {
-        let line = tool_line("bash", r#"{"command":"set -e\ncargo fmt"}"#, 80);
+        let line = tool_line(
+            ToolState::Running,
+            "bash",
+            r#"{"command":"set -e\ncargo fmt"}"#,
+            80,
+        );
         assert_eq!(line, "⚙ Bash · set -e …");
     }
 
     #[test]
     fn a_long_line_keeps_its_label_and_the_end_of_what_it_acts_on() {
         let line = tool_line(
+            ToolState::Running,
             "read",
             r#"{"file_path":"crates/nanus-bundle/src/tools/glob.rs"}"#,
             40,
@@ -253,9 +320,32 @@ mod tests {
         assert!(line.ends_with("glob.rs"), "{line}");
     }
 
+    /// The mark is the only place a call's outcome is recorded in this form, so it has to
+    /// be the one the caller passed rather than a constant of this module's.
+    #[test]
+    fn a_tool_line_is_marked_with_the_outcome_it_was_given() {
+        let arguments = r#"{"file_path":"a.rs"}"#;
+        for state in [ToolState::Running, ToolState::Ok, ToolState::Failed] {
+            let line = tool_line(state, "read", arguments, 80);
+            assert!(
+                line.starts_with(&format!("{} Read File", state.mark())),
+                "{state:?} is drawn as {line}"
+            );
+            // And the label survives whichever mark it carries, on a narrow terminal too.
+            let narrow = tool_line(state, "read", arguments, 20);
+            assert!(
+                narrow.starts_with(&format!("{} Read File", state.mark())),
+                "{narrow}"
+            );
+        }
+        assert_eq!(ToolState::Running.mark(), "⚙");
+        assert_eq!(ToolState::Ok.mark(), "✓");
+        assert_eq!(ToolState::Failed.mark(), "✗");
+    }
+
     #[test]
     fn a_terminal_narrower_than_the_label_still_gets_a_line() {
-        let line = tool_line("read", r#"{"file_path":"a.rs"}"#, 4);
+        let line = tool_line(ToolState::Running, "read", r#"{"file_path":"a.rs"}"#, 4);
         assert_eq!(line.chars().count(), 4, "{line}");
     }
 
