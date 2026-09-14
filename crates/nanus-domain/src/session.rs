@@ -349,6 +349,16 @@ impl SessionLog {
     /// Folds the log into the message list a model would be shown.
     #[must_use]
     pub fn derive_messages(&self) -> Vec<Message> {
+        // Which calls some result answers. Collected first because a call can only be judged
+        // against results that follow it, and the fold below is a single pass.
+        let answered: Vec<&ToolCallId> = self
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolResult { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
         let mut messages: Vec<Message> = Vec::new();
         for event in &self.events {
             match event {
@@ -362,27 +372,28 @@ impl SessionLog {
                     ..
                 } => {
                     let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
-                    // Nothing here reconciles a call that no result answers, and that is
-                    // deliberate rather than an oversight. Such a call cannot be replayed — the
-                    // provider refuses an assistant message whose calls are unanswered — but
-                    // the two ways out are both closed: dropping the call loses the reasoning
-                    // of a tool-using turn, and writing a synthetic result is the fold
-                    // *inventing* a message, which the postcondition at the end of this
-                    // function forbids. The state is also unreachable through the harness: a
-                    // step records its calls and runs them in the same step, and a turn is
-                    // written to the store only once it is over, so a process that died between
-                    // the two took the whole turn with it. A log that holds one was written by
-                    // something other than this loop.
+                    let has_reasoning = reasoning.as_ref().is_some_and(|value| !value.is_empty());
+                    // A call that no result answers cannot travel: the provider refuses a request
+                    // whose assistant message names a call with nothing answering it. A log can
+                    // hold one — a step records its calls and runs them, so anything that stopped
+                    // the process between the two left the call behind — and a resumed session
+                    // would then send a request no provider accepts, failing every turn from a log
+                    // it can never repair. So the unanswered calls are dropped.
                     //
-                    // An assistant turn with neither text nor tool calls carries
-                    // nothing a model can read, so it is skipped rather than
-                    // replayed as an empty message.
-                    if has_text || !tool_calls.is_empty() {
-                        messages.push(Message::assistant(
-                            text.clone(),
-                            reasoning.clone(),
-                            tool_calls.clone(),
-                        ));
+                    // The *message* stays when it has something to say: its text, a call that
+                    // survived, or the reasoning of a turn that had calls at all. That last clause
+                    // is why the condition is not simply "text or calls": the provider wants a
+                    // tool-using turn's reasoning back, and dropping the calls must not take the
+                    // reasoning with them. A message with nothing but reasoning and no calls is
+                    // still skipped, because it carries nothing a model reads.
+                    let had_calls = !tool_calls.is_empty();
+                    let calls: Vec<ToolCall> = tool_calls
+                        .iter()
+                        .filter(|call| answered.contains(&&call.id))
+                        .cloned()
+                        .collect();
+                    if has_text || !calls.is_empty() || (had_calls && has_reasoning) {
+                        messages.push(Message::assistant(text.clone(), reasoning.clone(), calls));
                     }
                 }
                 SessionEvent::ToolResult {
@@ -962,6 +973,75 @@ mod tests {
         assert_eq!(call_id.as_str(), "c-7");
         assert_eq!(content, "no such file");
         assert!(*is_error);
+    }
+
+    /// A call nothing answered is dropped from the replay, and what the turn said is kept.
+    ///
+    /// The provider refuses an assistant message whose calls have no results, so a log holding
+    /// one — the calls are recorded before they run, so anything that stopped the process
+    /// between the two left it behind — would make every request of the resumed session invalid.
+    /// Dropping the call is the fix; dropping the *message* would take the turn's reasoning with
+    /// it, which the provider wants back.
+    #[test]
+    fn a_tool_call_with_no_result_is_not_replayed() {
+        let call = |id: &str| {
+            ToolCall::new(
+                ToolCallId::new(id),
+                ToolName::new("read").unwrap_or_else(|_| unreachable!("valid")),
+                serde_json::json!({}),
+            )
+        };
+        let unanswered = call("c1");
+        let answered = call("c2");
+        let mut log = SessionLog::new();
+        log.append(SessionEvent::UserMessage {
+            text: String::from("hi"),
+        });
+        log.append(SessionEvent::AssistantMessage {
+            text: Some(String::from("looking")),
+            reasoning: Some(String::from("I should read it")),
+            tool_calls: vec![unanswered, answered.clone()],
+            usage: None,
+            interrupted: false,
+        });
+        log.append(SessionEvent::ToolResult {
+            call_id: answered.id.clone(),
+            content: String::from("done"),
+            is_error: false,
+        });
+
+        let messages = log.derive_messages();
+        let assistant = messages
+            .iter()
+            .find(|message| message.text() == Some("looking"));
+        assert!(
+            assistant.is_some_and(|message| {
+                message.tool_calls().len() == 1 && message.tool_calls()[0].id == answered.id
+            }),
+            "only the answered call is replayed: {messages:?}"
+        );
+        assert!(
+            assistant.is_some_and(|message| message.reasoning() == Some("I should read it")),
+            "and the reasoning of the tool-using turn survives the dropped call"
+        );
+    }
+
+    /// The other direction, and the reason the rule is not "keep anything that had a call": a
+    /// turn that only thought, with no calls at all, still carries nothing a model reads.
+    #[test]
+    fn an_assistant_turn_that_only_thought_is_still_skipped() {
+        let mut log = SessionLog::new();
+        log.append(SessionEvent::AssistantMessage {
+            text: None,
+            reasoning: Some(String::from("thinking")),
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+        });
+        assert!(
+            log.derive_messages().is_empty(),
+            "reasoning without a call is not model-visible on its own"
+        );
     }
 
     #[test]

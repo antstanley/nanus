@@ -894,4 +894,26 @@ mod tests {
             "a frame that never got its newline is still a frame"
         );
     }
+
+    /// A tool-call index sizes a vector, so an absurd one is folded rather than obeyed.
+    ///
+    /// The guard was `usize::try_from(u64)`, which cannot fail on a 64-bit target: an index of
+    /// `u64::MAX` allocated until the process died.
+    #[test]
+    fn an_absurd_tool_call_index_does_not_allocate_without_limit() {
+        let mut assembled = StreamAccumulator::default();
+        assembled.observe_tool_call_delta(&serde_json::json!({
+            "index": u64::MAX,
+            "id": "c1",
+            "type": "function",
+            "function": { "name": "read", "arguments": "{}" }
+        }));
+        assert!(
+            assembled.calls.len() <= MAX_TOOL_CALLS,
+            "the vector is bounded by the ceiling rather than by the index: {}",
+            assembled.calls.len()
+        );
+        // Folding it into slot zero keeps the arguments in order rather than dropping them.
+        assert_eq!(assembled.calls.len(), 1);
+    }
 }

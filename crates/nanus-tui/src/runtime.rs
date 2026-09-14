@@ -1689,6 +1689,49 @@ mod tests {
         ));
     }
 
+    /// Every frame that appends to the transcript follows it, which is the view's own rule.
+    ///
+    /// `Frame::Tool`, `ToolDone` and `Failed` appended without following, so a line arriving
+    /// below a full transcript stayed below the fold. The failure is the one that matters most:
+    /// it is the last frame a transport sends, so its notice was never shown while the status
+    /// line went back to "ready" — a failure reported nowhere on screen.
+    #[test]
+    fn the_frames_that_append_also_follow() {
+        let frames = [
+            Frame::Tool {
+                name: "read".to_owned(),
+                arguments: serde_json::json!({}),
+            },
+            Frame::ToolDone {
+                name: "read".to_owned(),
+                error: false,
+            },
+            Frame::Failed {
+                message: "the agent closed the link".to_owned(),
+            },
+        ];
+        for frame in frames {
+            let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+            let mut view = ViewState::new();
+            for index in 0..200 {
+                view.transcript
+                    .push(Entry::prose(Role::User, format!("entry {index}")));
+            }
+            // Any scroll tells the view what it is scrolling inside.
+            view.scroll_by(0, 20, 60);
+            view.scroll_to_bottom();
+            assert!(view.following, "a reader at the bottom is following");
+
+            assert!(sender.try_send(frame).is_ok());
+            drain_frames(&mut receiver, &mut view);
+            assert_eq!(
+                view.scroll_offset,
+                view.max_scroll(),
+                "the frame was followed to the bottom"
+            );
+        }
+    }
+
     #[test]
     fn page_up_moves_back_through_the_conversation() {
         // The bug this pins: the offset counts rows skipped from the top, and Page-Up was

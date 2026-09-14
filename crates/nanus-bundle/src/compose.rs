@@ -458,6 +458,24 @@ mod tests {
         assert!(matches!(outcome, Err(BundleError::Config(_))));
     }
 
+    /// A relative configured root is made absolute, so nothing downstream meets a path the
+    /// sandbox policy asserts is absolute. The shell adapter resolves a `workdir` against the
+    /// policy root and `ensure_within` asserts that root is absolute, so a relative
+    /// `workspace_root` in the configuration file used to panic the shell tool.
+    #[test]
+    fn a_relative_workspace_root_is_made_absolute() {
+        let config = NanusConfig {
+            workspace_root: Some(PathBuf::from(".")),
+            ..NanusConfig::default()
+        };
+        let root = workspace_root(&config).expect("the current directory is a directory");
+        assert!(
+            root.is_absolute(),
+            "the root everything is confined to is absolute: {}",
+            root.display()
+        );
+    }
+
     #[test]
     fn the_current_directory_is_the_default_workspace() {
         let config = NanusConfig::default();

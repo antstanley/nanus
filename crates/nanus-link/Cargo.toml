@@ -34,6 +34,9 @@ nanus-adapter-local = { workspace = true }
 nanus-adapter-store = { workspace = true }
 nanus-kernel = { workspace = true }
 tempfile = { workspace = true }
+# `test-util` pauses the clock, so the test for a client that never makes room for the end
+# of a turn does not have to sit out the real timeout.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

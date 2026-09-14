@@ -200,6 +200,7 @@ impl JsonlStore {
     /// Writes `session` atomically, replacing any existing log for its id.
     async fn save_blocking(&self, session: &Session) -> StoreResult<()> {
         let dir = self.session_dir(session.id())?;
+        refuse_symlinked_dir(&dir).await?;
         fs::create_dir_all(&dir)
             .await
             .map_err(|source| io_error(&dir, &source))?;
@@ -248,10 +249,12 @@ impl JsonlStore {
     /// Records `name` for `id`, refusing a name another session already holds.
     async fn name_blocking(&self, id: &SessionId, name: &str) -> StoreResult<()> {
         validate_name(name)?;
+        let dir = self.session_dir(id)?;
+        refuse_symlinked_dir(&dir).await?;
         // The session has to exist before it can be named. An alias for a session
         // that is not there is a promise this store cannot keep, and the caller
         // that made it would rather hear about it now.
-        let log = self.session_file(id)?;
+        let log = dir.join(SESSION_FILE);
         if !fs::try_exists(&log).await.unwrap_or(false) {
             return Err(not_found(id));
         }
@@ -700,6 +703,32 @@ fn io_error(path: &Path, source: &std::io::Error) -> StoreError {
     StoreError::Io {
         path: path.to_path_buf(),
         message: source.to_string(),
+    }
+}
+
+/// Refuses a session directory that is a symlink.
+///
+/// A save writes `<home>/sessions/<id>/session.jsonl`, and the id is the only thing keeping
+/// that path inside the home — but `create_dir_all` and `rename` both *follow* a link that
+/// is already there, so a link planted under `sessions/` would redirect the write, and a
+/// name, into a tree the store does not own. Refusing is the whole fix: the store cannot
+/// tell a link somebody meant to create from one they did not, and a session that silently
+/// lands outside the home is worse than a session that does not save.
+///
+/// Deletion is the exception and is not routed through here: it unlinks the link itself
+/// rather than following it, which is both safe and what the caller asked for.
+///
+/// An entry that is absent is fine — the caller is about to create it.
+async fn refuse_symlinked_dir(dir: &Path) -> StoreResult<()> {
+    match fs::symlink_metadata(dir).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StoreError::Io {
+            path: dir.to_path_buf(),
+            message: "the session directory is a symlink, which this store will not write through"
+                .to_owned(),
+        }),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(dir, &source)),
     }
 }
 

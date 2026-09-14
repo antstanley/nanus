@@ -1032,3 +1032,225 @@ async fn write_frames(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanus_adapter_local::SystemClock;
+    use nanus_adapter_store::JsonlStore;
+    use nanus_bundle::AgentRunner;
+    use nanus_domain::{AgentConfig, ToolRegistry};
+    use nanus_ports::{ChatRequest, LlmPort, LlmStream};
+
+    /// A model that is never asked: these tests drive the server's own bookkeeping.
+    struct SilentLlm;
+
+    impl LlmPort for SilentLlm {
+        fn model(&self) -> &'static str {
+            "silent"
+        }
+
+        fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    /// A held session with nobody attached.
+    ///
+    /// Built here rather than through `Registry::hold` because none of these tests needs a
+    /// store: what is under test is who a session is talking to, which is `Held` alone.
+    fn held(id: &str) -> Rc<Held> {
+        let session = Session::new(SessionId::new(id), 0, "/work");
+        Rc::new(Held {
+            id: session.id().clone(),
+            session: RefCell::new(session),
+            name: None,
+            headline: RefCell::new(Headline::default()),
+            viewers: RefCell::new(Vec::new()),
+            busy: Cell::new(false),
+            stop: Cell::new(false),
+            touched: Cell::new(0),
+        })
+    }
+
+    /// Builds a registry over a store in `dir`, with a model no turn ever reaches.
+    async fn registry_over(dir: &Path) -> Rc<Registry> {
+        let store = JsonlStore::new(dir.to_path_buf())
+            .await
+            .expect("the store opens")
+            .handle();
+        let config = AgentConfig::new(4, 1, "silent", 4096).expect("a valid config");
+        let runner = AgentRunner::new(
+            Rc::new(Box::new(SilentLlm)),
+            Rc::new(ToolRegistry::new()),
+            "a test",
+            config,
+        )
+        .expect("a valid runner");
+        Rc::new(Registry::new(Rc::new(Agent::from_parts(Parts {
+            runner: Rc::new(runner),
+            store,
+            clock: SystemClock::new().handle(),
+            workspace: dir.to_path_buf(),
+            model: "silent".to_owned(),
+            tools: 0,
+        }))))
+    }
+
+    #[tokio::test]
+    async fn a_request_from_a_viewer_that_was_detached_is_refused() {
+        let session = held("refused");
+        let (frames, mut queued) = mpsc::channel(FRAME_BUFFER);
+        let viewer = 7;
+        session.viewers.borrow_mut().push((viewer, frames.clone()));
+
+        // While the viewer is attached a request is acted on, and nothing is said to it.
+        assert!(
+            !refuse_if_detached(&frames, Some(&(viewer, Rc::clone(&session)))).await,
+            "an attached viewer is not refused"
+        );
+        assert!(
+            queued.try_recv().is_err(),
+            "an accepted request says nothing"
+        );
+
+        // Detached, which is what falling behind the ending does to a connection: the same
+        // request must not act on the session, and the client has to be told why rather
+        // than watching nothing happen.
+        session.unview(viewer);
+        assert!(
+            refuse_if_detached(&frames, Some(&(viewer, Rc::clone(&session)))).await,
+            "a detached viewer is refused"
+        );
+        match queued.try_recv() {
+            Ok(Frame::Failed { message }) => assert!(
+                message.contains("attach again"),
+                "the refusal says how to recover: {message}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // A connection that never attached is not detached, it is unattached: prompting it
+        // is a different mistake with a different message.
+        assert!(
+            !refuse_if_detached(&frames, None).await,
+            "a connection with no session is left to the caller"
+        );
+    }
+
+    /// The ending is the one frame a client cannot be allowed to miss, so a viewer that
+    /// never makes room is dropped rather than waited for.
+    // Paused time so the test does not wait the real timeout out; the timeout is still the
+    // production constant, and it is still what ends the send.
+    #[tokio::test(start_paused = true)]
+    async fn a_viewer_that_cannot_make_room_for_an_ending_is_detached() {
+        let session = held("ending");
+        let ending = Frame::Done {
+            answer: "done".to_owned(),
+            reason: TurnEnd::Completed,
+        };
+
+        let (roomy, mut roomy_queue) = mpsc::channel(FRAME_BUFFER);
+        session.viewers.borrow_mut().push((1, roomy));
+
+        // A viewer whose connection, and therefore whose writer task, has gone.
+        let (gone, receiver) = mpsc::channel(FRAME_BUFFER);
+        session.viewers.borrow_mut().push((2, gone));
+        drop(receiver);
+
+        // A viewer that is still connected but not reading, with its queue already full.
+        let (stalled, _unread) = mpsc::channel(1);
+        stalled
+            .try_send(Frame::Bye)
+            .expect("one frame fits in a queue of one");
+        session.viewers.borrow_mut().push((3, stalled));
+
+        broadcast_end(&session, ending).await;
+
+        assert!(
+            session.is_watching(1),
+            "a viewer that made room stays attached"
+        );
+        assert!(
+            matches!(roomy_queue.try_recv(), Ok(Frame::Done { .. })),
+            "and it received the ending"
+        );
+        assert!(
+            !session.is_watching(2),
+            "a viewer whose client left is gone"
+        );
+        assert!(
+            !session.is_watching(3),
+            "a viewer that never made room is detached"
+        );
+    }
+
+    /// A prompt is the other frame a watcher cannot be allowed to miss: an answer to a
+    /// question it never saw is a conversation that cannot be read. It waits for room, and
+    /// the client that asked is skipped because its own words are already on its screen.
+    // Paused time, as above: the timeout is the production constant and still fires.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_reaches_every_watcher_or_that_watcher_is_detached() {
+        let session = held("prompt");
+        let (asker, mut asker_queue) = mpsc::channel(FRAME_BUFFER);
+        let (watcher, mut watcher_queue) = mpsc::channel(FRAME_BUFFER);
+        let (stalled, _unread) = mpsc::channel(1);
+        stalled
+            .try_send(Frame::Bye)
+            .expect("one frame fits in a queue of one");
+        session.viewers.borrow_mut().push((1, asker));
+        session.viewers.borrow_mut().push((2, watcher));
+        session.viewers.borrow_mut().push((3, stalled));
+
+        broadcast_awaited(
+            &session,
+            Frame::User {
+                text: "hello".to_owned(),
+            },
+            Some(1),
+        )
+        .await;
+
+        assert!(
+            asker_queue.try_recv().is_err(),
+            "the asker is not sent its own prompt back"
+        );
+        assert!(
+            matches!(watcher_queue.try_recv(), Ok(Frame::User { text }) if text == "hello"),
+            "a watcher is told what was asked"
+        );
+        assert!(
+            !session.is_watching(3),
+            "a watcher that could not be told is detached rather than left guessing"
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_is_reaped_before_the_next_one_is_spawned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        nanus_kernel::runtime::block_on_local(async move {
+            let registry = registry_over(dir.path()).await;
+
+            let (finished, waiter) = tokio::sync::oneshot::channel();
+            registry.spawn_turn(async move {
+                let _ = finished.send(());
+            });
+            waiter.await.expect("the first turn ran to completion");
+
+            // The spawn happens after the reap, so the task set holds one turn however
+            // many have finished. Without the reap this is two, and a service that has
+            // been up for a week has one uncollected slot per turn it ever ran.
+            let (again, second) = tokio::sync::oneshot::channel();
+            registry.spawn_turn(async move {
+                let _ = again.send(());
+            });
+            assert_eq!(
+                registry.turns.borrow().len(),
+                1,
+                "the finished turn was reaped before the new one was spawned"
+            );
+            second.await.expect("the second turn ran to completion");
+            assert_eq!(registry.turns.borrow().len(), 1);
+        });
+    }
+}

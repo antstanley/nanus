@@ -3,7 +3,7 @@
 //! The core never sees a `reqwest::Error`: every vendor failure is translated here
 //! so the domain depends on vocabulary it owns.
 
-use crate::config::{API_KEY_ENV, DEFAULT_BASE_URL};
+use crate::config::API_KEY_ENV;
 
 /// Failures the `DeepSeek` adapter can report.
 #[derive(Debug, thiserror::Error)]
@@ -35,8 +35,8 @@ pub enum DeepSeekError {
     /// The request did not complete.
     #[error("transport failure reaching {host}: {message}")]
     Transport {
-        /// The host that was unreachable.
-        host: &'static str,
+        /// The host that was unreachable, as the client was configured to reach it.
+        host: String,
         /// The underlying failure, rendered.
         message: String,
     },
@@ -72,9 +72,14 @@ impl DeepSeekError {
     }
 
     /// Builds a [`DeepSeekError::Transport`] from a `reqwest` request failure.
-    pub(crate) fn transport(source: &reqwest::Error) -> Self {
+    ///
+    /// The host is the one the client was configured with rather than the default, because the
+    /// error is read by somebody deciding what to do next: "the request to api.deepseek.com
+    /// failed" is misleading advice when the request went to a local proxy, and the whole point
+    /// of a custom `base_url` is that it is somewhere else.
+    pub(crate) fn transport(source: &reqwest::Error, host: &str) -> Self {
         Self::Transport {
-            host: DEFAULT_BASE_URL,
+            host: host.to_owned(),
             message: source.to_string(),
         }
     }

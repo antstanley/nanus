@@ -363,6 +363,62 @@ async fn delete_does_not_follow_a_symlink_out_of_the_home() {
     );
 }
 
+#[tokio::test]
+async fn a_save_refuses_to_follow_a_symlink_out_of_the_home() {
+    let (_dir, store) = store().await;
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(outside.path().join("precious.txt"), "keep me").expect("seed");
+    let id = SessionId::new("linked");
+    let dir = store.session_dir(&id).expect("dir");
+    std::os::unix::fs::symlink(outside.path(), &dir).expect("symlink");
+
+    let outcome = store.save(&session("linked", 1, &["hello"])).await;
+    assert!(
+        matches!(outcome, Err(StoreError::Io { .. })),
+        "a save through a link is refused, got {outcome:?}"
+    );
+    // The link is the whole point: without the refusal, `create_dir_all` and the
+    // rename would both follow it and the log would land in `outside`.
+    assert!(
+        !outside.path().join("session.jsonl").exists(),
+        "the log must not be written through the link"
+    );
+    assert!(
+        outside.path().join("precious.txt").exists(),
+        "the tree behind the link is untouched"
+    );
+}
+
+#[tokio::test]
+async fn naming_refuses_to_follow_a_symlink_out_of_the_home() {
+    let (_dir, store) = store().await;
+    let outside = tempfile::tempdir().expect("outside");
+    let id = SessionId::new("linked");
+    let saved = session("linked", 1, &["hello"]);
+    store.save(&saved).await.expect("save");
+    // The real directory is moved behind the link rather than replaced by an empty
+    // one, so the existence check a naming would do *would* pass: this is the case a
+    // guard that only checked for the log would let through.
+    let dir = store.session_dir(&id).expect("dir");
+    let stolen = outside.path().join("stolen");
+    std::fs::rename(&dir, &stolen).expect("move the real directory aside");
+    std::os::unix::fs::symlink(&stolen, &dir).expect("symlink");
+
+    let outcome = store.name(&id, "a-name").await;
+    assert!(
+        matches!(outcome, Err(StoreError::Io { .. })),
+        "naming through a link is refused, got {outcome:?}"
+    );
+    assert!(
+        !stolen.join("name").exists(),
+        "the alias must not be written through the link"
+    );
+    assert!(
+        stolen.join("session.jsonl").exists(),
+        "the log behind the link is untouched"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Session ids.
 // ---------------------------------------------------------------------------

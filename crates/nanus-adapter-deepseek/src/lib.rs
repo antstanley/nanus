@@ -177,6 +177,10 @@ impl LlmPort for DeepSeekLlm {
         let client = self.client.clone();
         let endpoint = self.endpoint();
         let api_key = self.config.api_key().to_owned();
+        // The host is resolved before the request so it survives as an owned value inside the
+        // stream: the transport failure is reported after `&self` has gone out of scope.
+        let host = self.config.base_url().to_owned();
+        let stream_host = host.clone();
 
         let response = async move {
             let sent = client
@@ -189,15 +193,15 @@ impl LlmPort for DeepSeekLlm {
                 .await;
             match sent {
                 Ok(response) => Ok(response),
-                Err(source) => Err(DeepSeekError::transport(&source).to_string()),
+                Err(source) => Err(DeepSeekError::transport(&source, &host).to_string()),
             }
         };
 
         // The stream resolves the request, then decodes the body it produced. A
         // transport failure becomes a single terminal `Error` event rather than a
         // stream that ends silently, so the agent loop always learns why.
-        let stream = futures::stream::once(response).flat_map(|outcome| match outcome {
-            Ok(response) => decode(response),
+        let stream = futures::stream::once(response).flat_map(move |outcome| match outcome {
+            Ok(response) => decode(response, stream_host.clone()),
             Err(message) => error_stream_owned(message),
         });
         Box::pin(stream)
@@ -215,7 +219,10 @@ fn error_stream_owned(message: String) -> LlmStream {
 }
 
 /// Decodes a successful streaming response into model events.
-fn decode(response: reqwest::Response) -> EventStream {
+///
+/// `host` is the base URL the request was sent to, carried so that a failure part-way through
+/// the body names the same endpoint the request did.
+fn decode(response: reqwest::Response, host: String) -> EventStream {
     let status = response.status();
     if !status.is_success() {
         // The body carries DeepSeek's own message, which is the only useful thing
@@ -267,7 +274,7 @@ fn decode(response: reqwest::Response) -> EventStream {
                     }
                 }
                 core::task::Poll::Ready(Some(Err(error))) => {
-                    accumulator.fail(DeepSeekError::transport(&error).to_string());
+                    accumulator.fail(DeepSeekError::transport(&error, &host).to_string());
                     done = true;
                 }
                 core::task::Poll::Ready(None) => {

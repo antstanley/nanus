@@ -373,3 +373,38 @@ async fn escaping_error(shell: &LocalShell, request: ShellRequest) -> bool {
         Err(nanus_ports::ShellError::OutsideWorkspace { .. })
     )
 }
+
+/// A run that cannot start says so in the stream.
+///
+/// The failure was reported as an `Exited` with no code and no output, which is exactly what a
+/// process that ran and printed nothing looks like: a consumer reading the stream — the only
+/// channel it has — could not tell that the command never started.
+#[tokio::test]
+async fn a_failed_spawn_is_reported_rather_than_looking_silent() {
+    let (_root, shell) = shell();
+    let request = ShellRequest::direct("/definitely/not/a/program/here", Vec::new())
+        .with_timeout(Duration::from_secs(5));
+    let mut stream = shell.spawn(request).await.expect("the stream opens");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ShellEvent::Stderr { chunk } if chunk.contains("not/a/program")
+        )),
+        "the reason the run did not start is in the stream: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(ShellEvent::Exited {
+                exit_code: None,
+                signal: None,
+                ..
+            })
+        ),
+        "and the stream still ends with an exit: {events:?}"
+    );
+}
