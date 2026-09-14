@@ -578,8 +578,14 @@ impl InputBuffer {
     }
 
     /// Returns the character just before `index`, if there is one.
+    ///
+    /// `checked_sub` rather than `saturating_sub`: at index zero there is no character
+    /// before, and saturating turned "before the start" into *the first character*. A
+    /// composer whose text began with a backslash therefore treated it as a trailing one —
+    /// `\` plus Enter with the caret at the start broke the line and ate the backslash
+    /// instead of submitting the prompt.
     fn character_before(&self, index: usize) -> Option<char> {
-        self.text.get(index.saturating_sub(1)).copied()
+        self.text.get(index.checked_sub(1)?).copied()
     }
 
     /// Returns the character at `index`, if there is one.
@@ -805,6 +811,22 @@ mod tests {
         assert_eq!(buffer.text(), "first \n", "the backslash is consumed");
         // Without one, the caller is free to treat Enter as a submission.
         assert!(!buffer.break_line_after_escape());
+    }
+
+    /// A backslash *at* the caret is not before it. Reading "before the start" as the first
+    /// character made a prompt that opens with a backslash unsendable: Enter broke the line
+    /// and ate the character instead of submitting.
+    #[test]
+    fn a_backslash_at_the_start_of_the_line_is_not_before_the_caret() {
+        let mut buffer = InputBuffer::with_text("\\abc");
+        buffer.move_home();
+        assert_eq!(buffer.cursor(), 0);
+        assert!(!buffer.break_line_after_escape());
+        assert_eq!(buffer.text(), "\\abc", "nothing was consumed");
+        // The other direction: one character later, it is before the caret again.
+        buffer.move_right();
+        assert!(buffer.break_line_after_escape());
+        assert_eq!(buffer.text(), "\nabc");
     }
 
     /// The search walks the history newest-first, which is what makes repeated `Ctrl+R`

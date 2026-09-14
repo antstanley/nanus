@@ -238,6 +238,14 @@ struct Slot {
     value: Rc<dyn Any>,
     provider: PluginId,
     generation: u64,
+    /// Whether the provider is being unloaded.
+    ///
+    /// A retiring binding satisfies nobody *new* — a mount that requires it is left pending,
+    /// which is what makes the sweep deactivate the dependents that already hold it — but it
+    /// still *resolves*, because those dependents have to hand back what they borrowed. That
+    /// distinction is the whole of "withdrawal waits for dependents": the name is spoken for
+    /// before it is gone.
+    retiring: bool,
 }
 
 impl Slot {
@@ -348,6 +356,7 @@ impl Registry {
                 value: erased,
                 provider,
                 generation,
+                retiring: false,
             },
         );
         // Pair assertion: the slot we just inserted carries the key we were given.
@@ -392,7 +401,7 @@ impl Registry {
         let entries = self.entries.borrow();
         entries
             .get(&key.name)
-            .is_some_and(|slot| slot.key.type_id() == key.type_id())
+            .is_some_and(|slot| slot.key.type_id() == key.type_id() && !slot.retiring)
     }
 
     /// Returns `true` when `key` is published with a matching erased type.
@@ -404,7 +413,7 @@ impl Registry {
         let entries = self.entries.borrow();
         entries
             .get(&key.name)
-            .is_some_and(|slot| slot.key.type_id() == key.type_id())
+            .is_some_and(|slot| slot.key.type_id() == key.type_id() && !slot.retiring)
     }
 
     /// Removes `name` if and only if `provider` is the plugin that published it.
@@ -428,6 +437,21 @@ impl Registry {
     ///
     /// Removal happens inside the provider's effect revert, so this is the
     /// registry-side inverse of [`provide`](Registry::provide).
+    /// Marks everything `provider` published as being withdrawn.
+    ///
+    /// The bindings stay resolvable — a dependent that is about to be torn down must still be
+    /// able to return what it borrowed — but they stop satisfying requirements, which is what
+    /// lets the sweep notice that the dependents are stale and deactivate them *before* the
+    /// provider's effects take the binding away.
+    pub(crate) fn retire_owned_by(&self, provider: PluginId) {
+        let mut entries = self.entries.borrow_mut();
+        for slot in entries.values_mut() {
+            if slot.provider == provider {
+                slot.retiring = true;
+            }
+        }
+    }
+
     pub(crate) fn remove_owned_by(&self, provider: PluginId) {
         let mut entries = self.entries.borrow_mut();
         let before = entries.len();

@@ -8,7 +8,7 @@ Eleven crates of safe Rust. A seven-tool toolset. Every part of it — the model
 the tool registry, the session log, the permission policy, and the agent loop itself —
 is a plugin you can remove, replace, or write yourself.
 
-[![tests](https://img.shields.io/badge/tests-737%20passing-brightgreen)](docs/testing.md)
+[![tests](https://img.shields.io/badge/tests-758%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
@@ -213,7 +213,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.0s] 737 tests run: 737 passed, 0 skipped
+Summary [3.3s] 758 tests run: 758 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed

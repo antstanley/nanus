@@ -454,13 +454,20 @@ impl LocalShell {
         lock(&self.registry).len()
     }
 
-    /// Rejects a working directory the policy does not permit.
-    fn check_cwd(&self, request: &ShellRequest) -> ShellResult<()> {
+    /// Rewrites the request's working directory to the absolute path the policy permits.
+    ///
+    /// It used to *check* the path and throw the answer away, leaving the request's own value
+    /// for `Command::current_dir` to resolve. A relative `workdir` — which is what this tool's
+    /// schema documents, "relative to the workspace root" — was therefore validated as
+    /// `<root>/src` and executed in `<process cwd>/src`, which is a different directory and may
+    /// be outside the workspace entirely. Returning the resolved path is the fix: what was
+    /// checked is what runs.
+    fn confine_cwd(&self, request: ShellRequest) -> ShellResult<ShellRequest> {
         let Some(cwd) = request.cwd.as_ref() else {
-            return Ok(());
+            return Ok(request);
         };
         if !self.policy.mode.is_confined() {
-            return Ok(());
+            return Ok(request);
         }
         let root = self.policy.workspace_root.clone();
         let resolved = ensure_within(&root, cwd).map_err(|_| ShellError::OutsideWorkspace {
@@ -468,7 +475,10 @@ impl LocalShell {
             path: cwd.clone(),
         })?;
         assert!(resolved.starts_with(&self.policy.workspace_root));
-        Ok(())
+        Ok(ShellRequest {
+            cwd: Some(resolved),
+            ..request
+        })
     }
 
     /// Returns the effective request, applying the adapter's timeout default.
@@ -512,7 +522,7 @@ impl ShellPort for LocalShell {
     fn run(&self, request: ShellRequest) -> LocalBoxFuture<'_, ShellResult<ShellOutcome>> {
         Box::pin(async move {
             let request = self.resolve(request)?;
-            self.check_cwd(&request)?;
+            let request = self.confine_cwd(request)?;
             run_engine(request, Arc::clone(&self.registry), None).await
         })
     }
@@ -520,7 +530,7 @@ impl ShellPort for LocalShell {
     fn spawn(&self, request: ShellRequest) -> LocalBoxFuture<'_, ShellResult<ShellStream>> {
         Box::pin(async move {
             let request = self.resolve(request)?;
-            self.check_cwd(&request)?;
+            let request = self.confine_cwd(request)?;
             let (sender, receiver) = mpsc::channel::<ShellEvent>(STREAM_DEPTH);
             let registry = Arc::clone(&self.registry);
             let finisher = sender.clone();
@@ -535,6 +545,19 @@ impl ShellPort for LocalShell {
                     },
                     Err(error) => {
                         tracing::warn!(%error, "a spawned run failed before it could start");
+                        // The failure is *said* before the stream ends. An `Exited` with no
+                        // code and no output is indistinguishable from a process that ran and
+                        // printed nothing, so a consumer reading the stream — which has no
+                        // other channel for it — could not tell that the command never started.
+                        if finisher
+                            .send(ShellEvent::Stderr {
+                                chunk: format!("{error}\n"),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!("no consumer was left for the failure");
+                        }
                         ShellEvent::Exited {
                             exit_code: None,
                             signal: None,

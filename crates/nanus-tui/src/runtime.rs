@@ -71,6 +71,7 @@ use tokio::sync::mpsc;
 
 use crate::command::{Command, Submission, submission_of};
 use crate::compact::Detail;
+use crate::notice::{self, Ending};
 use crate::transcript::{Entry, Role};
 use crate::view::{Theme, ViewState};
 
@@ -1013,31 +1014,11 @@ fn handle_search_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 
 /// What to tell the reader when a turn stopped without finishing, if it did.
 ///
-/// `None` means the turn completed and the text it produced is the answer. Everything
-/// else is a sentence for the transcript, and every variant is named rather than
-/// rendered from a generic reason: "the model hit its output ceiling, so the answer is
-/// cut off" is the fact a reader needs, and a bare `max_tokens` is not.
+/// The wording lives in [`crate::notice`], with the replay path's, because the two render the
+/// same fact: a live turn learns it from the ending frame and a recorded one from the log, and
+/// when those were two renderers the recorded one said nothing at all.
 fn stopping_notice(reason: &TurnEnd, step: u32) -> Option<String> {
-    match reason {
-        TurnEnd::Completed => None,
-        TurnEnd::MaxSteps => {
-            // A budget that ended after one step is not "after 1 steps", and the notice
-            // is read by a person who did not configure the number and has no reason to
-            // expect a template that forgot.
-            let noun = if step == 1 { "step" } else { "steps" };
-            Some(format!(
-                "the turn stopped at its step budget after {step} {noun}, so the work is \
-                 unfinished"
-            ))
-        }
-        TurnEnd::MaxTokens => Some(String::from(
-            "the turn stopped at the model's token ceiling, so the answer is cut off",
-        )),
-        TurnEnd::Interrupted => Some(String::from("the turn was interrupted")),
-        TurnEnd::Aborted { reason } => Some(format!("the turn was stopped: {reason}")),
-        TurnEnd::Blocked => Some(String::from("the turn was blocked by a policy")),
-        TurnEnd::Error { message } => Some(format!("the turn failed: {message}")),
-    }
+    notice::stopping(&Ending::from(reason), step)
 }
 
 /// Applies one frame from the agent to the view.
@@ -1064,6 +1045,9 @@ fn apply(frame: Frame, view: &mut ViewState) {
         }
         Frame::Step { step } => view.begin_turn(step),
         Frame::Tool { name, arguments } => {
+            // Followed like every other append: a tool line that arrives below the fold is a
+            // line the reader is not shown, and the transcript's own rule is that everything
+            // which appends follows.
             // Rendered once, here, because a transcript entry holds a *rendered* form: what
             // a reader sees is the view's decision, and the wire's job is to carry what the
             // model sent. A frame from an agent that predates the arguments decodes to
@@ -1074,6 +1058,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
                 other => other.to_string(),
             };
             view.transcript.push(Entry::tool_call(name, arguments));
+            view.follow();
         }
         Frame::ToolDone { name, error } => {
             // No content, because the frame carries none: a tool's output is in the
@@ -1082,6 +1067,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // in a live transcript — a line of screen saying nothing — and with the
             // outcome moved onto the call's own line it would have said it twice.
             view.transcript.push(Entry::tool_result(name, error, ""));
+            view.follow();
         }
         Frame::Usage {
             tokens,
@@ -1117,7 +1103,11 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.follow();
         }
         Frame::Failed { message } => {
+            // The last frame a transport sends, so an unfollowed notice is one the reader may
+            // never see: the status line goes back to ready either way, and a failure nobody
+            // was shown is a failure reported nowhere.
             view.transcript.push(Entry::notice(message));
+            view.follow();
             view.end_turn();
         }
         // Frames that describe the connection rather than the conversation. The interface

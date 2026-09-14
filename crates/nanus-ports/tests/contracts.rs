@@ -181,6 +181,17 @@ impl FsPort for MemoryFs {
     fn canonicalize<'a>(&'a self, path: &'a Path) -> LocalBoxFuture<'a, FsResult<PathBuf>> {
         Box::pin(async move { ensure_within(&self.root, path) })
     }
+
+    fn read_bytes<'a>(&'a self, path: &'a Path) -> LocalBoxFuture<'a, FsResult<Vec<u8>>> {
+        Box::pin(async move {
+            let resolved = ensure_within(&self.root, path)?;
+            let files = self.files.borrow();
+            let Some(text) = files.get(&resolved) else {
+                return Err(FsError::NotFound { path: resolved });
+            };
+            Ok(text.as_bytes().to_vec())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

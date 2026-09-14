@@ -685,11 +685,14 @@ fn decode_id(encoded: &str) -> Option<SessionId> {
         bytes.push(high.checked_shl(4)?.checked_add(low)?);
     }
     let decoded = String::from_utf8(bytes).ok()?;
-    assert!(
-        encode_id(&SessionId::new(decoded.clone())).is_ok(),
-        "a decoded id re-encodes"
-    );
-    Some(SessionId::new(decoded))
+    // The guard at the top of this function is about the *encoded* name, and decoding is
+    // what makes a name dangerous: `%2e` is not `.`, and it decodes to one. Re-encoding is
+    // the check that catches both spellings, and a name that fails it is skipped the way
+    // every other undecodable name is — a directory called `%2e` in the sessions directory
+    // used to abort `nanus sessions` on an assertion instead.
+    let id = SessionId::new(decoded);
+    encode_id(&id).ok()?;
+    Some(id)
 }
 
 /// Builds the port's I/O error for `path`.
@@ -744,4 +747,38 @@ fn temp_path(path: &Path) -> PathBuf {
         |name| format!(".{name}.{pid}.{seq}.tmp"),
     );
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory whose name decodes to something `encode_id` refuses is not an id, and
+    /// saying so is not a reason to abort the process.
+    ///
+    /// `%2e` is the case that did: the guard at the top of `decode_id` compares the *encoded*
+    /// name against `.` and `..`, so the encoded spelling walked past it, decoded to `.`, and
+    /// tripped the re-encode postcondition — a panic in `nanus sessions`, reachable by a
+    /// single oddly named directory in the sessions directory.
+    #[test]
+    fn a_name_that_decodes_to_a_dot_is_skipped_rather_than_asserted_on() {
+        assert!(decode_id("%2e").is_none());
+        assert!(decode_id("%2e%2e").is_none());
+        assert!(decode_id(".").is_none());
+        assert!(decode_id("..").is_none());
+        assert!(decode_id("").is_none());
+        // A percent escape that is not hex, and a decoded value that is not UTF-8, are the
+        // same answer: not an id.
+        assert!(decode_id("%zz").is_none());
+        assert!(decode_id("%ff").is_none());
+    }
+
+    /// The other direction: an ordinary id survives the round trip, so the refusal above is
+    /// about the dangerous names rather than about decoding.
+    #[test]
+    fn an_ordinary_id_round_trips() {
+        let id = SessionId::new("01a0c27-86d9-76d2");
+        let encoded = encode_id(&id).unwrap_or_else(|error| panic!("a plain id encodes: {error}"));
+        assert_eq!(decode_id(&encoded), Some(id));
+    }
 }

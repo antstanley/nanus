@@ -330,3 +330,46 @@ async fn the_live_channel_is_bounded() {
     );
     assert_eq!(shell.live_groups(), 0);
 }
+
+/// A relative working directory runs *inside* the root it was checked against.
+///
+/// The confinement check resolved a relative path against the workspace root and then threw the
+/// answer away, leaving the relative path for `Command::current_dir` — which resolves against the
+/// *process's* working directory. So a `workdir` of `sub` was validated as `<root>/sub` and
+/// executed in `<cwd>/sub`: a different directory, which need not be inside the workspace at all.
+/// The tool's own schema documents `workdir` as relative to the workspace root, so the documented
+/// spelling was the broken one, and it takes a root that differs from the process's directory to
+/// see it — which is exactly what this test arranges.
+#[tokio::test]
+async fn a_relative_working_directory_runs_under_the_root_it_was_checked_against() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::create_dir(root.path().join("sub")).expect("create sub");
+    std::fs::write(root.path().join("sub").join("marker"), "here").expect("write marker");
+    let shell = LocalShell::new(SandboxPolicy::workspace_write(root.path()));
+
+    let request = ShellRequest::shell("cat marker", None)
+        .with_cwd("sub")
+        .with_timeout(Duration::from_secs(5));
+    let outcome = shell.run(request).await.expect("the relative cwd resolves");
+    assert_eq!(
+        outcome.stdout.text, "here",
+        "the command ran where the policy checked, not where the process happens to be"
+    );
+
+    // And escaping through the relative path is still refused.
+    let escaping = ShellRequest::shell("pwd", None)
+        .with_cwd("../..")
+        .with_timeout(Duration::from_secs(5));
+    assert!(
+        escaping_error(&shell, escaping).await,
+        "a relative path that climbs out is refused"
+    );
+}
+
+/// Runs a request and reports whether the policy refused the working directory.
+async fn escaping_error(shell: &LocalShell, request: ShellRequest) -> bool {
+    matches!(
+        shell.run(request).await,
+        Err(nanus_ports::ShellError::OutsideWorkspace { .. })
+    )
+}

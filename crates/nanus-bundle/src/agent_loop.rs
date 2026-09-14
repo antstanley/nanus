@@ -60,12 +60,16 @@ pub struct RunOutcome {
 
 impl RunOutcome {
     /// Returns `true` when the run finished normally.
+    ///
+    /// Delegated to [`TurnEndReason::is_success`] rather than written out again. The two used to
+    /// answer differently — this one counted a turn cut off at the model's token ceiling as a
+    /// success, the domain's counted only a completion — and this is the one that decides
+    /// `nanus run`'s exit code. So a truncated answer exited zero while the interface printed
+    /// "the answer is cut off", and the documented contract ("zero only for a completed turn")
+    /// lost to whichever predicate happened to be consulted. One definition, one answer.
     #[must_use]
     pub const fn is_success(&self) -> bool {
-        matches!(
-            self.reason,
-            TurnEndReason::Completed | TurnEndReason::MaxTokens
-        )
+        self.reason.is_success()
     }
 }
 
@@ -233,7 +237,33 @@ impl AgentRunner {
                 let step = steps.saturating_add(1);
                 steps = step;
                 progress.step_started(step);
-                self.run_step(session, turn, step, progress).await?
+                match self.run_step(session, turn, step, progress).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // A step that failed still has to close its turn. Returning here
+                        // without one left a log ending at `step_start` — no `step_end`, no
+                        // `turn_end` — which is the one state the domain says a resumed
+                        // session must never be handed, and which the closing postcondition
+                        // below never got to check. The reason goes through the machine, as
+                        // every other reason does.
+                        let reason = machine
+                            .decide(
+                                session.log(),
+                                &StepOutcome::Error {
+                                    message: error.to_string(),
+                                },
+                            )
+                            .turn_end_reason();
+                        if let Some(reason) = reason {
+                            session.append(SessionEvent::TurnEnd { turn, reason });
+                        }
+                        assert!(
+                            session.log().last_turn_end().is_some(),
+                            "a failed run closes its turn"
+                        );
+                        return Err(error);
+                    }
+                }
             };
             let decision = machine.decide(session.log(), &step_outcome);
             // The machine owns the mapping from a decision to a recorded reason, so
@@ -280,7 +310,16 @@ impl AgentRunner {
         session.append(SessionEvent::StepStart { turn, step });
         let request = self.build_request(session);
         let mut stream = self.llm.stream_chat(request);
-        let assembled = self.consume_stream(&mut stream, progress).await?;
+        let assembled = match self.consume_stream(&mut stream, progress).await {
+            Ok(assembled) => assembled,
+            Err(error) => {
+                // The step ends before the turn does: a log with a step that never finished
+                // is one a reader has to guess about, and the turn above is closed by
+                // `run_turn` whatever happened here.
+                session.append(SessionEvent::StepEnd { turn, step });
+                return Err(error);
+            }
+        };
 
         // The assistant message is appended before its tools run, so a crash between
         // the two leaves a record of what was asked for rather than a silently
@@ -970,6 +1009,27 @@ mod tests {
             return;
         };
         assert!(error.to_string().contains("upstream is down"));
+
+        // The failure is reported *and* the turn is closed: a log that ends with an open
+        // turn is one a resumed session has to guess about, and this path used to leave
+        // exactly that — `turn_start`, `user_message`, `step_start`, and nothing else.
+        assert_eq!(
+            session.log().last_turn_end(),
+            Some(&TurnEndReason::Error {
+                message: String::from("the model failed: upstream is down"),
+            }),
+            "the turn is closed with the reason that closed it"
+        );
+        let steps: Vec<u32> = session
+            .log()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::StepEnd { step, .. } => Some(*step),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, vec![1], "and the step boundary is balanced");
     }
 
     #[tokio::test]

@@ -51,6 +51,14 @@ impl FsPort for UnusedFs {
         Box::pin(async move { Self::missing(&path) })
     }
 
+    fn read_bytes<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+    ) -> LocalBoxFuture<'a, FsResult<Vec<u8>>> {
+        let path = path.to_path_buf();
+        Box::pin(async move { Self::missing(&path) })
+    }
+
     fn exists<'a>(&'a self, _path: &'a std::path::Path) -> LocalBoxFuture<'a, bool> {
         Box::pin(async { false })
     }

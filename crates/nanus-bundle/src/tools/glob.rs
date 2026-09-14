@@ -90,6 +90,15 @@ async fn glob_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         .unwrap_or(None)
         .unwrap_or(DEFAULT_MATCH_LIMIT)
         .min(MAX_MATCH_LIMIT);
+    // A cap of zero is refused rather than reinterpreted, for the same reason `read`
+    // refuses one: it is a nonsense request, and the adapter's `SearchQuery` has a
+    // precondition that the cap is positive.
+    if limit == 0 {
+        return ToolResult::new(
+            id,
+            ToolOutcome::failure(String::from("glob: limit must be at least 1")),
+        );
+    }
 
     let mut query = SearchQuery::glob(&root, &pattern);
     query.max_results = usize::try_from(limit).unwrap_or(SearchQuery::DEFAULT_MAX_RESULTS);

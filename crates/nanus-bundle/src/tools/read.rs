@@ -120,6 +120,17 @@ async fn read_outcome(fs: FsHandle, id: ToolCallId, arguments: &Arguments<'_>) -
         .optional_u32("limit")
         .unwrap_or(None)
         .unwrap_or(DEFAULT_READ_LIMIT);
+    // A zero-line window is nonsense, and the workspace's habit is to refuse a nonsense
+    // budget rather than reinterpret it: `AgentConfig::validate` rejects a zero step budget
+    // for the same reason. Reinterpreting it as one would answer a question the model did
+    // not ask, and passing it on used to abort the process on `render_window`'s
+    // precondition.
+    if requested == 0 {
+        return ToolResult::new(
+            id,
+            ToolOutcome::failure(String::from("read: limit must be at least 1")),
+        );
+    }
 
     let metadata = fs.metadata(std::path::Path::new(&path)).await;
     let Ok(meta) = metadata else {
@@ -223,7 +234,7 @@ impl ToolExecutor for ReadImageExecutor {
 }
 
 /// Reads an image and renders it as a content block.
-async fn read_image_outcome(_fs: FsHandle, call: ToolCall) -> ToolResult {
+async fn read_image_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
     let id = call.id.clone();
     let arguments = Arguments::new("read_image", &call.arguments);
     let path = match arguments.required_str("file_path") {
@@ -239,17 +250,33 @@ async fn read_image_outcome(_fs: FsHandle, call: ToolCall) -> ToolResult {
         );
     };
 
-    // The port reads text, so an image is read as bytes and encoded here. The base64
-    // alphabet is defined by RFC 4648 and is reimplemented below rather than pulled
-    // in as a dependency, because it is twenty lines and has no failure modes.
-    let bytes = match tokio::fs::read(&path).await {
+    // Size first, as `read` does, so a huge image never enters memory. The ceiling is the
+    // same one: both tools put a file's contents into the model's context, and base64 makes
+    // an image a third larger again than the bytes it came from.
+    let metadata = fs.metadata(std::path::Path::new(&path)).await;
+    let Ok(meta) = metadata else {
+        let Err(error) = metadata else {
+            unreachable!("a failed metadata call carries an error")
+        };
+        return port_error_result(id, "read_image", &error);
+    };
+    if meta.byte_len > MAX_READ_BYTES {
+        return ToolResult::new(
+            id,
+            ToolOutcome::failure(format!(
+                "read_image: {path} is {} bytes, above the {MAX_READ_BYTES}-byte ceiling",
+                meta.byte_len
+            )),
+        );
+    }
+
+    // Read through the port, which is what confines the path to the workspace root. This
+    // tool used to read the raw model string with `tokio::fs`, which meant any readable
+    // image anywhere on the host — and a relative path resolved against the process's
+    // working directory rather than the workspace this tool's own schema promises.
+    let bytes = match fs.read_bytes(std::path::Path::new(&path)).await {
         Ok(bytes) => bytes,
-        Err(error) => {
-            return ToolResult::new(
-                id,
-                ToolOutcome::failure(format!("read_image: {path} could not be read: {error}")),
-            );
-        }
+        Err(error) => return port_error_result(id, "read_image", &error),
     };
     if bytes.is_empty() {
         return ToolResult::new(

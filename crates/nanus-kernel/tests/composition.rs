@@ -187,6 +187,13 @@ impl Plugin for Consumer {
         // teardown: a connection pool needs to hand its connections back.
         let resolved = cx.get(greeter_key());
         *self.saw_service_during_unmount.borrow_mut() = resolved.is_ok();
+        // Recorded as well as kept, because the flag lives inside a plugin the kernel now
+        // owns: a test that wants to assert it has to read it out of the trace.
+        self.trace.record(format!(
+            "{}.unmount-saw-service:{}",
+            self.id,
+            resolved.is_ok()
+        ));
         Box::pin(async { Ok(()) })
     }
 }
@@ -440,6 +447,93 @@ fn a_consumer_can_still_resolve_its_service_while_unmounting() {
     assert!(context.get(greeter_key()).is_ok());
 }
 
+/// Teardown runs in reverse *activation* order, not reverse declaration order.
+///
+/// A consumer written above its provider is skipped by the first sweep and activated second, so
+/// the two orders differ. Shutting down in reverse declaration order therefore unloaded the
+/// provider first, and the consumer's `unmount` — the hook a plugin uses to hand back what it
+/// borrowed — ran against a context whose service was already gone.
+#[test]
+fn shutdown_unloads_in_reverse_activation_order() {
+    let trace = Rc::new(Trace::default());
+    // Declared consumer-first, which is the whole point: activation still runs the publisher
+    // first because the consumer's requirement is not met until it does.
+    let kernel = Kernel::new()
+        .with_plugin(
+            plugin_id("consumer"),
+            Consumer::new(plugin_id("consumer"), Rc::clone(&trace)),
+        )
+        .with_plugin(
+            plugin_id("publisher"),
+            Publisher::new(plugin_id("publisher"), Rc::clone(&trace), 4),
+        );
+    let started = kernel.start();
+    assert!(started.is_ok(), "both mount");
+    let Ok(context) = started else {
+        return;
+    };
+
+    let shutdown = context.shutdown();
+    assert!(shutdown.is_ok(), "shutdown reverts cleanly");
+    assert_eq!(
+        trace.entries(),
+        vec![
+            // `init` runs in declaration order, which is consumer-first here...
+            "consumer.init",
+            "publisher.init",
+            // ...and `mount` in activation order, which cannot be: the consumer's requirement
+            // is not met until the publisher has published.
+            "publisher.mount",
+            "consumer.mount",
+            "consumer.greeted:hello-4",
+            // Teardown is the activation order backwards, so the dependent goes first and can
+            // still resolve what it borrowed.
+            "consumer.unmount",
+            "consumer.unmount-saw-service:true",
+            "publisher.unmount",
+            "publisher.marker-reverted",
+        ],
+        "the dependent is torn down before the thing it depends on"
+    );
+}
+
+/// A dependent's teardown sees the service of the provider that is being *removed*.
+///
+/// Removing a provider withdraws its service and sweeps the consumers that required it, whose
+/// `unmount` runs last of all. The withdrawal used to happen first — the comment above it
+/// described the opposite of what the line did — so a consumer's teardown resolved nothing.
+#[test]
+fn a_dependent_resolves_the_service_of_the_provider_being_removed() {
+    let trace = Rc::new(Trace::default());
+    let kernel = Kernel::new()
+        .with_plugin(
+            plugin_id("consumer"),
+            Consumer::new(plugin_id("consumer"), Rc::clone(&trace)),
+        )
+        .with_plugin(
+            plugin_id("publisher"),
+            Publisher::new(plugin_id("publisher"), Rc::clone(&trace), 3),
+        );
+    let started = kernel.start();
+    assert!(started.is_ok(), "both mount");
+    let Ok(context) = started else {
+        return;
+    };
+
+    let unloaded = context.unload(plugin_id("publisher"));
+    assert!(unloaded.is_ok(), "the provider unloads");
+    assert!(
+        trace
+            .entries()
+            .contains(&"consumer.unmount-saw-service:true".to_owned()),
+        "the consumer could still resolve its requirement while being deactivated by the          provider's removal: {:?}",
+        trace.entries()
+    );
+    assert!(
+        context.get(greeter_key()).is_err(),
+        "and the binding is withdrawn once everyone is done with it"
+    );
+}
 #[test]
 fn a_provider_that_replaces_itself_is_observed() {
     let trace = Rc::new(Trace::default());

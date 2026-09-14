@@ -244,6 +244,11 @@ impl Held {
         }
     }
 
+    /// Returns whether `viewer` is still being sent this session's frames.
+    fn is_watching(&self, viewer: u64) -> bool {
+        self.viewers.borrow().iter().any(|(id, _)| *id == viewer)
+    }
+
     /// Detaches a client.
     fn unview(&self, viewer: u64) {
         self.viewers.borrow_mut().retain(|(id, _)| *id != viewer);
@@ -318,7 +323,18 @@ impl Registry {
             touched: Cell::new(self.stamp()),
         });
         entry.refresh(&entry.session.borrow());
-        self.held.borrow_mut().insert(id, Rc::clone(&entry));
+        let mut held = self.held.borrow_mut();
+        // The map is the authority, not this call. Two connections can reach here with the
+        // same session — `open_reference` awaits the store between its check and its insert,
+        // and both connections run on the same set — and inserting over the first would
+        // leave two holders for one session: the loser's client subscribed to a session
+        // nothing else can see, `busy` no longer gating either copy, and both recording the
+        // same store key over each other.
+        if let Some(existing) = held.get(&id) {
+            return Rc::clone(existing);
+        }
+        held.insert(id, Rc::clone(&entry));
+        drop(held);
         entry
     }
 
@@ -405,7 +421,11 @@ impl Registry {
     where
         F: Future<Output = ()> + 'static,
     {
-        self.turns.borrow_mut().spawn_local(task);
+        let mut turns = self.turns.borrow_mut();
+        // Reaped before spawning: a service that has been up for a week has run thousands of
+        // turns, and a completed task nobody collects is a slot the set never gives back.
+        while turns.try_join_next().is_some() {}
+        turns.spawn_local(task);
     }
 
     /// Lets idle sessions go until the agent is holding no more than it should.
@@ -539,18 +559,6 @@ impl Broadcast<'_> {
     /// A client that has gone is dropped here, and one that has fallen behind loses the
     /// frame: the store holds the conversation, so a missing delta costs a re-read rather
     /// than a fact.
-    fn push_except(&self, except: u64, frame: &Frame) {
-        self.held.viewers.borrow_mut().retain(|(viewer, sender)| {
-            if *viewer == except {
-                return true;
-            }
-            !matches!(
-                sender.try_send(frame.clone()),
-                Err(mpsc::error::TrySendError::Closed(_))
-            )
-        });
-    }
-
     fn push(&self, frame: &Frame) {
         self.held.viewers.borrow_mut().retain(|(_, sender)| {
             !matches!(
@@ -624,9 +632,26 @@ impl Progress for Broadcast<'_> {
 /// [`ENDING_TIMEOUT`] is detached instead, because a queue that is not being read is not
 /// a client any more.
 async fn broadcast_end(held: &Held, frame: Frame) {
+    broadcast_awaited(held, frame, None).await;
+}
+
+/// Sends a frame every attached client must see, waiting for room.
+///
+/// The two frames with this treatment are the ending and the prompt that opened the turn.
+/// Both are facts a watcher cannot infer from anything else it receives: a client that
+/// never learns a turn finished shows it running for ever, and one that never sees the
+/// prompt watches an answer to a question it never heard. Progress — deltas, steps, tool
+/// names — stays on the droppable path, where a missed frame costs a re-read.
+///
+/// A client that does not make room within [`ENDING_TIMEOUT`] is detached, and the next
+/// request it makes is refused rather than acted on.
+async fn broadcast_awaited(held: &Held, frame: Frame, except: Option<u64>) {
     let viewers: Vec<(u64, mpsc::Sender<Frame>)> = held.viewers.borrow().clone();
     let mut stale: Vec<u64> = Vec::new();
     for (viewer, sender) in &viewers {
+        if Some(*viewer) == except {
+            continue;
+        }
         match tokio::time::timeout(ENDING_TIMEOUT, sender.send(frame.clone())).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => stale.push(*viewer),
@@ -742,6 +767,50 @@ pub async fn serve(
     Ok(())
 }
 
+/// Subscribes this connection to a session it asked to open, or says why it could not.
+///
+/// The two ways a connection acquires a session — `new` and `attach` — differ only in how
+/// the session is found, and everything after that is the same: send the attachment, or
+/// send the reason it did not happen.
+async fn watch_opened(
+    registry: &Rc<Registry>,
+    frames: &mpsc::Sender<Frame>,
+    opened: Result<Rc<Held>, String>,
+) -> Option<(u64, Rc<Held>)> {
+    match opened {
+        Ok(held) => Some(attach(registry, &held, frames).await),
+        Err(message) => {
+            send(frames, Frame::Failed { message }).await;
+            None
+        }
+    }
+}
+
+/// Tells a connection the session stopped serving that it is no longer following it.
+///
+/// A connection detached for falling behind is no longer sent frames, so a request from it
+/// must not act on the session: a prompt whose every answer goes nowhere, or an interrupt
+/// aimed at a turn it cannot see. Saying so is the honest answer, and the connection stays
+/// open so that re-attaching is what recovers.
+///
+/// Returns whether the refusal was sent, which is what the caller acts on.
+async fn refuse_if_detached(
+    frames: &mpsc::Sender<Frame>,
+    watching: Option<&(u64, Rc<Held>)>,
+) -> bool {
+    let Some((viewer, held)) = watching else {
+        return false;
+    };
+    if held.is_watching(*viewer) {
+        return false;
+    }
+    let message = String::from(
+        "this connection fell behind and is no longer following the session; attach again",
+    );
+    send(frames, Frame::Failed { message }).await;
+    true
+}
+
 /// Serves one client for as long as its connection lasts.
 ///
 /// # Errors
@@ -762,20 +831,19 @@ async fn serve_connection(
     // Which session this connection is watching, and the id it watches under.
     let mut watching: Option<(u64, Rc<Held>)> = None;
     while let Some(request) = read_request(&mut reader).await? {
+        if refuse_if_detached(&frames, watching.as_ref()).await {
+            continue;
+        }
         match request {
             Request::New { name } => {
                 release(&mut watching);
-                match new_session_of(&registry, name).await {
-                    Ok(held) => watching = Some(attach(&registry, &held, &frames).await),
-                    Err(message) => send(&frames, Frame::Failed { message }).await,
-                }
+                let opened = new_session_of(&registry, name).await;
+                watching = watch_opened(&registry, &frames, opened).await;
             }
             Request::Attach { session } => {
                 release(&mut watching);
-                match registry.open_reference(&session).await {
-                    Ok(held) => watching = Some(attach(&registry, &held, &frames).await),
-                    Err(message) => send(&frames, Frame::Failed { message }).await,
-                }
+                let opened = registry.open_reference(&session).await;
+                watching = watch_opened(&registry, &frames, opened).await;
             }
             Request::Prompt { text } => {
                 if let Some((viewer, held)) = &watching {
@@ -914,9 +982,6 @@ async fn start_turn(
     frames: &mpsc::Sender<Frame>,
     viewer: u64,
 ) {
-    // Cleared before the turn can read it, so a request aimed at the last turn cannot
-    // stop this one before it has taken a step.
-    held.stop.set(false);
     if held.busy.replace(true) {
         let message = String::from(
             "a turn is already running in this session; wait for it to finish or start another session",
@@ -924,14 +989,18 @@ async fn start_turn(
         send(frames, Frame::Failed { message }).await;
         return;
     }
+    // Cleared only once this call is the one running the turn, and after the refusal above
+    // has returned. Clearing it first — which is what this did — meant that a prompt to a
+    // busy session *cancelled the interrupt aimed at the turn it was refused by*: press
+    // Esc and then Enter in the same terminal and the turn carries on regardless.
+    held.stop.set(false);
     // Everyone else is told what was asked, before the turn can queue anything. The
     // client that asked already has its own words on screen and is skipped, which is
     // what keeps the prompt from appearing twice in its transcript.
-    let progress = Broadcast {
-        held,
-        started: None,
-    };
-    progress.push_except(viewer, &Frame::User { text: text.clone() });
+    // Waited for rather than dropped on a full queue: a watcher that misses the prompt
+    // reads an answer to a question it never saw, which the protocol promises cannot
+    // happen.
+    broadcast_awaited(held, Frame::User { text: text.clone() }, Some(viewer)).await;
     held.touched.set(registry.stamp());
     // Two handles: one for the task to own, one to hand the task to. Building the future
     // before borrowing the task set is what keeps the move of the first out of the

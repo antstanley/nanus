@@ -261,7 +261,13 @@ pub fn workspace_root(config: &NanusConfig) -> Result<PathBuf, BundleError> {
             root.display()
         )));
     }
-    Ok(root)
+    // Canonicalised, so that everything downstream holds the same absolute path this check
+    // just accepted. A relative `workspace_root` in the configuration file used to reach the
+    // sandbox policy as written, and `ensure_within` asserts that a root is absolute — a
+    // panic in the shell tool, from a configuration the file's own documentation allows.
+    // (The filesystem adapter canonicalised all along; this is the shell agreeing with it.)
+    std::fs::canonicalize(&root)
+        .map_err(|error| BundleError::config(format!("the workspace root is unusable: {error}")))
 }
 
 /// Returns the harness home directory.

@@ -105,7 +105,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 737 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 758 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -130,8 +130,8 @@ Contract to preserve:
 - **stdout is the answer and nothing else.** Reasoning and tool activity go to
   stderr.
 - **Exit code is meaningful:** `0` only for a completed turn, a clean interface
-  exit, or a service that started; a failed run, an exhausted step budget, or a
-  `service status` with nothing listening is non-zero.
+  exit, or a service that started; a failed run, an exhausted step budget, a turn cut
+  off at the model's token ceiling, or a `service status` with nothing listening is non-zero.
 - A bare `nanus` starts the interface when there is a terminal and prints usage when
   there is not. It never panics on a missing terminal.
 - **A `Done` frame means the session is already on disk.** The link server records

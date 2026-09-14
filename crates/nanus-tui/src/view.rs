@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
 use crate::stats::Throughput;
-use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_rows};
+use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_count};
 
 /// Colours and emphasis for each role.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -789,11 +789,33 @@ impl ViewState {
     }
 
     /// The display rows each rendered line occupies at `width`.
+    ///
+    /// Counted by the same rule the renderer breaks by, rather than by dividing the line's
+    /// width: ceiling division is a *lower bound* for word wrapping, because a row whose next
+    /// word does not fit ends early and wastes the rest of itself. A window computed from a
+    /// bound that is too low leaves the rows it under-counted below the fold *permanently* —
+    /// scrolling can only reach content whose height it knows about — which is how the last
+    /// rows of a long line of paths became visible at no offset at all.
+    ///
+    /// A line that fits is one row and needs no counting, which is most of them.
     fn line_heights(lines: &[Line<'static>], width: u16) -> Vec<u32> {
         let usable = width.max(1);
         lines
             .iter()
-            .map(|line| wrap_rows(u32::try_from(line.width()).unwrap_or(u32::MAX), usable))
+            .map(|line| {
+                if line.width() <= usize::from(usable) {
+                    return 1;
+                }
+                // Measured from the text rather than from the line's width: the width is a
+                // number of columns and the question is how many *rows* those columns take,
+                // which depends on where the words break.
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                wrap_count(&text, usable)
+            })
             .collect()
     }
 

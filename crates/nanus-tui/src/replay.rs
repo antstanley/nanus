@@ -12,6 +12,8 @@
 
 use nanus_domain::{Session, SessionEvent};
 
+use crate::notice::{self, Ending};
+
 use crate::transcript::{Entry, Role, Transcript};
 
 /// Builds a transcript from a session's event log.
@@ -43,8 +45,16 @@ fn build(session: &Session, banner: Option<String>) -> Transcript {
     if let Some(banner) = banner {
         transcript.push(Entry::notice(banner));
     }
-    for event in session.log().events() {
-        apply(&mut transcript, event);
+    // Whether the log closed its turns at all, which decides who reports a stop. A log that
+    // ends mid-write has no ending to render, and then a step cut short has to say so itself;
+    // a complete one says it once, from the ending.
+    let events = session.log().events();
+    let closed = events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::TurnEnd { .. }));
+    let mut steps = 0_u32;
+    for event in events {
+        apply(&mut transcript, event, closed, &mut steps);
     }
     // The last entry may still be marked streaming, which would draw a cursor on a
     // finished conversation.
@@ -67,11 +77,17 @@ fn header(session: &Session) -> String {
 
 /// Folds one event into the transcript.
 ///
-/// `TurnStart`, `TurnEnd`, `StepStart` and `StepEnd` are deliberately skipped. They are
-/// structural rather than informational: a reader cares what the model did, not where the
-/// loop drew its step boundaries, and printing them would triple the length of every
-/// transcript to say nothing the entries themselves do not already show.
-fn apply(transcript: &mut Transcript, event: &SessionEvent) {
+/// `TurnStart`, `StepStart` and `StepEnd` are deliberately skipped as structural: a reader
+/// cares what the model did, not where the loop drew its step boundaries, and printing them
+/// would triple the length of every transcript to say nothing the entries themselves do not
+/// already show.
+///
+/// `TurnEnd` is *not* skipped, though it was. Why a turn stopped is exactly what a reader
+/// needs when it stopped early, and the live view has always said so — so a recording that
+/// stayed silent made a turn cut off at its budget read as a finished one, which is the same
+/// defect the live view was fixed for, one layer down. `steps` counts the steps of the turn
+/// being folded, for the notice that names them.
+fn apply(transcript: &mut Transcript, event: &SessionEvent, closed: bool, steps: &mut u32) {
     match event {
         SessionEvent::UserMessage { text } => {
             transcript.push(Entry::prose(Role::User, text.clone()));
@@ -87,12 +103,17 @@ fn apply(transcript: &mut Transcript, event: &SessionEvent) {
             if let Some(reasoning) = reasoning.as_deref().filter(|text| !text.is_empty()) {
                 transcript.push(Entry::prose(Role::Reasoning, reasoning));
             }
+            // The `interrupted` flag on the message is not rendered: the turn it belongs to
+            // ends with a `TurnEnd` carrying the same fact, and saying it twice would be two
+            // notices for one stop. What the flag is for is the case below, where there is no
+            // text to show and the reader would otherwise see nothing at all for the step.
             if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
                 // A recorded message is settled: it is not still arriving.
                 transcript.push(Entry::prose(Role::Assistant, text));
-            } else if *interrupted {
-                // A step cut short mid-stream produced no text; saying so is better than
-                // rendering nothing, which would look like the model simply stopped.
+            } else if *interrupted && !closed {
+                // A truncated log has no `TurnEnd` to render, and a step cut short mid-stream
+                // is still worth a line: rendering nothing would look like the model simply
+                // stopped. A complete log says it once, at the turn's end.
                 transcript.push(Entry::notice("(the response was cut short)"));
             }
         }
@@ -112,10 +133,14 @@ fn apply(transcript: &mut Transcript, event: &SessionEvent) {
             let name = last_tool_name(transcript).unwrap_or_else(|| String::from("tool"));
             transcript.push(Entry::tool_result(name, *is_error, summarise(content)));
         }
-        SessionEvent::TurnStart { .. }
-        | SessionEvent::TurnEnd { .. }
-        | SessionEvent::StepStart { .. }
-        | SessionEvent::StepEnd { .. } => {}
+        SessionEvent::TurnStart { .. } => *steps = 0,
+        SessionEvent::StepStart { .. } => *steps = steps.saturating_add(1),
+        SessionEvent::TurnEnd { reason, .. } => {
+            if let Some(notice) = notice::stopping(&Ending::from(reason), *steps) {
+                transcript.push(Entry::notice(notice));
+            }
+        }
+        SessionEvent::StepEnd { .. } => {}
     }
 }
 
@@ -329,8 +354,11 @@ mod tests {
         assert!(transcript_of(&session).is_empty());
     }
 
+    /// A truncated log — one that stops mid-write — has no ending to render, so a step cut
+    /// short mid-stream has to say so itself; otherwise nothing in the transcript says the
+    /// response was incomplete.
     #[test]
-    fn an_interrupted_turn_with_no_text_says_so() {
+    fn an_interrupted_step_in_a_truncated_log_says_so_itself() {
         let session = session_with(vec![SessionEvent::AssistantMessage {
             text: None,
             reasoning: None,
@@ -344,6 +372,78 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|entry| entry.text().contains("cut short"))
+        );
+    }
+
+    /// The defect this closes: a turn that stopped at its step budget, or failed, or was
+    /// interrupted, read as a finished conversation — `nanus tui --session` on the very log
+    /// the live view had just explained said nothing at all.
+    #[test]
+    fn a_turn_that_stopped_early_says_so_in_a_recording() {
+        for (reason, expected) in [
+            (TurnEndReason::MaxSteps, "step budget"),
+            (TurnEndReason::MaxTokens, "token ceiling"),
+            (TurnEndReason::Interrupted, "interrupted"),
+            (TurnEndReason::Blocked, "policy"),
+            (
+                TurnEndReason::Error {
+                    message: String::from("the model failed"),
+                },
+                "the model failed",
+            ),
+        ] {
+            let session = session_with(vec![
+                SessionEvent::TurnStart { turn: 1 },
+                SessionEvent::StepStart { turn: 1, step: 1 },
+                SessionEvent::AssistantMessage {
+                    text: Some(String::from("half an answer")),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    interrupted: false,
+                },
+                SessionEvent::StepEnd { turn: 1, step: 1 },
+                SessionEvent::TurnEnd {
+                    turn: 1,
+                    reason: reason.clone(),
+                },
+            ]);
+            let transcript = transcript_of(&session);
+            let notices: Vec<&str> = transcript
+                .entries()
+                .iter()
+                .filter(|entry| entry.role() == Role::Harness)
+                .map(Entry::text)
+                .collect();
+            assert!(
+                notices.iter().any(|notice| notice.contains(expected)),
+                "{reason:?} reads as {notices:?}, which does not mention {expected:?}"
+            );
+        }
+
+        // And the other direction: a completed turn adds no notice at all.
+        let session = session_with(vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::StepStart { turn: 1, step: 1 },
+            SessionEvent::AssistantMessage {
+                text: Some(String::from("the answer")),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                interrupted: false,
+            },
+            SessionEvent::StepEnd { turn: 1, step: 1 },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                reason: TurnEndReason::Completed,
+            },
+        ]);
+        assert!(
+            transcript_of(&session)
+                .entries()
+                .iter()
+                .all(|entry| entry.role() != Role::Harness),
+            "a conversation that finished says nothing about finishing"
         );
     }
 

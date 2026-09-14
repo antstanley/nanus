@@ -140,15 +140,7 @@ impl LocalFs {
     /// Reads a file and counts its lines.
     fn read_blocking(&self, path: &Path) -> FsResult<FileRead> {
         let resolved = self.resolve(path)?;
-        let metadata =
-            std::fs::metadata(&resolved).map_err(|source| io_error(&resolved, &source))?;
-        if metadata.is_dir() {
-            return Err(FsError::IsADirectory { path: resolved });
-        }
-        if !metadata.is_file() {
-            return Err(FsError::NotAFile { path: resolved });
-        }
-        let bytes = std::fs::read(&resolved).map_err(|source| io_error(&resolved, &source))?;
+        let bytes = read_checked(&resolved)?;
         let text = String::from_utf8(bytes).map_err(|_| FsError::Io {
             path: resolved.clone(),
             message: String::from("the file is not valid UTF-8"),
@@ -533,4 +525,31 @@ impl FsPort for LocalFs {
     fn canonicalize<'a>(&'a self, path: &'a Path) -> LocalBoxFuture<'a, FsResult<PathBuf>> {
         Box::pin(async move { self.resolve(path) })
     }
+
+    fn read_bytes<'a>(&'a self, path: &'a Path) -> LocalBoxFuture<'a, FsResult<Vec<u8>>> {
+        Box::pin(async move {
+            let resolved = self.resolve(path)?;
+            read_checked(&resolved)
+        })
+    }
+}
+
+/// Reads a path the adapter has already confined, refusing anything that is not a file.
+///
+/// Shared by both reads so the two cannot disagree about what a readable path is: the
+/// binary one exists for images, and an image tool that accepted a directory where the text
+/// tool refused one would be a second, quieter definition of "readable".
+fn read_checked(resolved: &Path) -> FsResult<Vec<u8>> {
+    let metadata = std::fs::metadata(resolved).map_err(|source| io_error(resolved, &source))?;
+    if metadata.is_dir() {
+        return Err(FsError::IsADirectory {
+            path: resolved.to_path_buf(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(FsError::NotAFile {
+            path: resolved.to_path_buf(),
+        });
+    }
+    std::fs::read(resolved).map_err(|source| io_error(resolved, &source))
 }

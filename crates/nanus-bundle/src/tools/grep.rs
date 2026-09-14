@@ -112,6 +112,15 @@ async fn grep_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         .unwrap_or(None)
         .unwrap_or(DEFAULT_MATCH_LIMIT)
         .min(MAX_MATCH_LIMIT);
+    // A cap of zero is refused rather than reinterpreted, for the same reason `read`
+    // refuses one: it is a nonsense request, and the adapter's `SearchQuery` has a
+    // precondition that the cap is positive.
+    if limit == 0 {
+        return ToolResult::new(
+            id,
+            ToolOutcome::failure(String::from("grep: limit must be at least 1")),
+        );
+    }
 
     // The search runs unfiltered and the `include` glob is applied to the returned
     // paths. That is deliberate for this port shape: the port's query carries no
@@ -200,7 +209,18 @@ pub fn validate_include(include: &str) -> Result<(), String> {
 /// Renders matches grouped by file, with a cap notice.
 pub fn render_matches(matches: &[nanus_ports::SearchMatch], truncated: bool, limit: u32) -> String {
     if matches.is_empty() {
-        return "No matches found.\n".to_owned();
+        // A capped search that matched nothing *here* is a different fact from a search that
+        // matched nothing at all. The cap stops the walk, so an empty set after one may mean
+        // the matches were never reached — and "No matches found." would then be a confident
+        // false negative that a model has no way to question.
+        return if truncated {
+            format!(
+                "No matches in the files reached: the search stopped at the {limit}-match cap \
+                 before it finished, so matches may exist beyond it.\n"
+            )
+        } else {
+            "No matches found.\n".to_owned()
+        };
     }
     let mut rendered = String::new();
     let mut current: Option<&std::path::Path> = None;
@@ -348,5 +368,28 @@ mod tests {
         assert!(message.contains("positive"), "{message}");
 
         assert!(validate_include("   ").is_err());
+    }
+
+    /// A capped search that reached no match in the files it filtered is not a search that
+    /// found nothing. Saying "No matches found." there is a confident false negative that a
+    /// model has no way to question — it cannot tell a complete search from a truncated one.
+    #[test]
+    fn an_empty_result_after_a_cap_is_not_reported_as_no_matches() {
+        let complete = render_matches(&[], false, 100);
+        assert_eq!(complete, "No matches found.\n");
+
+        let capped = render_matches(&[], true, 100);
+        assert!(
+            !capped.contains("No matches found."),
+            "a capped search must not claim there are none: {capped}"
+        );
+        assert!(
+            capped.contains("100-match cap"),
+            "it says what stopped it: {capped}"
+        );
+
+        // The other direction: a match is rendered as a match whatever `truncated` says.
+        let rendered = render_matches(&[found("a.rs", 1, "hit")], true, 1);
+        assert!(rendered.contains("hit"), "{rendered}");
     }
 }

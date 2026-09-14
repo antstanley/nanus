@@ -72,6 +72,15 @@ pub trait FsPort {
 
     /// Resolves a path to its canonical, absolute form.
     fn canonicalize<'a>(&'a self, path: &'a Path) -> LocalBoxFuture<'a, FsResult<PathBuf>>;
+
+    /// Reads a file's bytes.
+    ///
+    /// The binary counterpart of [`FsPort::read`], for a caller that needs the bytes rather
+    /// than the text: an image is not UTF-8 and has no lines, so there is no `FileRead` to
+    /// put it in. Confinement is the adapter's here exactly as it is there — a path outside
+    /// the workspace root is refused by the port rather than by the caller remembering to
+    /// ask, which is what keeps a tool from being the one place that forgets.
+    fn read_bytes<'a>(&'a self, path: &'a Path) -> LocalBoxFuture<'a, FsResult<Vec<u8>>>;
 }
 
 /// The result type of every filesystem operation.

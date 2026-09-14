@@ -151,21 +151,41 @@ pub struct EventKey<K> {
 impl<K: 'static> EventKey<K> {
     /// Builds an event key for payload `K` under `name`.
     ///
-    /// # Panics
+    /// **The name is not validated here**, and no `const fn` on stable Rust could validate it: a
+    /// checked `Name` cannot be built in a constant, and the whole point of `of` is to sit in a
+    /// `const`. The documentation used to promise a compile-time panic, which was never true of
+    /// any code path — the literal went straight into `Name::new_unchecked`.
     ///
-    /// Panics at compile time when `name` is empty or contains a character
-    /// outside `[a-z0-9_.-]`.
+    /// The invariant is held elsewhere instead: [`EventKey::checked`] for any name that is not a
+    /// literal, and the test at the bottom of this module, which asserts the names the kernel
+    /// ships are names [`Name::new`] accepts. A name that is not one still keys the registry —
+    /// names are compared as strings — so the cost of getting it wrong is a listener that never
+    /// hears an event, not a broken invariant.
     #[must_use]
     pub const fn of(name: &'static str) -> Self {
-        // Built unchecked because validation is not usable in a `const` on stable
-        // Rust; `event_key_names_are_valid` asserts every shipped name passes
-        // `Name::new`, so the unchecked path cannot drift from the checked one.
         let validated = Name::new_unchecked(name);
         Self {
             name: validated,
             type_id: TypeId::of::<K>(),
             marker: PhantomData,
         }
+    }
+
+    /// Builds an event key for payload `K`, refusing a name the kernel would not accept.
+    ///
+    /// The checked counterpart of [`EventKey::of`], for a key built from anything that is not a
+    /// literal: configured, computed, or received from somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidName`] when the name is empty, longer than the kernel's
+    /// limit, or contains a character outside `[a-z0-9_.-]`.
+    pub fn checked(name: &'static str) -> Result<Self, crate::Error> {
+        Ok(Self {
+            name: Name::new(name)?,
+            type_id: TypeId::of::<K>(),
+            marker: PhantomData,
+        })
     }
 
     /// Returns the event name.
@@ -777,5 +797,33 @@ impl fmt::Debug for EventGuard {
             .field("key", &self.key)
             .field("order", &self.order)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `of` is unchecked by necessity — a `const fn` cannot build a validated [`Name`] — so
+    /// `checked` is what a name that is not a literal goes through. This is both halves: a name
+    /// the unchecked path would accept blindly is refused when it is not a name at all, and the
+    /// unchecked path still builds the key it always did.
+    #[test]
+    fn a_checked_key_refuses_a_name_the_kernel_would_not_accept() {
+        assert!(EventKey::<u32>::checked("step.start").is_ok());
+        assert!(EventKey::<u32>::checked("").is_err(), "empty");
+        assert!(EventKey::<u32>::checked("Agent Loop").is_err(), "spaces");
+        assert!(EventKey::<u32>::checked("Step").is_err(), "capitals");
+        assert!(
+            EventKey::<u32>::checked("step/start").is_err(),
+            "punctuation"
+        );
+
+        let unchecked = EventKey::<u32>::of("step.start");
+        assert_eq!(unchecked.as_str(), "step.start");
+        assert!(
+            EventKey::<u32>::checked("step.start").is_ok_and(|key| key.as_str() == "step.start"),
+            "and the two agree on a name that is valid"
+        );
     }
 }

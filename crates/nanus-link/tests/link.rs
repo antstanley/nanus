@@ -722,6 +722,159 @@ fn a_turn_finishes_after_the_client_that_asked_for_it_leaves() {
     );
 }
 
+/// A prompt refused because a turn is already running must not cancel an interrupt aimed at
+/// that turn.
+///
+/// It used to: `start_turn` cleared the stop flag *before* checking whether it was starting
+/// anything, so the refusal path cleared the running turn's flag instead of its own. One
+/// terminal is enough to reach it — press Esc to stop, then press Enter with text in the
+/// composer — and the turn then carried on to its budget.
+#[test]
+fn a_refused_prompt_does_not_cancel_an_interrupt() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(SlowRelentlessLlm)),
+        "slow-relentless",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "keep going".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mut frames = Vec::new();
+        while let Some(frame) = client.next().await.expect("frames are readable") {
+            let started = matches!(frame, Frame::Step { .. });
+            frames.push(frame);
+            if started {
+                break;
+            }
+        }
+        client
+            .send(&Request::Interrupt)
+            .await
+            .expect("the interrupt is sent");
+        // Refused, because the turn above is still running — and this is the request that
+        // used to take the interrupt with it.
+        client
+            .send(&Request::Prompt {
+                text: "me too".to_owned(),
+            })
+            .await
+            .expect("the second prompt is sent");
+        // Read on to the turn's own ending, skipping the refusal, which is a `Failed` frame
+        // and would otherwise look like the end.
+        while let Some(frame) = client.next().await.expect("frames are readable") {
+            let ended = matches!(frame, Frame::Done { .. });
+            frames.push(frame);
+            if ended {
+                break;
+            }
+        }
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        frames
+    });
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Failed { .. })),
+        "the second prompt was refused: {frames:?}"
+    );
+    assert_eq!(
+        reason_of(&frames),
+        Some(&TurnEnd::Interrupted),
+        "and the interrupt survived the refusal: {frames:?}"
+    );
+}
+
+/// One session, one holder — even when two connections open it at the same moment.
+///
+/// `open_reference` checks whether a session is held, *awaits* the store, and only then
+/// inserts. Two connections interleaving at those awaits used to end up with a `Held` each:
+/// `busy` gated neither copy, both could run turns on stale copies, both recorded to the same
+/// key, and the loser's client was invisible to `sessions`. The observable here is that a
+/// prompt from one client reaches the other, which is only true if they watch one session.
+#[test]
+fn two_clients_opening_the_same_session_at_once_share_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let id = nanus_kernel::runtime::block_on(async {
+        let session = Session::new(SessionId::new("shared"), 1, "/work");
+        store.save(&session).await.expect("save");
+        session.id().as_str().to_owned()
+    });
+
+    let (held, saw_the_prompt) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut a = Client::connect(&socket_for_client)
+            .await
+            .expect("the first client connects");
+        let mut b = Client::connect(&socket_for_client)
+            .await
+            .expect("the second client connects");
+        // Concurrently, so the two connections interleave at the store's awaits.
+        let (first, second) = tokio::join!(a.attach(&id), b.attach(&id));
+        assert!(first.is_ok() && second.is_ok(), "both attach");
+
+        a.send(&Request::Prompt {
+            text: "hello from a".to_owned(),
+        })
+        .await
+        .expect("the prompt is sent");
+        let mut saw_the_prompt = false;
+        while let Some(frame) = b.next().await.expect("frames are readable") {
+            if matches!(&frame, Frame::User { text } if text == "hello from a") {
+                saw_the_prompt = true;
+                break;
+            }
+            if frame.is_end_of_turn() {
+                break;
+            }
+        }
+
+        b.send(&Request::Sessions).await.expect("the listing");
+        let mut held = 0;
+        while let Some(frame) = b.next().await.expect("frames are readable") {
+            if let Frame::Sessions { held: list } = frame {
+                held = list.len();
+                break;
+            }
+        }
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        (held, saw_the_prompt)
+    });
+
+    assert!(
+        saw_the_prompt,
+        "the other client was told about the prompt, so both watch one session"
+    );
+    assert_eq!(held, 1, "and the agent holds it once, not twice");
+}
+
 #[test]
 fn a_session_that_was_never_held_is_loaded_from_the_store() {
     let dir = tempfile::tempdir().expect("temp dir");

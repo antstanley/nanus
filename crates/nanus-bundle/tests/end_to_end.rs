@@ -302,6 +302,115 @@ async fn a_search_finds_a_file_that_was_just_written() {
     assert_eq!(outcome.steps, 3);
 }
 
+/// Everything the model was told, as text: the prompt, its own words, and tool results.
+///
+/// A tool failure is only observable through the model's eyes — the runner returns an
+/// outcome, not a transcript — so a test that wants to know *what the tool said* has to
+/// read the request the next step was built from.
+fn told_to_the_model(model: &Rc<ScriptedModel>) -> String {
+    model
+        .requests()
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .filter_map(|message| message.text())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn a_zero_limit_is_refused_rather_than_aborting_the_process() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let root = dir.path();
+    let (tools, _shell) = workspace_tools(root);
+
+    let model = ScriptedModel::new(vec![
+        call("c1", "read", r#"{"file_path":"a.txt","limit":0}"#),
+        answer("told to use a sensible limit"),
+    ]);
+    let outcome = run(as_port(&model), tools, "read with a zero limit").await;
+
+    assert_eq!(outcome.answer, "told to use a sensible limit");
+    assert_eq!(outcome.steps, 2, "the turn carried on after the refusal");
+    assert!(
+        told_to_the_model(&model).contains("limit must be at least 1"),
+        "the model is told why rather than the process dying: {}",
+        told_to_the_model(&model)
+    );
+}
+
+#[tokio::test]
+async fn a_search_with_a_zero_limit_is_refused_too() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let root = dir.path();
+    let (tools, _shell) = workspace_tools(root);
+
+    for tool in ["glob", "grep"] {
+        let model = ScriptedModel::new(vec![
+            call("c1", tool, r#"{"pattern":"*.txt","limit":0}"#),
+            answer("refused"),
+        ]);
+        let outcome = run(as_port(&model), tools.clone(), "zero cap").await;
+        assert_eq!(outcome.steps, 2, "{tool} refused without stopping the turn");
+        assert!(
+            told_to_the_model(&model).contains("limit must be at least 1"),
+            "{tool} says why: {}",
+            told_to_the_model(&model)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_read_image_outside_the_workspace_is_refused() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let root = dir.path();
+    let (tools, _shell) = workspace_tools(root);
+
+    // A real image, outside the root, with a supported extension.
+    let outside = root
+        .parent()
+        .unwrap_or_else(|| panic!("the temp dir has a parent"))
+        .join("nanus-image-escape-probe.png");
+    std::fs::write(&outside, b"\x89PNG\r\n\x1a\n").unwrap_or_else(|error| panic!("write: {error}"));
+
+    let model = ScriptedModel::new(vec![
+        call(
+            "c1",
+            "read_image",
+            &format!(r#"{{"file_path":"{}"}}"#, outside.display()),
+        ),
+        answer("refused"),
+    ]);
+    let outcome = run(
+        as_port(&model),
+        tools,
+        "read an image outside the workspace",
+    )
+    .await;
+    assert_eq!(outcome.answer, "refused");
+    assert!(
+        told_to_the_model(&model).contains("outside the workspace root"),
+        "the port refuses it: {}",
+        told_to_the_model(&model)
+    );
+
+    // And the same file *inside* the workspace is read, so the refusal is about the root
+    // rather than about images.
+    let inside = root.join("inside.png");
+    std::fs::write(&inside, b"\x89PNG\r\n\x1a\n").unwrap_or_else(|error| panic!("write: {error}"));
+    let (tools, _shell) = workspace_tools(root);
+    let model = ScriptedModel::new(vec![
+        call("c1", "read_image", r#"{"file_path":"inside.png"}"#),
+        answer("read it"),
+    ]);
+    let outcome = run(as_port(&model), tools, "read an image inside the workspace").await;
+    assert_eq!(outcome.answer, "read it");
+    assert!(
+        told_to_the_model(&model).contains("image/png"),
+        "a file inside the root is read as the image it is: {}",
+        told_to_the_model(&model)
+    );
+}
+
 #[tokio::test]
 async fn a_write_outside_the_workspace_is_refused() {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));

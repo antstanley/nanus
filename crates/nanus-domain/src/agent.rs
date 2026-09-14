@@ -163,9 +163,14 @@ pub enum StepOutcome {
 /// What the turn machine decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnOutcome {
-    /// The turn stays open; run the step at the given index.
+    /// The turn stays open.
     Continue {
-        /// The step index the next step will carry.
+        /// How many steps the turn has taken, counting from zero.
+        ///
+        /// It said "the step index the next step will carry", which is this plus one: the first
+        /// step is recorded as 1 and `steps_taken` is 1 after it, so a caller that trusted the
+        /// old wording would run the step it had just run. Nothing reads the field today, which
+        /// is why the wording could be wrong for so long.
         step: u32,
     },
     /// The turn closed normally, with nothing owed.

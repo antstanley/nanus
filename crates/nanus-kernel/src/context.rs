@@ -36,6 +36,8 @@ pub(crate) struct ContextInner {
     pub(crate) migrations: Vec<Migration>,
     /// Whether `start` has run.
     pub(crate) started: bool,
+    /// How many activations have happened, for ordering teardown by them.
+    pub(crate) activations: u64,
     /// Guards against re-entrant activation sweeps.
     pub(crate) refreshing: bool,
 }
@@ -60,6 +62,14 @@ pub(crate) struct PluginRecord {
     pub(crate) guards: RefCell<Vec<Rc<EventGuard>>>,
     /// Requirements that were unsatisfied at the last sweep.
     pub(crate) missing: Vec<ServiceName>,
+    /// When this plugin was activated, counting from one.
+    ///
+    /// Declaration order is not activation order. A consumer declared before its provider is
+    /// skipped by the first sweep and activated after it, so the two orders differ whenever a
+    /// plugin is written above the thing it needs — and teardown has to run the *activation*
+    /// order backwards, or a consumer is torn down after the service it depends on has gone.
+    /// Zero means it has never been activated.
+    pub(crate) activated: u64,
 }
 
 impl core::fmt::Debug for PluginRecord {
@@ -108,6 +118,7 @@ impl Context {
                 plugins: Vec::new(),
                 migrations: Vec::new(),
                 started: false,
+                activations: 0,
                 refreshing: false,
             })),
         }
@@ -291,6 +302,7 @@ impl Context {
             description,
             version,
             state: PluginState::Pending,
+            activated: 0,
             plugin,
             requirements,
             disposer,
@@ -499,9 +511,14 @@ impl Context {
             Ok(()) => {
                 let effects = disposer.len();
                 let mut inner = self.inner_mut();
+                // Counted before the record is borrowed, because the record is reached through
+                // the same borrow the counter lives in.
+                let activated = inner.activations.saturating_add(1);
+                inner.activations = activated;
                 if let Some(record) = inner.plugins.iter_mut().find(|record| record.id == id) {
                     record.disposer = disposer;
                     record.state = PluginState::Active;
+                    record.activated = activated;
                     record.missing.clear();
                 }
                 drop(inner);
@@ -550,28 +567,50 @@ impl Context {
         if let Err(error) = outcome {
             tracing::warn!(plugin = %id, error = %error, "unmount hook failed");
         }
-        // Registrations are withdrawn before the effects revert, so a plugin's
-        // effects can still resolve the services it published while unwinding.
-        // Both withdrawals are name-scoped and owner-checked, so a replacement
-        // another plugin published is left untouched.
-        let registered: Vec<ServiceName> = record
-            .guards
-            .borrow()
-            .iter()
-            .map(|guard| guard.key())
-            .collect();
+        // Withdrawn *after* the effects revert and after the sweep below, which is the order the
+        // comment that used to sit here described and the code did not implement: withdrawing
+        // first meant the plugin's own effects could not resolve the services they had
+        // published, and neither could a dependent's `unmount` — which resolves its
+        // requirements one last time on the way out. Both withdrawals are name-scoped and
+        // owner-checked, so a replacement another plugin published in the meantime is untouched.
+        // Retired first, so the sweep below finds the dependents stale *while the binding still
+        // resolves*: their `unmount` runs before the effects take the service away, which is
+        // what lets a plugin hand back what it borrowed from the thing being removed.
+        self.inner().services.retire_owned_by(id);
+        record.state = PluginState::Unloaded;
+        // The disposer is taken out before the record is handed to the context, because the
+        // sweep in `refresh` needs the record to be in the list — its state is how the sweep
+        // knows the plugin is gone — and the effects are reverted after the sweep has run.
+        let mut disposer = core::mem::take(&mut record.disposer);
+        self.inner_mut().plugins.push(record);
+        self.refresh();
+        let revert = disposer.revert(self);
+        let registered: Vec<ServiceName> = {
+            let inner = self.inner();
+            inner
+                .plugins
+                .iter()
+                .find(|record| record.id == id)
+                .map(|record| {
+                    record
+                        .guards
+                        .borrow()
+                        .iter()
+                        .map(|guard| guard.key())
+                        .collect::<Vec<ServiceName>>()
+                })
+                .unwrap_or_default()
+        };
         self.inner_mut().services.remove_owned_by(id);
         {
             let inner = self.inner();
             for name in registered {
                 inner.events.remove_named(name, id);
             }
+            if let Some(retired) = inner.plugins.iter().find(|record| record.id == id) {
+                retired.guards.borrow_mut().clear();
+            }
         }
-        record.guards.borrow_mut().clear();
-        let revert = record.disposer.revert(self);
-        record.state = PluginState::Unloaded;
-        self.inner_mut().plugins.push(record);
-        self.refresh();
         match revert {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -650,17 +689,22 @@ impl Context {
     ///
     /// Returns the first revert failure; remaining plugins still revert.
     pub fn shutdown(&self) -> Result<(), Error> {
-        let ids: Vec<PluginId> = {
+        let mut ids: Vec<(u64, PluginId)> = {
             let inner = self.inner();
             inner
                 .plugins
                 .iter()
                 .filter(|record| record.state.is_active())
-                .map(|record| record.id)
+                .map(|record| (record.activated, record.id))
                 .collect()
         };
+        // Newest activation first, which is the reverse of the order they came up in — not the
+        // reverse of the order they were written in. Those differ as soon as a plugin is written
+        // above something it depends on, and tearing down in the wrong one hands a consumer's
+        // `unmount` a context whose service is already gone.
+        ids.sort_by_key(|(activated, _)| core::cmp::Reverse(*activated));
         let mut first_failure: Option<Error> = None;
-        for id in ids.into_iter().rev() {
+        for (_, id) in ids {
             if let Err(error) = self.unload(id)
                 && first_failure.is_none()
             {

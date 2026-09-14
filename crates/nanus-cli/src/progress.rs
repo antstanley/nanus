@@ -4,7 +4,9 @@
 //! nothing else**. Reasoning and tool activity go to stderr, and they are written
 //! incrementally so a long turn shows progress rather than appearing to hang.
 
+use std::cell::Cell;
 use std::io::Write as _;
+use std::rc::Rc;
 
 use nanus_bundle::Progress;
 use nanus_domain::{ToolName, Usage};
@@ -17,6 +19,8 @@ pub struct StderrProgress {
     tools: bool,
     /// Whether a reasoning heading has been printed for the current step.
     heading_written: bool,
+    /// A flag the process sets when it is interrupted, which the turn reads.
+    stop: Option<Rc<Cell<bool>>>,
 }
 
 impl StderrProgress {
@@ -27,7 +31,20 @@ impl StderrProgress {
             reasoning,
             tools,
             heading_written: false,
+            stop: None,
         }
+    }
+
+    /// Returns the reporter, asking the turn to stop when `stop` is set.
+    ///
+    /// A headless run has no interface to press a key in. Without this, Ctrl-C killed the
+    /// process outright: no answer, and no recorded session to resume from — which is the worst
+    /// of both, since the turn's work is what a resume would build on. With it, the turn stops
+    /// at its next checkpoint and is recorded as interrupted.
+    #[must_use]
+    pub fn stopping_when(mut self, stop: Rc<Cell<bool>>) -> Self {
+        self.stop = Some(stop);
+        self
     }
 
     /// Writes a line to stderr, ignoring a failure.
@@ -48,6 +65,10 @@ impl StderrProgress {
 }
 
 impl Progress for StderrProgress {
+    fn cancelled(&self) -> bool {
+        self.stop.as_ref().is_some_and(|stop| stop.get())
+    }
+
     fn reasoning(&mut self, delta: &str) {
         if !self.reasoning {
             return;
@@ -128,5 +149,20 @@ mod tests {
 
     fn tool() -> ToolName {
         ToolName::new("read").unwrap_or_else(|_| unreachable!("read is a valid tool name"))
+    }
+
+    /// The interrupt the binary watches for reaches the loop through this flag; without the
+    /// wiring the turn would run to its budget and the session would never be recorded.
+    #[test]
+    fn the_reporter_asks_the_turn_to_stop_when_the_flag_is_set() {
+        let stop = Rc::new(Cell::new(false));
+        let reporter = StderrProgress::new(false, false).stopping_when(Rc::clone(&stop));
+        assert!(!reporter.cancelled(), "nothing has asked it to stop");
+
+        stop.set(true);
+        assert!(reporter.cancelled(), "the interrupt reaches the loop");
+
+        // The other direction: a reporter with no flag — every other caller — never asks.
+        assert!(!StderrProgress::new(false, false).cancelled());
     }
 }

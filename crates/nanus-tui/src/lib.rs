@@ -37,6 +37,7 @@
 pub mod buffer;
 pub mod command;
 pub mod compact;
+pub mod notice;
 pub mod replay;
 pub mod stats;
 pub mod transcript;
@@ -48,6 +49,7 @@ pub mod runtime;
 pub use buffer::{InputBuffer, KeyOutcome};
 pub use command::{Command, Submission, submission_of};
 pub use compact::Detail;
+pub use notice::{Ending, stopping};
 pub use replay::{recording_of, transcript_of};
 pub use stats::Throughput;
 pub use transcript::{Entry, EntryKind, Role, Transcript};

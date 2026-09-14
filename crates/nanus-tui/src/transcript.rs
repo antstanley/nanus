@@ -241,46 +241,75 @@ impl Entry {
     }
 }
 
-/// Counts the display lines a paragraph needs at `width` columns.
+/// Counts the display rows a line of text needs at `width` columns.
 ///
-/// The model is `ceil(characters / width)`, which is exact when every character is
-/// one column wide — the case for the ASCII and common Latin text a transcript
-/// mostly holds. Wide characters and combining marks are therefore slightly
-/// under-counted; the renderer still wraps them correctly, and the only cost is that
-/// a row estimate can be one too small. Over-counting would leave a visible blank
-/// row, so rounding *down* is the safer error.
+/// The break modelled here is the one the renderer makes: words are packed until the next will
+/// not fit, the space that would have separated them is dropped when the row breaks, and a word
+/// longer than a row is split across rows.
 ///
-/// Shared with the view, which needs the same estimate to turn a scroll offset
-/// measured in rows into the line index a renderer can actually skip to.
+/// That last part is why this is not `ceil(characters / width)`. Ceiling division cannot see the
+/// space a broken row wastes, so it under-counts a line made of words that are each just over
+/// half the width — the shape of a list of paths — and an under-count is not a cosmetic error:
+/// the scroll bound is computed from it, so the rows it missed cannot be reached at any offset.
+/// The estimate was a lower bound and the reader had no way to see the rest of the line.
+#[must_use]
 pub(crate) fn wrap_count(text: &str, width: u16) -> u32 {
+    let usable = u32::from(width.max(1));
     // An empty paragraph still occupies the row it is drawn on.
     if text.is_empty() {
         return 1;
     }
-    let columns = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
-    wrap_rows(columns, width)
+    text.split('\n')
+        .map(|line| rows_of(line, usable))
+        .fold(0_u32, u32::saturating_add)
 }
 
-/// Counts the display rows `columns` columns of text need at `width` columns.
-///
-/// The same estimate as [`wrap_count`], for a caller that has already measured its
-/// text — a rendered line knows its own width, and counting its characters again to
-/// learn the same number would be work for nothing.
-pub(crate) fn wrap_rows(columns: u32, width: u16) -> u32 {
-    // Precondition: a zero width would divide by zero.
-    assert!(width >= 1, "a wrap width is at least one column");
-    if columns == 0 {
+/// Counts the rows one paragraph of `text` occupies, in rows of at most `width` columns.
+fn rows_of(line: &str, width: u32) -> u32 {
+    if line.is_empty() {
         return 1;
     }
-    let usable = u32::from(width);
-    // Ceiling division without the overflow a `+ usable - 1` would risk.
-    let full = columns.checked_div(usable).unwrap_or(0);
-    let remainder = columns.checked_rem(usable).unwrap_or(1);
-    if remainder == 0 {
-        full.max(1)
-    } else {
-        full.saturating_add(1)
+    let mut rows = 1_u32;
+    let mut used = 0_u32;
+    // Whitespace since the last word: it is kept inside a row and dropped at a break.
+    let mut pending = 0_u32;
+    let mut word = 0_u32;
+    for character in line.chars() {
+        if character.is_whitespace() {
+            if word > 0 {
+                place(&mut rows, &mut used, &mut pending, word, width);
+                word = 0;
+            }
+            pending = pending.saturating_add(1);
+        } else {
+            word = word.saturating_add(1);
+        }
     }
+    if word > 0 {
+        place(&mut rows, &mut used, &mut pending, word, width);
+    }
+    rows
+}
+
+/// Places one word on the current row, breaking the row — and the word — as it must.
+fn place(rows: &mut u32, used: &mut u32, pending: &mut u32, mut word: u32, width: u32) {
+    let separator = if *used == 0 { 0 } else { *pending };
+    if used.saturating_add(separator).saturating_add(word) <= width {
+        *used = used.saturating_add(separator).saturating_add(word);
+        *pending = 0;
+        return;
+    }
+    if *used > 0 {
+        *rows = rows.saturating_add(1);
+        *used = 0;
+    }
+    *pending = 0;
+    // A word wider than a row is split rather than allowed to overflow one.
+    while word > width {
+        *rows = rows.saturating_add(1);
+        word = word.saturating_sub(width);
+    }
+    *used = word;
 }
 
 /// An ordered list of entries, with a streaming tail at most.
@@ -637,5 +666,26 @@ mod tests {
             entry.push_str("more", false);
         });
         assert!(outcome.is_err());
+    }
+    /// The count models the break the renderer makes, and these are the cases where ceiling
+    /// division and word wrapping disagree — the first two measured against ratatui's own line
+    /// count. Every one of them is a line whose bottom rows were unreachable while the estimate
+    /// was a lower bound.
+    #[test]
+    fn a_wrapped_line_is_counted_the_way_it_is_drawn() {
+        assert_eq!(wrap_count("hello world this is a test of wrapping", 10), 5);
+        assert_eq!(wrap_count("a bbbbb a bbbbb", 5), 4);
+        // Words just over half the width: one per row, where `ceil(chars / width)` said four.
+        let tokens = ["TOKEN0000000000000000"; 6].join(" ");
+        assert_eq!(tokens.chars().count(), 131);
+        assert_eq!(wrap_count(&tokens, 40), 6);
+        // A word wider than a row is split rather than allowed to overflow one.
+        assert_eq!(wrap_count(&"x".repeat(25), 10), 3);
+        // Lines break where the text does, and the obvious counts stay obvious.
+        assert_eq!(wrap_count("one\ntwo", 40), 2);
+        assert_eq!(wrap_count("short", 40), 1);
+        assert_eq!(wrap_count("", 40), 1);
+        // A row of spaces is a row.
+        assert_eq!(wrap_count("   ", 40), 1);
     }
 }

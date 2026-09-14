@@ -31,8 +31,10 @@
 //! workspace a session belongs to. `run`, `tui`, and `service` differ in how long the
 //! agent lives, not in what the agent is.
 
+use std::cell::Cell;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use nanus_adapter_config::NanusConfig;
@@ -269,12 +271,17 @@ pub async fn prepare() -> Result<Ready, String> {
             // A help or version request is a successful outcome, not a failure, so it
             // is printed and treated as done.
             let rendered = error.render().to_string();
+            // `use_stderr` is true for an error and false for a help or version request,
+            // and it selects the *stream* as well as the outcome. Printing everything to
+            // stdout put clap's "unexpected argument" and the whole usage block into a
+            // redirected stdout — which is documented as the answer and nothing else, so a
+            // script capturing an answer captured a usage message instead.
+            if error.use_stderr() {
+                eprint!("{rendered}");
+                return Err(String::from("invalid arguments"));
+            }
             print!("{rendered}");
-            return if error.use_stderr() {
-                Err(String::from("invalid arguments"))
-            } else {
-                Ok(Ready::Done)
-            };
+            return Ok(Ready::Done);
         }
     };
     // The subcommand is taken by value so the task words move rather than clone, and
@@ -625,6 +632,20 @@ async fn prepare_service(args: &Options, action: ServiceAction) -> Result<Ready,
     }
 }
 
+/// Sets `stop` when the process is interrupted.
+///
+/// Resolves when the signal arrives, or immediately when it cannot be watched for at all — a
+/// platform without the signal, in which case the turn simply runs to completion as it did
+/// before. Nothing here prints: what the reader sees is the turn's own ending.
+async fn watch_for_interrupt(stop: Rc<Cell<bool>>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+        return;
+    };
+    interrupt.recv().await;
+    stop.set(true);
+}
+
 /// Mounts a harness and runs one turn, synchronously.
 ///
 /// Prints the answer on stdout and nothing else, persists the session, and tears the
@@ -645,9 +666,19 @@ fn run_turn(
         Some(reference) => load_session(&harness, reference)?,
         None => harness.new_session(workspace),
     };
-    let mut reporter = StderrProgress::new(verbose, verbose);
+    // A headless run is the one mode with no interface to press a key in, so the interrupt is
+    // watched for here and handed to the turn through its reporter: it stops at the next
+    // checkpoint, the session is recorded, and the exit code says the turn did not complete.
+    let interrupted = Rc::new(Cell::new(false));
+    let mut reporter = StderrProgress::new(verbose, verbose).stopping_when(Rc::clone(&interrupted));
 
-    let outcome = kernel_block_on(harness.runner.run_turn(&mut session, prompt, &mut reporter));
+    let outcome = crate::block_on_local(async {
+        let watch = watch_for_interrupt(Rc::clone(&interrupted));
+        let turn = harness.runner.run_turn(&mut session, prompt, &mut reporter);
+        // Both at once: the turn does the work, and the watcher is what makes it stop when the
+        // process is asked to.
+        tokio::join!(turn, watch).0
+    });
 
     // Recorded whatever the turn did, and before anything is printed: a caller that
     // redirects stdout and loses the process should still find the transcript, and a turn

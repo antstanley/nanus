@@ -16,6 +16,13 @@ const DATA_PREFIX: &str = "data:";
 /// The sentinel `DeepSeek` sends after the last frame.
 const DONE_SENTINEL: &str = "[DONE]";
 
+/// The most tool calls one response may carry.
+///
+/// A ceiling on a number a provider supplies, because it sizes an allocation. No model calls
+/// anything like this many tools in one response — the toolset has seven tools and the
+/// harness runs four at once — so a response claiming more is malformed rather than ambitious.
+const MAX_TOOL_CALLS: usize = 256;
+
 /// Builds the JSON body for a chat completion.
 ///
 /// Only the fields `DeepSeek` actually honours are sent. `presence_penalty`,
@@ -230,7 +237,17 @@ impl SseDecoder {
             return None;
         }
         let line = std::mem::take(&mut self.pending);
-        decode_line(&line)
+        let payload = decode_line(&line)?;
+        // The sentinel is tested here too, and not only in `push`: the last frame of a stream
+        // frequently arrives without a trailing newline, so this is *the* path `[DONE]` takes
+        // when a server closes immediately after it. Returning it made `observe_line` try to
+        // parse `[DONE]` as JSON, which failed the whole turn — an answer that had fully
+        // arrived was thrown away because the goodbye was not understood.
+        if payload == DONE_SENTINEL {
+            self.done = true;
+            return None;
+        }
+        Some(payload)
     }
 }
 
@@ -349,9 +366,16 @@ impl StreamAccumulator {
     /// Folds one `tool_calls` delta into the partial call it belongs to.
     fn observe_tool_call_delta(&mut self, delta: &Value) {
         let index = delta.get("index").and_then(Value::as_u64).unwrap_or(0);
-        // An index that cannot be represented is a protocol violation; folding it
-        // into slot zero keeps the arguments in order rather than dropping them.
-        let index = usize::try_from(index).unwrap_or_default();
+        // An index beyond any plausible response is a protocol violation rather than a call:
+        // it is used to size a vector, so an index of 2^64-1 would allocate until the process
+        // died. Folding it into slot zero keeps the arguments in order rather than dropping
+        // them, which is what the previous line already did for an index that would not fit a
+        // `usize` — a case that cannot arise on a 64-bit target, making that guard alone
+        // insufficient.
+        let index = usize::try_from(index)
+            .ok()
+            .filter(|index| *index < MAX_TOOL_CALLS)
+            .unwrap_or_default();
         while self.calls.len() <= index {
             self.calls.push(PartialToolCall::default());
         }
@@ -835,5 +859,39 @@ mod tests {
         // The second close is a no-op, so a finish is never reported twice.
         assert!(accumulator.take_ready().is_none());
         assert!(accumulator.is_closed());
+    }
+    /// A sentinel that arrives without a trailing newline still ends the stream cleanly.
+    ///
+    /// `push` handles `[DONE]` for whole lines; the *tail* is what `finish` decodes, and a
+    /// server that closes immediately after `data: [DONE]` leaves exactly that. Returning the
+    /// sentinel as a payload made the caller try to parse `[DONE]` as JSON — an `LlmEvent::Error`
+    /// that failed a turn whose answer had already arrived in full.
+    #[test]
+    fn a_sentinel_with_no_trailing_newline_ends_the_stream() {
+        let mut decoder = SseDecoder::new();
+        let payloads = decoder.push(b"data: {\"id\":1}\ndata: [DONE]");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the whole frame is returned: {payloads:?}"
+        );
+        assert!(
+            decoder.finish().is_none(),
+            "the sentinel is consumed rather than returned as a frame"
+        );
+        assert!(decoder.done, "and the stream is marked finished");
+    }
+
+    /// The other half: a genuine tail — a frame with no newline — is still returned, because
+    /// dropping it would lose the last delta of a response.
+    #[test]
+    fn a_real_tail_is_still_decoded() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push(b"data: {\"id\":1}").is_empty());
+        assert_eq!(
+            decoder.finish().as_deref(),
+            Some("{\"id\":1}"),
+            "a frame that never got its newline is still a frame"
+        );
     }
 }

@@ -362,6 +362,18 @@ impl SessionLog {
                     ..
                 } => {
                     let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
+                    // Nothing here reconciles a call that no result answers, and that is
+                    // deliberate rather than an oversight. Such a call cannot be replayed — the
+                    // provider refuses an assistant message whose calls are unanswered — but
+                    // the two ways out are both closed: dropping the call loses the reasoning
+                    // of a tool-using turn, and writing a synthetic result is the fold
+                    // *inventing* a message, which the postcondition at the end of this
+                    // function forbids. The state is also unreachable through the harness: a
+                    // step records its calls and runs them in the same step, and a turn is
+                    // written to the store only once it is over, so a process that died between
+                    // the two took the whole turn with it. A log that holds one was written by
+                    // something other than this loop.
+                    //
                     // An assistant turn with neither text nor tool calls carries
                     // nothing a model can read, so it is skipped rather than
                     // replayed as an empty message.
