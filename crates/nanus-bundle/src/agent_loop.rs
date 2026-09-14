@@ -387,9 +387,7 @@ impl AgentRunner {
             // would be replayed as one that ran, and the next request would be refused for
             // a call nothing ever answered.
             if progress.cancelled() {
-                assembled.interrupted = true;
-                assembled.calls.clear();
-                assembled.partial.clear();
+                assembled.interrupt();
                 break;
             }
             match event {
@@ -418,6 +416,14 @@ impl AgentRunner {
                     return Err(BundleError::Model(message));
                 }
             }
+        }
+        // Asked once more now the stream has ended, which is the last moment before this step's
+        // tool calls would run. A stop that arrives during the *closing* await — the end of the
+        // response body, after the last event — is not seen by the check inside the loop,
+        // because there is no next event to see it at, and running a command the reader has
+        // just asked to stop is the one thing stopping is for.
+        if progress.cancelled() {
+            assembled.interrupt();
         }
         assembled.settle();
         Ok(assembled)
@@ -530,6 +536,21 @@ struct Assembled {
     partial: Vec<PartialCall>,
     /// Whether the stream was cut short by a stop request rather than finishing.
     interrupted: bool,
+}
+
+impl Assembled {
+    /// Marks the assembly as cut short: the words stay, the calls that never ran go.
+    ///
+    /// One method rather than the same three assignments at each site, because the pair is the
+    /// point: what the model already said is kept — a conversation that forgets words the reader
+    /// watched arrive is worse than one that keeps them — and the calls it was part way through
+    /// naming are dropped, because a call with no result to answer it would be replayed as one
+    /// that ran.
+    fn interrupt(&mut self) {
+        self.interrupted = true;
+        self.calls.clear();
+        self.partial.clear();
+    }
 }
 
 impl Default for Assembled {
@@ -792,6 +813,75 @@ mod tests {
         fn text(&mut self, _delta: &str) {
             self.stop();
         }
+    }
+
+    /// A driver that asks the turn to stop on the *n*th question the loop asks.
+    ///
+    /// The loop asks once before each step, once before each streamed event, and once more when
+    /// the stream has ended. A count is how a test reaches that last one: a flag set by `text` is
+    /// seen at the next event, and the case here is a stop that arrives after the final one.
+    struct StopOnCheck {
+        after: u32,
+        asked: std::cell::Cell<u32>,
+    }
+
+    impl Progress for StopOnCheck {
+        fn cancelled(&self) -> bool {
+            let asked = self.asked.get().saturating_add(1);
+            self.asked.set(asked);
+            asked > self.after
+        }
+    }
+
+    /// A stop that arrives while the response is *closing* still stops the step.
+    ///
+    /// The check inside the stream loop only runs when another event arrives, so a stop during
+    /// the last await — the end of the response body — was not seen until the next step, and this
+    /// step's tools ran anyway. Running the command a reader has just asked to stop is the one
+    /// thing stopping is for.
+    #[tokio::test]
+    async fn a_stop_during_the_closing_await_still_stops_the_step() {
+        let llm = ScriptedLlm::handle(vec![vec![
+            LlmEvent::TextDelta("about to run something".to_owned()),
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("c1")),
+                name: Some(ToolName::new("echo").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{\"x\":1}".to_owned(),
+            },
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]]);
+        let Some(runner) = runner(Rc::clone(&llm), registry_with_echo()) else {
+            return;
+        };
+        let mut session = session();
+        // One question for the step, three for the events, and the fourth is the one asked after
+        // the stream ended — which is the check under test.
+        let mut progress = StopOnCheck {
+            after: 4,
+            asked: std::cell::Cell::new(0),
+        };
+
+        let outcome = runner.run_turn(&mut session, "hi", &mut progress).await;
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else { return };
+        assert_eq!(
+            outcome.reason,
+            TurnEndReason::Interrupted,
+            "the stop was seen rather than deferred to the next step"
+        );
+        assert_eq!(outcome.answer, "about to run something");
+        assert!(
+            !session
+                .log()
+                .events()
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ToolResult { .. })),
+            "and the tool never ran: {:?}",
+            session.log().events()
+        );
     }
 
     /// A stop asked for before a step is issued takes effect there: no request is made, and

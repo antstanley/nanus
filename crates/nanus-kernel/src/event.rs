@@ -156,11 +156,11 @@ impl<K: 'static> EventKey<K> {
     /// `const`. The documentation used to promise a compile-time panic, which was never true of
     /// any code path — the literal went straight into `Name::new_unchecked`.
     ///
-    /// The invariant is held elsewhere instead: [`EventKey::checked`] for any name that is not a
-    /// literal, and the test at the bottom of this module, which asserts the names the kernel
-    /// ships are names [`Name::new`] accepts. A name that is not one still keys the registry —
-    /// names are compared as strings — so the cost of getting it wrong is a listener that never
-    /// hears an event, not a broken invariant.
+    /// The invariant is held by [`EventKey::checked`], which is what any name that is not a
+    /// literal should go through: it builds the same key and refuses a name the kernel would not
+    /// accept. A name that is not one still keys the registry — names are compared as strings —
+    /// so the cost of getting it wrong is a listener that never hears an event, not a broken
+    /// invariant.
     #[must_use]
     pub const fn of(name: &'static str) -> Self {
         let validated = Name::new_unchecked(name);
