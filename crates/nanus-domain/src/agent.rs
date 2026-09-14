@@ -34,13 +34,13 @@ use crate::session::{SessionLog, TurnEndReason};
 
 /// Default number of steps a single turn may take.
 ///
-/// A hundred and twenty-eight is chosen to be far above any genuine tool-using turn and
-/// far below the point at which a runaway loop becomes expensive. The first number tried
-/// was sixteen, on the theory that a real turn is a handful of steps; the first
-/// multi-file task this harness was given spent twenty-seven steps reading before it
-/// wrote anything, so the theory was wrong and the ceiling was raised until it stopped
-/// being the thing that ended a turn.
-pub const DEFAULT_MAX_STEPS_PER_TURN: u32 = 128;
+/// Far above any genuine tool-using turn and far below the point at which a runaway loop
+/// becomes expensive, which are the two bounds this number is always a compromise between.
+/// The first value tried was sixteen, on the theory that a real turn is a handful of steps;
+/// the first multi-file task this harness was given spent twenty-seven steps reading before
+/// it wrote anything, so the theory was wrong and the ceiling has been raised every time it
+/// turned out to be the thing that ended a turn rather than the loop it was meant to catch.
+pub const DEFAULT_MAX_STEPS_PER_TURN: u32 = 512;
 
 /// Default number of tool calls a harness may have in flight at once.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: u32 = 4;
@@ -425,7 +425,7 @@ mod tests {
     fn the_default_budget_is_the_documented_one() {
         let machine = machine();
         assert_eq!(machine.step_budget(), DEFAULT_MAX_STEPS_PER_TURN);
-        assert_eq!(machine.step_budget(), 128);
+        assert_eq!(machine.step_budget(), 512);
     }
 
     #[test]

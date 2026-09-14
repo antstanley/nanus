@@ -78,16 +78,21 @@ The reference harness has **no** step budget: a tool loop continues until the mo
 stops calling tools. `nanus` bounds a turn. This is a deliberate divergence and is
 documented at the type that enforces it.
 
-The bound is 128 steps, and the number has been wrong twice in the same direction. It
-started at sixteen and then thirty-two, on the theory that a genuine tool-using turn is a
-handful of steps and anything longer is a runaway. Then the first multi-file task this
+The bound is 512 steps. It began at sixteen, on the theory that a genuine tool-using turn
+is a handful of steps and anything longer is a runaway; the first multi-file task this
 harness was given — three counters in the interface, touching two crates — spent
-twenty-seven of its thirty-two steps reading before it made its first edit, and closed
+twenty-seven of its thirty-two steps reading before it made its first edit and closed
 mid-change. A bound a normal task hits is not bounding a runaway; it is bounding the task.
-Two things came out of that besides the number. The model is told its budget in the system
-prompt, because a ceiling nobody mentioned is not one it can pace against. And the ending
-carries the reason it stopped, because a turn cut off at the budget used to reach the
-interface looking exactly like one that had finished.
+So it went to a hundred and twenty-eight, and then to five hundred and twelve: the last
+raise is headroom for the work that legitimately takes a long time — a refactor across
+several crates, a task whose build-and-test cycle runs a dozen times — rather than a fix
+for a failure anyone watched happen, and the honesty of the number is that a runaway loop
+is now stopped later than a long turn ends.
+
+Two things came out of the first raise besides the number. The model is told its budget in
+the system prompt, because a ceiling nobody mentioned is not one it can pace against. And
+the ending carries the reason it stopped, because a turn cut off at the budget used to
+reach the interface looking exactly like one that had finished.
 
 ### The current model ids, and no aliases for the dead ones
 
