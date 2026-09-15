@@ -229,6 +229,14 @@ pub enum Frame {
     /// request's active time because the two rates an interface shows — tokens per
     /// second for the request, and the share of the prompt that was cached — are about
     /// this request's accounting and this request's clock.
+    ///
+    /// The request's time is reported as a decomposition rather than as one figure,
+    /// because the parts answer different questions and only one of them is the model's
+    /// generation speed. Issuing the request, waiting for the first token, generating, and
+    /// closing the stream are four different costs; a rate that divides generated tokens by
+    /// their sum charges the three that are not generation to the model, and understates it
+    /// most for exactly the steps a coding session is made of — a tool call is a short
+    /// generation behind a long wait.
     Usage {
         /// Tokens the request used, prompt and completion, which an interface
         /// accumulates rather than replaces.
@@ -253,9 +261,39 @@ pub enum Frame {
         ///
         /// Active rather than elapsed: it starts when the request is issued and ends
         /// when its stream does, so a rate computed from it excludes the idle time
-        /// between turns and the tool time *within* one.
+        /// between turns and the tool time *within* one. It is the whole request, so it is
+        /// `ttft_ms` plus the generation plus however long the stream took to close — which
+        /// is why it is no longer what a rate is divided by.
         #[serde(default)]
         duration_ms: u64,
+        /// The share of `completion_tokens` the model spent thinking.
+        ///
+        /// A subset of the generated count rather than a part of it, so it must not be added
+        /// to `completion_tokens` — the provider bills the same tokens once. It is carried
+        /// because thinking is generated at the model's speed but is not visible in the
+        /// answer, so a single rate over both reports a number a reader watching the
+        /// transcript cannot account for.
+        #[serde(default)]
+        reasoning_tokens: u32,
+        /// How long the request waited before its first generated token, in milliseconds.
+        ///
+        /// This is the wait a reader feels, and the part a rate that divides by the whole
+        /// request silently charges to generation. It spans everything between issuing the
+        /// request and the first token arriving — the provider's queue, the connection, and
+        /// the prompt being read — so it bounds any of those rather than measuring prefill
+        /// alone. Nothing at this layer can separate them, and the frame does not pretend to.
+        #[serde(default)]
+        ttft_ms: u64,
+        /// How long the request spent generating: its first token to its last, in
+        /// milliseconds.
+        ///
+        /// This is the only stretch during which the model was generating anything, so it is
+        /// what a generation rate divides by. Zero when the stream carried fewer than two
+        /// chunks — there is no interval between an instant and itself — and a reader that
+        /// divides by it has to decide for itself what to do instead, because dividing by
+        /// zero is not an answer.
+        #[serde(default)]
+        decode_ms: u64,
     },
 
     /// The turn ended, whatever the outcome.
@@ -421,6 +459,9 @@ mod tests {
                 cache_hit_tokens: 900,
                 cache_miss_tokens: 100,
                 duration_ms: 2500,
+                reasoning_tokens: 40,
+                ttft_ms: 700,
+                decode_ms: 1_500,
             },
             Frame::Done {
                 answer: "done".to_owned(),
@@ -507,9 +548,13 @@ mod tests {
         assert!(decode::<Request>("").is_err());
     }
 
-    /// The cache counters and the active time were added to a frame that used to carry
-    /// only a token count. A client talking to an agent that predates them must read the
-    /// frame rather than fail on it, and an absent counter is zero.
+    /// The cache counters, the generation window, and the active time were added to a frame
+    /// that used to carry only a token count. A client talking to an agent that predates them
+    /// must read the frame rather than fail on it, and an absent counter is zero.
+    ///
+    /// Zero is also what an older agent's frame *means* for the two durations: a reader that
+    /// divides by the generation window has to treat zero as "not measured" rather than as an
+    /// instantaneous request, which is why the interface falls back rather than dividing.
     #[test]
     fn a_usage_frame_from_an_older_agent_still_decodes() {
         let decoded = decode::<Frame>(r#"{"frame":"usage","tokens":42}"#);
@@ -521,6 +566,9 @@ mod tests {
                 cache_hit_tokens: 0,
                 cache_miss_tokens: 0,
                 duration_ms: 0,
+                reasoning_tokens: 0,
+                ttft_ms: 0,
+                decode_ms: 0,
             })
         );
     }

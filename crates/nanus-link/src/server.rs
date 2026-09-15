@@ -497,6 +497,8 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
         let mut progress = Broadcast {
             held,
             started: None,
+            first_token: None,
+            last_token: None,
         };
         agent
             .runner()
@@ -551,6 +553,31 @@ struct Broadcast<'a> {
     /// produced here, which keeps the loop's [`Progress`] contract about what happened
     /// rather than about how long it took.
     started: Option<Instant>,
+    /// When this step's first generated delta arrived, if any did.
+    ///
+    /// Taken from every delta callback rather than only from the two that carry something a
+    /// reader sees, because a step that answers with a tool call and no prose generates
+    /// without calling either of them — and in a coding session that is the ordinary step,
+    /// not the exceptional one. Timing only the visible kinds would report the speed of the
+    /// steps that happened to talk, which are the long ones.
+    first_token: Option<Instant>,
+    /// When this step's most recent generated delta arrived.
+    ///
+    /// The other end of the generation window, and the reason a rate is no longer divided by
+    /// the whole request: between the first token and this one the model was generating, and
+    /// outside them it was not.
+    last_token: Option<Instant>,
+}
+
+/// Milliseconds between two instants, saturating rather than failing.
+///
+/// `as_millis` is a `u128`; a request that ran for longer than a `u64` of milliseconds did
+/// not happen, so the conversion saturates rather than failing the frame. The subtraction
+/// saturates too, because these instants are taken in an order the callbacks imply but that
+/// no signature enforces, and a clock read backwards should report a duration of zero rather
+/// than a number near `u64::MAX`.
+fn millis_between(from: Instant, to: Instant) -> u64 {
+    u64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Broadcast<'_> {
@@ -567,23 +594,60 @@ impl Broadcast<'_> {
             )
         });
     }
+
+    /// Records that the model generated something, whatever it was.
+    ///
+    /// The three delta callbacks are one event to a clock: what arrived changes what a reader
+    /// sees and nothing about when it arrived. Both ends of the window are written here so
+    /// that a step either has a measurable generation window or has none, and never half of
+    /// one.
+    fn note_token(&mut self) {
+        let now = Instant::now();
+        if self.first_token.is_none() {
+            self.first_token = Some(now);
+        }
+        self.last_token = Some(now);
+    }
+
+    /// Starts the clock for the request a step is about to issue.
+    ///
+    /// All three instants are cleared together rather than only the one the last usage record
+    /// consumed. A request that generated nothing leaves its first and last token unread, and
+    /// clearing only `started` would let the next step inherit them and report a generation
+    /// window belonging to the step before it — which is a wrong number presented as a
+    /// measurement rather than as an absence.
+    fn start_request(&mut self) {
+        self.started = Some(Instant::now());
+        self.first_token = None;
+        self.last_token = None;
+    }
 }
 
 impl Progress for Broadcast<'_> {
     fn text(&mut self, delta: &str) {
+        self.note_token();
         self.push(&Frame::Text {
             delta: delta.to_owned(),
         });
     }
 
     fn reasoning(&mut self, delta: &str) {
+        self.note_token();
         self.push(&Frame::Reasoning {
             delta: delta.to_owned(),
         });
     }
 
+    fn tool_call(&mut self, _delta: &str) {
+        // The delta is the loop's to assemble and nothing here forwards it: a reader is told
+        // about a call as a call, once the step has decided to run it. What this observer
+        // wants is only that the model generated, which for a tool-call step is the only
+        // evidence there is.
+        self.note_token();
+    }
+
     fn step_started(&mut self, step: u32) {
-        self.started = Some(Instant::now());
+        self.start_request();
         self.push(&Frame::Step { step });
     }
 
@@ -606,21 +670,49 @@ impl Progress for Broadcast<'_> {
     }
 
     fn usage(&mut self, usage: &Usage) {
-        // The request's active time, taken from the step that issued it. A usage record
-        // that arrives with no step before it cannot be timed, and reports zero rather
-        // than a duration measured from some other request's start. `as_millis` is a
-        // `u128`; a request that ran for longer than a `u64` of milliseconds did not
-        // happen, so the conversion saturates rather than failing the frame.
-        let duration_ms = self
-            .started
-            .take()
-            .map_or(0, |started| started.elapsed().as_millis());
+        let now = Instant::now();
+        let started = self.started.take();
+        let first = self.first_token.take();
+        let last = self.last_token.take();
+        // Both ends of the window are written together or not at all, so one present without
+        // the other would mean a callback took a clock reading this code does not take.
+        assert!(
+            first.is_some() == last.is_some(),
+            "a generation window with only one end is not one this observer records"
+        );
+        // The request ends at its usage record — except when a generated delta arrived after
+        // it, which a provider is free to do and which must not make the request end before
+        // its own last token. Taking the later of the two is what keeps the three durations
+        // addable.
+        let end = last.map_or(now, |last| last.max(now));
+        // A usage record with no step before it cannot be timed, and reports zero rather than
+        // a duration measured from some other request's start.
+        let duration_ms = started.map_or(0, |at| millis_between(at, end));
+        // Measured from the step's own start, not from the request: the wait is part of what
+        // the reader waits for even though it is not part of generation.
+        let (ttft_ms, decode_ms) = match (started, first, last) {
+            (Some(at), Some(first), Some(last)) => {
+                (millis_between(at, first), millis_between(first, last))
+            }
+            _ => (0, 0),
+        };
+        // The wait, the generation, and whatever followed the last token are disjoint and
+        // cover the request, so they cannot exceed it. Asserted rather than clamped because a
+        // rate now divides by one of the parts, and parts that could add up to more than the
+        // whole would make the rate a claim about arithmetic instead of about the model.
+        assert!(
+            ttft_ms.saturating_add(decode_ms) <= duration_ms,
+            "a request's {ttft_ms}ms wait plus {decode_ms}ms generation exceeds its {duration_ms}ms"
+        );
         self.push(&Frame::Usage {
             tokens: usage.total_tokens(),
             completion_tokens: usage.completion_tokens,
             cache_hit_tokens: usage.cache_hit_tokens,
             cache_miss_tokens: usage.cache_miss_tokens,
-            duration_ms: u64::try_from(duration_ms).unwrap_or(u64::MAX),
+            duration_ms,
+            reasoning_tokens: usage.reasoning_tokens,
+            ttft_ms,
+            decode_ms,
         });
     }
 }

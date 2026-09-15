@@ -85,6 +85,19 @@ pub trait Progress {
     /// The model emitted more of its reasoning.
     fn reasoning(&mut self, _delta: &str) {}
 
+    /// The model emitted more of a tool call: its name, its arguments, or both.
+    ///
+    /// A step that answers with a tool call and no prose reaches neither of the two
+    /// callbacks above, and that is the common case in a coding session rather than an edge
+    /// one. A listener measuring how fast the model generates therefore has to hear about
+    /// this kind of delta too, or the rate it reports covers only the steps that happened to
+    /// talk — which are the long ones, and the flattering ones.
+    ///
+    /// The delta is the call's arguments as they arrived, which is empty for a chunk that
+    /// carried only a name. Nothing here is for display: the call is assembled and reported
+    /// through [`Progress::tool_started`] once the step has decided to run it.
+    fn tool_call(&mut self, _delta: &str) {}
+
     /// A step began.
     fn step_started(&mut self, _step: u32) {}
 
@@ -404,7 +417,10 @@ impl AgentRunner {
                     name,
                     arguments_delta,
                     ..
-                } => assembled.absorb(id, name, &arguments_delta),
+                } => {
+                    progress.tool_call(&arguments_delta);
+                    assembled.absorb(id, name, &arguments_delta);
+                }
                 LlmEvent::Usage(usage) => {
                     progress.usage(&usage);
                     assembled.usage = Some(usage);
@@ -831,6 +847,94 @@ mod tests {
             self.asked.set(asked);
             asked > self.after
         }
+    }
+
+    /// A driver that writes down which of the delta callbacks it was told about, in order.
+    ///
+    /// The kind of each delta rather than the delta itself: what is under test is *which* kinds
+    /// of generation reach a listener, because a rate is measured from these callbacks and a kind
+    /// that never arrives is a kind that is not counted.
+    #[derive(Default)]
+    struct Recorder {
+        told: Vec<&'static str>,
+    }
+
+    impl Progress for Recorder {
+        fn text(&mut self, _delta: &str) {
+            self.told.push("text");
+        }
+
+        fn reasoning(&mut self, _delta: &str) {
+            self.told.push("reasoning");
+        }
+
+        fn tool_call(&mut self, _delta: &str) {
+            self.told.push("tool_call");
+        }
+    }
+
+    /// A step that answers with a tool call and no prose still reaches a listener.
+    ///
+    /// This is the ordinary step in a coding session rather than an edge case, and before there
+    /// was a callback for it, it reached none: an observer timing generation heard nothing at all
+    /// from the steps that only called a tool, so the rate it reported was the rate of the steps
+    /// that happened to talk — the long ones.
+    #[tokio::test]
+    async fn a_step_that_only_calls_a_tool_still_reaches_a_listener() {
+        let llm = ScriptedLlm::handle(vec![vec![
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("c1")),
+                name: Some(ToolName::new("echo").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{\"x\":1}".to_owned(),
+            },
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]]);
+        let Some(runner) = runner(Rc::clone(&llm), registry_with_echo()) else {
+            return;
+        };
+        let mut session = session();
+        let mut progress = Recorder::default();
+
+        assert!(
+            runner
+                .run_turn(&mut session, "hi", &mut progress)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            progress.told,
+            vec!["tool_call"],
+            "the call is generation, and nothing else was said"
+        );
+    }
+
+    /// The other direction: a step that only speaks reports prose and not a tool call, so the
+    /// listener is told what arrived rather than being told the same thing whatever did.
+    #[tokio::test]
+    async fn a_step_that_only_speaks_is_reported_as_prose() {
+        let llm = ScriptedLlm::handle(vec![vec![
+            LlmEvent::ReasoningDelta("thinking".to_owned()),
+            LlmEvent::TextDelta("an answer".to_owned()),
+            LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ]]);
+        let Some(runner) = runner(Rc::clone(&llm), registry_with_echo()) else {
+            return;
+        };
+        let mut session = session();
+        let mut progress = Recorder::default();
+
+        assert!(
+            runner
+                .run_turn(&mut session, "hi", &mut progress)
+                .await
+                .is_ok()
+        );
+        assert_eq!(progress.told, vec!["reasoning", "text"]);
     }
 
     /// A stop that arrives while the response is *closing* still stops the step.

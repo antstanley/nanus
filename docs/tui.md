@@ -442,32 +442,55 @@ the streaming tail already holds exactly that text it is settled instead of bein
 by a second copy. Appending drew every completed turn's answer twice, once where it was
 written and once after everything the turn did afterwards.
 
-**Three numbers under the composer** are the model's, not the session's:
+**The readings under the composer** are the model's, not the session's:
 
 | | |
 |---|---|
 | `cache hit 96%` | the share of the session's prompt tokens the provider served from its cache |
+| `ttft 0.8s` | how long the last request waited for its first token |
 | `last 41 tok/s` | how fast the last request generated tokens |
 | `avg 38 tok/s` | how fast the session's requests have generated, on average |
 
-Both rates are measured against **active request time** — the time a request spent in
-flight, reported by the agent one request at a time — rather than wall-clock time, so a
-session that sat idle overnight or spent five minutes inside a tool has the same average
-as one that ran its requests back to back. A rate that includes waiting measures the
-person waiting. They count *generated* tokens rather than the whole request: the prompt is
-mostly cache hits, so a prompt-inclusive rate would mostly report how large the context
-had grown, and the cache share is already the number for that side.
+Both rates are measured against **generation time** — the stretch from a request's first
+generated token to its last — rather than against the whole request. The difference is not a
+detail. A request's active time is the wait for its first token, the generation, and however
+long the stream took to close, and only the middle of those is the model generating. In a
+coding session the wait dominates, because it is where the prompt is read, and a tool call is
+a short generation behind a long one — so dividing by the whole request reports a number well
+below the model's speed and calls it the model's speed, and it is worst for exactly the steps
+a session is mostly made of. The wait is shown beside the rates instead, because it is a real
+cost *and* one a reader can do something about: a shorter prompt, or a cached one, shortens
+it.
 
-The line gives up its row before the composer gives up one of its own: on a terminal too
-short for everything, a number the reader can live without is what should go, not the row
-they are typing on.
+Wall-clock time is still not what any of this is measured against, so a session that sat idle
+overnight or spent five minutes inside a tool has the same average as one that ran its
+requests back to back. A rate that includes waiting measures the person waiting. The rates
+count *generated* tokens rather than the whole request: the prompt is mostly cache hits, so a
+prompt-inclusive rate would mostly report how large the context had grown, and the cache
+share is already the number for that side.
+
+The line gives up its readings before it gives up its row, and its row before the composer
+gives up one of its own. On a terminal too narrow for all four, the wait is the one that goes
+— the rates are what the row is for, and a reading running off the end (`avg 150`, with the
+unit lopped off) is worse than one reading fewer. On a terminal too short for everything, a
+number the reader can live without is what should go, not the row they are typing on.
 
 The average is over the session's totals rather than the mean of its per-request rates,
-because a mean of rates is only an average when every request took the same time. The
-arithmetic is whole numbers with `checked_*`, for the workspace's reasons, and a number
-that has not been measured is drawn as a dash: zero is a measurement — it says the model
-generated nothing — and showing it for "no request has finished yet" would be a claim
-rather than a blank.
+because a mean of rates is only an average when every request took the same time. A request
+whose generation window the agent could not measure is left out of both sides of that average,
+rather than contributing its tokens to the numerator and nothing to the denominator. The
+arithmetic is whole numbers with `checked_*`, for the workspace's reasons, and a number that
+has not been measured is drawn as a dash: zero is a measurement — it says the model generated
+nothing — and showing it for "no request has finished yet" would be a claim rather than a
+blank.
+
+The link carries the request's time as a decomposition rather than as one figure — the wait,
+the generation, the whole request, and how much of the generation was thinking — because the
+parts answer different questions and only one of them is the model's speed. An interface that
+wants the prompt-side figure has it too: prompt tokens per second of waiting is a floor on the
+provider's prefill throughput, since the wait covers the connection and the provider's queue
+as well as the prompt being read, and the frame does not pretend to separate what nothing at
+this end of a socket can separate.
 
 ## Why the interface is testable
 

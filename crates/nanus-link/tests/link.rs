@@ -25,7 +25,7 @@ use nanus_adapter_local::SystemClock;
 use nanus_adapter_store::JsonlStore;
 use nanus_bundle::AgentRunner;
 use nanus_domain::{
-    AgentConfig, Session, SessionEvent, SessionId, ToolCallId, ToolName, ToolRegistry,
+    AgentConfig, Session, SessionEvent, SessionId, ToolCallId, ToolName, ToolRegistry, Usage,
 };
 use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
 use nanus_link::server::{Agent, Parts};
@@ -68,6 +68,63 @@ impl LlmPort for SlowLlm {
                 reason: FinishReason::Stop,
             }])),
         )
+    }
+}
+
+/// A model that reports what its request cost, and takes long enough for the report to be
+/// measured.
+///
+/// The first step generates *nothing but a tool call*, which is the case that reached no
+/// listener at all before there was a callback for it. Its arguments arrive in two chunks with a
+/// wait between them, so the generation window has two ends to be measured between: a usage
+/// frame carrying a non-zero window is proof that the tool-call delta reached the clock, rather
+/// than merely that the clock works.
+struct MeteredLlm {
+    /// The step the model is on, so the second request answers instead of calling again.
+    step: std::cell::Cell<u32>,
+}
+
+impl LlmPort for MeteredLlm {
+    fn model(&self) -> &'static str {
+        "metered"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        let step = self.step.get();
+        self.step.set(step.saturating_add(1));
+        if step > 0 {
+            return Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta("finished".to_owned()),
+                LlmEvent::Usage(Usage::new(30, 2, 0, 28, 2)),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ]));
+        }
+        let opening = futures::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("call_1")),
+                name: Some(ToolName::new("nowhere").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{".to_owned(),
+            }
+        });
+        let closing = futures::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: "}".to_owned(),
+            }
+        });
+        Box::pin(opening.chain(closing).chain(futures::stream::iter(vec![
+            LlmEvent::Usage(Usage::new(20, 5, 3, 18, 2)),
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ])))
     }
 }
 
@@ -1254,4 +1311,90 @@ fn a_shutdown_request_stops_the_agent_by_itself() {
     });
 
     assert!(served.is_ok(), "{served:?}");
+}
+
+/// A usage frame reports the wait and the generation separately, and both are measured from the
+/// deltas a *tool-call* step produces.
+///
+/// The two bounds are the point. A generation window wider than nothing says the tool call's own
+/// deltas reached the clock — the one thing that could not be asserted before there was a
+/// callback for them, because a step that answers with a call and no prose generates without
+/// touching either of the callbacks that existed. A wait wider than nothing says the clock
+/// started when the request was issued rather than at the first token, which is what makes the
+/// wait a figure at all. And the parts have to fit inside the request they were taken from.
+#[test]
+fn a_usage_frame_separates_the_wait_from_the_generation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let metered = MeteredLlm {
+        step: std::cell::Cell::new(0),
+    };
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(metered)), "metered");
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let _ = client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "do something".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    let reported = frames.iter().find_map(|frame| match frame {
+        Frame::Usage {
+            ttft_ms,
+            decode_ms,
+            duration_ms,
+            completion_tokens,
+            reasoning_tokens,
+            ..
+        } => Some((
+            *ttft_ms,
+            *decode_ms,
+            *duration_ms,
+            *completion_tokens,
+            *reasoning_tokens,
+        )),
+        _ => None,
+    });
+    let Some((ttft_ms, decode_ms, duration_ms, completion_tokens, reasoning_tokens)) = reported
+    else {
+        panic!("the turn reported usage: {frames:?}");
+    };
+
+    assert_eq!(completion_tokens, 5, "the model's own count travels");
+    assert_eq!(
+        reasoning_tokens, 3,
+        "and thinking is reported beside it, inside it rather than added to it"
+    );
+    assert!(
+        decode_ms > 0,
+        "a tool call whose arguments took 80ms to finish generated for longer than no time: \
+         {frames:?}"
+    );
+    assert!(
+        ttft_ms > 0,
+        "the wait began when the request was issued, not when the first token arrived"
+    );
+    assert!(
+        ttft_ms.saturating_add(decode_ms) <= duration_ms,
+        "the parts fit inside the request: {ttft_ms} + {decode_ms} > {duration_ms}"
+    );
 }

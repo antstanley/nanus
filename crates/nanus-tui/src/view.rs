@@ -250,6 +250,30 @@ fn indented(text: &str, depth: usize, style: Style) -> Vec<Line<'static>> {
     lines
 }
 
+/// The separator between two readings on the stats row.
+const STATS_SEPARATOR: &str = "  \u{b7}  ";
+
+/// A duration in the form the stats line uses: whole milliseconds below a second, one decimal
+/// of a second above it, and a dash for one that was not measured.
+///
+/// Integer arithmetic rather than a float, for the same reason the rates are whole numbers:
+/// this workspace denies the operators that would need a lossy cast to print, and a tenth of a
+/// second is all the precision a reader glancing at this row can use. Milliseconds rather than
+/// seconds below the first second is not decoration — a wait of forty milliseconds printed as
+/// `0.0s` would read as no wait at all.
+fn show_duration(millis: Option<u64>) -> String {
+    let Some(millis) = millis else {
+        return String::from("\u{2014}");
+    };
+    let seconds = millis.checked_div(1_000).unwrap_or(0);
+    if seconds == 0 {
+        return format!("{millis}ms");
+    }
+    let whole = seconds.checked_mul(1_000).unwrap_or(0);
+    let tenths = millis.saturating_sub(whole).checked_div(100).unwrap_or(0);
+    format!("{seconds}.{tenths}s")
+}
+
 impl ViewState {
     /// Creates an empty view.
     #[must_use]
@@ -1021,6 +1045,10 @@ impl ViewState {
     /// A number that has not been measured is drawn as a dash. Zero is a measurement —
     /// it says the model generated nothing — and showing it for "no request has finished
     /// yet" would be a claim rather than a blank.
+    ///
+    /// The wait sits beside the rates rather than inside them, because it is the one figure on
+    /// this row a reader can act on: the generation rate is the provider's and is not theirs to
+    /// change, while the wait is what a shorter prompt — or a cached one — buys back.
     fn render_stats(&self, frame: &mut Frame<'_>, area: Rect) {
         let dim = Style::default().fg(Color::DarkGray);
         let show = |value: Option<u64>| {
@@ -1030,18 +1058,37 @@ impl ViewState {
             .stats
             .cache_hit_percent()
             .map_or_else(|| String::from("\u{2014}"), |number| format!("{number}%"));
-        let line = Line::from(vec![
-            Span::styled(format!("cache hit {percent}"), dim),
-            Span::styled(
-                format!("  \u{b7}  last {} tok/s", show(self.stats.last_rate())),
-                dim,
-            ),
-            Span::styled(
-                format!("  \u{b7}  avg {} tok/s", show(self.stats.average_rate())),
-                dim,
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        let cache = format!("cache hit {percent}");
+        let wait = format!("ttft {}", show_duration(self.stats.last_ttft_ms()));
+        let last = format!("last {} tok/s", show(self.stats.last_rate()));
+        let average = format!("avg {} tok/s", show(self.stats.average_rate()));
+        // The wait is the reading this row can do without: the rates are what the row is for,
+        // and the cache share is what the wait is usually made of. A number running off the end
+        // of a narrow terminal is worse than one number fewer — `avg 150` is not a reading, it
+        // is half of one — so the wait is dropped when all four do not fit and the three do.
+        let wide = Self::row_fits(&[&cache, &wait, &last, &average], area.width);
+        let mut spans = vec![Span::styled(cache, dim)];
+        if wide {
+            spans.push(Span::styled(format!("{STATS_SEPARATOR}{wait}"), dim));
+        }
+        spans.push(Span::styled(format!("{STATS_SEPARATOR}{last}"), dim));
+        spans.push(Span::styled(format!("{STATS_SEPARATOR}{average}"), dim));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Whether `parts`, laid out with separators between them, fit in `width` columns.
+    ///
+    /// Counted in characters rather than bytes: the separator is a multi-byte glyph, and
+    /// measuring it in bytes would drop a reading that fits. Saturating throughout, because
+    /// laying out a row is a rendering detail and must not be able to overflow a counter.
+    fn row_fits(parts: &[&str], width: u16) -> bool {
+        let reading = parts
+            .iter()
+            .map(|part| part.chars().count())
+            .fold(0_usize, usize::saturating_add);
+        let gaps = parts.len().saturating_sub(1);
+        let total = reading.saturating_add(gaps.saturating_mul(STATS_SEPARATOR.chars().count()));
+        total <= usize::from(width)
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1290,6 +1337,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::stats::Generation;
 
     /// Renders `state` into a test terminal and returns the buffer as text.
     fn rendered(state: &mut ViewState, width: u16, height: u16) -> String {
@@ -1621,9 +1669,20 @@ mod tests {
     #[test]
     fn the_throughput_line_is_drawn_under_the_composer() {
         let mut state = ViewState::new();
-        state.stats.record(300, 900, 100, 2_000);
-        let text = rendered(&mut state, 60, 14);
+        // 300 tokens generated in two seconds is 150 a second, and the half-second wait in
+        // front of them is not generation — which is the whole point of the split.
+        state.stats.record(Generation {
+            completion_tokens: 300,
+            cache_hit_tokens: 900,
+            cache_miss_tokens: 100,
+            ttft_ms: 500,
+            decode_ms: 2_000,
+            duration_ms: 2_500,
+            ..Generation::default()
+        });
+        let text = rendered(&mut state, 80, 14);
         assert!(text.contains("cache hit 90%"), "{text}");
+        assert!(text.contains("ttft 500ms"), "{text}");
         assert!(text.contains("last 150 tok/s"), "{text}");
         assert!(text.contains("avg 150 tok/s"), "{text}");
         let rows: Vec<&str> = text.lines().collect();
@@ -1645,6 +1704,32 @@ mod tests {
         );
     }
 
+    /// The wait gives up its place when the row cannot hold it, because half a reading is worse
+    /// than one reading fewer: a terminal a few columns too narrow otherwise shows `avg 150`
+    /// with the unit lopped off, which is not a number anyone can use.
+    #[test]
+    fn a_narrow_terminal_loses_the_wait_rather_than_half_of_a_rate() {
+        let mut state = ViewState::new();
+        state.stats.record(Generation {
+            completion_tokens: 300,
+            cache_hit_tokens: 900,
+            cache_miss_tokens: 100,
+            ttft_ms: 500,
+            decode_ms: 2_000,
+            duration_ms: 2_500,
+            ..Generation::default()
+        });
+        // All four readings need more than this row has; the three that remain need less.
+        let narrow = rendered(&mut state, 60, 14);
+        assert!(
+            !narrow.contains("ttft"),
+            "the wait gave up its place: {narrow}"
+        );
+        assert!(narrow.contains("cache hit 90%"), "{narrow}");
+        assert!(narrow.contains("last 150 tok/s"), "{narrow}");
+        assert!(narrow.contains("avg 150 tok/s"), "{narrow}");
+    }
+
     /// Nothing measured is drawn as a dash rather than as a zero. A zero is a
     /// measurement — it says the model generated nothing — and a reader whose first
     /// request has not finished has not been told that.
@@ -1653,6 +1738,7 @@ mod tests {
         let mut state = ViewState::new();
         let text = rendered(&mut state, 60, 14);
         assert!(text.contains("cache hit \u{2014}"), "{text}");
+        assert!(text.contains("ttft \u{2014}"), "{text}");
         assert!(text.contains("last \u{2014} tok/s"), "{text}");
         assert!(text.contains("avg \u{2014} tok/s"), "{text}");
         assert!(
@@ -1661,13 +1747,36 @@ mod tests {
         );
     }
 
+    /// A wait is printed in milliseconds until it reaches a second and in seconds after that,
+    /// because a tenth of a second is all this row can use but rounding a short wait down to
+    /// `0.0s` would read as no wait at all — which is the opposite of what a slow prefill is.
+    #[test]
+    fn a_wait_is_shown_in_the_unit_that_does_not_round_it_away() {
+        assert_eq!(show_duration(Some(40)), "40ms");
+        assert_eq!(show_duration(Some(500)), "500ms");
+        assert_eq!(show_duration(Some(999)), "999ms");
+        assert_eq!(show_duration(Some(1_000)), "1.0s");
+        assert_eq!(show_duration(Some(1_250)), "1.2s");
+        assert_eq!(show_duration(Some(15_342)), "15.3s");
+        // The other direction: a wait nobody measured is a dash, not a zero.
+        assert_eq!(show_duration(None), "\u{2014}");
+    }
+
     /// The throughput line gives up its row before the composer gives up one of its own.
     /// A terminal with rows to spare shows both; one without shows the row the reader is
     /// typing on, which is the one thing on this screen they cannot do without.
     #[test]
     fn the_throughput_line_yields_its_row_to_the_composer() {
         let mut state = ViewState::new();
-        state.stats.record(300, 900, 100, 2_000);
+        state.stats.record(Generation {
+            completion_tokens: 300,
+            cache_hit_tokens: 900,
+            cache_miss_tokens: 100,
+            ttft_ms: 500,
+            decode_ms: 2_000,
+            duration_ms: 2_500,
+            ..Generation::default()
+        });
         // Nine rows is the least that holds the title, the transcript's floor, an empty
         // composer, the throughput line, and the status line.
         let roomy = rendered(&mut state, 60, 9);

@@ -72,6 +72,7 @@ use tokio::sync::mpsc;
 use crate::command::{Command, Submission, submission_of};
 use crate::compact::Detail;
 use crate::notice::{self, Ending};
+use crate::stats::Generation;
 use crate::transcript::{Entry, Role};
 use crate::view::{Theme, ViewState};
 
@@ -1075,14 +1076,24 @@ fn apply(frame: Frame, view: &mut ViewState) {
             cache_hit_tokens,
             cache_miss_tokens,
             duration_ms,
+            reasoning_tokens,
+            ttft_ms,
+            decode_ms,
         } => {
             view.add_tokens(tokens);
-            view.stats.record(
-                completion_tokens,
-                cache_hit_tokens,
-                cache_miss_tokens,
+            // The frame's counters are the agent's; the shape the interface reckons in is its
+            // own, because the agent's vocabulary is about a request and this one is about a
+            // rate. Converting here keeps `stats` free of the link's types and the wire free
+            // of the interface's.
+            view.stats.record(Generation {
+                completion_tokens: u64::from(completion_tokens),
+                reasoning_tokens: u64::from(reasoning_tokens),
+                cache_hit_tokens: u64::from(cache_hit_tokens),
+                cache_miss_tokens: u64::from(cache_miss_tokens),
+                ttft_ms,
+                decode_ms,
                 duration_ms,
-            );
+            });
         }
         // A turn that stopped early is not a turn that finished, and the reason is the
         // only thing that says which one this is. Drawing the answer either way is how a
@@ -1928,6 +1939,9 @@ mod tests {
                 cache_hit_tokens: 800,
                 cache_miss_tokens: 200,
                 duration_ms: 1_000,
+                reasoning_tokens: 4,
+                ttft_ms: 600,
+                decode_ms: 300,
             },
         ] {
             assert!(sender.try_send(frame).is_ok());
@@ -2108,8 +2122,8 @@ mod tests {
         assert_eq!(said, vec!["never streamed"]);
     }
 
-    /// What the throughput line is fed from: one frame per request, carrying the
-    /// counters that request reported and how long it was in flight.
+    /// What the throughput line is fed from: one frame per request, carrying the counters that
+    /// request reported and the three durations it was measured with.
     #[test]
     fn usage_frames_feed_the_throughput_line() {
         let (sender, mut receiver) = mpsc::channel::<Frame>(8);
@@ -2121,7 +2135,10 @@ mod tests {
                     completion_tokens: 300,
                     cache_hit_tokens: 900,
                     cache_miss_tokens: 100,
-                    duration_ms: 2_000,
+                    duration_ms: 2_500,
+                    reasoning_tokens: 120,
+                    ttft_ms: 500,
+                    decode_ms: 2_000,
                 })
                 .is_ok()
         );
