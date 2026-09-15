@@ -33,7 +33,15 @@ pub const API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 pub const DEFAULT_MODEL: &str = "deepseek-flash";
 
 /// The per-response token budget used when the configuration names none.
-pub const DEFAULT_MAX_TOKENS: u32 = 8_192;
+///
+/// It sits *below* the output ceiling `DeepSeek` documents (256000) rather than at it,
+/// because this is the value every deployment inherits unless it says otherwise and the
+/// budget is sent with every request. Spending a provider's whole ceiling as a shared
+/// default leaves no headroom for the second provider whose ceiling is lower, and the
+/// failure that buys is a request refused upstream rather than a file written short. It
+/// began at 8192, which cut long answers and large file writes off at the model's token
+/// ceiling.
+pub const DEFAULT_MAX_TOKENS: u32 = 128_000;
 
 /// The step budget for one turn used when the configuration names none.
 ///

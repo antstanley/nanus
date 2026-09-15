@@ -147,7 +147,7 @@ thinks it is:
 ```console
 $ nanus config
 model: deepseek-flash
-max tokens: 8192
+max tokens: 128000
 reasoning effort: Medium
 approval policy: Ask
 sandbox mode: ReadOnly

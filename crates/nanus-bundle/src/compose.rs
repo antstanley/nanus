@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use nanus_adapter_config::NanusConfig;
-use nanus_adapter_deepseek::{DeepSeekConfig, DeepSeekLlm};
+use nanus_adapter_config::{DEFAULT_MAX_TOKENS, NanusConfig};
+use nanus_adapter_deepseek::{DEFAULT_MAX_OUTPUT_TOKENS, DeepSeekConfig, DeepSeekLlm};
 use nanus_adapter_local::{LocalFs, LocalShell, SystemClock};
 use nanus_adapter_store::JsonlStore;
 use nanus_domain::{AgentConfig, Session, ToolRegistry};
@@ -278,6 +278,16 @@ pub fn workspace_root(config: &NanusConfig) -> Result<PathBuf, BundleError> {
 pub fn store_home() -> Result<PathBuf, BundleError> {
     nanus_adapter_store::resolve_home(None).map_err(|error| BundleError::session(error.to_string()))
 }
+
+/// The configured default has to fit inside the ceiling the shipped provider documents.
+///
+/// `build_llm` always overrides the adapter's own default with the configured one, so the
+/// configuration's default is what every request sends. A default above the provider's
+/// documented ceiling would ask for more output than the provider permits on every single
+/// request, and that failure surfaces as a refused request rather than as anything pointing
+/// back here. Stated as a constant so it fails the build instead of a run, and stated *here*
+/// because this is the only module where both numbers are in scope.
+const _: () = assert!(DEFAULT_MAX_TOKENS <= DEFAULT_MAX_OUTPUT_TOKENS);
 
 /// Builds the model adapter for `config`.
 fn build_llm(config: &NanusConfig, api_key: &str) -> Result<LlmHandle, BundleError> {
