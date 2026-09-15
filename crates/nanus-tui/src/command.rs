@@ -12,6 +12,8 @@
 pub enum Command {
     /// Leave the interface — and, unless the agent is a service, the agent with it.
     Exit,
+    /// Write the session's model figures into the transcript.
+    Stats,
 }
 
 impl Command {
@@ -20,7 +22,7 @@ impl Command {
     /// The table is the list an unrecognised command is answered with, so a command added
     /// here is documented by existing rather than by somebody remembering to update a
     /// message.
-    pub const NAMES: &'static [&'static str] = &["/exit", "/quit"];
+    pub const NAMES: &'static [&'static str] = &["/exit", "/quit", "/stats"];
 }
 
 /// What the interface makes of a line the reader submitted.
@@ -49,6 +51,7 @@ pub fn submission_of(text: &str) -> Submission {
     }
     match first {
         "/exit" | "/quit" => Submission::Run(Command::Exit),
+        "/stats" => Submission::Run(Command::Stats),
         // A slash alone, or a path, or a typo: named as what was typed rather than
         // guessed at, because "no such command: /quitx" is what tells a reader they
         // fat-fingered it.
@@ -67,6 +70,16 @@ mod tests {
         // Whitespace around it is the reader's business, not the command's.
         assert_eq!(submission_of("  /exit  "), Submission::Run(Command::Exit));
         assert_eq!(submission_of("/quit now"), Submission::Run(Command::Exit));
+    }
+
+    /// The figures a session has are not on the screen at once — four readings fit under the
+    /// composer and the rest do not — so the command is how the whole set is read.
+    #[test]
+    fn stats_is_a_command() {
+        assert_eq!(submission_of("/stats"), Submission::Run(Command::Stats));
+        assert_eq!(submission_of("  /stats  "), Submission::Run(Command::Stats));
+        // Only the first word is read, so a word after it changes nothing.
+        assert_eq!(submission_of("/stats now"), Submission::Run(Command::Stats));
     }
 
     #[test]

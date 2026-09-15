@@ -232,12 +232,20 @@ inventing a purpose for a key would be worse than leaving it alone:
 ### Commands
 
 A line whose first word opens with `/` is a command, and the interface answers it rather
-than sending it to the model. Two exist:
+than sending it to the model.
 
 | Command | Effect |
 |---|---|
 | `/exit` | leave the interface |
 | `/quit` | the same command under its other name |
+| `/stats` | write the session's model figures into the transcript |
+
+`/stats` exists because the row under the composer cannot hold everything. Four readings fit
+on a glanceable line and the session has more than four: the report adds the totals, the
+prompt broken into cached and read, how much of what was generated was thinking, and prompt
+tokens per second while waiting. It is a notice rather than prose — the model did not say it,
+the interface did — and it reports the session rather than the last request, so it is worth
+reading after a few turns and not before the first.
 
 Nothing else is a command yet, and an unrecognised one is not sent to the model: it is
 named in the transcript along with the commands that do exist, because a typo should say so
@@ -446,34 +454,43 @@ written and once after everything the turn did afterwards.
 
 | | |
 |---|---|
-| `cache hit 96%` | the share of the session's prompt tokens the provider served from its cache |
+| `last 41/23 tok/s` | the last request's two rates: generating, then over its whole active time |
+| `avg 150/140 tok/s` | the same pair over the session's totals |
 | `ttft 0.8s` | how long the last request waited for its first token |
-| `last 41 tok/s` | how fast the last request generated tokens |
-| `avg 38 tok/s` | how fast the session's requests have generated, on average |
+| `cache hit 96%` | the share of the session's prompt tokens the provider served from its cache |
 
-Both rates are measured against **generation time** — the stretch from a request's first
-generated token to its last — rather than against the whole request. The difference is not a
-detail. A request's active time is the wait for its first token, the generation, and however
-long the stream took to close, and only the middle of those is the model generating. In a
-coding session the wait dominates, because it is where the prompt is read, and a tool call is
-a short generation behind a long one — so dividing by the whole request reports a number well
-below the model's speed and calls it the model's speed, and it is worst for exactly the steps
-a session is mostly made of. The wait is shown beside the rates instead, because it is a real
-cost *and* one a reader can do something about: a shorter prompt, or a cached one, shortens
-it.
+**Every rate is written as a pair, and the pair is the point.** A request's active time is the
+wait for its first token, the generation, and however long the stream took to close — and only
+the middle of those is the model generating. So there are two honest answers to "how fast": the
+first figure divides generated tokens by the *generation* alone, which is the model's speed,
+and the second divides the same tokens by the *whole* request, which is the speed a reader
+actually waited at. The gap between them is the wait, and in a coding session the wait
+dominates: it is where the prompt is read, and a tool call is a short generation behind a long
+one. Reporting only the first would flatter the model on exactly the steps a session is mostly
+made of; reporting only the second would blame it for the prompt. Both are shown, so the reader
+can see which they are getting — and `ttft` is beside them because it is the one figure anyone
+can act on: the generating rate is the provider's and is not theirs to change, while the wait
+is what a shorter prompt, or a cached one, buys back.
 
-Wall-clock time is still not what any of this is measured against, so a session that sat idle
-overnight or spent five minutes inside a tool has the same average as one that ran its
-requests back to back. A rate that includes waiting measures the person waiting. The rates
-count *generated* tokens rather than the whole request: the prompt is mostly cache hits, so a
-prompt-inclusive rate would mostly report how large the context had grown, and the cache
-share is already the number for that side.
+Wall-clock time is not what either rate is measured against, so a session that sat idle
+overnight or spent five minutes inside a tool has the same averages as one that ran its
+requests back to back. A rate that includes waiting measures the person waiting. Both count
+*generated* tokens rather than the whole request: the prompt is mostly cache hits, so a
+prompt-inclusive rate would mostly report how large the context had grown, and the cache share
+is already the number for that side.
 
-The line gives up its readings before it gives up its row, and its row before the composer
-gives up one of its own. On a terminal too narrow for all four, the wait is the one that goes
-— the rates are what the row is for, and a reading running off the end (`avg 150`, with the
-unit lopped off) is worse than one reading fewer. On a terminal too short for everything, a
-number the reader can live without is what should go, not the row they are typing on.
+A request whose generation window the agent could not measure leaves the first figure of the
+pair blank rather than restating the second under a different label; `avg` is over the requests
+that reported a window, and only those, because a request that reported none would otherwise
+contribute its tokens to the numerator and nothing to the denominator.
+
+The line gives up its readings whole, from the end, before it gives up its row, and its row
+before the composer gives up one of its own. The order is the order a reader would give them
+up in: the rates first, then the wait that explains the gap between them, then the cache share
+that usually explains the wait. A reading running off the end (`last 150/1`, with half of it
+lopped off) is worse than one reading fewer, so a terminal too narrow for all four loses the
+cache share rather than half a rate — and a terminal too short for everything loses the whole
+row rather than the row the reader is typing on.
 
 The average is over the session's totals rather than the mean of its per-request rates,
 because a mean of rates is only an average when every request took the same time. A request

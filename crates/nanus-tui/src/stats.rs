@@ -49,6 +49,41 @@ fn measured(millis: u64) -> Option<u64> {
     (millis > 0).then_some(millis)
 }
 
+/// A reading written out, or a dash when nobody took it.
+///
+/// Zero is left as zero: it is a measurement — the model generated nothing, or none of what it
+/// generated was thinking — and a dash would say the reader was not told, which is a different
+/// thing to have been told.
+pub(crate) fn show(value: Option<u64>) -> String {
+    value.map_or_else(|| String::from("\u{2014}"), |number| number.to_string())
+}
+
+/// The same, with a per-cent sign.
+pub(crate) fn share(value: Option<u64>) -> String {
+    value.map_or_else(|| String::from("\u{2014}"), |number| format!("{number}%"))
+}
+
+/// A duration in the form the interface writes one: whole milliseconds below a second, one
+/// decimal of a second above it, and a dash for one that was not measured.
+///
+/// Integer arithmetic rather than a float, for the same reason the rates are whole numbers: this
+/// workspace denies the operators that would need a lossy cast to print, and a tenth of a second
+/// is all the precision a reader glancing at a row can use. Milliseconds rather than seconds
+/// below the first second is not decoration — a wait of forty milliseconds printed as `0.0s`
+/// would read as no wait at all.
+pub(crate) fn show_duration(millis: Option<u64>) -> String {
+    let Some(millis) = millis else {
+        return String::from("\u{2014}");
+    };
+    let seconds = millis.checked_div(1_000).unwrap_or(0);
+    if seconds == 0 {
+        return format!("{millis}ms");
+    }
+    let whole = seconds.checked_mul(1_000).unwrap_or(0);
+    let tenths = millis.saturating_sub(whole).checked_div(100).unwrap_or(0);
+    format!("{seconds}.{tenths}s")
+}
+
 /// One request's generation, as the agent measured it.
 ///
 /// The sum of two of these is another one, field by field, which is how the session totals
@@ -94,22 +129,6 @@ impl Generation {
     fn timed(&self) -> bool {
         self.decode_ms > 0
     }
-
-    /// The window this request's rate is measured over.
-    ///
-    /// The generation window when one was measured. When none was — an agent that predates the
-    /// measurement, or a response that arrived in a single chunk, where there is no interval
-    /// between an instant and itself — the request's whole active time stands in. That
-    /// understates the rate, because the wait for the first token is in it and the model was
-    /// not generating during that, so it is a floor offered instead of a blank rather than a
-    /// reading.
-    fn window_ms(&self) -> u64 {
-        if self.decode_ms > 0 {
-            self.decode_ms
-        } else {
-            self.duration_ms
-        }
-    }
 }
 
 /// The model's throughput, as the interface reckons it.
@@ -149,26 +168,49 @@ impl Throughput {
 
     /// How fast the last request generated tokens, per second.
     ///
-    /// `None` before the first request of a session, and from an agent that reports nothing
-    /// about timing at all.
+    /// `None` before the first request of a session, and whenever the agent reported no
+    /// generation window — an agent that predates the measurement, or a response that arrived
+    /// in a single chunk, where there is no interval between an instant and itself. A blank is
+    /// the honest reading there, and it costs the reader nothing now that
+    /// [`last_request_rate`](Self::last_request_rate) sits beside it with the one denominator
+    /// that is always available.
     #[must_use]
     pub fn last_rate(&self) -> Option<u64> {
-        rate(self.last.completion_tokens, self.last.window_ms())
+        rate(self.last.completion_tokens, self.last.decode_ms)
+    }
+
+    /// How fast the last request ran end to end, per second.
+    ///
+    /// Generated tokens over the request's whole active time — its wait for a first token, its
+    /// generation, and however long its stream took to close. This is the rate a reader
+    /// *experiences* rather than the one the model achieves, and the two differ by exactly the
+    /// time the model spent not generating. It is always available when a request was timed at
+    /// all, which is what makes it the figure to read when the generation window is missing.
+    #[must_use]
+    pub fn last_request_rate(&self) -> Option<u64> {
+        rate(self.last.completion_tokens, self.last.duration_ms)
     }
 
     /// How fast the session's requests have generated tokens, per second, on average.
     ///
     /// Over the session's totals rather than the mean of its per-request rates, because a mean
-    /// of rates is only an average when every request took the same time. Over the timed
-    /// requests when there are any, and over every request's active time when there are none —
-    /// see [`Generation::window_ms`] for what that standing-in means.
+    /// of rates is only an average when every request took the same time. Over the requests
+    /// that reported a window, and only those: a request that reported none is left out of both
+    /// sides rather than contributing its tokens to the numerator and nothing to the
+    /// denominator, which is how an untimed request would report a model of infinite speed.
     #[must_use]
     pub fn average_rate(&self) -> Option<u64> {
-        if self.timed_requests > 0 {
-            rate(self.timed.completion_tokens, self.timed.decode_ms)
-        } else {
-            rate(self.all.completion_tokens, self.all.duration_ms)
-        }
+        rate(self.timed.completion_tokens, self.timed.decode_ms)
+    }
+
+    /// How fast the session's requests have run end to end, per second, on average.
+    ///
+    /// Over every request's active time, because that denominator needs no measurement the
+    /// agent might not have made — which is why it is the one average that survives an agent
+    /// that reports no timing at all.
+    #[must_use]
+    pub fn average_request_rate(&self) -> Option<u64> {
+        rate(self.all.completion_tokens, self.all.duration_ms)
     }
 
     /// How long the last request waited for its first token.
@@ -231,6 +273,85 @@ impl Throughput {
     pub const fn requests(&self) -> u64 {
         self.requests
     }
+
+    /// Every prompt token the session sent, cached and not.
+    ///
+    /// Derived from the two cache counters rather than tracked beside them, because they
+    /// partition the prompt: a separate total is one more number that could disagree with the
+    /// parts it is meant to be the sum of.
+    #[must_use]
+    pub fn prompt_tokens(&self) -> u64 {
+        self.all
+            .cache_hit_tokens
+            .saturating_add(self.all.cache_miss_tokens)
+    }
+
+    /// Everything the session has, as the block `/stats` prints into the transcript.
+    ///
+    /// The phrasing is the interface's, because none of it is sent anywhere: it is written to be
+    /// read once. So every reading carries its unit, a reading nobody took is a dash rather than
+    /// a zero, and the two rates are named for what they divide by — *generating* is the model's
+    /// speed and *whole request* is the reader's, and the gap between them is the time the model
+    /// spent not generating.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let row = |label: &str, reading: String| format!("  {label:<13} {reading}");
+        let generated = self.all.completion_tokens;
+        let thinking = self.all.reasoning_tokens;
+        let lines = [
+            String::from("session stats"),
+            row("requests", self.requests.to_string()),
+            row(
+                "generated",
+                format!(
+                    "{generated} tokens ({thinking} thinking \u{b7} {})",
+                    share(self.reasoning_percent())
+                ),
+            ),
+            row(
+                "prompt",
+                format!(
+                    "{} tokens \u{b7} {} cached, {} read \u{b7} {} hit",
+                    self.prompt_tokens(),
+                    self.all.cache_hit_tokens,
+                    self.all.cache_miss_tokens,
+                    share(self.cache_hit_percent())
+                ),
+            ),
+            row(
+                "generating",
+                format!(
+                    "last {} tok/s \u{b7} average {} tok/s",
+                    show(self.last_rate()),
+                    show(self.average_rate())
+                ),
+            ),
+            row(
+                "whole request",
+                format!(
+                    "last {} tok/s \u{b7} average {} tok/s",
+                    show(self.last_request_rate()),
+                    show(self.average_request_rate())
+                ),
+            ),
+            row(
+                "first token",
+                format!(
+                    "last {} \u{b7} average {}",
+                    show_duration(self.last_ttft_ms()),
+                    show_duration(self.average_ttft_ms())
+                ),
+            ),
+            row(
+                "prefill",
+                format!(
+                    "{} prompt tok/s while waiting (a floor, not the provider's rate)",
+                    show(self.encode_rate())
+                ),
+            ),
+        ];
+        lines.join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -270,11 +391,13 @@ mod tests {
         assert_eq!(stats.last_rate(), Some(0));
     }
 
-    /// A request whose generation window was not measured falls back to its active time, so an
-    /// agent that reports no window shows a floor rather than a blank — and the floor includes
-    /// the wait, which is why it is lower than the same generation would rate.
+    /// A request whose generation window was not measured leaves the generating rate blank rather
+    /// than filling it with the whole-request rate. The blank costs nothing now that the
+    /// whole-request rate is reported in its own right: a reader has the figure either way, and
+    /// showing one number under two labels would claim the model was generating during a wait it
+    /// was not.
     #[test]
-    fn an_unmeasured_window_falls_back_to_the_whole_request() {
+    fn an_unmeasured_window_leaves_the_generating_rate_blank() {
         let mut stats = Throughput::default();
         stats.record(Generation {
             completion_tokens: 500,
@@ -283,7 +406,10 @@ mod tests {
             duration_ms: 2_500,
             ..Generation::default()
         });
-        assert_eq!(stats.last_rate(), Some(200));
+        assert_eq!(stats.last_rate(), None, "no window, so no generating rate");
+        assert_eq!(stats.average_rate(), None);
+        assert_eq!(stats.last_request_rate(), Some(200), "the wait included");
+        assert_eq!(stats.average_request_rate(), Some(200));
     }
 
     /// A request that reported no window at all must not join the timed totals: its tokens in
@@ -308,8 +434,10 @@ mod tests {
             Some(500),
             "the untimed request is left out"
         );
-        // Its own rate is still reported, from the one clock there is.
-        assert_eq!(stats.last_rate(), Some(10_000_000));
+        // Its own figures are still reported, from the one denominator it has: nothing was
+        // measured for its generation, and its whole request took a millisecond.
+        assert_eq!(stats.last_rate(), None);
+        assert_eq!(stats.last_request_rate(), Some(10_000_000));
     }
 
     /// A request whose timing was not reported has no rate. Showing zero would say the model
@@ -323,6 +451,8 @@ mod tests {
         });
         assert_eq!(stats.last_rate(), None);
         assert_eq!(stats.average_rate(), None);
+        assert_eq!(stats.last_request_rate(), None, "no clock at all");
+        assert_eq!(stats.average_request_rate(), None);
     }
 
     #[test]
@@ -440,6 +570,73 @@ mod tests {
             stats.encode_rate(),
             Some(1_000),
             "the untimed prompt is left out"
+        );
+    }
+
+    /// The two averages divide the same tokens by different clocks, so the generating one is the
+    /// higher of the two by exactly the share of the session spent not generating.
+    #[test]
+    fn the_two_average_rates_differ_by_the_wait() {
+        let mut stats = Throughput::default();
+        // Two seconds generating behind one second of waiting: 3,000 over 2,000 is 1,500, and
+        // 3,000 over the whole three seconds is 1,000.
+        stats.record(generation(3_000, 1_000, 2_000));
+        assert_eq!(stats.last_rate(), Some(1_500));
+        assert_eq!(stats.last_request_rate(), Some(1_000));
+        assert_eq!(stats.average_rate(), Some(1_500));
+        assert_eq!(stats.average_request_rate(), Some(1_000));
+    }
+
+    /// The report `/stats` prints carries every figure the session has, each under a label. A
+    /// number without its label is a puzzle, which is the reason the block exists at all.
+    #[test]
+    fn the_report_names_every_figure_the_session_has() {
+        let mut stats = Throughput::default();
+        stats.record(Generation {
+            completion_tokens: 1_000,
+            reasoning_tokens: 250,
+            cache_hit_tokens: 4_500,
+            cache_miss_tokens: 500,
+            ttft_ms: 1_000,
+            decode_ms: 2_000,
+            duration_ms: 3_000,
+        });
+        let report = stats.report();
+        for expected in [
+            "session stats",
+            "requests      1",
+            "generated     1000 tokens (250 thinking \u{b7} 25%)",
+            "prompt        5000 tokens \u{b7} 4500 cached, 500 read \u{b7} 90% hit",
+            "generating    last 500 tok/s \u{b7} average 500 tok/s",
+            "whole request last 333 tok/s \u{b7} average 333 tok/s",
+            "first token   last 1.0s \u{b7} average 1.0s",
+            "prefill       5000 prompt tok/s while waiting",
+        ] {
+            assert!(
+                report.contains(expected),
+                "missing {expected:?} in:\n{report}"
+            );
+        }
+    }
+
+    /// The other direction: a session with nothing in it still reports, and every reading it has
+    /// no value for is a dash rather than a zero. A zero would say the model generated nothing,
+    /// which is a measurement nobody took.
+    #[test]
+    fn a_report_of_nothing_is_dashes_rather_than_zeroes() {
+        let report = Throughput::default().report();
+        assert!(report.contains("requests      0"), "{report}");
+        assert!(
+            report.contains("generating    last \u{2014} tok/s \u{b7} average \u{2014} tok/s"),
+            "{report}"
+        );
+        assert!(
+            report.contains("prompt        0 tokens \u{b7} 0 cached, 0 read \u{b7} \u{2014} hit"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("0 tok/s"),
+            "not a rate nobody measured: {report}"
         );
     }
 

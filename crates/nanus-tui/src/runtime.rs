@@ -676,6 +676,12 @@ async fn event_loop(
                     Outcome::Submit(prompt) => {
                         match route_submission(prompt, source.accepts_prompts()) {
                             Routed::Leave => break,
+                            Routed::Stats => {
+                                // A notice rather than prose: the model did not say this, the
+                                // interface did, and the colour is how a reader tells them apart.
+                                view.transcript.push(Entry::notice(view.stats.report()));
+                                view.scroll_to_bottom();
+                            }
                             Routed::Say(message) => {
                                 view.transcript.push(Entry::notice(message));
                                 view.scroll_to_bottom();
@@ -718,6 +724,11 @@ enum Routed {
     Send(String),
     /// Leave the interface.
     Leave,
+    /// Write the session's figures into the transcript.
+    ///
+    /// Routed rather than said, because the text is not known until the view is: the router is a
+    /// pure function of the line and what the source accepts, and the figures are state.
+    Stats,
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -730,6 +741,7 @@ enum Routed {
 fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
     match submission_of(&prompt) {
         Submission::Run(Command::Exit) => Routed::Leave,
+        Submission::Run(Command::Stats) => Routed::Stats,
         Submission::Unknown(name) => Routed::Say(format!(
             "no such command: {name} — this interface knows {}",
             Command::NAMES.join(" and ")
@@ -1492,6 +1504,16 @@ mod tests {
             message.contains("/exit") && message.contains("/quit"),
             "and the commands that exist: {message}"
         );
+
+        // `/stats` is the interface's to answer, and it is answered in a recording too: what it
+        // reports belongs to the session, and a recorded one has a session.
+        for accepts in [true, false] {
+            assert_eq!(
+                route_submission(String::from("/stats"), accepts),
+                Routed::Stats,
+                "the figures are the interface's to report"
+            );
+        }
 
         // Prose is prose, and a prompt in a recording is refused rather than dropped.
         assert_eq!(
