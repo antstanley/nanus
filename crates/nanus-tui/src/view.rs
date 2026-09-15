@@ -423,10 +423,20 @@ impl ViewState {
                 lines
             }
             EntryKind::Notice => {
-                vec![Line::from(Span::styled(
-                    format!("· {}", entry.text()),
-                    style,
-                ))]
+                // A notice is usually one line, but the interface writes some of them — the
+                // session's figures — as a block. `Line` does not break on `\n`, so a block
+                // left whole would arrive as one mangled row with every newline dropped; each
+                // source line becomes its own `Line`, with the bullet on the first and the
+                // rest indented under it so the block reads as one notice.
+                entry
+                    .text()
+                    .split('\n')
+                    .enumerate()
+                    .map(|(index, line)| {
+                        let marker = if index == 0 { "· " } else { "  " };
+                        Line::from(Span::styled(format!("{marker}{line}"), style))
+                    })
+                    .collect()
             }
             EntryKind::Text => {
                 let mut lines: Vec<Line<'static>> = entry
@@ -1971,6 +1981,80 @@ mod tests {
         let text = rendered(&mut state, 60, 12);
         assert!(text.contains('·'));
         assert!(text.contains("workspace-write enabled"));
+    }
+
+    /// A notice that is a block keeps its shape, indented under its bullet.
+    ///
+    /// `/stats` writes the session's figures as a notice, and a `Line` does not break on `\n`:
+    /// left whole, the block arrived as one mangled row with every label run together — which
+    /// is what `/stats` looked like. Each source line has to become its own `Line`, and the
+    /// continuation lines have to be indented by the bullet's width so the block still reads
+    /// as one notice rather than as several.
+    #[test]
+    fn a_multi_line_notice_keeps_its_lines() {
+        let mut state = state_with(vec![Entry::notice(
+            "session stats\n  requests      1\n  generated     1000 tokens",
+        )]);
+        let text = rendered(&mut state, 60, 20);
+        let rows: Vec<&str> = text.lines().collect();
+        let title = rows
+            .iter()
+            .position(|row| row.contains("session stats"))
+            .expect("the notice is drawn");
+        assert_eq!(
+            rows[title].trim_end(),
+            "· session stats",
+            "the bullet is on the first line: {text}"
+        );
+        assert_eq!(
+            rows[title + 1].trim_end(),
+            "    requests      1",
+            "the second line is its own row, under the bullet: {text}"
+        );
+        assert_eq!(
+            rows[title + 2].trim_end(),
+            "    generated     1000 tokens",
+            "and so is the third: {text}"
+        );
+    }
+
+    /// The two halves meet: the block [`Throughput::report`] builds renders as the block it is
+    /// written as, with every label on a row of its own rather than run together into one.
+    ///
+    /// This is the shape a reader sees from `/stats`, so it is asserted on the report itself
+    /// rather than on a hand-written stand-in: the padding in the report and the newline
+    /// handling in the view are two separate decisions that have to survive each other.
+    #[test]
+    fn the_stats_report_renders_as_its_own_rows() {
+        let mut state = ViewState::new();
+        state.stats.record(Generation {
+            completion_tokens: 1_000,
+            reasoning_tokens: 250,
+            cache_hit_tokens: 4_500,
+            cache_miss_tokens: 500,
+            head_ms: 400,
+            ttft_ms: 1_000,
+            decode_ms: 2_000,
+            duration_ms: 3_000,
+        });
+        state.transcript.push(Entry::notice(state.stats.report()));
+        let text = rendered(&mut state, 80, 24);
+        for label in [
+            "requests",
+            "generated",
+            "prompt",
+            "generating",
+            "whole request",
+            "first token",
+            "until head",
+            "from head",
+            "prefill",
+        ] {
+            assert!(
+                text.lines().any(|row| row.trim_start().starts_with(label)),
+                "the {label:?} row is a row of its own in:\n{text}"
+            );
+        }
     }
 
     #[test]

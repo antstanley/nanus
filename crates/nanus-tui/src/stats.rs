@@ -365,9 +365,12 @@ impl Throughput {
     /// a zero, and the two rates are named for what they divide by — *generating* is the model's
     /// speed and *whole request* is the reader's, and the gap between them is the time the model
     /// spent not generating.
+    ///
+    /// The label column is one wider than the longest label, so the widest row still has two
+    /// spaces before its reading rather than fusing into it.
     #[must_use]
     pub fn report(&self) -> String {
-        let row = |label: &str, reading: String| format!("  {label:<13} {reading}");
+        let row = |label: &str, reading: String| format!("  {label:<14} {reading}");
         let generated = self.all.completion_tokens;
         let thinking = self.all.reasoning_tokens;
         let lines = [
@@ -772,15 +775,15 @@ mod tests {
         let report = stats.report();
         for expected in [
             "session stats",
-            "requests      1",
-            "generated     1000 tokens (250 thinking \u{b7} 25%)",
-            "prompt        5000 tokens \u{b7} 4500 cached, 500 read \u{b7} 90% hit",
-            "generating    last 500 tok/s \u{b7} average 500 tok/s",
-            "whole request last 333 tok/s \u{b7} average 333 tok/s",
-            "first token   last 1.0s \u{b7} average 1.0s",
-            "until head    last 400ms \u{b7} average 400ms",
-            "from head     last 600ms \u{b7} average 600ms",
-            "prefill       8333 prompt tok/s while the server worked",
+            "requests       1",
+            "generated      1000 tokens (250 thinking \u{b7} 25%)",
+            "prompt         5000 tokens \u{b7} 4500 cached, 500 read \u{b7} 90% hit",
+            "generating     last 500 tok/s \u{b7} average 500 tok/s",
+            "whole request  last 333 tok/s \u{b7} average 333 tok/s",
+            "first token    last 1.0s \u{b7} average 1.0s",
+            "until head     last 400ms \u{b7} average 400ms",
+            "from head      last 600ms \u{b7} average 600ms",
+            "prefill        8333 prompt tok/s while the server worked",
         ] {
             assert!(
                 report.contains(expected),
@@ -795,13 +798,13 @@ mod tests {
     #[test]
     fn a_report_of_nothing_is_dashes_rather_than_zeroes() {
         let report = Throughput::default().report();
-        assert!(report.contains("requests      0"), "{report}");
+        assert!(report.contains("requests       0"), "{report}");
         assert!(
-            report.contains("generating    last \u{2014} tok/s \u{b7} average \u{2014} tok/s"),
+            report.contains("generating     last \u{2014} tok/s \u{b7} average \u{2014} tok/s"),
             "{report}"
         );
         assert!(
-            report.contains("prompt        0 tokens \u{b7} 0 cached, 0 read \u{b7} \u{2014} hit"),
+            report.contains("prompt         0 tokens \u{b7} 0 cached, 0 read \u{b7} \u{2014} hit"),
             "{report}"
         );
         assert!(
