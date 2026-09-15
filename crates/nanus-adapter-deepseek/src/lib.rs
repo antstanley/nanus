@@ -201,7 +201,16 @@ impl LlmPort for DeepSeekLlm {
         // transport failure becomes a single terminal `Error` event rather than a
         // stream that ends silently, so the agent loop always learns why.
         let stream = futures::stream::once(response).flat_map(move |outcome| match outcome {
-            Ok(response) => decode(response, stream_host.clone()),
+            Ok(response) => {
+                // The head is in hand, so the server is answering and everything from here is
+                // its body. Reported before the body is read, because this is the earliest
+                // moment the fact is true — reading even one byte of it would put the wait for
+                // that byte on the wrong side of the split.
+                let head = futures::stream::iter([LlmEvent::ResponseHead]);
+                let announced: EventStream =
+                    Box::pin(head.chain(decode(response, stream_host.clone())));
+                announced
+            }
             Err(message) => error_stream_owned(message),
         });
         Box::pin(stream)

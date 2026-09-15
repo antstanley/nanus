@@ -1089,6 +1089,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
             cache_miss_tokens,
             duration_ms,
             reasoning_tokens,
+            head_ms,
             ttft_ms,
             decode_ms,
         } => {
@@ -1102,6 +1103,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
                 reasoning_tokens: u64::from(reasoning_tokens),
                 cache_hit_tokens: u64::from(cache_hit_tokens),
                 cache_miss_tokens: u64::from(cache_miss_tokens),
+                head_ms,
                 ttft_ms,
                 decode_ms,
                 duration_ms,
@@ -1962,6 +1964,7 @@ mod tests {
                 cache_miss_tokens: 200,
                 duration_ms: 1_000,
                 reasoning_tokens: 4,
+                head_ms: 250,
                 ttft_ms: 600,
                 decode_ms: 300,
             },
@@ -2159,6 +2162,7 @@ mod tests {
                     cache_miss_tokens: 100,
                     duration_ms: 2_500,
                     reasoning_tokens: 120,
+                    head_ms: 200,
                     ttft_ms: 500,
                     decode_ms: 2_000,
                 })

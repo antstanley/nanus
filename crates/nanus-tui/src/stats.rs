@@ -101,6 +101,8 @@ pub struct Generation {
     pub cache_hit_tokens: u64,
     /// Prompt tokens the provider had to read.
     pub cache_miss_tokens: u64,
+    /// How long the request took to reach the server and be answered at all.
+    pub head_ms: u64,
     /// How long the request waited for its first generated token.
     pub ttft_ms: u64,
     /// How long it spent generating: its first token to its last.
@@ -112,6 +114,7 @@ pub struct Generation {
 impl Generation {
     /// Adds `other` into this one, field by field, saturating.
     fn absorb(&mut self, other: Self) {
+        self.head_ms = self.head_ms.saturating_add(other.head_ms);
         self.completion_tokens = self
             .completion_tokens
             .saturating_add(other.completion_tokens);
@@ -129,6 +132,18 @@ impl Generation {
     fn timed(&self) -> bool {
         self.decode_ms > 0
     }
+
+    /// The part of the wait spent in the server after it began answering.
+    ///
+    /// `None` when the provider announced no response head — the split is then unknown rather
+    /// than the whole wait, and calling the whole wait the server's share would blame the server
+    /// for the network — and `None` when there was no wait for a first token to divide at all.
+    fn server_ms(&self) -> Option<u64> {
+        if self.head_ms == 0 || self.ttft_ms == 0 {
+            return None;
+        }
+        Some(self.ttft_ms.saturating_sub(self.head_ms))
+    }
 }
 
 /// The model's throughput, as the interface reckons it.
@@ -144,6 +159,14 @@ pub struct Throughput {
     all: Generation,
     /// Only the requests that reported a generation window, summed.
     timed: Generation,
+    /// Prompt tokens over the requests that reported both ends of the wait's split.
+    split_prompt_tokens: u64,
+    /// Waits to a response head over those same requests.
+    split_head_ms: u64,
+    /// Waits from a response head to a first token over those same requests.
+    split_server_ms: u64,
+    /// How many requests reported both ends of that split.
+    split_requests: u64,
     /// How many requests reported a generation window.
     timed_requests: u64,
     /// How many requests have been recorded.
@@ -162,6 +185,19 @@ impl Throughput {
         if generation.timed() {
             self.timed_requests = self.timed_requests.saturating_add(1);
             self.timed.absorb(generation);
+        }
+        // The split of the wait, summed only where both of its ends were reported. Subtracting
+        // one average from another is not the average of the differences unless both were taken
+        // over the same requests, so both halves are accumulated over exactly this set rather
+        // than each over whichever requests happened to report it.
+        if let Some(server) = generation.server_ms() {
+            self.split_requests = self.split_requests.saturating_add(1);
+            self.split_head_ms = self.split_head_ms.saturating_add(generation.head_ms);
+            self.split_server_ms = self.split_server_ms.saturating_add(server);
+            self.split_prompt_tokens = self
+                .split_prompt_tokens
+                .saturating_add(generation.cache_hit_tokens)
+                .saturating_add(generation.cache_miss_tokens);
         }
         self.last = generation;
     }
@@ -226,6 +262,42 @@ impl Throughput {
         measured(mean)
     }
 
+    /// How long the last request took to reach the server and be answered at all.
+    ///
+    /// The near half of the wait: connecting, uploading, and waiting to be answered. `None` from
+    /// a provider that announced no response head.
+    #[must_use]
+    pub fn last_head_ms(&self) -> Option<u64> {
+        measured(self.last.head_ms)
+    }
+
+    /// How long the last request spent in the server after it began answering.
+    ///
+    /// The far half: the server's queue, its reading of the prompt, and the first token. This is
+    /// the half prefill lives in, which is the whole reason for splitting the wait — the near
+    /// half cannot contain it.
+    #[must_use]
+    pub fn last_server_ms(&self) -> Option<u64> {
+        self.last.server_ms()
+    }
+
+    /// How long the session's requests have taken to reach the server and be answered, on
+    /// average.
+    ///
+    /// Over the requests that reported both ends of the split, so that the two halves of it are
+    /// averages over the same set and remain each other's complement.
+    #[must_use]
+    pub fn average_head_ms(&self) -> Option<u64> {
+        self.split_head_ms.checked_div(self.split_requests)
+    }
+
+    /// How long the session's requests have spent in the server after it began answering, on
+    /// average. The complement of [`average_head_ms`](Self::average_head_ms).
+    #[must_use]
+    pub fn average_server_ms(&self) -> Option<u64> {
+        self.split_server_ms.checked_div(self.split_requests)
+    }
+
     /// The share of the session's prompt tokens that came from the provider's cache.
     ///
     /// The counters partition the prompt, so their sum is the prompt rather than a separate
@@ -251,21 +323,21 @@ impl Throughput {
         percent(self.all.reasoning_tokens, self.all.completion_tokens)
     }
 
-    /// Prompt tokens the session's timed requests moved per second of waiting for a first
-    /// token.
+    /// Prompt tokens the session moved per second of the *server's* own work.
     ///
-    /// A *floor* on the provider's prefill throughput rather than a measurement of it. The wait
-    /// covers the connection and the provider's queue as well as the prompt being read, so the
-    /// real prefill is at least this fast and possibly much faster — and nothing at this end of
-    /// a socket can separate the three, which is why the figure is named for what crosses
-    /// rather than for what the provider did.
+    /// A much closer bound on prefill than dividing by the whole wait was, because the time spent
+    /// reaching the server and waiting to be answered at all is no longer in the denominator —
+    /// and that time cannot contain prefill, which happens on the far side of it. It is still a
+    /// bound rather than a measurement, and a loose one: the server's work also covers its queue
+    /// and producing the first token, and on a shared endpoint prefill is scheduled in chunks
+    /// beside other requests, so how long it takes is partly a property of the batch rather than
+    /// of the prompt.
+    ///
+    /// `None` when no request reported both ends of the split, since without them the server's
+    /// own share is unknown rather than equal to the whole wait.
     #[must_use]
     pub fn encode_rate(&self) -> Option<u64> {
-        let prompt = self
-            .timed
-            .cache_hit_tokens
-            .checked_add(self.timed.cache_miss_tokens)?;
-        rate(prompt, self.timed.ttft_ms)
+        rate(self.split_prompt_tokens, self.split_server_ms)
     }
 
     /// How many requests have been recorded.
@@ -343,9 +415,25 @@ impl Throughput {
                 ),
             ),
             row(
+                "until head",
+                format!(
+                    "last {} \u{b7} average {}  (reaching the server)",
+                    show_duration(self.last_head_ms()),
+                    show_duration(self.average_head_ms())
+                ),
+            ),
+            row(
+                "from head",
+                format!(
+                    "last {} \u{b7} average {}  (the server's own work)",
+                    show_duration(self.last_server_ms()),
+                    show_duration(self.average_server_ms())
+                ),
+            ),
+            row(
                 "prefill",
                 format!(
-                    "{} prompt tok/s while waiting (a floor, not the provider's rate)",
+                    "{} prompt tok/s while the server worked (a bound, not a measurement)",
                     show(self.encode_rate())
                 ),
             ),
@@ -531,45 +619,124 @@ mod tests {
         assert_eq!(stats.reasoning_percent(), None);
     }
 
-    /// The encode figure is prompt tokens per second of waiting, over the requests that
-    /// reported a window — because the wait it divides by belongs to those requests.
+    /// The prefill figure divides by the server's *own* work rather than by the whole wait, which
+    /// is what splitting the wait bought: time spent reaching the server cannot contain prefill,
+    /// so charging it to prefill reported a rate lower than any the provider could have had.
     #[test]
-    fn the_encode_rate_is_the_prompt_crossing_during_the_wait() {
+    fn the_encode_rate_divides_the_servers_own_work() {
         let mut stats = Throughput::default();
         stats.record(Generation {
             cache_hit_tokens: 9_000,
             cache_miss_tokens: 1_000,
-            ..generation(10, 1_000, 2_000)
+            head_ms: 400,
+            ttft_ms: 1_000,
+            decode_ms: 2_000,
+            duration_ms: 3_000,
+            ..Generation::default()
         });
         assert_eq!(
             stats.encode_rate(),
-            Some(10_000),
-            "10,000 tokens in one second"
+            Some(16_666),
+            "10,000 prompt tokens against the server's 600ms, not against the whole second"
         );
     }
 
-    /// A request that reported no window is left out of the encode figure too: its prompt
-    /// tokens would be counted against waits that are not its own.
+    /// The split of the wait, and the two halves adding back up to the whole: a reader diagnosing
+    /// a slow turn needs to know how much was reaching the server and how much was the server, and
+    /// losing a millisecond between them would make the parts a lie about the whole.
     #[test]
-    fn an_untimed_request_does_not_join_the_encode_figure() {
+    fn the_wait_splits_at_the_response_head() {
+        let mut stats = Throughput::default();
+        stats.record(Generation {
+            completion_tokens: 500,
+            head_ms: 300,
+            ttft_ms: 1_100,
+            decode_ms: 2_000,
+            duration_ms: 3_100,
+            ..Generation::default()
+        });
+        assert_eq!(stats.last_head_ms(), Some(300), "reaching the server");
+        assert_eq!(stats.last_server_ms(), Some(800), "the server's own work");
+        assert_eq!(stats.average_head_ms(), Some(300));
+        assert_eq!(stats.average_server_ms(), Some(800));
+        assert_eq!(
+            stats
+                .last_head_ms()
+                .zip(stats.last_server_ms())
+                .map(|(head, server)| head + server),
+            stats.last_ttft_ms(),
+            "the halves are the wait"
+        );
+    }
+
+    /// Both halves average over the *same* requests, so each stays the other's complement. Summing
+    /// them over different sets would make their difference something other than the average
+    /// difference, which is the arithmetic this accumulator exists to avoid.
+    #[test]
+    fn the_halves_of_the_split_are_averaged_over_one_set() {
+        let mut stats = Throughput::default();
+        // Two requests that reported a head, and one that reported only a wait.
+        stats.record(Generation {
+            head_ms: 200,
+            ttft_ms: 1_000,
+            ..Generation::default()
+        });
+        stats.record(Generation {
+            head_ms: 400,
+            ttft_ms: 2_000,
+            ..Generation::default()
+        });
+        stats.record(Generation {
+            ttft_ms: 9_000,
+            ..Generation::default()
+        });
+        assert_eq!(
+            stats.average_head_ms(),
+            Some(300),
+            "200 and 400, not the third"
+        );
+        assert_eq!(stats.average_server_ms(), Some(1_200), "800 and 1,600");
+    }
+
+    /// A provider that announced no response head leaves the split unknown rather than reporting
+    /// the whole wait as the server's share, which would blame the server for the network. The
+    /// wait itself is still reported: only its division is unknown.
+    #[test]
+    fn a_wait_with_no_head_reported_has_no_split() {
+        let mut stats = Throughput::default();
+        stats.record(generation(500, 1_000, 2_000));
+        assert_eq!(stats.last_ttft_ms(), Some(1_000));
+        assert_eq!(stats.last_head_ms(), None);
+        assert_eq!(stats.last_server_ms(), None);
+        assert_eq!(stats.average_head_ms(), None);
+        assert_eq!(stats.average_server_ms(), None);
+        assert_eq!(stats.encode_rate(), None, "and no denominator for prefill");
+    }
+
+    /// A request that reported no split is left out of the prefill figure too: its prompt tokens
+    /// would be counted against server work that is not its own.
+    #[test]
+    fn a_request_with_no_split_does_not_join_the_prefill_figure() {
         let mut stats = Throughput::default();
         stats.record(Generation {
             cache_hit_tokens: 1_000,
-            cache_miss_tokens: 0,
-            ..generation(10, 1_000, 2_000)
+            head_ms: 400,
+            ttft_ms: 1_000,
+            decode_ms: 2_000,
+            duration_ms: 3_000,
+            ..Generation::default()
         });
-        assert_eq!(stats.encode_rate(), Some(1_000));
+        assert_eq!(stats.encode_rate(), Some(1_666));
 
         stats.record(Generation {
             cache_hit_tokens: 500_000,
-            cache_miss_tokens: 0,
             duration_ms: 5_000,
             ..Generation::default()
         });
         assert_eq!(
             stats.encode_rate(),
-            Some(1_000),
-            "the untimed prompt is left out"
+            Some(1_666),
+            "the unsplit prompt is left out"
         );
     }
 
@@ -597,6 +764,7 @@ mod tests {
             reasoning_tokens: 250,
             cache_hit_tokens: 4_500,
             cache_miss_tokens: 500,
+            head_ms: 400,
             ttft_ms: 1_000,
             decode_ms: 2_000,
             duration_ms: 3_000,
@@ -610,7 +778,9 @@ mod tests {
             "generating    last 500 tok/s \u{b7} average 500 tok/s",
             "whole request last 333 tok/s \u{b7} average 333 tok/s",
             "first token   last 1.0s \u{b7} average 1.0s",
-            "prefill       5000 prompt tok/s while waiting",
+            "until head    last 400ms \u{b7} average 400ms",
+            "from head     last 600ms \u{b7} average 600ms",
+            "prefill       8333 prompt tok/s while the server worked",
         ] {
             assert!(
                 report.contains(expected),

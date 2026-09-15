@@ -101,6 +101,10 @@ impl LlmPort for MeteredLlm {
                 },
             ]));
         }
+        let acknowledged = futures::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            LlmEvent::ResponseHead
+        });
         let opening = futures::stream::once(async {
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             LlmEvent::ToolCallDelta {
@@ -119,12 +123,17 @@ impl LlmPort for MeteredLlm {
                 arguments_delta: "}".to_owned(),
             }
         });
-        Box::pin(opening.chain(closing).chain(futures::stream::iter(vec![
-            LlmEvent::Usage(Usage::new(20, 5, 3, 18, 2)),
-            LlmEvent::Finished {
-                reason: FinishReason::ToolCalls,
-            },
-        ])))
+        Box::pin(
+            acknowledged
+                .chain(opening)
+                .chain(closing)
+                .chain(futures::stream::iter(vec![
+                    LlmEvent::Usage(Usage::new(20, 5, 3, 18, 2)),
+                    LlmEvent::Finished {
+                        reason: FinishReason::ToolCalls,
+                    },
+                ])),
+        )
     }
 }
 
@@ -1313,15 +1322,18 @@ fn a_shutdown_request_stops_the_agent_by_itself() {
     assert!(served.is_ok(), "{served:?}");
 }
 
-/// A usage frame reports the wait and the generation separately, and both are measured from the
-/// deltas a *tool-call* step produces.
+/// A usage frame reports the wait, how much of it went on being answered at all, and the
+/// generation separately — and all of them are measured from the deltas a *tool-call* step
+/// produces.
 ///
 /// The two bounds are the point. A generation window wider than nothing says the tool call's own
 /// deltas reached the clock — the one thing that could not be asserted before there was a
 /// callback for them, because a step that answers with a call and no prose generates without
 /// touching either of the callbacks that existed. A wait wider than nothing says the clock
 /// started when the request was issued rather than at the first token, which is what makes the
-/// wait a figure at all. And the parts have to fit inside the request they were taken from.
+/// wait a figure at all. A head wider than nothing, and narrower than the wait it divides, says the
+/// split is real rather than a relabelling. And the parts have to fit inside the request they were
+/// taken from.
 #[test]
 fn a_usage_frame_separates_the_wait_from_the_generation() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1359,6 +1371,7 @@ fn a_usage_frame_separates_the_wait_from_the_generation() {
 
     let reported = frames.iter().find_map(|frame| match frame {
         Frame::Usage {
+            head_ms,
             ttft_ms,
             decode_ms,
             duration_ms,
@@ -1366,6 +1379,7 @@ fn a_usage_frame_separates_the_wait_from_the_generation() {
             reasoning_tokens,
             ..
         } => Some((
+            *head_ms,
             *ttft_ms,
             *decode_ms,
             *duration_ms,
@@ -1374,7 +1388,8 @@ fn a_usage_frame_separates_the_wait_from_the_generation() {
         )),
         _ => None,
     });
-    let Some((ttft_ms, decode_ms, duration_ms, completion_tokens, reasoning_tokens)) = reported
+    let Some((head_ms, ttft_ms, decode_ms, duration_ms, completion_tokens, reasoning_tokens)) =
+        reported
     else {
         panic!("the turn reported usage: {frames:?}");
     };
@@ -1396,5 +1411,19 @@ fn a_usage_frame_separates_the_wait_from_the_generation() {
     assert!(
         ttft_ms.saturating_add(decode_ms) <= duration_ms,
         "the parts fit inside the request: {ttft_ms} + {decode_ms} > {duration_ms}"
+    );
+    assert!(
+        head_ms > 0,
+        "being answered at all is a wait, and it took 50ms: {frames:?}"
+    );
+    assert!(
+        head_ms <= ttft_ms,
+        "the server answered before it spoke: head {head_ms}ms, first token {ttft_ms}ms"
+    );
+    // The server's own share is the rest of the wait, and it has to hold the 120ms it spent before
+    // its first delta — the half prefill lives in, which is the point of splitting the wait.
+    assert!(
+        ttft_ms.saturating_sub(head_ms) > 0,
+        "the server worked after it answered: {ttft_ms} - {head_ms}"
     );
 }

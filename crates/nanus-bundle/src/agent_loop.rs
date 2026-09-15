@@ -101,6 +101,21 @@ pub trait Progress {
     /// A step began.
     fn step_started(&mut self, _step: u32) {}
 
+    /// The server began answering the request the current step issued.
+    ///
+    /// The one moment between asking and the first token, and therefore the only place a
+    /// request's wait can be split from this side of a socket. It matters because a wait that is
+    /// mostly network and upload is a different problem from a wait that is mostly the server
+    /// reading the prompt, and a single duration cannot tell a reader which they have.
+    ///
+    /// Reported as the fact and not as an instant, for the same reason the durations are taken
+    /// elsewhere: a listener measuring with its own clock must be the one to read it, or the two
+    /// readings are from clocks that were never compared.
+    ///
+    /// Optional, like the deltas: an agent whose provider cannot report one says nothing here,
+    /// and a listener that does not care ignores it.
+    fn response_head(&mut self) {}
+
     /// A tool is about to run.
     ///
     /// The arguments come with the name because knowing *which* tool ran is often not
@@ -421,6 +436,7 @@ impl AgentRunner {
                     progress.tool_call(&arguments_delta);
                     assembled.absorb(id, name, &arguments_delta);
                 }
+                LlmEvent::ResponseHead => progress.response_head(),
                 LlmEvent::Usage(usage) => {
                     progress.usage(&usage);
                     assembled.usage = Some(usage);
@@ -871,6 +887,10 @@ mod tests {
         fn tool_call(&mut self, _delta: &str) {
             self.told.push("tool_call");
         }
+
+        fn response_head(&mut self) {
+            self.told.push("head");
+        }
     }
 
     /// A step that answers with a tool call and no prose still reaches a listener.
@@ -909,6 +929,60 @@ mod tests {
             vec!["tool_call"],
             "the call is generation, and nothing else was said"
         );
+    }
+
+    /// The server beginning to answer is reported before anything it says, which is what makes it
+    /// a boundary a listener can split the wait at. Reported as the fact rather than as an instant,
+    /// so the listener reads its own clock and both halves of the wait are measured with one clock
+    /// rather than two that were never compared.
+    #[tokio::test]
+    async fn the_server_answering_is_reported_before_what_it_says() {
+        let llm = ScriptedLlm::handle(vec![vec![
+            LlmEvent::ResponseHead,
+            LlmEvent::TextDelta("an answer".to_owned()),
+            LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ]]);
+        let Some(runner) = runner(Rc::clone(&llm), registry_with_echo()) else {
+            return;
+        };
+        let mut session = session();
+        let mut progress = Recorder::default();
+
+        assert!(
+            runner
+                .run_turn(&mut session, "hi", &mut progress)
+                .await
+                .is_ok()
+        );
+        assert_eq!(progress.told, vec!["head", "text"]);
+    }
+
+    /// And the other direction: a provider that says nothing about a response head reports none,
+    /// rather than a listener inventing one from the first delta — an invented boundary would put
+    /// the whole wait on whichever side of it the guess happened to land.
+    #[tokio::test]
+    async fn a_provider_that_reports_no_head_reports_none() {
+        let llm = ScriptedLlm::handle(vec![vec![
+            LlmEvent::TextDelta("an answer".to_owned()),
+            LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ]]);
+        let Some(runner) = runner(Rc::clone(&llm), registry_with_echo()) else {
+            return;
+        };
+        let mut session = session();
+        let mut progress = Recorder::default();
+
+        assert!(
+            runner
+                .run_turn(&mut session, "hi", &mut progress)
+                .await
+                .is_ok()
+        );
+        assert_eq!(progress.told, vec!["text"], "no head was announced");
     }
 
     /// The other direction: a step that only speaks reports prose and not a tool call, so the

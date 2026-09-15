@@ -501,13 +501,27 @@ has not been measured is drawn as a dash: zero is a measurement — it says the 
 nothing — and showing it for "no request has finished yet" would be a claim rather than a
 blank.
 
-The link carries the request's time as a decomposition rather than as one figure — the wait,
-the generation, the whole request, and how much of the generation was thinking — because the
-parts answer different questions and only one of them is the model's speed. An interface that
-wants the prompt-side figure has it too: prompt tokens per second of waiting is a floor on the
-provider's prefill throughput, since the wait covers the connection and the provider's queue
-as well as the prompt being read, and the frame does not pretend to separate what nothing at
-this end of a socket can separate.
+The link carries the request's time as a decomposition rather than as one figure — the wait, how
+much of that wait went on reaching the server and being answered at all, the generation, the whole
+request, and how much of the generation was thinking — because the parts answer different questions
+and only one of them is the model's speed.
+
+**The wait is split at the response head**, which is the one boundary this end of a socket can see.
+Everything before it is connecting, uploading, and waiting to be answered at all; everything after
+it is the server's own work — its queue, its reading of the prompt, and the first token. The split
+is worth having because the two halves have different owners: a wait that is mostly the near half is
+a network or an upload problem, and one that is mostly the far half is a prompt problem, and a
+single duration cannot tell a reader which they have. `/stats` prints both halves.
+
+It is also what makes the prompt-side figure worth reading. Prompt tokens per second is divided by
+the server's *own* work rather than by the whole wait, and the time spent reaching the server cannot
+contain prefill — prefill happens on the far side of the split — so charging that time to prefill
+reported a rate lower than any the provider could have had. It is still a bound rather than a
+measurement, and still a loose one: the server's work also covers its queue and the production of
+the first token, and on a shared endpoint prefill is scheduled in chunks beside other requests, so
+how long it takes is partly a property of the batch rather than of the prompt. Nothing at this end
+separates those, and the report says `a bound, not a measurement` rather than implying an instrument
+it does not have.
 
 ## Why the interface is testable
 

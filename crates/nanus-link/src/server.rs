@@ -497,6 +497,7 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
         let mut progress = Broadcast {
             held,
             started: None,
+            head: None,
             first_token: None,
             last_token: None,
         };
@@ -553,6 +554,13 @@ struct Broadcast<'a> {
     /// produced here, which keeps the loop's [`Progress`] contract about what happened
     /// rather than about how long it took.
     started: Option<Instant>,
+    /// When the server began answering this step's request, if it announced that it had.
+    ///
+    /// The far side of the split a reader's wait can be divided at: everything before this is
+    /// reaching the server and being answered at all, and everything after it is the server's own
+    /// work. `None` from a provider that does not report it, which is a blank rather than a
+    /// measurement of no time.
+    head: Option<Instant>,
     /// When this step's first generated delta arrived, if any did.
     ///
     /// Taken from every delta callback rather than only from the two that carry something a
@@ -618,6 +626,7 @@ impl Broadcast<'_> {
     /// measurement rather than as an absence.
     fn start_request(&mut self) {
         self.started = Some(Instant::now());
+        self.head = None;
         self.first_token = None;
         self.last_token = None;
     }
@@ -651,6 +660,14 @@ impl Progress for Broadcast<'_> {
         self.push(&Frame::Step { step });
     }
 
+    fn response_head(&mut self) {
+        // Taken once. A provider that repeated the announcement would otherwise move the
+        // boundary later and quietly shorten the part of the wait it is meant to measure.
+        if self.head.is_none() {
+            self.head = Some(Instant::now());
+        }
+    }
+
     fn tool_started(&mut self, name: &ToolName, arguments: &serde_json::Value) {
         self.push(&Frame::Tool {
             name: name.as_str().to_owned(),
@@ -672,6 +689,7 @@ impl Progress for Broadcast<'_> {
     fn usage(&mut self, usage: &Usage) {
         let now = Instant::now();
         let started = self.started.take();
+        let head = self.head.take();
         let first = self.first_token.take();
         let last = self.last_token.take();
         // Both ends of the window are written together or not at all, so one present without
@@ -696,6 +714,20 @@ impl Progress for Broadcast<'_> {
             }
             _ => (0, 0),
         };
+        // The part of the wait spent reaching the server and being answered at all, before its
+        // own work started. Zero when it was not reported, which is the same "not measured" the
+        // other durations use: a response head takes longer than a millisecond to cross a
+        // network, so a measured zero is not a thing that happens.
+        let head_ms = started
+            .zip(head)
+            .map_or(0, |(at, head)| millis_between(at, head));
+        // A step that generated nothing can still have been answered, so the head is not
+        // required to sit inside a first-token wait that never happened — but where both exist,
+        // the head precedes the token it is measured against.
+        assert!(
+            first.is_none() || head_ms <= ttft_ms,
+            "a response head {head_ms}ms cannot follow the first token at {ttft_ms}ms"
+        );
         // The wait, the generation, and whatever followed the last token are disjoint and
         // cover the request, so they cannot exceed it. Asserted rather than clamped because a
         // rate now divides by one of the parts, and parts that could add up to more than the
@@ -713,6 +745,7 @@ impl Progress for Broadcast<'_> {
             reasoning_tokens: usage.reasoning_tokens,
             ttft_ms,
             decode_ms,
+            head_ms,
         });
     }
 }

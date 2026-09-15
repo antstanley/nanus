@@ -18,8 +18,11 @@ use std::net::TcpListener;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use nanus_domain::{AgentConfig, Session, SessionId};
-use nanus_ports::SandboxPolicy;
+// The adapter's methods come from the port trait, so a test that drives it directly needs the
+// trait in scope rather than only the type.
+use nanus_ports::{LlmPort as _, SandboxPolicy};
 
 /// One scripted HTTP response, as the server should write it.
 #[derive(Clone)]
@@ -385,4 +388,54 @@ async fn a_frame_whose_last_character_arrives_later_still_decodes() {
         )
     });
     assert!(!corrupted, "no replacement character was invented");
+}
+
+/// The response head is announced before any of the body.
+///
+/// This is the whole worth of the event: it is the boundary a request's wait is split at, so a
+/// head announced after the first token would put that token's wait on the wrong side of the
+/// split — and the split would then be measuring the wrong interval while looking correct. The
+/// assertion is on the order, not on the count, because the count would be satisfied by an
+/// announcement that arrived too late to divide anything.
+#[tokio::test]
+async fn the_response_head_is_announced_before_the_body() {
+    // No workspace: this drives the adapter's own stream rather than a turn, and nothing here
+    // reaches a tool.
+    let (base_url, _requests) = spawn_server(vec![Response {
+        body: answer_stream("hello"),
+    }]);
+    let adapter = nanus_adapter_deepseek::DeepSeekConfig::with_base_url(
+        nanus_adapter_deepseek::MODEL_FLASH,
+        "test-key",
+        &base_url,
+    );
+    let llm = nanus_adapter_deepseek::DeepSeekLlm::new(adapter).expect("the adapter builds");
+    let request = nanus_ports::ChatRequest::new(
+        nanus_adapter_deepseek::MODEL_FLASH,
+        vec![nanus_domain::Message::user("hi")],
+    );
+
+    let events: Vec<nanus_ports::LlmEvent> = llm.stream_chat(request).collect().await;
+
+    // The other direction first: this body does carry generated content, so an announcement ahead
+    // of nothing would satisfy an order assertion vacuously.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, nanus_ports::LlmEvent::TextDelta(_))),
+        "the body carried text to be announced before: {events:?}"
+    );
+    assert_eq!(
+        events.first(),
+        Some(&nanus_ports::LlmEvent::ResponseHead),
+        "the head comes before everything the body said: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, nanus_ports::LlmEvent::ResponseHead))
+            .count(),
+        1,
+        "and is announced once, because a second announcement would move the boundary"
+    );
 }

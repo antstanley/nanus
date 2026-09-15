@@ -235,6 +235,21 @@ pub enum LlmEvent {
         /// A fragment of the arguments JSON string.
         arguments_delta: String,
     },
+    /// The server began answering: its response head arrived, before any of the body.
+    ///
+    /// A fact about the transport rather than about the model, and the only one this vocabulary
+    /// carries. It exists because it is the one boundary a request's wait can be split at from
+    /// this side of the socket: everything before it is connecting, uploading, and waiting to be
+    /// answered at all, and everything after it is the server's own work. Without the split
+    /// those are a single number, and telling a slow network from a slow prompt is a guess.
+    ///
+    /// It carries no instant, because a listener owns its own clock — an adapter that reported
+    /// the time would be reporting a reading from a clock nobody else measures with. The event
+    /// says only *that* it happened, as everything else here does.
+    ///
+    /// Optional, like the rest: a port that cannot see a response head emits none, and a
+    /// listener that has no use for it ignores it.
+    ResponseHead,
     /// Token accounting, usually delivered once near the end.
     Usage(Usage),
     /// The response is complete.

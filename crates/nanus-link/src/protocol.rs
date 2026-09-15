@@ -275,6 +275,20 @@ pub enum Frame {
         /// transcript cannot account for.
         #[serde(default)]
         reasoning_tokens: u32,
+        /// How long the request took to reach the server and be answered at all, in
+        /// milliseconds.
+        ///
+        /// The response head — the moment the server began replying, before any of the body —
+        /// measured from the request being issued. Everything before it is connecting, uploading,
+        /// and waiting to be answered; everything between it and the first token is the server's
+        /// own work. Without both ends those are one number, and whether a slow wait is the
+        /// network or the prompt is a guess.
+        ///
+        /// This is the nearer end of the split, and the only end the agent can measure: the far
+        /// end is `ttft_ms`, so the server's own share is the difference. Zero when the
+        /// provider announced no head, which is a blank rather than a measurement of no time.
+        #[serde(default)]
+        head_ms: u64,
         /// How long the request waited before its first generated token, in milliseconds.
         ///
         /// This is the wait a reader feels, and the part a rate that divides by the whole
@@ -462,6 +476,7 @@ mod tests {
                 reasoning_tokens: 40,
                 ttft_ms: 700,
                 decode_ms: 1_500,
+                head_ms: 250,
             },
             Frame::Done {
                 answer: "done".to_owned(),
@@ -569,6 +584,7 @@ mod tests {
                 reasoning_tokens: 0,
                 ttft_ms: 0,
                 decode_ms: 0,
+                head_ms: 0,
             })
         );
     }
