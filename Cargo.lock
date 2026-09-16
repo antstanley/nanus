@@ -1646,6 +1646,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]

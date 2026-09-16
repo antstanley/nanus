@@ -147,6 +147,11 @@ Contract to preserve:
   `compact` (the default) is one line each, `full` is the whole argument block and the whole
   reasoning segment. The interface reads it itself, from the same file the core reads, so
   the setting reaches every way the interface is started. See `docs/tui.md`.
+- `markdown` / `mermaid` — whether the interface renders the model's answers as markdown
+  and draws `mermaid` fences as text diagrams. Both default to `true`. Only the model's
+  *answer* is ever parsed: reasoning and tool output are drawn verbatim, so a diff cannot
+  become a bulleted list. The renderer does no I/O — an image is a placeholder and a URL is
+  never fetched — and `docs/tui.md` is the whole of it.
 - `DEEPSEEK_API_KEY` — provider key. Read from the environment on each use; it is
   **never** stored in `NanusConfig`, serialised, or rendered by `Debug`.
 - `NANUS_HOME` — override the session-store home. Sessions live under

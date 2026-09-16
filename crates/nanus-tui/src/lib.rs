@@ -37,6 +37,10 @@
 pub mod buffer;
 pub mod command;
 pub mod compact;
+// The markdown renderer is an implementation detail of the view: it produces the same
+// `Line`s every other entry is drawn from, and nothing outside this crate needs to name
+// it. Keeping it private is what stops it becoming a second public rendering surface.
+mod markdown;
 pub mod notice;
 pub mod replay;
 pub mod stats;

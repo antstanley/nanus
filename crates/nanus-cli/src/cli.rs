@@ -801,6 +801,8 @@ fn show_config(args: &Options) -> Result<(), String> {
     println!("max steps per turn: {}", config.max_steps_per_turn);
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
+    println!("markdown answers: {}", config.markdown);
+    println!("mermaid diagrams: {}", config.mermaid);
     println!("workspace root: {}", workspace_display(&config));
     // Resolved rather than echoed: the socket is a path a user will paste into a command
     // or a supervisor, and a default spelled `<the nanus home>/…` is not one.

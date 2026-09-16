@@ -523,6 +523,54 @@ how long it takes is partly a property of the batch rather than of the prompt. N
 separates those, and the report says `a bound, not a measurement` rather than implying an instrument
 it does not have.
 
+## The answer is markdown
+
+The model writes markdown, so the interface parses its answer and draws the *rendered*
+form: headings are headings rather than `#` lines, emphasis and inline code carry their
+style, lists get bullets, and a fenced block is drawn as code. The source scaffolding is
+never shown, because it was syntax rather than content.
+
+What is supported is the subset a coding assistant actually emits: ATX headings,
+paragraphs with word wrapping, `**bold**` / `*italic*` / `` `inline code` ``, links
+(`[label](url)` becomes the label and its destination), fenced code blocks, ordered,
+unordered, and task lists, nested blockquotes, horizontal rules, pipe tables, and
+whole-line images. A leading `+++`-delimited TOML frontmatter block is stripped. A
+construct that never closes — a `**` mid-stream, a fence still open — is drawn as itself,
+so a half-arrived answer is readable rather than mangled.
+
+**Only the model's answer is parsed.** Reasoning is still the newest line of itself and
+tool output is still drawn verbatim, and that is deliberate: a `read` that returned a
+unified diff or a file of `#` comments would otherwise turn into a bulleted list and a
+wall of headings. The rule is the role, not the content.
+
+**Mermaid is drawn as text.** A `mermaid` fence is parsed and rendered as a diagram:
+flowcharts, sequence diagrams, pie charts, gantt charts, state diagrams, class diagrams,
+quadrant charts, and block diagrams. A diagram that cannot be parsed — including one that
+is still being streamed — falls back to showing the fence's source, because losing a
+diagram is worse than showing it unfinished. Diagrams use the interface's own accents and,
+like everything else, obey the column budget, so the scroll arithmetic stays exact.
+
+Two settings turn the rendering off, both defaulting to on, in the same configuration file:
+
+```toml
+markdown = true   # render the model's answers as markdown
+mermaid = true    # draw mermaid fences as diagrams
+```
+
+`markdown = false` draws every answer exactly as it arrived, and `mermaid = false` shows
+the fence as code even when it would parse.
+
+**The renderer does no I/O.** An image is a labelled placeholder, not a file read and not
+a URL fetch: the view is a pure function of the transcript and the composer, and a remote
+fetch on a model's say-so is a request the reader did not ask for. Control characters are
+stripped at the parse boundary, so a model — or a file it read — cannot smuggle a terminal
+escape sequence into the screen through a heading or a code fence. Syntax highlighting is
+deliberately absent for now; a fenced block is drawn verbatim in the code style.
+
+The markdown styles are derived from the interface's role styles, so the answer keeps the
+answer's colour and `NO_COLOR` works without a second palette: `Theme::monochrome` is the
+colour theme with the colours removed, and the markdown theme inherits that.
+
 ## Why the interface is testable
 
 The view is a pure function of a `Transcript` and an `InputBuffer`, neither of which knows

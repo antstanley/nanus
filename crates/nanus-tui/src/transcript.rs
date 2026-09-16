@@ -222,6 +222,11 @@ impl Entry {
     /// height of what `tui_detail = "full"` shows rather than of what is on screen. The
     /// view measures the lines it actually draws instead of asking here, which is why the
     /// two cannot drift.
+    ///
+    /// This is the raw-text estimate and is therefore *not* the height of a markdown
+    /// answer, whose blocks occupy rows the text alone does not predict. The view does not
+    /// use it for that reason: `ViewState::transcript_lines` renders the markdown and
+    /// measures the drawn lines, so the scroll arithmetic follows what is on screen.
     #[must_use]
     pub fn height_at(&self, width: u16) -> u16 {
         let usable = width.max(1);

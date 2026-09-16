@@ -103,6 +103,10 @@ ignore = "0.4"
 globset = "0.4"
 similar = "3.2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+# Display width, not character count: the markdown renderer wraps by the columns a
+# character occupies, and a CJK glyph or an emoji is two. Ratatui already carries this
+# transitively; naming it directly is what lets the interface agree with it.
+unicode-width = "0.2"
 
 # Dev-dependencies.
 proptest = "1.11"

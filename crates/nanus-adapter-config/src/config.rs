@@ -185,6 +185,18 @@ pub struct NanusConfig {
     pub max_parallel_tools: u32,
     /// How much of a tool call and a thinking segment the interface draws.
     pub tui_detail: TuiDetail,
+    /// Whether the interface renders the model's answers as markdown.
+    ///
+    /// On by default: the model writes markdown, and a transcript that shows the source
+    /// shows the scaffolding. Setting it false draws every answer exactly as it arrived.
+    /// Only the model's *answer* is ever parsed — reasoning and tool output are not, so
+    /// this cannot turn a diff into a bulleted list.
+    pub markdown: bool,
+    /// Whether the interface draws a `mermaid` fence as a diagram.
+    ///
+    /// A diagram that cannot be parsed falls back to the fence's source whether this is
+    /// set or not; the setting is for a reader who would rather always see the source.
+    pub mermaid: bool,
     /// An override for the built-in system prompt.
     pub system_prompt: Option<String>,
     /// An override for the workspace root the tools are confined to.
@@ -214,6 +226,8 @@ impl Default for NanusConfig {
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             tui_detail: TuiDetail::default(),
+            markdown: true,
+            mermaid: true,
             system_prompt: None,
             workspace_root: None,
             service_socket: None,

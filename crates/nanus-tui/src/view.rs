@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
+use crate::markdown::{self, MarkdownTheme};
 use crate::stats::{Throughput, share, show, show_duration};
 use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_count};
 
@@ -180,6 +181,19 @@ pub struct ViewState {
     pub label: Option<String>,
     /// Styling.
     pub theme: Theme,
+    /// Whether the model's answers are rendered as markdown.
+    ///
+    /// On by default, because the model writes markdown and showing its source shows the
+    /// scaffolding. Only the model's *answer* is parsed: reasoning is drawn as itself, and
+    /// tool output never is — a unified diff that became a bulleted list would be worse
+    /// than no rendering at all.
+    pub markdown: bool,
+    /// Whether a `mermaid` fence is drawn as a diagram.
+    ///
+    /// Separate from [`ViewState::markdown`] because a diagram is a different kind of
+    /// claim: when it cannot be parsed the fence is shown as code, but a reader who would
+    /// rather always see the source can turn it off outright.
+    pub mermaid: bool,
     /// Rows to scroll back from the end on the next render, if a caller asked for it.
     ///
     /// Deferred rather than applied immediately because "48 rows back from the end"
@@ -213,6 +227,8 @@ impl Default for ViewState {
             detail: Detail::default(),
             label: None,
             theme: Theme::default(),
+            markdown: true,
+            mermaid: true,
             pending_scroll_back: None,
             last_viewport: None,
         }
@@ -396,7 +412,16 @@ impl ViewState {
     /// The entry's own text carries the style; tool entries add a header so a reader
     /// can tell an invocation from its result.
     #[must_use]
-    pub fn lines_for(&self, entry: &Entry) -> Vec<Line<'static>> {
+    pub fn lines_for(&self, entry: &Entry, width: u16) -> Vec<Line<'static>> {
+        // The model's answer is markdown; everything else is drawn as itself. A tool's
+        // output in particular must never be parsed — a unified diff is not a bulleted
+        // list, and a file of `#` comments is not a wall of headings.
+        if self.markdown
+            && entry.role() == Role::Assistant
+            && matches!(entry.kind(), EntryKind::Text)
+        {
+            return self.markdown_lines(entry, width);
+        }
         let style = self.theme.style_for_entry(entry);
         match entry.kind() {
             EntryKind::ToolCall { name, arguments } => {
@@ -457,6 +482,23 @@ impl ViewState {
                 lines
             }
         }
+    }
+
+    /// Renders an assistant message as markdown, with the streaming cursor.
+    ///
+    /// The cursor is appended after the render rather than passed in, because a markdown
+    /// construct may be open at the tail: the parser shows an unclosed fence or `**` as
+    /// itself, and the cursor is simply the next thing drawn after whatever the partial
+    /// parse produced.
+    fn markdown_lines(&self, entry: &Entry, width: u16) -> Vec<Line<'static>> {
+        let theme = MarkdownTheme::from_view(&self.theme);
+        let mut lines = markdown::render(entry.text(), width, self.mermaid, &theme);
+        if entry.is_streaming()
+            && let Some(last) = lines.last_mut()
+        {
+            last.spans.push(Span::styled("▌", self.theme.assistant));
+        }
+        lines
     }
 
     /// Builds the header line naming the role.
@@ -649,7 +691,7 @@ impl ViewState {
             if self.detail != Detail::Compact || entry.role() != Role::Tool {
                 lines.push(self.header_for(entry));
             }
-            lines.extend(self.lines_for(entry));
+            lines.extend(self.lines_for(entry, width));
             // A blank row between entries, so two consecutive messages do not read
             // as one paragraph.
             lines.push(Line::from(""));
@@ -2715,5 +2757,87 @@ mod colour_tests {
             carries(theme.reasoning.fg),
             "the reasoning colour is rendered"
         );
+    }
+}
+
+/// Markdown is the model's answer and only the model's answer.
+///
+/// The negative case is the one that matters: a tool result is a file or a diff, and a
+/// `#` line or a `-` line in one must stay itself rather than becoming a heading or a
+/// bullet.
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+
+    fn text(state: &ViewState, width: u16) -> String {
+        state
+            .transcript_lines(width)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn an_answer_is_rendered_as_markdown() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "# Title\n\n- one\n- two"));
+        let rendered = text(&state, 60);
+        assert!(rendered.contains("Title"), "{rendered}");
+        assert!(rendered.contains("• one"), "{rendered}");
+        // The heading's hash was syntax, not content.
+        assert!(!rendered.contains("# Title"), "{rendered}");
+    }
+
+    #[test]
+    fn a_tool_result_is_never_parsed_as_markdown() {
+        let mut state = ViewState::new();
+        // A diff, which markdown would turn into a heading and a bullet list.
+        state.transcript.push(Entry::tool_result(
+            "read",
+            false,
+            "# not a heading\n- not a bullet",
+        ));
+        let rendered = text(&state, 60);
+        assert!(rendered.contains("# not a heading"), "{rendered}");
+        assert!(rendered.contains("- not a bullet"), "{rendered}");
+    }
+
+    #[test]
+    fn markdown_can_be_turned_off() {
+        let mut state = ViewState::new();
+        state.markdown = false;
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "# Title"));
+        let rendered = text(&state, 60);
+        assert!(rendered.contains("# Title"), "{rendered}");
+    }
+
+    #[test]
+    fn a_mermaid_fence_is_drawn_as_a_diagram() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::prose(
+            Role::Assistant,
+            "```mermaid\ngraph TD\nA[Start] --> B[End]\n```",
+        ));
+        let rendered = text(&state, 60);
+        assert!(rendered.contains("Start"), "{rendered}");
+        assert!(rendered.contains("End"), "{rendered}");
+        // The fence's language label is replaced by the drawing.
+        assert!(!rendered.contains("── mermaid"), "{rendered}");
+    }
+
+    #[test]
+    fn a_broken_mermaid_fence_falls_back_to_its_source() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::prose(
+            Role::Assistant,
+            "```mermaid\nnot a diagram\n```",
+        ));
+        let rendered = text(&state, 60);
+        assert!(rendered.contains("not a diagram"), "{rendered}");
     }
 }

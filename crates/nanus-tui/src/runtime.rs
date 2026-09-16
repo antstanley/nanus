@@ -108,10 +108,24 @@ fn no_color_requested(value: Option<&OsStr>) -> bool {
 /// A configuration that exists and cannot be read is an error rather than a default. It is
 /// the same file the core refuses to start on, and silently drawing a transcript the reader
 /// did not ask for would be the wrong kind of silence.
-fn configured_detail() -> io::Result<Detail> {
+fn configured_preferences() -> io::Result<Preferences> {
     NanusConfig::load(None)
-        .map(|config| detail_from(config.tui_detail))
+        .map(|config| Preferences {
+            detail: detail_from(config.tui_detail),
+            markdown: config.markdown,
+            mermaid: config.mermaid,
+        })
         .map_err(|error| io::Error::other(format!("the configuration could not be read: {error}")))
+}
+
+/// The interface's display preferences, read together from one file.
+///
+/// One read rather than one per setting: the file is the same file, and a load that fails
+/// should be a single sentence on stderr rather than three attempts at the same thing.
+struct Preferences {
+    detail: Detail,
+    markdown: bool,
+    mermaid: bool,
 }
 
 /// Maps the configured spelling onto the rendering it selects.
@@ -615,10 +629,12 @@ async fn event_loop(
 ) -> io::Result<()> {
     // Read before the terminal is taken, so a configuration that cannot be read is a
     // sentence on stderr rather than an abort with a screen already in raw mode.
-    let detail = configured_detail()?;
+    let preferences = configured_preferences()?;
     let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
-    view.detail = detail;
+    view.detail = preferences.detail;
+    view.markdown = preferences.markdown;
+    view.mermaid = preferences.mermaid;
     // Chosen here, at the boundary with the terminal, rather than inside the view: the
     // environment is a property of this run, and a view built with one would render
     // differently in a test that happened to inherit `NO_COLOR` from whatever ran it.

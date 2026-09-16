@@ -54,6 +54,9 @@ futures = { workspace = true, optional = true }
 crossterm = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The markdown renderer wraps by display width, so it agrees with the terminal about how
+# many columns a character takes.
+unicode-width = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["rt", "macros", "sync", "time"] }
 
 [dev-dependencies]

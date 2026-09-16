@@ -80,6 +80,11 @@ fn the_built_in_defaults_are_the_documented_ones() {
         TuiDetail::Compact,
         "a transcript is compact unless the reader asked otherwise"
     );
+    assert!(
+        config.markdown,
+        "the model's markdown is rendered by default"
+    );
+    assert!(config.mermaid, "a mermaid fence is drawn by default");
     assert_eq!(config.config_version, CONFIG_VERSION);
     assert!(config.system_prompt.is_none());
     assert!(config.workspace_root.is_none());
@@ -182,6 +187,22 @@ fn the_interface_detail_spelling_round_trips() {
     config.save(Some(&written)).expect("save");
     let reloaded = NanusConfig::load(Some(&written)).expect("reload");
     assert_eq!(reloaded.tui_detail, TuiDetail::Full);
+}
+
+#[test]
+fn markdown_rendering_can_be_turned_off() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "markdown = false\nmermaid = false\n").expect("seed");
+    let config = NanusConfig::load(Some(&path)).expect("load");
+    assert!(!config.markdown);
+    assert!(!config.mermaid);
+    // The setting survives a save and a reload, not only the first parse.
+    let written = dir.path().join("written.toml");
+    config.save(Some(&written)).expect("save");
+    let reloaded = NanusConfig::load(Some(&written)).expect("reload");
+    assert!(!reloaded.markdown);
+    assert!(!reloaded.mermaid);
 }
 
 #[test]
