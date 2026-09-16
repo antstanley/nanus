@@ -21,6 +21,12 @@ use super::wrap::{hard_wrap, wrap};
 /// The widest a table column may grow before it is treated as a paragraph of its own.
 const MAX_COLUMN: usize = 48;
 
+/// The narrowest a table column may be squeezed before the table is drawn flat instead.
+///
+/// A column one or two cells wide is a grid of ellipses: it shows that data exists without
+/// showing any of it. Below this the flat form, which wraps whole cell text, says more.
+const MIN_COLUMN: usize = 4;
+
 /// Renders blocks to lines at `width` columns.
 pub(crate) fn blocks(
     blocks: &[Block],
@@ -199,6 +205,17 @@ fn table(
         })
         .collect();
     let widths = column_widths(&natural, available);
+    // A column cut below the minimum is not worth a grid: at that point the flat form shows
+    // more of every cell than a row of ellipses does. This is a test on the *allocated*
+    // widths rather than on the terminal width alone, because columns that are naturally
+    // narrow are fine however tight the terminal — only being cut is not.
+    let cramped = widths
+        .iter()
+        .zip(&natural)
+        .any(|(&width, &natural)| width < natural.min(MIN_COLUMN));
+    if cramped {
+        return table_flat(headers, rows, width, theme);
+    }
     let mut out = Vec::new();
     out.push(table_row(headers, &widths, theme.table_header, theme));
     let separator: usize = widths.iter().copied().fold(gaps, usize::saturating_add);
@@ -212,7 +229,7 @@ fn table(
     out
 }
 
-/// Renders a table as wrapped lines when there is no room for columns.
+/// Renders a table as wrapped lines when there is no room for readable columns.
 fn table_flat(
     headers: &[String],
     rows: &[Vec<String>],
@@ -280,36 +297,66 @@ fn table_row(
 }
 
 /// Renders a table cell's inline styling, padded to its column width.
+///
+/// The padding is measured from the *rendered* spans rather than the source text.
+/// Inline markup is syntax: `**bold**` and `` `code` `` are wider as written than as
+/// drawn, so padding by the source width leaves the cell short and shifts every later
+/// column left — a handful of markup characters is a handful of columns of misalignment.
 fn cell_spans(text: &str, width: usize, base: Style, theme: &MarkdownTheme) -> Vec<Span<'static>> {
-    let plain = str_width(text);
-    if plain > width {
-        return vec![Span::styled(fit(text, width), base)];
-    }
     let mut spans = inline::spans_with(text, base, theme);
-    let padding = width.saturating_sub(plain);
+    let rendered = spans_width(&spans);
+    if rendered > width {
+        return fit_spans(spans, width, base);
+    }
+    let padding = width.saturating_sub(rendered);
     if padding > 0 {
         spans.push(Span::styled(" ".repeat(padding), base));
     }
     spans
 }
 
-/// Truncates `text` to `width` columns, ending with an ellipsis when it was cut.
-fn fit(text: &str, width: usize) -> String {
-    if str_width(text) <= width {
-        return text.to_owned();
+/// The display width of a run of styled spans.
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans.iter().fold(0_usize, |total, span| {
+        total.saturating_add(str_width(span.content.as_ref()))
+    })
+}
+
+/// Truncates styled spans to `width` columns, ending with an ellipsis when content was cut.
+///
+/// Truncation runs on the parsed spans, not the source, so a cut cell never shows a
+/// half-consumed marker like `**` or an unmatched backtick.
+fn fit_spans(spans: Vec<Span<'static>>, width: usize, base: Style) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
     }
     let room = width.saturating_sub(1);
-    let mut out = String::new();
+    let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0_usize;
-    for character in text.chars() {
-        let current = char_width(character);
-        if used.saturating_add(current) > room {
+    // Whether a character did not fit and ended the walk. The partial span accumulated so
+    // far is pushed *before* the outer loop stops, which a labelled `break` would skip —
+    // and skipping it would throw away the whole truncated cell for the sake of the dot.
+    let mut cut = false;
+    for span in spans {
+        let style = span.style;
+        let mut kept = String::new();
+        for character in span.content.chars() {
+            let current = char_width(character);
+            if used.saturating_add(current) > room {
+                cut = true;
+                break;
+            }
+            kept.push(character);
+            used = used.saturating_add(current);
+        }
+        if !kept.is_empty() {
+            out.push(Span::styled(kept, style));
+        }
+        if cut {
             break;
         }
-        out.push(character);
-        used = used.saturating_add(current);
     }
-    out.push('…');
+    out.push(Span::styled("…", base));
     out
 }
 
@@ -377,6 +424,72 @@ mod tests {
         let out = render("| alpha | beta |\n| - | - |\n| gamma | delta |", 9);
         let widest = out.iter().map(|line| str_width(line)).max().unwrap_or(0);
         assert!(widest <= 9, "{out:?}");
+    }
+
+    /// Columns squeezed to a cell or two are a grid of ellipses, which says nothing. Below
+    /// the readable minimum the table is drawn flat, where the whole cell text wraps.
+    #[test]
+    fn a_table_too_narrow_for_readable_columns_is_drawn_flat() {
+        let out = render(
+            "| Diagram kind | Syntax opener | Verified in the live capture |\n\
+             | --- | --- | --- |\n\
+             | Flowchart | graph TD | yes - correct when acyclic |",
+            12,
+        );
+        assert!(
+            out.iter().all(|line| !line.contains('│')),
+            "a grid of ellipses is not a table: {out:?}"
+        );
+        let joined = out.join("\n");
+        assert!(joined.contains("Diagram"), "{out:?}");
+        assert!(joined.contains("Flowchart"), "{out:?}");
+        let widest = out.iter().map(|line| str_width(line)).max().unwrap_or(0);
+        assert!(widest <= 12, "{out:?}");
+    }
+
+    /// Naturally narrow columns are not "cramped": a small table of short cells stays a
+    /// table however tight the terminal, because no cell is being cut.
+    #[test]
+    fn narrow_columns_that_need_no_cutting_stay_a_table() {
+        let out = render("| a | b | c |\n| - | - | - |\n| 1 | 22 | 3 |", 20);
+        assert!(out.iter().any(|line| line.contains('│')), "{out:?}");
+    }
+
+    /// A cell's padding is measured from what is *drawn*, so inline markup a cell keeps
+    /// as syntax does not pull the columns to its right out of line.
+    #[test]
+    fn inline_markup_in_a_cell_keeps_the_columns_aligned() {
+        let out = render(
+            "| kind | syntax | note |\n\
+             | --- | --- | --- |\n\
+             | flow | `graph TD` | no markup here |\n\
+             | plain | words | **bold** tail |",
+            60,
+        );
+        let bars = |line: &str| {
+            line.char_indices()
+                .filter(|(_, character)| *character == '│')
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        let header = bars(&out[0]);
+        assert_eq!(header.len(), 2, "{out:?}");
+        for row in &out[2..] {
+            assert_eq!(bars(row), header, "row {row:?} is out of line in {out:?}");
+        }
+    }
+
+    /// Truncation runs on the parsed spans, so a cut never leaves half a marker behind.
+    #[test]
+    fn a_truncated_cell_does_not_show_a_marker() {
+        let out = render(
+            "| a | b |\n| - | - |\n| x | **a bold cell that must be cut** |",
+            24,
+        );
+        let last = out.last().cloned().unwrap_or_default();
+        assert!(last.ends_with('…'), "{out:?}");
+        assert!(!last.contains("**"), "{out:?}");
+        assert!(str_width(&last) <= 24, "{out:?}");
     }
 
     #[test]
