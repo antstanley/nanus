@@ -22,6 +22,7 @@ should read the relevant page before changing a subsystem:
 | [`docs/design.md`](docs/design.md) | Changing a deliberate design decision (toolset size, approval, budget). |
 | [`docs/testing.md`](docs/testing.md) | Adding tests or wondering what "verified" means here. |
 | [`docs/status.md`](docs/status.md) | Depending on something; includes known limits. |
+| [`docs/features.md`](docs/features.md) | Checking whether a capability exists before relying on it. |
 | [`docs/style.md`](docs/style.md) | Writing any Rust. |
 | [`docs/tui.md`](docs/tui.md) | Changing the interface, or the link between it and the core. |
 | [`docs/service.md`](docs/service.md) | Changing how an agent is started, detached, or stopped. |

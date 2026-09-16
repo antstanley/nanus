@@ -3,6 +3,15 @@
 The [README](../README.md) is the front door: what `nanus` is, why it exists, and how to
 run it. Everything below is the detail behind that pitch.
 
+## [Features](features.md)
+
+A map of what the harness supports today — the three modes, the seven tools, the
+provider and its controls, sessions, configuration, the command line, the interface, the
+service, the link, the kernel, and what is deliberately not covered — each with a link to
+the page that explains it.
+
+Start here if you want to know what it can do before reading how.
+
 ## [The interface](tui.md)
 
 Starting the interface, how it reaches an agent, browsing a recorded session without an
