@@ -343,6 +343,20 @@ impl InputBuffer {
         true
     }
 
+    /// Moves the cursor to `column` characters into `line`, clamping to the line's end.
+    ///
+    /// The mouse names a cell rather than an index into the text, so a click arrives as a
+    /// line and a column. Clamping rather than refusing means a click past the end of a
+    /// line puts the caret at the end of it, which is what the click meant.
+    pub fn place_cursor(&mut self, line: usize, column: usize) {
+        let start = self.line_start(line);
+        let column = column.min(self.line_length(line));
+        self.cursor = start.saturating_add(column);
+        self.leave_history();
+        // Postcondition: the cursor stays inside the text.
+        assert!(self.cursor <= self.text.len());
+    }
+
     /// Deletes from the cursor back to the start of the current word.
     ///
     /// Returns whether anything was removed.

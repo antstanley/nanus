@@ -45,6 +45,9 @@
 //! | `PageUp` / `PageDown` | scroll the transcript |
 //! | `Left` / `Right`, `Home` / `End` | move the cursor |
 //!
+//! The mouse navigates too: the wheel scrolls the conversation, and a left click in the
+//! composer puts the caret where it landed.
+//!
 //! A line whose first word opens with `/` is a command the interface answers itself:
 //! `/exit` and `/quit` leave, and anything else is named as unrecognised rather than sent
 //! to the model. See [`crate::command`].
@@ -65,7 +68,8 @@ use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
 use nanus_ports::{StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use tokio::sync::mpsc;
 
@@ -78,6 +82,12 @@ use crate::view::{Theme, ViewState};
 
 /// Rows scrolled per `PageUp` or `PageDown`.
 const PAGE_ROWS: i32 = 10;
+
+/// Rows scrolled per notch of the mouse wheel.
+///
+/// Smaller than a page because a wheel notch is a nudge rather than a jump: a page at a
+/// time with a wheel overshoots whatever the reader was aiming at.
+const MOUSE_SCROLL_ROWS: i32 = 3;
 
 /// Whether the terminal asked for no colour.
 ///
@@ -153,11 +163,13 @@ struct TerminalGuard {
     terminal: DefaultTerminal,
     /// Whether the keyboard protocol was asked for, so it is only given back if it was.
     enhanced: bool,
+    /// Whether the mouse was captured, so it is only released if it was.
+    mouse: bool,
 }
 
 impl TerminalGuard {
-    /// Enters raw mode, the alternate screen, and — where the terminal supports it — the
-    /// keyboard protocol that reports modifiers.
+    /// Enters raw mode, the alternate screen, mouse reporting, and — where the terminal
+    /// supports it — the keyboard protocol that reports modifiers.
     ///
     /// A terminal in its default mode sends one byte for `Enter`, and it is the same byte
     /// whether or not Shift is held: `Shift+Enter` is not a key a program is told about,
@@ -165,10 +177,19 @@ impl TerminalGuard {
     /// protocol can say otherwise, so the protocol is requested when the terminal
     /// answers that it speaks it, and not requested when it does not — a terminal that
     /// does not understand the request may print the escape sequence instead.
+    ///
+    /// Mouse reporting is asked for unconditionally: a terminal that does not speak it
+    /// ignores the request rather than printing it, and until it is asked for the wheel
+    /// and the pointer are the terminal's rather than this program's.
     fn enter() -> Self {
         let terminal = ratatui::init();
+        let mouse = enable_mouse();
         let enhanced = enable_keyboard_protocol();
-        Self { terminal, enhanced }
+        Self {
+            terminal,
+            enhanced,
+            mouse,
+        }
     }
 
     /// Returns the terminal to draw into.
@@ -179,6 +200,11 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Given back before the screen is restored, so the shell that inherits the
+        // terminal is not left with a mouse mode it never asked for.
+        if self.mouse {
+            let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+        }
         if self.enhanced {
             // Given back before the screen is restored, so the shell that inherits the
             // terminal does not inherit a keyboard mode it never asked for.
@@ -186,6 +212,21 @@ impl Drop for TerminalGuard {
             let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
         ratatui::restore();
+    }
+}
+
+/// Asks the terminal to report mouse events.
+///
+/// Returns whether the request was made. A write that fails leaves the interface exactly
+/// as it was before the feature existed — keyboard-only — which is why this is a
+/// best-effort upgrade rather than a requirement, like [`enable_keyboard_protocol`].
+fn enable_mouse() -> bool {
+    match crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(%error, "mouse capture could not be enabled");
+            false
+        }
     }
 }
 
@@ -673,7 +714,15 @@ async fn event_loop(
                     // read. Leaving is the only sensible answer.
                     break;
                 };
-                let TerminalEvent::Key(key) = event? else {
+                let event = event?;
+                // Mouse events are routed before the keyboard, so the key handling
+                // below stays the one flat match it always was. The event is borrowed
+                // rather than moved so it is still there when it is not a mouse event.
+                if let TerminalEvent::Mouse(mouse) = &event {
+                    handle_mouse(*mouse, &mut view);
+                    continue;
+                }
+                let TerminalEvent::Key(key) = event else {
                     continue;
                 };
                 // Windows reports both press and release; only a press is a keystroke.
@@ -972,6 +1021,27 @@ fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     }
 }
 
+/// Routes a mouse event.
+///
+/// The wheel is the whole of scrolling with the mouse, and it is not confined to the
+/// transcript band: it is the one gesture for "move through the conversation", and
+/// requiring the pointer to be over a particular area would make it fail exactly when a
+/// reader reached for it without looking. A left click belongs to the composer, and only
+/// there: the transcript is read, not pointed at, so a click that misses the prompt is
+/// not a command.
+fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => view.scroll(-MOUSE_SCROLL_ROWS),
+        MouseEventKind::ScrollDown => view.scroll(MOUSE_SCROLL_ROWS),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let _ = view.place_caret(mouse.column, mouse.row);
+        }
+        // Scrolling sideways and every other button are not things this interface has
+        // anywhere to put. Ignoring them is deliberate rather than an oversight.
+        _ => {}
+    }
+}
+
 /// Stops the turn that is running, or cancels the prompt, or leaves.
 ///
 /// Three meanings on one key, in the order a reader means them. A turn in flight is what
@@ -1181,6 +1251,16 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// A mouse event at a cell, for the wheel and the click.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     /// `NO_COLOR` is `present and not empty`, and the empty case is the one that matters:
@@ -1813,6 +1893,43 @@ mod tests {
             view.scroll_offset > after_up,
             "Page-Down came forward again"
         );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_conversation() {
+        // The wheel is a nudge rather than a page: up moves toward older content, down
+        // toward the newest, and a reader who scrolled away stops following.
+        let mut view = ViewState::new();
+        for index in 0..200 {
+            view.transcript
+                .push(Entry::prose(Role::User, format!("entry {index}")));
+        }
+        view.scroll_by(0, 20, 60);
+        view.scroll_to_bottom();
+        let bottom = view.scroll_offset;
+        assert!(bottom > 0, "the conversation is longer than the viewport");
+
+        handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), &mut view);
+        let back = view.scroll_offset;
+        assert!(back < bottom, "the wheel went back: {back} < {bottom}");
+        assert!(!view.following, "and stopped following the newest output");
+        assert_eq!(bottom.saturating_sub(back), 3, "one notch is a nudge");
+
+        handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0), &mut view);
+        assert_eq!(view.scroll_offset, bottom, "and forward again");
+    }
+
+    #[test]
+    fn a_click_outside_the_composer_is_ignored() {
+        // Nothing in the transcript is clickable, so a click that is not on the prompt
+        // has no meaning and must not move the caret.
+        let mut view = ViewState::new();
+        view.input.insert_str("draft");
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut view,
+        );
+        assert_eq!(view.input.cursor(), 5, "the caret was left where it was");
     }
 
     #[test]

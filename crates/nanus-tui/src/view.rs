@@ -4,7 +4,7 @@
 //! against ratatui's `TestBackend` without a terminal. Nothing here performs I/O.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -114,14 +114,20 @@ impl Theme {
 /// typed is the one on screen.
 const MAX_COMPOSER_ROWS: u16 = 5;
 
-/// The rows the composer's border adds around its text.
+/// The rows the composer's top and bottom rules add around its text.
 const COMPOSER_BORDER_ROWS: u16 = 2;
 
 /// The rows the transcript keeps whatever else wants them.
 const TRANSCRIPT_FLOOR: u16 = 3;
 
-/// The columns the composer's border adds around its text.
-const COMPOSER_BORDER_COLS: u16 = 2;
+/// The columns the composer keeps clear on either side of its prompt.
+///
+/// The box has no left or right border — its rules run above and below the prompt — so
+/// this is what stops the prompt sitting flush against the terminal's edge.
+const COMPOSER_PADDING_COLS: u16 = 1;
+
+/// The blank rows the composer keeps above and below its box.
+const COMPOSER_PADDING_ROWS: u16 = 1;
 
 /// What the interface is currently showing.
 ///
@@ -208,6 +214,14 @@ pub struct ViewState {
     /// the transcript occupies and how many the viewport shows, so a caller cannot
     /// compute it without knowing the terminal size.
     last_viewport: Option<(u16, u16)>,
+
+    /// The composer's text area as it was last drawn, if it has been drawn.
+    ///
+    /// Screen coordinates rather than composer-relative ones, because a click arrives
+    /// as a cell on the terminal and the row it lands on depends on everything drawn
+    /// above it. Recorded here so a click can be turned back into a caret position
+    /// without the runtime re-deriving the layout.
+    last_composer: Option<Rect>,
 }
 
 impl Default for ViewState {
@@ -231,6 +245,7 @@ impl Default for ViewState {
             mermaid: true,
             pending_scroll_back: None,
             last_viewport: None,
+            last_composer: None,
         }
     }
 }
@@ -351,6 +366,53 @@ impl ViewState {
         self.scroll_offset = 0;
         // At the top by definition, so new output must not drag the reader away.
         self.following = false;
+    }
+
+    /// Moves the caret to the composer cell a click landed on, if it landed in the
+    /// composer.
+    ///
+    /// Returns whether the composer took the click, so a caller can leave the caret
+    /// alone when the click was somewhere else. The cell names a display row and a
+    /// column; the row is mapped back through the composer's own wrapping to the source
+    /// character under it, which is the same wrap the caret is drawn with.
+    ///
+    /// A click is refused during a reverse search: the composer is showing a match
+    /// rather than editing text, and moving the caret through it is not what a reader
+    /// reaching for the mouse is doing.
+    pub fn place_caret(&mut self, column: u16, row: u16) -> bool {
+        if self.input.is_searching() {
+            return false;
+        }
+        let Some(area) = self.last_composer else {
+            return false;
+        };
+        if !area.contains(Position::new(column, row)) {
+            return false;
+        }
+        let layout = self.composer_layout(area.width);
+        // The window that follows the caret is the one the click was drawn in, so the
+        // row has to be shifted by the same amount the render scrolled by.
+        let visible = usize::from(area.height);
+        let offset = layout.caret_row.saturating_sub(visible.saturating_sub(1));
+        let display = usize::from(row.saturating_sub(area.y)).saturating_add(offset);
+        let Some(line) = layout.rows.get(display) else {
+            return false;
+        };
+        let Some((source_line, start)) = line.source else {
+            // The blank row a full caret wraps onto carries no text of its own; a click
+            // there means the end of the prompt, which is the only thing that row can be
+            // showing.
+            let last = self.input.line_count().saturating_sub(1);
+            self.input.place_cursor(last, usize::MAX);
+            return true;
+        };
+        let prefix = line.prefix.chars().count();
+        let within = usize::from(column.saturating_sub(area.x))
+            .saturating_sub(prefix)
+            .min(line.text.chars().count());
+        self.input
+            .place_cursor(source_line, start.saturating_add(within));
+        true
     }
 
     /// Switches between the one-line form and the whole of a tool call and a thinking
@@ -535,9 +597,7 @@ impl ViewState {
         // The composer grows with the prompt, so a multi-line one is visible rather
         // than clipped to a single row. The transcript keeps a floor of rows so that a
         // tall composer cannot squeeze the conversation out entirely.
-        let composer = self
-            .composer_rows(area.width.saturating_sub(COMPOSER_BORDER_COLS))
-            .saturating_add(COMPOSER_BORDER_ROWS);
+        let composer = self.composer_height(area.width);
         // The throughput line is the first thing to give up its row when there are not
         // enough: a terminal too short for everything should cost the reader a number
         // they can live without, not the row they are typing on. Everything else here
@@ -938,18 +998,27 @@ impl ViewState {
     }
 
     /// Renders the composer.
-    fn render_input(&self, frame: &mut Frame<'_>, area: Rect) {
-        let inner = area.width.saturating_sub(COMPOSER_BORDER_COLS);
+    ///
+    /// The box is inset from the area it is granted, so the prompt is not flush against
+    /// the terminal's edges, and it keeps only its top and bottom rules: a prompt is
+    /// prose rather than a field, and a full rectangle draws more box than it needs.
+    fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let block_area = Self::composer_box(area);
+        // The block has no side border, so its inner width is the whole inset width.
+        let inner = block_area.width;
         // The viewport is the height actually granted, not the one asked for: when the
         // terminal is short the layout gives the composer less than `composer_rows`, and
         // a window sized from the request would scroll the caret just off the bottom.
-        let visible = area.height.saturating_sub(COMPOSER_BORDER_ROWS);
+        let visible = block_area.height.saturating_sub(COMPOSER_BORDER_ROWS);
         let composer = self.composer_layout(inner);
         // The window follows the caret, keeping it on the last row it can when the
         // prompt is taller than the composer.
         let caret = u16::try_from(composer.caret_row).unwrap_or(u16::MAX);
         let offset = caret.saturating_sub(visible.saturating_sub(1));
-        let block = Block::default().borders(Borders::ALL).title(" message ");
+        let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
+        // Recorded for the mouse: a click arrives as a cell, and the cell has to be
+        // turned back into a line and column through this same layout.
+        self.last_composer = Some(block.inner(block_area));
         // No `Wrap`: the rows are already wrapped, and asking the renderer to wrap them
         // again would re-break lines the layout has counted — which is how the caret's
         // row and the drawn row drifted apart in the first place.
@@ -957,7 +1026,7 @@ impl ViewState {
             Paragraph::new(composer.lines(self))
                 .block(block)
                 .scroll((offset, 0)),
-            area,
+            block_area,
         );
     }
 
@@ -997,7 +1066,7 @@ impl ViewState {
                 // it to mean a cell on the screen.
                 caret_column = column.saturating_add(if row == 0 { Self::PROMPT_WIDTH } else { 0 });
             }
-            for (offset, (line, _, _)) in wrapped.into_iter().enumerate() {
+            for (offset, (line, start, _)) in wrapped.into_iter().enumerate() {
                 rows.push(ComposerRow {
                     prefix: if offset == 0 {
                         prefix.clone()
@@ -1005,6 +1074,9 @@ impl ViewState {
                         String::new()
                     },
                     text: line,
+                    // The row's first character, as a line and a column within it, so a
+                    // click can be turned back into a caret position.
+                    source: Some((index, start)),
                 });
             }
         }
@@ -1014,6 +1086,7 @@ impl ViewState {
             rows.push(ComposerRow {
                 prefix: prompt,
                 text: String::new(),
+                source: Some((0, 0)),
             });
             caret_row = 0;
             caret_column = Self::PROMPT_WIDTH;
@@ -1032,6 +1105,7 @@ impl ViewState {
                 rows.push(ComposerRow {
                     prefix: String::new(),
                     text: String::new(),
+                    source: None,
                 });
                 rows.len().saturating_sub(1)
             };
@@ -1055,6 +1129,38 @@ impl ViewState {
         u16::try_from(rows)
             .unwrap_or(u16::MAX)
             .clamp(1, MAX_COMPOSER_ROWS)
+    }
+
+    /// Returns the total rows the composer occupies at `width`: its text, its two
+    /// rules, and the blank rows kept above and below it.
+    ///
+    /// One function rather than the arithmetic repeated, because the layout budgets rows
+    /// against this figure and the renderer draws inside it; two copies would let a
+    /// padding row be granted twice or not at all.
+    fn composer_height(&self, width: u16) -> u16 {
+        let inner = width.saturating_sub(COMPOSER_PADDING_COLS.saturating_mul(2));
+        self.composer_rows(inner)
+            .saturating_add(COMPOSER_BORDER_ROWS)
+            .saturating_add(COMPOSER_PADDING_ROWS.saturating_mul(2))
+    }
+
+    /// Returns the area the composer's box is drawn in: `area` with its padding removed.
+    ///
+    /// The vertical padding is the first thing given up when the terminal is too short
+    /// for it and a row of text, because the row a reader is typing on is the one thing
+    /// on this screen they cannot do without. A box squeezed until its rules meet would
+    /// draw a prompt that is not there.
+    fn composer_box(area: Rect) -> Rect {
+        let padded = COMPOSER_PADDING_ROWS
+            .saturating_mul(2)
+            .saturating_add(COMPOSER_BORDER_ROWS)
+            .saturating_add(1);
+        let vertical = if area.height >= padded {
+            COMPOSER_PADDING_ROWS
+        } else {
+            0
+        };
+        area.inner(Margin::new(COMPOSER_PADDING_COLS, vertical))
     }
 
     /// The prompt drawn before the composer's first line.
@@ -1234,6 +1340,13 @@ struct ComposerRow {
     prefix: String,
     /// The row's text, without the caret.
     text: String,
+    /// Where the text starts in the composer, as a source line and a character within
+    /// it.
+    ///
+    /// `None` on a row that carries no source text: the blank row a caret at the end of
+    /// a full row wraps onto. Kept so a click can be mapped back to a caret position
+    /// without a second implementation of the wrap.
+    source: Option<(usize, usize)>,
 }
 
 impl ComposerLayout {
@@ -1464,7 +1577,71 @@ mod tests {
         let text = rendered(&mut state, 60, 12);
         assert!(text.contains("nanus"));
         assert!(text.contains("ready"));
-        assert!(text.contains("message"));
+        assert!(text.contains('›'), "and the composer: {text}");
+    }
+
+    #[test]
+    fn the_composer_is_two_rules_with_padding_rather_than_a_box() {
+        // The box a prompt used to be drawn in had four sides and a title. A prompt is
+        // prose, so it keeps the rules that separate it from the transcript and the
+        // figures below, loses the sides and the word, and is inset so it does not sit
+        // against the terminal's edge.
+        let mut state = ViewState::new();
+        let text = rendered(&mut state, 40, 12);
+        assert!(!text.contains("message"), "no title: {text}");
+        assert!(!text.contains('│'), "no side borders: {text}");
+        let rows: Vec<&str> = text.lines().collect();
+        let top = rows
+            .iter()
+            .position(|row| row.trim_start().starts_with('─'))
+            .expect("the top rule is drawn");
+        assert_eq!(rows[top], format!(" {} ", "─".repeat(38)), "{text}");
+        assert!(
+            rows.get(top.saturating_add(1))
+                .is_some_and(|row| row.contains('›')),
+            "the prompt sits inside the rules: {text}"
+        );
+        assert!(
+            rows.get(top.saturating_add(2))
+                .is_some_and(|row| row.trim_start().starts_with('─')),
+            "and the bottom rule closes it: {text}"
+        );
+    }
+
+    #[test]
+    fn the_composer_keeps_a_blank_row_around_its_rules() {
+        // The padding is what stops the box touching what is around it: a blank row
+        // above the top rule and a blank row between the bottom rule and the figures.
+        let mut state = ViewState::new();
+        let text = rendered(&mut state, 40, 14);
+        let rows: Vec<&str> = text.lines().collect();
+        let rules: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.trim_start().starts_with('─'))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(rules.len(), 2, "the composer's two rules: {text}");
+        let (top, bottom) = (rules[0], rules[1]);
+        assert_eq!(bottom, top.saturating_add(2), "one prompt row: {text}");
+        assert!(rows[top.saturating_sub(1)].trim().is_empty(), "{text}");
+        assert!(
+            rows[bottom.saturating_add(1)].trim().is_empty(),
+            "the row under the box is clear: {text}"
+        );
+        assert!(
+            !rows[bottom.saturating_add(2)].trim().is_empty(),
+            "and the figures are the row after that: {text}"
+        );
+    }
+
+    #[test]
+    fn a_cramped_terminal_gives_up_the_padding_before_the_prompt() {
+        // Eight rows is not enough for the padding, the rules, the transcript's floor,
+        // the title and the status. What must survive is the row being typed on.
+        let mut state = ViewState::new();
+        let text = rendered(&mut state, 40, 8);
+        assert!(text.contains('›'), "the prompt is still drawn: {text}");
     }
 
     #[test]
@@ -1754,7 +1931,7 @@ mod tests {
         let rows: Vec<&str> = text.lines().collect();
         let composer = rows
             .iter()
-            .position(|row| row.contains("message"))
+            .position(|row| row.contains('›'))
             .expect("the composer is drawn");
         let throughput = rows
             .iter()
@@ -1844,15 +2021,15 @@ mod tests {
             duration_ms: 2_500,
             ..Generation::default()
         });
-        // Nine rows is the least that holds the title, the transcript's floor, an empty
-        // composer, the throughput line, and the status line.
-        let roomy = rendered(&mut state, 60, 9);
+        // Eleven rows is the least that holds the title, the transcript's floor, an empty
+        // composer with its padding, the throughput line, and the status line.
+        let roomy = rendered(&mut state, 60, 11);
         assert!(
             roomy.contains("last 150/120 tok/s"),
             "rows to spare: {roomy}"
         );
         assert!(roomy.contains('›'), "and the composer too: {roomy}");
-        let cramped = rendered(&mut state, 60, 8);
+        let cramped = rendered(&mut state, 60, 10);
         assert!(
             !cramped.contains("tok/s"),
             "the stats go without: {cramped}"
@@ -2138,9 +2315,9 @@ mod tests {
         // character, so there was nothing to reverse and the cursor simply vanished for
         // the one keystroke in which a prompt crossed a row boundary.
         let mut state = ViewState::new();
-        // A forty-column terminal inside the composer's borders leaves thirty-eight
-        // columns, two of which the prompt takes on the first row: thirty-six characters
-        // fill it exactly.
+        // A forty-column terminal with a column of padding on either side leaves
+        // thirty-eight columns, two of which the prompt takes on the first row:
+        // thirty-six characters fill it exactly.
         state.input = InputBuffer::with_text(&"x".repeat(36));
         let (text, caret) = draw_with_caret(&mut state, 40, 12);
         let caret = caret.expect("the caret is drawn even when its row is full");
@@ -2203,10 +2380,84 @@ mod tests {
         assert!(text.contains('›'), "the prompt is drawn: {text}");
         let caret = caret.expect("the caret is drawn");
         assert_eq!(caret.symbol, " ", "a block after the prompt");
-        assert_eq!(
-            caret.column, 3,
-            "one border, one inner column, two of prompt"
+        assert_eq!(caret.column, 3, "one pad column, then two of prompt");
+    }
+
+    /// The text area of the composer as the last render laid it out, which is what a
+    /// click's coordinates are relative to.
+    fn drawn_composer(state: &mut ViewState) -> Rect {
+        draw_with_caret(state, 40, 12);
+        state
+            .last_composer
+            .expect("the composer records the area it was drawn in")
+    }
+
+    #[test]
+    fn a_click_in_the_composer_puts_the_caret_where_it_landed() {
+        // A click names a cell, so the row and column have to be mapped back through the
+        // same wrap the caret is drawn with. Five columns past the prompt is five
+        // characters into the text.
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("hello world");
+        let area = drawn_composer(&mut state);
+        let column = area
+            .x
+            .saturating_add(u16::try_from(ViewState::PROMPT_WIDTH).unwrap_or(0))
+            .saturating_add(5);
+        assert!(state.place_caret(column, area.y), "the click landed");
+        assert_eq!(state.input.cursor(), 5);
+    }
+
+    #[test]
+    fn a_click_past_the_end_of_a_line_puts_the_caret_at_its_end() {
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("short");
+        let area = drawn_composer(&mut state);
+        // The far right of the box is past every character in the line.
+        assert!(state.place_caret(area.x.saturating_add(area.width).saturating_sub(1), area.y));
+        assert_eq!(state.input.cursor(), 5);
+    }
+
+    #[test]
+    fn a_click_on_the_second_line_lands_on_the_second_line() {
+        // Rows are display rows rather than source lines, but a click one row below the
+        // first has to reach the second source line rather than a wrap of the first.
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("first\nsecond");
+        let area = drawn_composer(&mut state);
+        let column = area
+            .x
+            .saturating_add(u16::try_from(ViewState::PROMPT_WIDTH).unwrap_or(0))
+            .saturating_add(2);
+        assert!(state.place_caret(column, area.y.saturating_add(1)));
+        // "first\n" is six characters, then two into "second".
+        assert_eq!(state.input.cursor(), 8);
+    }
+
+    #[test]
+    fn a_click_on_the_row_a_full_line_wraps_onto_goes_to_the_end() {
+        // A line that fills its row exactly gives the caret a row of its own below it.
+        // That row exists to hold the caret at the end, so a click on it is accepted and
+        // leaves the caret there.
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text(&"x".repeat(36));
+        let area = drawn_composer(&mut state);
+        assert!(
+            state.place_caret(area.x, area.y.saturating_add(1)),
+            "the click landed on the caret's own row"
         );
+        assert_eq!(state.input.cursor(), 36);
+    }
+
+    #[test]
+    fn a_click_outside_the_composer_leaves_the_caret_alone() {
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("draft");
+        let area = drawn_composer(&mut state);
+        let left = state.input.cursor();
+        // A row above the box is the transcript's, not the composer's.
+        assert!(!state.place_caret(area.x, area.y.saturating_sub(1)));
+        assert_eq!(state.input.cursor(), left, "the caret did not move");
     }
 
     #[test]
@@ -2216,7 +2467,7 @@ mod tests {
         // flicker a row taller for the single keystroke that lands on it.
         let rows = |length: usize| {
             let mut state = ViewState::new();
-            // Thirty-eight columns, as a forty-column terminal leaves inside the borders.
+            // Thirty-eight columns, as a forty-column terminal leaves inside the padding.
             state.input = InputBuffer::with_text(&"x".repeat(length));
             state.composer_rows(38)
         };

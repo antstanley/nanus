@@ -212,6 +212,22 @@ rather than on how they started.
 
 [cc-keys]: https://code.claude.com/docs/en/interactive-mode
 
+### Mouse
+
+The mouse navigates as well as the keyboard. The wheel scrolls the conversation three rows
+a notch, in the same direction and with the same follow rule as `PageUp`/`PageDown`, and a
+left click in the composer puts the caret on the character it landed on, so a long prompt
+can be corrected without arrow keys. A click anywhere else is not a command: the transcript
+is read, not pointed at, and nothing in it is a target.
+
+The wheel is taken wherever the pointer is rather than only over the conversation. A reader
+reaching for it without looking should not have to find a band first, and the conversation
+is the only thing here there is to scroll. Mouse reporting is asked for when the interface
+starts and given back when it leaves, and while it is on the terminal's own
+click-and-drag selection needs whatever modifier that terminal uses for it — usually
+`Shift`. That is the cost of a program that draws its own screen, and it is the cost every
+full-screen terminal program pays.
+
 ### What is deliberately missing
 
 Claude Code's mode has more bindings than this interface has things to bind them to, and
@@ -292,7 +308,8 @@ new binding should do the same, and there is a test that fails if it does not.
 
 The conversation follows the newest output until you scroll away from it, and follows
 again when you scroll back to the bottom. There is no key to press to resume and none to
-remember: `PageUp` means "I am reading something", and coming back down means "carry on".
+remember: `PageUp` — or the wheel — means "I am reading something", and coming back down
+means "carry on".
 
 That rule exists because the alternative is unusable. Every streamed token used to pull the
 view to the bottom, so a reader who scrolled up during a turn was dragged back down on the
@@ -306,6 +323,12 @@ appeared to do nothing at all. Both are fixed, and both directions are pinned by
 new line, so a prompt can be a paragraph rather than a sentence. `Up` and `Down` move
 between those lines, and only from the top line do they browse submitted prompts, which is
 what keeps the single-line case behaving exactly as it did.
+
+What used to be a box is now a prompt between two rules. The sides and the `message` title
+were more frame than a line of prose needs, and the rules still separate it from the
+transcript above and the figures below. It is inset from the terminal's edges so the prompt
+does not sit against them, and on a terminal too short for that padding the blank rows are
+the first thing given up — the row being typed on is the last.
 
 The composer grows with the prompt up to five rows and then scrolls to keep the line being
 typed on screen, so a long prompt stays editable without squeezing the conversation out
