@@ -71,6 +71,24 @@ covered. Also the composition staging rule, which is subtle and was learned the 
 
 Start here if you are about to depend on something.
 
+## [Roadmap](roadmap.md)
+
+What is planned, in priority order, with a rough t-shirt size on each item: the
+correctness gaps between what the docs claim and what runs, the interface features that
+would make it a daily driver, the larger bets like an OS-enforced sandbox, and the
+things that are deliberately absent.
+
+Start here if you want to know what is coming, or why something is not.
+
+## [Goal research note](goal-research.md)
+
+A survey of how PrimeIntellect, OpenAI Codex, and DeepSeek Harness implement a persistent
+objective (`/goal`), what they agree on, and what a goal should look like here — including
+the tension between automatic continuation and the turn budget, and the questions left
+open. Background for [roadmap item 24](roadmap.md#next-new-capabilities).
+
+Start here if you are picking up the goal work, or designing a feature that spans turns.
+
 ## [Style](style.md)
 
 The Tiger Style rules, which of them are enforced by a tool rather than by review, and how

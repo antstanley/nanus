@@ -3,7 +3,8 @@
 What `nanus` supports today, grouped by area. This page is a map rather than a
 manual: each section links to the page that explains the reasoning and the
 details. For what is incomplete or deliberately absent, see
-[status](status.md#known-limits) and the closing section here.
+[status](status.md#known-limits) and the closing section here; for what is
+planned, and the effort attached, see [the roadmap](roadmap.md).
 
 ## The agent
 
@@ -249,8 +250,11 @@ The Cordis-style kernel is the framework underneath. See
   none in the repository. See [design decisions](design.md#safe-rust-because-the-model-is-writing-the-code).
 - **No `panic!`, `unwrap`, `expect`, `todo!`, or `dbg!` in production code**;
   `assert!` is the sanctioned invariant. See [style](style.md).
-- **Fail-closed approval**: only `AllowedOnce` proceeds, and there is
-  deliberately no auto-approve policy. See [SAFETY.md](../SAFETY.md).
+- **Fail-closed by construction, and no auto-approve.** `ApprovalOutcome` allows
+  only `AllowedOnce`, and the policy set is `ask` / `never` — there is
+  deliberately no mode that means yes to everything. The gate is not yet wired
+  into the tool path, though, so `sandbox_mode` is the enforcement that runs
+  today. See below and [SAFETY.md](../SAFETY.md).
 - **A sandbox mode is reported, not OS-enforced** — it governs whether writes
   are refused or confined by the tools, not what an approved program may do. See
   [SAFETY.md](../SAFETY.md) and [status](status.md#known-limits).
@@ -265,6 +269,11 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
+- **Approval is not yet enforced.** `ApprovalPolicy`, `ApprovalRequest`, and
+  `ApprovalOutcome` exist and are described in [SAFETY.md](../SAFETY.md), but
+  nothing constructs a request or gates a call on a decision: the tool path
+  executes directly, and sandbox mode is what refuses or confines a write. See
+  [the roadmap](roadmap.md#now-close-the-gap-between-what-is-written-and-what-runs).
 - **DeepSeek is the only provider.** The `LlmPort` seam is real, but no second
   adapter exists.
 - **The link is Unix-only and local.** No remote mode, no Windows, no
