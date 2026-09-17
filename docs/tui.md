@@ -149,8 +149,10 @@ exhaustive match, so a reason the domain grows cannot quietly fail to cross.
 so it survives the connection that opened it, and a client joins one with `--resume`.
 Several clients can be attached at once and all see the same frames, which is what makes
 watching a running conversation possible. One turn runs at a time, because a turn owns the
-log — a prompt to a busy session is refused rather than queued. [Sessions](sessions.md) is
-the whole of it.
+log — a prompt to a busy session is refused rather than queued. That is the agent's rule,
+and the interface answers it without making the reader wait: a prompt typed during a turn
+is held and sent when the agent is ready, which is [queuing a prompt](#queuing-a-prompt).
+[Sessions](sessions.md) is the whole of it.
 
 **Nothing about the conversation travels twice.** The link carries what *happened*; the
 history a client shows comes from the store, where it is already durable. A socket that
@@ -205,6 +207,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Ctrl+C` / `Esc` | stop the running turn; then cancel the prompt; then quit |
 | `Ctrl+D` | quit |
 | `Ctrl+R` | reverse-search submitted prompts |
+| `Ctrl+Q` | open the queue of prompts waiting for the turn to end (and close it) |
 | `Ctrl+O` | switch between the one-line form and the whole of a tool call |
 | `Ctrl+T` | summarise runs of tool calls |
 | `Ctrl+E` | summarise runs of reasoning |
@@ -264,6 +267,46 @@ rather than on how they started.
 
 [cc-keys]: https://code.claude.com/docs/en/interactive-mode
 
+### Queuing a prompt
+
+A turn owns the session's log, so the agent serves one turn at a time and refuses a second
+prompt rather than interleaving it. The interface turns that refusal into a queue: a prompt
+typed while a turn is running is held and sent as soon as the agent is ready for it — one
+per turn end, in the order it was typed. Typing ahead is therefore ordinary rather than
+refused, and the agent is still asked for one turn at a time exactly as a person would be.
+
+The same holds when the session is already busy as the interface opens — attaching to a
+turn another client started — because a client that joins late has missed the prompt that
+began it. The status line says a turn is already running, and the reader's first prompt
+queues behind it rather than being sent to an agent that cannot take it.
+
+Queued prompts are listed above the composer, oldest first, because the oldest is the one
+that runs next: the list is a schedule rather than a history. The status line counts them,
+and the list is bounded — past three entries the rest are counted — so a queue can never
+push the conversation off the screen. A queued prompt is *not* in the transcript yet: it
+has not been sent and the model has not seen it, so it appears as an ordinary prompt only
+when the turn before it ends. The queue is the interface's and not the session's, so it is
+deliberately not written into the log: it dies with the terminal that typed it rather than
+being replayed to the next client that attaches.
+
+`Ctrl+Q` opens the overlay, which is where a queue is read and changed, and it owns the
+keyboard while it is up:
+
+| Key | Effect |
+|---|---|
+| `Up` / `Down` (or `k` / `j`) | move the selection |
+| `Enter` (or `e`) | pull the selected prompt into the composer to edit it |
+| `d` / `Delete` | remove the selected prompt |
+| `Esc` (or `q`, `Ctrl+Q` again, `Ctrl+C`) | close the overlay |
+
+**Editing takes the prompt out of the queue and into the composer**, so a turn that ends
+mid-edit cannot send the half-read text. `Enter` saves it back at the position it came
+from; `Esc` or `Ctrl+C` cancels and gives back both the original prompt and whatever draft
+was in the composer before the edit began. Deleting every character and saving removes the
+entry, because an empty prompt is not one worth sending. The one place this differs from
+every other mode is `Enter`: everywhere else it sends, and here it keeps the edit — which
+is what the status line says while the composer is holding a queued prompt.
+
 ### Mouse
 
 The mouse navigates as well as the keyboard. The wheel scrolls the conversation three rows
@@ -295,8 +338,8 @@ inventing a purpose for a key would be worse than leaving it alone:
 - **`?` for a key list** is not implemented: the composer needs `?` to be a `?`, and
   swallowing it on an empty prompt is a cost this interface is not willing to pay for a
   list that is one `Ctrl+L` away from being off screen anyway. This table is that list.
-- **Vim mode**, `@` mentions and `!` bash mode are input *modes* rather than shortcuts, and
-  each is a feature in its own right. Slash commands have begun — see below.
+- **`@` mentions and `!` bash mode** are input *modes* rather than shortcuts, and each is a
+  feature in its own right. Slash commands have begun — see below.
 
 ### Commands
 

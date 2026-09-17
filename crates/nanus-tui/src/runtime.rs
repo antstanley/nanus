@@ -309,6 +309,16 @@ pub trait SessionSource {
         None
     }
 
+    /// Whether a turn is already running when the interface opens.
+    ///
+    /// A client that attaches mid-turn has missed the prompt that started it, so nothing
+    /// else tells it the session is busy: without this, its first prompt would be sent to
+    /// an agent that cannot take it and refused, rather than queued behind the turn in
+    /// flight. The default is `false`, which is every source that cannot run a turn.
+    fn initial_busy(&self) -> bool {
+        false
+    }
+
     /// Starts whatever background work the source needs, inside the interface's task set.
     ///
     /// Called once, after the event loop's own channel exists and before the first frame
@@ -474,6 +484,8 @@ pub struct Remote {
     pending: Option<mpsc::UnboundedReceiver<Request>>,
     /// The approval state a startup flag asked for, sent once the agent is attached.
     approval: Option<ApprovalPolicy>,
+    /// Whether a turn was already running in the session when it was attached to.
+    busy: bool,
 }
 
 impl Remote {
@@ -510,6 +522,7 @@ impl Remote {
         }
         let session = history(store, &attached, &agent.workspace).await;
         let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
+        let busy = attached.busy;
         let (requests, pending) = mpsc::unbounded_channel();
         Ok(Self {
             session,
@@ -518,6 +531,7 @@ impl Remote {
             requests,
             pending: Some(pending),
             approval,
+            busy,
         })
     }
 }
@@ -571,6 +585,10 @@ impl SessionSource for Remote {
 
     fn initial_approval(&self) -> Option<ApprovalPolicy> {
         self.approval
+    }
+
+    fn initial_busy(&self) -> bool {
+        self.busy
     }
 
     fn attach(&mut self, frames: &mpsc::Sender<Frame>) {
@@ -816,6 +834,14 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     if let Some(policy) = source.initial_approval() {
         view.approval = policy;
     }
+    // A session attached to mid-turn is already busy, and nothing else in the frames tells
+    // the interface so: the prompt that started the turn is behind it. Drawing it as ready
+    // would send the reader's next prompt to an agent that cannot take it, so the state is
+    // taken from the attachment and the first prompt is queued like any other.
+    if source.initial_busy() {
+        view.busy = true;
+        view.status = String::from("a turn is already running");
+    }
     if viewing_only {
         view.status = String::from("viewing a recorded session · Ctrl-C quits");
     }
@@ -928,15 +954,7 @@ async fn event_loop(
                                 view.transcript.push(Entry::notice(message));
                                 view.scroll_to_bottom();
                             }
-                            Routed::Send(prompt) => {
-                                // The transcript is seeded here, where the mutable view
-                                // lives.
-                                view.transcript
-                                    .push(Entry::prose(Role::User, prompt.clone()));
-                                view.begin_turn(1);
-                                view.scroll_to_bottom();
-                                source.submit(prompt);
-                            }
+                            Routed::Send(prompt) => send_or_queue(prompt, source, &mut view),
                         }
                     }
                     Outcome::Continue => {}
@@ -955,6 +973,11 @@ async fn event_loop(
                 drain_frames(&mut frames, &mut view);
             }
         }
+        // A turn ends with a frame and never with a keystroke, so this is the only place
+        // the agent can become ready for the next prompt. Checked after every wake-up
+        // rather than only after an ending, because it is a no-op unless a turn just
+        // closed with something waiting.
+        flush_queue(source, &mut view);
     }
     Ok(view.stats)
 }
@@ -1000,6 +1023,81 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
             }
         }
     }
+}
+
+/// Sends a prompt, or holds it until the running turn ends.
+///
+/// A prompt typed while a turn is running cannot be sent: the agent serves one turn per
+/// session and refuses a second rather than interleaving it, because a turn owns the log.
+/// Refusing the reader's words instead would make typing ahead impossible, so the
+/// interface holds them and sends one per turn end — which is what makes the busy state a
+/// queue rather than a wall.
+///
+/// The prompt is *not* written into the transcript here. The transcript is the
+/// conversation, and a queued prompt is not part of it yet: it has not been sent, the
+/// model has not seen it, and the session log does not have it. It appears as itself when
+/// [`flush_queue`] sends it, at which point the agent broadcasts it and the reader's own
+/// words are already on screen.
+fn send_or_queue(prompt: String, source: &mut dyn SessionSource, view: &mut ViewState) {
+    // `busy` is the interface's read of the turn state and `has_queued` covers the moment
+    // a turn just ended: a prompt typed then should join the line rather than overtake it.
+    if view.busy || view.has_queued() {
+        view.enqueue(prompt);
+        view.status = queued_status(view.queue.len());
+        return;
+    }
+    view.transcript
+        .push(Entry::prose(Role::User, prompt.clone()));
+    view.begin_turn(1);
+    view.scroll_to_bottom();
+    source.submit(prompt);
+}
+
+/// Sends the next queued prompt, if the agent is free.
+///
+/// Called after every wake-up because an ending is a frame, not a keystroke: this is the
+/// only point at which the agent has gone from busy to ready, and it is where a queue
+/// becomes the next turn. One entry per call, so the order the reader typed survives and
+/// the loop's next wake-up sends the one after it — the agent is asked for one turn at a
+/// time exactly as a person would be.
+fn flush_queue(source: &mut dyn SessionSource, view: &mut ViewState) {
+    if view.busy {
+        return;
+    }
+    let Some(prompt) = view.take_queued() else {
+        return;
+    };
+    view.transcript
+        .push(Entry::prose(Role::User, prompt.clone()));
+    view.begin_turn(1);
+    view.scroll_to_bottom();
+    // `begin_turn` says "thinking", which is true, but the reader should also be told the
+    // prompt was one they thought had not been sent yet.
+    view.status = if view.has_queued() {
+        queued_status(view.queue.len())
+    } else {
+        String::from("sending the queued prompt")
+    };
+    source.submit(prompt);
+}
+
+/// The status line while prompts are waiting.
+fn queued_status(waiting: usize) -> String {
+    format!("queued · {waiting} waiting · Ctrl+Q to edit")
+}
+
+/// Restores what the status line should say once an edit has ended.
+///
+/// The line said what the composer was for, and the composer is back to being an ordinary
+/// one; leaving the old sentence up would describe a mode the reader has already left.
+fn queue_edit_finished(view: &mut ViewState) {
+    view.status = if view.busy {
+        String::from("thinking")
+    } else if view.has_queued() {
+        queued_status(view.queue.len())
+    } else {
+        String::from("ready")
+    };
 }
 
 /// What a keystroke asked for.
@@ -1058,6 +1156,17 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     if view.input.is_searching() {
         return handle_search_key(key, view);
     }
+    // A queued prompt being edited takes the keys that end the edit — Enter saves and Esc
+    // cancels — and lets every other key through, because the composer *is* the editor.
+    // The overlay is the other half: while it is up the keyboard belongs to the queue, as
+    // the approval dialog's does, and every key means something about it or nothing.
+    if view.queue_editor.is_some() {
+        if let Some(outcome) = handle_queue_edit_key(key, view) {
+            return outcome;
+        }
+    } else if view.queue_open {
+        return handle_queue_key(key, view);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return handle_control_key(key, view);
     }
@@ -1109,6 +1218,84 @@ fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
             stop: false,
         },
         _ => Outcome::Continue,
+    }
+}
+
+/// Routes a key while the queue overlay is open.
+///
+/// The overlay is modal, so this is the whole vocabulary a reader has while it is up:
+/// move the selection, edit or remove the selected prompt, or close. Every other key does
+/// nothing rather than reaching the composer behind it, which is what stops a stray `d`
+/// from typing into a prompt nobody can see.
+fn handle_queue_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let plain = !control && !key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        // `q` closes whether or not Control is held, so the key that opened the overlay
+        // also closes it; `Ctrl+C` closes it too, because that is what it means in the
+        // history search — abandon what you are looking at.
+        KeyCode::Esc | KeyCode::Char('q' | 'Q') => view.close_queue(),
+        KeyCode::Char('c' | 'C') if control => view.close_queue(),
+        KeyCode::Up => view.queue_up(),
+        KeyCode::Down => view.queue_down(),
+        KeyCode::Char('k') if plain => view.queue_up(),
+        KeyCode::Char('j') if plain => view.queue_down(),
+        KeyCode::Enter => begin_queue_edit(view),
+        KeyCode::Char('e') if plain => begin_queue_edit(view),
+        KeyCode::Delete => view.remove_queued(),
+        KeyCode::Char('d') if plain => view.remove_queued(),
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Pulls the selected prompt into the composer and says what the keys now do.
+///
+/// The status line has to say it, because the composer looks exactly as it does when it is
+/// composing something new: without a word there, a reader who pressed Enter by habit
+/// would send a prompt they were only looking at.
+fn begin_queue_edit(view: &mut ViewState) {
+    if view.begin_queue_edit() {
+        view.status = String::from("editing a queued prompt · Enter saves · Esc cancels");
+    }
+}
+
+/// Routes a key while a queued prompt is being edited.
+///
+/// `Some` when the key belonged to the edit and `None` when it did not, so the caller can
+/// let everything else — text, movement, word deletes — reach the composer, which is the
+/// editor. Only the two keys that end the edit are intercepted, and Enter is one of them:
+/// in every other mode it sends, and here it saves.
+fn handle_queue_edit_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        // Saving on the same key that sends everywhere else: the reader came here to fix a
+        // queued prompt, and the thing they want next is for the edit to be kept. `Alt+Enter`
+        // and `Shift+Enter` still start a new line, so a multi-line prompt stays editable.
+        KeyCode::Enter if !alt && !shift => {
+            view.save_queue_edit();
+            queue_edit_finished(view);
+            Some(Outcome::Continue)
+        }
+        // Cancelling gives back the draft that was being typed, so looking at a queued
+        // prompt costs nothing. `Ctrl+C` means the same thing here, as it does in the
+        // history search: the key that abandons what you are looking at.
+        KeyCode::Esc => {
+            view.cancel_queue_edit();
+            queue_edit_finished(view);
+            Some(Outcome::Continue)
+        }
+        KeyCode::Char('c' | 'C') if control => {
+            view.cancel_queue_edit();
+            queue_edit_finished(view);
+            Some(Outcome::Continue)
+        }
+        // The overlay's key does nothing mid-edit rather than opening a second list over a
+        // composer that is already showing one of its entries.
+        KeyCode::Char('q' | 'Q') if control => Some(Outcome::Continue),
+        _ => None,
     }
 }
 
@@ -1176,6 +1363,15 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         // same binding twice over rather than a special case.
         KeyCode::Char('j' | 'J') => {
             view.input.insert('\n');
+            Outcome::Continue
+        }
+        // The queue: prompts typed while a turn was running. Opening it when there is
+        // nothing queued would draw an empty dialogue, so that case answers on the status
+        // line instead — a key should always say what it did.
+        KeyCode::Char('q' | 'Q') => {
+            if !view.open_queue() {
+                view.status = String::from("nothing is queued");
+            }
             Outcome::Continue
         }
         // A character with Control held is not text. Terminals report control bytes as
@@ -1293,7 +1489,9 @@ fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
     match mouse.kind {
         MouseEventKind::ScrollUp => view.scroll(-MOUSE_SCROLL_ROWS),
         MouseEventKind::ScrollDown => view.scroll(MOUSE_SCROLL_ROWS),
-        MouseEventKind::Down(MouseButton::Left) => {
+        // The overlay owns the keyboard, so it owns the pointer too: a click behind a
+        // modal dialogue should not move a caret the reader cannot see.
+        MouseEventKind::Down(MouseButton::Left) if !view.queue_open => {
             let _ = view.place_caret(mouse.column, mouse.row);
         }
         // Scrolling sideways and every other button are not things this interface has
@@ -1667,6 +1865,225 @@ mod tests {
             Outcome::Continue
         ));
         assert_eq!(view.input.text(), "line\n");
+    }
+
+    /// Files a prompt the way the event loop does when the agent cannot take it yet.
+    ///
+    /// A turn in flight is what makes the agent busy, so the test opens one; the prompt is
+    /// then held rather than refused, which is the whole point of the queue.
+    #[test]
+    fn a_prompt_typed_during_a_turn_is_held_rather_than_sent() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        send_or_queue(
+            String::from("and then check the tests"),
+            &mut source,
+            &mut view,
+        );
+        assert!(
+            source.requests.borrow().is_empty(),
+            "nothing reaches the agent while it is busy"
+        );
+        assert_eq!(view.queue.len(), 1);
+        assert!(view.status.contains("queued"), "{}", view.status);
+        assert!(
+            view.transcript.is_empty(),
+            "a prompt nobody has sent is not part of the conversation"
+        );
+    }
+
+    /// A prompt typed in the instant a turn ends should join the queue behind the ones
+    /// already waiting, not overtake them: order is the reader's.
+    #[test]
+    fn a_prompt_typed_behind_a_queue_joins_the_end_of_it() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        send_or_queue(String::from("first"), &mut source, &mut view);
+        view.end_turn();
+        // Not busy, but the queue is not empty: the new prompt must not jump it.
+        send_or_queue(String::from("second"), &mut source, &mut view);
+        assert!(source.requests.borrow().is_empty());
+        assert_eq!(view.queue.iter().collect::<Vec<_>>(), ["first", "second"]);
+    }
+
+    /// The ending is the only thing that frees the agent, so the ending is what drains the
+    /// queue — one entry at a time, in the order the reader typed.
+    #[test]
+    fn a_queued_prompt_is_sent_when_the_turn_ends_in_order() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        send_or_queue(String::from("first"), &mut source, &mut view);
+        send_or_queue(String::from("second"), &mut source, &mut view);
+        assert_eq!(view.queue.len(), 2);
+
+        view.end_turn();
+        flush_queue(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::Prompt {
+                text: String::from("first"),
+            }]
+        );
+        assert!(view.busy, "sending a prompt opens a turn");
+        assert_eq!(view.queue.len(), 1, "the second waits for the next ending");
+        let sent: Vec<&str> = view
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| entry.role() == Role::User)
+            .map(Entry::text)
+            .collect();
+        assert_eq!(sent, ["first"], "and only then joins the transcript");
+
+        view.end_turn();
+        flush_queue(&mut source, &mut view);
+        assert_eq!(view.queue.len(), 0);
+        assert_eq!(source.requests.borrow().len(), 2);
+    }
+
+    /// `Ctrl+Q` is the queue's key, and it answers on the status line when there is
+    /// nothing to open rather than drawing an empty dialogue.
+    #[test]
+    fn ctrl_q_opens_the_queue_and_says_when_there_is_none() {
+        let mut view = ViewState::new();
+        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
+        assert!(!view.queue_open);
+        assert!(view.status.contains("nothing is queued"), "{}", view.status);
+
+        view.enqueue(String::from("held"));
+        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
+        assert!(view.queue_open, "the key opens the overlay");
+        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
+        assert!(!view.queue_open, "and the same key closes it");
+    }
+
+    /// The overlay is modal: a key that is not one of its own does not reach the composer
+    /// behind it, which is what stops a stray letter typing into an invisible prompt.
+    #[test]
+    fn the_queue_overlay_swallows_keys_that_are_not_its_own() {
+        let mut view = ViewState::new();
+        view.enqueue(String::from("held"));
+        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
+        assert!(view.queue_open);
+        let outcome = handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut view);
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(view.input.is_empty(), "the composer behind it is untouched");
+        assert!(view.queue_open, "and the overlay stays up");
+
+        // `Ctrl+C` is the one control key it does honour: the same "abandon this" it means
+        // in the history search.
+        let _ = handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view);
+        assert!(!view.queue_open, "Ctrl+C closes the overlay");
+    }
+
+    /// Editing takes the prompt out of the schedule and puts it in the composer, and
+    /// saving returns it to the position it came from — so an ending that arrives mid-edit
+    /// cannot send the half-read text.
+    #[test]
+    fn a_queued_prompt_is_edited_in_place_and_returns_to_its_place() {
+        let mut view = ViewState::new();
+        view.input.insert_str("a draft");
+        view.enqueue(String::from("first"));
+        view.enqueue(String::from("second"));
+        assert!(view.open_queue());
+        view.queue_down();
+        assert!(view.begin_queue_edit());
+        assert_eq!(view.input.text(), "second");
+        assert_eq!(view.queue.iter().collect::<Vec<_>>(), ["first"]);
+        assert!(!view.queue_open, "the overlay closes while editing");
+        view.input.insert_str(" (revised)");
+        view.save_queue_edit();
+        assert_eq!(
+            view.queue.iter().collect::<Vec<_>>(),
+            ["first", "second (revised)"]
+        );
+        assert_eq!(view.input.text(), "a draft", "the draft comes back");
+        assert!(view.queue_editor.is_none());
+    }
+
+    /// Enter is the save key while a queued prompt is being edited, and Esc is the cancel
+    /// — neither may fall through to the keys that send and stop.
+    #[test]
+    fn enter_saves_a_queued_edit_and_esc_cancels_it() {
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        view.enqueue(String::from("held"));
+        assert!(view.open_queue());
+        let opened = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(
+            matches!(opened, Outcome::Continue),
+            "opening is not sending"
+        );
+        assert!(view.queue_editor.is_some());
+        assert_eq!(view.input.text(), "held");
+        assert!(view.status.contains("editing"), "{}", view.status);
+
+        view.input.insert_str(" changed");
+        let saved = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(
+            matches!(saved, Outcome::Continue),
+            "Enter saves rather than submitting to the model"
+        );
+        assert_eq!(view.queue.iter().collect::<Vec<_>>(), ["held changed"]);
+        assert_eq!(view.status, "thinking", "the edit's status does not linger");
+
+        // A second edit, cancelled: the turn must still be running and the queue intact.
+        assert!(view.open_queue());
+        assert!(view.begin_queue_edit());
+        view.input.insert_str(" thrown away");
+        let cancelled = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(
+            matches!(cancelled, Outcome::Continue),
+            "Esc cancels the edit rather than stopping the turn"
+        );
+        assert!(view.busy, "the turn was not interrupted");
+        assert_eq!(view.queue.iter().collect::<Vec<_>>(), ["held changed"]);
+    }
+
+    /// An edit that deletes everything takes the entry back rather than queueing blank
+    /// text, and cancelling gives back whatever was being typed before.
+    #[test]
+    fn erasing_a_queued_prompt_removes_it_and_cancelling_restores_the_draft() {
+        let mut view = ViewState::new();
+        view.input.insert_str("draft");
+        view.enqueue(String::from("held"));
+        assert!(view.open_queue());
+        assert!(view.begin_queue_edit());
+        view.input.clear();
+        view.save_queue_edit();
+        assert!(!view.has_queued(), "an empty edit is a removal");
+        assert_eq!(view.input.text(), "draft");
+
+        view.enqueue(String::from("kept"));
+        assert!(view.open_queue());
+        assert!(view.begin_queue_edit());
+        view.input.insert_str(" discarded");
+        view.cancel_queue_edit();
+        assert_eq!(view.queue.iter().collect::<Vec<_>>(), ["kept"]);
+        assert_eq!(view.input.text(), "draft");
+    }
+
+    /// Removing entries keeps the selection on a real one, and the overlay closes when the
+    /// list it is showing becomes empty.
+    #[test]
+    fn removing_queued_prompts_keeps_a_selection_and_closes_an_empty_overlay() {
+        let mut view = ViewState::new();
+        view.enqueue(String::from("first"));
+        view.enqueue(String::from("second"));
+        assert!(view.open_queue());
+        view.queue_down();
+        view.remove_queued();
+        assert_eq!(view.queue.iter().collect::<Vec<_>>(), ["first"]);
+        assert_eq!(
+            view.queue_selection, 0,
+            "the selection moved to a real entry"
+        );
+        view.remove_queued();
+        assert!(!view.has_queued());
+        assert!(!view.queue_open, "an empty queue has no overlay to show");
     }
 
     #[test]

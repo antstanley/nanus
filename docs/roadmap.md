@@ -94,7 +94,6 @@ readings into a result.
 | 13 | **Paste an image (`Ctrl+V`).** | **M** | Needs clipboard access this program does not have, plus a way to send bytes that are not a file path — `read_image` proves the wire side works, but it takes a path. |
 | 14 | **`@` file mentions.** | **M** | A completion over workspace paths and a prompt expansion, with the same rooted-filesystem rule the tools use. |
 | 15 | **`!` bash mode.** | **M** | A direct shell escape that does not go through the model. It is a convenience with a sharp edge, so it wants a safety note before it wants code. |
-| 16 | **Vim mode.** | **L** | An input *mode* rather than a shortcut: a modal layer over the composer, and a feature in its own right. |
 
 ## Next: sessions and the link
 

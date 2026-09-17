@@ -14,6 +14,7 @@ use nanus_domain::ApprovalPolicy;
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
 use crate::markdown::{self, MarkdownTheme};
+use crate::queue::Queue;
 use crate::stats::{Throughput, share, show, show_duration};
 use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_count};
 
@@ -131,6 +132,14 @@ const COMPOSER_PADDING_COLS: u16 = 1;
 /// The blank rows the composer keeps above and below its box.
 const COMPOSER_PADDING_ROWS: u16 = 1;
 
+/// How many queued prompts are listed in full under the heading.
+///
+/// A third entry is enough to see what is coming without the queue pushing the
+/// conversation off a short terminal; the rest are counted, and the overlay lists them
+/// all. It is a display bound rather than a queue bound — nothing is dropped, only
+/// deferred to a screen that can hold it.
+const QUEUE_MAX_ROWS: u16 = 3;
+
 /// An approval question the agent is waiting on.
 ///
 /// It carries the tool and the harness's reason, and deliberately not the call's arguments:
@@ -145,6 +154,29 @@ pub struct PendingApproval {
     pub tool: String,
     /// Why the harness is asking, in the harness's own words.
     pub reason: Option<String>,
+}
+
+/// A queued prompt pulled into the composer for editing.
+///
+/// The prompt is *out* of the queue while it is being edited, which is what keeps a turn
+/// that ends mid-edit from sending half-read text: the entry is not in the schedule, so
+/// the runtime cannot reach it, and saving puts it back at the position it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueEdit {
+    /// Where the prompt goes back when the edit ends.
+    pub index: usize,
+    /// What the composer held before the edit began, restored when it ends.
+    ///
+    /// A reader who was halfway through a sentence and pulled a queued prompt open to
+    /// check it should get their own words back, not lose them to the entry they looked
+    /// at — which is the same contract the history search keeps with its draft.
+    pub draft: String,
+    /// The prompt as it was, put back unchanged when the edit is cancelled.
+    ///
+    /// The entry lives here while it is being edited, so cancelling has to hand it back:
+    /// a cancel that discarded it would quietly delete a prompt the reader was only
+    /// looking at.
+    pub original: String,
 }
 
 /// What the interface is currently showing.
@@ -239,6 +271,32 @@ pub struct ViewState {
     /// prompt appears.
     pub approval: ApprovalPolicy,
 
+    /// Prompts typed while a turn was running, oldest first.
+    ///
+    /// The agent serves one turn at a time and refuses a prompt to a busy session, so a
+    /// reader who types ahead has their words held here and delivered one per turn end
+    /// rather than refused. This is the interface's queue and not the session's: nothing
+    /// here has been sent, so nothing here belongs in the log.
+    pub queue: Queue,
+
+    /// Whether the overlay listing the queue is open.
+    ///
+    /// While it is set, the overlay owns the keyboard, exactly as the approval dialog
+    /// does: every key means something about the queue or nothing at all.
+    pub queue_open: bool,
+
+    /// Which queued prompt the overlay has selected.
+    ///
+    /// An index into [`ViewState::queue`], kept valid by the queue methods rather than
+    /// by the callers, so a selection can never point past the end.
+    pub queue_selection: usize,
+
+    /// The queued prompt currently pulled into the composer, if any.
+    ///
+    /// While it is set the composer is editing that prompt, and the keys that send save
+    /// instead: see [`crate::queue`].
+    pub queue_editor: Option<QueueEdit>,
+
     /// The transcript area the view last drew into, if it has drawn.
     ///
     /// Recorded because "the bottom" is not a constant: it depends on how many rows
@@ -277,6 +335,10 @@ impl Default for ViewState {
             pending_scroll_back: None,
             pending_approval: None,
             approval: ApprovalPolicy::default(),
+            queue: Queue::new(),
+            queue_open: false,
+            queue_selection: 0,
+            queue_editor: None,
             last_viewport: None,
             last_composer: None,
         }
@@ -293,8 +355,24 @@ impl std::fmt::Debug for ViewState {
             .field("busy", &self.busy)
             .field("step", &self.step)
             .field("tokens_used", &self.tokens_used)
+            .field("queued", &self.queue.len())
             .finish_non_exhaustive()
     }
+}
+
+/// The first line of a prompt, with a mark when there is more.
+///
+/// A queued prompt is drawn on one row by construction: a `Line` holds spans rather than
+/// paragraphs, so an embedded newline is painted literally and a multi-line prompt would
+/// bleed into the rows below it. The mark says there is more without spending the rows,
+/// and the overlay is where the whole prompt is read.
+#[must_use]
+fn first_line(text: &str) -> String {
+    let mut line = text.lines().next().unwrap_or("").to_owned();
+    if text.contains('\n') {
+        line.push('…');
+    }
+    line
 }
 
 /// Splits `text` into one styled line per source line, indented by `depth`.
@@ -616,6 +694,129 @@ impl ViewState {
         self.status = String::from("ready");
     }
 
+    /// Adds a prompt to the end of the queue.
+    pub fn enqueue(&mut self, prompt: String) {
+        self.queue.push(prompt);
+    }
+
+    /// Whether any prompt is waiting.
+    #[must_use]
+    pub fn has_queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Takes the oldest queued prompt, if there is one.
+    pub fn take_queued(&mut self) -> Option<String> {
+        let prompt = self.queue.pop_front();
+        self.settle_queue();
+        prompt
+    }
+
+    /// Opens the queue overlay, if there is anything to show.
+    ///
+    /// Returns `false` when the queue is empty, so the caller can say so rather than draw
+    /// an empty list: a key that opened a dialogue with nothing in it would be worse than
+    /// one that answered.
+    pub fn open_queue(&mut self) -> bool {
+        if self.queue.is_empty() {
+            return false;
+        }
+        self.queue_open = true;
+        self.settle_queue();
+        true
+    }
+
+    /// Closes the queue overlay.
+    pub fn close_queue(&mut self) {
+        self.queue_open = false;
+    }
+
+    /// Moves the overlay's selection toward the front of the queue.
+    pub fn queue_up(&mut self) {
+        self.queue_selection = self.queue_selection.saturating_sub(1);
+    }
+
+    /// Moves the overlay's selection toward the back of the queue.
+    pub fn queue_down(&mut self) {
+        if let Some(last) = self.queue.last_index() {
+            self.queue_selection = self.queue_selection.saturating_add(1).min(last);
+        }
+    }
+
+    /// Removes the selected prompt from the queue.
+    pub fn remove_queued(&mut self) {
+        self.settle_queue();
+        if self.queue.is_empty() {
+            return;
+        }
+        let _ = self.queue.remove(self.queue_selection);
+        self.settle_queue();
+    }
+
+    /// Pulls the selected prompt into the composer for editing.
+    ///
+    /// Returns `false` when there is nothing to edit. The entry leaves the queue while it
+    /// is in the composer, so a turn that ends here cannot send it half-edited; saving
+    /// puts it back, and cancelling leaves the queue as it was.
+    pub fn begin_queue_edit(&mut self) -> bool {
+        self.settle_queue();
+        if self.queue.is_empty() {
+            return false;
+        }
+        let index = self.queue_selection;
+        let Some(text) = self.queue.remove(index) else {
+            return false;
+        };
+        self.queue_editor = Some(QueueEdit {
+            index,
+            draft: self.input.text(),
+            original: text.clone(),
+        });
+        self.input.clear();
+        self.input.insert_str(&text);
+        self.queue_open = false;
+        self.settle_queue();
+        true
+    }
+
+    /// Saves the prompt being edited back into the queue and restores the draft.
+    ///
+    /// An edit that leaves nothing behind removes the entry rather than queueing blank
+    /// text: deleting everything in a queued prompt is how a reader takes it back.
+    pub fn save_queue_edit(&mut self) {
+        let Some(edit) = self.queue_editor.take() else {
+            return;
+        };
+        let text = self.input.text();
+        self.input.clear();
+        self.input.insert_str(&edit.draft);
+        if !text.trim().is_empty() {
+            self.queue.insert(edit.index, text);
+        }
+        self.settle_queue();
+    }
+
+    /// Abandons the edit, putting the prompt back as it was and giving back the draft.
+    pub fn cancel_queue_edit(&mut self) {
+        let Some(edit) = self.queue_editor.take() else {
+            return;
+        };
+        self.queue.insert(edit.index, edit.original);
+        self.input.clear();
+        self.input.insert_str(&edit.draft);
+        self.settle_queue();
+    }
+
+    /// Keeps the selection on a real entry, closing the overlay when there is none.
+    fn settle_queue(&mut self) {
+        if let Some(last) = self.queue.last_index() {
+            self.queue_selection = self.queue_selection.min(last);
+        } else {
+            self.queue_selection = 0;
+            self.queue_open = false;
+        }
+    }
+
     /// Adds to the running token total.
     pub fn add_tokens(&mut self, tokens: u32) {
         self.tokens_used = self.tokens_used.saturating_add(u64::from(tokens));
@@ -753,6 +954,23 @@ impl ViewState {
         // than clipped to a single row. The transcript keeps a floor of rows so that a
         // tall composer cannot squeeze the conversation out entirely.
         let composer = self.composer_height(area.width);
+        // The queue is drawn above the composer, so a reader can see what they have
+        // already asked for while they type the next thing. It yields its rows the same
+        // way the throughput line does — before the composer, which is the one row they
+        // cannot do without — and the overlay stays the place to read a queue longer than
+        // the terminal can show.
+        let queued = self.queue_rows();
+        let queue = if area.height
+            >= 1_u16
+                .saturating_add(TRANSCRIPT_FLOOR)
+                .saturating_add(queued)
+                .saturating_add(composer)
+                .saturating_add(2)
+        {
+            queued
+        } else {
+            0
+        };
         // The throughput line is the first thing to give up its row when there are not
         // enough: a terminal too short for everything should cost the reader a number
         // they can live without, not the row they are typing on. Everything else here
@@ -764,6 +982,7 @@ impl ViewState {
             area.height
                 >= 1_u16
                     .saturating_add(TRANSCRIPT_FLOOR)
+                    .saturating_add(queue)
                     .saturating_add(composer)
                     .saturating_add(2),
         );
@@ -772,6 +991,7 @@ impl ViewState {
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(TRANSCRIPT_FLOOR),
+                Constraint::Length(queue),
                 Constraint::Length(composer),
                 Constraint::Length(stats),
                 Constraint::Length(1),
@@ -796,20 +1016,166 @@ impl ViewState {
             self.clamp_scroll(body.height, body.width);
             self.render_transcript(frame, *body);
         }
-        if let Some(input) = chunks.get(2) {
+        if let Some(queue) = chunks.get(2) {
+            self.render_queue(frame, *queue);
+        }
+        if let Some(input) = chunks.get(3) {
             self.render_input(frame, *input);
         }
-        if let Some(stats) = chunks.get(3) {
+        if let Some(stats) = chunks.get(4) {
             self.render_stats(frame, *stats);
         }
-        if let Some(status) = chunks.get(4) {
+        if let Some(status) = chunks.get(5) {
             self.render_status(frame, *status);
+        }
+        // Before the approval dialog, because a question the agent is blocked on has to be
+        // the thing a reader sees: the queue is something they can act on afterwards.
+        if self.queue_open {
+            self.render_queue_dialog(frame, area);
         }
         // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
         // be the thing a reader sees, not a dialogue behind the transcript.
         if self.pending_approval.is_some() {
             self.render_approval(frame, area);
         }
+    }
+
+    /// How many rows the inline queue draws, and therefore how many it needs.
+    ///
+    /// Zero when the queue is empty, which is what keeps the chunk out of the layout —
+    /// and the tests that count rows on a bare terminal — rather than reserving a heading
+    /// for a list that does not exist.
+    #[must_use]
+    fn queue_rows(&self) -> u16 {
+        if self.queue.is_empty() {
+            return 0;
+        }
+        let shown = self.queue.len().min(usize::from(QUEUE_MAX_ROWS));
+        let listed = u16::try_from(shown).unwrap_or(QUEUE_MAX_ROWS);
+        let more = u16::from(self.queue.len() > usize::from(QUEUE_MAX_ROWS));
+        listed.saturating_add(1).saturating_add(more)
+    }
+
+    /// Draws the prompts waiting for the running turn to end.
+    ///
+    /// Oldest first, because the oldest is the one that runs next: this is a schedule
+    /// rather than a history. The heading carries the count and the key that opens the
+    /// overlay, which is the one thing here a reader cannot work out from the list itself.
+    fn render_queue(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.queue.is_empty() || area.height == 0 {
+            return;
+        }
+        let dim = Style::default().fg(Color::DarkGray);
+        let total = self.queue.len();
+        let mut lines = vec![Line::from(vec![
+            Span::styled("── queued", self.theme.notice),
+            Span::styled(format!(" · {total} · Ctrl+Q to edit"), dim),
+        ])];
+        for (index, prompt) in self
+            .queue
+            .iter()
+            .enumerate()
+            .take(usize::from(QUEUE_MAX_ROWS))
+        {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:>2}  ", index.saturating_add(1)), dim),
+                Span::styled(first_line(prompt), Style::default()),
+            ]));
+        }
+        if total > usize::from(QUEUE_MAX_ROWS) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  … and {} more",
+                    total.saturating_sub(usize::from(QUEUE_MAX_ROWS))
+                ),
+                dim,
+            )));
+        }
+        // No `Wrap`: the rows are counted by `queue_rows`, and a wrapped line would be
+        // more rows than were granted. A long prompt is clipped, as the compact tool line
+        // is, and the overlay is where a reader goes to read it whole.
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    }
+
+    /// Draws the queue overlay: every prompt, a selection, and the keys that act on it.
+    ///
+    /// Centred and bounded like the approval dialog, and drawn over the interface rather
+    /// than in it, because while it is up the keyboard belongs to the queue.
+    fn render_queue_dialog(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.queue.is_empty() {
+            return;
+        }
+        // Clamped between a comfortable reading width and a usable one, and never wider
+        // than the terminal that has to draw it.
+        let width = area.width.saturating_sub(4).clamp(24, 72);
+        let mut lines: Vec<Line<'static>> = self
+            .queue
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| {
+                let selected = index == self.queue_selection;
+                let style = if selected {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let marker = if selected { "\u{25b6}" } else { " " };
+                Line::from(vec![
+                    Span::styled(format!("{marker} {:>2}  ", index.saturating_add(1)), style),
+                    Span::styled(first_line(prompt), style),
+                ])
+            })
+            .collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" edit    "),
+            Span::styled(
+                "d",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" remove    "),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+            Span::raw(" close"),
+        ]));
+        // Taller than the terminal is a scroll, not a drawing: the block is clamped and
+        // the text is clipped, which is what the approval dialog does too.
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(4).max(4));
+        // Shifted rather than divided: the centring offset is an unsigned count of cells, and
+        // the workspace treats integer division as a defect wherever it appears.
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.busy)
+            .title(Line::from(Span::styled(
+                " queued prompts ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        // Cleared first, so the transcript behind the dialog does not show through the gaps
+        // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .style(self.theme.notice),
+            dialog,
+        );
     }
 
     /// Draws the approval dialog over the interface.
@@ -1506,6 +1872,17 @@ impl ViewState {
         } else {
             Span::raw("")
         };
+        // Right after what is happening, because it is the one thing here a reader acted
+        // on: the inline list gives up its rows on a short terminal, and the count is how
+        // they know there is something to open.
+        let queued = if self.has_queued() {
+            Span::styled(
+                format!("  ·  {} queued (Ctrl+Q)", self.queue.len()),
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::raw("")
+        };
         // What is collapsed, so a reader who toggled something (or inherited a toggle
         // from an earlier keypress) can see why the transcript looks the way it does.
         let collapsed = if self.collapse_tools || self.collapse_reasoning {
@@ -1524,7 +1901,9 @@ impl ViewState {
             Span::raw("")
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![busy, step, permission, usage, collapsed])),
+            Paragraph::new(Line::from(vec![
+                busy, queued, step, permission, usage, collapsed,
+            ])),
             area,
         );
     }
@@ -2305,6 +2684,112 @@ mod tests {
         assert!(
             !cramped.contains("tok/s"),
             "the stats go without: {cramped}"
+        );
+        assert!(
+            cramped.contains('›'),
+            "the composer keeps its row: {cramped}"
+        );
+    }
+
+    /// A prompt waiting for the running turn is drawn above the composer, oldest first,
+    /// with a count and the key that opens the overlay.
+    #[test]
+    fn queued_prompts_are_drawn_above_the_composer() {
+        let mut state = ViewState::new();
+        state.enqueue(String::from("run the tests"));
+        state.enqueue(String::from("then fix the docs"));
+        let text = rendered(&mut state, 70, 16);
+        assert!(text.contains("── queued"), "{text}");
+        assert!(text.contains("run the tests"), "{text}");
+        assert!(text.contains("then fix the docs"), "{text}");
+        assert!(
+            text.contains("2 queued (Ctrl+Q)"),
+            "the status counts them: {text}"
+        );
+        let rows: Vec<&str> = text.lines().collect();
+        let first = rows
+            .iter()
+            .position(|row| row.contains("run the tests"))
+            .expect("the oldest queued prompt is drawn");
+        let composer = rows
+            .iter()
+            .position(|row| row.contains('›'))
+            .expect("the composer is drawn");
+        assert!(
+            first < composer,
+            "the queue sits above the composer, not in it:\n{text}"
+        );
+    }
+
+    /// The inline list is bounded and the rest are counted: a reader can see what is
+    /// coming without the queue eating the conversation.
+    #[test]
+    fn a_long_queue_is_counted_rather_than_listed_in_full() {
+        let mut state = ViewState::new();
+        for index in 0..5 {
+            state.enqueue(format!("prompt {index}"));
+        }
+        let text = rendered(&mut state, 70, 16);
+        assert!(
+            text.contains("prompt 2"),
+            "the third is the last drawn: {text}"
+        );
+        assert!(
+            !text.contains("prompt 3"),
+            "past the cap the entries are counted: {text}"
+        );
+        assert!(text.contains("and 2 more"), "{text}");
+    }
+
+    /// A multi-line prompt is one row with a mark, because a `Line` does not break on a
+    /// newline and a second line would paint over the rows below.
+    #[test]
+    fn a_multi_line_queued_prompt_is_one_row_with_a_mark() {
+        let mut state = ViewState::new();
+        state.enqueue(String::from("first line\nsecond line"));
+        let text = rendered(&mut state, 70, 16);
+        assert!(text.contains("first line…"), "{text}");
+        assert!(
+            !text.contains("second line"),
+            "the rest is left to the overlay: {text}"
+        );
+    }
+
+    /// The overlay lists every prompt, marks the selection, and spells out the keys — a
+    /// list a reader can act on rather than a count they have to trust.
+    #[test]
+    fn the_queue_overlay_lists_the_prompts_and_marks_the_selection() {
+        let mut state = ViewState::new();
+        state.enqueue(String::from("first"));
+        state.enqueue(String::from("second"));
+        assert!(state.open_queue());
+        state.queue_down();
+        let text = rendered(&mut state, 70, 20);
+        assert!(text.contains("queued prompts"), "{text}");
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+        assert!(text.contains("edit"), "{text}");
+        assert!(text.contains("remove"), "{text}");
+        let marked = text
+            .lines()
+            .find(|row| row.contains('\u{25b6}'))
+            .expect("the selection is marked");
+        assert!(
+            marked.contains("second"),
+            "the selection moved to the second entry: {marked}"
+        );
+    }
+
+    /// The queue gives up its rows before the composer does: on a terminal with no room to
+    /// spare, the row being typed on is the one that stays.
+    #[test]
+    fn the_queue_yields_its_rows_to_the_composer() {
+        let mut state = ViewState::new();
+        state.enqueue(String::from("a queued prompt"));
+        // Minus the title, floor, queue, composer and status there is nothing left for it.
+        let cramped = rendered(&mut state, 70, 8);
+        assert!(
+            !cramped.contains("queued prompt"),
+            "the list goes without: {cramped}"
         );
         assert!(
             cramped.contains('›'),

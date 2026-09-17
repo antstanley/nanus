@@ -42,6 +42,7 @@ pub mod compact;
 // it. Keeping it private is what stops it becoming a second public rendering surface.
 mod markdown;
 pub mod notice;
+pub mod queue;
 pub mod replay;
 pub mod stats;
 pub mod summary;
@@ -55,7 +56,8 @@ pub use buffer::{InputBuffer, KeyOutcome};
 pub use command::{Command, Submission, submission_of};
 pub use compact::Detail;
 pub use notice::{Ending, stopping};
+pub use queue::Queue;
 pub use replay::{recording_of, transcript_of};
 pub use stats::{Generation, Throughput};
 pub use transcript::{Entry, EntryKind, Role, Transcript};
-pub use view::{PendingApproval, Theme, ViewState};
+pub use view::{PendingApproval, QueueEdit, Theme, ViewState};

@@ -117,7 +117,8 @@ A session is the conversation, written down as it happens. See
 - **Live sessions.** An agent holds sessions open, a turn runs in its own task
   so it outlives the client that asked, and several clients can watch one
   session at once. One turn at a time per session; a prompt to a busy session is
-  refused rather than queued.
+  refused rather than queued — the interface holds prompts typed during a turn
+  and sends them, one per turn end, when the agent is ready.
 - **Reading without an agent or a key.** `nanus tui --session [<id>]` replays a
   recorded transcript from the same event log the live view uses, with
   `--scroll <rows>` to open part way back.
@@ -343,6 +344,6 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   to a live session is the supported way to share one.
 - **No syntax highlighting** in fenced code blocks, and no image paste; the
   markdown renderer performs no I/O.
-- **No vim mode, `@` mentions, or `!` bash mode** in the interface, and no model
+- **No `@` mentions or `!` bash mode** in the interface, and no model
   switching from a key. The approval state does cycle from the keyboard, with
   `Shift+Tab`.
