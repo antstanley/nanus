@@ -41,6 +41,7 @@
 //! | `Ctrl+W` / `Alt+B` / `Alt+F` | delete a word / move a word back / forward |
 //! | `Alt+P` | switch to the next model the agent offers |
 //! | `Alt+T` | ask for the next step of reasoning effort |
+//! | `Ctrl+V` | paste an image from the clipboard, as a path |
 //! | `Ctrl+L` | clear the transcript |
 //! | `Backspace` / `Delete` | delete a character |
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
@@ -311,6 +312,14 @@ pub trait SessionSource {
         None
     }
 
+    /// The directory a pasted file has to be written inside to be readable by the tools.
+    ///
+    /// The tools are rooted at the workspace, so a paste written anywhere else is one the model
+    /// cannot read. `None` is a source with nowhere to put one.
+    fn workspace(&self) -> Option<&str> {
+        None
+    }
+
     /// The models this source may be switched between, in the agent's own order.
     ///
     /// Empty when there is nothing to switch: a recorded transcript has no agent, so the key
@@ -487,6 +496,12 @@ impl SessionSource for Recording {
         &self.session
     }
 
+    /// Where the recorded session ran, which is where a paste would go: a recording has no agent
+    /// to ask, but it does know its own working directory.
+    fn workspace(&self) -> Option<&str> {
+        Some(self.session.cwd())
+    }
+
     /// The model the session was recorded under, which is what a reader of it wants to know
     /// and is not a claim about anything that could be switched.
     fn model(&self) -> Option<&str> {
@@ -530,6 +545,8 @@ pub struct Remote {
     pending: Option<mpsc::UnboundedReceiver<Request>>,
     /// The approval state a startup flag asked for, sent once the agent is attached.
     approval: Option<ApprovalPolicy>,
+    /// The workspace the agent's tools are confined to, which is where a paste has to go.
+    workspace: String,
     /// The model the agent reported, and the ones it offers to switch between.
     model: Option<String>,
     models: Vec<String>,
@@ -571,12 +588,14 @@ impl Remote {
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        let workspace = agent.workspace.clone();
         let session = history(store, &attached, &agent.workspace).await;
         let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
         let busy = attached.busy;
         let (requests, pending) = mpsc::unbounded_channel();
         Ok(Self {
             session,
+            workspace,
             label,
             client: Some(client),
             requests,
@@ -627,6 +646,10 @@ async fn history(store: &StoreHandle, attached: &SessionInfo, workspace: &str) -
 impl SessionSource for Remote {
     fn session(&self) -> &Session {
         &self.session
+    }
+
+    fn workspace(&self) -> Option<&str> {
+        Some(&self.workspace)
     }
 
     fn models(&self) -> &[String] {
@@ -1037,6 +1060,9 @@ async fn event_loop(
                             };
                         }
                     }
+                    Outcome::PasteImage => {
+                        paste_image(&crate::paste::from_clipboard, source.workspace(), &mut view);
+                    }
                     Outcome::OpenPermissions => {
                         view.open_permissions();
                         view.status = String::from("permission: Enter applies, Esc cancels");
@@ -1249,6 +1275,33 @@ fn switch_model(requested: Option<String>, source: &mut dyn SessionSource, view:
     source.set_model(&chosen);
 }
 
+/// Puts a pasted image into the workspace and its path into the composer.
+///
+/// The reader is the clipboard reader, passed in so the decision — what to say when there is
+/// nothing to paste, and what to do when the file cannot be written — can be tested without a
+/// clipboard and without a terminal.
+fn paste_image(read: &dyn Fn() -> Option<Vec<u8>>, workspace: Option<&str>, view: &mut ViewState) {
+    let Some(workspace) = workspace else {
+        view.status = String::from("this session has no workspace to paste into");
+        return;
+    };
+    let Some(bytes) = read() else {
+        view.status = String::from("nothing image-shaped on the clipboard");
+        return;
+    };
+    match crate::paste::store(&bytes, Path::new(workspace)) {
+        Ok(path) => {
+            // The path goes into the prompt, which is the only way the model can be shown the
+            // image: `read_image` takes a path, and the wire has no way to carry the bytes.
+            view.input.insert_str(&path);
+            view.status = format!("pasted {path} — Enter sends it to the model");
+        }
+        Err(error) => {
+            view.status = format!("the pasted image could not be written: {error}");
+        }
+    }
+}
+
 /// Asks for the next step of reasoning effort.
 ///
 /// A source that has not said which effort it is using starts at the provider's default — the
@@ -1368,7 +1421,8 @@ enum Outcome {
     OpenPermissions,
     /// Switch to this model, or to the next one when nothing is named.
     SetModel(Option<String>),
-    /// Ask the agent for more or less reasoning effort.
+    /// Read an image off the clipboard and put its path in the composer.
+    PasteImage,
     ///
     /// The key is a cycle rather than a toggle because the scale has four steps and only one of
     /// them means "no thinking": a toggle would have to invent what "on" means after a reader has
@@ -1653,6 +1707,10 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.toggle_detail();
             Outcome::Continue
         }
+        // `Ctrl+V` pastes an image, which a terminal may well have claimed for itself: one that
+        // handles paste never sends this key, and the text it pastes instead arrives as ordinary
+        // input. A terminal that passes it through reaches here.
+        KeyCode::Char('v' | 'V') => Outcome::PasteImage,
         KeyCode::Char('k' | 'K') => {
             view.input.kill_to_end();
             Outcome::Continue
@@ -2774,6 +2832,90 @@ mod tests {
             "a model the build no longer offers does not leave the key dead"
         );
         assert_eq!(next_model(&[], Some("one")), None);
+    }
+
+    /// `Ctrl+V` writes the clipboard's image into the workspace and puts its path in the prompt.
+    ///
+    /// The reader is a stub, so this covers the decision rather than the clipboard: what the
+    /// reader is told when there is nothing to paste, and that the file lands where the tools can
+    /// reach it — inside the workspace, because `read_image` takes a path and the tools are rooted.
+    #[test]
+    fn a_pasted_image_becomes_a_path_in_the_prompt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let mut view = ViewState::new();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(b"the rest of a png");
+        let reader = {
+            let bytes = png.clone();
+            move || Some(bytes.clone())
+        };
+
+        paste_image(&reader, root.to_str(), &mut view);
+        let pasted = view.input.text();
+        assert!(pasted.starts_with(".nanus/pasted/"), "{pasted}");
+        assert!(
+            pasted.ends_with("png"),
+            "the extension says what it is: {pasted}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(&pasted)).expect("the image is written"),
+            png,
+            "the file is where the prompt says it is"
+        );
+        assert!(view.status.contains("pasted"), "{}", view.status);
+        assert!(view.status.contains(&pasted), "{}", view.status);
+
+        // The key is the entry point, and it asks for a paste rather than doing one: the
+        // clipboard is read in the loop, which is where the side effects belong.
+        let mut keys = ViewState::new();
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL), &mut keys),
+            Outcome::PasteImage
+        ));
+    }
+
+    /// Nothing on the clipboard, or nowhere to put it: the reader is told, and the prompt is left
+    /// exactly as it was rather than gaining a path to a file that does not exist.
+    #[test]
+    fn a_paste_that_cannot_happen_says_so_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let mut view = ViewState::new();
+        view.input.insert_str("a draft");
+
+        // A clipboard reader that found nothing image-shaped: the ordinary case on a machine where
+        // the clipboard holds text.
+        paste_image(&|| None, root.to_str(), &mut view);
+        assert!(
+            view.status.contains("nothing image-shaped"),
+            "{}",
+            view.status
+        );
+        assert_eq!(view.input.text(), "a draft", "the draft is untouched");
+
+        // A reader that answered with text rather than an image is refused by the store, and the
+        // draft is still untouched: writing it to a `.png` would be showing the model a lie.
+        paste_image(
+            &|| Some(b"a paragraph of text".to_vec()),
+            root.to_str(),
+            &mut view,
+        );
+        assert!(
+            view.status.contains("could not be written"),
+            "{}",
+            view.status
+        );
+        assert_eq!(view.input.text(), "a draft");
+        assert!(
+            !root.join(crate::paste::PASTED_DIR).exists(),
+            "nothing was created for it"
+        );
+
+        // And a source with no workspace says that rather than writing somewhere the tools cannot
+        // read: a session record still has one, but a source that does not is not a panic.
+        paste_image(&|| Some(vec![0x89, b'P', b'N', b'G']), None, &mut view);
+        assert!(view.status.contains("no workspace"), "{}", view.status);
     }
 
     /// `Alt+T` steps the effort and sends what it stepped to.

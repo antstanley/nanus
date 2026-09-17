@@ -40,6 +40,10 @@ pub mod compact;
 // The key list the overlay and `/help` draw. Private because it is a rendering detail of
 // this crate: nobody outside needs to name a binding.
 mod help;
+// Reading an image off the clipboard and putting it where the tools can reach it. Private
+// because it is the runtime's convenience: the view never sees it, and the wire has no way to
+// carry the bytes.
+mod paste;
 // The markdown renderer is an implementation detail of the view: it produces the same
 // `Line`s every other entry is drawn from, and nothing outside this crate needs to name
 // it. Keeping it private is what stops it becoming a second public rendering surface.

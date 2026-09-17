@@ -220,6 +220,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `?` | show the key list, when the prompt is empty |
 | `Alt+P` | switch to the next model the agent offers |
 | `Alt+T` | ask for the next step of reasoning effort |
+| `Ctrl+V` | paste an image from the clipboard, as a path |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
@@ -348,7 +349,6 @@ inventing a purpose for a key would be worse than leaving it alone:
   dialog says so where a reader is choosing, rather than leaving the difference to be found
   in a document.
 - **Background tasks** (`Ctrl+B`) — there are none to background.
-- **Pasting an image** (`Ctrl+V`) would need clipboard access this program does not have.
 - **`@` mentions and `!` bash mode** are input *modes* rather than shortcuts, and each is a
   feature in its own right. Slash commands have begun — see below.
 
@@ -489,6 +489,33 @@ own name, and the alternative — rebuilding the prompt on every switch — woul
 conversation the model is being sent no longer matches the one recorded against it. The live
 value is the one in the title bar; the recorded one is what the session says produced it, and the
 two are the same thing until somebody switches.
+
+### Pasting an image
+
+`Ctrl+V` reads an image off the clipboard, writes it into the workspace under `.nanus/pasted/`,
+and puts the path in the composer. Press Enter and the model is shown the path; it calls
+`read_image` on it like any other file.
+
+It is a path rather than bytes because that is what the wire has. `read_image` is how an image
+reaches a model — a tool result with a content block — and the link has no request that carries
+bytes a client produced; adding one would mean a frame whose payload is arbitrary binary. So the
+file lands in the reader's own directory, where the tools can reach it, and it stays there: a
+paste is not cleaned up, and a reader who does not want it keeps it or deletes it. A temporary
+directory would not do, because the tools are rooted at the workspace and a path outside it is
+refused.
+
+The clipboard is read by the platform's own tool — `pbpaste` on macOS, `wl-paste` or `xclip`
+elsewhere — because a terminal has no clipboard API and the crates that provide one pull in a
+windowing system this program never opens. What comes back is checked by its magic number rather
+than trusted: a reader that answered with the clipboard's *text* has not provided an image, and the
+path inserted is never a `.png` full of prose. Nothing to paste says so on the status line, in the
+three cases that are all the same to a reader: no reader installed, nothing on the clipboard, or
+something on it that is not an image.
+
+**A terminal may claim `Ctrl+V` for itself**, and most do: one that handles paste never sends the
+key, and pastes *text* into the composer instead, which is what that key does everywhere else. This
+binding is for the terminals that pass it through, and there is no way to ask which kind you have
+other than to press it.
 
 ### How hard the model is asked to think
 

@@ -342,9 +342,9 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   writes, its network access, or its process table.
 - **Sessions are not locked.** Two writers on one log can lose a turn; attaching
   to a live session is the supported way to share one.
-- **No image paste** in the interface, and no remote fetch from the renderer: a
-  fenced block is highlighted by a lexer inside the view, which is still a pure
-  function of the transcript.
+- **No remote fetch from the renderer**: a fenced block is highlighted by a lexer
+  inside the view, and an image is a placeholder or a pasted file, never a URL
+  fetched on a model's say-so.
 - **No `@` mentions or `!` bash mode** in the interface. The approval state cycles
   from the keyboard with `Shift+Tab`, the model switches with `Alt+P` or `/model`,
   and the reasoning effort steps with `Alt+T`.

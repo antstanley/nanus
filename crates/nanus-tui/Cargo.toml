@@ -61,6 +61,9 @@ tokio = { workspace = true, optional = true, features = ["rt", "macros", "sync",
 
 [dev-dependencies]
 proptest = { workspace = true }
+# A pasted image is written beside the workspace, so the test that stores one needs a directory
+# of its own to write into.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

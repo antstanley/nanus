@@ -1646,6 +1646,7 @@ dependencies = [
  "proptest",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "unicode-width",
