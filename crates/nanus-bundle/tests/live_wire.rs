@@ -6,10 +6,12 @@
 //! them, split mid-frame and mid-multibyte-character, and that the assembled tool call
 //! then reaches the real `glob` tool and produces a second step.
 //!
-//! What it deliberately does **not** prove is that the live API's framing matches this
-//! replay. A live text run already confirmed the request shape, TLS, auth, the streaming
-//! transport and the reasoning passback rule; the only thing left unverified is a live
-//! *tool call*, and this is the closest a hermetic test can get to it.
+//! Two kinds of replay live here. Most script the frames a response is *documented* to
+//! carry, so a test can aim at one behaviour. One replays a **captured** response — a real
+//! tool call streamed by `api.deepseek.com`, embedded from `tests/data/` — so the decoder
+//! is also held to the shape a real stream has, which a hand-written replay would quietly
+//! correct for. That trace is what makes "the live framing matches" a tested claim rather
+//! than an assumption.
 
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
@@ -29,6 +31,16 @@ use nanus_ports::{LlmPort as _, SandboxPolicy};
 struct Response {
     body: String,
 }
+
+/// A real tool-call response, captured from the live API and replayed byte for byte.
+///
+/// Recorded from `https://api.deepseek.com/chat/completions` with `deepseek-flash` in the
+/// mode the harness sends by default — streaming, usage included, thinking enabled. The
+/// model answered a request to run `printf hello` with a `bash` call whose arguments
+/// arrived a few characters at a time. `tests/data/README.md` records the recording and
+/// what the trace pins; the point of embedding it is that the replay is held to a shape
+/// nobody here wrote.
+const CAPTURED_TOOL_CALL: &str = include_str!("data/deepseek-tool-call.sse");
 
 /// Serves `responses` in order, one per request, until the script is exhausted.
 ///
@@ -286,6 +298,88 @@ async fn a_streamed_tool_call_runs_the_real_tool_and_produces_a_second_step() {
     // Tokens from both responses are summed, proving the usage path survived decoding.
     assert_eq!(outcome.usage.prompt_tokens, 32);
     assert_eq!(outcome.usage.completion_tokens, 12);
+
+    let reaped = shell.kill_all().await;
+    assert!(reaped.is_ok());
+}
+
+#[tokio::test]
+async fn a_captured_live_tool_call_reassembles_and_runs_the_real_tool() {
+    // The one thing the replay above cannot prove: that the live API's framing matches it.
+    // This is a response captured from `api.deepseek.com` (see `tests/data/README.md`) and
+    // replayed byte for byte, so the decoder is held to a shape it did not invent. If the
+    // live shape drifts from the documented one, this is where it shows.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let responses = vec![
+        Response {
+            body: CAPTURED_TOOL_CALL.to_owned(),
+        },
+        Response {
+            body: answer_stream("done"),
+        },
+    ];
+    let (base_url, _requests) = spawn_server(responses);
+    let (runner, shell) = runner(&base_url, dir.path());
+
+    let mut session = Session::new(SessionId::new("captured"), 0, "/tmp");
+    let outcome = runner
+        .run_turn(
+            &mut session,
+            "run printf hello with bash, then stop",
+            &mut nanus_bundle::Silent,
+            None,
+        )
+        .await
+        .expect("the captured trace decodes");
+    assert_eq!(outcome.steps, 2, "the captured call owes a second step");
+    assert_eq!(outcome.answer, "done");
+    assert!(outcome.is_success(), "{:?}", outcome.reason);
+
+    // The captured arguments arrived in eleven frames, ten of them a few characters each.
+    // The call the log recorded is the call the API sent.
+    let call = session.log().events().iter().find_map(|event| match event {
+        nanus_domain::SessionEvent::ToolCall {
+            name, arguments, ..
+        } => Some((name.clone(), arguments.clone())),
+        _ => None,
+    });
+    let Some((name, arguments)) = call else {
+        panic!("the captured call reached the log: {:?}", session.log());
+    };
+    assert_eq!(name.as_str(), "bash");
+    assert_eq!(
+        arguments,
+        serde_json::json!({ "command": "printf hello" }),
+        "the fragments reassembled in order"
+    );
+
+    // And it really ran: the tool result carries the command's output, so the reassembled
+    // arguments reached the shell rather than only the log.
+    let ran = session.log().events().iter().any(|event| {
+        matches!(
+            event,
+            nanus_domain::SessionEvent::ToolResult { content, is_error: false, .. }
+                if content.contains("hello")
+        )
+    });
+    assert!(ran, "the captured call ran: {:?}", session.log());
+
+    // The trace carries deliberate nulls and empty strings — `reasoning_content: null` and
+    // `content: ""` on the final frame — and a decoder that tripped on either would have
+    // failed before here. This pins that the reasoning beside the call was kept.
+    let reasoned = session.log().events().iter().any(|event| {
+        matches!(
+            event,
+            nanus_domain::SessionEvent::AssistantMessage {
+                reasoning: Some(text),
+                ..
+            } if !text.trim().is_empty()
+        )
+    });
+    assert!(reasoned, "the reasoning frames decoded too");
+    // Reasoning tokens arrived inside `completion_tokens_details`, which is the only place
+    // the live API reports them.
+    assert_eq!(outcome.usage.reasoning_tokens, 21);
 
     let reaped = shell.kill_all().await;
     assert!(reaped.is_ok());

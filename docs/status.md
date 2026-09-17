@@ -35,12 +35,13 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 
 ## Known limits
 
-- **Live tool calling was verified by inspection, not replay.** The framing replayed in
-  `live_wire.rs` follows the documented shape, and a live text run confirmed the request
-  side, TLS, auth, and the reasoning passback rule. What no hermetic test can prove is
-  that the live API's tool-call frames match the replay byte for byte; if they differ,
-  [`crates/nanus-adapter-deepseek/src/wire.rs`](../crates/nanus-adapter-deepseek/src/wire.rs)
-  is the only file involved.
+- **Live tool calling is replayed from a captured trace.** `live_wire.rs` replays a real
+  response recorded from `api.deepseek.com` — a `bash` call whose arguments arrived a few
+  characters at a time — byte for byte, in `crates/nanus-bundle/tests/data/`. That is what
+  makes the framing a tested claim rather than an assumption; what it cannot catch is a
+  shape the API starts sending *tomorrow*, and if one appears,
+  [`wire.rs`](../crates/nanus-adapter-deepseek/src/wire.rs) is the only adapter file
+  involved.
 - **The TUI has no automated end-to-end test.** Raw mode needs a real terminal, so the
   alternate screen and the drawing itself are exercised by hand. What *is* covered
   automatically are the parts that can be: key handling, scrolling and wrapping against

@@ -32,7 +32,11 @@ ambiguous edit leaves the file byte-for-byte unchanged.
 runs the real adapter against a local TCP server replaying genuine SSE frames, so
 tool-call reassembly is exercised over a real connection with a real HTTP client rather
 than against a mock stream. It covers a tool call split across three frames, a response
-truncated mid-frame, and the request carrying all seven schemas.
+truncated mid-frame, and the request carrying all seven schemas — and one case replays a
+response **captured from the live API**
+([`tests/data/`](../crates/nanus-bundle/tests/data/README.md)), a `bash` call whose
+arguments arrived a few characters at a time, so the decoder is held to a shape nobody
+here wrote rather than to the one this suite assumes.
 
 **The link and its sessions, over real sockets.**
 [`crates/nanus-link/tests/link.rs`](../crates/nanus-link/tests/link.rs) binds real sockets
