@@ -705,13 +705,16 @@ fn run_turn(
     let approver = crate::approve::TerminalApprover::standard();
 
     let outcome = crate::block_on_local(async {
-        let watch = watch_for_interrupt(Rc::clone(&interrupted));
-        let turn = harness
+        // The watcher is a task of its own rather than half of a `join!`. Joining made the
+        // run wait for *both*, and the watcher only ever finishes when a signal arrives — so
+        // `nanus run` printed nothing and exited only after a Ctrl-C, which is not a
+        // behaviour anyone could mistake for a long model call. The turn is the thing being
+        // awaited; the watcher exists to set the flag the turn reads at its next checkpoint.
+        tokio::task::spawn_local(watch_for_interrupt(Rc::clone(&interrupted)));
+        harness
             .runner
-            .run_turn(&mut session, prompt, &mut reporter, Some(&approver));
-        // Both at once: the turn does the work, and the watcher is what makes it stop when the
-        // process is asked to.
-        tokio::join!(turn, watch).0
+            .run_turn(&mut session, prompt, &mut reporter, Some(&approver))
+            .await
     });
 
     // Recorded whatever the turn did, and before anything is printed: a caller that
