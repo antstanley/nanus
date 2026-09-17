@@ -506,7 +506,8 @@ wants when they paste an answer into an editor, an issue, or a message.
 letting go leaves it standing; a click that never moved is not a selection, and it takes any
 selection off, so the pointer is never left holding a highlight nobody meant.
 
-**With the keyboard**, `Shift` with any movement key: `Shift+Up` and `Shift+Down` take a row
+**With the keyboard**, `Shift` with any movement key — while no overlay is up, since an overlay
+owns the keys it uses, exactly as it does everywhere else: `Shift+Up` and `Shift+Down` take a row
 at a time, `Shift+PageUp`/`Shift+PageDown` a screenful, and `Shift+Home`/`Shift+End` to the
 end of the row the selection is on. The first press selects the line the reader is looking
 at — the newest text, not the blank row after it — and each press after that takes one more
@@ -572,8 +573,9 @@ and a `[exit N]` line when the exit status was not zero.
 `@` starts a mention: a word in the prompt that names a file, completed from the workspace. Type
 `@ma`, and a menu appears over the composer listing the files that answer it — `src/main.rs` before
 `docs/maintenance.md`, because the file's own name counts for more than the directory it is in.
-`Tab` completes the selected one, `Up`/`Down` choose, `Esc` closes the menu and leaves the word
-alone, and typing another character narrows the list. Every other key still belongs to the
+`Tab` completes the selected one, `Up`/`Down` choose (with or without `Shift`: the arrows are the
+menu's while it is up, as an overlay's keys are), `Esc` closes the menu and leaves the word alone,
+and typing another character narrows the list. Every other key still belongs to the
 composer: a mention is a word being typed, not a mode, so `Enter` sends the sentence it is part of
 rather than accepting the completion.
 
