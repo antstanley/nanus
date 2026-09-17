@@ -43,6 +43,13 @@ A tool's declared access decides which of the three sandbox questions it is: the
 read tools and the search tools read, `write` and `edit` write, and `bash` runs a
 program. There is deliberately no "auto-approve" or "always allow" policy.
 
+Who is asked depends on where you are. `nanus run` prompts on the terminal, and
+only when stdin is a terminal: a redirected stdin is not an answerer, so a script
+cannot approve by accident. The interactive interface draws the question over the
+conversation, and the agent asks over the local link — every client attached to
+the session sees it and the first answer settles it. A service with no client
+attached has nobody to ask and therefore denies.
+
 `danger-full-access` is never sent to the model provider as a request; it is a
 local decision, and it means what it says.
 

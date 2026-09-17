@@ -135,6 +135,20 @@ pub enum Request {
     /// List the sessions the agent is holding open.
     Sessions,
 
+    /// Answer an approval question about one tool call.
+    ///
+    /// The agent asks with [`Frame::Approval`] and waits; this is the answer. It is a
+    /// *request* rather than a keystroke for the same reason [`Request::Interrupt`] is:
+    /// the turn belongs to the session, not to the connection, and any client watching may
+    /// be the one to answer. The first answer wins, and one is enough — the question is
+    /// whether a single call may run once, not a standing permission.
+    Approve {
+        /// The call the question was about, exactly as the approval frame named it.
+        call_id: String,
+        /// Whether the call may run.
+        allow: bool,
+    },
+
     /// Describe the agent without changing anything.
     Status,
 
@@ -219,6 +233,28 @@ pub enum Frame {
         name: String,
         /// Whether it reported a failure, which is a result rather than a broken link.
         error: bool,
+    },
+
+    /// The agent is asking whether one tool call may run.
+    ///
+    /// Sent when the loop reaches a call the sandbox does not already permit and the policy
+    /// is `ask`, and sent to every client attached to the session — so a watcher sees both
+    /// the question and, in the transcript that follows, what was decided. The turn waits
+    /// for [`Request::Approve`], and a question nobody answers leaves the call denied.
+    ///
+    /// Only the tool and the harness's own reason cross the link. The arguments do not:
+    /// the domain's approval request deliberately carries none, so model-controlled text
+    /// cannot be placed in front of the person deciding.
+    Approval {
+        /// The call the question is about, and what an answer must name.
+        call_id: String,
+        /// The tool the model wants to run.
+        tool: String,
+        /// Why the harness is asking, in the harness's own words.
+        ///
+        /// Defaulted on the way in, so a reason-less question still decodes.
+        #[serde(default)]
+        reason: Option<String>,
     },
 
     /// Usage was reported for the request that just completed.
@@ -467,6 +503,11 @@ mod tests {
                 name: "read".to_owned(),
                 error: true,
             },
+            Frame::Approval {
+                call_id: "call-1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: Some("the sandbox mode `read_only` does not permit execute".to_owned()),
+            },
             Frame::Usage {
                 tokens: 1234,
                 completion_tokens: 90,
@@ -513,6 +554,14 @@ mod tests {
             },
             Request::Prompt {
                 text: "do the thing".to_owned(),
+            },
+            Request::Approve {
+                call_id: "call-1".to_owned(),
+                allow: true,
+            },
+            Request::Approve {
+                call_id: "call-1".to_owned(),
+                allow: false,
             },
             Request::Sessions,
             Request::Status,

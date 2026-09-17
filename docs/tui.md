@@ -74,11 +74,12 @@ interface. There is no port and nothing listening on an address, the run directo
 running as you", which can read the workspace and the session log anyway.
 
 The protocol is deliberately tiny. A client says what it wants — start a session, attach
-to one, list the ones the agent is holding, ask a question, send a prompt, stop — and the
-agent answers with its handshake, the attachment, and then the same progress callbacks the
-agent loop already reports: text, reasoning, a step boundary, a tool starting and its
-arguments, a tool finishing, usage, and the ending. Nothing an interface *might* want is in
-it; anything else an interface needs about a conversation, the session log already holds.
+to one, list the ones the agent is holding, ask a question, send a prompt, stop, answer an
+approval question — and the agent answers with its handshake, the attachment, and then the
+same progress callbacks the agent loop already reports: text, reasoning, a step boundary, a
+tool starting and its arguments, a tool finishing, usage, and the ending. Nothing an
+interface *might* want is in it; anything else an interface needs about a conversation, the
+session log already holds.
 
 The tool frame carries the arguments because a name is not enough to draw a call. `read`
 says nothing a reader can use and `read` of one file says everything, and the half of the
@@ -93,6 +94,18 @@ sends an `interrupt` request and the agent asks the turn to stop, which is the o
 that can: the agent is what holds the `&mut Session` the turn is writing. Nothing is sent
 back, because a turn that stops ends with the ending frame it always ends with, and a client
 that asked to stop a session which was not busy has asked for something already true.
+
+**A tool call outside the sandbox is decided by whoever is watching.** When the loop
+reaches a call the sandbox does not already permit and the policy is `ask`, the agent sends
+an `approval` frame to every client attached to the session and the turn waits. The frame
+carries the tool and the harness's own reason and deliberately *not* the call's arguments:
+the domain's approval request carries none, so model-controlled text cannot be placed in
+front of the person deciding, and the transcript already shows what the call is. A client
+answers with an `approve` request naming the question; the first answer wins, and denying
+is the safe reading of everything else. Nobody attached, or a last client that detaches
+while a question is open, is an unavailable answerer — the call is denied rather than left
+waiting for a decision that cannot arrive. `never` never reaches the link at all: it
+refuses without asking anyone.
 
 **The ending says why the turn ended, not only that it did.** A turn can stop for reasons
 that are not the model finishing — it can run out of steps, hit its token ceiling, be
@@ -157,6 +170,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 
 | Key | Effect |
 |---|---|
+| `y` / `n` (or `Esc`) | while an approval dialog is up: allow the call once, or deny it |
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
@@ -175,6 +189,12 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
+
+**While an approval dialog is up, `y` and `n` are the only keys that do anything.** The
+dialog is drawn over the interface, names the tool and the harness's reason, and `y` allows
+that one call while `n` or `Esc` denies it; every other key is swallowed, so a stray
+keypress cannot approve a command. The status line says what is being waited for, and the
+dialog closes when the turn ends — an answer cannot outlive the question.
 
 **`Ctrl+R` searches the history** rather than toggling anything, because that is what it is
 in every interface that has one — including the one these bindings are modelled on, where
@@ -233,8 +253,9 @@ full-screen terminal program pays.
 Claude Code's mode has more bindings than this interface has things to bind them to, and
 inventing a purpose for a key would be worse than leaving it alone:
 
-- **Permission modes** (`Shift+Tab`) — approvals are the agent's policy, set in
-  configuration, and this interface has no dialog to switch them from.
+- **Permission modes** (`Shift+Tab`) — the sandbox and approval policy are set in
+  configuration. The interface *answers* the agent's approval questions (see the keys
+  table), but it does not switch the policy they are asked under.
 - **Model switching** (`Alt+P`) and **extended thinking** (`Alt+T`) are agent-side
   decisions with no request to carry them.
 - **Background tasks** (`Ctrl+B`) — there are none to background.

@@ -25,7 +25,9 @@ use nanus_adapter_local::SystemClock;
 use nanus_adapter_store::JsonlStore;
 use nanus_bundle::AgentRunner;
 use nanus_domain::{
-    AgentConfig, Session, SessionEvent, SessionId, ToolCallId, ToolName, ToolRegistry, Usage,
+    AgentConfig, ApprovalPolicy, SandboxMode, Session, SessionEvent, SessionId, ToolAccess,
+    ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolRegistry,
+    ToolResult, ToolSchema, Usage,
 };
 use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
 use nanus_link::server::{Agent, Parts};
@@ -257,6 +259,101 @@ fn agent_over(dir: &Path, llm: Rc<Box<dyn LlmPort>>, model: &str) -> (Agent, Sto
         workspace: dir.to_path_buf(),
         model: model.to_owned(),
         tools: 0,
+    });
+    (agent, store)
+}
+
+/// A model that calls the `runner` tool once and then answers.
+///
+/// The step counter matters: the second request is answered rather than calling again, so a
+/// turn ends. `Cell` because the port is shared by reference and never needs to be `Send`.
+struct CallingLlm {
+    step: std::cell::Cell<u32>,
+}
+
+impl LlmPort for CallingLlm {
+    fn model(&self) -> &'static str {
+        "calling"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        let step = self.step.get();
+        self.step.set(step.saturating_add(1));
+        if step > 0 {
+            return Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta("finished".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ]));
+        }
+        Box::pin(futures::stream::iter(vec![
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("call_1")),
+                name: Some(ToolName::new("runner").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{}".to_owned(),
+            },
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]))
+    }
+}
+
+/// A tool that succeeds without touching anything, declared as running a program.
+///
+/// `Execute` is the access no confined sandbox permits, which is what makes every call to it
+/// need an exception and therefore a decision.
+struct StubTool;
+
+impl ToolExecutor for StubTool {
+    fn execute(&self, call: ToolCall) -> ToolFuture {
+        Box::pin(async move { ToolResult::success(call.id, serde_json::json!({ "ran": true })) })
+    }
+}
+
+/// Builds an agent with one gated tool and the given approval policy.
+///
+/// The sandbox is `workspace_write`, which does not permit a program, so the call needs an
+/// exception: with `ask` the turn puts the question to a watching client, and with `never`
+/// it refuses the call outright.
+fn gated_agent(dir: &Path, approval: ApprovalPolicy) -> (Agent, StoreHandle) {
+    let store = nanus_kernel::runtime::block_on(async {
+        JsonlStore::new(dir.to_path_buf())
+            .await
+            .expect("the store opens")
+            .handle()
+    });
+    let mut registry = ToolRegistry::new();
+    let schema = ToolSchema {
+        name: ToolName::new("runner").unwrap_or_else(|_| unreachable!("a valid tool name")),
+        description: "A tool that runs something".to_owned(),
+        parameters: serde_json::json!({ "type": "object" }),
+    };
+    let registered =
+        registry.register(ToolDefinition::new(schema, StubTool).with_access(ToolAccess::Execute));
+    assert!(registered.is_ok(), "the gated tool registers");
+    let config = AgentConfig::new(4, 1, "calling", 4096)
+        .expect("a valid agent config")
+        .with_sandbox(SandboxMode::WorkspaceWrite)
+        .with_approval(approval);
+    let runner = AgentRunner::new(
+        Rc::new(Box::new(CallingLlm {
+            step: std::cell::Cell::new(0),
+        })),
+        Rc::new(registry),
+        "you are a test",
+        config,
+    )
+    .expect("a valid runner");
+    let agent = Agent::from_parts(Parts {
+        runner: Rc::new(runner),
+        store: store.clone(),
+        clock: SystemClock::new().handle(),
+        workspace: dir.to_path_buf(),
+        model: "calling".to_owned(),
+        tools: 1,
     });
     (agent, store)
 }
@@ -1426,4 +1523,191 @@ fn a_usage_frame_separates_the_wait_from_the_generation() {
         ttft_ms.saturating_sub(head_ms) > 0,
         "the server worked after it answered: {ttft_ms} - {head_ms}"
     );
+}
+
+/// Reads frames until the agent asks to approve a call, and returns the question.
+///
+/// The question is what a watching client is waiting for, so the loop stops there rather
+/// than at the end of the turn: an answer has to be sent while the turn is *blocked* on it.
+async fn until_approval(client: &mut Client, frames: &mut Vec<Frame>) -> Option<(String, String)> {
+    loop {
+        let frame = client.next().await.expect("frames are readable")?;
+        let question = match &frame {
+            Frame::Approval { call_id, tool, .. } => Some((call_id.clone(), tool.clone())),
+            _ => None,
+        };
+        let ended = frame.is_end_of_turn();
+        frames.push(frame);
+        if question.is_some() {
+            return question;
+        }
+        if ended {
+            return None;
+        }
+    }
+}
+
+/// The gate means something over the link: a call outside the sandbox is put to the client
+/// watching, and its answer runs the call.
+#[test]
+fn an_approval_question_reaches_the_client_and_its_answer_runs_the_call() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::Ask);
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mut frames = Vec::new();
+        let question = until_approval(&mut client, &mut frames).await;
+        let Some((call_id, tool)) = question else {
+            panic!("the agent asked about the call: {frames:?}");
+        };
+        assert_eq!(tool, "runner", "the question names the tool");
+        client
+            .send(&Request::Approve {
+                call_id,
+                allow: true,
+            })
+            .await
+            .expect("the answer is sent");
+        frames.extend(turn_frames(&mut client).await);
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ToolDone { error: false, .. })),
+        "the approved call ran and succeeded: {frames:?}"
+    );
+    assert_eq!(answer_of(&frames), Some("finished"));
+    assert_eq!(reason_of(&frames), Some(&TurnEnd::Completed));
+}
+
+/// The other direction: a refusal stops the call, is recorded as a failed result rather than
+/// a harness error, and the turn still finishes — the model is told and can respond.
+#[test]
+fn a_refused_approval_denies_the_call_and_the_turn_finishes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::Ask);
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mut frames = Vec::new();
+        let question = until_approval(&mut client, &mut frames).await;
+        let Some((call_id, _)) = question else {
+            panic!("the agent asked about the call: {frames:?}");
+        };
+        client
+            .send(&Request::Approve {
+                call_id,
+                allow: false,
+            })
+            .await
+            .expect("the refusal is sent");
+        frames.extend(turn_frames(&mut client).await);
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ToolDone { error: true, .. })),
+        "the refused call is reported as a failed result: {frames:?}"
+    );
+    assert_eq!(
+        answer_of(&frames),
+        Some("finished"),
+        "the model was told and answered"
+    );
+    assert_eq!(reason_of(&frames), Some(&TurnEnd::Completed));
+}
+
+/// `never` refuses the call without asking anyone, so no question crosses the link at all.
+#[test]
+fn a_never_policy_denies_the_call_without_asking_the_client() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::Never);
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Approval { .. })),
+        "`never` consults nobody: {frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ToolDone { error: true, .. })),
+        "the call was refused rather than run: {frames:?}"
+    );
+    assert_eq!(reason_of(&frames), Some(&TurnEnd::Completed));
 }

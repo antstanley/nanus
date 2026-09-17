@@ -43,13 +43,15 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use nanus_bundle::compose::new_session;
-use nanus_bundle::{AgentRunner, Harness, Progress};
-use nanus_domain::{Session, SessionId, ToolName, TurnEndReason, Usage};
+use nanus_bundle::{AgentRunner, Approver, Harness, Progress};
+use nanus_domain::{
+    ApprovalOutcome, ApprovalRequest, Session, SessionId, ToolName, TurnEndReason, Usage,
+};
 use nanus_ports::{ClockHandle, StoreHandle};
 use tokio::io::BufReader;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::error::{LinkError, LinkResult};
@@ -226,6 +228,16 @@ struct Held {
     /// it has not. Cleared when a turn starts, so a request that arrived a moment after the
     /// last turn ended cannot stop the next one before it begins.
     stop: Cell<bool>,
+    /// Approval questions this session is waiting on, keyed by the id sent to clients.
+    ///
+    /// The sender is how a client's answer reaches the turn: `Request::Approve` looks the
+    /// id up here and delivers the decision. Dropping the map — which happens when the
+    /// session is let go, and when a turn ends with a question still open — is what makes
+    /// a question nobody answers a *denial* rather than a hang: the approver's receiver
+    /// ends and it reports `Unavailable`.
+    approvals: RefCell<BTreeMap<String, oneshot::Sender<ApprovalOutcome>>>,
+    /// The next approval question's id, so ids stay unique even across turns.
+    approval_seq: Cell<u64>,
     /// When it was last used, for letting an idle session go.
     touched: Cell<u64>,
 }
@@ -250,8 +262,15 @@ impl Held {
     }
 
     /// Detaches a client.
+    ///
+    /// When the last one goes, any open approval question goes with it: nobody is left to
+    /// answer it, and the waiting turn is denied rather than left waiting for a client that
+    /// has closed the window.
     fn unview(&self, viewer: u64) {
         self.viewers.borrow_mut().retain(|(id, _)| *id != viewer);
+        if self.viewers.borrow().is_empty() {
+            self.abandon_approvals();
+        }
     }
 
     /// Refreshes the cached headline from the session.
@@ -260,6 +279,41 @@ impl Held {
             title: session.title(),
             events: u64::try_from(session.event_count()).unwrap_or(u64::MAX),
         };
+    }
+
+    /// Opens an approval question and returns the id a client answers with.
+    fn ask(&self, sender: oneshot::Sender<ApprovalOutcome>) -> String {
+        let next = self.approval_seq.get().saturating_add(1);
+        self.approval_seq.set(next);
+        let call_id = format!("a{next}");
+        self.approvals.borrow_mut().insert(call_id.clone(), sender);
+        call_id
+    }
+
+    /// Delivers a client's answer, if the question is still open.
+    ///
+    /// Returns whether it was delivered: the first answer wins, and an answer to a question
+    /// another client already settled — or one the turn abandoned — is dropped rather than
+    /// reported, because by then there is nothing left to decide.
+    fn answer(&self, call_id: &str, allow: bool) -> bool {
+        let Some(sender) = self.approvals.borrow_mut().remove(call_id) else {
+            return false;
+        };
+        let outcome = if allow {
+            ApprovalOutcome::AllowedOnce
+        } else {
+            ApprovalOutcome::Rejected
+        };
+        sender.send(outcome).is_ok()
+    }
+
+    /// Abandons every question still open.
+    ///
+    /// Called when a turn ends, so a late answer cannot be mistaken for a decision about the
+    /// next turn's call: the sender is dropped, the waiting approver sees `Unavailable` and
+    /// the call it was about is denied.
+    fn abandon_approvals(&self) {
+        self.approvals.borrow_mut().clear();
     }
 }
 
@@ -320,6 +374,8 @@ impl Registry {
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),
             stop: Cell::new(false),
+            approvals: RefCell::new(BTreeMap::new()),
+            approval_seq: Cell::new(0),
             touched: Cell::new(self.stamp()),
         });
         entry.refresh(&entry.session.borrow());
@@ -481,6 +537,55 @@ impl From<&TurnEndReason> for TurnEnd {
     }
 }
 
+/// Asks the clients attached to a session to approve one call.
+///
+/// The link's answerer, and the reason the approval gate means something when a person is
+/// watching: the question goes to every client attached to the session as a
+/// [`Frame::Approval`], and the turn waits for the first [`Request::Approve`] that names it.
+///
+/// Nobody attached is [`ApprovalOutcome::Unavailable`], which the loop treats as a denial —
+/// a service with no client, or a turn nobody is watching, fails closed rather than
+/// proceeding on an answer that never came.
+struct LinkApprover<'a> {
+    /// The session whose viewers are asked.
+    held: &'a Held,
+}
+
+impl Approver for LinkApprover<'_> {
+    fn decide(&self, request: ApprovalRequest) -> nanus_ports::LocalBoxFuture<'_, ApprovalOutcome> {
+        Box::pin(async move {
+            // Asked before the question is queued, so a turn with nobody watching does not
+            // put a frame nowhere and wait for an answer that cannot arrive.
+            if self.held.viewers.borrow().is_empty() {
+                return ApprovalOutcome::Unavailable;
+            }
+            let (sender, receiver) = oneshot::channel();
+            let call_id = self.held.ask(sender);
+            broadcast_awaited(
+                self.held,
+                Frame::Approval {
+                    call_id: call_id.clone(),
+                    tool: request.tool.as_str().to_owned(),
+                    reason: request.reason.clone(),
+                },
+                None,
+            )
+            .await;
+            // A question that reached nobody is one that cannot be answered, and without
+            // this check the turn would wait for a client the broadcast just detached.
+            if self.held.viewers.borrow().is_empty() {
+                self.held.approvals.borrow_mut().remove(&call_id);
+                return ApprovalOutcome::Unavailable;
+            }
+            // A closed receiver means the sender was dropped: the session was let go, or
+            // the turn abandoned its questions. Either way nobody decided.
+            let outcome = receiver.await.unwrap_or(ApprovalOutcome::Unavailable);
+            self.held.approvals.borrow_mut().remove(&call_id);
+            outcome
+        })
+    }
+}
+
 /// Runs one turn in a held session and tells everyone watching.
 ///
 /// The session is borrowed for the whole turn, which is why exactly one turn may run at a
@@ -501,11 +606,18 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
             first_token: None,
             last_token: None,
         };
+        // The approver borrows the session too — for its viewers rather than its log — so it
+        // is built here and lives exactly as long as the turn that may ask through it.
+        let approver = LinkApprover { held };
         agent
             .runner()
-            .run_turn(&mut session, &text, &mut progress, None)
+            .run_turn(&mut session, &text, &mut progress, Some(&approver))
             .await
     };
+    // A question still open when the turn ended belongs to a turn that is over. Abandoning
+    // it drops the sender, so a late answer cannot be read as a decision about the next
+    // turn's call, and a waiting approver — none can be waiting here — would be denied.
+    held.abandon_approvals();
 
     let ending = match outcome {
         // The reason travels with the ending. A turn that closed at its step budget is
@@ -999,6 +1111,19 @@ async fn serve_connection(
                 let held = registry.listing();
                 send(&frames, Frame::Sessions { held }).await;
             }
+            Request::Approve { call_id, allow } => {
+                // Delivered only against the session this connection is watching: an answer
+                // is about a question that session asked, and a connection that is not
+                // attached has not been asked anything. An id nobody is waiting on is
+                // dropped rather than refused — the first answer has already settled it, or
+                // the turn ended — and saying so would only be noise on a client's screen.
+                let delivered = watching
+                    .as_ref()
+                    .is_some_and(|(_, held)| held.answer(&call_id, allow));
+                if !delivered {
+                    tracing::debug!(call = %call_id, "an approval answer matched no open question");
+                }
+            }
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
                 shutdown.notify_one();
@@ -1194,6 +1319,8 @@ mod tests {
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),
             stop: Cell::new(false),
+            approvals: RefCell::new(BTreeMap::new()),
+            approval_seq: Cell::new(0),
             touched: Cell::new(0),
         })
     }
@@ -1350,13 +1477,96 @@ mod tests {
         );
     }
 
+    /// A question reaches every client attached to the session, and the first answer settles
+    /// it: the second client is not asked again, and a later answer changes nothing.
+    #[tokio::test]
+    async fn a_question_reaches_the_viewers_and_the_first_answer_settles_it() {
+        let session = held("approval");
+        let (first, mut first_queue) = mpsc::channel(FRAME_BUFFER);
+        let (second, mut second_queue) = mpsc::channel(FRAME_BUFFER);
+        session.viewers.borrow_mut().push((1, first));
+        session.viewers.borrow_mut().push((2, second));
+
+        let approver = LinkApprover { held: &session };
+        let name = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let request = ApprovalRequest::new(name).with_reason("a reason");
+        let answering = async {
+            let question = first_queue.try_recv();
+            assert!(
+                matches!(
+                    question,
+                    Ok(Frame::Approval { ref tool, ref reason, .. })
+                        if tool == "bash" && reason.as_deref() == Some("a reason")
+                ),
+                "the first viewer is asked which tool: {question:?}"
+            );
+            let Ok(Frame::Approval { call_id, .. }) = question else {
+                return;
+            };
+            assert!(
+                matches!(second_queue.try_recv(), Ok(Frame::Approval { .. })),
+                "and so is the second: every client sees the question"
+            );
+            assert!(
+                session.answer(&call_id, true),
+                "the first answer settles the question"
+            );
+            // The first answer wins: a second one finds nothing to settle.
+            assert!(
+                !session.answer(&call_id, false),
+                "the question is already settled"
+            );
+        };
+        let (outcome, ()) = tokio::join!(approver.decide(request), answering);
+        assert_eq!(outcome, ApprovalOutcome::AllowedOnce);
+        assert!(
+            session.approvals.borrow().is_empty(),
+            "no answered question is left waiting"
+        );
+    }
+
+    /// Nobody attached means nobody to answer, and the turn is told so rather than left
+    /// waiting for an answer that cannot come. This is the fail-closed direction over the
+    /// link.
+    #[tokio::test]
+    async fn a_question_with_nobody_attached_is_unavailable() {
+        let session = held("unattended");
+        let approver = LinkApprover { held: &session };
+        let name = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let outcome = approver.decide(ApprovalRequest::new(name)).await;
+        assert_eq!(outcome, ApprovalOutcome::Unavailable);
+        assert!(
+            session.approvals.borrow().is_empty(),
+            "no question is left open for a client that is not there"
+        );
+    }
+
+    /// An abandoned question cannot be answered afterwards, which is what keeps a late
+    /// answer from deciding the next turn's call.
+    #[tokio::test]
+    async fn an_abandoned_question_cannot_be_answered() {
+        let session = held("abandoned");
+        let (sender, receiver) = oneshot::channel();
+        let call_id = session.ask(sender);
+        assert_eq!(session.approvals.borrow().len(), 1, "the question is open");
+        session.abandon_approvals();
+        assert!(
+            !session.answer(&call_id, true),
+            "the abandoned question is gone"
+        );
+        assert!(
+            receiver.await.is_err(),
+            "the waiting approver sees the question go away"
+        );
+    }
+
     #[test]
     fn a_finished_turn_is_reaped_before_the_next_one_is_spawned() {
         let dir = tempfile::tempdir().expect("temp dir");
         nanus_kernel::runtime::block_on_local(async move {
             let registry = registry_over(dir.path()).await;
 
-            let (finished, waiter) = tokio::sync::oneshot::channel();
+            let (finished, waiter) = oneshot::channel();
             registry.spawn_turn(async move {
                 let _ = finished.send(());
             });
@@ -1365,7 +1575,7 @@ mod tests {
             // The spawn happens after the reap, so the task set holds one turn however
             // many have finished. Without the reap this is two, and a service that has
             // been up for a week has one uncollected slot per turn it ever ran.
-            let (again, second) = tokio::sync::oneshot::channel();
+            let (again, second) = oneshot::channel();
             registry.spawn_turn(async move {
                 let _ = again.send(());
             });

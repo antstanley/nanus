@@ -57,4 +57,4 @@ pub use notice::{Ending, stopping};
 pub use replay::{recording_of, transcript_of};
 pub use stats::{Generation, Throughput};
 pub use transcript::{Entry, EntryKind, Role, Transcript};
-pub use view::{Theme, ViewState};
+pub use view::{PendingApproval, Theme, ViewState};

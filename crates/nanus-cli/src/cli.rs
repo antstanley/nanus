@@ -671,12 +671,16 @@ fn run_turn(
     // checkpoint, the session is recorded, and the exit code says the turn did not complete.
     let interrupted = Rc::new(Cell::new(false));
     let mut reporter = StderrProgress::new(verbose, verbose).stopping_when(Rc::clone(&interrupted));
+    // A headless run is the one mode with no interface to press a key in, so the approval
+    // gate asks *here*. With no terminal on stdin there is nobody to ask, and the loop
+    // denies what the sandbox does not already permit rather than proceeding unasked.
+    let approver = crate::approve::TerminalApprover::standard();
 
     let outcome = crate::block_on_local(async {
         let watch = watch_for_interrupt(Rc::clone(&interrupted));
         let turn = harness
             .runner
-            .run_turn(&mut session, prompt, &mut reporter, None);
+            .run_turn(&mut session, prompt, &mut reporter, Some(&approver));
         // Both at once: the turn does the work, and the watcher is what makes it stop when the
         // process is asked to.
         tokio::join!(turn, watch).0

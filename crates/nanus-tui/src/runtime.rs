@@ -78,7 +78,7 @@ use crate::compact::Detail;
 use crate::notice::{self, Ending};
 use crate::stats::Generation;
 use crate::transcript::{Entry, Role};
-use crate::view::{Theme, ViewState};
+use crate::view::{PendingApproval, Theme, ViewState};
 
 /// Rows scrolled per `PageUp` or `PageDown`.
 const PAGE_ROWS: i32 = 10;
@@ -317,6 +317,12 @@ pub trait SessionSource {
     /// nothing to stop, and the interface never asks one to.
     fn interrupt(&mut self) {}
 
+    /// Answers the agent's approval question about one call.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::interrupt`]: a
+    /// recording is never asked anything.
+    fn answer(&mut self, _call_id: &str, _allow: bool) {}
+
     /// Releases whatever the source owns.
     ///
     /// # Errors
@@ -525,6 +531,13 @@ impl SessionSource for Remote {
 
     fn interrupt(&mut self) {
         self.send(Request::Interrupt);
+    }
+
+    fn answer(&mut self, call_id: &str, allow: bool) {
+        self.send(Request::Approve {
+            call_id: call_id.to_owned(),
+            allow,
+        });
     }
 }
 
@@ -738,6 +751,18 @@ async fn event_loop(
                         view.status = String::from("stopping");
                         source.interrupt();
                     }
+                    Outcome::Answer { call_id, allow } => {
+                        // Cleared before the answer is sent, so a reader cannot press `y`
+                        // twice and have the second press land on whatever question comes
+                        // next — answers are keyed by id, but the dialog is not.
+                        view.pending_approval = None;
+                        view.status = if allow {
+                            String::from("allowed once; the turn is running")
+                        } else {
+                            String::from("denied; the model is told")
+                        };
+                        source.answer(&call_id, allow);
+                    }
                     Outcome::Submit(prompt) => {
                         match route_submission(prompt, source.accepts_prompts()) {
                             Routed::Leave => break,
@@ -835,10 +860,23 @@ enum Outcome {
     Submit(String),
     /// Ask the agent to stop the turn that is running.
     Interrupt,
+    /// Answer the agent's approval question about this call.
+    Answer {
+        /// The call the question was about.
+        call_id: String,
+        /// Whether it may run once.
+        allow: bool,
+    },
 }
 
 /// Applies one keystroke to the view.
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    // An approval question owns the keyboard while it is up. Its two answers are the only
+    // things a reader can mean, and letting a `y` reach the composer would answer a
+    // question *and* type a letter into a prompt nobody asked for.
+    if view.pending_approval.is_some() {
+        return handle_approval_key(key, view);
+    }
     // A running search rewrites what every key means: the composer is showing a match
     // rather than the reader's own text, so typing extends the *query* and the keys that
     // would normally edit the prompt end the search instead. Routing it before anything
@@ -850,6 +888,29 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         return handle_control_key(key, view);
     }
     handle_plain_key(key, view)
+}
+
+/// Applies one keystroke to an open approval question.
+///
+/// `y` allows the call once, and `n` or `Esc` denies it. Nothing else does anything: a
+/// stray keypress must not approve a command, and it must not close the question either,
+/// so the one key a reader has to get right is `y`.
+fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
+    let Some(approval) = view.pending_approval.as_ref() else {
+        return Outcome::Continue;
+    };
+    let call_id = approval.call_id.clone();
+    match key.code {
+        KeyCode::Char('y' | 'Y') => Outcome::Answer {
+            call_id,
+            allow: true,
+        },
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => Outcome::Answer {
+            call_id,
+            allow: false,
+        },
+        _ => Outcome::Continue,
+    }
 }
 
 /// Routes a key with Control held.
@@ -1143,6 +1204,21 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.follow();
         }
         Frame::Step { step } => view.begin_turn(step),
+        Frame::Approval {
+            call_id,
+            tool,
+            reason,
+        } => {
+            // The question is drawn as a dialog rather than appended to the transcript: it
+            // is a thing the reader must answer, not a thing the model said. The status line
+            // says what is being waited for, so a reader who scrolled away still knows.
+            view.status = format!("waiting for your decision on the {tool} call");
+            view.pending_approval = Some(PendingApproval {
+                call_id,
+                tool,
+                reason,
+            });
+        }
         Frame::Tool { name, arguments } => {
             // Followed like every other append: a tool line that arrives below the fold is a
             // line the reader is not shown, and the transcript's own rule is that everything
@@ -1201,6 +1277,10 @@ fn apply(frame: Frame, view: &mut ViewState) {
         // the model happened to say was put on screen as its conclusion, and the reader
         // was left to work out from the silence that the work had been cut off.
         Frame::Done { answer, reason } => {
+            // A turn that ends takes any open question with it: the call it was about was
+            // answered on the agent's side — denied, or the turn never got that far — and a
+            // dialog left on screen would ask the reader to decide something that is over.
+            view.pending_approval = None;
             if let Some(notice) = stopping_notice(&reason, view.step) {
                 view.transcript.settle_tail();
                 view.transcript.push(Entry::notice(notice));
@@ -1216,7 +1296,8 @@ fn apply(frame: Frame, view: &mut ViewState) {
         Frame::Failed { message } => {
             // The last frame a transport sends, so an unfollowed notice is one the reader may
             // never see: the status line goes back to ready either way, and a failure nobody
-            // was shown is a failure reported nowhere.
+            // was shown is a failure reported nowhere. An open question goes with it.
+            view.pending_approval = None;
             view.transcript.push(Entry::notice(message));
             view.follow();
             view.end_turn();
@@ -2451,6 +2532,116 @@ mod tests {
             [Request::Prompt {
                 text: "do the thing".to_owned()
             }]
+        );
+    }
+
+    /// An approval frame opens a dialog, and only the two answer keys close it.
+    ///
+    /// The gate means nothing in the interface unless the question is visible and the answer
+    /// is reachable, so this pins both halves: the frame becomes a pending question, and the
+    /// keys that answer it do not also edit the composer.
+    #[test]
+    fn an_approval_frame_opens_a_dialog_and_the_keys_answer_it() {
+        let mut view = ViewState::new();
+        apply(
+            Frame::Approval {
+                call_id: "a1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: Some("the sandbox mode `read_only` does not permit it".to_owned()),
+            },
+            &mut view,
+        );
+        let pending = view.pending_approval.clone();
+        assert_eq!(
+            pending,
+            Some(PendingApproval {
+                call_id: "a1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: Some("the sandbox mode `read_only` does not permit it".to_owned()),
+            })
+        );
+        assert!(
+            view.status.contains("bash"),
+            "the status line says what is being waited for: {}",
+            view.status
+        );
+
+        // A key that is neither answer does nothing: it must not approve, and it must not
+        // reach the composer either.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(view.input.is_empty(), "the composer is not taking text");
+        assert!(
+            view.pending_approval.is_some(),
+            "and the question is still open"
+        );
+
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+            Outcome::Answer { call_id, allow: true } if call_id == "a1"
+        ));
+
+        // The denial keys, in the other direction.
+        view.pending_approval = Some(PendingApproval {
+            call_id: "a2".to_owned(),
+            tool: "write".to_owned(),
+            reason: None,
+        });
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Answer { call_id, allow: false } if call_id == "a2"
+        ));
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE), &mut view),
+            Outcome::Answer { call_id, allow: false } if call_id == "a2"
+        ));
+    }
+
+    /// A turn that ends takes any open question with it, so the reader is not asked to decide
+    /// something that is already over.
+    #[test]
+    fn an_ending_frame_closes_an_open_question() {
+        let mut view = ViewState::new();
+        apply(
+            Frame::Approval {
+                call_id: "a1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: None,
+            },
+            &mut view,
+        );
+        assert!(view.pending_approval.is_some(), "the question is open");
+        apply(
+            Frame::Done {
+                answer: "I could not run it".to_owned(),
+                reason: TurnEnd::Completed,
+            },
+            &mut view,
+        );
+        assert!(
+            view.pending_approval.is_none(),
+            "the ending closes the question"
+        );
+
+        apply(
+            Frame::Approval {
+                call_id: "a2".to_owned(),
+                tool: "bash".to_owned(),
+                reason: None,
+            },
+            &mut view,
+        );
+        apply(
+            Frame::Failed {
+                message: "the link went away".to_owned(),
+            },
+            &mut view,
+        );
+        assert!(
+            view.pending_approval.is_none(),
+            "and a failure does too: there is nothing left to answer"
         );
     }
 

@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
@@ -129,6 +129,22 @@ const COMPOSER_PADDING_COLS: u16 = 1;
 /// The blank rows the composer keeps above and below its box.
 const COMPOSER_PADDING_ROWS: u16 = 1;
 
+/// An approval question the agent is waiting on.
+///
+/// It carries the tool and the harness's reason, and deliberately not the call's arguments:
+/// the link's approval frame carries no arguments either, so model-controlled text cannot
+/// be put in front of the person deciding. A reader who wants to see what the call actually
+/// is has the tool line already in the transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApproval {
+    /// The id an answer must name, exactly as the agent sent it.
+    pub call_id: String,
+    /// The tool the model wants to run.
+    pub tool: String,
+    /// Why the harness is asking, in the harness's own words.
+    pub reason: Option<String>,
+}
+
 /// What the interface is currently showing.
 ///
 /// ## The scroll convention
@@ -208,6 +224,12 @@ pub struct ViewState {
     /// the top.
     pub pending_scroll_back: Option<u32>,
 
+    /// The approval question the agent is waiting on, if one is open.
+    ///
+    /// While it is set, the dialog owns the keyboard: the composer is not taking text, and
+    /// the only keys that do anything are the two answers.
+    pub pending_approval: Option<PendingApproval>,
+
     /// The transcript area the view last drew into, if it has drawn.
     ///
     /// Recorded because "the bottom" is not a constant: it depends on how many rows
@@ -244,6 +266,7 @@ impl Default for ViewState {
             markdown: true,
             mermaid: true,
             pending_scroll_back: None,
+            pending_approval: None,
             last_viewport: None,
             last_composer: None,
         }
@@ -650,6 +673,73 @@ impl ViewState {
         if let Some(status) = chunks.get(4) {
             self.render_status(frame, *status);
         }
+        // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
+        // be the thing a reader sees, not a dialogue behind the transcript.
+        if self.pending_approval.is_some() {
+            self.render_approval(frame, area);
+        }
+    }
+
+    /// Draws the approval dialog over the interface.
+    ///
+    /// Centred and bounded, so it reads as a question rather than as part of the transcript,
+    /// and its keys are the only ones that do anything while it is up.
+    fn render_approval(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(approval) = self.pending_approval.as_ref() else {
+            return;
+        };
+        // Clamped between a comfortable reading width and a usable one, and never wider
+        // than the terminal that has to draw it.
+        let width = area.width.saturating_sub(4).clamp(20, 64);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Run the ", Style::default()),
+            Span::styled(
+                approval.tool.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" tool?", Style::default()),
+        ])];
+        if let Some(reason) = approval.reason.as_deref().filter(|text| !text.is_empty()) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                reason.to_owned(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "y allow once  ·  n or Esc deny",
+            Style::default().fg(Color::DarkGray),
+        )));
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(4).max(4));
+        // Shifted rather than divided: the centring offset is an unsigned count of cells, and
+        // the workspace treats integer division as a defect wherever it appears.
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.busy)
+            .title(Line::from(Span::styled(
+                " approval needed ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .style(self.theme.notice);
+        // Cleared first, so the transcript behind the dialog does not show through the gaps
+        // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(paragraph, dialog);
     }
 
     /// Renders the title bar.
@@ -1578,6 +1668,38 @@ mod tests {
         assert!(text.contains("nanus"));
         assert!(text.contains("ready"));
         assert!(text.contains('›'), "and the composer: {text}");
+    }
+
+    /// The question has to be on the screen, with its two answers, or the gate is invisible
+    /// and the turn waits for a decision nobody knows they can make.
+    #[test]
+    fn an_open_approval_is_drawn_as_a_dialog_with_both_answers() {
+        let mut state = ViewState::new();
+        // Something in the transcript, so the dialog has content to cover and a reader can
+        // tell it is drawn *over* the interface rather than appended to it.
+        state.transcript.push(Entry::prose(Role::User, "do it"));
+        state.pending_approval = Some(PendingApproval {
+            call_id: "a1".to_owned(),
+            tool: "bash".to_owned(),
+            reason: Some("the sandbox mode `read_only` does not permit execute".to_owned()),
+        });
+        let text = rendered(&mut state, 60, 16);
+        assert!(text.contains("approval needed"), "{text}");
+        assert!(text.contains("bash"), "the tool is named: {text}");
+        assert!(
+            text.contains("read_only"),
+            "and the harness's reason is shown: {text}"
+        );
+        assert!(text.contains("y allow once"), "{text}");
+        assert!(text.contains("deny"), "{text}");
+    }
+
+    /// And the other direction: with no question open, nothing that looks like one is drawn.
+    #[test]
+    fn no_dialog_is_drawn_without_a_question() {
+        let mut state = ViewState::new();
+        let text = rendered(&mut state, 60, 16);
+        assert!(!text.contains("approval needed"), "{text}");
     }
 
     #[test]

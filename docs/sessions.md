@@ -130,6 +130,7 @@ A session is the agent's; a client's view of it is a handful of frames.
 | `Sessions` | The sessions the agent is holding. |
 | `User` | Somebody asked something, sent to every view but the one that asked. |
 | `Text`, `Reasoning`, `Step`, `Tool`, `ToolDone`, `Usage` | The turn, as it happens. |
+| `Approval` | A call outside the sandbox needs a decision; the client answers with an `approve` request. |
 | `Done`, `Failed` | How it ended. |
 
 Deliberately not a session log. A client that wants the conversation reads it from the

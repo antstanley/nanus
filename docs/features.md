@@ -221,8 +221,8 @@ The only thing the core and the interface share. See
   directory, with one line of JSON per frame in both directions.
 - **A small frame vocabulary**: handshake, attachment, held-session listing, a
   question or prompt, the progress of a turn (text, reasoning, step boundaries,
-  tool call and result, usage), the ending and its reason, and interrupt,
-  status, and shutdown requests.
+  tool call and result, usage), an approval question and its answer, the ending and
+  its reason, and interrupt, status, and shutdown requests.
 - **Local only by construction.** No port, no TLS, no remote mode; the
   reachable set is processes already running as the same user.
 - **The session log is the authority.** The link carries what happened; history
@@ -257,6 +257,10 @@ The Cordis-style kernel is the framework underneath. See
   anyone. `ApprovalOutcome` allows only `AllowedOnce`, there is deliberately no
   mode that means yes to everything, and a denial is a tool result the model can
   read rather than a dropped call. See [SAFETY.md](../SAFETY.md).
+- **Someone to ask, wherever a person is watching.** `nanus run` prompts on the
+  terminal when stdin is one, and the interface draws a dialog over the
+  conversation and answers the agent over the link. Both deny when nobody is
+  there to answer, and an unattended service with no client attached is nobody.
 - **The model is told what it is running under.** The system prompt carries a
   runtime section: the workspace root, the model, the approval policy, and the
   sandbox mode.
@@ -274,11 +278,6 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **Approval has no answerer in the CLI or the interface yet.** The gate is
-  enforced — a call outside the sandbox is denied unless an answerer grants it —
-  but nothing constructs the prompt a person would see, so only calls the sandbox
-  permits run. See
-  [the roadmap](roadmap.md#now-close-the-gap-between-what-is-written-and-what-runs).
 - **DeepSeek is the only provider.** The `LlmPort` seam is real, but no second
   adapter exists.
 - **The link is Unix-only and local.** No remote mode, no Windows, no

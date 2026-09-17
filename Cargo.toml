@@ -47,6 +47,10 @@ tokio = { version = "1.53", features = [
     "macros",
     "process",
     "io-util",
+    # `nanus run` asks the terminal whether a tool call may run, and reading that answer
+    # must not block the runtime thread: the signal watcher that makes Ctrl-C stop a turn
+    # lives on it. `io-std` is what makes `tokio::io::stdin` available.
+    "io-std",
     "fs",
     "time",
     "sync",

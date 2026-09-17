@@ -42,6 +42,7 @@
 // The binary's modules are internal to it, so `unreachable_pub` has nothing to say.
 #![allow(unreachable_pub)]
 
+mod approve;
 mod cli;
 mod progress;
 mod service;
