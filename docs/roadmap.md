@@ -41,6 +41,29 @@ entry says where the work lives rather than what it was going to be.
 | 5 | **The link handshake is versioned.** A mismatch is a sentence naming both versions rather than a decode error mid-turn, and an unversioned handshake is refused rather than assumed compatible. | `nanus-link/src/{protocol,client,error}.rs` |
 | 6 | **`nanus sessions delete <ref>` removes a session**, resolving the reference as naming does and refusing one that answers to nothing. The interface has no key for it yet. | `nanus-cli/src/cli.rs` |
 
+## Shipped: what a second review found
+
+The items above were the gap between what is *written* and what *runs*. A second review read
+every crate in dependency order and looked for the opposite — behaviour that is enforced and
+wrong where two parts meet, which is where a test built from one component at a time cannot
+look. What it found has landed, and it is the same kind of work: correctness rather than new
+surface. None of it takes an item number, because the numbers are the plan's and later items
+refer to them ("depends on 2"); an unnumbered list here records what shipped without moving
+a reference.
+
+| What landed | Where it lives |
+|---|---|
+| **A withdrawal waits for the deactivations it causes, at any depth.** Unloading a provider retires its bindings, sweeps the whole cascade while they still resolve, and only then takes them away — so a dependent can hand back what it borrowed even when the thing being unloaded is two hops away. The kernel could do this one level deep, and a chain of three lost the middle binding. | `nanus-kernel/src/context.rs`, `tests/composition.rs` |
+| **A tool result is paired with the call it answers, by identity.** A step writes every call it made and then every result, so position could not pair them: a two-call step drew its first call as still running, under the second tool's name, and its last result twice. The replay pairs by the log's `call_id`, and the link now carries that id on both tool frames so the live view pairs by identity too — falling back to name and order only for a frame from an agent that predates the field, which is why `PROTOCOL_VERSION` did not move. | `nanus-tui/src/{replay,view,transcript}.rs`, `nanus-link/src/protocol.rs`, `nanus-bundle/src/agent_loop.rs` |
+| **`bash` runs in the workspace root by default**, which is what its schema and the system prompt both promised and what the process's own directory was not: the two agreed only while `workspace_root` was unset, and a service inherited its directory from the shell that started it. | `nanus-bundle/src/tools/bash.rs` |
+| **The agent advertises the toolset it dispatches from.** The runner and the published `tools` service were two registries built from the same ports, so registering a tool changed the count in the handshake and nothing about the requests. There is one registry now, with a `ptr_eq` postcondition where the composition is mounted. | `nanus-bundle/src/compose.rs`, `agent_loop.rs` |
+| **A malformed optional argument is a correction rather than a default.** `Arguments` exists so a bad call becomes a message the model can act on, and every tool was reading optional fields with `unwrap_or(None)` — so `{"limit": "ten"}` quietly meant the default. The same shape of defect as item 1: a rule that was written down and then never applied on the path that mattered. | `nanus-bundle/src/tools/*.rs`, `args.rs` |
+| **`serial` and `bail` are two modes rather than one function**, which is what their documentation had claimed all along. | `nanus-kernel/src/event.rs` |
+| **Smaller, and the same kind of thing:** `Ctrl-C` at an approval prompt did nothing, because the turn is asleep on the answer and the stop flag never reached a checkpoint; `--scroll` without `--session` was accepted and then ignored; a capped search reported `truncated` whenever the cap was *reached* rather than when a match was dropped; `tools_plugin` swallowed a toolset that failed to build into an empty registry; and several doc comments described behaviour that had changed under them, including the one that called `danger_full_access` "no confinement" when the filesystem tools are rooted whatever the mode. | `nanus-cli/src/{approve,cli}.rs`, `nanus-adapter-local/src/fs.rs`, `nanus-bundle/src/lib.rs`, `nanus-domain/src/approval.rs` |
+
+The findings in full, why the suite could not see them, and the tests that pin them are in
+[the bugs a certificate review found](testing.md#the-bugs-a-certificate-review-found).
+
 ## Next: what the interface needs to be a daily driver
 
 | # | Item | Size | Notes |
