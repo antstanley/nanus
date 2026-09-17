@@ -50,6 +50,9 @@ mod mentions;
 // The `!` escape. Private because it is the runtime's own shell rather than a display: nothing the
 // view draws is a function of it.
 mod shell;
+// Putting a selection on the clipboard, which is the other direction from `paste`. Private for the
+// same reason: it is a side effect the runtime owns, not something the view draws.
+mod copy;
 // The markdown renderer is an implementation detail of the view: it produces the same
 // `Line`s every other entry is drawn from, and nothing outside this crate needs to name
 // it. Keeping it private is what stops it becoming a second public rendering surface.

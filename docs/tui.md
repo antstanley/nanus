@@ -204,7 +204,9 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
-| `Ctrl+C` / `Esc` | stop the running turn; then cancel the prompt; then quit |
+| `Shift` + arrows, `Home` / `End` | select text in the transcript |
+| `Ctrl+C` | copy the selection; or stop the running turn, then cancel the prompt, then quit |
+| `Esc` | clear the selection; then stop the running turn, then cancel the prompt, then quit |
 | `Ctrl+D` | quit |
 | `Ctrl+R` | reverse-search submitted prompts |
 | `Ctrl+Q` | open the queue of prompts waiting for the turn to end (and close it) |
@@ -329,8 +331,9 @@ is what the status line says while the composer is holding a queued prompt.
 The mouse navigates as well as the keyboard. The wheel scrolls the conversation three rows
 a notch, in the same direction and with the same follow rule as `PageUp`/`PageDown`, and a
 left click in the composer puts the caret on the character it landed on, so a long prompt
-can be corrected without arrow keys. A click anywhere else is not a command: the transcript
-is read, not pointed at, and nothing in it is a target.
+can be corrected without arrow keys. Everywhere else in the transcript, a *drag* selects —
+see [selecting and copying](#selecting-and-copying) — and a click that does not drag takes
+the selection off.
 
 The wheel is taken wherever the pointer is rather than only over the conversation. A reader
 reaching for it without looking should not have to find a band first, and the conversation
@@ -368,6 +371,7 @@ than sending it to the model.
 | `/help` | draw the key list, the same one `?` opens |
 | `/clear` | empty the transcript, leaving the draft and the toggles alone |
 | `/model [id]` | switch to the next model the agent offers, or to the one named |
+| `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
 on a glanceable line and the session has more than four: the report adds the totals, the
@@ -492,6 +496,54 @@ own name, and the alternative — rebuilding the prompt on every switch — woul
 conversation the model is being sent no longer matches the one recorded against it. The live
 value is the one in the title bar; the recorded one is what the session says produced it, and the
 two are the same thing until somebody switches.
+
+### Selecting and copying
+
+Text can be taken out of the transcript and put on the clipboard, which is what a reader
+wants when they paste an answer into an editor, an issue, or a message.
+
+**With the mouse**, drag over the text. The press starts a selection, the drag draws it, and
+letting go leaves it standing; a click that never moved is not a selection, and it takes any
+selection off, so the pointer is never left holding a highlight nobody meant.
+
+**With the keyboard**, `Shift` with any movement key: `Shift+Up` and `Shift+Down` take a row
+at a time, `Shift+PageUp`/`Shift+PageDown` a screenful, and `Shift+Home`/`Shift+End` to the
+end of the row the selection is on. The first press selects the line the reader is looking
+at — the newest text, not the blank row after it — and each press after that takes one more
+row in the direction being pressed. The transcript has no cursor of its own, so a selection
+is what those keys move; without `Shift` they are the composer's keys, exactly as before.
+
+**`Ctrl+C` copies what is selected**, and with nothing selected it is the key it always was:
+it stops the running turn, then cancels the prompt, then leaves. A copy that worked takes the
+selection off, so the next press is the stop rather than a second copy; a copy that failed —
+no clipboard tool and a terminal that did not take the write — leaves the selection standing
+so the reader can try again. `Esc` takes the selection off before it stops anything, which is
+what makes it safe to press when a highlight is in the way. The status line says what
+happened: how many lines went, or which failure it was.
+
+**`/copy` is the same thing for the commonest case**: the newest answer, selected and copied
+without having to point at it. It takes the last thing the *model* wrote rather than whatever
+came last, because a tool line after an answer is not what a reader means by it.
+
+A selection is a range of *rendered* rows, which has two consequences worth knowing. A resize
+re-wraps every paragraph, so the same range would mean different text: the selection is
+dropped rather than left to highlight something nobody chose, and so is a selection when the
+transcript is cleared. And a line the *drawer* has to wrap — one wider than the terminal that
+the renderer did not wrap itself — is selected whole, because which character a wrapped row
+begins with is the drawing library's business and it does not report it. Every line a model's
+answer is made of is wrapped by the renderer, so this is rare, and it errs towards copying
+too much rather than too little.
+
+**The clipboard is the platform's own tool, or the terminal's.** `pbcopy` on macOS, `wl-copy`
+or `xclip` elsewhere; when none of those exists — a server reached over ssh, a session with no
+window system — the interface asks the terminal with `OSC 52`, which is a request nothing can
+confirm. The status line says which of the two happened, because "copied" and "asked the
+terminal to" are different claims.
+
+**That is a different thing from your terminal's own selection.** Mouse reporting is on, so
+holding `Shift` (or whatever modifier your terminal uses) and dragging gives you the terminal's
+selection instead, with all its own features. This interface's selection is for when you would
+rather not hold a modifier, and for the keyboard.
 
 ### Running a command yourself with `!`
 

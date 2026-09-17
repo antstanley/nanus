@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use nanus_domain::ApprovalPolicy;
 use nanus_ports::ReasoningEffort;
+use unicode_width::UnicodeWidthChar as _;
 
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
@@ -147,6 +148,102 @@ const MENTION_MAX_ROWS: u16 = 6;
 /// all. It is a display bound rather than a queue bound — nothing is dropped, only
 /// deferred to a screen that can hold it.
 const QUEUE_MAX_ROWS: u16 = 3;
+
+/// One end of a selection: a place in the transcript, a rendered line and a character inside it.
+///
+/// Character offsets rather than screen columns, because that is what the text is. The column a
+/// character is *drawn* at depends on how wide everything before it is, so a selection that counted
+/// cells would copy the wrong characters out of any line holding a CJK ideograph or an emoji.
+///
+/// The offset is inclusive: a position names a character rather than a boundary, which is what makes
+/// "drag from here to there" mean the characters a reader drew a box around rather than one fewer.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct Place {
+    /// Which rendered line, counting from the top of the transcript.
+    pub(crate) line: usize,
+    /// How many characters into that line, counted from its start.
+    pub(crate) column: usize,
+}
+
+impl Place {
+    /// The first character of a line.
+    pub(crate) const fn start(line: usize) -> Self {
+        Self { line, column: 0 }
+    }
+
+    /// The last character of a line, whichever it turns out to be.
+    ///
+    /// `MAX` rather than a measured length, because nothing here knows the line's text: every use
+    /// clamps to what the line actually holds, which is also what keeps this correct for a line that
+    /// is still being streamed into.
+    pub(crate) const fn end(line: usize) -> Self {
+        Self {
+            line,
+            column: usize::MAX,
+        }
+    }
+}
+
+/// A range of the transcript the reader has selected, and the width it was made at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Selection {
+    /// Where the selection began: the end that stays put while the other moves.
+    pub(crate) anchor: Place,
+    /// The end that moves.
+    pub(crate) head: Place,
+    /// The width the transcript was drawn at when the selection was made.
+    ///
+    /// A selection is a range of *rendered* lines, and rendering depends on the width: a resize
+    /// re-wraps every paragraph, so the same range means different text afterwards. Keeping the width
+    /// is what lets the view notice that and drop the selection rather than highlight the wrong text.
+    pub(crate) width: u16,
+}
+
+impl Selection {
+    /// The two ends in order, whichever way round the reader dragged.
+    #[must_use]
+    pub(crate) fn range(self) -> (Place, Place) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// The characters the selection covers on `line`, as an inclusive range, when it covers any.
+    #[must_use]
+    pub(crate) fn columns(self, line: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.range();
+        if line < start.line || line > end.line {
+            return None;
+        }
+        // One line is the case the two columns describe directly; across several, an endpoint's column
+        // is where the range begins or ends *on that endpoint's own line*, and every line between is
+        // taken whole. That is what makes a box drawn with a mouse and one grown with arrow keys the
+        // same shape.
+        if start.line == end.line {
+            return Some((start.column.min(end.column), start.column.max(end.column)));
+        }
+        let from = if line == start.line { start.column } else { 0 };
+        let to = if line == end.line {
+            end.column
+        } else {
+            usize::MAX
+        };
+        Some((from, to))
+    }
+}
+
+/// The style the selected characters are drawn with.
+///
+/// A modifier rather than a background colour, for the reason the caret is one: the backend sets a
+/// cell's colours in a single command, and when colour is suppressed that command degenerates to a
+/// reset that clears the modifiers set just before it. Reverse video survives `NO_COLOR`, which is
+/// exactly when a reader needs to see what they have selected.
+const SELECTION_STYLE: Modifier = Modifier::REVERSED;
+
+/// The width assumed before anything has been drawn, for a key pressed on the first frame.
+const ASSUMED_WIDTH: u16 = 80;
 
 /// An approval question the agent is waiting on.
 ///
@@ -324,6 +421,19 @@ pub struct ViewState {
     /// instead: see [`crate::queue`].
     pub queue_editor: Option<QueueEdit>,
 
+    /// The range of the transcript the reader has selected, if any.
+    ///
+    /// Held in *rendered* coordinates — a line of the drawn transcript and a character in it — which
+    /// is what a click and an arrow key can both mean. See [`Selection`] for why the width is kept
+    /// with it.
+    pub(crate) selection: Option<Selection>,
+
+    /// The transcript area as it was last drawn, for turning a click into a position.
+    ///
+    /// Recorded for the same reason the composer's rectangle is: a click arrives as a cell, and which
+    /// line that cell is showing depends on everything above it and on how far the view is scrolled.
+    last_transcript: Option<Rect>,
+
     /// Whether the key list is open.
     ///
     /// While it is set the overlay owns the keyboard, as the approval dialog and the queue
@@ -409,6 +519,8 @@ impl Default for ViewState {
             help_scroll: 0,
             mentions: Vec::new(),
             mention_selection: 0,
+            selection: None,
+            last_transcript: None,
             permission_open: false,
             permission_selection: 0,
             last_viewport: None,
@@ -475,6 +587,124 @@ fn clip_row(text: &str, room: usize) -> String {
     let mut clipped: String = text.chars().take(keep).collect();
     clipped.push('…');
     clipped
+}
+
+/// Moves a selection's head to a line, whole, and points the anchor's line the right way.
+///
+/// A key that moves by *lines* takes whole lines, so the head lands on the edge of its line nearest
+/// the anchor, and the anchor's own column becomes the edge nearest the head. Those two edges are what
+/// a reader would draw a box around: the top of the first line and the bottom of the last, whichever
+/// way round they are extending.
+fn place_head(selection: &mut Selection, line: usize) {
+    let whole_line_from_its_start =
+        line == selection.anchor.line && selection.anchor.column == usize::MAX;
+    selection.head = if line < selection.anchor.line || whole_line_from_its_start {
+        Place::start(line)
+    } else {
+        // Below the anchor, or on its line with the range ending at the anchor's own column: the head
+        // takes the far edge of its line, which is the end.
+        Place::end(line)
+    };
+    selection.anchor.column = edge_towards(selection.anchor.column, line, selection.anchor.line);
+}
+
+/// The column an anchor's line should keep, given where the head has gone.
+///
+/// A line is taken to its end when the range is above it and from its start when the range is below
+/// it, so that an anchor placed for one direction does not shrink the range when a reader crosses
+/// back over it.
+fn edge_towards(column: usize, head_line: usize, anchor_line: usize) -> usize {
+    match head_line.cmp(&anchor_line) {
+        core::cmp::Ordering::Less => usize::MAX,
+        core::cmp::Ordering::Greater => 0,
+        core::cmp::Ordering::Equal => column,
+    }
+}
+
+/// How far into a rendered line a screen column lands, as a character offset.
+///
+/// A line the terminal wraps is selected *whole*, and that is the one place this is approximate. The
+/// wrapping is the drawing library's, and which character a wrapped row begins with is not something
+/// it reports, so the first row of such a line resolves to its start and any later row to its end.
+/// The loss is small and it is not the usual case: every line the markdown renderer produces is
+/// wrapped by the renderer itself, one row per line, so this is reached only by a line the *drawer*
+/// had to break.
+fn column_in_line(line: &Line<'static>, x: usize, rows: usize, within: usize) -> usize {
+    if rows > 1 {
+        return if within == 0 {
+            0
+        } else {
+            line_text(line).chars().count()
+        };
+    }
+    let mut used = 0_usize;
+    let mut offset = 0_usize;
+    for span in &line.spans {
+        for character in span.content.chars() {
+            let current = character.width().unwrap_or(0);
+            if used.saturating_add(current) > x {
+                return offset;
+            }
+            used = used.saturating_add(current);
+            offset = offset.saturating_add(1);
+        }
+    }
+    offset
+}
+
+/// The text of one rendered line.
+fn line_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Marks the selected characters of every line with reverse video.
+fn mark_selection(lines: &mut [Line<'static>], selection: Selection) {
+    for (index, line) in lines.iter_mut().enumerate() {
+        let Some((from, to)) = selection.columns(index) else {
+            continue;
+        };
+        *line = marked_line(line, from, to);
+    }
+}
+
+/// Rebuilds one line with the characters between the offsets drawn in reverse video.
+///
+/// The spans are cut rather than restyled whole, because a line holds several: a highlighted run that
+/// took the whole line would reverse a heading's marker and the prose after it along with the
+/// characters a reader actually drew a box around.
+fn marked_line(line: &Line<'static>, from: usize, to: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut offset = 0_usize;
+    for span in &line.spans {
+        let mut before = String::new();
+        let mut inside = String::new();
+        let mut after = String::new();
+        for character in span.content.chars() {
+            if offset < from {
+                before.push(character);
+            } else if offset <= to {
+                inside.push(character);
+            } else {
+                after.push(character);
+            }
+            offset = offset.saturating_add(1);
+        }
+        for (text, selected) in [(before, false), (inside, true), (after, false)] {
+            if text.is_empty() {
+                continue;
+            }
+            let style = if selected {
+                span.style.add_modifier(SELECTION_STYLE)
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(text, style));
+        }
+    }
+    Line::from(spans)
 }
 
 /// The first line of a prompt, with a mark when there is more.
@@ -871,6 +1101,272 @@ impl ViewState {
     pub fn scroll_help(&mut self, rows: i32) {
         let moved = i32::from(self.help_scroll).saturating_add(rows).max(0);
         self.help_scroll = u16::try_from(moved).unwrap_or(u16::MAX);
+    }
+
+    /// Whether anything is selected.
+    #[must_use]
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Drops the selection.
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// The width the transcript is being drawn at.
+    ///
+    /// What a selection has to be made and read against, and what a key pressed before the first
+    /// frame falls back to.
+    #[must_use]
+    fn drawn_width(&self) -> u16 {
+        self.last_viewport.map_or(ASSUMED_WIDTH, |(width, _)| width)
+    }
+
+    /// Starts a selection at a point on the screen, replacing any there was.
+    ///
+    /// Returns `false` when the point is not over the transcript, so the caller can leave the
+    /// selection alone rather than clearing it on a click that was somewhere else entirely.
+    #[must_use]
+    pub(crate) fn begin_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(position) = self.position_at(column, row) else {
+            return false;
+        };
+        self.selection = Some(Selection {
+            anchor: position,
+            head: position,
+            width: self.drawn_width(),
+        });
+        true
+    }
+
+    /// Moves the selection's head to a point on the screen.
+    ///
+    /// A drag with no selection is a selection of nothing, so it starts one at the dragged-to point
+    /// rather than being ignored: a terminal that reports the press somewhere else, or a drag that
+    /// arrived without one, should still select what the pointer is over.
+    pub(crate) fn drag_selection(&mut self, column: u16, row: u16) {
+        let Some(position) = self.position_at(column, row) else {
+            return;
+        };
+        let width = self.drawn_width();
+        let selection = self.selection.get_or_insert(Selection {
+            anchor: position,
+            head: position,
+            width,
+        });
+        selection.head = position;
+        selection.width = width;
+    }
+
+    /// Ends a drag, dropping a selection that never moved.
+    ///
+    /// A press and a release in one place is a click, and a click into the transcript means "take the
+    /// selection off" — a one-character highlight left behind by a click would look like something a
+    /// reader meant, and they did not.
+    pub(crate) fn finish_selection(&mut self) {
+        if let Some(selection) = self.selection
+            && selection.anchor == selection.head
+        {
+            self.selection = None;
+        }
+    }
+
+    /// Extends the selection by rendered lines, starting one if there is none.
+    ///
+    /// `rows` is negative to move up the transcript. A selection that starts here starts on the last
+    /// line *drawn* and covers it, because a reader pressing a key at the bottom of a conversation
+    /// means the text they are looking at rather than a point somewhere off screen.
+    pub(crate) fn extend_selection(&mut self, rows: i32) {
+        let width = self.drawn_width();
+        let last = self.transcript_lines(width).len().saturating_sub(1);
+        let Some(mut selection) = self.selection.filter(|it| it.width == width) else {
+            // The first press takes the line the reader is looking at, and stops there: a highlight
+            // appears where they pressed, and each press after that takes one more line in the
+            // direction being pressed. Moving on this press as well would take two lines for one.
+            let line = self.bottom_line(width).min(last);
+            self.selection = Some(Selection {
+                anchor: Place::start(line),
+                head: Place::end(line),
+                width,
+            });
+            return;
+        };
+        let moved = i64::try_from(selection.head.line)
+            .unwrap_or(i64::MAX)
+            .saturating_add(i64::from(rows))
+            .clamp(0, i64::try_from(last).unwrap_or(i64::MAX));
+        let line = usize::try_from(moved).unwrap_or(0);
+        place_head(&mut selection, line);
+        selection.width = width;
+        self.selection = Some(selection);
+    }
+
+    /// Moves the selection's head to the start or the end of the line it is on.
+    pub(crate) fn select_line_edge(&mut self, to_end: bool) {
+        let width = self.drawn_width();
+        let last = self.transcript_lines(width).len().saturating_sub(1);
+        let mut selection = self
+            .selection
+            .filter(|it| it.width == width)
+            .unwrap_or_else(|| {
+                let line = self.bottom_line(width).min(last);
+                Selection {
+                    anchor: Place::start(line),
+                    head: Place::end(line),
+                    width,
+                }
+            });
+        let line = selection.head.line.min(last);
+        selection.head = if to_end {
+            Place::end(line)
+        } else {
+            Place::start(line)
+        };
+        selection.anchor.column =
+            edge_towards(selection.anchor.column, line, selection.anchor.line);
+        selection.width = width;
+        self.selection = Some(selection);
+    }
+
+    /// Selects a range outright, which is what a command that copies something does.
+    pub(crate) fn select_range(&mut self, anchor: Place, head: Place, width: u16) {
+        self.selection = Some(Selection {
+            anchor,
+            head,
+            width,
+        });
+    }
+
+    /// The line at the bottom of what is drawn, for a key that starts a selection.
+    fn bottom_line(&self, width: u16) -> usize {
+        let lines = self.transcript_lines(width);
+        let last = lines.len().saturating_sub(1);
+        if lines.is_empty() {
+            return 0;
+        }
+        let line = self.last_transcript.map_or(last, |area| {
+            self.position_at(area.x, area.y.saturating_add(area.height).saturating_sub(1))
+                .map_or(last, |position| position.line)
+        });
+        // A blank row separates every entry from the next, so the row under the newest one is empty:
+        // walking up to something that can be seen is what makes the highlight appear on a press
+        // rather than looking like nothing happened.
+        let mut line = line.min(last);
+        while line > 0
+            && lines
+                .get(line)
+                .is_some_and(|it| line_text(it).trim().is_empty())
+        {
+            line = line.saturating_sub(1);
+        }
+        line
+    }
+
+    /// Turns a cell on the terminal into a place in the transcript.
+    ///
+    /// The inverse of what the renderer does, and it has to agree with it row for row: the drawn
+    /// window starts at [`ViewState::scroll_offset`], rows above the content are the blank filler that
+    /// anchors the newest line to the bottom, and a row below the last line is the end of the
+    /// transcript — which is where a click under the conversation lands.
+    #[must_use]
+    fn position_at(&self, column: u16, row: u16) -> Option<Place> {
+        let area = self.last_transcript?;
+        if area.width == 0 || row < area.y || row >= area.y.saturating_add(area.height) {
+            return None;
+        }
+        let width = area.width;
+        let lines = self.transcript_lines(width);
+        if lines.is_empty() {
+            return None;
+        }
+        let heights = Self::line_heights(&lines, width);
+        let (start, padding) = Self::window(&heights, self.scroll_offset, area.height);
+        let from_top = row.saturating_sub(area.y);
+        let padding = u16::try_from(padding).unwrap_or(u16::MAX);
+        if from_top < padding {
+            // Above the content: the filler rows mean "the top of what is shown".
+            return Some(Place::start(start.min(lines.len().saturating_sub(1))));
+        }
+        let mut remaining = usize::from(from_top.saturating_sub(padding));
+        let mut index = start;
+        let mut within = 0_usize;
+        while index < heights.len() {
+            let rows = usize::try_from(heights.get(index).copied().unwrap_or(1)).unwrap_or(1);
+            let rows = rows.max(1);
+            if remaining < rows {
+                within = remaining;
+                break;
+            }
+            remaining = remaining.saturating_sub(rows);
+            index = index.saturating_add(1);
+        }
+        let index = index.min(lines.len().saturating_sub(1));
+        let drawn = usize::try_from(heights.get(index).copied().unwrap_or(1)).unwrap_or(1);
+        let column = column_in_line(
+            &lines[index],
+            usize::from(column.saturating_sub(area.x)),
+            drawn.max(1),
+            within,
+        );
+        Some(Place {
+            line: index,
+            column,
+        })
+    }
+
+    /// The text the selection covers, drawn as it is on screen.
+    ///
+    /// `None` when nothing is selected, and when what is selected is only whitespace: a reader who
+    /// pressed the key over a blank row meant to copy something else.
+    #[must_use]
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let lines = self.transcript_lines(selection.width);
+        let (start, end) = selection.range();
+        let mut rows: Vec<String> = Vec::new();
+        for index in start.line..=end.line.min(lines.len().saturating_sub(1)) {
+            let Some(line) = lines.get(index) else {
+                break;
+            };
+            let characters: Vec<char> = line.to_string().chars().collect();
+            let from = if index == start.line { start.column } else { 0 };
+            // Inclusive, and clamped to the line: `Position::end` is a wish rather than a length.
+            let to = if index == end.line {
+                end.column.saturating_add(1)
+            } else {
+                usize::MAX
+            };
+            let from = from.min(characters.len());
+            let to = to.min(characters.len());
+            rows.push(
+                characters
+                    .get(from..to)
+                    .map_or_else(String::new, |run| run.iter().collect::<String>()),
+            );
+        }
+        while rows.last().is_some_and(|row| row.trim().is_empty()) {
+            rows.pop();
+        }
+        let text = rows.join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// The lines the newest answer occupies, for a copy that does not need a mouse.
+    ///
+    /// The answer is the last entry the *model* wrote: a reader asking for it by command means the
+    /// prose, not a tool line that happened to come after it.
+    #[must_use]
+    pub(crate) fn last_answer_range(&self) -> Option<(Place, Place, u16)> {
+        let width = self.drawn_width();
+        let entries = self.transcript.entries();
+        let last = entries
+            .iter()
+            .rposition(|entry| entry.role() == Role::Assistant)?;
+        let from = self.lines_of(&entries[..last], width).len();
+        let total = self.lines_of(entries, width).len();
+        let end = total.saturating_sub(1);
+        (end > from).then_some((Place::start(from), Place::end(end), width))
     }
 
     /// Shows the files a mention offers.
@@ -1837,8 +2333,16 @@ impl ViewState {
     /// scroll arithmetic is built on these heights.
     #[must_use]
     pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.lines_of(self.transcript.entries(), width)
+    }
+
+    /// Builds the lines for part of the transcript.
+    ///
+    /// The same rendering as [`ViewState::transcript_lines`], over the entries it is given: a caller
+    /// that needs to know where one entry's lines *start* asks for the lines before it and counts
+    /// them, which is the only way to find a boundary that no other part of the interface defines.
+    fn lines_of(&self, entries: &[Entry], width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let entries = self.transcript.entries();
         // Which call each result answers and which result answers each call, worked out once
         // for the whole transcript rather than asked of the entry above: a step's calls and its
         // results do not interleave, so adjacency cannot pair them.
@@ -1996,8 +2500,18 @@ impl ViewState {
     }
 
     /// Renders the conversation.
-    fn render_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
-        let lines = self.transcript_lines(area.width);
+    fn render_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.last_transcript = Some(area);
+        // A selection is a range of rendered lines, so a resize invalidates it: the same range would
+        // highlight different text, and copying it would copy the wrong thing. Dropped rather than
+        // clamped, because a reader who resized mid-selection has moved what they were pointing at.
+        if self.selection.is_some_and(|it| it.width != area.width) {
+            self.selection = None;
+        }
+        let mut lines = self.transcript_lines(area.width);
+        if let Some(selection) = self.selection {
+            mark_selection(&mut lines, selection);
+        }
         let heights = Self::line_heights(&lines, area.width);
         let (start, padding) = Self::window(&heights, self.scroll_offset, area.height);
         // Blank rows above the tail, so the newest line sits at the bottom of the
@@ -2664,6 +3178,29 @@ mod tests {
     /// Renders `state` into a test terminal and returns the buffer as text.
     fn rendered(state: &mut ViewState, width: u16, height: u16) -> String {
         draw_with_caret(state, width, height).0
+    }
+
+    /// The cells drawn in reverse video, as `(column, row)` pairs.
+    ///
+    /// A selection is a *style*, so a test that looked only at the text could not tell whether one was
+    /// drawn at all — the same reason the caret has a helper of its own.
+    fn reversed_cells(state: &mut ViewState, width: u16, height: u16) -> Vec<(u16, u16)> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("a test terminal always builds");
+        let drawn = terminal.draw(|frame| state.render(frame));
+        assert!(drawn.is_ok(), "rendering must not fail");
+        let buffer = terminal.backend().buffer();
+        let mut cells = Vec::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((column, row))
+                    && cell.style().add_modifier.contains(Modifier::REVERSED)
+                {
+                    cells.push((column, row));
+                }
+            }
+        }
+        cells
     }
 
     /// Where the caret was drawn: the cell, and the character in it.
@@ -3333,6 +3870,195 @@ mod tests {
                 "{draft:?} is judged by its first character"
             );
         }
+    }
+
+    /// A drag over the transcript selects the text drawn where it was dragged, and the copy is that
+    /// text. This is the whole mapping in one test: a screen cell, the line it shows, and the
+    /// characters of that line.
+    #[test]
+    fn dragging_over_the_transcript_selects_what_is_drawn_there() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "first line"));
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "second line"));
+        // Tall enough for both entries: the composer keeps five rows, and a transcript with less than
+        // what was written shows only its beginning.
+        let text = rendered(&mut state, 40, 18);
+        let row = text
+            .lines()
+            .position(|row| row.contains("second line"))
+            .expect("the answer is drawn");
+        let row = u16::try_from(row).expect("a row within a terminal");
+
+        assert!(state.begin_selection(0, row), "the transcript is there");
+        state.drag_selection(11, row);
+        assert!(state.has_selection());
+        assert_eq!(state.selected_text().as_deref(), Some("second line"));
+
+        // And it is drawn reversed, on the row it was dragged over.
+        let reversed = reversed_cells(&mut state, 40, 18);
+        assert!(
+            reversed.iter().any(|(_, drawn)| *drawn == row),
+            "the selection is drawn on its row: {reversed:?}"
+        );
+    }
+
+    /// A drag that starts on one line and ends on another takes every row between, and the copy is
+    /// those rows joined in order.
+    #[test]
+    fn a_selection_reaches_across_lines_in_either_direction() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "alpha"));
+        state.transcript.push(Entry::prose(Role::Assistant, "beta"));
+        let text = rendered(&mut state, 40, 18);
+        let first = text
+            .lines()
+            .position(|row| row.contains("alpha"))
+            .expect("drawn");
+        let second = text
+            .lines()
+            .position(|row| row.contains("beta"))
+            .expect("drawn");
+        let (first, second) = (
+            u16::try_from(first).expect("a row"),
+            u16::try_from(second).expect("a row"),
+        );
+
+        // Downwards, then the same range the other way round: a selection is a range, not a direction.
+        // Column 0 to past the end of the line, so the whole of both lines is inside it.
+        let _ = state.begin_selection(0, first);
+        state.drag_selection(40, second);
+        let down = state.selected_text().expect("something is selected");
+        let _ = state.begin_selection(40, second);
+        state.drag_selection(0, first);
+        assert_eq!(state.selected_text().as_deref(), Some(down.as_str()));
+
+        let rows: Vec<&str> = down.lines().collect();
+        assert_eq!(rows.first(), Some(&"alpha"), "{rows:?}");
+        assert_eq!(rows.last(), Some(&"beta"), "{rows:?}");
+        // The blank row between the two answers comes along: it is inside the range, and dropping it
+        // would join two paragraphs into one line.
+        assert!(rows.len() >= 3, "{rows:?}");
+    }
+
+    /// A click with no drag is not a selection: a one-character highlight left behind by a click would
+    /// look like something a reader meant, and they did not.
+    #[test]
+    fn a_click_that_did_not_drag_selects_nothing() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "a line"));
+        let text = rendered(&mut state, 40, 12);
+        let row = text
+            .lines()
+            .position(|row| row.contains("a line"))
+            .expect("drawn");
+        let row = u16::try_from(row).expect("a row");
+
+        assert!(state.begin_selection(2, row));
+        state.finish_selection();
+        assert!(!state.has_selection(), "a click is not a selection");
+        assert!(state.selected_text().is_none());
+
+        // A drag, and the button coming up, leaves it standing.
+        let _ = state.begin_selection(0, row);
+        state.drag_selection(5, row);
+        state.finish_selection();
+        assert!(state.has_selection());
+    }
+
+    /// The keyboard extends a selection from the bottom of what is drawn, one line per press, and
+    /// clearing it is what `Esc` does first.
+    #[test]
+    fn shift_extends_a_selection_from_the_bottom_of_the_screen() {
+        let mut state = ViewState::new();
+        for line in ["one", "two", "three"] {
+            state.transcript.push(Entry::prose(Role::Assistant, line));
+        }
+        rendered(&mut state, 40, 20);
+        // The first press takes the line the reader is looking at — the newest text rather than the
+        // blank row that follows every entry.
+        state.extend_selection(-1);
+        let up = state.selected_text().expect("something is selected");
+        assert_eq!(up, "three", "the first press takes the last line");
+
+        state.extend_selection(-1);
+        let further = state.selected_text().expect("still selected");
+        assert_eq!(
+            further.lines().count(),
+            2,
+            "each press takes one more row: {further:?}"
+        );
+        assert!(further.ends_with("three"), "{further:?}");
+
+        // Down again takes the extra lines back off, one press at a time.
+        state.extend_selection(1);
+        state.extend_selection(1);
+        assert_eq!(
+            state.selected_text().as_deref(),
+            Some(up.as_str()),
+            "the presses cancel out"
+        );
+
+        // And a line edge is the end of the line the head is on.
+        state.clear_selection();
+        state.select_line_edge(true);
+        let whole = state.selected_text().expect("a whole line");
+        assert_eq!(whole, "three");
+    }
+
+    /// A selection is a range of *rendered* lines, so a resize re-wraps what it meant: it is dropped
+    /// rather than left to highlight text nobody chose.
+    #[test]
+    fn a_resize_drops_the_selection() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "a line worth selecting"));
+        rendered(&mut state, 40, 12);
+        let _ = state.begin_selection(0, 1);
+        state.drag_selection(6, 1);
+        assert!(state.has_selection());
+        rendered(&mut state, 60, 12);
+        assert!(!state.has_selection(), "the width changed under it");
+    }
+
+    /// `/copy` needs the newest *answer*, which is the last thing the model wrote — not a tool line
+    /// that happened to come after it.
+    #[test]
+    fn the_newest_answer_is_the_range_a_command_copies() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::User, "a question"));
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "an answer"));
+        state
+            .transcript
+            .push(Entry::tool_call("read", "{\"file_path\":\"x\"}"));
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "a better answer"));
+        let (anchor, head, width) = state.last_answer_range().expect("there is an answer");
+        state.select_range(anchor, head, width);
+        let copied = state.selected_text().expect("something is selected");
+        assert!(copied.contains("a better answer"), "{copied}");
+        assert!(!copied.contains("a question"), "{copied}");
+        assert!(!copied.contains("read"), "{copied}");
+
+        // A transcript with nothing the model said has no answer to copy.
+        let mut empty = ViewState::new();
+        empty
+            .transcript
+            .push(Entry::prose(Role::User, "a question"));
+        assert_eq!(empty.last_answer_range(), None);
     }
 
     /// The menu is drawn above the composer, marked, and its heading carries the key that accepts

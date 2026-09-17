@@ -42,6 +42,8 @@
 //! | `Alt+P` | switch to the next model the agent offers |
 //! | `Alt+T` | ask for the next step of reasoning effort |
 //! | `Ctrl+V` | paste an image from the clipboard, as a path |
+//! | `Shift` + arrows | select text in the transcript |
+//! | `Ctrl+C` | copy the selection, or stop what is happening |
 //! | `Ctrl+L` | clear the transcript |
 //! | `Backspace` / `Delete` | delete a character |
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
@@ -1077,6 +1079,7 @@ async fn event_loop(
                             };
                         }
                     }
+                    Outcome::Copy => copy_selection(&crate::copy::to_clipboard, &mut view),
                     Outcome::PasteImage => {
                         paste_image(&crate::paste::from_clipboard, source.workspace(), &mut view);
                     }
@@ -1095,7 +1098,13 @@ async fn event_loop(
                         source.set_approval(policy);
                     }
                     Outcome::Submit(prompt) => {
-                        if submitted(prompt, source, &mut view, &shells) {
+                        if submitted(
+                            prompt,
+                            source,
+                            &mut view,
+                            &shells,
+                            &crate::copy::to_clipboard,
+                        ) {
                             break;
                         }
                     }
@@ -1151,6 +1160,11 @@ enum Routed {
     /// Routed for the same reason as [`Routed::Stats`]: the draft and the toggles are the
     /// view's state, and clearing one of them is not something a router can do.
     Clear,
+    /// Put the newest answer on the clipboard.
+    ///
+    /// Routed for the same reason as [`Routed::Stats`]: the range is a fact about the rendered
+    /// transcript, which the view holds and the router does not.
+    Copy,
     /// Run this shell command, in the interface's own shell rather than the agent's.
     ///
     /// Routed for the same reason as [`Routed::Stats`]: the transcript entry and the status line are
@@ -1180,6 +1194,7 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         // The argument is the rest of the line: `/model` cycles and `/model <id>` names one,
         // which is the pair a command with a useful default and a useful argument offers.
         Submission::Run(Command::Model) => Routed::SetModel(model_argument(&prompt)),
+        Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
             if command.trim().is_empty() {
                 Routed::Say(String::from(
@@ -1300,6 +1315,7 @@ fn submitted(
     source: &mut dyn SessionSource,
     view: &mut ViewState,
     shells: &mpsc::UnboundedSender<crate::shell::Outcome>,
+    copier: &dyn Fn(&str) -> Result<crate::copy::Copied, String>,
 ) -> bool {
     match route_submission(prompt, source.accepts_prompts()) {
         Routed::Leave => return true,
@@ -1310,9 +1326,14 @@ fn submitted(
             view.scroll_to_bottom();
         }
         Routed::Help => view.open_help(),
+        Routed::Copy => copy_last_answer(copier, view),
         // The transcript only: the draft in the composer and the toggles are about what the reader is
         // doing now, and `Ctrl+L` already means this.
-        Routed::Clear => view.transcript.clear(),
+        Routed::Clear => {
+            view.transcript.clear();
+            // The selection is a range of lines that no longer exist.
+            view.clear_selection();
+        }
         Routed::Shell(command) => begin_shell(command, shells, view),
         Routed::SetModel(requested) => switch_model(requested, source, view),
         Routed::Say(message) => {
@@ -1361,6 +1382,68 @@ fn begin_shell(
         let outcome = crate::shell::run(&command).await;
         let _ = results.send(outcome);
     });
+}
+
+/// Puts the selection on the clipboard, or says why it could not.
+///
+/// The copier is passed in so the decision — what to say when there is nothing to copy, and what to
+/// say when the clipboard refused — can be tested without a clipboard.
+///
+/// A copy that worked drops the selection, so the next `Ctrl+C` is the key that stops a turn rather
+/// than a second copy of the same text. A copy that did not is left standing, because the reader's
+/// next move is to try again or to copy by hand.
+fn copy_selection(
+    copier: &dyn Fn(&str) -> Result<crate::copy::Copied, String>,
+    view: &mut ViewState,
+) {
+    let Some(text) = view.selected_text() else {
+        view.clear_selection();
+        view.status = String::from("nothing is selected to copy");
+        return;
+    };
+    match copier(&text) {
+        Ok(crate::copy::Copied::System) => {
+            view.status = format!("copied {}", count_of(&text));
+            view.clear_selection();
+        }
+        Ok(crate::copy::Copied::Terminal) => {
+            // Said differently, because it is a different claim: the terminal was asked and nothing
+            // can confirm it listened.
+            view.status = format!(
+                "copied {} to the terminal (if it takes clipboard writes)",
+                count_of(&text)
+            );
+            view.clear_selection();
+        }
+        Err(error) => view.status = format!("the selection was not copied: {error}"),
+    }
+}
+
+/// “3 lines” or “41 characters”, whichever a reader can picture.
+fn count_of(text: &str) -> String {
+    let lines = text.lines().count();
+    if lines > 1 {
+        format!("{lines} lines")
+    } else {
+        format!("{} characters", text.chars().count())
+    }
+}
+
+/// Selects the newest answer and copies it: the command form of highlighting it and pressing the key.
+///
+/// Selecting rather than copying invisibly, because the highlight is what shows the reader *what* they
+/// got: an answer is often longer than the screen or shorter than they thought, and a copy with no
+/// evidence is one they have to paste somewhere to check.
+fn copy_last_answer(
+    copier: &dyn Fn(&str) -> Result<crate::copy::Copied, String>,
+    view: &mut ViewState,
+) {
+    let Some((anchor, head, width)) = view.last_answer_range() else {
+        view.status = String::from("there is no answer to copy yet");
+        return;
+    };
+    view.select_range(anchor, head, width);
+    copy_selection(copier, view);
 }
 
 /// Puts a pasted image into the workspace and its path into the composer.
@@ -1511,6 +1594,11 @@ enum Outcome {
     SetModel(Option<String>),
     /// Read an image off the clipboard and put its path in the composer.
     PasteImage,
+    /// Copy the selection to the clipboard.
+    ///
+    /// An outcome rather than something the key handling does, because copying runs a program: the
+    /// keys decide what the reader meant, and the loop is where the side effects are.
+    Copy,
     ///
     /// The key is a cycle rather than a toggle because the scale has four steps and only one of
     /// them means "no thinking": a toggle would have to invent what "on" means after a reader has
@@ -1746,6 +1834,18 @@ fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
     }
 }
 
+/// What `Ctrl+C` means with a selection up: copy it, and leave the stopping to the next press.
+///
+/// The order is the point. `Ctrl+C` stops what is happening everywhere else in this interface, and it
+/// still does — but a reader who has just drawn a box around an answer is asking for the answer, and a
+/// key that stopped the turn instead would be the one place they could not get it out.
+fn copy_or_stop(view: &mut ViewState) -> Outcome {
+    if view.has_selection() {
+        return Outcome::Copy;
+    }
+    stop_or_cancel_or_quit(view)
+}
+
 /// Routes a key while the key list is open.
 ///
 /// Three things and nothing else: close it, scroll it, or ignore the key. Closing takes the
@@ -1862,12 +1962,15 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     // interface impossible to quit and the toggles dead — the same mistake as reading a key
     // without asking what the modifiers did to it.
     match key.code {
-        // Stop what is happening, in the order a reader means it: the turn if one is
-        // running, then the prompt, then the session.
-        KeyCode::Char('c' | 'C') => stop_or_cancel_or_quit(view),
+        // With something selected, the key means copy it: a reader who has highlighted a passage and
+        // pressed `Ctrl+C` is asking for the passage, and stopping the turn would throw the answer
+        // away. Copying drops the selection, so the next press is the key it always was.
+        KeyCode::Char('c' | 'C') => copy_or_stop(view),
         KeyCode::Char('d' | 'D') => Outcome::Quit,
         KeyCode::Char('l' | 'L') => {
             view.transcript.clear();
+            // The selection was a range of lines the transcript no longer has.
+            view.clear_selection();
             Outcome::Continue
         }
         // Verbose output, which is the same toggle the configuration file sets: the
@@ -1941,6 +2044,11 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Shift with a movement key selects rather than moves, which is the only way to select without a
+    // mouse: the transcript has no cursor of its own, so a selection is what those keys move.
+    if let Some(outcome) = handle_selection_key(key, view) {
+        return outcome;
+    }
     match key.code {
         // Shift+Enter reaches here only from a terminal that reports it as distinct from
         // Enter — see `TerminalGuard::enter`. Elsewhere it is the same byte, and a newline
@@ -2054,6 +2162,27 @@ fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     }
 }
 
+/// Routes a movement key with Shift held: it extends the selection rather than moving the caret.
+///
+/// `Some` when the key was one of them and `None` otherwise, so the caller's own arms still see every
+/// other key: these *are* the movement keys, and Shift is the whole of what tells the two meanings
+/// apart.
+fn handle_selection_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome> {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => view.extend_selection(-1),
+        KeyCode::Down => view.extend_selection(1),
+        KeyCode::PageUp => view.extend_selection(-PAGE_ROWS),
+        KeyCode::PageDown => view.extend_selection(PAGE_ROWS),
+        KeyCode::Home => view.select_line_edge(false),
+        KeyCode::End => view.select_line_edge(true),
+        _ => return None,
+    }
+    Some(Outcome::Continue)
+}
+
 /// Routes a mouse event.
 ///
 /// The wheel is the whole of scrolling with the mouse, and it is not confined to the
@@ -2069,8 +2198,20 @@ fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
         // The overlay owns the keyboard, so it owns the pointer too: a click behind a
         // modal dialogue should not move a caret the reader cannot see.
         MouseEventKind::Down(MouseButton::Left) if !view.queue_open => {
-            let _ = view.place_caret(mouse.column, mouse.row);
+            // The composer and the transcript are the two places a click means something: a caret in
+            // the one, the start of a selection in the other. A click in the composer is not a
+            // selection, so it takes any selection off.
+            if view.place_caret(mouse.column, mouse.row) {
+                view.clear_selection();
+            } else {
+                let _ = view.begin_selection(mouse.column, mouse.row);
+            }
         }
+        // A drag extends the selection it started, and finishes it when the button comes up. Both are
+        // reported as their own events because a terminal does not send a release for every pixel: the
+        // drags are what draw the box, and the release is what says the reader has stopped.
+        MouseEventKind::Drag(MouseButton::Left) => view.drag_selection(mouse.column, mouse.row),
+        MouseEventKind::Up(MouseButton::Left) => view.finish_selection(),
         // Scrolling sideways and every other button are not things this interface has
         // anywhere to put. Ignoring them is deliberate rather than an oversight.
         _ => {}
@@ -2086,6 +2227,13 @@ fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
 /// running the key reaches the prompt, and only an empty prompt leaves, which is what keeps
 /// a key meaning "stop" from throwing away what somebody spent a minute writing.
 fn stop_or_cancel_or_quit(view: &mut ViewState) -> Outcome {
+    // A selection is what the key means first: it is the thing the reader put on screen, dropping it
+    // costs nothing, and the alternative is that `Esc` — which they may press to *dismiss* the
+    // highlight — stops a turn instead.
+    if view.has_selection() {
+        view.clear_selection();
+        return Outcome::Continue;
+    }
     if view.busy {
         return Outcome::Interrupt;
     }
@@ -3167,6 +3315,286 @@ mod tests {
         unmatched.input.insert_str("@nothing-matches-this");
         refresh_mentions(&mut unmatched, &mut walked, dir.path().to_str());
         assert!(!unmatched.mention_open());
+    }
+
+    /// With something selected, `Ctrl+C` copies it; with nothing selected it is the key it always
+    /// was. That precedence is the whole design: the key that stops a turn is the key a terminal user
+    /// reaches for to copy, and a reader who has drawn a box around an answer means the answer.
+    #[test]
+    fn ctrl_c_copies_a_selection_and_otherwise_stops() {
+        let mut view = ViewState::new();
+        // Nothing selected and nothing running: the two-step exit, as before.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Quit
+        ));
+        // A turn running: it is asked to stop.
+        let mut busy = ViewState::new();
+        busy.begin_turn(1);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut busy),
+            Outcome::Interrupt
+        ));
+        // Something selected: neither, and the selection is what the key is for.
+        let mut selected = ViewState::new();
+        selected.begin_turn(1);
+        selected.select_range(crate::view::Place::start(0), crate::view::Place::end(0), 40);
+        assert!(matches!(
+            handle_key(
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut selected
+            ),
+            Outcome::Copy
+        ));
+    }
+
+    /// `Esc` takes the selection off before it stops anything, which is what makes it safe to press
+    /// when a highlight is in the way.
+    #[test]
+    fn escape_clears_the_selection_before_it_stops_anything() {
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        view.select_range(crate::view::Place::start(0), crate::view::Place::end(0), 40);
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(!view.has_selection(), "the selection went");
+        assert!(view.busy, "and the turn did not");
+        // The next press is the stop it always was.
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Interrupt
+        ));
+    }
+
+    /// Shift with a movement key selects; without it, the same keys move the caret and browse history
+    /// — which is what keeps the selection a choice rather than a new meaning for the arrows.
+    #[test]
+    fn shift_with_a_movement_key_selects_and_without_it_does_not() {
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            let mut view = ViewState::new();
+            view.input.insert_str("a draft");
+            let _ = handle_key(key(code, KeyModifiers::SHIFT), &mut view);
+            assert!(view.has_selection(), "{code:?} with Shift selects");
+            assert_eq!(
+                view.input.text(),
+                "a draft",
+                "{code:?} with Shift leaves the prompt alone"
+            );
+
+            // Without Shift, the same key is the composer's: it moves the caret or browses history,
+            // and the transcript is not selected at all.
+            let mut plain = ViewState::new();
+            plain.input.insert_str("a draft");
+            let _ = handle_key(key(code, KeyModifiers::NONE), &mut plain);
+            assert!(!plain.has_selection(), "{code:?} without Shift");
+        }
+
+        // Home and End with Shift are the ends of the line the head is on.
+        for code in [KeyCode::Home, KeyCode::End] {
+            let mut view = ViewState::new();
+            let _ = handle_key(key(code, KeyModifiers::SHIFT), &mut view);
+            assert!(view.has_selection(), "{code:?} selects a line edge");
+        }
+    }
+
+    /// Draws the view into a test terminal and returns the buffer as text.
+    ///
+    /// A selection is made of *rendered* lines, so a test that means to select something has to render
+    /// it first: there is nothing to point at until the view has drawn itself once.
+    fn drawn(view: &mut ViewState, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal always builds");
+        let painted = terminal.draw(|frame| view.render(frame));
+        assert!(painted.is_ok(), "rendering must not fail");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                text.push_str(buffer.cell((column, row)).map_or(" ", |cell| cell.symbol()));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// What a recording copier was given: the text it was asked to copy.
+    type Copied = std::rc::Rc<std::cell::RefCell<String>>;
+
+    /// A copier that records what it was asked to copy, and can be told to fail.
+    #[allow(clippy::type_complexity)]
+    fn recording_copier(
+        refuses: bool,
+    ) -> (Copied, impl Fn(&str) -> Result<crate::copy::Copied, String>) {
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let recorder = std::rc::Rc::clone(&copied);
+        let take = move |text: &str| {
+            if refuses {
+                return Err(String::from("no clipboard here"));
+            }
+            recorder.borrow_mut().push_str(text);
+            Ok(crate::copy::Copied::System)
+        };
+        (copied, take)
+    }
+
+    /// Copying says what it did, and a copy that worked takes the selection away so the next `Ctrl+C`
+    /// stops a turn rather than copying the same text twice.
+    #[test]
+    fn copying_reports_where_the_text_went() {
+        let mut view = ViewState::new();
+        view.select_range(crate::view::Place::start(0), crate::view::Place::end(0), 40);
+        // Nothing is drawn, so there are no lines to copy: the interface says so rather than copying
+        // an empty string.
+        // Nothing is drawn, so there are no lines to copy: the interface says so rather than copying
+        // an empty string, and drops the selection that no longer points at anything.
+        let rejected = |_: &str| Err(String::from("no clipboard"));
+        copy_selection(&rejected, &mut view);
+        assert!(
+            view.status.contains("nothing is selected"),
+            "{}",
+            view.status
+        );
+        assert!(!view.has_selection(), "and the stale selection is gone");
+
+        // A drawn answer can be selected and copied, and the copy says how much went.
+        let mut drawn_view = ViewState::new();
+        drawn_view
+            .transcript
+            .push(Entry::prose(Role::Assistant, "the answer"));
+        let text = drawn(&mut drawn_view, 60, 16);
+        let row = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("the answer"))
+                .expect("the answer is drawn"),
+        )
+        .expect("a row within a terminal");
+        let _ = drawn_view.begin_selection(0, row);
+        drawn_view.drag_selection(60, row);
+        let (copied, send) = recording_copier(false);
+        copy_selection(&send, &mut drawn_view);
+        assert_eq!(copied.borrow().as_str(), "the answer");
+        assert!(
+            drawn_view.status.contains("copied"),
+            "{}",
+            drawn_view.status
+        );
+        assert!(
+            !drawn_view.has_selection(),
+            "the highlight goes, so the next Ctrl+C stops a turn"
+        );
+
+        // A clipboard that refused says so, and leaves the selection standing so the reader can try
+        // again or copy it by hand.
+        let mut refusing_view = ViewState::new();
+        refusing_view
+            .transcript
+            .push(Entry::prose(Role::Assistant, "the answer"));
+        drawn(&mut refusing_view, 60, 16);
+        let _ = refusing_view.begin_selection(0, row);
+        refusing_view.drag_selection(60, row);
+        let (_, refusing) = recording_copier(true);
+        copy_selection(&refusing, &mut refusing_view);
+        assert!(
+            refusing_view.status.contains("not copied"),
+            "{}",
+            refusing_view.status
+        );
+        assert!(
+            refusing_view.has_selection(),
+            "the selection is still there"
+        );
+    }
+
+    /// `/copy` takes the newest answer without anyone having to point at it, which is the commonest
+    /// thing a reader wants out of a transcript.
+    #[test]
+    fn the_copy_command_takes_the_newest_answer() {
+        assert_eq!(
+            route_submission(String::from("/copy"), true),
+            Routed::Copy,
+            "the command is routed rather than sent to the model"
+        );
+
+        let mut view = ViewState::new();
+        view.transcript.push(Entry::prose(Role::User, "a question"));
+        view.transcript
+            .push(Entry::prose(Role::Assistant, "the answer"));
+        drawn(&mut view, 60, 16);
+        let (copied, send) = recording_copier(false);
+        copy_last_answer(&send, &mut view);
+        assert!(
+            copied.borrow().contains("the answer"),
+            "{:?}",
+            copied.borrow()
+        );
+        assert!(
+            !copied.borrow().contains("a question"),
+            "the question is not the answer: {:?}",
+            copied.borrow()
+        );
+        assert!(view.status.contains("copied"), "{}", view.status);
+
+        // A session with nothing to copy says so rather than clearing the clipboard.
+        let mut empty = ViewState::new();
+        drawn(&mut empty, 60, 16);
+        let (nothing, send) = recording_copier(false);
+        copy_last_answer(&send, &mut empty);
+        assert!(nothing.borrow().is_empty());
+        assert!(empty.status.contains("no answer"), "{}", empty.status);
+    }
+
+    /// The mouse: a press in the transcript starts a selection, a drag draws it, and the release ends
+    /// it. This is the whole path a reader takes, from a cell to the characters under it.
+    #[test]
+    fn dragging_in_the_transcript_selects_the_rows_it_crossed() {
+        let mut view = ViewState::new();
+        view.transcript
+            .push(Entry::prose(Role::Assistant, "copy me"));
+        let text = drawn(&mut view, 60, 16);
+        let row = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("copy me"))
+                .expect("the answer is drawn"),
+        )
+        .expect("a row within a terminal");
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, row),
+            &mut view,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 7, row),
+            &mut view,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 7, row),
+            &mut view,
+        );
+        assert!(view.has_selection(), "the drag selected the answer");
+        assert_eq!(view.selected_text().as_deref(), Some("copy me"));
+
+        // The composer is not the transcript: a drag there is a caret, and it takes the selection off.
+        let mut typing = ViewState::new();
+        drawn(&mut typing, 60, 16);
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 4, 13),
+            &mut typing,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 8, 13),
+            &mut typing,
+        );
+        assert!(
+            !typing.has_selection(),
+            "the composer is not the transcript"
+        );
     }
 
     /// `Ctrl+V` writes the clipboard's image into the workspace and puts its path in the prompt.

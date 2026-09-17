@@ -35,6 +35,8 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "PageUp / PageDown",
         "scroll back and forward through the conversation",
     ),
+    ("Shift+arrows", "select text in the transcript"),
+    ("Ctrl+C", "copy the selection, when there is one"),
     (
         "Ctrl+C / Esc",
         "stop the running turn; then cancel the prompt; then quit",
@@ -63,6 +65,7 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("Ctrl+V", "paste an image from the clipboard, as a path"),
     ("@path", "name a file; Tab completes it"),
     ("!command", "run a shell command here, without the model"),
+    ("/copy", "put the newest answer on the clipboard"),
     ("?", "show this list, when the prompt is empty"),
     ("", "while an approval dialog is up"),
     ("y", "allow the call once"),

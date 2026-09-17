@@ -202,8 +202,8 @@ supports:
   prompts (`Alt+Enter`, `Shift+Enter` where the terminal reports it, `Ctrl+J`),
   cursor movement, word and line deletion, kill/yank, history browsing, and
   reverse search (`Ctrl+R`). See [the key table](tui.md#keys).
-- **Mouse support**: the wheel scrolls, and a click in the composer places the
-  caret.
+- **Mouse support**: the wheel scrolls, a click in the composer places the caret,
+  and a drag in the transcript selects text.
 - **Follow and scroll-back**: the view follows new output until you scroll away
   and follows again at the bottom, with `PageUp`/`PageDown` and the wheel.
 - **A growing multi-line composer** with word-boundary wrapping and a caret drawn
@@ -242,6 +242,10 @@ supports:
 - **Pasting an image** (`Ctrl+V`): the clipboard is read by the platform's own
   tool, the bytes are checked by their magic number, and the file is written inside
   the workspace so `read_image` can reach it.
+- **Selecting and copying**: drag with the mouse or extend with `Shift` and a
+  movement key, then `Ctrl+C` — or `/copy` for the newest answer. The clipboard is
+  the platform's own tool, falling back to the terminal's `OSC 52`. See
+  [the interface](tui.md#selecting-and-copying).
 - **`!` for your own commands**: a line that opens with `!` is a shell command the
   interface runs itself, echoed into the transcript. It is not the model's, is not
   recorded, and is not confined — see [SAFETY.md](../SAFETY.md).

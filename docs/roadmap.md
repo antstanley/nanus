@@ -84,7 +84,10 @@ readings into a result.
 ## Shipped: what the interface needed to be a daily driver
 
 The interface items, taken in the order they were worth doing, and where each one landed. The
-numbers are the plan's, kept because later items refer to them.
+numbers are the plan's, kept because later items refer to them. Number 16 was the one number the plan
+had left unfilled — an item that was taken out and whose number was not reused — and it now names
+selecting and copying, which was asked for once the rest of this block had landed. Nothing below it
+moved, so every reference from 17 onwards still means what it said.
 
 | # | Item | Where it landed |
 |---|---|---|
@@ -97,11 +100,8 @@ numbers are the plan's, kept because later items refer to them.
 | 13 | **Paste an image (`Ctrl+V`).** The clipboard is read by the platform's own tool — `pbpaste`, `wl-paste`, or `xclip` — and the bytes are checked by their magic number, because a reader that answers with text has not provided an image. The image is written into the workspace (`.nanus/pasted/`, `.nanus/` is the harness's) and its *path* goes into the prompt, because `read_image` takes a path and the wire has no way to carry bytes a client produced. | `nanus-tui/src/paste.rs`, `runtime.rs`, `docs/tui.md` |
 | 14 | **`@` file mentions.** A bounded walk of the workspace with three machinery names skipped, a ranking that puts a file's own name above a path that contains it, and a menu above the composer that `Tab` completes, the arrows choose and `Esc` dismisses. It expands to the *path*, because inlining contents would spend the context on a file the model never asked for. The walk is remade whenever a mention starts, so a file the agent just wrote is offered. | `nanus-tui/src/mentions.rs`, `runtime.rs`, `view.rs` |
 | 15 | **`!` bash mode.** A line that opens with `!` is a shell command the interface runs itself, echoed into the transcript with its output bounded and its exit status named. It is a task rather than a blocking wait, so a slow command does not stop a running turn's frames being read, and the composer's mark becomes `$` so the mode is visible before `Enter`. Nothing about it reaches the session log or the model, and it is not confined — which is why the safety note landed first, in [SAFETY.md](../SAFETY.md) and [the interface](tui.md#running-a-command-yourself-with-). | `nanus-tui/src/{shell,command,runtime,view}.rs`, `SAFETY.md` |
-
+| 16 | **Selecting and copying text out of the transcript.** A drag with the mouse or `Shift` with a movement key selects rendered rows, `Ctrl+C` copies them, and `/copy` takes the newest answer without pointing at it. The clipboard is the platform's own tool with the terminal's `OSC 52` behind it, and the two are reported differently because only one of them can be confirmed. A copy that worked clears the selection, so `Ctrl+C` goes back to meaning stop. | `nanus-tui/src/{copy,view,runtime,command}.rs` |
 ## Next: sessions and the link
-
-The numbers skip 16: an item was taken out of the plan and the number was left unfilled rather than
-reused, so every reference from 17 onwards still means what it said when it was written.
 
 | # | Item | Size | Notes |
 |---|---|---|---|

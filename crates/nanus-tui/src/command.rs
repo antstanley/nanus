@@ -28,6 +28,12 @@ pub enum Command {
     /// Switch the model: the next one offered when no id is given, and the named one when it
     /// is.
     Model,
+    /// Put the newest answer on the clipboard.
+    ///
+    /// A command as well as a key, because the commonest thing a reader wants out of a transcript is
+    /// the last answer, and getting it by highlighting it with the mouse is a fiddly way to ask for
+    /// something the interface knows the bounds of.
+    Copy,
 }
 
 impl Command {
@@ -82,6 +88,7 @@ pub fn submission_of(text: &str) -> Submission {
         "/help" => Submission::Run(Command::Help),
         "/clear" => Submission::Run(Command::Clear),
         "/model" => Submission::Run(Command::Model),
+        "/copy" => Submission::Run(Command::Copy),
         // A slash alone, or a path, or a typo: named as what was typed rather than
         // guessed at, because "no such command: /quitx" is what tells a reader they
         // fat-fingered it.
@@ -159,6 +166,12 @@ mod tests {
         // And a `!` that is not the first character is just punctuation in a sentence.
         assert_eq!(submission_of("that was exciting!"), Submission::Prompt);
         assert_eq!(submission_of("wow! /exit"), Submission::Prompt);
+    }
+
+    #[test]
+    fn copy_is_a_command() {
+        assert_eq!(submission_of("/copy"), Submission::Run(Command::Copy));
+        assert_eq!(submission_of("  /copy  "), Submission::Run(Command::Copy));
     }
 
     #[test]
