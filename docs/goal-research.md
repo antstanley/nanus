@@ -172,9 +172,11 @@ A few implications that are specific to this codebase:
   interface's commands are answered client-side today; a goal mutation has to
   reach the agent, because a session is the agent's (see
   [design decisions](design.md#a-session-belongs-to-the-agent-not-to-the-connection)).
-  That means new request/response frames, and it is a good argument for
-  [versioning the handshake](roadmap.md#now-close-the-gap-between-what-is-written-and-what-runs)
-  first. Like DeepSeek, the command's own output should not enter model history.
+  That means new request/response frames, and it is why the handshake was
+  [versioned](roadmap.md#shipped-the-gap-between-what-is-written-and-what-runs)
+  first — a client and an agent that disagree about the frame vocabulary now say
+  so instead of misreading a frame. Like DeepSeek, the command's own output should
+  not enter model history.
 - **Continuation is in direct tension with the turn budget.** `nanus` bounds a
   turn at 512 steps *because* unattended loops are a cost hazard
   ([design](design.md#a-budget-because-unattended-loops-are-a-cost-hazard)). An

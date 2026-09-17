@@ -26,19 +26,20 @@ Sizes assume one person familiar with the repository. They are not additive, and
 an item that depends on another is noted — doing the dependency first usually
 makes the dependent cheaper.
 
-## Now: close the gap between what is written and what runs
+## Shipped: the gap between what is written and what runs
 
-These are first because they are correctness, not new surface. Two of them are
-places where a document already says something the code does not yet do.
+These were first because they were correctness rather than new surface, and they have
+landed. The numbers are kept because later items refer to them ("depends on 2"), and each
+entry says where the work lives rather than what it was going to be.
 
-| # | Item | Size | Notes |
-|---|---|---|---|
-| 1 | **Enforce approval at the tool boundary.** | **M** | `ApprovalPolicy`, `ApprovalRequest`, and `ApprovalOutcome` exist and `ask` / `never` parse, but nothing constructs a request or gates on a decision: `AgentRunner::run_tools` executes every call directly. `Never` should deterministically deny and `Ask` should deny when no answerer exists, exactly as the fail-closed types describe. The default system prompt should also state the runtime policy — the domain's `runtime_context` renders it, but the bundle never calls it. |
-| 2 | **Interactive consent in the interface.** | **L** | Depends on 1. New link frames for a request and its answer, a dialog in the interface, and an answerer in the CLI, so `ask` means something when a person is watching. Until both land, [sandbox mode](features.md#safety-and-verification) is the only enforcement. |
-| 3 | **Run a step's tool calls concurrently, bounded by `max_parallel_tools`.** | **M** | The setting is validated, plumbed into `AgentConfig`, and printed by `nanus config`, but `run_tools` awaits each call in turn. The work is cooperative concurrency on the single-threaded runtime with ordered event recording (a call and its result must still pair up in the log) and tests for out-of-order completion. |
-| 4 | **Verify live tool-call frames against the real API.** | **S** | `live_wire.rs` replays a documented shape rather than a captured one. Record a real tool-call trace and replay it; if it differs, [`wire.rs`](../crates/nanus-adapter-deepseek/src/wire.rs) is the only file to change. This is verification, not a feature. |
-| 5 | **Version the link handshake.** | **S** | Today the two binaries ship together and the core never searches `PATH`, so a mismatch is a crash to diagnose. A version field in the handshake turns it into a sentence naming the mismatch. |
-| 6 | **Delete a session from the CLI.** | **S** | `StorePort::delete` exists and `nanus sessions` does not expose it. `nanus sessions delete <ref>` with the same refusal rules as naming; a confirmation in the interface can follow. |
+| # | Item | Where it landed |
+|---|---|---|
+| 1 | **Approval is enforced at the tool boundary.** A tool declares what it can touch, the sandbox decides what runs unasked, and a call outside it is denied unless an answerer grants it — `never` without asking anyone, and `ask` failing closed when nobody can answer. The system prompt carries the runtime policy. | `nanus-domain/src/approval.rs`, `nanus-bundle/src/agent_loop.rs` |
+| 2 | **The interface and the CLI answer it.** An `approval` frame and an `approve` request cross the link, the interface draws a dialog and answers, and `nanus run` prompts on the terminal — or denies, when stdin is not one. | `nanus-link/src/{protocol,server}.rs`, `nanus-tui/src/{runtime,view}.rs`, `nanus-cli/src/approve.rs` |
+| 3 | **A step's tool calls run together, bounded by `max_parallel_tools`.** Cooperative concurrency with results recorded in call order, and decisions kept sequential so an approval question is asked one at a time. | `nanus-bundle/src/agent_loop.rs` |
+| 4 | **The live tool-call frames are verified.** A real `api.deepseek.com` tool-call response is replayed byte for byte; it decoded with no change to the wire. | `nanus-bundle/tests/data/`, `live_wire.rs` |
+| 5 | **The link handshake is versioned.** A mismatch is a sentence naming both versions rather than a decode error mid-turn, and an unversioned handshake is refused rather than assumed compatible. | `nanus-link/src/{protocol,client,error}.rs` |
+| 6 | **`nanus sessions delete <ref>` removes a session**, resolving the reference as naming does and refusing one that answers to nothing. The interface has no key for it yet. | `nanus-cli/src/cli.rs` |
 
 ## Next: what the interface needs to be a daily driver
 
