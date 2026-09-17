@@ -4,9 +4,10 @@
 
 **A coding agent you can take apart.**
 
-Eleven crates of safe Rust. A seven-tool toolset. Every part of it — the model adapter,
-the tool registry, the session log, the permission policy, and the agent loop itself —
-is a plugin you can remove, replace, or write yourself.
+Eleven crates of safe Rust. A seven-tool toolset. Everything the agent runs on — the
+filesystem, the shell, the session log, the model adapter, and the tool registry — is a
+plugin you can remove, replace, or write yourself, and the loop over them is built from
+the handles they publish.
 
 [![tests](https://img.shields.io/badge/tests-918%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)

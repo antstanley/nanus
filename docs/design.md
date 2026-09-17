@@ -173,8 +173,18 @@ because they name the actual mechanism rather than a mood:
   is a dependency, never a boot script. The tool provider and the model adapter can be
   staged in either order.
 
-Together they are why "everything is a plugin" is a mechanism here rather than a slogan.
-The agent loop itself is a plugin. So you can replace it.
+Together they are why "everything below the loop is a plugin" is a mechanism here rather
+than a slogan. The clock, the filesystem, the shell, the session log, the model adapter, and
+the tool registry are services on the kernel, and the loop consumes them, so replacing the
+provider or the toolset needs no edit to the loop at all.
+
+The loop is not itself a plugin, and this page used to say it was. It is built — by
+`compose::build_runner`, over those same handles, which is what makes the sentence above
+true — and then handed to the caller rather than provided as a service, so replacing it
+means editing the composition rather than unloading one component and mounting another.
+Closing that gap is the one place the framework's story is still a promise rather than a
+mechanism, and it is worth doing for the reason the promise was made: a replacement loop
+registered like any other component, activated when the ports it needs appear.
 
 The design follows _A Programming Paradigm for Spatiotemporal Composability_
 ([arXiv:2608.25512](https://arxiv.org/abs/2608.25512)). Where the paper and the shipped

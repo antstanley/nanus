@@ -28,8 +28,9 @@ that runs a turn.
   that holds sessions open across terminals. See [the service](service.md).
 - **A bounded turn.** `max_steps_per_turn` (default 512) caps a turn; the model
   is told its budget, and an ending always says why it stopped — completed,
-  blocked by a policy, errored, at the token ceiling, out of steps, or
-  interrupted.
+  errored, at the token ceiling, out of steps, or interrupted. Those five are what
+  the harness produces; the domain's vocabulary carries two more, a policy block
+  and a human abort, that nothing mints yet.
 - **Interruptible turns.** `Ctrl+C` / `Esc` in the interface and `SIGINT` on a
   headless run ask the turn to stop at the next safe point.
 - **A step's tool calls run together, bounded.** `max_parallel_tools` (default 4)
@@ -38,9 +39,13 @@ that runs a turn.
   call and its result in call order, whatever order the work finished in.
 - **A model-visible failure instead of a panic.** A bad tool argument is a
   failed tool result the model can correct, not a harness error.
-- **Everything is a plugin.** The model adapter, tool registry, session log,
-  approval policy, and the agent loop itself mount on the kernel and can be
-  replaced or unloaded. See [design decisions](design.md) and
+- **Everything below the loop is a plugin.** The clock, the filesystem, the shell,
+  the session log, the model adapter, and the tool registry mount on the kernel as
+  services, so a different provider, toolset, store, or filesystem is a plugin rather
+  than an edit to the loop — and unloading one withdraws it and deactivates what
+  depended on it. The permission policy and the agent loop are *not* plugins: the
+  policy is a configuration value the loop reads, and the loop is built over the
+  handles the composition publishes. See [design decisions](design.md) and
   [architecture](architecture.md).
 
 ## The toolset
@@ -131,6 +136,7 @@ ignored, and there is no field that can hold the API key. See
 | `workspace_root` | the current directory | root the tools are confined to |
 | `service_socket` | `<nanus home>/run/agent.sock` | where a service listens |
 | `service_log` | `<nanus home>/nanus-service.log` | where a detached service writes |
+| `config_version` | the build's version | the schema the file was written with; a newer one is refused, and a missing one is read as the pre-1.0 shape and migrated |
 
 Environment variables:
 
@@ -145,7 +151,10 @@ Environment variables:
 
 ## The command line
 
-Global options on `nanus`: `--verbose`, `--quiet`, `--config <PATH>`.
+Global options on `nanus`: `--verbose`, `--quiet`, `--config <PATH>`. `--quiet` is
+accepted and does nothing, because the default already is what it asks for — stdout
+carries the answer and nothing else on every run — and it conflicts with `--verbose`,
+which asks for progress on stderr.
 
 | Command | What it does |
 |---|---|
@@ -234,6 +243,11 @@ The only thing the core and the interface share. See
   question or prompt, the progress of a turn (text, reasoning, step boundaries,
   tool call and result, usage), an approval question and its answer, the ending and
   its reason, and interrupt, status, and shutdown requests.
+- **A tool call and its result are identifiable.** Both tool frames carry the call's
+  id, so a client pairs them by identity rather than by the order two frames happened
+  to arrive in — a step sends every call before any result, and its results arrive in
+  the order the tools finished. A frame from an agent too old to send one leaves the
+  client to pair by name and order, which is what it did before the field existed.
 - **Local only by construction.** No port, no TLS, no remote mode; the
   reachable set is processes already running as the same user.
 - **The session log is the authority.** The link carries what happened; history
@@ -245,7 +259,11 @@ The Cordis-style kernel is the framework underneath. See
 [architecture](architecture.md#how-the-two-halves-fit).
 
 - **Revertible effects**: every registration records its inverse, and unloading
-  a plugin reverts in reverse order.
+  a plugin reverts in reverse *activation* order — not reverse declaration order, which
+  differs as soon as a plugin is written above something it depends on. A withdrawal
+  also waits for the deactivations it causes, however deep the chain, so a dependent's
+  teardown still resolves what it borrowed. `tests/composition.rs` asserts the trace
+  order rather than the end state.
 - **Reactive coeffects**: a component declares the services it needs and is
   activated when they appear and deactivated when they vanish, so load order is
   a dependency rather than a boot script.

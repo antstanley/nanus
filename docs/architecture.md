@@ -95,8 +95,12 @@ unpacking because they are the actual mechanism:
   runtime activates it when they appear and deactivates it when they vanish. Load order
   is a dependency, never a boot script.
 
-Together they are why "everything is a plugin" is a mechanism here rather than a
-slogan. The agent loop itself is a plugin. So you can replace it.
+Together they are why "everything below the loop is a plugin" is a mechanism here rather
+than a slogan: the ports and the tool registry are components the runtime activates, and the
+loop is built over the handles they publish. The loop itself is not one of them — it is
+handed to its caller rather than provided as a service, so replacing it is an edit to the
+composition. [The design decisions](design.md#the-two-halves-and-why-they-are-the-mechanism)
+say why that gap exists and what closing it would take.
 
 The design follows _A Programming Paradigm for Spatiotemporal Composability_
 ([arXiv:2608.25512](https://arxiv.org/abs/2608.25512)) and the reference harness

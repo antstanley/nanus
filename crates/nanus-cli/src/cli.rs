@@ -63,7 +63,14 @@ pub struct Args {
     #[arg(long, global = true)]
     pub verbose: bool,
 
-    /// Print nothing but the answer on stdout.
+    /// Print nothing but the answer on stdout, which is the default.
+    ///
+    /// Accepted and deliberately without an effect of its own: stdout carries the answer and
+    /// nothing else on every run, so this says out loud what the program already does, and a
+    /// script that wants to state its expectation can. It conflicts with `--verbose` because
+    /// the two ask for opposite things — one for progress on stderr, one for none of it —
+    /// and a caller that asked for both has a mistake worth being told about rather than a
+    /// precedence rule to remember.
     #[arg(long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 

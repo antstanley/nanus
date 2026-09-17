@@ -8,9 +8,11 @@ compiler, so most habits from other Rust projects will fail the build here.
 
 `nanus` is a coding-agent harness in safe Rust: a headless CLI and an interactive
 TUI over a Rust implementation of the [Cordis](https://github.com/cordiverse/cordis)
-meta-framework. Every part of it — the model adapter, the tool registry, the
-session log, the permission policy, and the agent loop — is a plugin mounted on a
-shared kernel context.
+meta-framework. The clock, the filesystem, the shell, the session log, the model
+adapter, and the tool registry are plugins mounted on a shared kernel context, and the
+agent loop is built over the handles they publish. The loop itself is *not* a plugin:
+`compose` hands it to the caller rather than registering it, so replacing it means
+editing `crates/nanus-bundle/src/compose.rs`.
 
 The front door for humans is [`README.md`](README.md). The docs in
 [`docs/`](docs/README.md) explain *why* things are the way they are, and agents
