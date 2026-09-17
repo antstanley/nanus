@@ -67,26 +67,129 @@ places where a document already says something the code does not yet do.
 
 ## Next: new capabilities
 
-Three additions larger than a feature but short of a rewrite: a way to package
-behaviour, a way to hold a secret, and a goal that outlives a turn. Skills come
-first because `/goal` is a natural thing to ship as one.
+Four additions larger than a feature but short of a rewrite: a way to package
+behaviour, a way to hold a secret, a goal that outlives a turn, and a tool that
+starts another agent. Skills come first because `/goal` is a natural thing to
+ship as one.
 
 | # | Item | Size | Notes |
 |---|---|---|---|
 | 22 | **Agent skills: `SKILL.md` discovery and progressive disclosure.** | **M** | A skill is a directory with a markdown file whose frontmatter names it and says when to use it; the body is loaded only when it applies. PrimeIntellect's [goal skill](https://github.com/PrimeIntellect-ai/prime-agent/blob/b6ac5d014d99401b55820835a4966584271e9a3c/packages/coding-agent/skills/goal/SKILL.md) is the reference shape. The pieces are a loader (a user directory under `<nanus home>/skills/`, optionally a workspace one), a frontmatter parser, and a way to reach the body: either a `skill` tool — which collides with the seven-tool invariant and would need a design note — or a prompt section, which is where the domain's unused `PromptBuilder` already points. A skill read from the workspace is untrusted input, as [SAFETY.md](../SAFETY.md) says of anything that reads files. Grows to **L** if a packaged core library and a tool are both wanted. |
 | 23 | **Secret storage: an OS keychain instead of `DEEPSEEK_API_KEY`.** | **L** | Move the provider key out of the environment and into the platform store — Keychain on macOS, Secret Service on Linux, Credential Manager on Windows — behind a new `SecretPort` in `nanus-ports` and a keyring adapter, with `nanus auth set` / `clear` / `status` and the `nanus config` presence line it already prints. The environment variable stays as a fallback for CI and containers. The hard part is the service: a detached `nanus service` may run with no unlocked keychain and no session bus, so the design needs a defined fallback (a `0600` file under `NANUS_HOME`) or a fail-closed refusal, and the key must never reach the config, a log, or `Debug` — guarantees the current design already keeps. |
 | 24 | **A goal: a durable objective that continues across turns (`/goal`).** | **L** | A session-scoped completion contract: one objective per session, persisted in the log, with a phase (`active` / `paused` / `blocked` / `complete`), a budget, and evidence-based completion. Three surfaces, which can land in stages: the state as a durable `goal/change` session event folded by the domain (the log is already the only source of model history); model tools to read, edit, and complete it; and a human `/goal` that needs a new link request, because the interface cannot mutate a session it does not own. Automatic continuation is an agent-side driver that queues one turn while the session is idle, bounded by the goal budget *and* the existing turn budget. See [the goal research note](goal-research.md). The largest of the three and the one with the most decisions left open; possibly **XL** if it lands whole. |
+| 25 | **An `agent` tool: spawn a sub-agent to do a task.** | **XL** | The model calls it with a `prompt`, a `provider`, a `model`, and a `reasoning_effort`, and gets the child's answer (or a handle) back; with a handle it can send follow-ups and check the child's progress on demand, without pulling a whole transcript into its own context. It is more than an eighth tool: it composes a second agent at runtime, with its own session, policy, and budget, and a channel the parent and child can talk over. Depends on a provider factory (item 26) and per-request effort (item 11). See [the detail below](#the-agent-tool-in-more-detail). |
+
+### The `agent` tool, in more detail
+
+The argument list is what makes the tool more than a second turn: the choice of
+agent travels with the call rather than with the process.
+
+```text
+agent(prompt, provider?, model?, reasoning_effort?)
+```
+
+- **`prompt`** is the task, and the child's answer comes back as the tool result
+  the parent reads — the same shape as any other tool, so the parent's loop needs
+  no new vocabulary for the common case.
+- **`provider`, `model`, and `reasoning_effort`** select the child's model per
+  call. `provider` is why this is a runtime composition rather than a second
+  `Harness`: the process builds one adapter from configuration today
+  (`build_llm`), so a per-call choice needs a provider factory keyed by name —
+  which is what makes the second-provider and runtime-switching items
+  prerequisites rather than siblings.
+- **The bounds** are not optional. A child needs its own step and token budget,
+  the tree needs a depth limit and a cap on children, and the parent's budget has
+  to account for what its children spent. A parent that can spawn without a bound
+  has rebuilt the cost hazard the turn budget exists to prevent.
+
+Two communication shapes are worth keeping distinct:
+
+- **Synchronous** — the tool call returns when the child finishes. No mid-flight
+  channel, and the simplest thing that is still useful: "go and find this out".
+- **A child with a mailbox** — the call returns an id, and the parent can send a
+  follow-up, check the child's progress, wait, or cancel. Delivery belongs at the
+  child's turn boundary and never into the middle of one, exactly as the link
+  refuses a prompt to a busy session. The child is a session, so its transcript is
+  already the observation channel; a follow-up is just the next prompt, and it
+  should be recorded as coming from the parent rather than from a person.
+
+The questions to settle before the code are the policy ones: whether a child
+inherits the parent's sandbox and approval policy (it should), whether an `ask`
+the user cannot be shown from inside a child denies the call (it must, fail
+closed), whether a child may itself call `agent` (a depth limit, or a flag), and
+how a child's session is linked to its parent so `nanus sessions` can show a
+tree. Child progress also has nowhere to appear yet: the link's frames are flat,
+so either a child's turn is not streamed to the parent's client or the frame
+vocabulary grows a way to nest one.
+
+### Following a child's progress
+
+The point of reading a child is to know whether it is making progress or stuck,
+not to replay its work — and the parent's context is the scarce resource, so the
+read is a deliberate check-in, never a stream. Nothing from a child reaches the
+parent automatically. The parent asks, on its own cadence, and only what it asks
+for is charged to its context; there is no timer that pushes a child's output
+into the parent, and no check-in happens at all unless the parent makes one.
+
+Two reads are worth having, and they are different sizes:
+
+- **A progress digest, for the question "is it stuck?"** A small, bounded summary
+  of the child's current state: whether it is running, idle, or finished, how many
+  steps it has taken, how long it has run, what it has spent, the newest thing it
+  said, and the last few tool calls with their outcomes. It is a pure fold of the
+  child's session events, like the transcript fold but pointed at the present
+  rather than the whole history — the same idea as `Ctrl+T` summarising a run of
+  tool calls, computed in the bundle so it does not need the interface crate.
+  This is what a periodic check-in uses, and it should fit in a few hundred
+  tokens regardless of how long the child has been running.
+- **A transcript window, for the question "what did it actually do?"** A tail, or
+  everything since a cursor, bounded by a count — the convention `read` already
+  uses. This is the explicit request, and it is the read that can grow, which is
+  exactly why it is not the default.
+
+**Progressive by cursor.** A check-in returns only what has happened since the
+parent last looked, so polling a long-running child costs the new steps rather
+than a replay from the start. A parent that ignores the cursor and asks for the
+whole transcript is choosing to pay for it, and the count cap still bounds the
+answer.
+
+The digest is also where "stuck" should be named rather than left for the parent
+to infer: repeated identical tool calls, a run of failing results, no new step
+between two check-ins, a budget nearly exhausted, or a turn that ended without
+the objective. Saying so is what lets the parent decide to send guidance, cancel,
+or take the work over — the decision the read exists to inform.
+
+Three constraints shape the read itself:
+
+- **The unit is the child's own session events**, because that is what the child
+  writes and what outlives it: a parent that reads a finished child reads the
+  same log `nanus tui --session` would. The digest is a fold over those events
+  rather than a second source of truth.
+- **Reading must not contend with the child's turn.** A turn owns the log while
+  it runs, which is why the link server caches what a listing shows rather than
+  borrowing the session. Progress therefore has to come from a snapshot the
+  child publishes as it appends, or from reads between its steps — never from a
+  second borrow of a session a turn is writing.
+- **A parent reads what it spawned, and no further.** The store has no ownership
+  relation today, so a child has to record its parent for the read to be scoped
+  rather than a way to read any session on the machine.
+
+Worth stating plainly: a child's transcript is everything the child saw,
+including any file or command output it read, so a parent that pulls a window of
+it into its own context is choosing to send that to its model. Bound the window
+with a count, as every other read here is bounded — and prefer the digest when
+the question is only whether the child needs help.
 
 ## Later: larger bets
 
 | # | Item | Size | Notes |
 |---|---|---|---|
-| 25 | **A second model provider.** | **M** | The `LlmPort` seam is real and an OpenAI-compatible adapter is mostly request and response encoding; a genuinely different protocol is more like an **L**. Nothing in the tools or the domain should change. |
-| 26 | **An OS-enforced sandbox.** | **XL** | Confinement is advisory: the tools refuse or confine writes, but an approved program can do anything the user can, including reach the network. Landlock or seccomp on Linux and `sandbox-exec` on macOS, with the platform and `unsafe` story written down first. |
-| 27 | **Network confinement.** | **XL** | Part of 26, and separable only if 26 lands as a mechanism with more than one policy. |
-| 28 | **Windows support.** | **XL** | The link is a Unix domain socket and the shell adapter depends on `nix` for process groups, so this is a transport plus a process-lifecycle story, not a build flag. |
-| 29 | **Automated end-to-end tests for the interface.** | **M** | Raw mode needs a real terminal; a PTY-backed test binary would cover the alternate screen and the drawing that are manual today. |
-| 30 | **Background tasks (`Ctrl+B`).** | **L** | Needs a task model the agent and the session own, not just a key in the interface. |
+| 26 | **A second model provider.** | **M** | The `LlmPort` seam is real and an OpenAI-compatible adapter is mostly request and response encoding; a genuinely different protocol is more like an **L**. Nothing in the tools or the domain should change. |
+| 27 | **An OS-enforced sandbox.** | **XL** | Confinement is advisory: the tools refuse or confine writes, but an approved program can do anything the user can, including reach the network. Landlock or seccomp on Linux and `sandbox-exec` on macOS, with the platform and `unsafe` story written down first. |
+| 28 | **Network confinement.** | **XL** | Part of 27, and separable only if 27 lands as a mechanism with more than one policy. |
+| 29 | **Windows support.** | **XL** | The link is a Unix domain socket and the shell adapter depends on `nix` for process groups, so this is a transport plus a process-lifecycle story, not a build flag. |
+| 30 | **Automated end-to-end tests for the interface.** | **M** | Raw mode needs a real terminal; a PTY-backed test binary would cover the alternate screen and the drawing that are manual today. |
+| 31 | **Background tasks (`Ctrl+B`).** | **L** | Needs a task model the agent and the session own, not just a key in the interface. |
 
 ## By design, not planned
 
