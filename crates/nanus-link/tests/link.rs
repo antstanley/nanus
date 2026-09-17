@@ -262,7 +262,12 @@ fn agent_over(dir: &Path, llm: Rc<Box<dyn LlmPort>>, model: &str) -> (Agent, Sto
         store: store.clone(),
         clock: SystemClock::new().handle(),
         workspace: dir.to_path_buf(),
-        model: model.to_owned(),
+        // The shipped ids plus whatever this test scripts, so a switch has somewhere to go and
+        // the model in use is still in the list.
+        models: nanus_bundle::model_ids()
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect(),
         tools: 0,
     });
     (agent, store)
@@ -357,7 +362,7 @@ fn gated_agent(dir: &Path, approval: ApprovalPolicy) -> (Agent, StoreHandle) {
         store: store.clone(),
         clock: SystemClock::new().handle(),
         workspace: dir.to_path_buf(),
-        model: "calling".to_owned(),
+        models: vec![String::from("calling")],
         tools: 1,
     });
     (agent, store)
@@ -467,6 +472,95 @@ fn a_prompt_streams_an_answer_and_records_the_session() {
     assert!(
         listed.first().is_some_and(|row| row.event_count > 0),
         "the turn left events behind: {listed:?}"
+    );
+}
+
+/// A model switch reaches the agent, is broadcast to the client that asked, and is refused by
+/// name when the id is one the agent does not offer.
+///
+/// The refusal is the half that matters: an id forwarded to the provider is a request rather
+/// than a diagnosis, and the sentence names the ids that do exist so a client can act on it.
+#[test]
+fn a_model_switch_reaches_the_agent_and_is_answered() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(ScriptedLlm)), "scripted");
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let outcome = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        // The handshake is where a client learns what it may ask for: an interface that
+        // cycled a list of its own would offer models the agent refuses.
+        let offered = client.info().models.clone();
+        client.start(None).await.expect("a session starts");
+        // The attachment says which model is answering, so the client draws it before the
+        // reader types rather than after the first answer. The frames after `Attached` are the
+        // approval state and this one.
+        let before = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::ModelChanged { model }) => break model,
+                Some(_) => {}
+                None => break String::new(),
+            }
+        };
+        assert_eq!(
+            before, "scripted",
+            "the attachment says which model answers"
+        );
+
+        let chosen = String::from("deepseek-v4-pro");
+        client
+            .send(&Request::SetModel {
+                model: chosen.clone(),
+            })
+            .await
+            .expect("the switch is sent");
+        let broadcast = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::ModelChanged { model }) => break model,
+                Some(_) => {}
+                None => break String::new(),
+            }
+        };
+
+        // An id the agent does not offer is refused, and the sentence says what it does offer.
+        client
+            .send(&Request::SetModel {
+                model: String::from("deepseek-chat"),
+            })
+            .await
+            .expect("the request is sent");
+        let refused = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::Failed { message }) => break message,
+                Some(_) => {}
+                None => break String::new(),
+            }
+        };
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        (offered, broadcast, refused)
+    });
+    let (offered, broadcast, refused) = outcome;
+
+    assert!(
+        offered.contains(&String::from("deepseek-v4-pro")),
+        "the handshake offers the models the agent will accept: {offered:?}"
+    );
+    assert_eq!(
+        broadcast, "deepseek-v4-pro",
+        "the switch is broadcast to the client that made it"
+    );
+    assert!(
+        refused.contains("deepseek-chat") && refused.contains("deepseek-v4-pro"),
+        "the refusal names the id and the ones that exist: {refused}"
     );
 }
 

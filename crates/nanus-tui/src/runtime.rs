@@ -39,6 +39,7 @@
 //! | `Ctrl+T` / `Ctrl+E` | summarise runs of tool calls / of reasoning |
 //! | `Ctrl+K` / `Ctrl+U` / `Ctrl+Y` | delete to the line's end / the line / put it back |
 //! | `Ctrl+W` / `Alt+B` / `Alt+F` | delete a word / move a word back / forward |
+//! | `Alt+P` | switch to the next model the agent offers |
 //! | `Ctrl+L` | clear the transcript |
 //! | `Backspace` / `Delete` | delete a character |
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
@@ -309,6 +310,22 @@ pub trait SessionSource {
         None
     }
 
+    /// The models this source may be switched between, in the agent's own order.
+    ///
+    /// Empty when there is nothing to switch: a recorded transcript has no agent, so the key
+    /// says so rather than offering a list that nothing would honour.
+    fn models(&self) -> &[String] {
+        &[]
+    }
+
+    /// Which model the conversation is being answered by, when one was said.
+    ///
+    /// `None` means nothing recorded one — a session from before the configuration was written
+    /// down — which the title bar draws as nothing rather than as a guess.
+    fn model(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether a turn is already running when the interface opens.
     ///
     /// A client that attaches mid-turn has missed the prompt that started it, so nothing
@@ -349,6 +366,12 @@ pub trait SessionSource {
     /// A default of doing nothing, for the same reason as [`SessionSource::interrupt`]: a
     /// recording has no agent to tell, and its displayed state is whatever the flag said.
     fn set_approval(&mut self, _policy: ApprovalPolicy) {}
+
+    /// Tells the agent which model to use from now on.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::set_approval`]: a
+    /// recording has no agent to tell, and the model it shows is the one it was recorded with.
+    fn set_model(&mut self, _model: &str) {}
 
     /// Releases whatever the source owns.
     ///
@@ -449,6 +472,14 @@ impl SessionSource for Recording {
         &self.session
     }
 
+    /// The model the session was recorded under, which is what a reader of it wants to know
+    /// and is not a claim about anything that could be switched.
+    fn model(&self) -> Option<&str> {
+        self.session
+            .origin()
+            .and_then(|origin| origin.model.as_deref())
+    }
+
     fn initial_scroll(&self) -> u32 {
         self.scroll_back
     }
@@ -484,6 +515,9 @@ pub struct Remote {
     pending: Option<mpsc::UnboundedReceiver<Request>>,
     /// The approval state a startup flag asked for, sent once the agent is attached.
     approval: Option<ApprovalPolicy>,
+    /// The model the agent reported, and the ones it offers to switch between.
+    model: Option<String>,
+    models: Vec<String>,
     /// Whether a turn was already running in the session when it was attached to.
     busy: bool,
 }
@@ -531,6 +565,8 @@ impl Remote {
             requests,
             pending: Some(pending),
             approval,
+            model: Some(agent.model.clone()),
+            models: agent.models.clone(),
             busy,
         })
     }
@@ -573,6 +609,14 @@ async fn history(store: &StoreHandle, attached: &SessionInfo, workspace: &str) -
 impl SessionSource for Remote {
     fn session(&self) -> &Session {
         &self.session
+    }
+
+    fn models(&self) -> &[String] {
+        &self.models
+    }
+
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     fn label(&self) -> Option<&str> {
@@ -621,6 +665,12 @@ impl SessionSource for Remote {
     fn set_approval(&mut self, policy: ApprovalPolicy) {
         self.send(Request::SetApproval {
             state: wire_state(policy),
+        });
+    }
+
+    fn set_model(&mut self, model: &str) {
+        self.send(Request::SetModel {
+            model: model.to_owned(),
         });
     }
 }
@@ -829,6 +879,8 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     // render, when the viewport it is measured against is known.
     view.pending_scroll_back = Some(source.initial_scroll());
     view.label = source.label().map(str::to_owned);
+    view.model = source.model().map(str::to_owned);
+    view.models = source.models().to_vec();
     // Only when one was asked for: the default is already the fail-closed state, and a live
     // conversation overwrites this with the agent's own answer as soon as it is attached.
     if let Some(policy) = source.initial_approval() {
@@ -933,6 +985,7 @@ async fn event_loop(
                             };
                         }
                     }
+                    Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
                     Outcome::SetApproval(policy) => {
                         // Applied locally first, so the status line answers the keypress
                         // immediately, and sent to the agent, which owns the gate: the state
@@ -949,6 +1002,9 @@ async fn event_loop(
                                 // interface did, and the colour is how a reader tells them apart.
                                 view.transcript.push(Entry::notice(view.stats.report()));
                                 view.scroll_to_bottom();
+                            }
+                            Routed::SetModel(requested) => {
+                                switch_model(requested, source, &mut view);
                             }
                             Routed::Help => view.open_help(),
                             Routed::Clear => {
@@ -1011,6 +1067,12 @@ enum Routed {
     /// Routed for the same reason as [`Routed::Stats`]: the draft and the toggles are the
     /// view's state, and clearing one of them is not something a router can do.
     Clear,
+    /// Switch to this model, or cycle when nothing is named.
+    ///
+    /// Routed for the same reason as [`Routed::Stats`]: which models exist is the agent's
+    /// answer, carried in the handshake and held by the view, and a router that decided a
+    /// switch was valid would be a second list of model ids to keep true.
+    SetModel(Option<String>),
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1026,6 +1088,9 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         Submission::Run(Command::Stats) => Routed::Stats,
         Submission::Run(Command::Help) => Routed::Help,
         Submission::Run(Command::Clear) => Routed::Clear,
+        // The argument is the rest of the line: `/model` cycles and `/model <id>` names one,
+        // which is the pair a command with a useful default and a useful argument offers.
+        Submission::Run(Command::Model) => Routed::SetModel(model_argument(&prompt)),
         Submission::Unknown(name) => Routed::Say(format!(
             "no such command: {name} — this interface knows {}",
             Command::NAMES.join(" and ")
@@ -1100,6 +1165,56 @@ fn flush_queue(source: &mut dyn SessionSource, view: &mut ViewState) {
     source.submit(prompt);
 }
 
+/// Switches the model, or says why it could not.
+///
+/// The list the switch is checked against came from the agent's handshake, which is what makes
+/// the refusal here a sentence rather than a round trip: the agent refuses an id it does not
+/// offer too, and this is the same decision made where the reader is looking.
+fn switch_model(requested: Option<String>, source: &mut dyn SessionSource, view: &mut ViewState) {
+    let chosen = if let Some(named) = requested {
+        if !view.models.contains(&named) {
+            view.status = format!("no such model: {named}");
+            return;
+        }
+        named
+    } else {
+        let Some(next) = next_model(&view.models, view.model.as_deref()) else {
+            view.status = String::from("this session offers no model to switch to");
+            return;
+        };
+        next
+    };
+    // Applied locally first, so the title bar answers the keypress immediately, and sent to
+    // the agent, which is what names the model in a request. The agent answers with
+    // `ModelChanged`, which is the same value and the authority when the two disagree.
+    view.model = Some(chosen.clone());
+    view.status = format!("model: {chosen}");
+    source.set_model(&chosen);
+}
+
+/// The model a cycle moves to, or `None` when there is nothing to move to.
+///
+/// A model not in the list starts the cycle at the first one, which is what keeps the key
+/// useful when a session is resumed under an id this build no longer offers: the alternative
+/// is a key that does nothing in exactly the case a reader most wants it.
+fn next_model(models: &[String], current: Option<&str>) -> Option<String> {
+    let first = models.first()?;
+    let Some(current) = current else {
+        return Some(first.clone());
+    };
+    let position = models
+        .iter()
+        .position(|id| id == current)
+        .unwrap_or_else(|| models.len().saturating_sub(1));
+    let next = models.get(position.saturating_add(1)).unwrap_or(first);
+    Some(next.clone())
+}
+
+/// The model named after a command, if one was.
+fn model_argument(line: &str) -> Option<String> {
+    line.split_whitespace().nth(1).map(str::to_owned)
+}
+
 /// The status line while prompts are waiting.
 fn queued_status(waiting: usize) -> String {
     format!("queued · {waiting} waiting · Ctrl+Q to edit")
@@ -1117,6 +1232,32 @@ fn queue_edit_finished(view: &mut ViewState) {
     } else {
         String::from("ready")
     };
+}
+
+/// Ends the interface's view of a turn and points the reader at what ended it.
+///
+/// An open question goes with the turn that raised it: the call it was about was answered on
+/// the agent's side — denied, or the turn never got that far — and a dialog left on screen
+/// would ask the reader to decide something that is already over. The transcript follows,
+/// because the sentence that says *why* the turn ended is written after the turn does.
+fn closed(view: &mut ViewState) {
+    view.pending_approval = None;
+    view.end_turn();
+    view.follow();
+}
+
+/// Renders a tool frame's arguments for the transcript.
+///
+/// Rendered here rather than in the frame's handler because a transcript entry holds a
+/// *rendered* form: what a reader sees is the view's decision, and the wire's job is to carry
+/// what the model sent. A frame from an agent that predates the arguments decodes to `null`,
+/// which is "nothing to show" rather than the word `null` — the compact line is then the tool
+/// alone.
+fn tool_arguments(arguments: serde_json::Value) -> String {
+    match arguments {
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 /// What a keystroke asked for.
@@ -1147,6 +1288,8 @@ enum Outcome {
     },
     /// Tell the agent to use this approval state from now on.
     SetApproval(ApprovalPolicy),
+    /// Switch to this model, or to the next one when nothing is named.
+    SetModel(Option<String>),
 }
 
 /// Applies one keystroke to the view.
@@ -1467,6 +1610,12 @@ fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.input.move_word_right();
             Outcome::Continue
         }
+        // `Alt+P` switches models, on the same rule as the two above: the key *code* is read,
+        // so a terminal that reports the character its modifier state produced still reaches
+        // this arm. The choice is not made here — which models exist is the agent's answer,
+        // held by the view — so the key asks for the next one and the switch decides whether
+        // there is one.
+        KeyCode::Char('p' | 'P') if alt => Outcome::SetModel(None),
         // `?` is the key list, and only on an empty prompt. The gate is the price of the
         // binding: a prompt may open with a question mark, and swallowing it would make this
         // interface unable to ask a question that starts with one. A reader who means to type
@@ -1686,6 +1835,12 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // startup is drawn without the reader pressing anything.
             view.approval = view_policy(state);
         }
+        Frame::ModelChanged { model } => {
+            // The agent is the authority here too, and for a stronger reason: it is the model
+            // named in the next request. A client that switched it has already drawn the
+            // switch, and a client watching another conversation learns it from this frame.
+            view.model = Some(model);
+        }
         Frame::Tool {
             call_id,
             name,
@@ -1694,17 +1849,10 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // Followed like every other append: a tool line that arrives below the fold is a
             // line the reader is not shown, and the transcript's own rule is that everything
             // which appends follows.
-            // Rendered once, here, because a transcript entry holds a *rendered* form: what
-            // a reader sees is the view's decision, and the wire's job is to carry what the
-            // model sent. A frame from an agent that predates the arguments decodes to
-            // `null`, which is "nothing to show" rather than the word `null` — the compact
-            // line is then the tool alone.
-            let arguments = match arguments {
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            };
-            view.transcript
-                .push(call_entry(Entry::tool_call(name, arguments), call_id));
+            view.transcript.push(call_entry(
+                Entry::tool_call(name, tool_arguments(arguments)),
+                call_id,
+            ));
             view.follow();
         }
         Frame::ToolDone {
@@ -1754,30 +1902,20 @@ fn apply(frame: Frame, view: &mut ViewState) {
         // the model happened to say was put on screen as its conclusion, and the reader
         // was left to work out from the silence that the work had been cut off.
         Frame::Done { answer, reason } => {
-            // A turn that ends takes any open question with it: the call it was about was
-            // answered on the agent's side — denied, or the turn never got that far — and a
-            // dialog left on screen would ask the reader to decide something that is over.
-            view.pending_approval = None;
             if let Some(notice) = stopping_notice(&reason, view.step) {
                 view.transcript.settle_tail();
                 view.transcript.push(Entry::notice(notice));
             } else {
-                // Reconciliation rather than a second copy: the answer already streamed
-                // in delta by delta, and settling that entry is what stops the same
-                // paragraph being drawn twice.
+                // Reconciliation rather than a second copy: the answer already streamed in
+                // delta by delta, and settling that entry is what stops the same paragraph
+                // being drawn twice.
                 view.transcript.settle_with(Role::Assistant, &answer);
             }
-            view.end_turn();
-            view.follow();
+            closed(view);
         }
         Frame::Failed { message } => {
-            // The last frame a transport sends, so an unfollowed notice is one the reader may
-            // never see: the status line goes back to ready either way, and a failure nobody
-            // was shown is a failure reported nowhere. An open question goes with it.
-            view.pending_approval = None;
             view.transcript.push(Entry::notice(message));
-            view.follow();
-            view.end_turn();
+            closed(view);
         }
         // Frames that describe the connection rather than the conversation. The interface
         // learned what it needed from the handshake and the attachment before it drew
@@ -1891,6 +2029,12 @@ mod tests {
             self.requests
                 .borrow_mut()
                 .push(Request::Prompt { text: prompt });
+        }
+
+        fn set_model(&mut self, model: &str) {
+            self.requests.borrow_mut().push(Request::SetModel {
+                model: model.to_owned(),
+            });
         }
     }
 
@@ -2412,6 +2556,113 @@ mod tests {
         assert!(!view.help_open, "a prompt means the key is text");
     }
 
+    /// `Alt+P` switches, and the switch sends what it decided to the agent.
+    ///
+    /// The decision is checked against the list the agent offered, so the two ends agree: the
+    /// key asks, this picks, and the agent is told — and would refuse an id it does not offer
+    /// if the list here were ever wrong.
+    #[test]
+    fn the_model_key_cycles_the_list_the_agent_offered() {
+        let mut view = ViewState::new();
+        view.models = vec![String::from("one"), String::from("two")];
+        view.model = Some(String::from("one"));
+        let mut source = Scripted::new(Vec::new());
+
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('p'), KeyModifiers::ALT), &mut view),
+            Outcome::SetModel(None)
+        ));
+        switch_model(None, &mut source, &mut view);
+        assert_eq!(view.model.as_deref(), Some("two"));
+        assert_eq!(view.status, "model: two");
+
+        // Wrapping, rather than stopping at the end: the key is a cycle.
+        switch_model(None, &mut source, &mut view);
+        assert_eq!(view.model.as_deref(), Some("one"));
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[
+                Request::SetModel {
+                    model: String::from("two")
+                },
+                Request::SetModel {
+                    model: String::from("one")
+                },
+            ]
+        );
+    }
+
+    /// A source with nothing to switch — a recording — says so rather than pretending.
+    #[test]
+    fn a_model_switch_that_cannot_happen_is_said_out_loud() {
+        let mut view = ViewState::new();
+        let mut source = Scripted::new(Vec::new());
+        switch_model(None, &mut source, &mut view);
+        assert!(
+            view.status.contains("no model to switch to"),
+            "{}",
+            view.status
+        );
+        assert!(source.requests.borrow().is_empty(), "nothing was sent");
+
+        // A named model that is not offered is refused here, where the reader is looking, and
+        // not sent for the agent to refuse a round trip later.
+        view.models = vec![String::from("one")];
+        switch_model(Some(String::from("deepseek-chat")), &mut source, &mut view);
+        assert!(view.status.contains("no such model"), "{}", view.status);
+        assert!(view.status.contains("deepseek-chat"), "{}", view.status);
+        assert!(source.requests.borrow().is_empty());
+        assert_eq!(view.model, None, "a refused switch changes nothing");
+    }
+
+    #[test]
+    fn a_model_that_is_not_in_the_list_starts_the_cycle_at_the_first() {
+        let models = vec![String::from("one"), String::from("two")];
+        assert_eq!(next_model(&models, None), Some(String::from("one")));
+        assert_eq!(
+            next_model(&models, Some("deepseek-chat")),
+            Some(String::from("one")),
+            "a model the build no longer offers does not leave the key dead"
+        );
+        assert_eq!(next_model(&[], Some("one")), None);
+    }
+
+    /// The agent is the authority on which model is answering, so the reply wins over what the
+    /// client drew when it asked.
+    #[test]
+    fn a_model_frame_sets_the_model_that_is_drawn() {
+        let mut view = ViewState::new();
+        view.model = Some(String::from("one"));
+        apply(
+            Frame::ModelChanged {
+                model: String::from("two"),
+            },
+            &mut view,
+        );
+        assert_eq!(view.model.as_deref(), Some("two"));
+    }
+
+    /// A recording knows the model it ran under and offers nothing to switch to.
+    #[test]
+    fn a_recorded_session_reports_the_model_it_was_recorded_with() {
+        let origin = nanus_domain::Origin {
+            model: Some(String::from("deepseek-v4-pro")),
+            ..nanus_domain::Origin::default()
+        };
+        let recorded = session().with_origin(origin);
+        let recording = Recording::new(recorded);
+        assert_eq!(recording.model(), Some("deepseek-v4-pro"));
+        assert!(
+            recording.models().is_empty(),
+            "there is nothing to switch to"
+        );
+
+        // A session recorded before the configuration was written down says nothing rather
+        // than guessing, which the title bar draws as nothing at all.
+        let unknown = Recording::new(session());
+        assert_eq!(unknown.model(), None);
+    }
+
     /// The stop key means the thing that is happening now: with a turn running it asks the
     /// agent to stop, and only with nothing running does it reach the prompt and the
     /// session.
@@ -2501,6 +2752,19 @@ mod tests {
                 "clearing the transcript is the interface's to do"
             );
         }
+
+        // `/model` is routed rather than decided here: which models exist is the agent's
+        // answer, held by the view, and the router only says which of the two forms was asked
+        // for — a cycle, or a named id.
+        assert_eq!(
+            route_submission(String::from("/model"), true),
+            Routed::SetModel(None),
+            "a bare /model asks for the next one"
+        );
+        assert_eq!(
+            route_submission(String::from("/model deepseek-v4-pro"), true),
+            Routed::SetModel(Some(String::from("deepseek-v4-pro")))
+        );
 
         // Prose is prose, and a prompt in a recording is refused rather than dropped.
         assert_eq!(
@@ -3350,6 +3614,7 @@ mod tests {
             Frame::Status(nanus_link::protocol::AgentInfo {
                 workspace: "/tmp".to_owned(),
                 model: "m".to_owned(),
+                models: Vec::new(),
                 tools: 0,
                 version: nanus_link::protocol::PROTOCOL_VERSION,
             }),

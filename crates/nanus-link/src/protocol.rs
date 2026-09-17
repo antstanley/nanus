@@ -183,6 +183,21 @@ pub enum Request {
         state: ApprovalState,
     },
 
+    /// Replace the model every later request will name.
+    ///
+    /// The interface's runtime switch, sent when a reader cycles or names a model. A request
+    /// rather than part of a prompt because the *agent* issues the request to the provider: the
+    /// choice has to reach the loop, so that a model switched while a turn is running affects
+    /// the next step of that turn rather than the next conversation.
+    ///
+    /// An id the agent does not offer is refused with a sentence naming the ones it does, the
+    /// same way the handshake refuses a protocol it does not speak: a request that quietly
+    /// named a retired model would be answered by the provider, not by the harness.
+    SetModel {
+        /// The model id to use from now on.
+        model: String,
+    },
+
     /// Describe the agent without changing anything.
     Status,
 
@@ -309,6 +324,17 @@ pub enum Frame {
         /// Defaulted on the way in, so a reason-less question still decodes.
         #[serde(default)]
         reason: Option<String>,
+    },
+
+    /// The model the agent's next request will name.
+    ///
+    /// Sent once when a client attaches, so the interface knows what it is talking to before
+    /// it draws, and again whenever any client changes it, so two views of one agent cannot
+    /// disagree about which model is answering. A switch that reaches the agent therefore
+    /// reaches every watcher, which is precisely what a shared session needs.
+    ModelChanged {
+        /// The model id the agent is using now.
+        model: String,
     },
 
     /// The agent's approval state, for an interface to draw and cycle from.
@@ -488,6 +514,15 @@ pub struct AgentInfo {
     pub workspace: String,
     /// The model id the agent will call.
     pub model: String,
+    /// The model ids a client may switch this agent to, the current one first.
+    ///
+    /// Carried so a client does not have to know the names: which models exist is a decision
+    /// of the composition, and an interface that cycled a list of its own would offer models
+    /// the agent would refuse. Defaulted on the way in, so a handshake from an agent that
+    /// predates the field decodes — a client then has nothing to offer but knows the model in
+    /// use, which is what it draws.
+    #[serde(default)]
+    pub models: Vec<String>,
     /// How many tools the agent exposes.
     pub tools: usize,
     /// The link protocol version the agent speaks.
@@ -555,6 +590,7 @@ mod tests {
         AgentInfo {
             workspace: "/work".to_owned(),
             model: "deepseek-flash".to_owned(),
+            models: vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()],
             tools: 7,
             version: PROTOCOL_VERSION,
         }
@@ -624,6 +660,9 @@ mod tests {
             Frame::ApprovalChanged {
                 state: ApprovalState::AllCalls,
             },
+            Frame::ModelChanged {
+                model: "deepseek-v4-pro".to_owned(),
+            },
             Frame::Usage {
                 tokens: 1234,
                 completion_tokens: 90,
@@ -689,6 +728,9 @@ mod tests {
             Request::SetApproval {
                 state: ApprovalState::AllCalls,
             },
+            Request::SetModel {
+                model: "deepseek-v4-pro".to_owned(),
+            },
             Request::Sessions,
             Request::Status,
             Request::Shutdown,
@@ -735,6 +777,7 @@ mod tests {
             Some(Frame::Ready(AgentInfo {
                 workspace: "/w".to_owned(),
                 model: "m".to_owned(),
+                models: Vec::new(),
                 tools: 7,
                 version: 0,
             }))

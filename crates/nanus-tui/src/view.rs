@@ -228,6 +228,18 @@ pub struct ViewState {
     /// setting lives in the configuration file rather than behind a key because it is a
     /// standing preference rather than something to toggle mid-turn.
     pub detail: Detail,
+    /// The model the agent will name in its next request, when one is known.
+    ///
+    /// Drawn in the title bar rather than in the status line, because it is the same kind of
+    /// fact as the session's name — where am I — and the status line's readings are the ones
+    /// that give way on a narrow terminal. `None` means nothing has said which model is
+    /// answering, which is the state of a recording made before that was recorded.
+    pub model: Option<String>,
+    /// The models the interface may switch between, from the agent's handshake.
+    ///
+    /// Empty for a source that cannot be switched — a recorded transcript has no agent to
+    /// tell, and the key says so rather than offering a list nobody would honour.
+    pub models: Vec<String>,
     /// What to call the session in the title bar, when the interface is in one.
     ///
     /// A live conversation is a conversation *with something*, and once sessions can be
@@ -342,6 +354,8 @@ impl Default for ViewState {
             collapse_tools: false,
             collapse_reasoning: false,
             detail: Detail::default(),
+            model: None,
+            models: Vec::new(),
             label: None,
             theme: Theme::default(),
             markdown: true,
@@ -1048,7 +1062,7 @@ impl ViewState {
             .split(area);
 
         if let Some(title) = chunks.first() {
-            Self::render_title(frame, *title, self.label.as_deref());
+            Self::render_title(frame, *title, self.label.as_deref(), self.model.as_deref());
         }
         if let Some(body) = chunks.get(1) {
             self.last_viewport = Some((body.width, body.height));
@@ -1379,8 +1393,12 @@ impl ViewState {
     ///
     /// Associated rather than a method: the title bar shows the same things in every
     /// state, so taking `self` would suggest a dependence that does not exist. The session
-    /// label is passed in because it is the one part that varies.
-    fn render_title(frame: &mut Frame<'_>, area: Rect, label: Option<&str>) {
+    /// label and the model are passed in because they are the parts that vary.
+    ///
+    /// The model is here rather than on the status line because it is the same kind of fact
+    /// the label is — which conversation, answered by what — and it is drawn before the key
+    /// hints so that a narrow terminal loses a hint rather than the model.
+    fn render_title(frame: &mut Frame<'_>, area: Rect, label: Option<&str>, model: Option<&str>) {
         let mut spans = vec![Span::styled(
             "nanus",
             Style::default().add_modifier(Modifier::BOLD),
@@ -1388,6 +1406,12 @@ impl ViewState {
         if let Some(label) = label {
             spans.push(Span::styled(
                 format!("  ·  {label}"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if let Some(model) = model {
+            spans.push(Span::styled(
+                format!("  ·  {model}"),
                 Style::default().fg(Color::Cyan),
             ));
         }
@@ -2911,6 +2935,29 @@ mod tests {
             last.contains("deny it and stop"),
             "the last row is reachable: {last}"
         );
+    }
+
+    /// The model is drawn in the title bar, because it is the same kind of fact the session's
+    /// name is — which conversation, answered by what — and it is drawn before the key hints
+    /// so a narrow terminal loses a hint rather than the model.
+    #[test]
+    fn the_title_bar_names_the_model_that_is_answering() {
+        let mut state = ViewState::new();
+        state.label = Some(String::from("the-glob-bug"));
+        let without = rendered(&mut state, 80, 12);
+        assert!(without.contains("the-glob-bug"), "{without}");
+
+        state.model = Some(String::from("deepseek-v4-pro"));
+        let with = rendered(&mut state, 80, 12);
+        assert!(with.contains("deepseek-v4-pro"), "{with}");
+        assert!(with.contains("the-glob-bug"), "the label stays: {with}");
+
+        // Nothing said which model is answering is drawn as nothing, not as a guess: a
+        // recording made before the configuration was written down has no model to show.
+        let mut unknown = ViewState::new();
+        unknown.model = None;
+        let bare = rendered(&mut unknown, 80, 12);
+        assert!(!bare.contains("deepseek"), "{bare}");
     }
 
     /// Reopening starts at the top, whatever a previous look was scrolled to: the list is

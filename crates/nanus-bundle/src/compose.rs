@@ -59,6 +59,12 @@ pub struct Harness {
     pub clock: ClockHandle,
     /// The model adapter, for its model id.
     pub llm: LlmHandle,
+    /// The model ids a client may switch this harness between, in cycling order.
+    ///
+    /// Taken from [`crate::model_ids`] rather than from the adapter, because which ids are
+    /// offered is a decision about this deployment and not about the provider: the adapter
+    /// accepts what it is told, and the list is what the interface may name.
+    models: Vec<String>,
     /// What a session created here is being run under.
     ///
     /// Kept on the harness rather than passed to [`Harness::new_session`], so a session is
@@ -83,6 +89,12 @@ impl Harness {
         self.context
             .try_get(crate::tools_key())
             .map_or(0, |handle| handle.borrow().len())
+    }
+
+    /// Returns the model ids a client may switch this harness between.
+    #[must_use]
+    pub fn models(&self) -> &[String] {
+        &self.models
     }
 
     /// Starts a new session.
@@ -200,6 +212,10 @@ impl Pending {
             store: self.store,
             clock: self.clock,
             llm: self.llm,
+            models: crate::model_ids()
+                .iter()
+                .map(|id| (*id).to_owned())
+                .collect(),
             origin,
         })
     }

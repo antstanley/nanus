@@ -90,13 +90,13 @@ numbers are the plan's, kept because later items refer to them.
 |---|---|---|
 | 7 | **Syntax highlighting in fenced code blocks.** A lexer inside the view rather than a highlighting crate: nothing is read from disk to draw an answer, a construct that spans lines stays itself across them, and a language it does not know is drawn verbatim. The classes borrow the role styles, so `NO_COLOR` keeps the modifiers and loses only the colours. | `nanus-tui/src/markdown/{highlight,theme,render,wrap}.rs` |
 | 8 | **A help overlay for the key list (`?`).** One table in the crate, drawn as an overlay and scrollable, opened by `?` on an empty prompt and closed by the keys that leave any other dialogue. The gate is the composer: `?` is still a `?` in a prompt. | `nanus-tui/src/help.rs`, `view.rs`, `runtime.rs` |
+| 10 | **Switch model at runtime (`Alt+P`).** The list of ids crosses the handshake, `Alt+P` cycles it and `/model <id>` names one, a `SetModel` request carries the choice to the agent, and `ModelChanged` tells every watcher. The choice persists for the agent's lifetime rather than the turn's, the same rule the approval state has, and the id is refused by name when the agent does not offer it. The system prompt keeps naming the startup model, as it keeps naming the startup approval state. | `nanus-bundle/src/{agent_loop,compose,lib}.rs`, `nanus-link/src/{protocol,server}.rs`, `nanus-tui/src/{runtime,view,command}.rs` |
 | 9 | **More slash commands.** `/help` and `/clear` landed. Both act on the screen rather than the session, so both are answered in a recorded transcript as well as a live one, and `/help` draws the same overlay `?` does rather than a second list. The remaining two the item named are not free standing: `/model` lands with item 10, and `/compact` is a policy for the context window, which is item 21. | `nanus-tui/src/command.rs`, `runtime.rs` |
 
 ## Next: what the interface needs to be a daily driver
 
 | # | Item | Size | Notes |
 |---|---|---|---|
-| 10 | **Switch model at runtime (`Alt+P`).** | **M** | A config-and-restart decision today. Needs the request to carry the switch and a rule for whether it persists; depends on the provider seam. |
 | 11 | **Extended-thinking toggle (`Alt+T`).** | **S** | Needs the same request plumbing as 10. `reasoning_effort` is already a per-request control. |
 | 12 | **Permission-mode switching (`Shift+Tab`).** | **M** | Depends on 2; a dialog to move between the presets `PermissionPreset` already defines. |
 | 13 | **Paste an image (`Ctrl+V`).** | **M** | Needs clipboard access this program does not have, plus a way to send bytes that are not a file path — `read_image` proves the wire side works, but it takes a path. |

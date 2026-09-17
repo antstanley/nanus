@@ -78,14 +78,16 @@ pub const MAX_HELD_SESSIONS: usize = 32;
 /// An agent a link can serve.
 ///
 /// The three things a served turn needs are a runner, somewhere to record what it did,
-/// and a workspace to record it against; the model and tool count are what the agent
-/// says about itself when a client asks.
+/// and a workspace to record it against; the models it offers and its tool count are what
+/// the agent says about itself when a client asks. The model *in use* is not here: it lives
+/// in the runner, which is the object that names it in a request, and [`Agent::model`] reads
+/// it there rather than from a copy that could drift.
 pub struct Agent {
     runner: Rc<AgentRunner>,
     store: StoreHandle,
     clock: ClockHandle,
     workspace: PathBuf,
-    model: String,
+    models: Vec<String>,
     tools: usize,
 }
 
@@ -103,8 +105,13 @@ pub struct Parts {
     pub clock: ClockHandle,
     /// The workspace the tools are confined to.
     pub workspace: PathBuf,
-    /// The model id the runner calls.
-    pub model: String,
+    /// The model ids a client may switch the runner between.
+    ///
+    /// The composition's list, not the adapter's: which models are offered is a decision of
+    /// the deployment, and the agent is what refuses an id nobody offers. The model actually
+    /// in use is read from the runner rather than carried here, because the runner is what
+    /// issues the request — two copies of that string would be two answers to one question.
+    pub models: Vec<String>,
     /// How many tools the runner exposes.
     pub tools: usize,
 }
@@ -118,7 +125,7 @@ impl Agent {
             store: harness.store.clone(),
             clock: harness.clock.clone(),
             workspace: workspace.into(),
-            model: harness.llm.model().to_owned(),
+            models: harness.models().to_vec(),
             tools: harness.tool_count(),
         })
     }
@@ -130,12 +137,20 @@ impl Agent {
     /// model has no adapters to compose a harness from.
     #[must_use]
     pub fn from_parts(parts: Parts) -> Self {
+        // A composition that named no models still offers the one it is using, so the first
+        // switch is never one-way. Enforced here rather than at the call sites, which is what
+        // makes it true of every agent however it was built.
+        let mut models = parts.models;
+        let current = parts.runner.model();
+        if !models.contains(&current) {
+            models.insert(0, current);
+        }
         Self {
             runner: parts.runner,
             store: parts.store,
             clock: parts.clock,
             workspace: parts.workspace,
-            model: parts.model,
+            models,
             tools: parts.tools,
         }
     }
@@ -152,17 +167,28 @@ impl Agent {
         &self.runner
     }
 
-    /// Returns the model id the agent calls.
+    /// Returns the model id the agent's next request will name.
+    ///
+    /// Read from the runner rather than kept beside it: a client may switch the model, and the
+    /// runner is the object that issues the request, so a copy here would be a second answer to
+    /// a question that has one.
     #[must_use]
-    pub fn model(&self) -> &str {
-        &self.model
+    pub fn model(&self) -> String {
+        self.runner.model()
+    }
+
+    /// Returns the model ids a client may switch to, the one in use first.
+    #[must_use]
+    pub fn models(&self) -> &[String] {
+        &self.models
     }
 
     /// Describes the agent itself.
     fn info(&self) -> AgentInfo {
         AgentInfo {
             workspace: self.workspace.display().to_string(),
-            model: self.model.clone(),
+            model: self.model(),
+            models: self.models.clone(),
             tools: self.tools,
             version: crate::protocol::PROTOCOL_VERSION,
         }
@@ -189,7 +215,8 @@ impl Agent {
 impl core::fmt::Debug for Agent {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Agent")
-            .field("model", &self.model)
+            .field("model", &self.model())
+            .field("models", &self.models)
             .field("tools", &self.tools)
             .field("workspace", &self.workspace)
             .finish_non_exhaustive()
@@ -530,6 +557,25 @@ impl Registry {
         let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
         for entry in held {
             broadcast_awaited(&entry, Frame::ApprovalChanged { state }, None).await;
+        }
+    }
+
+    /// Tells every attached client which model the agent is using now.
+    ///
+    /// Sent to every session's viewers for the same reason the approval state is: the model is
+    /// the agent's, so a client that switched it and a client watching another conversation
+    /// have to agree about it.
+    async fn broadcast_model(&self, model: &str) {
+        let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
+        for entry in held {
+            broadcast_awaited(
+                &entry,
+                Frame::ModelChanged {
+                    model: model.to_owned(),
+                },
+                None,
+            )
+            .await;
         }
     }
 
@@ -1174,10 +1220,7 @@ async fn serve_connection(
                 if let Some((viewer, held)) = &watching {
                     start_turn(&registry, held, text, &frames, *viewer).await;
                 } else {
-                    let message = String::from(
-                        "this connection is not attached to a session; send `new` or `attach` first",
-                    );
-                    send(&frames, Frame::Failed { message }).await;
+                    refuse_unattached(&frames).await;
                 }
             }
             Request::Interrupt => {
@@ -1189,10 +1232,7 @@ async fn serve_connection(
                         held.stop.set(true);
                     }
                 } else {
-                    let message = String::from(
-                        "this connection is not attached to a session; send `new` or `attach` first",
-                    );
-                    send(&frames, Frame::Failed { message }).await;
+                    refuse_unattached(&frames).await;
                 }
             }
             Request::Sessions => {
@@ -1203,19 +1243,7 @@ async fn serve_connection(
                 call_id,
                 allow,
                 always,
-            } => {
-                // Delivered only against the session this connection is watching: an answer
-                // is about a question that session asked, and a connection that is not
-                // attached has not been asked anything. An id nobody is waiting on is
-                // dropped rather than refused — the first answer has already settled it, or
-                // the turn ended — and saying so would only be noise on a client's screen.
-                let delivered = watching
-                    .as_ref()
-                    .is_some_and(|(_, held)| held.answer(&call_id, allow, always));
-                if !delivered {
-                    tracing::debug!(call = %call_id, "an approval answer matched no open question");
-                }
-            }
+            } => answer_approval(watching.as_ref(), &call_id, allow, always),
             Request::SetApproval { state } => {
                 // The state belongs to the agent rather than to the session: the runner the
                 // gate consults is one object shared by every session the agent holds, and a
@@ -1225,6 +1253,7 @@ async fn serve_connection(
                 registry.agent.runner().set_approval(domain_policy(state));
                 registry.broadcast_approval(state).await;
             }
+            Request::SetModel { model } => set_model(&registry, &frames, model).await,
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
                 shutdown.notify_one();
@@ -1244,6 +1273,53 @@ async fn serve_connection(
             "the link writer did not finish: {error}"
         ))),
     }
+}
+
+/// Delivers an approval answer to the question it names.
+///
+/// Only against the session this connection is watching: an answer is about a question that
+/// session asked, and a connection that is not attached has not been asked anything. An id
+/// nobody is waiting on is dropped rather than refused — the first answer has already settled
+/// it, or the turn ended — and saying so would only be noise on a client's screen.
+fn answer_approval(watching: Option<&(u64, Rc<Held>)>, call_id: &str, allow: bool, always: bool) {
+    let delivered = watching.is_some_and(|(_, held)| held.answer(call_id, allow, always));
+    if !delivered {
+        tracing::debug!(call = %call_id, "an approval answer matched no open question");
+    }
+}
+
+/// Refuses a request that needs a session on a connection that has not attached to one.
+///
+/// Both requests that need a session say the same sentence, because it is the same mistake:
+/// a client that prompts or interrupts before `new` or `attach` has asked about a conversation
+/// it has not chosen yet.
+async fn refuse_unattached(frames: &mpsc::Sender<Frame>) {
+    let message =
+        String::from("this connection is not attached to a session; send `new` or `attach` first");
+    send(frames, Frame::Failed { message }).await;
+}
+
+/// Replaces the agent's model, or refuses an id it does not offer.
+///
+/// Validated here rather than accepted and forwarded: a retired or mistyped id would reach the
+/// provider as a request rather than as a diagnosis, and the client would have been told
+/// nothing it can act on. The refusal names the ids that do exist, the way an unknown slash
+/// command names the commands that do.
+async fn set_model(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, model: String) {
+    if !registry.agent.models().contains(&model) {
+        let message = format!(
+            "no such model: {model} — this agent offers {}",
+            registry.agent.models().join(", ")
+        );
+        send(frames, Frame::Failed { message }).await;
+        return;
+    }
+    // The model belongs to the agent rather than to the session, exactly as the approval state
+    // does: one runner serves every session the agent holds. Every viewer is told, not only the
+    // connection that asked, so two views of one agent cannot disagree about which model is
+    // answering.
+    registry.agent.runner().set_model(&model);
+    registry.broadcast_model(&model).await;
 }
 
 /// Detaches a connection from the session it was watching.
@@ -1282,6 +1358,11 @@ async fn attach(
     // client reads frames until the attachment and would discard one that arrived first.
     let state = wire_state(registry.agent.runner().approval());
     send(frames, Frame::ApprovalChanged { state }).await;
+    // The model follows for the same reason: it is the agent's rather than the session's, it
+    // can be switched by any client, and a reader should see which one is answering before
+    // they type rather than after the first answer.
+    let model = registry.agent.model();
+    send(frames, Frame::ModelChanged { model }).await;
     (viewer, Rc::clone(held))
 }
 
@@ -1451,7 +1532,7 @@ mod tests {
             store,
             clock: SystemClock::new().handle(),
             workspace: dir.to_path_buf(),
-            model: "silent".to_owned(),
+            models: vec![String::from("silent")],
             tools: 0,
         }))))
     }

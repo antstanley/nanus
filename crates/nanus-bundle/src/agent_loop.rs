@@ -261,6 +261,15 @@ pub struct AgentRunner {
     /// It is a `Cell` rather than an `Atomic` because the kernel is single-threaded by
     /// design and the runner is `!Send` with it.
     approval: Rc<core::cell::Cell<ApprovalPolicy>>,
+    /// The model the next request will name, shared so a caller can switch it mid-session.
+    ///
+    /// [`AgentConfig`] carries the *startup* value, and this is that value as a cell the link
+    /// can turn — the same shape as [`AgentRunner::approval`], and for the same reason: an
+    /// interface switching models has to affect the next request of a turn already running,
+    /// which a value copied into a request at construction could not do. A `RefCell` rather
+    /// than a `Cell` because a model id is a string, and the kernel is single-threaded so
+    /// there is no lock to take.
+    model: Rc<core::cell::RefCell<String>>,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -299,11 +308,13 @@ impl AgentRunner {
             system_prompt.len() <= config.system_prompt_max,
             "the system prompt fits its configured ceiling"
         );
+        let model = Rc::new(core::cell::RefCell::new(config.model.clone()));
         Ok(Self {
             llm,
             tools,
             system_prompt,
             approval: Rc::new(core::cell::Cell::new(config.approval_policy)),
+            model,
             config,
         })
     }
@@ -327,6 +338,39 @@ impl AgentRunner {
     /// case this exists for.
     pub fn set_approval(&self, policy: ApprovalPolicy) {
         self.approval.set(policy);
+    }
+
+    /// Returns the model every later request will name.
+    ///
+    /// Not [`AgentConfig::model`], which is the model this runner was *built* with: a caller
+    /// may switch models mid-session, and the request is what the switch has to change.
+    #[must_use]
+    pub fn model(&self) -> String {
+        self.model.borrow().clone()
+    }
+
+    /// Replaces the model every later request names.
+    ///
+    /// The change takes effect on the next request, including one in a turn that is already
+    /// running, which is the case this exists for: a reader who switches while the model works
+    /// is saying what they want the next step to be, not what they wanted the last one to be.
+    ///
+    /// Nothing else is re-assembled. The system prompt's runtime section names the model the
+    /// composition started with, exactly as it names the approval state it started with — a
+    /// sentence about how the deployment was set up rather than a claim about the next
+    /// request — and the interface is where the live value is shown.
+    ///
+    /// # Panics
+    ///
+    /// Asserts that the id is not empty: an empty model is not a switch to nothing, it is a
+    /// request the provider would refuse, and refusing it here is a postcondition rather than
+    /// a round trip.
+    pub fn set_model(&self, model: &str) {
+        assert!(
+            !model.trim().is_empty(),
+            "a model id that is being switched to is not empty"
+        );
+        model.clone_into(&mut self.model.borrow_mut());
     }
 
     /// Returns the tool registry this runner dispatches from.
@@ -493,7 +537,7 @@ impl AgentRunner {
             // one the request named; the effort comes from the adapter, which is the
             // component that fills in an unset effort and so the only one that knows what
             // was actually asked for.
-            model: Some(self.config.model.clone()),
+            model: Some(self.model()),
             effort: self
                 .llm
                 .reasoning_effort()
@@ -533,7 +577,7 @@ impl AgentRunner {
             let registry = self.tools.borrow();
             registry.schemas().into_iter().cloned().collect()
         };
-        let mut request = ChatRequest::new(self.config.model.clone(), messages);
+        let mut request = ChatRequest::new(self.model(), messages);
         request.tools = tools;
         request
     }
@@ -958,17 +1002,31 @@ mod tests {
     struct ScriptedLlm {
         batches: std::cell::RefCell<Vec<Vec<LlmEvent>>>,
         model: String,
-        seen: std::cell::RefCell<Vec<ChatRequest>>,
+        seen: Rc<std::cell::RefCell<Vec<ChatRequest>>>,
     }
+
+    /// What a scripted model was asked for, shared with the test that built it.
+    type Requests = Rc<std::cell::RefCell<Vec<ChatRequest>>>;
 
     impl ScriptedLlm {
         /// Builds a handle, which is what a runner takes; the name says so.
         fn handle(batches: Vec<Vec<LlmEvent>>) -> Rc<Box<dyn LlmPort>> {
-            Rc::new(Box::new(Self {
+            Self::recording(batches).0
+        }
+
+        /// Builds a handle and the requests it is sent.
+        ///
+        /// The second half is how a test observes what actually reached the model: a stub is
+        /// behind a `dyn LlmPort` by the time the runner holds it, and the request it was
+        /// given is not in the session log.
+        fn recording(batches: Vec<Vec<LlmEvent>>) -> (Rc<Box<dyn LlmPort>>, Requests) {
+            let seen: Requests = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let port: Box<dyn LlmPort> = Box::new(Self {
                 batches: std::cell::RefCell::new(batches),
                 model: "test-model".to_owned(),
-                seen: std::cell::RefCell::new(Vec::new()),
-            }))
+                seen: Rc::clone(&seen),
+            });
+            (Rc::new(port), seen)
         }
     }
 
@@ -1669,6 +1727,53 @@ mod tests {
         // The request must carry the prompt, the tool schemas, and the user message.
         // `ScriptedLlm::seen` is the only way to observe what was sent.
         assert_eq!(llm.model(), "test-model");
+    }
+
+    /// Switching the model changes the next request *and* what the turn records.
+    ///
+    /// The configuration is the startup value, so a runner that read it instead of its own
+    /// cell would keep asking the old model while the interface showed the new one — and a
+    /// session resumed against a different model would record the first request's model
+    /// against every step after the switch.
+    #[tokio::test]
+    async fn switching_the_model_changes_the_next_request_and_what_is_recorded() {
+        let (llm, seen) = ScriptedLlm::recording(vec![
+            vec![LlmEvent::TextDelta("ok".to_owned())],
+            vec![LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            }],
+        ]);
+        let Some(runner) = runner(llm, registry_with_echo()) else {
+            return;
+        };
+        assert_eq!(runner.model(), "test-model");
+        runner.set_model("deepseek-v4-pro");
+        assert_eq!(runner.model(), "deepseek-v4-pro");
+        assert_eq!(
+            runner.config().model,
+            "test-model",
+            "the configured model is the startup value and is not rewritten"
+        );
+
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "a question", &mut Silent, None)
+            .await;
+        assert!(outcome.is_ok());
+        assert_eq!(
+            seen.borrow().first().map(|request| request.model.clone()),
+            Some(String::from("deepseek-v4-pro")),
+            "the request names the model that was switched to"
+        );
+        let recorded = session.log().events().iter().find_map(|event| match event {
+            SessionEvent::AssistantMessage { model, .. } => model.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            recorded,
+            Some(String::from("deepseek-v4-pro")),
+            "and the log says which model produced the message"
+        );
     }
 
     #[tokio::test]

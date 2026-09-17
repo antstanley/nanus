@@ -355,6 +355,7 @@ mod tests {
         let mut line = encode(&Frame::Ready(AgentInfo {
             workspace: "/work".to_owned(),
             model: "scripted".to_owned(),
+            models: Vec::new(),
             tools: 0,
             version: PROTOCOL_VERSION,
         }))
@@ -402,6 +403,7 @@ mod tests {
             Frame::Ready(AgentInfo {
                 workspace: "/work".to_owned(),
                 model: "scripted".to_owned(),
+                models: Vec::new(),
                 tools: 0,
                 version: PROTOCOL_VERSION,
             }),
@@ -445,6 +447,7 @@ mod tests {
             Frame::Ready(AgentInfo {
                 workspace: "/work".to_owned(),
                 model: "scripted".to_owned(),
+                models: Vec::new(),
                 tools: 0,
                 version: PROTOCOL_VERSION,
             }),
@@ -489,6 +492,7 @@ mod tests {
         let mut line = encode(&Frame::Ready(AgentInfo {
             workspace: "/work".to_owned(),
             model: "scripted".to_owned(),
+            models: Vec::new(),
             tools: 0,
             version: PROTOCOL_VERSION.saturating_add(1),
         }))
@@ -533,6 +537,7 @@ mod tests {
         let info = AgentInfo {
             workspace: "/work".to_owned(),
             model: "deepseek-flash".to_owned(),
+            models: vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()],
             tools: 7,
             version: PROTOCOL_VERSION,
         };

@@ -64,6 +64,21 @@ pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
 pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, compose};
 pub use error::BundleError;
 
+/// The model ids this build offers a runtime switch between, in the order they cycle.
+///
+/// Here rather than in the link or the interface for the same reason the adapter is mounted
+/// here: this is the only crate that names a concrete provider. The link carries a choice
+/// somebody else made and the interface draws one, and neither may know that one of the ids
+/// is called `deepseek-flash` — a second place that knew the names would be a second place to
+/// change when a provider is added.
+#[must_use]
+pub fn model_ids() -> &'static [&'static str] {
+    &[
+        nanus_adapter_deepseek::MODEL_FLASH,
+        nanus_adapter_deepseek::MODEL_PRO,
+    ]
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support;
 

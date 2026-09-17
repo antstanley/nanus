@@ -25,6 +25,9 @@ pub enum Command {
     /// not about what is being typed: the panel is a view, and the session it views is
     /// untouched.
     Clear,
+    /// Switch the model: the next one offered when no id is given, and the named one when it
+    /// is.
+    Model,
 }
 
 impl Command {
@@ -65,6 +68,7 @@ pub fn submission_of(text: &str) -> Submission {
         "/stats" => Submission::Run(Command::Stats),
         "/help" => Submission::Run(Command::Help),
         "/clear" => Submission::Run(Command::Clear),
+        "/model" => Submission::Run(Command::Model),
         // A slash alone, or a path, or a typo: named as what was typed rather than
         // guessed at, because "no such command: /quitx" is what tells a reader they
         // fat-fingered it.
@@ -104,6 +108,17 @@ mod tests {
         // Only the first word is read, so a word after either changes nothing.
         assert_eq!(submission_of("/clear now"), Submission::Run(Command::Clear));
         assert_eq!(submission_of("/help me"), Submission::Run(Command::Help));
+    }
+
+    /// The model switch has a default and an argument, which is what makes it a command
+    /// rather than only a key: `Alt+P` cycles and `/model <id>` names one.
+    #[test]
+    fn model_is_a_command() {
+        assert_eq!(submission_of("/model"), Submission::Run(Command::Model));
+        assert_eq!(
+            submission_of("/model deepseek-v4-pro"),
+            Submission::Run(Command::Model)
+        );
     }
 
     #[test]

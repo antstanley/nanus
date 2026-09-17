@@ -218,6 +218,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Alt+B` / `Alt+F` | move the cursor a word back / forward |
 | `Ctrl+L` | clear the transcript |
 | `?` | show the key list, when the prompt is empty |
+| `Alt+P` | switch to the next model the agent offers |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
@@ -343,8 +344,7 @@ inventing a purpose for a key would be worse than leaving it alone:
 - **The sandbox mode** is set in configuration rather than from the keyboard: the approval
   state cycles with `Shift+Tab`, but `sandbox_mode` is a standing decision about what the
   tools may touch, and changing it mid-turn would make the prompt the model was sent a lie.
-- **Model switching** (`Alt+P`) and **extended thinking** (`Alt+T`) are agent-side
-  decisions with no request to carry them.
+- **Extended thinking** (`Alt+T`) is an agent-side decision with no request to carry it yet.
 - **Background tasks** (`Ctrl+B`) — there are none to background.
 - **Pasting an image** (`Ctrl+V`) would need clipboard access this program does not have.
 - **`@` mentions and `!` bash mode** are input *modes* rather than shortcuts, and each is a
@@ -362,6 +362,7 @@ than sending it to the model.
 | `/stats` | write the session's model figures into the transcript |
 | `/help` | draw the key list, the same one `?` opens |
 | `/clear` | empty the transcript, leaving the draft and the toggles alone |
+| `/model [id]` | switch to the next model the agent offers, or to the one named |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
 on a glanceable line and the session has more than four: the report adds the totals, the
@@ -369,6 +370,9 @@ prompt broken into cached and read, how much of what was generated was thinking,
 tokens per second while waiting. It is a notice rather than prose — the model did not say it,
 the interface did — and it reports the session rather than the last request, so it is worth
 reading after a few turns and not before the first.
+
+`/model` is the command form of `Alt+P`, and the pair is deliberate: the key cycles and the
+argument names one. See [switching models](#switching-models).
 
 `/help` and `/clear` are the screen's business rather than the session's, which is why they
 are answered in a recorded session too: neither needs an agent, and a reader browsing a
@@ -438,6 +442,30 @@ the key *code* and ignores the modifiers when inserting text, so typing is unaff
 new binding should do the same, and there is a test that fails if it does not.
 
 [shift-issue]: https://github.com/ratatui/templates/issues/26
+
+### Switching models
+
+A model is chosen by configuration and can be changed without restarting: `Alt+P` moves to the
+next one the agent offers and `/model <id>` names one, and the title bar says which model is
+answering. The list comes from the agent's handshake rather than from the interface, because
+which models exist is a decision of the composition — an interface that cycled a list of its own
+would offer models the agent refuses — and the agent refuses an id it does not offer with a
+sentence naming the ones it does. A session that offers nothing to switch to, which is every
+recording, says so rather than drawing a list nobody would honour.
+
+**The switch is the agent's, and it reaches every client.** The model belongs to the agent's
+runner rather than to a session, exactly as the approval state does: one runner serves every
+conversation it holds, and a client that switches tells every watcher, so two terminals attached
+to one session cannot disagree about which model is answering. It takes effect on the next
+request, including the next step of a turn that is already running, because what a reader
+switching mid-turn is saying is what they want the *next* step to be.
+
+**The system prompt names the model the composition started with**, exactly as it names the
+startup approval state, and a switch does not rewrite it. The model does not need to be told its
+own name, and the alternative — rebuilding the prompt on every switch — would mean the
+conversation the model is being sent no longer matches the one recorded against it. The live
+value is the one in the title bar; the recorded one is what the session says produced it, and the
+two are the same thing until somebody switches.
 
 ## Scrolling back
 
