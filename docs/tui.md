@@ -54,7 +54,7 @@ And which conversation it opens:
 
 `--approval` takes `per_call`, `permitted`, or `all_calls` and is the state the interface
 opens in — and, for a live conversation, the state it asks the agent to use. The status
-line always names the state in force, and `Shift+Tab` cycles it.
+line always names the state in force, and `Shift+Tab` opens the dialog that chooses it.
 
 The session's name is shown in the title bar, because two terminals can be attached to two
 different conversations and a reader should be able to tell which is which. See
@@ -200,7 +200,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `a` | while an approval dialog is up: allow the call and record the tool for the session |
 | `n` (or `Esc`) | while an approval dialog is up: deny it |
 | `Ctrl+C` | while an approval dialog is up: deny it *and* stop the turn |
-| `Shift+Tab` | cycle the approval state: per call → permitted calls → all calls |
+| `Shift+Tab` | choose the approval state, from anywhere |
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
@@ -342,9 +342,11 @@ full-screen terminal program pays.
 Claude Code's mode has more bindings than this interface has things to bind them to, and
 inventing a purpose for a key would be worse than leaving it alone:
 
-- **The sandbox mode** is set in configuration rather than from the keyboard: the approval
-  state cycles with `Shift+Tab`, but `sandbox_mode` is a standing decision about what the
-  tools may touch, and changing it mid-turn would make the prompt the model was sent a lie.
+- **The sandbox mode** is set in configuration rather than from the keyboard: `Shift+Tab`
+  chooses the approval state, but `sandbox_mode` is a standing decision about what the tools
+  may touch, and changing it mid-turn would make the prompt the model was sent a lie. The
+  dialog says so where a reader is choosing, rather than leaving the difference to be found
+  in a document.
 - **Background tasks** (`Ctrl+B`) — there are none to background.
 - **Pasting an image** (`Ctrl+V`) would need clipboard access this program does not have.
 - **`@` mentions and `!` bash mode** are input *modes* rather than shortcuts, and each is a
@@ -442,6 +444,27 @@ the key *code* and ignores the modifiers when inserting text, so typing is unaff
 new binding should do the same, and there is a test that fails if it does not.
 
 [shift-issue]: https://github.com/ratatui/templates/issues/26
+
+### Choosing the permission state
+
+`Shift+Tab` opens a dialog listing the three approval states with what each one means. The key
+works from anywhere — including from behind an approval question, because a reader who wants to
+stop being asked must not have to answer a question first — and it opens on the state the old
+binding moved to, so `Shift+Tab` then `Enter` is the cycle it always was, with the chance to read
+what it grants before granting it. That reading is the whole point: `permitted calls` and `all
+calls` are two words apart and nothing alike in what they allow, and a status line can only name
+one of them at a time.
+
+Inside the dialog, `Up`/`Down` (or `k`/`j`) move, `Tab` and `Shift+Tab` walk forward, the digits
+`1`–`3` select directly, `Enter` applies and `Esc` cancels. Every other key does nothing rather
+than typing into the composer behind the dialog.
+
+**The dialog moves one of the two knobs a preset bundles.** The approval state is what happens to
+a call the sandbox refused, and it is the agent's to change mid-session. The sandbox mode — what
+the tools may touch — is not: it is a standing decision the model was told about in the prompt it
+was sent, and the dialog says so rather than offering a switch that would make that sentence a
+lie. `PermissionPreset` and its three names are in
+[design](design.md#approval-is-a-three-state-axis-fail-closed-at-the-default).
 
 ### Switching models
 

@@ -50,9 +50,9 @@ of the session. It is per session and in memory, and it is wider than one call:
 granting `bash` means every later `bash` call in that conversation runs without
 asking, including a destructive one.
 
-The state is shown in the interface's status line and cycles with `Shift+Tab`; it
-can be chosen at startup with `--approval`. A state chosen in the interface reaches
-the agent that owns the gate, so it is not merely cosmetic.
+The state is shown in the interface's status line and chosen with `Shift+Tab`;
+it can be chosen at startup with `--approval`. A state chosen in the interface
+reaches the agent that owns the gate, so it is not merely cosmetic.
 
 A tool's declared access decides which of the three sandbox questions it is: the
 read tools and the search tools read, `write` and `edit` write, and `bash` runs a

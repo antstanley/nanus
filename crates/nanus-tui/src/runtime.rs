@@ -1037,6 +1037,10 @@ async fn event_loop(
                             };
                         }
                     }
+                    Outcome::OpenPermissions => {
+                        view.open_permissions();
+                        view.status = String::from("permission: Enter applies, Esc cancels");
+                    }
                     Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
                     Outcome::CycleEffort => cycle_effort(source, &mut view),
                     Outcome::SetApproval(policy) => {
@@ -1356,6 +1360,12 @@ enum Outcome {
     },
     /// Tell the agent to use this approval state from now on.
     SetApproval(ApprovalPolicy),
+    /// Open the permission dialog, which is where the approval state is chosen.
+    ///
+    /// A dialog rather than a blind cycle, which is what the roadmap asked for and what the three
+    /// states deserve: `permitted calls` and `all calls` are two words apart and grant very
+    /// different things.
+    OpenPermissions,
     /// Switch to this model, or to the next one when nothing is named.
     SetModel(Option<String>),
     /// Ask the agent for more or less reasoning effort.
@@ -1368,16 +1378,21 @@ enum Outcome {
 
 /// Applies one keystroke to the view.
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    // Shift+Tab cycles the approval state wherever the focus is. It is a setting rather than
-    // an edit, so it is routed before the approval dialog takes the keyboard: a reader who
-    // wants to stop being asked must not have to answer a question first.
+    // The permission dialog owns the keyboard while it is up, and it is checked first for that
+    // reason: what a reader is looking at has to be what their keys reach.
+    if view.permission_open {
+        return handle_permission_key(key, view);
+    }
+    // Shift+Tab opens the permission dialog wherever the focus is. It is a setting rather than an
+    // edit, so it is routed before the approval question takes the keyboard: a reader who wants to
+    // stop being asked must not have to answer a question first. The dialog is what makes that
+    // possible rather than merely convenient — the three states grant very different things, and a
+    // label alone does not say which is which.
     //
-    // Terminals disagree about how they spell it: most send `BackTab`, and one that speaks
-    // an enhanced keyboard protocol may send `Tab` with Shift held. Both mean the key.
-    if matches!(key.code, KeyCode::BackTab)
-        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
-    {
-        return Outcome::SetApproval(view.approval.next());
+    // Terminals disagree about how they spell it: most send `BackTab`, and one that speaks an
+    // enhanced keyboard protocol may send `Tab` with Shift held. Both mean the key.
+    if shift_tab(key) {
+        return Outcome::OpenPermissions;
     }
     // An approval question owns the keyboard while it is up. Its answers are the only things
     // a reader can mean, and letting a `y` reach the composer would answer a question *and*
@@ -1413,6 +1428,51 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         return handle_control_key(key, view);
     }
     handle_plain_key(key, view)
+}
+
+/// Whether a key is Shift+Tab, however the terminal spells it.
+///
+/// `BackTab` is the ordinary spelling and `Tab` with Shift held is what a terminal speaking an
+/// enhanced keyboard protocol may send instead. A bare `Tab` is not the key — it is the composer's
+/// own key and stays one.
+fn shift_tab(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::BackTab)
+        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+/// Routes a key while the permission dialog is open.
+///
+/// A movement key or a decision, and nothing else: this is a dialogue about one setting, and every
+/// other key does nothing rather than reaching the composer behind it. The digits are the
+/// shortcut — a reader who knows which of the three they want should not have to walk to it — and
+/// both Tab directions move, so the key that opened the dialog walks it.
+fn handle_permission_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => view.close_permissions(),
+        // `Ctrl+C` abandons what is in front of the reader everywhere else in this interface, and
+        // cancelling here changes nothing: the state in force is whatever it already was.
+        KeyCode::Char('c' | 'C') if control => view.close_permissions(),
+        KeyCode::Enter => {
+            // Closed before the answer leaves, so a reader cannot press Enter twice and have the
+            // second press land on a state they never looked at.
+            let chosen = view.selected_permission();
+            view.close_permissions();
+            return Outcome::SetApproval(chosen);
+        }
+        // Tab and Shift+Tab move it too, in the forward direction only: the key that opened the
+        // dialogue should walk it, and a reader who wants the other way has an arrow key.
+        KeyCode::Up | KeyCode::Char('k') => view.permission_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => {
+            view.permission_down();
+        }
+        KeyCode::Char(digit @ '1'..='3') => {
+            let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
+            let _ = view.permission_select(position);
+        }
+        _ => {}
+    }
+    Outcome::Continue
 }
 
 /// Applies one keystroke to an open approval question.
@@ -3915,53 +3975,108 @@ mod tests {
     }
 
     /// Shift+Tab cycles the approval state, and it is routed before the dialog takes the
-    /// keyboard: a reader who wants to stop being asked must not have to answer first.
+    /// Shift+Tab opens the permission dialog from anywhere, and it opens on the state the key
+    /// used to move to — so pressing it and then Enter is the cycle it always was.
     #[test]
-    fn shift_tab_cycles_the_approval_state_from_anywhere() {
-        let mut view = ViewState::new();
-        assert_eq!(view.approval, ApprovalPolicy::PerCall);
+    fn shift_tab_opens_the_permission_dialog_wherever_the_focus_is() {
+        // Both spellings of the key: a terminal that speaks an enhanced keyboard protocol may
+        // send `Tab` with Shift held rather than `BackTab`.
+        for pressed in [
+            key(KeyCode::BackTab, KeyModifiers::SHIFT),
+            key(KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            let mut view = ViewState::new();
+            assert_eq!(view.approval, ApprovalPolicy::PerCall);
+            assert!(matches!(
+                handle_key(pressed, &mut view),
+                Outcome::OpenPermissions
+            ));
+            view.open_permissions();
+            assert_eq!(
+                view.selected_permission(),
+                ApprovalPolicy::Permitted,
+                "the next state is what the dialog points at"
+            );
+            assert!(matches!(
+                handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view),
+                Outcome::SetApproval(ApprovalPolicy::Permitted)
+            ));
+            assert!(!view.permission_open, "applying closes the dialog");
+        }
 
-        // `BackTab` is how a terminal spells Shift+Tab, and the first press moves from the
-        // default to the next state.
+        // A bare Tab is not the key: it is the composer's own key and stays one.
+        let mut plain = ViewState::new();
         assert!(matches!(
-            handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &mut view),
-            Outcome::SetApproval(ApprovalPolicy::Permitted)
-        ));
-
-        // A terminal that speaks the enhanced keyboard protocol may send `Tab` with Shift
-        // held instead; it means the same key.
-        view.approval = ApprovalPolicy::Permitted;
-        assert!(matches!(
-            handle_key(key(KeyCode::Tab, KeyModifiers::SHIFT), &mut view),
-            Outcome::SetApproval(ApprovalPolicy::AllCalls)
-        ));
-        view.approval = ApprovalPolicy::AllCalls;
-        assert!(matches!(
-            handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &mut view),
-            Outcome::SetApproval(ApprovalPolicy::PerCall)
-        ));
-
-        // A bare Tab is not the key: it is the composer's own key and must stay one.
-        view.approval = ApprovalPolicy::PerCall;
-        assert!(matches!(
-            handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut view),
+            handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut plain),
             Outcome::Continue
         ));
+        assert!(!plain.permission_open);
 
-        // And with a question open, the key still cycles rather than answering.
-        view.pending_approval = Some(PendingApproval {
-            call_id: "a1".to_owned(),
-            tool: "bash".to_owned(),
+        // And with a question open the key still opens the dialog rather than answering it: a
+        // reader who wants to stop being asked must not have to answer a question first.
+        let mut asking = ViewState::new();
+        asking.pending_approval = Some(PendingApproval {
+            call_id: String::from("a1"),
+            tool: String::from("bash"),
             reason: None,
         });
         assert!(matches!(
-            handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &mut view),
-            Outcome::SetApproval(ApprovalPolicy::Permitted)
+            handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &mut asking),
+            Outcome::OpenPermissions
         ));
         assert!(
-            view.pending_approval.is_some(),
-            "cycling the state does not answer the question"
+            asking.pending_approval.is_some(),
+            "opening the dialog does not answer the question"
         );
+    }
+
+    /// The dialog walks both ways and wraps, takes a digit as a shortcut, and cancels without
+    /// changing anything.
+    #[test]
+    fn the_permission_dialog_is_navigated_and_cancelled() {
+        let mut view = ViewState::new();
+        view.open_permissions();
+        assert_eq!(view.permission_selection, 1, "the next state comes first");
+
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_permission(), ApprovalPolicy::AllCalls);
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        assert_eq!(
+            view.selected_permission(),
+            ApprovalPolicy::PerCall,
+            "it wraps round"
+        );
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut view);
+        assert_eq!(
+            view.selected_permission(),
+            ApprovalPolicy::AllCalls,
+            "and back the other way"
+        );
+        // Tab walks it forward too, so the key that opened the dialog is the key that moves it.
+        let _ = handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_permission(), ApprovalPolicy::PerCall);
+
+        // A digit selects directly, which is the shortcut for a reader who knows what they want.
+        let _ = handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_permission(), ApprovalPolicy::Permitted);
+        // A digit that is not offered is not a command.
+        let _ = handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_permission(), ApprovalPolicy::Permitted);
+
+        // Every other key does nothing rather than reaching the composer behind it.
+        for code in [KeyCode::Char('x'), KeyCode::Backspace] {
+            let _ = handle_key(key(code, KeyModifiers::NONE), &mut view);
+        }
+        assert!(view.input.is_empty(), "no key reached the composer");
+        assert!(view.permission_open);
+
+        // Cancelling leaves the state in force exactly as it was.
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(!view.permission_open);
+        assert_eq!(view.approval, ApprovalPolicy::PerCall);
     }
 
     /// The agent's own state is what the interface draws, so a state chosen elsewhere — a

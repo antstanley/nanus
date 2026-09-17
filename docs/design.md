@@ -80,7 +80,8 @@ restrictive one, which is the part of "fail closed" that still holds. `AllCalls`
 state this design used to rule out, and it exists because the honest alternative was not
 "safer": an operator who wants a free-for-all environment arranges one, and a harness that
 refuses to name the state only hides where it was chosen. Nothing about it is silent — the
-status line always says which state is in force, and Shift+Tab cycles them.
+status line always says which state is in force, and Shift+Tab opens the dialog that chooses
+between them.
 
 An answer may also be *standing*: the interface's "always allow" records the tool for the
 session, so the same question is not asked again for the rest of that conversation. The

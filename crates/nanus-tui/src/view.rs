@@ -324,6 +324,19 @@ pub struct ViewState {
     /// cannot end up in a prompt nobody is looking at.
     pub help_open: bool,
 
+    /// Whether the permission dialog is open.
+    ///
+    /// While it is set the dialog owns the keyboard, as the approval question and the key list
+    /// do: the reader is choosing between three states, and a key that reached the composer
+    /// behind it would be typed into a prompt nobody can see.
+    pub permission_open: bool,
+
+    /// Which of the three approval states the permission dialog has selected.
+    ///
+    /// An index into [`PERMISSIONS`], kept in range by the methods rather than by the callers,
+    /// so a selection can never point past the end.
+    pub permission_selection: usize,
+
     /// How many rows into the key list the overlay starts.
     ///
     /// The list is longer than a short terminal, so it is scrolled rather than cut: an
@@ -378,6 +391,8 @@ impl Default for ViewState {
             queue_editor: None,
             help_open: false,
             help_scroll: 0,
+            permission_open: false,
+            permission_selection: 0,
             last_viewport: None,
             last_composer: None,
         }
@@ -397,6 +412,51 @@ impl std::fmt::Debug for ViewState {
             .field("queued", &self.queue.len())
             .finish_non_exhaustive()
     }
+}
+
+/// The approval states the permission dialog offers, and what each one means.
+///
+/// The order is [`ApprovalPolicy::next`]'s, so the dialog and the key that opens it agree about
+/// which state comes next. The sentences are the interface's rather than the domain's: a domain
+/// state names itself, and a reader choosing between three of them needs the difference spelled
+/// out. ASCII only, because the layout counts characters rather than columns.
+const PERMISSIONS: [(ApprovalPolicy, &str); 3] = [
+    (
+        ApprovalPolicy::PerCall,
+        "ask about every exception; deny if nobody answers",
+    ),
+    (
+        ApprovalPolicy::Permitted,
+        "grant the harmless calls; ask about the rest",
+    ),
+    (
+        ApprovalPolicy::AllCalls,
+        "grant every exception; only safe if contained",
+    ),
+];
+
+/// What the permission dialog says about the knob it does not move.
+///
+/// The two knobs of a [`nanus_domain::PermissionPreset`] are not the same kind of decision: the
+/// approval state is about what happens to a call the sandbox refused, and the sandbox mode is
+/// what the tools are confined to. Changing the second mid-session would make the prompt the model
+/// was sent a lie, so this dialog moves the first and says so about the second.
+const SANDBOX_NOTE: &str = "the sandbox mode is set in configuration and does not change here";
+
+/// Cuts a dialog row to the room it has, counting characters.
+///
+/// Characters rather than columns, which is honest because the rows this is used on are built from
+/// ASCII — the labels, the sentences, and the digits. A row wider than the dialog would wrap under
+/// a `Paragraph` without `Wrap` and be clipped, but it would be clipped at the *terminal's* width
+/// rather than at the dialog's border, so the last column of the border would be overwritten.
+fn clip_row(text: &str, room: usize) -> String {
+    if text.chars().count() <= room {
+        return text.to_owned();
+    }
+    let keep = room.saturating_sub(1);
+    let mut clipped: String = text.chars().take(keep).collect();
+    clipped.push('…');
+    clipped
 }
 
 /// The first line of a prompt, with a mark when there is more.
@@ -795,6 +855,67 @@ impl ViewState {
         self.help_scroll = u16::try_from(moved).unwrap_or(u16::MAX);
     }
 
+    /// Opens the permission dialog, with the next state selected.
+    ///
+    /// The next one rather than the current: the key that opens this is the same key that used to
+    /// cycle the state, so a reader who presses it and then Enter has moved on exactly as they
+    /// would have, and the dialog is the chance to read what they are moving to before they do.
+    pub fn open_permissions(&mut self) {
+        self.permission_open = true;
+        self.permission_selection = PERMISSIONS
+            .iter()
+            .position(|(policy, _)| *policy == self.approval.next())
+            .unwrap_or(0);
+    }
+
+    /// Closes the permission dialog without changing anything.
+    pub fn close_permissions(&mut self) {
+        self.permission_open = false;
+    }
+
+    /// Moves the selection toward the more restrictive states, wrapping round.
+    ///
+    /// Wrapping, and in both directions, because the three states are a cycle and a reader at
+    /// either end should reach the other rather than being stuck.
+    pub fn permission_up(&mut self) {
+        self.permission_selection = self
+            .permission_selection
+            .checked_sub(1)
+            .unwrap_or(PERMISSIONS.len().saturating_sub(1));
+    }
+
+    /// Moves the selection toward the more permissive states, wrapping round.
+    pub fn permission_down(&mut self) {
+        self.permission_selection =
+            if self.permission_selection.saturating_add(1) >= PERMISSIONS.len() {
+                0
+            } else {
+                self.permission_selection.saturating_add(1)
+            };
+    }
+
+    /// Selects one of the states by its position in the dialog.
+    ///
+    /// Returns `false` for a position that is not offered, so a caller can say nothing rather than
+    /// moving a selection that does not exist: the digits are the keyboard's shortcut, and a key
+    /// that is not one of them is not a command.
+    #[must_use]
+    pub fn permission_select(&mut self, position: usize) -> bool {
+        if position >= PERMISSIONS.len() {
+            return false;
+        }
+        self.permission_selection = position;
+        true
+    }
+
+    /// Returns the state the dialog has selected.
+    #[must_use]
+    pub fn selected_permission(&self) -> ApprovalPolicy {
+        PERMISSIONS
+            .get(self.permission_selection)
+            .map_or(ApprovalPolicy::PerCall, |(policy, _)| *policy)
+    }
+
     /// The rows of the key list that fit in `height`, and where they start.
     #[must_use]
     fn help_window(&self, height: u16) -> (usize, usize) {
@@ -1121,6 +1242,12 @@ impl ViewState {
         if self.pending_approval.is_some() {
             self.render_approval(frame, area);
         }
+        // Over even that, because the key that opened it is routed first: what owns the keyboard
+        // has to be what is on top, or a reader would be pressing keys at a dialogue they cannot
+        // see. `Esc` closes this and gives the question back.
+        if self.permission_open {
+            self.render_permissions(frame, area);
+        }
     }
 
     /// How many rows the inline queue draws, and therefore how many it needs.
@@ -1344,6 +1471,82 @@ impl ViewState {
         // between its letters.
         frame.render_widget(Clear, dialog);
         frame.render_widget(paragraph, dialog);
+    }
+
+    /// Draws the permission dialog.
+    ///
+    /// Three states with what each one means, because a label is not an explanation and this is
+    /// the one place a reader can see the difference before choosing: `permitted calls` and `all
+    /// calls` are two words apart and nothing alike in what they grant.
+    fn render_permissions(&self, frame: &mut Frame<'_>, area: Rect) {
+        let width = area.width.saturating_sub(4).clamp(30, 76);
+        // The label column is the widest label plus its mark and number, so the meanings line up.
+        let label_width = PERMISSIONS
+            .iter()
+            .map(|(policy, _)| policy.label().len())
+            .max()
+            .unwrap_or(0);
+        let room = usize::from(width.saturating_sub(2));
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            "what happens to a call the sandbox refuses",
+            Style::default().fg(Color::DarkGray),
+        ))];
+        for (index, (policy, meaning)) in PERMISSIONS.iter().enumerate() {
+            let selected = index == self.permission_selection;
+            let style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "\u{25b6}" } else { " " };
+            let head = format!(
+                "{marker} {} {:<width$}  ",
+                index.saturating_add(1),
+                policy.label(),
+                width = label_width
+            );
+            let text = format!("{head}{meaning}");
+            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            clip_row(SANDBOX_NOTE, room),
+            Style::default().fg(Color::DarkGray),
+        )));
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(4).max(4));
+        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
+        // workspace treats integer division as a defect wherever it appears.
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.busy)
+            .title(Line::from(Span::styled(
+                " permission ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .title_bottom(Line::from(Span::styled(
+                " Enter applies, Esc cancels ",
+                Style::default().fg(Color::DarkGray),
+            )));
+        // Cleared first, so the transcript behind the dialog does not show through the gaps
+        // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .style(self.theme.notice),
+            dialog,
+        );
     }
 
     /// Draws the key list over the interface.
@@ -2920,6 +3123,60 @@ mod tests {
             !text.contains("second line"),
             "the rest is left to the overlay: {text}"
         );
+    }
+
+    /// The permission dialog lists all three states with what each one means, marks the selection,
+    /// and says what it does not change.
+    ///
+    /// The meanings are the point: `permitted calls` and `all calls` are two words apart and grant
+    /// very different things, and this is the one place a reader can see the difference before
+    /// choosing.
+    #[test]
+    fn the_permission_dialog_explains_the_states_it_offers() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::prose(
+            Role::User,
+            String::from("a prompt that must not show through"),
+        ));
+        state.open_permissions();
+        let text = rendered(&mut state, 90, 20);
+        assert!(text.contains("permission"), "{text}");
+        for label in ["per call", "permitted calls", "all calls"] {
+            assert!(text.contains(label), "{label} is listed: {text}");
+        }
+        assert!(text.contains("deny if nobody answers"), "{text}");
+        assert!(text.contains("grant the harmless calls"), "{text}");
+        assert!(text.contains("only safe if contained"), "{text}");
+        assert!(
+            text.contains("sandbox mode is set in configuration"),
+            "what it does not move is said: {text}"
+        );
+        assert!(text.contains("Enter applies"), "{text}");
+
+        // The marked row is the one that would be applied.
+        let marked = text
+            .lines()
+            .find(|row| row.contains('\u{25b6}'))
+            .expect("the selection is marked");
+        assert!(marked.contains("permitted calls"), "{marked}");
+        assert_eq!(state.selected_permission(), ApprovalPolicy::Permitted);
+    }
+
+    /// A terminal too narrow for the sentences cuts them rather than drawing over the border, and
+    /// says it cut them: a meaning that just stopped mid-word would read as a typo.
+    #[test]
+    fn a_narrow_permission_dialog_cuts_its_rows() {
+        let mut state = ViewState::new();
+        state.open_permissions();
+        let text = rendered(&mut state, 34, 14);
+        assert!(text.contains("permission"), "{text}");
+        assert!(text.contains('…'), "a cut row says so: {text}");
+        for row in text.lines() {
+            assert!(
+                row.chars().count() <= 34,
+                "no row is wider than the terminal: {row:?}"
+            );
+        }
     }
 
     /// The key list is drawn over the transcript, with the bindings and a way out.
