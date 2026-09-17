@@ -56,7 +56,9 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::error::{LinkError, LinkResult};
-use crate::protocol::{AgentInfo, ApprovalState, Frame, Request, SessionInfo, TurnEnd};
+use crate::protocol::{
+    AgentInfo, ApprovalState, EffortState, Frame, Request, SessionInfo, TurnEnd,
+};
 use crate::wire::{read_request, write_frame};
 
 /// How many frames may be queued to one client before progress is dropped.
@@ -183,12 +185,23 @@ impl Agent {
         &self.models
     }
 
+    /// Returns the reasoning effort the agent's next request will carry.
+    ///
+    /// Read from the runner, which is what fills a request in, and translated into the link's
+    /// vocabulary here rather than on the wire: `None` means the adapter has no notion of
+    /// effort, which is reported as the absence it is.
+    #[must_use]
+    pub fn effort(&self) -> Option<EffortState> {
+        self.runner.effort().map(wire_effort)
+    }
+
     /// Describes the agent itself.
     fn info(&self) -> AgentInfo {
         AgentInfo {
             workspace: self.workspace.display().to_string(),
             model: self.model(),
             models: self.models.clone(),
+            effort: self.effort(),
             tools: self.tools,
             version: crate::protocol::PROTOCOL_VERSION,
         }
@@ -579,6 +592,17 @@ impl Registry {
         }
     }
 
+    /// Tells every attached client which reasoning effort the agent is asking for now.
+    ///
+    /// Sent to every session's viewers for the same reason the approval state and the model are:
+    /// it is the agent's, so two clients watching one conversation have to agree about it.
+    async fn broadcast_effort(&self, state: EffortState) {
+        let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
+        for entry in held {
+            broadcast_awaited(&entry, Frame::EffortChanged { state }, None).await;
+        }
+    }
+
     /// Lets idle sessions go until the agent is holding no more than it should.
     ///
     /// `incoming` is how many sessions the caller is about to add. Counting them before
@@ -646,6 +670,28 @@ const fn wire_state(policy: ApprovalPolicy) -> ApprovalState {
 }
 
 /// Reads the link's approval state into the domain's vocabulary.
+/// Renders a reasoning effort in the link's vocabulary.
+///
+/// An exhaustive match, so a step the ports scale grows cannot quietly fail to cross.
+const fn wire_effort(effort: nanus_ports::ReasoningEffort) -> EffortState {
+    match effort {
+        nanus_ports::ReasoningEffort::Minimal => EffortState::Minimal,
+        nanus_ports::ReasoningEffort::Low => EffortState::Low,
+        nanus_ports::ReasoningEffort::Medium => EffortState::Medium,
+        nanus_ports::ReasoningEffort::High => EffortState::High,
+    }
+}
+
+/// Reads the link's effort into the ports vocabulary.
+const fn domain_effort(state: EffortState) -> nanus_ports::ReasoningEffort {
+    match state {
+        EffortState::Minimal => nanus_ports::ReasoningEffort::Minimal,
+        EffortState::Low => nanus_ports::ReasoningEffort::Low,
+        EffortState::Medium => nanus_ports::ReasoningEffort::Medium,
+        EffortState::High => nanus_ports::ReasoningEffort::High,
+    }
+}
+
 const fn domain_policy(state: ApprovalState) -> ApprovalPolicy {
     match state {
         ApprovalState::PerCall => ApprovalPolicy::PerCall,
@@ -1254,6 +1300,13 @@ async fn serve_connection(
                 registry.broadcast_approval(state).await;
             }
             Request::SetModel { model } => set_model(&registry, &frames, model).await,
+            Request::SetEffort { state } => {
+                registry
+                    .agent
+                    .runner()
+                    .set_effort(Some(domain_effort(state)));
+                registry.broadcast_effort(state).await;
+            }
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
                 shutdown.notify_one();
@@ -1363,6 +1416,11 @@ async fn attach(
     // they type rather than after the first answer.
     let model = registry.agent.model();
     send(frames, Frame::ModelChanged { model }).await;
+    // The effort follows, and only when the adapter has one: a frame carrying "no notion of
+    // effort" would need a second shape to say so, and the handshake already said it.
+    if let Some(state) = registry.agent.effort() {
+        send(frames, Frame::EffortChanged { state }).await;
+    }
     (viewer, Rc::clone(held))
 }
 

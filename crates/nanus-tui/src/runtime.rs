@@ -40,6 +40,7 @@
 //! | `Ctrl+K` / `Ctrl+U` / `Ctrl+Y` | delete to the line's end / the line / put it back |
 //! | `Ctrl+W` / `Alt+B` / `Alt+F` | delete a word / move a word back / forward |
 //! | `Alt+P` | switch to the next model the agent offers |
+//! | `Alt+T` | ask for the next step of reasoning effort |
 //! | `Ctrl+L` | clear the transcript |
 //! | `Backspace` / `Delete` | delete a character |
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
@@ -65,8 +66,8 @@ use futures::StreamExt as _;
 use nanus_adapter_config::{NanusConfig, TuiDetail};
 use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
-use nanus_link::protocol::{ApprovalState, Frame, Request, SessionInfo, TurnEnd};
-use nanus_ports::{StoreError, StoreHandle};
+use nanus_link::protocol::{ApprovalState, EffortState, Frame, Request, SessionInfo, TurnEnd};
+use nanus_ports::{ReasoningEffort, StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -326,6 +327,14 @@ pub trait SessionSource {
         None
     }
 
+    /// The reasoning effort the conversation is being answered at, when one is known.
+    ///
+    /// `None` means nothing said — an adapter without a notion of effort, or a recording made
+    /// before effort was recorded — and the title bar draws nothing rather than a guess.
+    fn effort(&self) -> Option<ReasoningEffort> {
+        None
+    }
+
     /// Whether a turn is already running when the interface opens.
     ///
     /// A client that attaches mid-turn has missed the prompt that started it, so nothing
@@ -372,6 +381,12 @@ pub trait SessionSource {
     /// A default of doing nothing, for the same reason as [`SessionSource::set_approval`]: a
     /// recording has no agent to tell, and the model it shows is the one it was recorded with.
     fn set_model(&mut self, _model: &str) {}
+
+    /// Tells the agent how much reasoning effort to ask for from now on.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::set_model`]: a
+    /// recording has no agent to tell.
+    fn set_effort(&mut self, _effort: ReasoningEffort) {}
 
     /// Releases whatever the source owns.
     ///
@@ -518,6 +533,8 @@ pub struct Remote {
     /// The model the agent reported, and the ones it offers to switch between.
     model: Option<String>,
     models: Vec<String>,
+    /// The reasoning effort the agent reported, when it has one.
+    effort: Option<ReasoningEffort>,
     /// Whether a turn was already running in the session when it was attached to.
     busy: bool,
 }
@@ -567,6 +584,7 @@ impl Remote {
             approval,
             model: Some(agent.model.clone()),
             models: agent.models.clone(),
+            effort: agent.effort.map(view_effort),
             busy,
         })
     }
@@ -617,6 +635,10 @@ impl SessionSource for Remote {
 
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn effort(&self) -> Option<ReasoningEffort> {
+        self.effort
     }
 
     fn label(&self) -> Option<&str> {
@@ -673,6 +695,12 @@ impl SessionSource for Remote {
             model: model.to_owned(),
         });
     }
+
+    fn set_effort(&mut self, effort: ReasoningEffort) {
+        self.send(Request::SetEffort {
+            state: wire_effort(effort),
+        });
+    }
 }
 
 /// Renders the interface's approval state in the link's vocabulary.
@@ -684,6 +712,29 @@ const fn wire_state(policy: ApprovalPolicy) -> ApprovalState {
         ApprovalPolicy::PerCall => ApprovalState::PerCall,
         ApprovalPolicy::Permitted => ApprovalState::Permitted,
         ApprovalPolicy::AllCalls => ApprovalState::AllCalls,
+    }
+}
+
+/// Renders an effort in the link's vocabulary.
+///
+/// An exhaustive match, so a step the ports scale grows is a compile error here rather than a
+/// value the wire cannot carry.
+const fn wire_effort(effort: ReasoningEffort) -> EffortState {
+    match effort {
+        ReasoningEffort::Minimal => EffortState::Minimal,
+        ReasoningEffort::Low => EffortState::Low,
+        ReasoningEffort::Medium => EffortState::Medium,
+        ReasoningEffort::High => EffortState::High,
+    }
+}
+
+/// Reads the link's effort into the interface's vocabulary.
+const fn view_effort(state: EffortState) -> ReasoningEffort {
+    match state {
+        EffortState::Minimal => ReasoningEffort::Minimal,
+        EffortState::Low => ReasoningEffort::Low,
+        EffortState::Medium => ReasoningEffort::Medium,
+        EffortState::High => ReasoningEffort::High,
     }
 }
 
@@ -881,6 +932,7 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     view.label = source.label().map(str::to_owned);
     view.model = source.model().map(str::to_owned);
     view.models = source.models().to_vec();
+    view.effort = source.effort();
     // Only when one was asked for: the default is already the fail-closed state, and a live
     // conversation overwrites this with the agent's own answer as soon as it is attached.
     if let Some(policy) = source.initial_approval() {
@@ -986,6 +1038,7 @@ async fn event_loop(
                         }
                     }
                     Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
+                    Outcome::CycleEffort => cycle_effort(source, &mut view),
                     Outcome::SetApproval(policy) => {
                         // Applied locally first, so the status line answers the keypress
                         // immediately, and sent to the agent, which owns the gate: the state
@@ -1192,6 +1245,21 @@ fn switch_model(requested: Option<String>, source: &mut dyn SessionSource, view:
     source.set_model(&chosen);
 }
 
+/// Asks for the next step of reasoning effort.
+///
+/// A source that has not said which effort it is using starts at the provider's default — the
+/// middle of the scale, which is where an unset request lands — and the reader's next press moves
+/// from there. The title bar names the result, so the state is never a mystery, and the status
+/// line says what was asked for at the moment it was asked.
+fn cycle_effort(source: &mut dyn SessionSource, view: &mut ViewState) {
+    let chosen = view
+        .effort
+        .map_or_else(|| ReasoningEffort::Medium.next(), ReasoningEffort::next);
+    view.effort = Some(chosen);
+    view.status = format!("thinking: {chosen}");
+    source.set_effort(chosen);
+}
+
 /// The model a cycle moves to, or `None` when there is nothing to move to.
 ///
 /// A model not in the list starts the cycle at the first one, which is what keeps the key
@@ -1290,6 +1358,12 @@ enum Outcome {
     SetApproval(ApprovalPolicy),
     /// Switch to this model, or to the next one when nothing is named.
     SetModel(Option<String>),
+    /// Ask the agent for more or less reasoning effort.
+    ///
+    /// The key is a cycle rather than a toggle because the scale has four steps and only one of
+    /// them means "no thinking": a toggle would have to invent what "on" means after a reader has
+    /// already chosen `low`.
+    CycleEffort,
 }
 
 /// Applies one keystroke to the view.
@@ -1616,6 +1690,9 @@ fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         // held by the view — so the key asks for the next one and the switch decides whether
         // there is one.
         KeyCode::Char('p' | 'P') if alt => Outcome::SetModel(None),
+        // `Alt+T` asks for more thinking, and wraps round at the top: see `Outcome::CycleEffort`
+        // for why this is a cycle rather than a toggle, and `ReasoningEffort::next` for the order.
+        KeyCode::Char('t' | 'T') if alt => Outcome::CycleEffort,
         // `?` is the key list, and only on an empty prompt. The gate is the price of the
         // binding: a prompt may open with a question mark, and swallowing it would make this
         // interface unable to ask a question that starts with one. A reader who means to type
@@ -1835,6 +1912,12 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // startup is drawn without the reader pressing anything.
             view.approval = view_policy(state);
         }
+        Frame::EffortChanged { state } => {
+            // Applied even to the client that asked, for the same reason the model is: the agent
+            // is what fills an unset effort in, and it is the authority on what the next request
+            // carries.
+            view.effort = Some(view_effort(state));
+        }
         Frame::ModelChanged { model } => {
             // The agent is the authority here too, and for a stronger reason: it is the model
             // named in the next request. A client that switched it has already drawn the
@@ -2034,6 +2117,12 @@ mod tests {
         fn set_model(&mut self, model: &str) {
             self.requests.borrow_mut().push(Request::SetModel {
                 model: model.to_owned(),
+            });
+        }
+
+        fn set_effort(&mut self, effort: ReasoningEffort) {
+            self.requests.borrow_mut().push(Request::SetEffort {
+                state: wire_effort(effort),
             });
         }
     }
@@ -2625,6 +2714,65 @@ mod tests {
             "a model the build no longer offers does not leave the key dead"
         );
         assert_eq!(next_model(&[], Some("one")), None);
+    }
+
+    /// `Alt+T` steps the effort and sends what it stepped to.
+    ///
+    /// A cycle rather than a toggle, because only one of the four steps means "no thinking": a
+    /// toggle would have to invent what "on" means for a reader who had already chosen `low`.
+    #[test]
+    fn the_thinking_key_cycles_the_effort_and_tells_the_agent() {
+        let mut view = ViewState::new();
+        let mut source = Scripted::new(Vec::new());
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('t'), KeyModifiers::ALT), &mut view),
+            Outcome::CycleEffort
+        ));
+
+        // Nothing said which effort is in use, so the cycle starts at the middle of the scale —
+        // where an unset request lands — and moves from there.
+        let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::ALT), &mut view);
+        cycle_effort(&mut source, &mut view);
+        assert_eq!(view.effort, Some(ReasoningEffort::High));
+        assert_eq!(view.status, "thinking: high");
+
+        for expected in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            cycle_effort(&mut source, &mut view);
+            assert_eq!(view.effort, Some(expected), "the cycle wraps round");
+        }
+        assert_eq!(
+            source.requests.borrow().last(),
+            Some(&Request::SetEffort {
+                state: EffortState::High
+            })
+        );
+    }
+
+    /// The agent is the authority on the effort its next request carries, and a recording has
+    /// nothing to ask.
+    #[test]
+    fn an_effort_frame_sets_the_effort_that_is_drawn() {
+        let mut view = ViewState::new();
+        assert_eq!(view.effort, None);
+        apply(
+            Frame::EffortChanged {
+                state: EffortState::Low,
+            },
+            &mut view,
+        );
+        assert_eq!(view.effort, Some(ReasoningEffort::Low));
+
+        // A recording offers no effort and, asked, says nothing rather than changing what it
+        // draws: the key is the agent's to answer.
+        let mut recording = Recording::new(session());
+        assert_eq!(recording.effort(), None);
+        recording.set_effort(ReasoningEffort::High);
+        assert_eq!(recording.effort(), None);
     }
 
     /// The agent is the authority on which model is answering, so the reply wins over what the
@@ -3615,6 +3763,7 @@ mod tests {
                 workspace: "/tmp".to_owned(),
                 model: "m".to_owned(),
                 models: Vec::new(),
+                effort: None,
                 tools: 0,
                 version: nanus_link::protocol::PROTOCOL_VERSION,
             }),

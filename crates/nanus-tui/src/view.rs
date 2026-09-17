@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use nanus_domain::ApprovalPolicy;
+use nanus_ports::ReasoningEffort;
 
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
@@ -240,6 +241,13 @@ pub struct ViewState {
     /// Empty for a source that cannot be switched — a recorded transcript has no agent to
     /// tell, and the key says so rather than offering a list nobody would honour.
     pub models: Vec<String>,
+    /// How hard the model is being asked to think, when anything said.
+    ///
+    /// Drawn in the title bar beside the model, because both are the same kind of fact — what
+    /// is answering — and because a toggle whose state is invisible is a toggle a reader has to
+    /// press to find out about. `None` is an adapter with no notion of effort, or a session that
+    /// predates the field, and it is drawn as nothing rather than as a guess.
+    pub effort: Option<ReasoningEffort>,
     /// What to call the session in the title bar, when the interface is in one.
     ///
     /// A live conversation is a conversation *with something*, and once sessions can be
@@ -356,6 +364,7 @@ impl Default for ViewState {
             detail: Detail::default(),
             model: None,
             models: Vec::new(),
+            effort: None,
             label: None,
             theme: Theme::default(),
             markdown: true,
@@ -1062,7 +1071,13 @@ impl ViewState {
             .split(area);
 
         if let Some(title) = chunks.first() {
-            Self::render_title(frame, *title, self.label.as_deref(), self.model.as_deref());
+            Self::render_title(
+                frame,
+                *title,
+                self.label.as_deref(),
+                self.model.as_deref(),
+                self.effort,
+            );
         }
         if let Some(body) = chunks.get(1) {
             self.last_viewport = Some((body.width, body.height));
@@ -1393,12 +1408,20 @@ impl ViewState {
     ///
     /// Associated rather than a method: the title bar shows the same things in every
     /// state, so taking `self` would suggest a dependence that does not exist. The session
-    /// label and the model are passed in because they are the parts that vary.
+    /// label, the model, and the effort are passed in because they are the parts that vary.
     ///
-    /// The model is here rather than on the status line because it is the same kind of fact
-    /// the label is — which conversation, answered by what — and it is drawn before the key
-    /// hints so that a narrow terminal loses a hint rather than the model.
-    fn render_title(frame: &mut Frame<'_>, area: Rect, label: Option<&str>, model: Option<&str>) {
+    /// These are here rather than on the status line because they are the same kind of fact
+    /// the label is — which conversation, answered by what, how hard it is thinking — and they
+    /// are drawn before the key hints so that a narrow terminal loses a hint rather than any of
+    /// them. The effort in particular has to be visible: a toggle whose state is invisible is
+    /// one a reader has to press to find out about.
+    fn render_title(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        label: Option<&str>,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+    ) {
         let mut spans = vec![Span::styled(
             "nanus",
             Style::default().add_modifier(Modifier::BOLD),
@@ -1412,6 +1435,14 @@ impl ViewState {
         if let Some(model) = model {
             spans.push(Span::styled(
                 format!("  ·  {model}"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if let Some(effort) = effort {
+            // Named as *thinking* rather than as an effort level, because that is what the key
+            // asks for and what a reader is looking for on the line.
+            spans.push(Span::styled(
+                format!("  ·  thinking: {effort}"),
                 Style::default().fg(Color::Cyan),
             ));
         }
@@ -2958,6 +2989,24 @@ mod tests {
         unknown.model = None;
         let bare = rendered(&mut unknown, 80, 12);
         assert!(!bare.contains("deepseek"), "{bare}");
+    }
+
+    /// How hard the model is being asked to think is drawn beside the model, because a toggle
+    /// whose state cannot be seen is one a reader has to press to find out about.
+    #[test]
+    fn the_title_bar_names_the_effort_in_force() {
+        let mut state = ViewState::new();
+        state.model = Some(String::from("deepseek-flash"));
+        let before = rendered(&mut state, 90, 12);
+        assert!(!before.contains("thinking"), "{before}");
+
+        state.effort = Some(ReasoningEffort::High);
+        let after = rendered(&mut state, 90, 12);
+        assert!(after.contains("thinking: high"), "{after}");
+        assert!(
+            after.contains("deepseek-flash"),
+            "the model stays beside it: {after}"
+        );
     }
 
     /// Reopening starts at the top, whatever a previous look was scrolled to: the list is

@@ -346,5 +346,5 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   fenced block is highlighted by a lexer inside the view, which is still a pure
   function of the transcript.
 - **No `@` mentions or `!` bash mode** in the interface. The approval state cycles
-  from the keyboard with `Shift+Tab`, and the model switches with `Alt+P` or
-  `/model`.
+  from the keyboard with `Shift+Tab`, the model switches with `Alt+P` or `/model`,
+  and the reasoning effort steps with `Alt+T`.

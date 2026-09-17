@@ -29,7 +29,7 @@ use nanus_domain::{
     ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolRegistry,
     ToolResult, ToolSchema, Usage,
 };
-use nanus_link::protocol::{ApprovalState, Frame, Request, SessionInfo, TurnEnd};
+use nanus_link::protocol::{ApprovalState, EffortState, Frame, Request, SessionInfo, TurnEnd};
 use nanus_link::server::{Agent, Parts};
 use nanus_link::{Client, LinkError};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, StoreHandle};
@@ -561,6 +561,63 @@ fn a_model_switch_reaches_the_agent_and_is_answered() {
     assert!(
         refused.contains("deepseek-chat") && refused.contains("deepseek-v4-pro"),
         "the refusal names the id and the ones that exist: {refused}"
+    );
+}
+
+/// The effort a client asks for reaches the agent and is broadcast to everyone watching.
+///
+/// There is nothing to validate here unlike the model: the scale is the protocol's own, and the
+/// only question is whether the choice arrives and whether the other clients hear about it.
+#[test]
+fn an_effort_switch_reaches_the_agent_and_is_broadcast() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(ScriptedLlm)), "scripted");
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let state = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        // The stub adapter has no notion of effort, so the handshake says so and the attach
+        // sends no effort frame: "no notion" is an absence rather than a fourth state.
+        assert_eq!(client.info().effort, None);
+        client.start(None).await.expect("a session starts");
+        let attached = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::ModelChanged { .. }) => break true,
+                Some(_) => {}
+                None => break false,
+            }
+        };
+        assert!(attached, "the attach frames arrived");
+        client
+            .send(&Request::SetEffort {
+                state: EffortState::High,
+            })
+            .await
+            .expect("the request is sent");
+        let state = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::EffortChanged { state }) => break Some(state),
+                Some(_) => {}
+                None => break None,
+            }
+        };
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        state
+    });
+
+    assert_eq!(
+        state,
+        Some(EffortState::High),
+        "the effort the client asked for is the one the agent says it is using"
     );
 }
 

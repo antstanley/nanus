@@ -270,6 +270,13 @@ pub struct AgentRunner {
     /// than a `Cell` because a model id is a string, and the kernel is single-threaded so
     /// there is no lock to take.
     model: Rc<core::cell::RefCell<String>>,
+    /// The reasoning effort later requests carry, shared so a caller can change it mid-session.
+    ///
+    /// `None` means *ask the adapter*, which is the startup behaviour: an adapter fills an unset
+    /// effort in from its own configuration, and it is the only component that knows what that
+    /// default is. `Some` is an interface that has chosen one, exactly as
+    /// [`AgentRunner::approval`] is an interface that has chosen a state.
+    effort: Rc<core::cell::Cell<Option<nanus_ports::ReasoningEffort>>>,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -315,6 +322,7 @@ impl AgentRunner {
             system_prompt,
             approval: Rc::new(core::cell::Cell::new(config.approval_policy)),
             model,
+            effort: Rc::new(core::cell::Cell::new(None)),
             config,
         })
     }
@@ -371,6 +379,26 @@ impl AgentRunner {
             "a model id that is being switched to is not empty"
         );
         model.clone_into(&mut self.model.borrow_mut());
+    }
+
+    /// Returns the reasoning effort the next request will carry.
+    ///
+    /// The chosen one when a caller has chosen, and otherwise what the adapter applies to a
+    /// request that sets none — which is the only place that answer exists, because an adapter
+    /// is what fills an unset effort in. `None` means this adapter has no notion of effort,
+    /// which is not the same fact as any effort at all.
+    #[must_use]
+    pub fn effort(&self) -> Option<nanus_ports::ReasoningEffort> {
+        self.effort.get().or_else(|| self.llm.reasoning_effort())
+    }
+
+    /// Replaces the reasoning effort every later request will carry.
+    ///
+    /// `None` gives the choice back to the adapter. Like [`AgentRunner::set_model`] and
+    /// [`AgentRunner::set_approval`], the change takes effect on the next request, including the
+    /// next step of a turn that is already running.
+    pub fn set_effort(&self, effort: Option<nanus_ports::ReasoningEffort>) {
+        self.effort.set(effort);
     }
 
     /// Returns the tool registry this runner dispatches from.
@@ -538,10 +566,7 @@ impl AgentRunner {
             // component that fills in an unset effort and so the only one that knows what
             // was actually asked for.
             model: Some(self.model()),
-            effort: self
-                .llm
-                .reasoning_effort()
-                .map(|effort| effort.as_str().to_owned()),
+            effort: self.effort().map(|effort| effort.as_str().to_owned()),
         });
 
         // An interrupted step is *interrupted*, not a step that called tools: what the
@@ -579,6 +604,11 @@ impl AgentRunner {
         };
         let mut request = ChatRequest::new(self.model(), messages);
         request.tools = tools;
+        // Set only when a caller chose one: an unset effort is the adapter filling in its own
+        // default, which is what a request that says nothing has always meant.
+        if let Some(effort) = self.effort.get() {
+            request = request.with_reasoning_effort(effort);
+        }
         request
     }
 
@@ -1773,6 +1803,68 @@ mod tests {
             recorded,
             Some(String::from("deepseek-v4-pro")),
             "and the log says which model produced the message"
+        );
+    }
+
+    /// The effort a caller chooses reaches the request, and giving it back to the adapter
+    /// leaves the request unset rather than sending the adapter's default as if it were a
+    /// choice.
+    #[tokio::test]
+    async fn the_effort_reaches_the_request_only_when_it_was_chosen() {
+        let (llm, seen) = ScriptedLlm::recording(vec![
+            vec![LlmEvent::TextDelta("ok".to_owned())],
+            vec![LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            }],
+            vec![LlmEvent::TextDelta("ok".to_owned())],
+            vec![LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            }],
+        ]);
+        let Some(runner) = runner(llm, registry_with_echo()) else {
+            return;
+        };
+        // The stub adapter has no notion of effort, so nothing is known until one is chosen.
+        assert_eq!(runner.effort(), None);
+
+        runner.set_effort(Some(nanus_ports::ReasoningEffort::High));
+        assert_eq!(runner.effort(), Some(nanus_ports::ReasoningEffort::High));
+        let mut chosen = session();
+        let outcome = runner
+            .run_turn(&mut chosen, "think harder", &mut Silent, None)
+            .await;
+        assert!(outcome.is_ok());
+        assert_eq!(
+            seen.borrow()
+                .first()
+                .and_then(|request| request.reasoning_effort),
+            Some(nanus_ports::ReasoningEffort::High),
+            "the chosen effort is what the request carries"
+        );
+        let recorded = chosen.log().events().iter().find_map(|event| match event {
+            SessionEvent::AssistantMessage { effort, .. } => effort.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            recorded,
+            Some(String::from("high")),
+            "and the log says which effort produced the message"
+        );
+
+        // Given back to the adapter, the request says nothing: an unset effort is the adapter
+        // applying its own default, which is a different fact from asking for `medium`.
+        runner.set_effort(None);
+        let mut second = session();
+
+        let outcome = runner
+            .run_turn(&mut second, "as usual", &mut Silent, None)
+            .await;
+        assert!(outcome.is_ok());
+        assert_eq!(
+            seen.borrow()
+                .get(1)
+                .and_then(|request| request.reasoning_effort),
+            None
         );
     }
 

@@ -219,6 +219,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Ctrl+L` | clear the transcript |
 | `?` | show the key list, when the prompt is empty |
 | `Alt+P` | switch to the next model the agent offers |
+| `Alt+T` | ask for the next step of reasoning effort |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
@@ -344,7 +345,6 @@ inventing a purpose for a key would be worse than leaving it alone:
 - **The sandbox mode** is set in configuration rather than from the keyboard: the approval
   state cycles with `Shift+Tab`, but `sandbox_mode` is a standing decision about what the
   tools may touch, and changing it mid-turn would make the prompt the model was sent a lie.
-- **Extended thinking** (`Alt+T`) is an agent-side decision with no request to carry it yet.
 - **Background tasks** (`Ctrl+B`) — there are none to background.
 - **Pasting an image** (`Ctrl+V`) would need clipboard access this program does not have.
 - **`@` mentions and `!` bash mode** are input *modes* rather than shortcuts, and each is a
@@ -466,6 +466,21 @@ own name, and the alternative — rebuilding the prompt on every switch — woul
 conversation the model is being sent no longer matches the one recorded against it. The live
 value is the one in the title bar; the recorded one is what the session says produced it, and the
 two are the same thing until somebody switches.
+
+### How hard the model is asked to think
+
+`Alt+T` steps the reasoning effort, and the title bar names the step in force. The scale is the
+provider's own, four steps from `minimal` — which is how a provider says "do not think" — through
+`low` and `medium` to `high`, and the key cycles it rather than toggling it: only one of the four
+means "no thinking", so a toggle would have to invent what "on" means for a reader who had already
+chosen `low`. A session that has not said which effort it is using starts above the middle, since a
+reader pressing a key called extended thinking means more thinking rather than the setting they
+already had.
+
+Like the model, the effort belongs to the agent's runner and reaches every watcher, and it takes
+effect on the next request rather than the next turn. An adapter with no notion of effort says so
+by the absence: nothing is drawn beside the model, and a change is a request the adapter ignores
+rather than an error.
 
 ## Scrolling back
 

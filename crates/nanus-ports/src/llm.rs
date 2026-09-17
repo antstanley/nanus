@@ -95,6 +95,21 @@ impl ReasoningEffort {
             Self::High => "high",
         }
     }
+
+    /// Returns the next step of the scale, wrapping round.
+    ///
+    /// The order is by increasing effort, so a reader stepping through it is asking for more
+    /// thinking rather than for a different setting, and wrapping is what keeps a key from
+    /// being stuck at the top: an interface cycling the scale needs a step that always exists.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Minimal => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Minimal,
+        }
+    }
 }
 
 impl fmt::Display for ReasoningEffort {
@@ -526,6 +541,19 @@ fn merge_name(slot: &mut Slot, index: u32, name: Option<ToolName>) -> LlmResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scale steps upward and wraps, which is what an interface cycling it needs: a step
+    /// that ends at the top would be a key that stops working.
+    #[test]
+    fn the_effort_scale_steps_upward_and_wraps() {
+        assert_eq!(ReasoningEffort::Minimal.next(), ReasoningEffort::Low);
+        assert_eq!(ReasoningEffort::Low.next(), ReasoningEffort::Medium);
+        assert_eq!(ReasoningEffort::Medium.next(), ReasoningEffort::High);
+        assert_eq!(ReasoningEffort::High.next(), ReasoningEffort::Minimal);
+        // The order agrees with `Ord`, so "more effort" means the same thing however it is
+        // expressed.
+        assert!(ReasoningEffort::High > ReasoningEffort::Minimal);
+    }
 
     fn tool_name(raw: &str) -> ToolName {
         ToolName::new(raw).unwrap_or_else(|error| panic!("test tool name {raw}: {error}"))

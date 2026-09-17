@@ -59,6 +59,7 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("Alt+B / Alt+F", "move the cursor a word back or forward"),
     ("Shift+Tab", "cycle the approval state from anywhere"),
     ("Alt+P", "switch to the next model the agent offers"),
+    ("Alt+T", "ask for the next step of reasoning effort"),
     ("?", "show this list, when the prompt is empty"),
     ("", "while an approval dialog is up"),
     ("y", "allow the call once"),

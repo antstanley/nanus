@@ -101,6 +101,25 @@ pub enum ApprovalState {
     AllCalls,
 }
 
+/// How much reasoning effort an agent asks the model to spend.
+///
+/// The link's own vocabulary rather than the ports enum, for the same reason [`ApprovalState`]
+/// is: a client that only draws links the protocol, and the ports crate is not something the
+/// interface half of the link may name. The server translates, and the translation is an
+/// exhaustive match, so a step the scale grows cannot quietly fail to cross.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortState {
+    /// Spend as little as possible: the provider's way of turning thinking off.
+    Minimal,
+    /// Spend a little.
+    Low,
+    /// Spend the provider's default amount.
+    Medium,
+    /// Spend as much as the provider allows.
+    High,
+}
+
 /// What a client asks an agent to do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -196,6 +215,17 @@ pub enum Request {
     SetModel {
         /// The model id to use from now on.
         model: String,
+    },
+
+    /// Replace the reasoning effort every later request will carry.
+    ///
+    /// The same shape as [`Request::SetModel`] and for the same reason: the effort travels with
+    /// the request the agent issues, so a choice has to reach the loop rather than ride along
+    /// with the next prompt. Unlike the model there is no list to validate against — the scale is
+    /// the protocol's own — and a provider that has no notion of effort simply ignores it.
+    SetEffort {
+        /// The effort to ask for from now on.
+        state: EffortState,
     },
 
     /// Describe the agent without changing anything.
@@ -335,6 +365,16 @@ pub enum Frame {
     ModelChanged {
         /// The model id the agent is using now.
         model: String,
+    },
+
+    /// The reasoning effort the agent's next request will carry.
+    ///
+    /// Sent whenever the choice changes, so every client attached to the agent agrees about how
+    /// hard the model is being asked to think. The value in the handshake is the one in force at
+    /// the moment of attaching; this is what keeps a client that attached earlier up to date.
+    EffortChanged {
+        /// The effort the agent is asking for now.
+        state: EffortState,
     },
 
     /// The agent's approval state, for an interface to draw and cycle from.
@@ -523,6 +563,13 @@ pub struct AgentInfo {
     /// use, which is what it draws.
     #[serde(default)]
     pub models: Vec<String>,
+    /// The reasoning effort the agent applies to a request that chooses none.
+    ///
+    /// `None` means the adapter has no notion of effort, which is not the same fact as any
+    /// effort at all and is reported as the absence it is. Defaulted on the way in for the same
+    /// reason `models` is.
+    #[serde(default)]
+    pub effort: Option<EffortState>,
     /// How many tools the agent exposes.
     pub tools: usize,
     /// The link protocol version the agent speaks.
@@ -591,6 +638,7 @@ mod tests {
             workspace: "/work".to_owned(),
             model: "deepseek-flash".to_owned(),
             models: vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()],
+            effort: Some(EffortState::Medium),
             tools: 7,
             version: PROTOCOL_VERSION,
         }
@@ -663,6 +711,12 @@ mod tests {
             Frame::ModelChanged {
                 model: "deepseek-v4-pro".to_owned(),
             },
+            Frame::EffortChanged {
+                state: EffortState::Minimal,
+            },
+            Frame::EffortChanged {
+                state: EffortState::High,
+            },
             Frame::Usage {
                 tokens: 1234,
                 completion_tokens: 90,
@@ -731,6 +785,9 @@ mod tests {
             Request::SetModel {
                 model: "deepseek-v4-pro".to_owned(),
             },
+            Request::SetEffort {
+                state: EffortState::Minimal,
+            },
             Request::Sessions,
             Request::Status,
             Request::Shutdown,
@@ -778,6 +835,7 @@ mod tests {
                 workspace: "/w".to_owned(),
                 model: "m".to_owned(),
                 models: Vec::new(),
+                effort: None,
                 tools: 7,
                 version: 0,
             }))
