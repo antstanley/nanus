@@ -64,6 +64,26 @@ and the agent picks up the new name the next time it opens the session — a lis
 *held* sessions can show the name it was opened under until then. Resuming by the new name
 works straight away, because resolving a reference falls through to the store.
 
+## Deleting
+
+```sh
+nanus sessions delete nightly
+nanus sessions delete 01a09a98-d8c4-73d7-b11d-638077efeeca
+```
+
+The reference is resolved exactly as naming resolves one — a name it answers to first, then
+a store key — and a reference that answers to nothing is refused rather than reported as a
+deletion that removed nothing. That refusal is in the CLI rather than in the store, because
+the port says deleting something absent is not an error: the caller asked for it to be gone
+and it is. Reporting success for a typo would leave somebody believing a conversation is
+gone while it is still on disk.
+
+Deleting removes the session's directory, so its name and its log go together and no alias
+is left pointing at nothing. It is not reversible, and nothing here knows whether an agent
+somewhere is holding the session: a held session can still be saved again by the turn
+writing it, which recreates the directory. Stop the agent, or attach and let it go, before
+deleting one it is serving.
+
 ## Resuming
 
 | Command | What it does |
@@ -141,8 +161,9 @@ would then be a second source of truth.
 
 - **No locking.** Two agents can be told to resume the same session, and the second save
   wins. Attaching to a live session is the supported way to share one.
-- **No deletion in the interface.** `StorePort::delete` exists and `nanus sessions` does
-  not expose it yet, so removing a session means removing its directory.
+- **No deletion in the interface.** `nanus sessions delete <ref>` removes a session and
+  releases its name; the interface has no key for it yet, so a conversation is removed from
+  the CLI rather than from the screen it is being read on.
 - **Names are flat and case-sensitive.** `Nightly` and `nightly` are two names, and there
   is no namespacing.
 - **A name is per store, not per machine.** `$NANUS_HOME` decides which names exist.

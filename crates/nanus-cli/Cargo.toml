@@ -38,6 +38,11 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# The session actions are tested against the real store rather than a stub: what is under
+# test is that a reference resolves, that an absent one is refused, and that a deletion
+# really removes the directory — all of which are the adapter's behaviour.
+nanus-adapter-store = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

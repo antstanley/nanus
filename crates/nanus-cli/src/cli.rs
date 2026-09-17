@@ -12,9 +12,10 @@
 //!
 //! A session is the conversation, and it is written down whether it was started by a run,
 //! an interface, or a service. `--name` records one under a name, `--resume` continues
-//! one, and `nanus sessions` lists them. The name is an alias for the store key, so a
-//! session keeps its identity through a rename, and a name is refused rather than moved
-//! when another session already answers to it.
+//! one, and `nanus sessions` lists, names, and deletes them. The name is an alias for the
+//! store key, so a session keeps its identity through a rename, a name is refused rather
+//! than moved when another session already answers to it, and deleting a session takes its
+//! name with it.
 //!
 //! ## What this binary is not
 //!
@@ -181,6 +182,17 @@ pub enum SessionsAction {
         /// The name to record.
         name: String,
         /// The session to record it for: an id, or a name it already answers to.
+        session: String,
+    },
+
+    /// Remove a session and everything it recorded.
+    ///
+    /// The reference is resolved exactly as naming resolves it — a name it already answers
+    /// to, then a store key — and a reference that answers to nothing is refused rather than
+    /// reported as a deletion that removed nothing. Deleting is not reversible; the name, if
+    /// the session had one, is released with it.
+    Delete {
+        /// The session to remove: an id, or a name it already answers to.
         session: String,
     },
 }
@@ -379,6 +391,13 @@ pub enum Ready {
         /// The session to record it for.
         session: String,
     },
+    /// A session is ready to be removed.
+    Delete {
+        /// The store that holds it.
+        store: nanus_ports::StoreHandle,
+        /// The session to remove: an id, or a name it answers to.
+        session: String,
+    },
     /// A composition is built for a shell-scoped agent the interface will talk to.
     Tui {
         /// The adapters, ready to mount.
@@ -447,6 +466,7 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             name,
             session,
         } => record_name(&store, &name, &session),
+        Ready::Delete { store, session } => delete_session(&store, &session),
         Ready::Tui {
             pending,
             workspace,
@@ -775,6 +795,30 @@ fn record_name(
     Ok(())
 }
 
+/// Removes a session, refusing a reference that answers to nothing.
+///
+/// The reference is resolved the way naming resolves one — a name it already answers to
+/// first, then a store key — and the session is checked to exist before anything is removed.
+/// The store's `delete` deliberately treats an absent session as success (the caller asked
+/// for it to be gone and it is), so the refusal has to be here: `nanus sessions delete typo`
+/// reporting that it deleted something is a person believing a conversation is gone when it
+/// is still on disk, which is the one thing a delete must not do.
+fn delete_session(store: &nanus_ports::StoreHandle, reference: &str) -> Result<(), String> {
+    let id = resolve_id(store, reference)?;
+    let listed = kernel_block_on(store.list()).map_err(|error| error.to_string())?;
+    let Some(summary) = listed.into_iter().find(|summary| summary.id == id) else {
+        return Err(format!("no session answers to {reference:?}"));
+    };
+    kernel_block_on(store.delete(&id)).map_err(|error| error.to_string())?;
+    // The name goes with the session, so saying which one it was is the last chance to
+    // notice that the wrong conversation was removed.
+    let name = summary
+        .name
+        .map_or_else(String::new, |name| format!(" ({name})"));
+    println!("nanus: deleted session {}{name}", id.as_str());
+    Ok(())
+}
+
 /// Persists the session, reporting a failure rather than losing it silently.
 ///
 /// Awaited rather than driven with `block_on`: this already runs inside the runtime,
@@ -861,6 +905,7 @@ async fn prepare_sessions(action: Option<SessionsAction>) -> Result<Ready, Strin
             name,
             session,
         }),
+        Some(SessionsAction::Delete { session }) => Ok(Ready::Delete { store, session }),
     }
 }
 
@@ -994,6 +1039,23 @@ mod tests {
 
         // Both ends are required: a name with nothing to name is not a command.
         assert!(Args::try_parse_from(["nanus", "sessions", "name", "nightly"]).is_err());
+
+        let deleted = Args::try_parse_from(["nanus", "sessions", "delete", "nightly"]);
+        assert!(deleted.is_ok(), "{deleted:?}");
+        let Ok(deleted) = deleted else { return };
+        let Some(Command::Sessions {
+            action: Some(SessionsAction::Delete { session }),
+        }) = deleted.command
+        else {
+            panic!("expected a delete action");
+        };
+        assert_eq!(session, "nightly");
+        // A deletion names exactly one session: there is nothing to ask for twice.
+        assert!(Args::try_parse_from(["nanus", "sessions", "delete"]).is_err());
+        assert!(
+            Args::try_parse_from(["nanus", "sessions", "delete", "a", "b"]).is_err(),
+            "a second reference is a usage error rather than a silent second deletion"
+        );
     }
 
     #[test]
@@ -1202,5 +1264,71 @@ mod tests {
             "/tmp/agent.sock"
         );
         assert!(resolved(&Err(String::from("no home"))).contains("nanus home"));
+    }
+
+    /// A store in a temporary home, so a delete test never touches a real session.
+    fn store_under(home: &Path) -> nanus_ports::StoreHandle {
+        use nanus_adapter_store::JsonlStore;
+        kernel_block_on(JsonlStore::new(home.to_path_buf()))
+            .unwrap_or_else(|error| panic!("a store in the temporary directory: {error}"))
+            .handle()
+    }
+
+    /// Records one session, named if asked, and returns its id.
+    fn saved_session(
+        store: &nanus_ports::StoreHandle,
+        id: &str,
+        name: Option<&str>,
+    ) -> nanus_domain::SessionId {
+        let session = nanus_domain::Session::new(nanus_domain::SessionId::new(id), 0, "/work");
+        let session_id = session.id().clone();
+        kernel_block_on(store.save(&session))
+            .unwrap_or_else(|error| panic!("the session is saved: {error}"));
+        if let Some(name) = name {
+            kernel_block_on(store.name(&session_id, name))
+                .unwrap_or_else(|error| panic!("the session is named: {error}"));
+        }
+        session_id
+    }
+
+    #[test]
+    fn deleting_a_session_by_name_removes_it_and_releases_the_name() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let store = store_under(dir.path());
+        let id = saved_session(&store, "01a09558", Some("nightly"));
+
+        let deleted = delete_session(&store, "nightly");
+        assert!(deleted.is_ok(), "deleting by name works: {deleted:?}");
+
+        // The directory is gone, so a listing no longer shows it...
+        let listed = kernel_block_on(store.list()).unwrap_or_else(|error| panic!("{error}"));
+        assert!(listed.is_empty(), "nothing is left: {listed:?}");
+        // ...and the name is released with it, so a later session cannot inherit an alias
+        // for a conversation that no longer exists.
+        let resolved =
+            kernel_block_on(store.resolve("nightly")).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(resolved, None, "the name was released");
+        // The id still resolves to itself as a name, which finds nothing now.
+        assert!(
+            delete_session(&store, id.as_str()).is_err(),
+            "the id is gone too"
+        );
+    }
+
+    #[test]
+    fn deleting_a_session_that_is_not_there_is_refused() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let store = store_under(dir.path());
+        let _kept = saved_session(&store, "01a09558", None);
+
+        let refused = delete_session(&store, "ghost");
+        let Err(message) = refused else {
+            panic!("an unknown reference must be refused: {refused:?}");
+        };
+        assert!(message.contains("ghost"), "the refusal names it: {message}");
+
+        // And the refusal removed nothing: the session that *is* there is still there.
+        let listed = kernel_block_on(store.list()).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(listed.len(), 1, "the store was not touched: {listed:?}");
     }
 }

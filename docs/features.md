@@ -92,6 +92,9 @@ A session is the conversation, written down as it happens. See
   `nanus sessions name <name> <session>` to rename later. A name is an alias for
   a store key: one session has one name, and a held name is refused rather than
   moved.
+- **Deleting a session**, with `nanus sessions delete <name|id>`. The reference is
+  resolved the way naming resolves one, a reference that answers to nothing is
+  refused rather than reported as a deletion, and the session's name goes with it.
 - **Resuming** by name or id: `--resume` on `run` and `tui`, including against a
   service that is already holding the session.
 - **Live sessions.** An agent holds sessions open, a turn runs in its own task
@@ -157,6 +160,7 @@ Global options on `nanus`: `--verbose`, `--quiet`, `--config <PATH>`.
 | `nanus config` | Print the effective configuration; no key needed. |
 | `nanus sessions` | List recorded sessions, newest first; no key needed. |
 | `nanus sessions name <NAME> <SESSION>` | Record or change a session's name. |
+| `nanus sessions delete <NAME\|ID>` | Remove a session and release its name. |
 
 A bare `nanus` starts the interface when there is a terminal and prints usage
 when there is not. The usage text is built from the same parser the commands
@@ -293,8 +297,6 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   writes, its network access, or its process table.
 - **Sessions are not locked.** Two writers on one log can lose a turn; attaching
   to a live session is the supported way to share one.
-- **`nanus sessions` does not delete.** `StorePort::delete` exists, but removing
-  a session means removing its directory.
 - **No syntax highlighting** in fenced code blocks, and no image paste; the
   markdown renderer performs no I/O.
 - **No vim mode, `@` mentions, or `!` bash mode** in the interface, and no
