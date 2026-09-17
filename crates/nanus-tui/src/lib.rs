@@ -44,6 +44,9 @@ mod help;
 // because it is the runtime's convenience: the view never sees it, and the wire has no way to
 // carry the bytes.
 mod paste;
+// `@` mentions: which word the caret is in, what the workspace holds, and which file answers the
+// query. Private because it is a detail of the composer rather than a surface of the crate.
+mod mentions;
 // The markdown renderer is an implementation detail of the view: it produces the same
 // `Line`s every other entry is drawn from, and nothing outside this crate needs to name
 // it. Keeping it private is what stops it becoming a second public rendering surface.

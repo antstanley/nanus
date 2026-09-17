@@ -345,6 +345,6 @@ The honest list lives in [status](status.md#known-limits); the headline items:
 - **No remote fetch from the renderer**: a fenced block is highlighted by a lexer
   inside the view, and an image is a placeholder or a pasted file, never a URL
   fetched on a model's say-so.
-- **No `@` mentions or `!` bash mode** in the interface. The approval state cycles
-  from the keyboard with `Shift+Tab`, the model switches with `Alt+P` or `/model`,
-  and the reasoning effort steps with `Alt+T`.
+- **No `!` bash mode** in the interface. The approval state is chosen with
+  `Shift+Tab`, the model switches with `Alt+P` or `/model`, the reasoning effort steps
+  with `Alt+T`, and `@` completes a file's path from the workspace.

@@ -133,6 +133,13 @@ const COMPOSER_PADDING_COLS: u16 = 1;
 /// The blank rows the composer keeps above and below its box.
 const COMPOSER_PADDING_ROWS: u16 = 1;
 
+/// How many files a mention menu lists at once.
+///
+/// Six is a glance rather than a list: the menu sits directly above the composer, and every row it
+/// takes is a row of the conversation. A reader who needs the seventh types another character,
+/// which is what narrows a completion anyway.
+const MENTION_MAX_ROWS: u16 = 6;
+
 /// How many queued prompts are listed in full under the heading.
 ///
 /// A third entry is enough to see what is coming without the queue pushing the
@@ -324,6 +331,15 @@ pub struct ViewState {
     /// cannot end up in a prompt nobody is looking at.
     pub help_open: bool,
 
+    /// The files a mention offers, best first, and which of them is selected.
+    ///
+    /// Empty means no menu: a mention that matches nothing closes rather than showing an empty
+    /// list, which is the same rule the queue overlay has. The list is computed by the runtime —
+    /// it reads the workspace — and held here so the view is still a pure function of its state.
+    pub mentions: Vec<String>,
+    /// Which offered file `Tab` would complete to.
+    pub mention_selection: usize,
+
     /// Whether the permission dialog is open.
     ///
     /// While it is set the dialog owns the keyboard, as the approval question and the key list
@@ -391,6 +407,8 @@ impl Default for ViewState {
             queue_editor: None,
             help_open: false,
             help_scroll: 0,
+            mentions: Vec::new(),
+            mention_selection: 0,
             permission_open: false,
             permission_selection: 0,
             last_viewport: None,
@@ -855,6 +873,92 @@ impl ViewState {
         self.help_scroll = u16::try_from(moved).unwrap_or(u16::MAX);
     }
 
+    /// Shows the files a mention offers.
+    ///
+    /// The selection is kept when it still points at something, which is what makes narrowing a
+    /// query behave: a reader arrowing down a list and then typing another character stays near
+    /// where they were rather than being thrown back to the top.
+    pub fn show_mentions(&mut self, candidates: Vec<String>) {
+        self.mention_selection = self
+            .mention_selection
+            .min(candidates.len().saturating_sub(1));
+        self.mentions = candidates;
+    }
+
+    /// Closes the mention menu.
+    pub fn close_mentions(&mut self) {
+        self.mentions.clear();
+        self.mention_selection = 0;
+    }
+
+    /// Whether a mention menu is offered.
+    #[must_use]
+    pub fn mention_open(&self) -> bool {
+        !self.mentions.is_empty()
+    }
+
+    /// The mention the caret is inside, when the composer is in one.
+    ///
+    /// `pub(crate)` rather than `pub`: the mention type is the crate's own, and a caller outside it
+    /// has no use for the offsets — what it would want is the completion, which is
+    /// [`ViewState::accept_mention`].
+    #[must_use]
+    pub(crate) fn mention(&self) -> Option<crate::mentions::Mention> {
+        crate::mentions::at_cursor(&self.input.text(), self.input.cursor())
+    }
+
+    /// Moves the mention selection, wrapping round.
+    pub fn mention_up(&mut self) {
+        if self.mentions.is_empty() {
+            return;
+        }
+        self.mention_selection = self
+            .mention_selection
+            .checked_sub(1)
+            .unwrap_or_else(|| self.mentions.len().saturating_sub(1));
+    }
+
+    /// Moves the mention selection forward, wrapping round.
+    pub fn mention_down(&mut self) {
+        if self.mentions.is_empty() {
+            return;
+        }
+        self.mention_selection = if self.mention_selection.saturating_add(1) >= self.mentions.len()
+        {
+            0
+        } else {
+            self.mention_selection.saturating_add(1)
+        };
+    }
+
+    /// Completes the mention with the selected file, and closes the menu.
+    ///
+    /// Returns `false` when there is nothing to complete — no menu, or no mention under the caret —
+    /// so the caller can let the key go to the composer instead of swallowing it.
+    ///
+    /// The whole word is replaced, not the part before the caret: a reader who arrowed back into the
+    /// middle of a name they had typed gets the file they picked rather than a name with a path
+    /// spliced into it.
+    pub fn accept_mention(&mut self) -> bool {
+        let Some(mention) = self.mention() else {
+            return false;
+        };
+        let Some(file) = self.mentions.get(self.mention_selection).cloned() else {
+            return false;
+        };
+        for _ in 0..mention.before {
+            let _ = self.input.backspace();
+        }
+        for _ in 0..mention.after {
+            let _ = self.input.delete();
+        }
+        // A trailing space, so the next word starts as a word: a reader who completes a name and
+        // types on should not be gluing the two together.
+        self.input.insert_str(&format!("{file} "));
+        self.close_mentions();
+        true
+    }
+
     /// Opens the permission dialog, with the next state selected.
     ///
     /// The next one rather than the current: the key that opens this is the same key that used to
@@ -1153,13 +1257,22 @@ impl ViewState {
         // cannot do without — and the overlay stays the place to read a queue longer than
         // the terminal can show.
         let queued = self.queue_rows();
-        let queue = if area.height
-            >= 1_u16
-                .saturating_add(TRANSCRIPT_FLOOR)
-                .saturating_add(queued)
-                .saturating_add(composer)
-                .saturating_add(2)
-        {
+        let offered = self.mention_rows();
+        // A band is granted its rows only when the transcript's floor, the composer, the title and
+        // the status line all still fit around it. The menu is measured first and the queue second,
+        // because the menu is part of the sentence being written now and the queue is a schedule of
+        // later ones: a short terminal keeps the completion and gives up the list of what is
+        // waiting.
+        let room_for = |rows: u16| {
+            area.height
+                >= 1_u16
+                    .saturating_add(TRANSCRIPT_FLOOR)
+                    .saturating_add(rows)
+                    .saturating_add(composer)
+                    .saturating_add(2)
+        };
+        let menu = if room_for(offered) { offered } else { 0 };
+        let queue = if room_for(menu.saturating_add(queued)) {
             queued
         } else {
             0
@@ -1171,19 +1284,13 @@ impl ViewState {
         // against the terminal alone, so it cannot be granted a row that the composer
         // needed. The chunk stays in the layout at zero height so that the rows below it
         // do not move.
-        let stats = u16::from(
-            area.height
-                >= 1_u16
-                    .saturating_add(TRANSCRIPT_FLOOR)
-                    .saturating_add(queue)
-                    .saturating_add(composer)
-                    .saturating_add(2),
-        );
+        let stats = u16::from(room_for(menu.saturating_add(queue)));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(TRANSCRIPT_FLOOR),
+                Constraint::Length(menu),
                 Constraint::Length(queue),
                 Constraint::Length(composer),
                 Constraint::Length(stats),
@@ -1215,16 +1322,19 @@ impl ViewState {
             self.clamp_scroll(body.height, body.width);
             self.render_transcript(frame, *body);
         }
-        if let Some(queue) = chunks.get(2) {
+        if let Some(menu) = chunks.get(2) {
+            self.render_mentions(frame, *menu);
+        }
+        if let Some(queue) = chunks.get(3) {
             self.render_queue(frame, *queue);
         }
-        if let Some(input) = chunks.get(3) {
+        if let Some(input) = chunks.get(4) {
             self.render_input(frame, *input);
         }
-        if let Some(stats) = chunks.get(4) {
+        if let Some(stats) = chunks.get(5) {
             self.render_stats(frame, *stats);
         }
-        if let Some(status) = chunks.get(5) {
+        if let Some(status) = chunks.get(6) {
             self.render_status(frame, *status);
         }
         // Before the approval dialog, because a question the agent is blocked on has to be
@@ -1264,6 +1374,61 @@ impl ViewState {
         let listed = u16::try_from(shown).unwrap_or(QUEUE_MAX_ROWS);
         let more = u16::from(self.queue.len() > usize::from(QUEUE_MAX_ROWS));
         listed.saturating_add(1).saturating_add(more)
+    }
+
+    /// How many rows the mention menu draws, and therefore how many it needs.
+    ///
+    /// Zero when there is nothing to offer, which is what keeps the band out of the layout rather
+    /// than reserving a heading for a menu that does not exist — the same rule the queue has. The
+    /// heading is one row, and carries the key that accepts: without it a reader is looking at a
+    /// list with no way to see how it becomes text.
+    #[must_use]
+    fn mention_rows(&self) -> u16 {
+        if self.mentions.is_empty() {
+            return 0;
+        }
+        let listed = u16::try_from(self.mentions.len().min(usize::from(MENTION_MAX_ROWS)))
+            .unwrap_or(MENTION_MAX_ROWS);
+        listed.saturating_add(1)
+    }
+
+    /// Draws the files a mention offers.
+    ///
+    /// Drawn from the *bottom* of what it was given: the composer is directly below, and a list
+    /// whose last row is the one nearest the sentence being typed is the one a reader is reading.
+    fn render_mentions(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.mentions.is_empty() || area.height == 0 {
+            return;
+        }
+        let dim = Style::default().fg(Color::DarkGray);
+        let total = self.mentions.len();
+        let shown = total.min(usize::from(MENTION_MAX_ROWS));
+        // The window moves with the selection, so the row a reader arrowed to is always drawn.
+        let offset = self
+            .mention_selection
+            .saturating_add(1)
+            .saturating_sub(shown);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("── files", self.theme.notice),
+            Span::styled(format!(" · {total} · Tab completes · Esc closes"), dim),
+        ])];
+        for (index, file) in self.mentions.iter().enumerate().skip(offset).take(shown) {
+            let selected = index == self.mention_selection;
+            let style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "\u{25b6}" } else { " " };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled(file.clone(), style),
+            ]));
+        }
+        // No `Wrap`: the rows are counted by `mention_rows`, and a wrapped line would be more rows
+        // than were granted. A long path is clipped from the front by the terminal itself, which
+        // keeps the file's own name where a reader is looking.
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
     }
 
     /// Draws the prompts waiting for the running turn to end.
@@ -3122,6 +3287,67 @@ mod tests {
         assert!(
             !text.contains("second line"),
             "the rest is left to the overlay: {text}"
+        );
+    }
+
+    /// The menu is drawn above the composer, marked, and its heading carries the key that accepts
+    /// it: a list with no way to see how it becomes text is a list a reader has to experiment with.
+    #[test]
+    fn the_mention_menu_is_drawn_above_the_composer() {
+        let mut state = ViewState::new();
+        state.input.insert_str("@s");
+        state.show_mentions(vec![
+            String::from("src/main.rs"),
+            String::from("src/lib.rs"),
+        ]);
+        state.mention_down();
+        let text = rendered(&mut state, 60, 16);
+        assert!(text.contains("files"), "{text}");
+        assert!(text.contains("Tab completes"), "{text}");
+        assert!(
+            text.contains("src/main.rs") && text.contains("src/lib.rs"),
+            "{text}"
+        );
+        let marked = text
+            .lines()
+            .find(|row| row.contains('\u{25b6}'))
+            .expect("the selection is marked");
+        assert!(marked.contains("src/lib.rs"), "{marked}");
+
+        // The menu is above the composer and the composer still holds what is being typed.
+        let menu = text
+            .lines()
+            .position(|row| row.contains("files"))
+            .expect("the menu is drawn");
+        let composer = text
+            .lines()
+            .position(|row| row.contains("@s"))
+            .expect("the composer is drawn");
+        assert!(menu < composer, "the menu sits above what is being typed");
+    }
+
+    /// More files than fit: the window follows the selection, so the row a reader arrowed to is
+    /// always one of the rows drawn.
+    #[test]
+    fn the_mention_menu_scrolls_with_the_selection() {
+        let mut state = ViewState::new();
+        state.input.insert_str("@");
+        let files: Vec<String> = (0..20).map(|index| format!("file{index}.rs")).collect();
+        state.show_mentions(files);
+        for _ in 0..19 {
+            state.mention_down();
+        }
+        assert_eq!(state.mention_selection, 19);
+        // Twenty rows rather than sixteen: the composer keeps five of them, so a menu of six needs
+        // the room a real terminal has rather than the smallest one that could hold it.
+        let text = rendered(&mut state, 60, 20);
+        assert!(
+            text.contains("file19.rs"),
+            "the selected row is drawn: {text}"
+        );
+        assert!(
+            !text.contains("file0.rs"),
+            "and the window moved off the first rows: {text}"
         );
     }
 

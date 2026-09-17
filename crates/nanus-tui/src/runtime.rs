@@ -86,6 +86,12 @@ use crate::view::{PendingApproval, Theme, ViewState};
 /// Rows scrolled per `PageUp` or `PageDown`.
 const PAGE_ROWS: i32 = 10;
 
+/// How many files a mention query is ranked against before the view takes its window.
+///
+/// More than the menu shows, because the menu's window follows the selection and a reader may walk
+/// down past the first screenful; bounded, because this runs on a keystroke.
+const MENTION_SHOWN: u16 = 32;
+
 /// Rows scrolled per notch of the mouse wheel.
 ///
 /// Smaller than a page because a wheel notch is a nudge rather than a jump: a page at a
@@ -995,6 +1001,9 @@ async fn event_loop(
     // Built before the terminal is taken, so a configuration that cannot be read is a
     // sentence on stderr rather than an abort with a screen already in raw mode.
     let mut view = opening_view(source)?;
+    // The workspace's files, walked on demand rather than at startup: most sessions never type an
+    // `@`, and a walk of a large tree is work nobody asked for until then.
+    let mut files: Option<Vec<String>> = None;
     let mut guard = TerminalGuard::enter();
 
     let mut events = EventStream::new();
@@ -1026,7 +1035,12 @@ async fn event_loop(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                match handle_key(key, &mut view) {
+                let outcome = handle_key(key, &mut view);
+                // After every keystroke, because a mention is a property of the text: typing
+                // narrows it, deleting closes it, and moving the caret into a different word
+                // changes which one it is.
+                refresh_mentions(&mut view, &mut files, source.workspace());
+                match outcome {
                     Outcome::Quit => break,
                     Outcome::Interrupt => {
                         // The turn ends when the agent says it did, with a frame carrying
@@ -1478,10 +1492,91 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     } else if view.queue_open {
         return handle_queue_key(key, view);
     }
+    // A mention menu takes the four keys that mean something about it — Tab to complete, the
+    // arrows to choose, Esc to close — and lets everything else through, because the composer is
+    // still the thing being typed into: a completion that swallowed the keyboard would make
+    // narrowing a query impossible.
+    if view.mention_open()
+        && let Some(outcome) = handle_mention_key(key, view)
+    {
+        return outcome;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return handle_control_key(key, view);
     }
     handle_plain_key(key, view)
+}
+
+/// Routes a key while a mention menu is offered.
+///
+/// `Some` when the key belonged to the menu and `None` when it did not, so the caller can let every
+/// other key — text, movement, the keys that send — reach the composer. That is the difference
+/// between this and the two overlays: a menu is attached to a word being typed, and taking the
+/// keyboard would stop the word.
+fn handle_mention_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        // `Tab` completes. `Enter` deliberately does not: it sends, and a reader who completed a
+        // name and pressed Enter meant to send the sentence, not to accept the completion twice.
+        KeyCode::Tab if !alt && !shift => {
+            let completed = view.accept_mention();
+            view.status = if completed {
+                String::from("mention completed · Enter sends it")
+            } else {
+                String::from("nothing to complete")
+            };
+            Some(Outcome::Continue)
+        }
+        // The arrows choose, and only while the menu is up: with it closed they are the composer's
+        // own keys, which is what keeps history browsing where it was.
+        KeyCode::Up => {
+            view.mention_up();
+            Some(Outcome::Continue)
+        }
+        KeyCode::Down => {
+            view.mention_down();
+            Some(Outcome::Continue)
+        }
+        // `Esc` closes the menu rather than stopping the turn: the word is still being typed, and
+        // the key that dismisses a completion should not also be the key that interrupts.
+        KeyCode::Esc => {
+            view.close_mentions();
+            Some(Outcome::Continue)
+        }
+        KeyCode::Char('?') if control => {
+            // `Ctrl+?` is not a key this interface binds, but a terminal reports `Ctrl+Backspace`
+            // and a few others as control characters that land here; nothing to do either way.
+            Some(Outcome::Continue)
+        }
+        _ => None,
+    }
+}
+
+/// Offers the files that answer the mention under the caret, or closes the menu.
+///
+/// The walk is cached and re-made whenever a mention *starts*, so a file the agent has just written
+/// is offered: a list computed once per session would quietly go stale in exactly a coding session,
+/// which is where mentions are used.
+fn refresh_mentions(
+    view: &mut ViewState,
+    files: &mut Option<Vec<String>>,
+    workspace: Option<&str>,
+) {
+    let Some(mention) = view.mention() else {
+        view.close_mentions();
+        // Forgotten rather than kept, so the next `@` walks again and sees what has changed.
+        *files = None;
+        return;
+    };
+    if files.is_none() {
+        *files = workspace.map(|root| crate::mentions::list(Path::new(root)));
+    }
+    let candidates = files.as_ref().map_or_else(Vec::new, |all| {
+        crate::mentions::matches(all, &mention.query, usize::from(MENTION_SHOWN))
+    });
+    view.show_mentions(candidates);
 }
 
 /// Whether a key is Shift+Tab, however the terminal spells it.
@@ -2832,6 +2927,125 @@ mod tests {
             "a model the build no longer offers does not leave the key dead"
         );
         assert_eq!(next_model(&[], Some("one")), None);
+    }
+
+    /// Typing `@` opens a menu over the files that answer it, and `Tab` puts the file in the text.
+    ///
+    /// The whole word is replaced, not the part before the caret: a reader who arrowed back into the
+    /// middle of a name still gets the file they picked.
+    #[test]
+    fn a_mention_offers_files_and_tab_completes_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for path in ["src/main.rs", "src/lib.rs", "docs/readme.md"] {
+            let full = dir.path().join(path);
+            let parent = full
+                .parent()
+                .map_or_else(|| dir.path().to_path_buf(), Path::to_path_buf);
+            std::fs::create_dir_all(parent).expect("a directory");
+            std::fs::write(&full, "").expect("a file");
+        }
+        let root = dir.path().to_path_buf();
+        let mut view = ViewState::new();
+        let mut files = None;
+
+        // Nothing typed yet: no menu, because there is no mention.
+        refresh_mentions(&mut view, &mut files, root.to_str());
+        assert!(!view.mention_open());
+
+        // `@` alone offers the workspace.
+        view.input.insert_str("look at @");
+        refresh_mentions(&mut view, &mut files, root.to_str());
+        assert!(view.mention_open());
+        assert_eq!(view.mentions.len(), 3);
+        assert!(files.is_some(), "the walk was made");
+
+        // Typing narrows it, and the ranking puts the name before the path.
+        view.input.insert_str("main");
+        refresh_mentions(&mut view, &mut files, root.to_str());
+        assert_eq!(view.mentions, vec![String::from("src/main.rs")]);
+
+        // `Tab` replaces the whole word and closes the menu.
+        let outcome = handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut view);
+        refresh_mentions(&mut view, &mut files, root.to_str());
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(view.input.text(), "look at src/main.rs ");
+        assert!(
+            !view.mention_open(),
+            "the menu closes when the word is done"
+        );
+        assert!(view.status.contains("mention completed"), "{}", view.status);
+    }
+
+    /// A file the agent has just written is offered, because the walk is remade each time a mention
+    /// starts rather than kept for the session.
+    #[test]
+    fn a_mention_sees_a_file_that_appeared_since_the_last_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let mut view = ViewState::new();
+        let mut files = None;
+        refresh_mentions(&mut view, &mut files, root.to_str());
+        assert!(!view.mention_open());
+
+        std::fs::write(root.join("new.rs"), "").expect("the agent writes a file");
+        view.input.insert_str("@new");
+        refresh_mentions(&mut view, &mut files, root.to_str());
+        assert_eq!(view.mentions, vec![String::from("new.rs")]);
+    }
+
+    /// The keys that are the menu's are only its while it is up: with no menu the arrows browse
+    /// history and `Esc` stops the turn.
+    #[test]
+    fn a_mention_menu_takes_only_its_own_keys() {
+        let mut view = ViewState::new();
+        view.show_mentions(vec![String::from("a.rs"), String::from("b.rs")]);
+        view.input.insert_str("@a");
+
+        // The arrows choose rather than browsing history.
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.mention_selection, 1);
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.mention_selection, 0);
+
+        // Text still reaches the composer, which is what lets a reader narrow the query.
+        let _ = handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.input.text(), "@ab");
+        assert!(view.mention_open(), "typing does not close the menu");
+
+        // `Esc` closes the menu rather than stopping anything.
+        let _ = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(!view.mention_open());
+        assert_eq!(
+            view.input.text(),
+            "@ab",
+            "closing the menu leaves the word alone"
+        );
+
+        // And with the menu closed the arrows are the composer's again.
+        let mut plain = ViewState::new();
+        plain.input.insert_str("a draft");
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut plain);
+        assert_eq!(plain.mention_selection, 0);
+        assert_eq!(plain.input.text(), "a draft");
+    }
+
+    /// A mention in a session with no workspace, and a mention that matches nothing, both close the
+    /// menu rather than offering an empty list.
+    #[test]
+    fn a_mention_that_cannot_be_answered_offers_nothing() {
+        let mut view = ViewState::new();
+        let mut files = None;
+        view.input.insert_str("@src");
+        refresh_mentions(&mut view, &mut files, None);
+        assert!(!view.mention_open(), "there is no workspace to look in");
+        assert!(files.is_none());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut unmatched = ViewState::new();
+        let mut walked = None;
+        unmatched.input.insert_str("@nothing-matches-this");
+        refresh_mentions(&mut unmatched, &mut walked, dir.path().to_str());
+        assert!(!unmatched.mention_open());
     }
 
     /// `Ctrl+V` writes the clipboard's image into the workspace and puts its path in the prompt.

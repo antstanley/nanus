@@ -221,6 +221,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Alt+P` | switch to the next model the agent offers |
 | `Alt+T` | ask for the next step of reasoning effort |
 | `Ctrl+V` | paste an image from the clipboard, as a path |
+| `@` | name a file; the menu completes it with `Tab` |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
@@ -349,8 +350,8 @@ inventing a purpose for a key would be worse than leaving it alone:
   dialog says so where a reader is choosing, rather than leaving the difference to be found
   in a document.
 - **Background tasks** (`Ctrl+B`) — there are none to background.
-- **`@` mentions and `!` bash mode** are input *modes* rather than shortcuts, and each is a
-  feature in its own right. Slash commands have begun — see below.
+- **`!` bash mode** is an input *mode* rather than a shortcut. Slash commands have begun, and
+  `@` mentions are below.
 
 ### Commands
 
@@ -489,6 +490,28 @@ own name, and the alternative — rebuilding the prompt on every switch — woul
 conversation the model is being sent no longer matches the one recorded against it. The live
 value is the one in the title bar; the recorded one is what the session says produced it, and the
 two are the same thing until somebody switches.
+
+### Naming a file with `@`
+
+`@` starts a mention: a word in the prompt that names a file, completed from the workspace. Type
+`@ma`, and a menu appears over the composer listing the files that answer it — `src/main.rs` before
+`docs/maintenance.md`, because the file's own name counts for more than the directory it is in.
+`Tab` completes the selected one, `Up`/`Down` choose, `Esc` closes the menu and leaves the word
+alone, and typing another character narrows the list. Every other key still belongs to the
+composer: a mention is a word being typed, not a mode, so `Enter` sends the sentence it is part of
+rather than accepting the completion.
+
+The menu is drawn above the composer and yields its rows to it on a short terminal, like the
+queue. It lists at most six files and offers at most thirty-two, because this runs on a keystroke:
+the walk of the workspace is bounded, it skips `.git`, `target`, and `node_modules`, and it is
+remade whenever a mention *starts* rather than kept for the session — which is what offers a file
+the agent wrote a minute ago. It does not read `.gitignore`: a file a reader has deliberately
+ignored is still a file they may want to name.
+
+**A mention expands to the path, not the file.** Inlining contents would put a file the model never
+asked for into the request, spend the context on it, and make the prompt a thing the reader cannot
+see all of. The model already has `read`; a mention is how it is told *which* file to read, and the
+path is the whole of what is inserted.
 
 ### Pasting an image
 
