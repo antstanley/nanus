@@ -2503,6 +2503,7 @@ mod tests {
                 workspace: "/tmp".to_owned(),
                 model: "m".to_owned(),
                 tools: 0,
+                version: nanus_link::protocol::PROTOCOL_VERSION,
             }),
         ] {
             assert!(sender.try_send(frame).is_ok());

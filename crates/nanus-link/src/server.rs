@@ -163,6 +163,7 @@ impl Agent {
             workspace: self.workspace.display().to_string(),
             model: self.model.clone(),
             tools: self.tools,
+            version: crate::protocol::PROTOCOL_VERSION,
         }
     }
 

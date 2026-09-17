@@ -22,7 +22,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::error::{LinkError, LinkResult};
-use crate::protocol::{AgentInfo, Frame, Request, SessionInfo, encode};
+use crate::protocol::{AgentInfo, Frame, PROTOCOL_VERSION, Request, SessionInfo, encode};
 use crate::wire::read_message;
 
 /// A connection to an agent.
@@ -70,6 +70,15 @@ impl Client {
                 "the agent opened with {frame:?} rather than its handshake"
             )));
         };
+        // Refused here, before the connection is usable, because every frame after this one
+        // is read with this build's vocabulary: a version mismatch is a sentence now rather
+        // than a decode error about a field halfway through a turn.
+        if info.version != PROTOCOL_VERSION {
+            return Err(LinkError::Version {
+                agent: info.version,
+                client: PROTOCOL_VERSION,
+            });
+        }
         Ok(Self {
             reader,
             writer,
@@ -307,6 +316,7 @@ mod tests {
             workspace: "/work".to_owned(),
             model: "scripted".to_owned(),
             tools: 0,
+            version: PROTOCOL_VERSION,
         }))
         .unwrap_or_else(|error| panic!("{error}"));
         line.push('\n');
@@ -353,6 +363,7 @@ mod tests {
                 workspace: "/work".to_owned(),
                 model: "scripted".to_owned(),
                 tools: 0,
+                version: PROTOCOL_VERSION,
             }),
             Frame::Text {
                 delta: "from the session being left".to_owned(),
@@ -395,6 +406,7 @@ mod tests {
                 workspace: "/work".to_owned(),
                 model: "scripted".to_owned(),
                 tools: 0,
+                version: PROTOCOL_VERSION,
             }),
             Frame::Failed {
                 message: "the name \"taken\" already belongs to session 01a0".to_owned(),
@@ -425,6 +437,56 @@ mod tests {
         assert!(matches!(opened, Err(LinkError::Closed)), "{opened:?}");
     }
 
+    /// A handshake from another version is refused with a sentence naming both.
+    ///
+    /// This is the failure the version field exists to turn from a decode error mid-turn
+    /// into a diagnosis. The two halves ship together, but a stale interface binary beside a
+    /// rebuilt core is exactly the case a person cannot see from the outside.
+    #[tokio::test]
+    async fn a_handshake_from_another_version_is_refused_by_name() {
+        let (agent, client) = pair();
+        let mut agent = agent;
+        let mut line = encode(&Frame::Ready(AgentInfo {
+            workspace: "/work".to_owned(),
+            model: "scripted".to_owned(),
+            tools: 0,
+            version: PROTOCOL_VERSION.saturating_add(1),
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        line.push('\n');
+        let written = agent.write_all(line.as_bytes()).await;
+        assert!(written.is_ok(), "the peer writes");
+
+        let opened = Client::open(client).await;
+        match opened {
+            Err(LinkError::Version { agent, client }) => {
+                assert_eq!(agent, PROTOCOL_VERSION.saturating_add(1));
+                assert_eq!(client, PROTOCOL_VERSION);
+            }
+            other => panic!("expected a version refusal, got {other:?}"),
+        }
+    }
+
+    /// And a build too old to send a version is refused too, rather than assumed to speak
+    /// this one: silence is not agreement.
+    #[tokio::test]
+    async fn an_unversioned_handshake_is_refused() {
+        let (agent, client) = pair();
+        let mut agent = agent;
+        // No `version` field, as a build that predates it writes.
+        let mut line =
+            String::from(r#"{"frame":"ready","workspace":"/work","model":"m","tools":0}"#);
+        line.push('\n');
+        let written = agent.write_all(line.as_bytes()).await;
+        assert!(written.is_ok(), "the peer writes");
+
+        let opened = Client::open(client).await;
+        assert!(
+            matches!(opened, Err(LinkError::Version { agent: 0, .. })),
+            "an unversioned handshake is version zero: {opened:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_handshake_is_kept_as_the_agents_description() {
         let (agent, client) = pair();
@@ -432,6 +494,7 @@ mod tests {
             workspace: "/work".to_owned(),
             model: "deepseek-flash".to_owned(),
             tools: 7,
+            version: PROTOCOL_VERSION,
         };
         let expected = info.clone();
         let mut agent = agent;

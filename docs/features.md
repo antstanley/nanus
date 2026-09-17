@@ -223,6 +223,9 @@ The only thing the core and the interface share. See
 
 - **A Unix domain socket** in `<nanus home>/run/`, `0600` inside a `0700`
   directory, with one line of JSON per frame in both directions.
+- **A versioned handshake.** The agent says which link protocol version it speaks, and a
+  client built from different sources refuses it with a sentence naming both rather than
+  misreading a frame. An unversioned handshake reads as version zero and is refused too.
 - **A small frame vocabulary**: handshake, attachment, held-session listing, a
   question or prompt, the progress of a turn (text, reasoning, step boundaries,
   tool call and result, usage), an approval question and its answer, the ending and

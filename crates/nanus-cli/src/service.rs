@@ -148,12 +148,17 @@ pub async fn start(config: &NanusConfig, options: &Options) -> Result<Start, Str
 async fn launch(options: &Options, socket: &Path, log: &Path) -> Result<Start, String> {
     // An agent that is already there is worth naming. Without this the child would fail
     // to bind and the poll below would find the *old* service and report success, which
-    // is the one outcome a user must never be given.
-    if Client::connect(socket).await.is_ok() {
-        return Err(format!(
-            "a nanus service is already listening at {}",
-            socket.display()
-        ));
+    // is the one outcome a user must never be given. Something listening but speaking
+    // another protocol version is reported as itself rather than mistaken for empty.
+    match Client::connect(socket).await {
+        Ok(_) => {
+            return Err(format!(
+                "a nanus service is already listening at {}",
+                socket.display()
+            ));
+        }
+        Err(LinkError::Connect { .. }) => {}
+        Err(error) => return Err(error.to_string()),
     }
     let binary = std::env::current_exe()
         .map_err(|error| format!("cannot find this program's own path: {error}"))?;
@@ -366,6 +371,10 @@ pub fn status(socket: &Path) -> Result<(), String> {
     println!("model: {}", info.model);
     println!("tools: {}", info.tools);
     println!("workspace: {}", info.workspace);
+    // Reported so a client and an agent built from different sources are visible before a
+    // frame is misread: connecting already refuses a mismatch, and this says which version
+    // the running agent is.
+    println!("link version: {}", info.version);
     if held.is_empty() {
         println!("sessions: none held");
     }

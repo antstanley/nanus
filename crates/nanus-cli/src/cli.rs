@@ -569,9 +569,17 @@ async fn prepare_tui(
     let socket = crate::service::socket_path(&config, socket.as_deref())?;
     // Asked before the interface starts, so the answer is a sentence naming the fix rather
     // than an empty screen, and so no terminal is taken for an interface that would have
-    // nothing to talk to.
-    if let Err(error) = nanus_link::Client::connect(&socket).await {
-        return Err(format!("{error}\nstart one with `nanus service start`"));
+    // nothing to talk to. Only "nothing is listening" gets the start hint: a version
+    // mismatch is a different problem with its own sentence.
+    match nanus_link::Client::connect(&socket).await {
+        Ok(_) => {}
+        Err(nanus_link::LinkError::Connect { .. }) => {
+            return Err(format!(
+                "no agent is listening at {}\nstart one with `nanus service start`",
+                socket.display()
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
     }
     let mut arguments = vec![OsString::from("--link"), OsString::from(socket.as_os_str())];
     arguments.extend(choice);

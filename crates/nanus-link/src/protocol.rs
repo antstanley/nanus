@@ -393,6 +393,30 @@ impl Frame {
     }
 }
 
+/// The version of this protocol, exchanged in the handshake.
+///
+/// The two halves ship together — `nanus tui` runs the interface binary from beside the
+/// core, and never looks one up on `PATH` — so a mismatch means two builds from different
+/// sources rather than two releases a user deliberately paired. Nothing stops that from
+/// happening (a stale `NANUS_TUI`, a partial rebuild), and without a version the first
+/// frame that changed shape is a decode error naming a field rather than a sentence naming
+/// the mismatch. Bump this when a frame's meaning changes in a way an older peer would
+/// misread.
+///
+/// The field is optional on the wire and defaults to zero, which is what a build that
+/// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
+/// rather than assuming compatibility.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The version a handshake that carries none is read as.
+///
+/// A serde default rather than [`PROTOCOL_VERSION`], deliberately: an agent too old to send
+/// a version is not one that speaks this version, and quietly treating it as one is the
+/// silence the field exists to remove.
+fn unversioned() -> u32 {
+    0
+}
+
 /// What an agent says about itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct AgentInfo {
@@ -402,6 +426,12 @@ pub struct AgentInfo {
     pub model: String,
     /// How many tools the agent exposes.
     pub tools: usize,
+    /// The link protocol version the agent speaks.
+    ///
+    /// Defaulted on the way in so a handshake from a build that predates the field still
+    /// decodes; the client then refuses it by name rather than misreading it.
+    #[serde(default = "unversioned")]
+    pub version: u32,
 }
 
 /// What an agent says about one session.
@@ -462,6 +492,7 @@ mod tests {
             workspace: "/work".to_owned(),
             model: "deepseek-flash".to_owned(),
             tools: 7,
+            version: PROTOCOL_VERSION,
         }
     }
 
@@ -593,6 +624,28 @@ mod tests {
         assert_eq!(encoded.lines().count(), 1, "one line: {encoded}");
         assert!(!encoded.contains('\n'), "no raw newline: {encoded}");
         assert_eq!(decode::<Frame>(&encoded).ok(), Some(frame));
+    }
+
+    /// A handshake that carries no version is not one that speaks this version.
+    ///
+    /// It decodes — a build that predates the field must not become an unreadable frame —
+    /// and it reads as zero, which is "too old to say". The client refuses it rather than
+    /// assuming the version it happens to speak, which is the whole point of the field.
+    #[test]
+    fn a_handshake_from_a_build_without_a_version_decodes_as_unversioned() {
+        let decoded =
+            decode::<Frame>(r#"{"frame":"ready","workspace":"/w","model":"m","tools":7}"#);
+        assert_eq!(
+            decoded.ok(),
+            Some(Frame::Ready(AgentInfo {
+                workspace: "/w".to_owned(),
+                model: "m".to_owned(),
+                tools: 7,
+                version: 0,
+            }))
+        );
+        // And zero is not the current version, so a client cannot read it as compatible.
+        assert_ne!(0, PROTOCOL_VERSION);
     }
 
     #[test]

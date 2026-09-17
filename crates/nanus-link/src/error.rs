@@ -33,6 +33,22 @@ pub enum LinkError {
     #[error("the link sent something that is not a nanus frame: {0}")]
     Protocol(String),
 
+    /// The peer speaks a different version of the link protocol.
+    ///
+    /// Its own variant rather than a [`LinkError::Protocol`], because the diagnosis is
+    /// specific: the two binaries were built from different sources, and the fix is to
+    /// build them together rather than to read a frame more carefully.
+    #[error(
+        "the agent speaks link protocol version {agent} and this client speaks {client}; \
+         build nanus and nanus-tui together and start the agent again"
+    )]
+    Version {
+        /// The version the agent's handshake named, zero when it named none.
+        agent: u32,
+        /// The version this client speaks.
+        client: u32,
+    },
+
     /// The connection closed before the expected frame arrived.
     #[error("the agent closed the link before answering")]
     Closed,

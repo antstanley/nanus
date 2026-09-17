@@ -95,6 +95,15 @@ that can: the agent is what holds the `&mut Session` the turn is writing. Nothin
 back, because a turn that stops ends with the ending frame it always ends with, and a client
 that asked to stop a session which was not busy has asked for something already true.
 
+**The handshake carries a protocol version.** The two binaries ship together — `nanus tui`
+runs the interface from beside the core and never looks on `PATH` — but nothing stops a
+stale `nanus-tui` from sitting next to a rebuilt `nanus`, and without a version the first
+frame whose shape changed is a decode error naming a field halfway through a turn. The
+handshake says which version the agent speaks, a client refuses anything else with a
+sentence naming both, and a build too old to send a version reads as version zero — refused
+rather than assumed compatible. `nanus service status` prints the version the running agent
+reported.
+
 **A tool call outside the sandbox is decided by whoever is watching.** When the loop
 reaches a call the sandbox does not already permit and the policy is `ask`, the agent sends
 an `approval` frame to every client attached to the session and the turn waits. The frame
