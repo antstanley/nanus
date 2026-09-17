@@ -12,11 +12,12 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::highlight::{self, Class};
 use super::inline;
 use super::text::{char_width, str_width};
 use super::theme::MarkdownTheme;
 use super::types::{Block, Marker};
-use super::wrap::{hard_wrap, wrap};
+use super::wrap::{hard_wrap_spans, wrap};
 
 /// The widest a table column may grow before it is treated as a paragraph of its own.
 const MAX_COLUMN: usize = 48;
@@ -111,13 +112,45 @@ fn paragraph(text: &str, width: usize, theme: &MarkdownTheme) -> Vec<Line<'stati
 }
 
 /// Renders a fenced code block, preserving line breaks and cutting long lines.
+///
+/// A fence is lexed one line at a time, with the lexer carrying a block comment or a
+/// triple-quoted string across the lines it spans, and each run is drawn in the style its
+/// class maps to — see [`super::highlight`]. A language the lexer does not know arrives as
+/// a single plain run, which is exactly what this function drew before it could highlight
+/// anything.
 fn code_block(lang: &str, code: &str, width: usize, theme: &MarkdownTheme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     if !lang.is_empty() {
-        out.push(Line::from(Span::styled(format!("── {lang}"), theme.aside)));
+        // A heading is not content — it says which language the fence is — so a terminal too
+        // narrow for it loses part of the name rather than being handed a line wider than
+        // the width it was given, which the scroll arithmetic would count wrongly.
+        let heading = Span::styled(format!("── {lang}"), theme.aside);
+        out.push(Line::from(fit_span(heading, width, theme.aside)));
     }
-    out.extend(hard_wrap(code, width, "│ ", theme.border, theme.code));
+    let mut highlighter = highlight::Highlighter::for_language(lang);
+    for source_line in code.split('\n') {
+        let spans: Vec<Span<'static>> = highlighter
+            .line(source_line)
+            .into_iter()
+            .map(|(class, text)| Span::styled(text, code_style(class, theme)))
+            .collect();
+        out.extend(hard_wrap_spans(&spans, width, "│ ", theme.border));
+    }
     out
+}
+
+/// The style a run of code is drawn with.
+///
+/// An exhaustive match, so a class the lexer grows cannot reach the screen unstyled — the
+/// same reason the protocol's translations are exhaustive matches.
+const fn code_style(class: Class, theme: &MarkdownTheme) -> Style {
+    match class {
+        Class::Plain => theme.code,
+        Class::Keyword => theme.code_keyword,
+        Class::Literal => theme.code_literal,
+        Class::Number => theme.code_number,
+        Class::Comment => theme.code_comment,
+    }
 }
 
 /// Renders one list item, continuing wrapped lines under the text.
@@ -313,6 +346,14 @@ fn cell_spans(text: &str, width: usize, base: Style, theme: &MarkdownTheme) -> V
         spans.push(Span::styled(" ".repeat(padding), base));
     }
     spans
+}
+
+/// Cuts one span to `width` columns, leaving it alone when it already fits.
+fn fit_span(span: Span<'static>, width: usize, base: Style) -> Vec<Span<'static>> {
+    if span.width() > width {
+        return fit_spans(vec![span], width, base);
+    }
+    vec![span]
 }
 
 /// The display width of a run of styled spans.
@@ -538,5 +579,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Highlighting is a colouring of the source, never an edit of it: the drawing of a
+    /// fence says exactly what the fence said, with the `│ ` prefixes taken off. A wrap
+    /// that dropped a character, or a lexer that ate one, shows up here.
+    #[test]
+    fn highlighting_leaves_the_code_as_it_arrived() {
+        let source = "```rust\nlet x = 1; // twelve\n\"unterminated\n```";
+        for width in 8..=60_usize {
+            let out = render(source, width);
+            let code: String = out
+                .iter()
+                .filter(|line| line.starts_with('│'))
+                .map(|line| line.strip_prefix("│ ").unwrap_or(line).to_owned())
+                .collect::<String>();
+            assert_eq!(
+                code, "let x = 1; // twelve\"unterminated",
+                "width {width} drew {out:?}"
+            );
+        }
+    }
+
+    /// A highlighted fence still fits, which is what the scroll arithmetic rests on. A wrap
+    /// that forgot that spans carry more than text would break this.
+    #[test]
+    fn a_highlighted_fence_fits_the_width() {
+        let source = "```rust\nfn main() { let greeting = \"a very long string literal\"; }\n```";
+        for width in 4..=40_usize {
+            let theme = MarkdownTheme::from_view(&Theme::default());
+            for line in blocks(&super::super::parse::parse(source), width, false, &theme) {
+                assert!(line.width() <= width, "width {width}: {line:?}");
+            }
+        }
+    }
+
+    /// Under `NO_COLOR` the theme has no colour in it at all, so a highlighted fence must
+    /// come out with modifiers only — the same rule the caret depends on.
+    #[test]
+    fn a_monochrome_theme_highlights_with_modifiers_only() {
+        let source = "```rust\nlet s = \"x\"; // note\n```";
+        let theme = MarkdownTheme::from_view(&Theme::monochrome());
+        let lines = blocks(&super::super::parse::parse(source), 40, false, &theme);
+        let mut styled = 0_usize;
+        for line in &lines {
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.fg, None,
+                    "{:?} has a colour under NO_COLOR",
+                    span.content
+                );
+                if !span.style.add_modifier.is_empty() {
+                    styled = styled.saturating_add(1);
+                }
+            }
+        }
+        assert!(styled > 0, "the classes are still told apart by modifier");
+    }
+
+    /// Which class a run is drawn in is the lexer's business; that the classes reach the
+    /// screen as *different* styles is this renderer's.
+    #[test]
+    fn a_keyword_and_a_comment_are_not_drawn_alike() {
+        let source = "```rust\nlet x; // note\n```";
+        let theme = MarkdownTheme::from_view(&Theme::default());
+        let lines = blocks(&super::super::parse::parse(source), 40, false, &theme);
+        let styles: Vec<Style> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.style))
+            .collect();
+        assert!(
+            styles.contains(&theme.code_keyword),
+            "the keyword is drawn in the keyword style: {lines:?}"
+        );
+        assert!(
+            styles.contains(&theme.code_comment),
+            "the comment is drawn in the comment style: {lines:?}"
+        );
     }
 }

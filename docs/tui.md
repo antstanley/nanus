@@ -704,8 +704,14 @@ the fence as code even when it would parse.
 a URL fetch: the view is a pure function of the transcript and the composer, and a remote
 fetch on a model's say-so is a request the reader did not ask for. Control characters are
 stripped at the parse boundary, so a model — or a file it read — cannot smuggle a terminal
-escape sequence into the screen through a heading or a code fence. Syntax highlighting is
-deliberately absent for now; a fenced block is drawn verbatim in the code style.
+escape sequence into the screen through a heading or a code fence. A fenced block *is*
+highlighted, by a small lexer that lives beside the renderer and reads nothing: Rust,
+Python, JavaScript and TypeScript, JSON, TOML, shell, and YAML are recognised, and a
+construct that spans lines — a block comment, a docstring — stays itself across them. A
+fence whose language the lexer does not know, and every fence when `markdown = false`, is
+drawn verbatim in the code style, which is what all of them were before. The classes borrow
+the interface's existing role colours — a keyword takes the tool accent, a comment the
+reasoning style — so a monochrome terminal keeps the modifiers and loses only the colours.
 
 The markdown styles are derived from the interface's role styles, so the answer keeps the
 answer's colour and `NO_COLOR` works without a second palette: `Theme::monochrome` is the

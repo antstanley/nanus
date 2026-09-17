@@ -81,11 +81,19 @@ money, so a run's cost is reported in tokens and whatever price list the reader 
 there is no task suite to run a comparison *over*, which is the item that would turn these
 readings into a result.
 
+## Shipped: what the interface needed to be a daily driver
+
+The interface items, taken in the order they were worth doing, and where each one landed. The
+numbers are the plan's, kept because later items refer to them.
+
+| # | Item | Where it landed |
+|---|---|---|
+| 7 | **Syntax highlighting in fenced code blocks.** A lexer inside the view rather than a highlighting crate: nothing is read from disk to draw an answer, a construct that spans lines stays itself across them, and a language it does not know is drawn verbatim. The classes borrow the role styles, so `NO_COLOR` keeps the modifiers and loses only the colours. | `nanus-tui/src/markdown/{highlight,theme,render,wrap}.rs` |
+
 ## Next: what the interface needs to be a daily driver
 
 | # | Item | Size | Notes |
 |---|---|---|---|
-| 7 | **Syntax highlighting in fenced code blocks.** | **M** | Deliberately absent today; fences draw verbatim in the code style. A highlighter dependency and a theme that inherits the monochrome story, kept inside the view so it cannot do I/O. |
 | 8 | **A help overlay for the key list (`?`).** | **XS** | The [key table](tui.md#keys) is the list; this draws it, gated so `?` is still a `?` in a prompt. |
 | 9 | **More slash commands.** | **S** each | Only `/exit`, `/quit`, and `/stats` exist. `/help`, `/clear`, and eventually `/model` and `/compact` are the obvious next ones; an unrecognised command is already named rather than sent to the model. |
 | 10 | **Switch model at runtime (`Alt+P`).** | **M** | A config-and-restart decision today. Needs the request to carry the switch and a rule for whether it persists; depends on the provider seam. |

@@ -10,8 +10,10 @@
 //! No I/O and no images. An `![alt](path)` becomes a labelled placeholder: the view is a
 //! pure function of the transcript and the composer, and resolving a path — let alone
 //! fetching a URL a model wrote — would break that and hand a remote party a request the
-//! reader did not ask for. No syntax highlighting either; a fenced block is drawn in the
-//! code style, verbatim.
+//! reader did not ask for. Syntax highlighting lives in [`highlight`], which is a lexer for
+//! the handful of languages a coding answer is written in and nothing more: no syntax
+//! definition is read from disk, and a language the lexer does not know is drawn in the
+//! code style, exactly as every fence used to be.
 //!
 //! ## Trust
 //!
@@ -25,6 +27,7 @@
 // this reason, and this is its clippy counterpart.
 #![allow(clippy::redundant_pub_crate)]
 
+mod highlight;
 mod inline;
 mod mermaid;
 mod parse;

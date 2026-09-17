@@ -342,8 +342,9 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   writes, its network access, or its process table.
 - **Sessions are not locked.** Two writers on one log can lose a turn; attaching
   to a live session is the supported way to share one.
-- **No syntax highlighting** in fenced code blocks, and no image paste; the
-  markdown renderer performs no I/O.
+- **No image paste** in the interface, and no remote fetch from the renderer: a
+  fenced block is highlighted by a lexer inside the view, which is still a pure
+  function of the transcript.
 - **No `@` mentions or `!` bash mode** in the interface, and no model
   switching from a key. The approval state does cycle from the keyboard, with
   `Shift+Tab`.

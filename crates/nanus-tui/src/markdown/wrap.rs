@@ -46,44 +46,51 @@ pub(crate) fn wrap(
     builder.finish()
 }
 
-/// Hard-wraps `text` at `width`, breaking lines mid-word and preserving indentation.
+/// Hard-wraps styled spans at `width`, breaking mid-run and repeating `prefix`.
 ///
 /// This is the code-block rule: a word wrap would reflow a program into something that
-/// no longer compiles, so a code line too long for the terminal is cut at the column
-/// budget and continued on the next row, indented by `prefix` again.
-pub(crate) fn hard_wrap(
-    text: &str,
+/// no longer compiles, so a line too long for the terminal is cut at the column budget
+/// and continued on the next row, indented by `prefix` again. The spans are kept rather
+/// than rebuilt, because a highlighted line arrives already cut into runs — a wrap that
+/// flattened them would colour the first row of a long command and no other.
+pub(crate) fn hard_wrap_spans(
+    spans: &[Span<'static>],
     width: usize,
     prefix: &str,
     prefix_style: Style,
-    body_style: Style,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     // Leave at least one column for content, so a prefix as wide as the terminal
     // cannot push a drawn line past it.
     let prefix = clamp(prefix, width.saturating_sub(1));
-    let prefix_width = str_width(&prefix);
-    let room = width.saturating_sub(prefix_width).max(1);
+    let room = width.saturating_sub(str_width(&prefix)).max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
-    for source_line in text.split('\n') {
-        let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix.clone(), prefix_style)];
-        let mut used = 0_usize;
-        for character in source_line.chars() {
+    let mut line: Vec<Span<'static>> = vec![Span::styled(prefix.clone(), prefix_style)];
+    let mut used = 0_usize;
+    for span in spans {
+        for character in span.content.chars() {
             let current = char_width(character);
             if used.saturating_add(current) > room && used > 0 {
-                out.push(Line::from(std::mem::take(&mut spans)));
-                spans = vec![Span::styled(prefix.clone(), prefix_style)];
+                out.push(Line::from(std::mem::take(&mut line)));
+                line.push(Span::styled(prefix.clone(), prefix_style));
                 used = 0;
             }
             let mut buffer = [0_u8; 4];
-            spans.push(Span::styled(
-                character.encode_utf8(&mut buffer).to_owned(),
-                body_style,
-            ));
+            let text = character.encode_utf8(&mut buffer);
+            // Runs are merged as they are laid down, so a wrapped line holds one span per
+            // colour rather than one per character. An empty span — the prefix of a line
+            // that has none — is replaced rather than kept beside the text it would precede.
+            match line.last_mut() {
+                Some(last) if last.style == span.style => last.content.to_mut().push_str(text),
+                Some(last) if last.content.is_empty() => {
+                    *last = Span::styled(text.to_owned(), span.style);
+                }
+                _ => line.push(Span::styled(text.to_owned(), span.style)),
+            }
             used = used.saturating_add(current);
         }
-        out.push(Line::from(spans));
     }
+    out.push(Line::from(line));
     out
 }
 
@@ -314,7 +321,20 @@ mod tests {
 
     #[test]
     fn hard_wrap_does_not_reflow_a_code_line() {
-        let lines = hard_wrap("a b c d", 4, "│ ", Style::new(), Style::new());
+        let lines = hard_wrap_spans(&plain("a b c d"), 4, "│ ", Style::new());
         assert_eq!(texts(&lines), ["│ a ", "│ b ", "│ c ", "│ d"]);
+    }
+
+    #[test]
+    fn a_wrapped_code_line_keeps_each_run_s_own_style() {
+        let bold = Style::new().add_modifier(ratatui::style::Modifier::BOLD);
+        let spans = vec![
+            Span::styled(String::from("ab"), bold),
+            Span::styled(String::from("cd"), Style::new()),
+        ];
+        let lines = hard_wrap_spans(&spans, 2, "", Style::new());
+        assert_eq!(texts(&lines), ["ab", "cd"]);
+        assert_eq!(lines[0].spans[0].style, bold, "the run keeps its style");
+        assert_eq!(lines[1].spans[0].style, Style::new());
     }
 }

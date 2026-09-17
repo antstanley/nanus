@@ -23,6 +23,14 @@ pub(crate) struct MarkdownTheme {
     pub subheading: Style,
     /// Code block content.
     pub code: Style,
+    /// A keyword in a code block.
+    pub code_keyword: Style,
+    /// A string literal in a code block.
+    pub code_literal: Style,
+    /// A numeric literal in a code block.
+    pub code_number: Style,
+    /// A comment in a code block.
+    pub code_comment: Style,
     /// Inline code.
     pub inline_code: Style,
     /// A link's label.
@@ -71,6 +79,18 @@ impl MarkdownTheme {
             heading: body.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             subheading: body.add_modifier(Modifier::BOLD),
             code: muted,
+            // Highlighting borrows the roles the interface already has rather than adding a
+            // second palette: a keyword takes the tool accent, which is the one colour here
+            // that means "this is a name for an action", a string takes the human's input
+            // colour, a number takes the busy accent, and a comment takes the reasoning
+            // style — dimmed and italic, because a comment is the one thing in a fence that
+            // is *about* the code rather than part of it. Under `NO_COLOR` every one of them
+            // loses its colour and keeps its modifier, so a monochrome terminal still sees
+            // keywords in bold and comments in italics.
+            code_keyword: theme.tool.add_modifier(Modifier::BOLD),
+            code_literal: theme.user,
+            code_number: theme.busy,
+            code_comment: theme.reasoning,
             inline_code: body.add_modifier(Modifier::BOLD),
             link: theme.notice.add_modifier(Modifier::UNDERLINED),
             aside: muted,
