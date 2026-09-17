@@ -58,6 +58,15 @@ pub enum EntryKind {
     Text,
     /// A tool invocation, before or after it runs.
     ToolCall {
+        /// The provider's identity for this call, when the producer had one.
+        ///
+        /// The one thing that pairs a call with its result by *identity* rather than by
+        /// position or by name: a step's calls are all written before any of its results,
+        /// and two calls to one tool in the same step arrive in whatever order they
+        /// finished. `None` from a producer that does not identify its calls — an older
+        /// agent over the link, or an entry a caller built by hand — and then the pairing
+        /// falls back to name and order.
+        call_id: Option<String>,
         /// The tool's name.
         name: String,
         /// The arguments, rendered as JSON.
@@ -65,6 +74,8 @@ pub enum EntryKind {
     },
     /// A tool's outcome.
     ToolResult {
+        /// The identity of the call this answers, when the producer had one.
+        call_id: Option<String>,
         /// The tool's name.
         name: String,
         /// Whether the tool reported failure.
@@ -119,11 +130,39 @@ impl Entry {
         Self {
             role: Role::Tool,
             kind: EntryKind::ToolCall {
+                call_id: None,
                 name: name.clone(),
                 arguments: arguments.into(),
             },
             text: name,
             streaming: true,
+        }
+    }
+
+    /// Attaches the provider's identity for the call this entry is about.
+    ///
+    /// A builder rather than another constructor, because every caller that has no id — most
+    /// of them, including every test that builds an entry by hand — should not have to say
+    /// so. Attaching one to a non-tool entry is a no-op: there is nothing for it to identify.
+    #[must_use]
+    pub fn identified(mut self, call_id: impl Into<String>) -> Self {
+        let call_id = call_id.into();
+        match &mut self.kind {
+            EntryKind::ToolCall { call_id: slot, .. }
+            | EntryKind::ToolResult { call_id: slot, .. } => *slot = Some(call_id),
+            EntryKind::Text | EntryKind::Notice => {}
+        }
+        self
+    }
+
+    /// Returns the identity of the call this entry is about, when it has one.
+    #[must_use]
+    pub fn call_id(&self) -> Option<&str> {
+        match &self.kind {
+            EntryKind::ToolCall { call_id, .. } | EntryKind::ToolResult { call_id, .. } => {
+                call_id.as_deref()
+            }
+            EntryKind::Text | EntryKind::Notice => None,
         }
     }
 
@@ -141,6 +180,7 @@ impl Entry {
         // Build the kind first, moving the content in, then clone it back out for
         // the entry's rendered text. That is one clone rather than two.
         let kind = EntryKind::ToolResult {
+            call_id: None,
             name,
             is_error,
             content,

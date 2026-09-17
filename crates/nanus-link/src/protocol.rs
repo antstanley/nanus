@@ -212,6 +212,20 @@ pub enum Frame {
 
     /// A tool is about to run.
     Tool {
+        /// The provider's identity for this call, when the agent has one.
+        ///
+        /// What pairs this frame with the [`Frame::ToolDone`] that answers it. A step sends
+        /// every call it made and then every result, and two calls in one step finish in
+        /// whatever order they finish in, so neither position nor name can pair them —
+        /// only this can, and only for an agent that has it. Absent from an agent too old to
+        /// send one, which a client reads as "not identified" and pairs by name and order
+        /// instead.
+        ///
+        /// Adding a field does not change what an older peer reads: it ignores the key, and
+        /// its own frames decode without it. So this does not bump
+        /// [`PROTOCOL_VERSION`].
+        #[serde(default)]
+        call_id: Option<String>,
         /// The tool's name.
         name: String,
         /// The arguments the model sent, as JSON.
@@ -229,6 +243,11 @@ pub enum Frame {
 
     /// A tool finished.
     ToolDone {
+        /// The identity of the call this answers, when the agent has one.
+        ///
+        /// See [`Frame::Tool`] for why it is here and why its absence is not an error.
+        #[serde(default)]
+        call_id: Option<String>,
         /// The tool's name.
         name: String,
         /// Whether it reported a failure, which is a result rather than a broken link.
@@ -527,12 +546,24 @@ mod tests {
             },
             Frame::Step { step: 2 },
             Frame::Tool {
+                call_id: Some("call-1".to_owned()),
+                name: "read".to_owned(),
+                arguments: serde_json::json!({"file_path": "src/main.rs"}),
+            },
+            Frame::Tool {
+                call_id: None,
                 name: "read".to_owned(),
                 arguments: serde_json::json!({"file_path": "src/main.rs"}),
             },
             Frame::ToolDone {
+                call_id: Some("call-1".to_owned()),
                 name: "read".to_owned(),
                 error: true,
+            },
+            Frame::ToolDone {
+                call_id: None,
+                name: "read".to_owned(),
+                error: false,
             },
             Frame::Approval {
                 call_id: "call-1".to_owned(),
@@ -701,6 +732,7 @@ mod tests {
         assert_eq!(
             decoded.ok(),
             Some(Frame::Tool {
+                call_id: None,
                 name: "read".to_owned(),
                 arguments: serde_json::Value::Null,
             })

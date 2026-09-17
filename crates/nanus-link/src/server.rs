@@ -45,7 +45,8 @@ use std::time::{Duration, Instant};
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{AgentRunner, Approver, Harness, Progress};
 use nanus_domain::{
-    ApprovalOutcome, ApprovalRequest, Session, SessionId, ToolName, TurnEndReason, Usage,
+    ApprovalOutcome, ApprovalRequest, Session, SessionId, ToolCallId, ToolName, TurnEndReason,
+    Usage,
 };
 use nanus_ports::{ClockHandle, StoreHandle};
 use tokio::io::BufReader;
@@ -781,15 +782,26 @@ impl Progress for Broadcast<'_> {
         }
     }
 
-    fn tool_started(&mut self, name: &ToolName, arguments: &serde_json::Value) {
+    fn tool_started(
+        &mut self,
+        call_id: &ToolCallId,
+        name: &ToolName,
+        arguments: &serde_json::Value,
+    ) {
+        // The id travels with the frame so a watcher can pair the call with the `ToolDone`
+        // that answers it: the frames of a step's calls all go out before its results, and
+        // the results go out in the order the tools finished rather than the order they
+        // were asked for.
         self.push(&Frame::Tool {
+            call_id: Some(call_id.as_str().to_owned()),
             name: name.as_str().to_owned(),
             arguments: arguments.clone(),
         });
     }
 
-    fn tool_finished(&mut self, name: &ToolName, is_error: bool) {
+    fn tool_finished(&mut self, call_id: &ToolCallId, name: &ToolName, is_error: bool) {
         self.push(&Frame::ToolDone {
+            call_id: Some(call_id.as_str().to_owned()),
             name: name.as_str().to_owned(),
             error: is_error,
         });

@@ -136,14 +136,13 @@ fn apply(
             name,
             arguments,
         } => {
-            // Remembered under the id the result will name, which is the only thing that
-            // pairs the two: a step's calls are all written before any of its results, so
-            // position cannot.
+            // Remembered under the id the result will name, because the result event carries
+            // an id and no name.
             calls.insert(call_id.clone(), name.as_str().to_owned());
-            transcript.push(Entry::tool_call(
-                name.as_str().to_owned(),
-                render_arguments(arguments),
-            ));
+            transcript.push(
+                Entry::tool_call(name.as_str().to_owned(), render_arguments(arguments))
+                    .identified(call_id.as_str().to_owned()),
+            );
         }
         SessionEvent::ToolResult {
             call_id,
@@ -153,12 +152,17 @@ fn apply(
             // The name comes from the call this result *names*. Reaching for the last call
             // in the transcript instead gave every result of a multi-call step the last
             // call's name — which then made the interface draw the first call as still
-            // running, its output under the next tool, and the last result twice.
+            // running, its output under the next tool, and the last result twice. The id goes
+            // on the entry as well, so the view pairs the two by identity rather than by the
+            // name and order it would otherwise be reduced to.
             let name = calls
                 .get(call_id)
                 .cloned()
                 .unwrap_or_else(|| String::from("tool"));
-            transcript.push(Entry::tool_result(name, *is_error, summarise(content)));
+            transcript.push(
+                Entry::tool_result(name, *is_error, summarise(content))
+                    .identified(call_id.as_str().to_owned()),
+            );
         }
         SessionEvent::TurnStart { .. } => *steps = 0,
         SessionEvent::StepStart { .. } => *steps = steps.saturating_add(1),

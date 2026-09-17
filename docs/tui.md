@@ -87,6 +87,15 @@ turn that says *what the agent is doing* cannot be recovered anywhere else while
 running: the session log has the arguments, but a client watching a turn is not reading the
 log as it is written.
 
+Both tool frames also carry the call's **id**, which is what pairs a call with its result.
+Position cannot: a step sends every call it made and only then every result, and a step's
+results go out in the order the tools finished rather than the order they were asked for —
+so two calls to one tool in one step are indistinguishable on screen without it, and the
+transcript would show the wrong one as having failed. The field is optional, and a client
+reading a frame without one falls back to pairing by name and then by order, which is exact
+for a step whose calls all name different tools. Adding it changed no frame's meaning, so
+the protocol version stands.
+
 **A turn can be stopped by a client, because the turn is not the client's.** It runs in a
 task the agent owns, in a session the agent holds, so that closing a terminal does not
 abandon a turn — and the same design is why a client cannot simply *drop* one. The client

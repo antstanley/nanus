@@ -576,7 +576,12 @@ async fn progress_reports_every_step_and_tool() {
             self.steps.push(step);
         }
 
-        fn tool_started(&mut self, name: &ToolName, arguments: &serde_json::Value) {
+        fn tool_started(
+            &mut self,
+            _call_id: &ToolCallId,
+            name: &ToolName,
+            arguments: &serde_json::Value,
+        ) {
             // The path is what makes a tool call readable, so it is part of what the loop
             // is expected to report rather than something a listener has to look up.
             self.tools.push(format!(

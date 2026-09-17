@@ -107,7 +107,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 915 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 918 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -321,6 +321,15 @@ something outside a turn), and handle it in `nanus_tui::runtime::apply`. The
 compiler will point at all three: the enum match in `apply` is exhaustive, so a
 new frame cannot be silently ignored. Add a round-trip case to the protocol test
 and a case to the `apply` test.
+
+**Add a field to a frame.** The same three places hold, because `apply` names every
+field it reads: a new one is a compile error there, in the protocol's own round-trip
+test, and at every construction site — which is the point, and it is why the fields are
+destructured rather than matched with `..`. Make it `#[serde(default)]` when an older
+peer could send a frame without it, and say in the field's doc comment what a reader
+should do about its absence. A defaulted field does not change what an older peer
+*reads*, so `PROTOCOL_VERSION` does not move for one; it moves when a frame's meaning
+changes.
 
 **Change what a session is or how it is named.** `nanus-ports::StorePort` is the
 boundary: `resolve` reads a name, `name` records one, `name_of` reads the reverse,

@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [5.2s] 915 tests run: 915 passed, 0 skipped
+Summary [5.3s] 918 tests run: 918 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
@@ -171,9 +171,11 @@ it answers. The recorded transcript therefore labelled a result with the *next* 
 which is not cosmetic: the interface pairs a result with the call above it, so a two-call
 step drew the first call as still running, drew its output under the second tool, and drew
 the last result twice. The log had the answer all along in `call_id`, which nothing used.
-The replay now pairs by id; the view pairs by name and order, because the link carries names
-rather than ids; and both are tested against a two-call step, since a one-call step cannot
-tell either of them apart.
+The replay now pairs by id, and the link was extended to carry
+the id with each tool frame so the live view pairs by identity too. Both fall back to name and
+then order for an entry that arrives without one — exact for a step whose calls name different
+tools, and the best available for two same-named calls, which only an id can tell apart. Both
+are tested against a two-call step, since a one-call step cannot tell either of them apart.
 
 **`bash` ran in the wrong directory.** The tool's schema says its working directory defaults
 to the workspace root, and the system prompt repeats it. It sent no working directory at all,

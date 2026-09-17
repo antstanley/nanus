@@ -92,16 +92,26 @@ impl Progress for StderrProgress {
         self.heading_written = false;
     }
 
-    fn tool_started(&mut self, name: &ToolName, _arguments: &serde_json::Value) {
-        // The arguments are available and deliberately unused: this reporter names the
-        // tool for someone watching a run, and the interface is where a call is turned
-        // into a sentence about what the agent is doing.
+    fn tool_started(
+        &mut self,
+        _call_id: &nanus_domain::ToolCallId,
+        name: &ToolName,
+        _arguments: &serde_json::Value,
+    ) {
+        // The arguments and the call's id are available and deliberately unused: this
+        // reporter names the tool for someone watching a run, and the interface is where a
+        // call is followed from start to finish.
         if self.tools {
             Self::note(&format!("nanus: running {name}"));
         }
     }
 
-    fn tool_finished(&mut self, name: &ToolName, is_error: bool) {
+    fn tool_finished(
+        &mut self,
+        _call_id: &nanus_domain::ToolCallId,
+        name: &ToolName,
+        is_error: bool,
+    ) {
         if self.tools {
             let status = if is_error { "failed" } else { "finished" };
             Self::note(&format!("nanus: {name} {status}"));
@@ -130,8 +140,8 @@ mod tests {
         reporter.reasoning("thinking");
         reporter.text("answer");
         reporter.step_started(1);
-        reporter.tool_started(&tool(), &serde_json::Value::Null);
-        reporter.tool_finished(&tool(), false);
+        reporter.tool_started(&call_id(), &tool(), &serde_json::Value::Null);
+        reporter.tool_finished(&call_id(), &tool(), false);
         reporter.usage(&Usage::default());
     }
 
@@ -141,10 +151,14 @@ mod tests {
         reporter.step_started(1);
         reporter.reasoning("a");
         reporter.reasoning("b");
-        reporter.tool_started(&tool(), &serde_json::Value::Null);
-        reporter.tool_finished(&tool(), true);
+        reporter.tool_started(&call_id(), &tool(), &serde_json::Value::Null);
+        reporter.tool_finished(&call_id(), &tool(), true);
         reporter.usage(&Usage::default());
         reporter.text("ignored");
+    }
+
+    fn call_id() -> nanus_domain::ToolCallId {
+        nanus_domain::ToolCallId::new("call-1")
     }
 
     fn tool() -> ToolName {

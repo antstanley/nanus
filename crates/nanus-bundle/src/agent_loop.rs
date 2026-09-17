@@ -121,11 +121,21 @@ pub trait Progress {
     ///
     /// The arguments come with the name because knowing *which* tool ran is often not
     /// knowing what happened: `edit` says nothing, and `edit` on `view.rs` says
-    /// everything. A listener that only wants the name ignores the second parameter.
-    fn tool_started(&mut self, _name: &ToolName, _arguments: &serde_json::Value) {}
+    /// everything. The call's id comes with both because it is the only thing that pairs
+    /// this call with the [`Progress::tool_finished`] that answers it: a step writes every
+    /// call it made before it writes any result, and two calls in one step arrive back in
+    /// whatever order they finished in. A listener that only wants the name ignores the
+    /// other two parameters.
+    fn tool_started(
+        &mut self,
+        _call_id: &ToolCallId,
+        _name: &ToolName,
+        _arguments: &serde_json::Value,
+    ) {
+    }
 
     /// A tool finished.
-    fn tool_finished(&mut self, _name: &ToolName, _is_error: bool) {}
+    fn tool_finished(&mut self, _call_id: &ToolCallId, _name: &ToolName, _is_error: bool) {}
 
     /// Usage was reported.
     fn usage(&mut self, _usage: &Usage) {}
@@ -581,13 +591,13 @@ impl AgentRunner {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            progress.tool_started(&call.name, &call.arguments);
+            progress.tool_started(&call.id, &call.name, &call.arguments);
         }
 
         let mut results: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
         for (index, call) in calls.iter().enumerate() {
             if let Some(denied) = self.gate(call, approver).await {
-                progress.tool_finished(&call.name, true);
+                progress.tool_finished(&call.id, &call.name, true);
                 results[index] = Some(denied);
             }
         }
@@ -614,7 +624,7 @@ impl AgentRunner {
             let finished = futures::future::join_all(running).await;
             for (index, result) in batch.iter().zip(finished) {
                 let is_error = !result.outcome.is_success();
-                progress.tool_finished(&calls[*index].name, is_error);
+                progress.tool_finished(&calls[*index].id, &calls[*index].name, is_error);
                 results[*index] = Some(result);
             }
         }

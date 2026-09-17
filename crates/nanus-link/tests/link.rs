@@ -678,10 +678,14 @@ fn a_tool_frame_carries_what_the_call_is_acting_on() {
     });
 
     let call = frames.iter().find_map(|frame| match frame {
-        Frame::Tool { name, arguments } => Some((name.as_str(), arguments)),
+        Frame::Tool {
+            call_id,
+            name,
+            arguments,
+        } => Some((call_id.as_deref(), name.as_str(), arguments)),
         _ => None,
     });
-    let (name, arguments) = call.expect("the call reaches the client before it runs");
+    let (call_id, name, arguments) = call.expect("the call reaches the client before it runs");
     assert_eq!(name, "nowhere");
     assert_eq!(
         arguments
@@ -689,6 +693,22 @@ fn a_tool_frame_carries_what_the_call_is_acting_on() {
             .and_then(serde_json::Value::as_str),
         Some("src/main.rs"),
         "the arguments travel with the call: {arguments}"
+    );
+
+    // The id travels too, and it is what pairs this frame with the `ToolDone` that answers
+    // it: a step's calls all go out before any of its results, and a step's results go out in
+    // the order the tools finished rather than the order they were asked for. Without the id
+    // a watcher has only the name, which cannot tell two calls to one tool apart.
+    let done = frames.iter().find_map(|frame| match frame {
+        Frame::ToolDone { call_id, name, .. } => Some((call_id.as_deref(), name.as_str())),
+        _ => None,
+    });
+    let (done_id, done_name) = done.expect("the call is answered");
+    assert_eq!(done_name, "nowhere");
+    assert_eq!(call_id, done_id, "the call and its result name the same id");
+    assert!(
+        call_id.is_some_and(|id| !id.is_empty()),
+        "and the agent sent one rather than leaving the client to guess"
     );
 }
 

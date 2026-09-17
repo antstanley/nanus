@@ -315,43 +315,71 @@ const STATS_SEPARATOR: &str = "  \u{b7}  ";
 /// draw every call as still running and every result as a block of its own with a redundant
 /// name on it, which is precisely the state the compact form's mark exists to avoid.
 ///
-/// Nor is the call's id available here: the link carries a tool's *name*, and a transcript
-/// entry does not hold an id even in the recorded path, where the log does have one. So the
-/// pairing is by name and then by order: the k-th result named `read` answers the k-th call
-/// named `read`. That is exact rather than a guess — the agent loop records a step's results
-/// in call order, so the k-th result of a name is the k-th call of it, whether the two names
-/// alternate or repeat.
+/// So there are two passes, and the first one is the honest one:
+///
+/// 1. **By identity**, when both entries carry a call id. The agent sends one with each
+///    `Tool` and `ToolDone` frame and the log records one with every call and result, so
+///    this is the pairing a transcript built from either source gets — and it is exact even
+///    when one tool is called twice in a step and the two finish in the other order.
+/// 2. **By name and then by order**, for whatever is left. That is an entry built by hand,
+///    or a frame from an agent too old to send an id: the k-th result named `read` answers
+///    the k-th call named `read`. Exact for the same reason pass 1 is not needed here — the
+///    agent records a step's results in call order — but blind to which of two same-named
+///    calls a given result is, which is exactly the ambiguity the ids remove.
 struct Pairing {
     /// For each entry, the index of the call it answers or of the result that answers it.
     partner: Vec<Option<usize>>,
 }
 
 impl Pairing {
-    /// Pairs every result with a call, by name and by order.
+    /// Pairs every result with a call, by identity where there is one and by name otherwise.
     fn of(entries: &[Entry]) -> Self {
         let mut partner: Vec<Option<usize>> = vec![None; entries.len()];
         // Each call is available at most once: two calls to `read` in one step need two
         // results to answer them, and a third result named `read` is an orphan.
         let mut taken: Vec<bool> = vec![false; entries.len()];
-        let calls: Vec<(usize, &str)> = entries
+        let calls: Vec<(usize, &str, Option<&str>)> = entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| match entry.kind() {
-                EntryKind::ToolCall { name, .. } => Some((index, name.as_str())),
+                EntryKind::ToolCall { name, .. } => Some((index, name.as_str(), entry.call_id())),
                 _ => None,
             })
             .collect();
+
+        // Pass 1: identity. Both sides have to carry one for the pairing to mean anything.
         for (result, entry) in entries.iter().enumerate() {
+            let EntryKind::ToolResult { name, .. } = entry.kind() else {
+                continue;
+            };
+            let Some(call_id) = entry.call_id() else {
+                continue;
+            };
+            let Some((call, _, _)) = calls.iter().find(|(call, call_name, id)| {
+                !taken[*call] && *id == Some(call_id) && *call_name == name
+            }) else {
+                continue;
+            };
+            taken[*call] = true;
+            partner[*call] = Some(result);
+            partner[result] = Some(*call);
+        }
+
+        // Pass 2: name and order, for anything the ids did not settle.
+        for (result, entry) in entries.iter().enumerate() {
+            if partner[result].is_some() {
+                continue;
+            }
             let EntryKind::ToolResult { name, .. } = entry.kind() else {
                 continue;
             };
             let matched = calls
                 .iter()
-                .position(|(call, call_name)| !taken[*call] && call_name == name);
+                .position(|(call, call_name, _)| !taken[*call] && call_name == name);
             let Some(position) = matched else {
                 continue;
             };
-            let (call, _) = calls[position];
+            let (call, _, _) = calls[position];
             taken[call] = true;
             partner[call] = Some(result);
             partner[result] = Some(call);
@@ -600,7 +628,9 @@ impl ViewState {
         }
         let style = self.theme.style_for_entry(entry);
         match entry.kind() {
-            EntryKind::ToolCall { name, arguments } => {
+            EntryKind::ToolCall {
+                name, arguments, ..
+            } => {
                 let mut lines = vec![Line::from(vec![
                     Span::styled("⚙ ", style),
                     Span::styled(format!("{name}("), style.add_modifier(Modifier::BOLD)),
@@ -613,6 +643,7 @@ impl ViewState {
                 name,
                 is_error,
                 content,
+                ..
             } => {
                 let marker = if *is_error { "✗" } else { "✓" };
                 let mut lines = vec![Line::from(Span::styled(format!("{marker} {name}"), style))];
@@ -904,7 +935,10 @@ impl ViewState {
             // the argument blocks and the whole of the reasoning asks for
             // [`Detail::Full`].
             if self.detail == Detail::Compact {
-                if let EntryKind::ToolCall { name, arguments } = entry.kind() {
+                if let EntryKind::ToolCall {
+                    name, arguments, ..
+                } = entry.kind()
+                {
                     let state = pairing.state_of_call(entries, index);
                     lines.push(self.compact_tool_line(state, name, arguments, width));
                     index = index.saturating_add(1);
@@ -3391,6 +3425,62 @@ mod multi_call_step_tests {
                 "  second file",
             ],
             "the k-th result of a name answers the k-th call of it, so the first succeeded and the second failed"
+        );
+    }
+
+    /// Two calls to one tool that finish in the other order are marked by identity.
+    ///
+    /// This is the case name-and-order cannot decide: both calls are `read`, and the frames
+    /// arrive in completion order, so the only thing that says which result answers which
+    /// call is the id the agent sends. Without it the marks would be swapped — the call that
+    /// succeeded would show a failure and the one that failed would show a tick.
+    #[test]
+    fn two_calls_to_one_tool_are_paired_by_id_when_the_results_arrive_out_of_order() {
+        let mut state = ViewState::new();
+        state.transcript.push(
+            Entry::tool_call("read", r#"{"file_path":"a.rs"}"#.to_owned()).identified("call-a"),
+        );
+        state.transcript.push(
+            Entry::tool_call("read", r#"{"file_path":"b.rs"}"#.to_owned()).identified("call-b"),
+        );
+        // `b` finished first and failed; `a` answered after it.
+        state
+            .transcript
+            .push(Entry::tool_result("read", true, "b broke").identified("call-b"));
+        state
+            .transcript
+            .push(Entry::tool_result("read", false, "a is fine").identified("call-a"));
+
+        assert_eq!(
+            rows(&state),
+            vec![
+                "✓ Read File · a.rs",
+                "✗ Read File · b.rs",
+                "  b broke",
+                "  a is fine",
+            ],
+            "the id decides, not the order the results arrived in"
+        );
+    }
+
+    /// The other direction: with no ids — an entry built by hand, or a frame from an agent
+    /// that predates the field — the pairing falls back to name and order rather than
+    /// giving up, so a transcript still marks its calls.
+    #[test]
+    fn entries_without_ids_still_pair_by_name_and_order() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::tool_call(
+            "read",
+            r#"{"file_path":"a.rs"}"#.to_owned(),
+        ));
+        state
+            .transcript
+            .push(Entry::tool_result("read", false, "the output"));
+
+        assert_eq!(
+            rows(&state),
+            vec!["✓ Read File · a.rs", "  the output"],
+            "the fallback still marks the call it can only identify by name"
         );
     }
 

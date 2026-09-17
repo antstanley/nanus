@@ -1251,7 +1251,11 @@ fn apply(frame: Frame, view: &mut ViewState) {
                 reason,
             });
         }
-        Frame::Tool { name, arguments } => {
+        Frame::Tool {
+            call_id,
+            name,
+            arguments,
+        } => {
             // Followed like every other append: a tool line that arrives below the fold is a
             // line the reader is not shown, and the transcript's own rule is that everything
             // which appends follows.
@@ -1264,16 +1268,22 @@ fn apply(frame: Frame, view: &mut ViewState) {
                 serde_json::Value::Null => String::new(),
                 other => other.to_string(),
             };
-            view.transcript.push(Entry::tool_call(name, arguments));
+            view.transcript
+                .push(call_entry(Entry::tool_call(name, arguments), call_id));
             view.follow();
         }
-        Frame::ToolDone { name, error } => {
+        Frame::ToolDone {
+            call_id,
+            name,
+            error,
+        } => {
             // No content, because the frame carries none: a tool's output is in the
             // session log, and this frame says only that the call is over and how it
             // went. A placeholder here used to put the word "done" under every tool call
             // in a live transcript — a line of screen saying nothing — and with the
             // outcome moved onto the call's own line it would have said it twice.
-            view.transcript.push(Entry::tool_result(name, error, ""));
+            view.transcript
+                .push(call_entry(Entry::tool_result(name, error, ""), call_id));
             view.follow();
         }
         Frame::Usage {
@@ -1342,6 +1352,17 @@ fn apply(frame: Frame, view: &mut ViewState) {
         | Frame::Sessions { .. }
         | Frame::Status(_)
         | Frame::Bye => {}
+    }
+}
+
+/// Attaches a call's identity to its entry, when the frame carried one.
+///
+/// A frame from an agent that predates the field has none, and the entry is left to be paired
+/// by name and order — which is what the whole transcript did before the id was on the wire.
+fn call_entry(entry: Entry, call_id: Option<String>) -> Entry {
+    match call_id {
+        Some(call_id) => entry.identified(call_id),
+        None => entry,
     }
 }
 
@@ -1943,10 +1964,12 @@ mod tests {
     fn the_frames_that_append_also_follow() {
         let frames = [
             Frame::Tool {
+                call_id: Some("c1".to_owned()),
                 name: "read".to_owned(),
                 arguments: serde_json::json!({}),
             },
             Frame::ToolDone {
+                call_id: Some("c1".to_owned()),
                 name: "read".to_owned(),
                 error: false,
             },
@@ -2454,6 +2477,7 @@ mod tests {
         assert!(
             sender
                 .try_send(Frame::Tool {
+                    call_id: Some("c-view".to_owned()),
                     name: "read".to_owned(),
                     arguments: serde_json::json!({"file_path": "src/view.rs"}),
                 })
@@ -2462,6 +2486,7 @@ mod tests {
         assert!(
             sender
                 .try_send(Frame::ToolDone {
+                    call_id: Some("c-view".to_owned()),
                     name: "read".to_owned(),
                     error: true
                 })
@@ -2480,6 +2505,41 @@ mod tests {
         // reader cannot get anywhere else: the session log has it, but a client watching a
         // turn is not reading the log as it is written.
         assert!(arguments.contains("src/view.rs"), "{arguments}");
+        // And so does the call's identity, which is what lets the view pair this entry with
+        // the `ToolDone` above it by something other than their order on screen.
+        assert_eq!(
+            view.transcript.entries().first().and_then(Entry::call_id),
+            Some("c-view"),
+            "the frame's call id reaches the entry"
+        );
+        assert_eq!(
+            view.transcript.entries().get(1).and_then(Entry::call_id),
+            Some("c-view"),
+            "on both halves of the pair"
+        );
+    }
+
+    /// The other direction: a frame from an agent that predates the field carries no id, and
+    /// the entry is left for the view to pair by name and order.
+    #[test]
+    fn a_tool_frame_without_a_call_id_leaves_the_entry_unidentified() {
+        let (sender, mut receiver) = mpsc::channel::<Frame>(8);
+        let mut view = ViewState::new();
+        assert!(
+            sender
+                .try_send(Frame::Tool {
+                    call_id: None,
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({"file_path": "src/view.rs"}),
+                })
+                .is_ok()
+        );
+        drain_frames(&mut receiver, &mut view);
+        assert_eq!(
+            view.transcript.entries().first().and_then(Entry::call_id),
+            None,
+            "an older agent's frame leaves the entry to be paired by name"
+        );
     }
 
     #[test]
@@ -2492,6 +2552,7 @@ mod tests {
         assert!(
             sender
                 .try_send(Frame::Tool {
+                    call_id: None,
                     name: "glob".to_owned(),
                     arguments: serde_json::Value::Null,
                 })
