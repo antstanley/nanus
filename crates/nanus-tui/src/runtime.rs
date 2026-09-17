@@ -967,7 +967,7 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     view.label = source.label().map(str::to_owned);
     view.model = source.model().map(str::to_owned);
     view.models = source.models().to_vec();
-    view.effort = source.effort();
+    view.effort = source.effort().map(|effort| effort.as_str().to_owned());
     // Only when one was asked for: the default is already the fail-closed state, and a live
     // conversation overwrites this with the agent's own answer as soon as it is attached.
     if let Some(policy) = source.initial_approval() {
@@ -1504,11 +1504,20 @@ fn paste_image(read: &dyn Fn() -> Option<Vec<u8>>, workspace: Option<&str>, view
 /// middle of the scale, which is where an unset request lands — and the reader's next press moves
 /// from there. The title bar names the result, so the state is never a mystery, and the status
 /// line says what was asked for at the moment it was asked.
+///
+/// The scale is stepped from the *word the title bar is drawing* rather than from what the agent
+/// last confirmed: a press has to move from what this reader last chose, and a frame that has not
+/// arrived yet must not make the key do nothing. That word is the provider's vocabulary, so it is
+/// read back through the scale itself rather than through a second list of steps kept here — and
+/// the two directions of that scale are one definition, in the ports crate, with a round trip
+/// test either side of them.
 fn cycle_effort(source: &mut dyn SessionSource, view: &mut ViewState) {
     let chosen = view
         .effort
+        .as_deref()
+        .and_then(ReasoningEffort::parse)
         .map_or_else(|| ReasoningEffort::Medium.next(), ReasoningEffort::next);
-    view.effort = Some(chosen);
+    view.effort = Some(chosen.as_str().to_owned());
     view.status = format!("thinking: {chosen}");
     source.set_effort(chosen);
 }
@@ -2386,7 +2395,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // Applied even to the client that asked, for the same reason the model is: the agent
             // is what fills an unset effort in, and it is the authority on what the next request
             // carries.
-            view.effort = Some(view_effort(state));
+            view.effort = Some(view_effort(state).as_str().to_owned());
         }
         Frame::ModelChanged { model } => {
             // The agent is the authority here too, and for a stronger reason: it is the model
@@ -3849,7 +3858,7 @@ mod tests {
         // where an unset request lands — and moves from there.
         let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::ALT), &mut view);
         cycle_effort(&mut source, &mut view);
-        assert_eq!(view.effort, Some(ReasoningEffort::High));
+        assert_eq!(view.effort.as_deref(), Some("high"));
         assert_eq!(view.status, "thinking: high");
 
         for expected in [
@@ -3859,7 +3868,11 @@ mod tests {
             ReasoningEffort::High,
         ] {
             cycle_effort(&mut source, &mut view);
-            assert_eq!(view.effort, Some(expected), "the cycle wraps round");
+            assert_eq!(
+                view.effort.as_deref(),
+                Some(expected.as_str()),
+                "the cycle wraps round"
+            );
         }
         assert_eq!(
             source.requests.borrow().last(),
@@ -3881,7 +3894,7 @@ mod tests {
             },
             &mut view,
         );
-        assert_eq!(view.effort, Some(ReasoningEffort::Low));
+        assert_eq!(view.effort.as_deref(), Some("low"));
 
         // A recording offers no effort and, asked, says nothing rather than changing what it
         // draws: the key is the agent's to answer.

@@ -15,7 +15,21 @@ Summary [5.3s] 918 tests run: 918 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
+
+$ cargo clippy -p nanus-tui --no-default-features --all-targets
+0 warnings, 0 errors
+
+$ cargo test -p nanus-tui --no-default-features
+Summary [0.1s] 326 tests run: 326 passed, 0 skipped
 ```
+
+**The last two are the interface's view layer on its own.** `nanus-tui` carries its terminal
+event loop, its link client, and its session store behind a `runtime` feature, so that the
+rendering can be built, linted, and tested without any of them — no tokio, no link, no store, and
+no agent anywhere near it. It is a second way of building one crate rather than a second crate, so
+it is checked separately: a view-layer module that reached for a runtime-only crate would compile
+in the run above and fail here, which is exactly how `notice.rs` and `view.rs` were found naming
+the link and the ports in a build that has neither.
 
 ## The tests that matter most
 

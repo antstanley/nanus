@@ -58,7 +58,7 @@ Start here if you are going to read or change the code.
 
 ## [Testing and verification](testing.md)
 
-The four quality gates and their current output, the tests that matter most — including
+The quality gates and their current output, the tests that matter most — including
 the link driven over real sockets — and an honest account of the bugs that verification
 found rather than reasoning.
 

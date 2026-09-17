@@ -6,14 +6,21 @@
 //! to work out why.
 //!
 //! There are two ways the interface learns the reason, and this module exists because of the
-//! second. A live turn ends with the link's `Done` frame, which carries a [`TurnEnd`]. A
+//! second. A live turn ends with the link's `Done` frame, which carries a `TurnEnd`. A
 //! *recorded* turn ends with a `SessionEvent::TurnEnd`, which carries the domain's
 //! [`TurnEndReason`]. Rendering those in two places is how the two drifted: the live view said
 //! `the turn stopped at its step budget after 32 steps` and the replay of the same session said
 //! nothing at all, so a conversation that reads as finished on screen reads as finished a day
 //! later too. One vocabulary, one renderer, two translations.
+//!
+//! The wire's translation is compiled only where the wire is: this module belongs to the view layer,
+//! which is built without the link — a test of the rendering links the view and nothing else — so
+//! that half of the pair lives behind the `runtime` feature. The interface's own [`Ending`] and the
+//! domain's translation are the same in both builds, because a recorded session has to say why a
+//! turn stopped whether or not there is an agent to talk to.
 
 use nanus_domain::TurnEndReason;
+#[cfg(feature = "runtime")]
 use nanus_link::protocol::TurnEnd;
 
 /// Why a turn ended, in the interface's own vocabulary.
@@ -39,6 +46,7 @@ pub enum Ending {
     Failed(String),
 }
 
+#[cfg(feature = "runtime")]
 impl From<&TurnEnd> for Ending {
     fn from(reason: &TurnEnd) -> Self {
         match reason {
@@ -148,7 +156,9 @@ mod tests {
 
     /// The two sources say the same thing about the same turn, which is the whole reason this
     /// module exists: a reason that translated differently on one side would put the live and
-    /// recorded views back where they started.
+    /// recorded views back where they started. Compiled only with the link, since it is the only
+    /// thing here that names both vocabularies.
+    #[cfg(feature = "runtime")]
     #[test]
     fn both_vocabularies_reach_the_same_sentence() {
         let pairs = [

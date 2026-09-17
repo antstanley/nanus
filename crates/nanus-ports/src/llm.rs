@@ -96,6 +96,31 @@ impl ReasoningEffort {
         }
     }
 
+    /// Returns the step a wire name names, when it names one.
+    ///
+    /// The counterpart of [`ReasoningEffort::as_str`], and the pair exists for the same reason the
+    /// finish reason has one: a caller that *draws* the name of the effort in force and then steps
+    /// the scale from what it drew needs to read its own drawing back, and a scale with one
+    /// direction only would have to be spelled a second time wherever it is stepped.
+    ///
+    /// `None` is an honest answer rather than a defaulted one: a word that is not on the scale is
+    /// not a step, and the caller has its own idea of where to start — the interface steps from the
+    /// middle of the scale when nothing is known — which a plausible-looking guess here would take
+    /// away from it.
+    ///
+    /// Not `const`, unlike [`ReasoningEffort::as_str`]: matching on a string is not something a
+    /// constant function may do yet, which is also why [`FinishReason::parse`] is not one.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
     /// Returns the next step of the scale, wrapping round.
     ///
     /// The order is by increasing effort, so a reader stepping through it is asking for more
@@ -553,6 +578,25 @@ mod tests {
         // The order agrees with `Ord`, so "more effort" means the same thing however it is
         // expressed.
         assert!(ReasoningEffort::High > ReasoningEffort::Minimal);
+    }
+
+    /// Every step survives the round trip through its own name, which is what lets a caller draw
+    /// the name and step the scale from what it drew. Both directions, because a name added to
+    /// one and not the other is a key that stops at a value nobody can read back.
+    #[test]
+    fn an_effort_is_read_back_from_its_own_name() {
+        for effort in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+            assert_eq!(effort.to_string(), effort.as_str());
+        }
+        // A word that is not on the scale is not a step, and is not guessed at.
+        assert_eq!(ReasoningEffort::parse("mediumish"), None);
+        assert_eq!(ReasoningEffort::parse(""), None);
     }
 
     fn tool_name(raw: &str) -> ToolName {

@@ -10,7 +10,6 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use nanus_domain::ApprovalPolicy;
-use nanus_ports::ReasoningEffort;
 use unicode_width::UnicodeWidthChar as _;
 
 use crate::buffer::InputBuffer;
@@ -345,13 +344,18 @@ pub struct ViewState {
     /// Empty for a source that cannot be switched — a recorded transcript has no agent to
     /// tell, and the key says so rather than offering a list nobody would honour.
     pub models: Vec<String>,
-    /// How hard the model is being asked to think, when anything said.
+    /// How hard the model is being asked to think, as the word the title bar draws.
     ///
     /// Drawn in the title bar beside the model, because both are the same kind of fact — what
     /// is answering — and because a toggle whose state is invisible is a toggle a reader has to
     /// press to find out about. `None` is an adapter with no notion of effort, or a session that
     /// predates the field, and it is drawn as nothing rather than as a guess.
-    pub effort: Option<ReasoningEffort>,
+    ///
+    /// The word rather than the port's own scale: the four steps, their order, and the switch that
+    /// steps them are the runtime's, and this half is the half that builds without them — the same
+    /// reason nothing here names the link. It is also the word the session *records*, which is why
+    /// a live title bar and a replayed one say the same thing.
+    pub effort: Option<String>,
     /// What to call the session in the title bar, when the interface is in one.
     ///
     /// A live conversation is a conversation *with something*, and once sessions can be
@@ -1824,7 +1828,7 @@ impl ViewState {
                 *title,
                 self.label.as_deref(),
                 self.model.as_deref(),
-                self.effort,
+                self.effort.as_deref(),
             );
         }
         if let Some(body) = chunks.get(1) {
@@ -2308,7 +2312,7 @@ impl ViewState {
         area: Rect,
         label: Option<&str>,
         model: Option<&str>,
-        effort: Option<ReasoningEffort>,
+        effort: Option<&str>,
     ) {
         let mut spans = vec![Span::styled(
             "nanus",
@@ -4298,7 +4302,7 @@ mod tests {
         let before = rendered(&mut state, 90, 12);
         assert!(!before.contains("thinking"), "{before}");
 
-        state.effort = Some(ReasoningEffort::High);
+        state.effort = Some(String::from("high"));
         let after = rendered(&mut state, 90, 12);
         assert!(after.contains("thinking: high"), "{after}");
         assert!(

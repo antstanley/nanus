@@ -90,11 +90,19 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 <crate>`) when you mean the whole project.
 
 ```sh
-# The four quality gates. All must pass and all are expected to be clean.
+# The five quality gates. All must pass and all are expected to be clean.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
 cargo nextest run --workspace --all-features
 cargo test --workspace --doc
+
+# The interface's view layer without its runtime half: no tokio, no link, no store.
+# It is a supported configuration rather than a curiosity — it is how the rendering is
+# worked on without an agent anywhere near it — so it has to build, lint, and test
+# cleanly too, and it is the only thing that catches a view-layer module reaching for a
+# runtime-only crate.
+cargo clippy -p nanus-tui --no-default-features --all-targets
+cargo test -p nanus-tui --no-default-features
 
 # Build both binaries: the core (`nanus`) and the interface (`nanus-tui`).
 # `--workspace` is required: `default-members` is the kernel alone, so a bare
@@ -404,7 +412,7 @@ what changed and why, capitalised, no conventional-commit prefixes.
 - Match the surrounding style. Comments here explain *why*, often at length;
   keep that voice and update the comment when you change the behaviour it
   describes.
-- Run all four gates before considering a change done. Do not leave the baseline
+- Run every gate before considering a change done. Do not leave the baseline
   count or lint status worse.
 - Prefer editing files over rewriting them, and keep diffs focused; unrelated
   reformatting obscures review.

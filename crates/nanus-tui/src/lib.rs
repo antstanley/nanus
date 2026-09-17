@@ -33,6 +33,13 @@
 // re-exports. The lint cannot tell that from an orphaned item, and every such item
 // here is deliberate.
 #![allow(unreachable_pub)]
+// Without the runtime feature this crate is the view layer alone, and much of what it holds is
+// *driven* by the half that is not built: the selection, the mention menu's filling, the paste. What
+// is missing there is their caller rather than their purpose — the runtime binary names every one of
+// them — and a dead-code `allow` on each of twenty-odd items would say the same thing twenty times
+// and say it wrongly. The cost is that this one build cannot see code the view layer has stopped
+// using; the build with the runtime can, and both are checked.
+#![cfg_attr(not(feature = "runtime"), allow(dead_code))]
 
 pub mod buffer;
 pub mod command;

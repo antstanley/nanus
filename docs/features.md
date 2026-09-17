@@ -346,8 +346,9 @@ The Cordis-style kernel is the framework underneath. See
 - **Secrets never reach a log or a request body**: the API key is read from the
   environment, is absent from the configuration type, and is redacted in
   `Debug`.
-- **Four quality gates** — `cargo fmt`, `cargo clippy`, `cargo nextest`, and the
-  doctests — with the tests that matter most and the bugs verification found in
+- **Five quality gates** — `cargo fmt`, `cargo clippy`, `cargo nextest`, the
+  doctests, and the interface's view layer built without its runtime half — with the
+  tests that matter most and the bugs verification found in
   [testing and verification](testing.md).
 
 ## Not supported yet
