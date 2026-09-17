@@ -532,10 +532,19 @@ impl AgentRunner {
 
     /// Runs every tool call in one step.
     ///
-    /// Each call is recorded *before* it is gated, so the log always says what the model
-    /// asked for even when a policy refused it, and a denied call is answered with a tool
-    /// result rather than being dropped — the turn machine reads an owed call from the log,
-    /// and a call with no result would keep the turn open for ever.
+    /// Three phases, and the split is what keeps concurrency from making the log
+    /// unreproducible:
+    ///
+    /// 1. Every call is written down before anything runs, so the log says what the model
+    ///    asked for even if the process dies mid-step, and every call the step owes is
+    ///    visible from the first line.
+    /// 2. The gate decides each call in order. Decisions are *not* concurrent: an approval
+    ///    question is a thing a person answers one at a time, and several questions in
+    ///    front of them at once is how one gets lost behind another.
+    /// 3. The permitted calls run at most [`AgentConfig::max_parallel_tools`] at a time,
+    ///    and their results are recorded in call order whatever order they finished in.
+    ///    A call and its result therefore pair up in the log by position and by id, however
+    ///    the work was scheduled.
     async fn run_tools(
         &self,
         session: &mut Session,
@@ -550,19 +559,69 @@ impl AgentRunner {
                 arguments: call.arguments.clone(),
             });
             progress.tool_started(&call.name, &call.arguments);
-            let result = match self.gate(call, approver).await {
-                Some(denied) => denied,
-                None => self.tools.execute(call.clone()).await,
+        }
+
+        let mut results: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
+        for (index, call) in calls.iter().enumerate() {
+            if let Some(denied) = self.gate(call, approver).await {
+                progress.tool_finished(&call.name, true);
+                results[index] = Some(denied);
+            }
+        }
+
+        let permitted: Vec<usize> = (0..calls.len())
+            .filter(|index| results[*index].is_none())
+            .collect();
+        for batch in permitted.chunks(self.parallel_limit()) {
+            // `join_all` polls the batch together on this thread, so a call that awaits
+            // leaves the others room to run: cooperative concurrency rather than
+            // parallelism, because the kernel and its futures are deliberately `!Send`.
+            let running: Vec<nanus_domain::ToolFuture> = batch
+                .iter()
+                .map(|index| self.tools.execute(calls[*index].clone()))
+                .collect();
+            let finished = futures::future::join_all(running).await;
+            for (index, result) in batch.iter().zip(finished) {
+                let is_error = !result.outcome.is_success();
+                progress.tool_finished(&calls[*index].name, is_error);
+                results[*index] = Some(result);
+            }
+        }
+
+        // Postcondition: every call was either denied or executed, so the results below
+        // answer every call the model made.
+        assert!(
+            results.iter().all(Option::is_some),
+            "every tool call has a result"
+        );
+        for (call, result) in calls.iter().zip(results) {
+            let Some(result) = result else {
+                continue;
             };
             let is_error = !result.outcome.is_success();
-            progress.tool_finished(&call.name, is_error);
             let content = render_content(result.outcome.content());
+            // The result answers the call it names: the pairing is by id as well as by
+            // position, which is what a replay of the log reads.
+            assert_eq!(
+                call.id, result.call_id,
+                "a result answers the call it names"
+            );
             session.append(SessionEvent::ToolResult {
                 call_id: result.call_id,
                 content,
                 is_error,
             });
         }
+    }
+
+    /// How many tool calls may be in flight at once.
+    ///
+    /// Validated at construction, so this cannot be zero; the clamp is here because a
+    /// zero-length chunk would make `chunks` iterate for ever rather than refuse.
+    fn parallel_limit(&self) -> usize {
+        usize::try_from(self.config.max_parallel_tools)
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 
     /// Enforces the sandbox and approval policy for one call.
@@ -1921,5 +1980,203 @@ mod tests {
             .await;
         assert!(outcome.is_ok(), "{outcome:?}");
         assert!(approver.asked().is_empty(), "nothing to approve");
+    }
+
+    /// A tool that sleeps, and records who was in flight while it did.
+    ///
+    /// The sleep is what makes concurrency observable: a tool that returns immediately
+    /// completes on its first poll, so "were two in flight at once?" can only be asked of a
+    /// tool that awaits.
+    struct Tracked {
+        /// What the result says it is.
+        label: &'static str,
+        /// How long it takes.
+        delay: std::time::Duration,
+        /// How many are running right now.
+        in_flight: Rc<std::cell::Cell<u32>>,
+        /// The most that were ever running at once.
+        peak: Rc<std::cell::Cell<u32>>,
+        /// The labels, in the order they finished.
+        finished: Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl nanus_domain::ToolExecutor for Tracked {
+        fn execute(&self, call: ToolCall) -> nanus_domain::ToolFuture {
+            let label = self.label;
+            let delay = self.delay;
+            let in_flight = Rc::clone(&self.in_flight);
+            let peak = Rc::clone(&self.peak);
+            let finished = Rc::clone(&self.finished);
+            Box::pin(async move {
+                let running = in_flight.get().saturating_add(1);
+                in_flight.set(running);
+                peak.set(peak.get().max(running));
+                tokio::time::sleep(delay).await;
+                in_flight.set(in_flight.get().saturating_sub(1));
+                finished.borrow_mut().push(label.to_owned());
+                ToolResult::new(
+                    call.id,
+                    ToolOutcome::success_with(
+                        serde_json::json!({}),
+                        vec![ContentBlock::Text(label.to_owned())],
+                    ),
+                )
+            })
+        }
+    }
+
+    /// How a set of tracked tools behaved.
+    struct Tracking {
+        peak: Rc<std::cell::Cell<u32>>,
+        finished: Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    /// Builds a registry of read-only tracked tools, named and delayed as given.
+    fn registry_with_tracked(specs: &[(&str, &'static str, u64)]) -> (Rc<ToolRegistry>, Tracking) {
+        let in_flight = Rc::new(std::cell::Cell::new(0));
+        let peak = Rc::new(std::cell::Cell::new(0));
+        let finished = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        for (name, label, delay_ms) in specs {
+            let schema = ToolSchema {
+                name: ToolName::new(*name)
+                    .unwrap_or_else(|_| unreachable!("a valid tracked tool name")),
+                description: "A tracked test tool".to_owned(),
+                parameters: json!({ "type": "object" }),
+            };
+            let tracked = Tracked {
+                label,
+                delay: std::time::Duration::from_millis(*delay_ms),
+                in_flight: Rc::clone(&in_flight),
+                peak: Rc::clone(&peak),
+                finished: Rc::clone(&finished),
+            };
+            assert!(
+                registry
+                    .register(
+                        nanus_domain::ToolDefinition::new(schema, tracked)
+                            .with_access(ToolAccess::Read)
+                    )
+                    .is_ok()
+            );
+        }
+        (Rc::new(registry), Tracking { peak, finished })
+    }
+
+    /// A model that calls every named tool in one step and then answers.
+    fn calls_many(pairs: &[(&str, &str)]) -> Rc<Box<dyn LlmPort>> {
+        let mut deltas: Vec<LlmEvent> = Vec::new();
+        for (id, name) in pairs {
+            deltas.push(LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new(*id)),
+                name: Some(ToolName::new(*name).unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{}".to_owned(),
+            });
+        }
+        deltas.push(LlmEvent::Finished {
+            reason: FinishReason::ToolCalls,
+        });
+        ScriptedLlm::handle(vec![
+            deltas,
+            vec![
+                LlmEvent::TextDelta("done".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ],
+        ])
+    }
+
+    /// A runner whose step may run `parallel` tools at once, over tools the sandbox permits.
+    fn parallel_runner(
+        llm: Rc<Box<dyn LlmPort>>,
+        tools: Rc<ToolRegistry>,
+        parallel: u32,
+    ) -> Option<AgentRunner> {
+        let config = AgentConfig::new(8, parallel, "test-model", 4096)
+            .ok()?
+            .with_sandbox(SandboxMode::ReadOnly);
+        AgentRunner::new(llm, tools, "you are a test", config).ok()
+    }
+
+    /// The `(call id, content)` pairs the log recorded, in the order it recorded them.
+    fn recorded_results(session: &Session) -> Vec<(String, String)> {
+        session
+            .log()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolResult {
+                    call_id, content, ..
+                } => Some((call_id.as_str().to_owned(), content.trim().to_owned())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A step's calls run together, and the log still pairs each result with its own call in
+    /// call order — the two facts the concurrency has to preserve at once.
+    #[tokio::test]
+    async fn a_step_runs_its_calls_concurrently_and_records_results_in_call_order() {
+        let (tools, tracking) =
+            registry_with_tracked(&[("slow", "slow result", 60), ("fast", "fast result", 5)]);
+        let Some(runner) = parallel_runner(calls_many(&[("c1", "slow"), ("c2", "fast")]), tools, 2)
+        else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner.run_turn(&mut session, "go", &mut Silent, None).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        assert_eq!(
+            tracking.peak.get(),
+            2,
+            "both calls were in flight at the same time"
+        );
+        assert_eq!(
+            tracking.finished.borrow().as_slice(),
+            ["fast result", "slow result"],
+            "and they finished out of call order, which is what concurrency means"
+        );
+        // The log is the reproducible part: results in call order, each one its own call's.
+        assert_eq!(
+            recorded_results(&session),
+            [
+                ("c1".to_owned(), "slow result".to_owned()),
+                ("c2".to_owned(), "fast result".to_owned()),
+            ]
+        );
+    }
+
+    /// The bound holds: one at a time with a limit of one, however many calls the step made.
+    ///
+    /// The other direction of the test above — concurrency is bounded, so a step of six
+    /// calls with a limit of one runs them in sequence.
+    #[tokio::test]
+    async fn a_step_never_runs_more_calls_at_once_than_the_limit() {
+        let (tools, tracking) =
+            registry_with_tracked(&[("slow", "slow result", 40), ("fast", "fast result", 5)]);
+        let Some(runner) = parallel_runner(calls_many(&[("c1", "slow"), ("c2", "fast")]), tools, 1)
+        else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner.run_turn(&mut session, "go", &mut Silent, None).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        assert_eq!(tracking.peak.get(), 1, "one call at a time");
+        assert_eq!(
+            tracking.finished.borrow().as_slice(),
+            ["slow result", "fast result"],
+            "so they finished in call order rather than racing"
+        );
+        assert_eq!(
+            recorded_results(&session),
+            [
+                ("c1".to_owned(), "slow result".to_owned()),
+                ("c2".to_owned(), "fast result".to_owned()),
+            ]
+        );
     }
 }

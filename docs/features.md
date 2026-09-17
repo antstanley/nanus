@@ -32,6 +32,10 @@ that runs a turn.
   interrupted.
 - **Interruptible turns.** `Ctrl+C` / `Esc` in the interface and `SIGINT` on a
   headless run ask the turn to stop at the next safe point.
+- **A step's tool calls run together, bounded.** `max_parallel_tools` (default 4)
+  caps how many are in flight at once. The concurrency is cooperative — the kernel
+  is single-threaded and its futures are `!Send` — and the log still records every
+  call and its result in call order, whatever order the work finished in.
 - **A model-visible failure instead of a panic.** A bad tool argument is a
   failed tool result the model can correct, not a harness error.
 - **Everything is a plugin.** The model adapter, tool registry, session log,
@@ -116,7 +120,7 @@ ignored, and there is no field that can hold the API key. See
 | `approval_policy` | `ask` | `ask`, `never` |
 | `sandbox_mode` | `read_only` | `read_only`, `workspace_write`, `danger_full_access` |
 | `max_steps_per_turn` | `512` | steps in one turn |
-| `max_parallel_tools` | `4` | tool-call concurrency ceiling; validated, though calls run in sequence today |
+| `max_parallel_tools` | `4` | how many of a step's calls may be in flight at once |
 | `tui_detail` | `compact` | `compact`, `full` |
 | `markdown` | `true` | render the model's answers as markdown |
 | `mermaid` | `true` | draw `mermaid` fences as text diagrams |
@@ -286,9 +290,6 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   writes, its network access, or its process table.
 - **Sessions are not locked.** Two writers on one log can lose a turn; attaching
   to a live session is the supported way to share one.
-- **Tool calls in a step run one at a time.** `max_parallel_tools` is
-  configured, validated, and reported, but the loop executes a step's calls in
-  sequence.
 - **`nanus sessions` does not delete.** `StorePort::delete` exists, but removing
   a session means removing its directory.
 - **No syntax highlighting** in fenced code blocks, and no image paste; the

@@ -66,7 +66,9 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   history comes from — but a watcher joining late has a gap until the turn ends.
 - **One agent, one thread.** A service serves several clients and their turns interleave
   cooperatively, because the kernel is single-threaded and its futures are not `Send`.
-  Concurrency is not parallelism, and there is no worker pool.
+  Concurrency is not parallelism, and there is no worker pool. A step's tool calls do run
+  together — cooperatively, capped by `max_parallel_tools`, and interleaved at their await
+  points — but a call that blocks the thread blocks all of them.
 - **DeepSeek is the only provider.** The `LlmPort` seam is real and a second adapter
   would be a single file, but none exists yet.
 - **The sandbox is reported, not OS-enforced.** `nanus-adapter-local` checks the working
