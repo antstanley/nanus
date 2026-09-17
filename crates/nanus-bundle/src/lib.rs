@@ -59,7 +59,7 @@ pub mod compose;
 pub mod error;
 pub mod tools;
 
-pub use agent_loop::{AgentRunner, Progress, RunOutcome, Silent};
+pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
 pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, compose};
 pub use error::BundleError;
 

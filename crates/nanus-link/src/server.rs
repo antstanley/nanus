@@ -503,7 +503,7 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
         };
         agent
             .runner()
-            .run_turn(&mut session, &text, &mut progress)
+            .run_turn(&mut session, &text, &mut progress, None)
             .await
     };
 

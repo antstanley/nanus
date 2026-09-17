@@ -674,7 +674,9 @@ fn run_turn(
 
     let outcome = crate::block_on_local(async {
         let watch = watch_for_interrupt(Rc::clone(&interrupted));
-        let turn = harness.runner.run_turn(&mut session, prompt, &mut reporter);
+        let turn = harness
+            .runner
+            .run_turn(&mut session, prompt, &mut reporter, None);
         // Both at once: the turn does the work, and the watcher is what makes it stop when the
         // process is asked to.
         tokio::join!(turn, watch).0

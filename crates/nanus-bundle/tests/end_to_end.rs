@@ -133,8 +133,12 @@ fn workspace_tools(root: &std::path::Path) -> (Rc<ToolRegistry>, nanus_ports::Sh
 }
 
 fn config() -> AgentConfig {
+    // Full access, so every tool the script calls is permitted by the sandbox and no
+    // answerer is needed: these tests are about the shipped tools, and the approval gate
+    // has its own tests in `agent_loop`.
     AgentConfig::new(8, 4, "scripted", 16_384)
         .unwrap_or_else(|error| panic!("the test configuration is valid: {error}"))
+        .with_sandbox(nanus_domain::SandboxMode::DangerFullAccess)
 }
 
 /// Runs one turn and returns the outcome.
@@ -147,7 +151,7 @@ async fn run(
         .unwrap_or_else(|error| panic!("the runner builds: {error}"));
     let mut session = Session::new(SessionId::new("e2e"), 0, "/tmp");
     runner
-        .run_turn(&mut session, prompt, &mut Silent)
+        .run_turn(&mut session, prompt, &mut Silent, None)
         .await
         .unwrap_or_else(|error| panic!("the turn completes: {error}"))
 }
@@ -522,7 +526,9 @@ async fn progress_reports_every_step_and_tool() {
         .unwrap_or_else(|error| panic!("the runner builds: {error}"));
     let mut session = Session::new(SessionId::new("progress"), 0, "/tmp");
     let mut recorder = Recorder::default();
-    let outcome = runner.run_turn(&mut session, "go", &mut recorder).await;
+    let outcome = runner
+        .run_turn(&mut session, "go", &mut recorder, None)
+        .await;
     assert!(outcome.is_ok());
     assert_eq!(recorder.steps, vec![1, 2]);
     // The reported call names the file it wrote, not only the tool, because that is what

@@ -82,6 +82,7 @@ pub use agent::{
 };
 pub use approval::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionPreset, PresetName, SandboxMode,
+    ToolAccess,
 };
 pub use error::{DomainError, DomainResult};
 pub use message::{Message, Role, ToolCallId, Usage};

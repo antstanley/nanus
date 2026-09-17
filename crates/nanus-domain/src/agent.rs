@@ -28,6 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::approval::{ApprovalPolicy, SandboxMode};
 use crate::error::DomainError;
 use crate::message::ToolCallId;
 use crate::session::{SessionLog, TurnEndReason};
@@ -59,6 +60,16 @@ pub struct AgentConfig {
     pub model: String,
     /// Maximum size, in bytes, of an assembled system prompt.
     pub system_prompt_max: usize,
+    /// Whether a tool call outside the sandbox asks a human first.
+    ///
+    /// Defaulted on the way in so a configuration written before the gate existed still
+    /// decodes, and defaulted to [`ApprovalPolicy::Ask`], the fail-closed value.
+    #[serde(default)]
+    pub approval_policy: ApprovalPolicy,
+    /// What a tool call may touch, which is the standing permission the approval gate
+    /// grants exceptions to.
+    #[serde(default)]
+    pub sandbox_mode: SandboxMode,
 }
 
 impl AgentConfig {
@@ -82,6 +93,8 @@ impl AgentConfig {
             max_parallel_tools,
             model,
             system_prompt_max,
+            approval_policy: ApprovalPolicy::default(),
+            sandbox_mode: SandboxMode::default(),
         };
         config.validate()?;
         Ok(config)
@@ -95,7 +108,23 @@ impl AgentConfig {
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             model: model.into(),
             system_prompt_max: DEFAULT_SYSTEM_PROMPT_MAX,
+            approval_policy: ApprovalPolicy::default(),
+            sandbox_mode: SandboxMode::default(),
         }
+    }
+
+    /// Replaces the approval policy.
+    #[must_use]
+    pub const fn with_approval(mut self, approval_policy: ApprovalPolicy) -> Self {
+        self.approval_policy = approval_policy;
+        self
+    }
+
+    /// Replaces the sandbox mode.
+    #[must_use]
+    pub const fn with_sandbox(mut self, sandbox_mode: SandboxMode) -> Self {
+        self.sandbox_mode = sandbox_mode;
+        self
     }
 
     /// Checks the configuration's invariants.

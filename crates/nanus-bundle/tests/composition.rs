@@ -116,6 +116,18 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     // The model id is the configured one, and the loop is constructed.
     assert_eq!(harness.llm.model(), settings.model);
 
+    // The prompt the model is sent describes this deployment: the workspace the tools are
+    // rooted in, and the two permission knobs the gate enforces. The domain renders this
+    // text; the failure this asserts against is the bundle never asking it to.
+    let prompt = harness.runner.system_prompt();
+    assert!(prompt.contains("Approval policy: ask"), "{prompt}");
+    assert!(prompt.contains("Sandbox: read_only"), "{prompt}");
+    assert!(
+        prompt.contains(&root.display().to_string()),
+        "the prompt names the workspace root: {prompt}"
+    );
+    assert!(prompt.contains(&settings.model), "{prompt}");
+
     // A session can be created and saved, which is the CLI's post-run step.
     let session = harness.new_session(root);
     let recorded = runtime.block_on(harness.store.save(&session));

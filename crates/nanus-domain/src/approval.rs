@@ -19,15 +19,24 @@ use crate::message::ToolCallId;
 use crate::tool::ToolName;
 
 /// Whether a tool call needs a human decision before it runs.
+///
+/// The policy is about *exceptions to the sandbox*, not about every call: a call the
+/// sandbox mode already permits runs without asking either way. What the policy decides is
+/// what happens to a call outside that standing permission — [`Ask`](Self::Ask) lets a
+/// human grant it once, and [`Never`](Self::Never) refuses it without consulting anyone.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
-    /// Every call that is not otherwise permitted asks a human first.
+    /// Every call outside the sandbox asks a human first.
     #[default]
     Ask,
-    /// No call ever asks; the sandbox is the whole of the control.
+    /// No call ever asks, so every call outside the sandbox is refused.
+    ///
+    /// Not "approve everything": `never` answers *no* to every request for an exception,
+    /// without consulting anyone. It is the setting for an unattended run, where nobody can
+    /// answer, and the sandbox is therefore the whole of the control.
     Never,
 }
 
@@ -61,6 +70,45 @@ impl ApprovalPolicy {
 }
 
 impl fmt::Display for ApprovalPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a call can do, which is what the sandbox and the approval gate reason about.
+///
+/// A tool declares its own access rather than being classified by name, because only the
+/// tool knows what it can reach: `bash` can do anything the user can, so it cannot be
+/// confined by a workspace root the way `write` can. The classes are the three questions a
+/// sandbox can answer — may it read, may it write, may it run a program — and a tool that
+/// declares none is treated as [`ToolAccess::Execute`], the most restrictive.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAccess {
+    /// Reads files inside the workspace. Permitted by every sandbox mode.
+    Read,
+    /// Writes files. Permitted once a sandbox mode allows writes at all.
+    Write,
+    /// Runs a program, which no workspace-confined sandbox can constrain.
+    #[default]
+    Execute,
+}
+
+impl ToolAccess {
+    /// Returns the wire name of the access class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+impl fmt::Display for ToolAccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -102,6 +150,23 @@ impl SandboxMode {
     #[must_use]
     pub const fn is_confined(self) -> bool {
         matches!(self, Self::ReadOnly | Self::WorkspaceWrite)
+    }
+
+    /// Returns `true` when the sandbox already permits a call with this access.
+    ///
+    /// This is the standing permission, and it is deliberately independent of
+    /// [`ApprovalPolicy`]: the sandbox says what runs without asking, and the policy says
+    /// how — or whether — an exception outside it may be obtained. A read is permitted by
+    /// every mode, a write by any mode that permits writes at all, and running a program
+    /// only by [`SandboxMode::DangerFullAccess`], because no workspace root can confine
+    /// what a program does once it starts.
+    #[must_use]
+    pub const fn permits(self, access: ToolAccess) -> bool {
+        match access {
+            ToolAccess::Read => true,
+            ToolAccess::Write => self.permits_writes(),
+            ToolAccess::Execute => matches!(self, Self::DangerFullAccess),
+        }
     }
 
     /// Parses a mode from its config name.
@@ -313,9 +378,11 @@ impl PermissionPreset {
 
     /// The danger-full-access preset: unconfined, and never asking.
     ///
-    /// The pairing is the point. Unconfined writes with approval still on would
-    /// ask a human to bless every write; the preset exists for the case where a
-    /// human has already decided to run unattended.
+    /// The pairing is the point, and it is the only way to run tools unattended. The
+    /// sandbox permits every access, so nothing needs an exception and `never` has nothing
+    /// to refuse; the human who chose this preset has already decided. Paired with any
+    /// confined mode, `never` would instead refuse every call the sandbox does not already
+    /// permit, which is what makes that a different — and much safer — bundle.
     #[must_use]
     pub const fn danger_full_access() -> Self {
         Self {
@@ -431,6 +498,34 @@ mod tests {
         assert!(SandboxMode::ReadOnly.is_confined());
         assert!(SandboxMode::WorkspaceWrite.is_confined());
         assert!(!SandboxMode::DangerFullAccess.is_confined());
+    }
+
+    #[test]
+    fn every_mode_permits_a_read_and_only_full_access_permits_a_program() {
+        for mode in [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::DangerFullAccess,
+        ] {
+            assert!(mode.permits(ToolAccess::Read), "{mode} permits reads");
+        }
+        // A workspace root cannot confine what a program does once it is running, so a
+        // confined mode never grants execution outright.
+        assert!(!SandboxMode::ReadOnly.permits(ToolAccess::Execute));
+        assert!(!SandboxMode::WorkspaceWrite.permits(ToolAccess::Execute));
+        assert!(SandboxMode::DangerFullAccess.permits(ToolAccess::Execute));
+
+        assert!(!SandboxMode::ReadOnly.permits(ToolAccess::Write));
+        assert!(SandboxMode::WorkspaceWrite.permits(ToolAccess::Write));
+        assert!(SandboxMode::DangerFullAccess.permits(ToolAccess::Write));
+    }
+
+    #[test]
+    fn an_undeclared_access_is_the_most_restrictive_one() {
+        // Fail-closed: a tool that does not say what it can do is treated as one that can
+        // do anything, so it is gated like a program rather than allowed like a read.
+        assert_eq!(ToolAccess::default(), ToolAccess::Execute);
+        assert!(!SandboxMode::WorkspaceWrite.permits(ToolAccess::default()));
     }
 
     #[test]

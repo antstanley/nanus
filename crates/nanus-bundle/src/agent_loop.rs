@@ -36,8 +36,9 @@ use core::fmt::Write as _;
 use std::rc::Rc;
 
 use nanus_domain::{
-    AgentConfig, ContentBlock, Session, SessionEvent, SessionId, StepOutcome, ToolCall, ToolCallId,
-    ToolName, ToolRegistry, TurnEndReason, TurnMachine, Usage,
+    AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ContentBlock, SandboxMode,
+    Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId, ToolName,
+    ToolRegistry, ToolResult, TurnEndReason, TurnMachine, Usage,
 };
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort};
 
@@ -150,6 +151,56 @@ pub struct Silent;
 
 impl Progress for Silent {}
 
+/// A party that can answer an approval request for one call.
+///
+/// The loop holds no opinion about who answers: a terminal prompts, a link asks the client
+/// attached to the session, and a test replies from a script. What matters is that the
+/// question is asked *before* the call runs, and that anything other than
+/// [`ApprovalOutcome::AllowedOnce`] stops it — a harness that cannot obtain an answer
+/// denies rather than proceeding.
+///
+/// The method is written as an ordinary function returning a boxed future rather than as
+/// `async fn`, because the loop drives it as a trait object.
+pub trait Approver {
+    /// Decides one call.
+    fn decide(&self, request: ApprovalRequest) -> nanus_ports::LocalBoxFuture<'_, ApprovalOutcome>;
+}
+
+/// Why a call the sandbox does not permit is being asked about.
+///
+/// The prompt is deliberately told the tool and the reason and *not* the arguments, so
+/// model-controlled text cannot be put in front of the decision. This sentence is the
+/// harness's own, and it names the knob that made the call an exception.
+fn approval_reason(sandbox: SandboxMode, access: ToolAccess) -> String {
+    format!(
+        "the sandbox mode `{sandbox}` does not permit {} calls without approval",
+        access.as_str()
+    )
+}
+
+/// The result a denied call leaves in the log.
+///
+/// A denial is a *result*, not a harness error: the model is told which call did not run
+/// and why, so it can say what it could not do instead of retrying something that will be
+/// refused again. Leaving the call unanswered would also keep the turn open for ever,
+/// because the turn machine reads an owed call from the log.
+fn denied_result(call: &ToolCall, reason: &str, outcome: ApprovalOutcome) -> ToolResult {
+    let detail = match outcome {
+        ApprovalOutcome::AllowedOnce => "it was allowed once",
+        ApprovalOutcome::Rejected => "the approval policy `never` grants no exceptions",
+        ApprovalOutcome::Cancelled => "the approval prompt was cancelled",
+        ApprovalOutcome::Unavailable => "nobody was available to approve it",
+    };
+    ToolResult::failure(
+        call.id.clone(),
+        format!(
+            "the {} call was not run: {reason}, and {detail}. Do not retry it; say what you \
+             could not do instead.",
+            call.name
+        ),
+    )
+}
+
 /// Appends the turn's step budget to a system prompt.
 ///
 /// The budget is a property of the run rather than of the prose, so it is stated here
@@ -230,7 +281,22 @@ impl AgentRunner {
         &self.config
     }
 
+    /// Returns the assembled system prompt every request carries.
+    ///
+    /// The prompt the model is actually sent, which is not the string a caller passed: the
+    /// step budget and the runtime context are appended to it. Exposed so a test can assert
+    /// that what a deployment believes about itself reaches the model.
+    #[must_use]
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     /// Runs one turn for `message` and returns what it produced.
+    ///
+    /// `approver` is who to ask about a tool call the sandbox does not already permit. It is
+    /// optional because not every caller has anyone to ask — a headless run with no
+    /// terminal, a service with no client attached — and a missing answerer denies rather
+    /// than allowing: the loop asks, and a call that cannot be approved does not run.
     ///
     /// # Errors
     ///
@@ -243,6 +309,7 @@ impl AgentRunner {
         session: &mut Session,
         message: &str,
         progress: &mut dyn Progress,
+        approver: Option<&dyn Approver>,
     ) -> Result<RunOutcome, BundleError> {
         let machine = TurnMachine::new(self.config.clone())
             .map_err(|error| BundleError::Config(error.to_string()))?;
@@ -265,7 +332,7 @@ impl AgentRunner {
                 let step = steps.saturating_add(1);
                 steps = step;
                 progress.step_started(step);
-                match self.run_step(session, turn, step, progress).await {
+                match self.run_step(session, turn, step, progress, approver).await {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         // A step that failed still has to close its turn. Returning here
@@ -334,6 +401,7 @@ impl AgentRunner {
         turn: u32,
         step: u32,
         progress: &mut dyn Progress,
+        approver: Option<&dyn Approver>,
     ) -> Result<StepOutcome, BundleError> {
         session.append(SessionEvent::StepStart { turn, step });
         let request = self.build_request(session);
@@ -375,7 +443,8 @@ impl AgentRunner {
                 StepOutcome::FinalAnswer
             }
         } else {
-            self.run_tools(session, &assembled.calls, progress).await;
+            self.run_tools(session, &assembled.calls, progress, approver)
+                .await;
             StepOutcome::ToolCalls {
                 count: u32::try_from(assembled.calls.len()).unwrap_or(u32::MAX),
             }
@@ -462,11 +531,17 @@ impl AgentRunner {
     }
 
     /// Runs every tool call in one step.
+    ///
+    /// Each call is recorded *before* it is gated, so the log always says what the model
+    /// asked for even when a policy refused it, and a denied call is answered with a tool
+    /// result rather than being dropped — the turn machine reads an owed call from the log,
+    /// and a call with no result would keep the turn open for ever.
     async fn run_tools(
         &self,
         session: &mut Session,
         calls: &[ToolCall],
         progress: &mut dyn Progress,
+        approver: Option<&dyn Approver>,
     ) {
         for call in calls {
             session.append(SessionEvent::ToolCall {
@@ -475,7 +550,10 @@ impl AgentRunner {
                 arguments: call.arguments.clone(),
             });
             progress.tool_started(&call.name, &call.arguments);
-            let result = self.tools.execute(call.clone()).await;
+            let result = match self.gate(call, approver).await {
+                Some(denied) => denied,
+                None => self.tools.execute(call.clone()).await,
+            };
             let is_error = !result.outcome.is_success();
             progress.tool_finished(&call.name, is_error);
             let content = render_content(result.outcome.content());
@@ -485,6 +563,39 @@ impl AgentRunner {
                 is_error,
             });
         }
+    }
+
+    /// Enforces the sandbox and approval policy for one call.
+    ///
+    /// Returns `Some` with the failure to record when the call must not run, and `None` when
+    /// it may. The sandbox is the standing permission, so a call it already permits is never
+    /// put to a human; a call outside it needs an exception, and the policy says how one is
+    /// obtained. `never` answers no without consulting anyone, so a later answerer cannot
+    /// bypass it, and `ask` with no answerer is denied too — fail closed either way.
+    async fn gate(&self, call: &ToolCall, approver: Option<&dyn Approver>) -> Option<ToolResult> {
+        let definition = self.tools.get(&call.name)?;
+        let access = definition.access();
+        let sandbox = self.config.sandbox_mode;
+        if sandbox.permits(access) {
+            return None;
+        }
+        let reason = approval_reason(sandbox, access);
+        let outcome = match self.config.approval_policy {
+            ApprovalPolicy::Never => ApprovalOutcome::Rejected,
+            ApprovalPolicy::Ask => match approver {
+                Some(approver) => {
+                    let request = ApprovalRequest::new(call.name.clone())
+                        .with_call_id(call.id.clone())
+                        .with_reason(reason.clone());
+                    approver.decide(request).await
+                }
+                None => ApprovalOutcome::Unavailable,
+            },
+        };
+        if outcome.is_allowed() {
+            return None;
+        }
+        Some(denied_result(call, &reason, outcome))
     }
 }
 
@@ -722,7 +833,7 @@ mod tests {
                     call.arguments,
                     vec![ContentBlock::Text("echoed".into())],
                 );
-                nanus_domain::ToolResult::new(call.id, outcome)
+                ToolResult::new(call.id, outcome)
             })
         }
     }
@@ -742,8 +853,15 @@ mod tests {
         Rc::new(registry)
     }
 
+    /// A configuration whose sandbox permits everything the stub tools declare.
+    ///
+    /// These tests are about the loop, not the gate: `echo` declares no access and is
+    /// therefore gated as an `execute` call, so the sandbox has to permit execution for it
+    /// to run without an answerer. The gate itself is tested separately, below.
     fn config() -> AgentConfig {
-        AgentConfig::new(4, 1, "test-model", 4096).unwrap_or_else(|_| unreachable!("valid config"))
+        AgentConfig::new(4, 1, "test-model", 4096)
+            .unwrap_or_else(|_| unreachable!("valid config"))
+            .with_sandbox(SandboxMode::DangerFullAccess)
     }
 
     fn session() -> Session {
@@ -920,7 +1038,7 @@ mod tests {
 
         assert!(
             runner
-                .run_turn(&mut session, "hi", &mut progress)
+                .run_turn(&mut session, "hi", &mut progress, None)
                 .await
                 .is_ok()
         );
@@ -952,7 +1070,7 @@ mod tests {
 
         assert!(
             runner
-                .run_turn(&mut session, "hi", &mut progress)
+                .run_turn(&mut session, "hi", &mut progress, None)
                 .await
                 .is_ok()
         );
@@ -978,7 +1096,7 @@ mod tests {
 
         assert!(
             runner
-                .run_turn(&mut session, "hi", &mut progress)
+                .run_turn(&mut session, "hi", &mut progress, None)
                 .await
                 .is_ok()
         );
@@ -1004,7 +1122,7 @@ mod tests {
 
         assert!(
             runner
-                .run_turn(&mut session, "hi", &mut progress)
+                .run_turn(&mut session, "hi", &mut progress, None)
                 .await
                 .is_ok()
         );
@@ -1042,7 +1160,9 @@ mod tests {
             asked: std::cell::Cell::new(0),
         };
 
-        let outcome = runner.run_turn(&mut session, "hi", &mut progress).await;
+        let outcome = runner
+            .run_turn(&mut session, "hi", &mut progress, None)
+            .await;
         assert!(outcome.is_ok());
         let Ok(outcome) = outcome else { return };
         assert_eq!(
@@ -1075,7 +1195,9 @@ mod tests {
         let mut progress = Switch::default();
         progress.stop();
 
-        let outcome = runner.run_turn(&mut session, "hi", &mut progress).await;
+        let outcome = runner
+            .run_turn(&mut session, "hi", &mut progress, None)
+            .await;
         assert!(outcome.is_ok());
         let Ok(outcome) = outcome else { return };
         assert_eq!(outcome.reason, TurnEndReason::Interrupted);
@@ -1113,7 +1235,9 @@ mod tests {
         let mut session = session();
         let mut progress = StopAfterFirstWord::default();
 
-        let outcome = runner.run_turn(&mut session, "hi", &mut progress).await;
+        let outcome = runner
+            .run_turn(&mut session, "hi", &mut progress, None)
+            .await;
         assert!(outcome.is_ok());
         let Ok(outcome) = outcome else { return };
         assert_eq!(outcome.reason, TurnEndReason::Interrupted);
@@ -1164,7 +1288,7 @@ mod tests {
             return;
         };
         let mut session = session();
-        let outcome = runner.run_turn(&mut session, "hi", &mut Silent).await;
+        let outcome = runner.run_turn(&mut session, "hi", &mut Silent, None).await;
         assert!(outcome.is_ok());
         assert!(outcome.is_ok_and(|outcome| outcome.reason == TurnEndReason::Completed));
     }
@@ -1181,7 +1305,7 @@ mod tests {
             return;
         };
         let mut session = session();
-        let outcome = runner.run_turn(&mut session, "hi", &mut Silent).await;
+        let outcome = runner.run_turn(&mut session, "hi", &mut Silent, None).await;
         assert!(outcome.is_ok());
         let Ok(outcome) = outcome else {
             return;
@@ -1219,7 +1343,7 @@ mod tests {
             return;
         };
         let mut session = session();
-        let outcome = runner.run_turn(&mut session, "go", &mut Silent).await;
+        let outcome = runner.run_turn(&mut session, "go", &mut Silent, None).await;
         assert!(outcome.is_ok());
         let Ok(outcome) = outcome else {
             return;
@@ -1254,7 +1378,9 @@ mod tests {
             return;
         };
         let mut session = session();
-        let outcome = runner.run_turn(&mut session, "loop", &mut Silent).await;
+        let outcome = runner
+            .run_turn(&mut session, "loop", &mut Silent, None)
+            .await;
         assert!(outcome.is_ok());
         let Ok(outcome) = outcome else {
             return;
@@ -1271,7 +1397,7 @@ mod tests {
             return;
         };
         let mut session = session();
-        let outcome = runner.run_turn(&mut session, "hi", &mut Silent).await;
+        let outcome = runner.run_turn(&mut session, "hi", &mut Silent, None).await;
         assert!(outcome.is_err());
         let Err(error) = outcome else {
             return;
@@ -1325,7 +1451,7 @@ mod tests {
             return;
         };
         let mut session = session();
-        let outcome = runner.run_turn(&mut session, "go", &mut Silent).await;
+        let outcome = runner.run_turn(&mut session, "go", &mut Silent, None).await;
         // The model asked for a tool that does not exist; that is its problem to
         // correct, not the harness's to fail on.
         assert!(outcome.is_ok());
@@ -1349,7 +1475,7 @@ mod tests {
         };
         let mut session = session();
         let r = runner
-            .run_turn(&mut session, "a question", &mut Silent)
+            .run_turn(&mut session, "a question", &mut Silent, None)
             .await;
         assert!(r.is_ok());
         let _ = r;
@@ -1370,7 +1496,7 @@ mod tests {
             return;
         };
         let mut session = session();
-        let outcome = runner.run_turn(&mut session, "hi", &mut Silent).await;
+        let outcome = runner.run_turn(&mut session, "hi", &mut Silent, None).await;
         assert!(outcome.is_ok());
         let Ok(outcome) = outcome else {
             return;
@@ -1501,8 +1627,299 @@ mod tests {
             max_parallel_tools: 1,
             model: "m".to_owned(),
             system_prompt_max: 1024,
+            approval_policy: ApprovalPolicy::default(),
+            sandbox_mode: SandboxMode::default(),
         };
         let outcome = AgentRunner::new(llm, Rc::new(ToolRegistry::new()), "p", bad);
         assert!(outcome.is_err());
+    }
+
+    /// An approver that answers the same way every time and records what it was asked.
+    ///
+    /// The record is the point: several of the tests below are not about the answer but
+    /// about whether the answerer was consulted at all, and "the sandbox already permitted
+    /// it" is only a fact if nobody was asked.
+    struct ScriptedApprover {
+        answer: ApprovalOutcome,
+        asked: std::cell::RefCell<Vec<ApprovalRequest>>,
+    }
+
+    impl ScriptedApprover {
+        fn new(answer: ApprovalOutcome) -> Self {
+            Self {
+                answer,
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<ApprovalRequest> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl Approver for ScriptedApprover {
+        fn decide(
+            &self,
+            request: ApprovalRequest,
+        ) -> nanus_ports::LocalBoxFuture<'_, ApprovalOutcome> {
+            self.asked.borrow_mut().push(request);
+            let answer = self.answer;
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// A tool that counts how many times it actually ran.
+    struct Counted {
+        runs: Rc<std::cell::Cell<u32>>,
+    }
+
+    impl nanus_domain::ToolExecutor for Counted {
+        fn execute(&self, call: ToolCall) -> nanus_domain::ToolFuture {
+            self.runs.set(self.runs.get().saturating_add(1));
+            Box::pin(async move { ToolResult::success(call.id, serde_json::json!({})) })
+        }
+    }
+
+    /// Builds a registry with one counted tool of the given access.
+    fn registry_with_counted(
+        name: &str,
+        access: ToolAccess,
+    ) -> (Rc<ToolRegistry>, Rc<std::cell::Cell<u32>>) {
+        let runs = Rc::new(std::cell::Cell::new(0));
+        let schema = ToolSchema {
+            name: ToolName::new(name).unwrap_or_else(|_| unreachable!("a valid test tool name")),
+            description: "A counted test tool".to_owned(),
+            parameters: json!({ "type": "object" }),
+        };
+        let mut registry = ToolRegistry::new();
+        assert!(
+            registry
+                .register(
+                    nanus_domain::ToolDefinition::new(
+                        schema,
+                        Counted {
+                            runs: Rc::clone(&runs),
+                        },
+                    )
+                    .with_access(access)
+                )
+                .is_ok()
+        );
+        (Rc::new(registry), runs)
+    }
+
+    /// A model that calls `name` once and then answers.
+    fn calls_then_answers(name: &str) -> Rc<Box<dyn LlmPort>> {
+        ScriptedLlm::handle(vec![
+            vec![
+                LlmEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some(ToolCallId::new("c1")),
+                    name: Some(ToolName::new(name).unwrap_or_else(|_| unreachable!("valid"))),
+                    arguments_delta: "{}".to_owned(),
+                },
+                LlmEvent::Finished {
+                    reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                LlmEvent::TextDelta("done".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ],
+        ])
+    }
+
+    /// Builds a runner over a sandbox mode and an approval policy.
+    fn gated_runner(
+        llm: Rc<Box<dyn LlmPort>>,
+        tools: Rc<ToolRegistry>,
+        sandbox: SandboxMode,
+        approval: ApprovalPolicy,
+    ) -> Option<AgentRunner> {
+        let config = AgentConfig::new(8, 1, "test-model", 4096)
+            .ok()?
+            .with_sandbox(sandbox)
+            .with_approval(approval);
+        AgentRunner::new(llm, tools, "you are a test", config).ok()
+    }
+
+    /// The sandbox is the standing permission, so a call it permits is never put to a
+    /// human: asking about every read would make the interface unusable and would make the
+    /// approval policy mean something it does not.
+    #[tokio::test]
+    async fn a_call_the_sandbox_permits_runs_without_asking() {
+        let (tools, runs) = registry_with_counted("reader", ToolAccess::Read);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers("reader"),
+            tools,
+            SandboxMode::ReadOnly,
+            ApprovalPolicy::Ask,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok_and(|outcome| outcome.answer == "done"));
+        assert_eq!(runs.get(), 1, "the tool ran");
+        assert!(
+            approver.asked().is_empty(),
+            "a permitted call is not a question for a human"
+        );
+    }
+
+    /// The other direction: a call outside the sandbox is asked about, and an approval runs
+    /// it. This is the whole of `ask`.
+    #[tokio::test]
+    async fn a_call_outside_the_sandbox_runs_when_it_is_allowed() {
+        let (tools, runs) = registry_with_counted("runner", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::AllowedOnce);
+        let Some(runner) = gated_runner(
+            calls_then_answers("runner"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Ask,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok_and(|outcome| outcome.answer == "done"));
+        assert_eq!(runs.get(), 1, "the tool ran once it was allowed");
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 1, "the call was put to a human");
+        assert_eq!(
+            asked.first().map(|request| request.tool.as_str()),
+            Some("runner")
+        );
+        // The reason names the knob that made the call an exception, so a reader can tell
+        // why they were asked.
+        assert!(
+            asked
+                .first()
+                .and_then(|request| request.reason.as_deref())
+                .is_some_and(|reason| reason.contains("workspace_write")),
+            "the reason names the sandbox mode: {asked:?}"
+        );
+    }
+
+    /// A refusal stops the call and is recorded as a result, so the model is told and the
+    /// turn can close rather than waiting for an answer that never comes.
+    #[tokio::test]
+    async fn a_refused_call_does_not_run_and_is_answered() {
+        let (tools, runs) = registry_with_counted("runner", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers("runner"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Ask,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "a refused call does not run");
+        let results: Vec<&SessionEvent> = session
+            .log()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ToolResult { .. }))
+            .collect();
+        assert_eq!(results.len(), 1, "the refusal is a recorded tool result");
+        assert!(
+            matches!(
+                results.first(),
+                Some(SessionEvent::ToolResult { is_error: true, content, .. })
+                    if content.contains("not run")
+            ),
+            "the model is told the call did not run: {results:?}"
+        );
+        // The turn still closed normally: a denial is information, not a failure.
+        assert_eq!(
+            session.log().last_turn_end(),
+            Some(&TurnEndReason::Completed)
+        );
+    }
+
+    /// `never` answers no without consulting anyone, so a later answerer cannot bypass it.
+    #[tokio::test]
+    async fn never_denies_without_consulting_the_answerer() {
+        let (tools, runs) = registry_with_counted("runner", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::AllowedOnce);
+        let Some(runner) = gated_runner(
+            calls_then_answers("runner"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Never,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "the call was refused");
+        assert!(
+            approver.asked().is_empty(),
+            "`never` is deterministic and consults nobody"
+        );
+    }
+
+    /// `ask` with nobody to ask is a denial, not a grant: the fail-closed direction.
+    #[tokio::test]
+    async fn ask_with_no_answerer_denies() {
+        let (tools, runs) = registry_with_counted("runner", ToolAccess::Execute);
+        let Some(runner) = gated_runner(
+            calls_then_answers("runner"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Ask,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner.run_turn(&mut session, "go", &mut Silent, None).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "no answerer means no exception");
+        assert!(
+            session.log().events().iter().any(|event| matches!(
+                event,
+                SessionEvent::ToolResult { is_error: true, content, .. }
+                    if content.contains("nobody was available")
+            )),
+            "the model is told nobody could approve it"
+        );
+    }
+
+    /// An unknown tool is not a question for a human: the registry reports it, and a request
+    /// about a tool that does not exist would be noise in front of the person deciding.
+    #[tokio::test]
+    async fn an_unknown_tool_is_not_put_to_the_answerer() {
+        let approver = ScriptedApprover::new(ApprovalOutcome::AllowedOnce);
+        let Some(runner) = gated_runner(
+            calls_then_answers("nope"),
+            Rc::new(ToolRegistry::new()),
+            SandboxMode::ReadOnly,
+            ApprovalPolicy::Ask,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(approver.asked().is_empty(), "nothing to approve");
     }
 }

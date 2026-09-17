@@ -20,8 +20,8 @@ use core::fmt::Write as _;
 use core::time::Duration;
 
 use nanus_domain::{
-    ContentBlock, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
-    ToolOutcome, ToolResult, ToolSchema,
+    ContentBlock, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture,
+    ToolName, ToolOutcome, ToolResult, ToolSchema,
 };
 use nanus_ports::{Captured, ShellHandle, ShellRequest};
 use serde_json::json;
@@ -66,7 +66,7 @@ pub fn bash_tool(shell: ShellHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, BashExecutor { shell })
+    ToolDefinition::new(schema, BashExecutor { shell }).with_access(ToolAccess::Execute)
 }
 
 /// Executes `bash`.

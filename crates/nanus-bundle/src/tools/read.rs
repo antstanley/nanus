@@ -8,8 +8,8 @@
 
 use core::fmt::Write as _;
 use nanus_domain::{
-    ContentBlock, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
-    ToolOutcome, ToolResult, ToolSchema,
+    ContentBlock, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture,
+    ToolName, ToolOutcome, ToolResult, ToolSchema,
 };
 use nanus_ports::FsHandle;
 use serde_json::json;
@@ -60,7 +60,7 @@ pub fn read_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, ReadExecutor { fs })
+    ToolDefinition::new(schema, ReadExecutor { fs }).with_access(ToolAccess::Read)
 }
 
 /// Builds the `read_image` tool over `fs`.
@@ -83,7 +83,7 @@ pub fn read_image_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, ReadImageExecutor { fs })
+    ToolDefinition::new(schema, ReadImageExecutor { fs }).with_access(ToolAccess::Read)
 }
 
 /// Executes `read`.

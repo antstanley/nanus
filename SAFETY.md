@@ -17,25 +17,31 @@ root.
 
 ## Defaults, and what they do not protect you from
 
-Two independent settings govern how much freedom the model has.
+Two independent settings govern how much freedom the model has. The **sandbox mode**
+is the standing permission — what a tool call may do without anyone being asked —
+and the **approval policy** decides what happens to a call *outside* it.
+
+**Sandbox mode** (`read_only` by default).
+
+- `read-only` — reads run; a write or a program needs approval.
+- `workspace-write` — reads and writes inside the workspace root run; a program
+  needs approval, because a workspace root cannot confine what a program does.
+- `danger-full-access` — every call runs; nothing needs approval.
 
 **Approval policy** (`ask` by default).
 
-- `ask` — a tool call that needs approval prompts you. If no answerer is available,
-  or the prompt cannot be delivered, the call is **denied** rather than allowed.
-  Approval is one-shot: answering once does not approve the next call.
-- `never` — every call that would need approval is **rejected immediately**,
-  without consulting anyone. This is not "approve everything". It is the setting to
-  choose for unattended runs, where nothing can answer and therefore everything
-  that asks must fail.
+- `ask` — a call the sandbox does not permit prompts you. If no answerer is
+  available, or the prompt cannot be delivered, the call is **denied** rather than
+  allowed. Approval is one-shot: answering once does not approve the next call.
+- `never` — every call the sandbox does not permit is **rejected immediately**,
+  without consulting anyone. This is not "approve everything": it means no
+  exception is ever granted, which is the setting to choose for an unattended run
+  where nobody can answer. It only leaves tools usable alongside
+  `danger-full-access`, where nothing needs an exception.
 
-There is deliberately no "auto-approve" or "always allow" policy.
-
-**Sandbox mode** (`workspace-write` by default).
-
-- `read-only` — writes are refused.
-- `workspace-write` — writes are confined to the workspace root.
-- `danger-full-access` — confinement is bypassed entirely.
+A tool's declared access decides which of the three sandbox questions it is: the
+read tools and the search tools read, `write` and `edit` write, and `bash` runs a
+program. There is deliberately no "auto-approve" or "always allow" policy.
 
 `danger-full-access` is never sent to the model provider as a request; it is a
 local decision, and it means what it says.

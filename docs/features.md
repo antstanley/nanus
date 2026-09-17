@@ -250,11 +250,16 @@ The Cordis-style kernel is the framework underneath. See
   none in the repository. See [design decisions](design.md#safe-rust-because-the-model-is-writing-the-code).
 - **No `panic!`, `unwrap`, `expect`, `todo!`, or `dbg!` in production code**;
   `assert!` is the sanctioned invariant. See [style](style.md).
-- **Fail-closed by construction, and no auto-approve.** `ApprovalOutcome` allows
-  only `AllowedOnce`, and the policy set is `ask` / `never` — there is
-  deliberately no mode that means yes to everything. The gate is not yet wired
-  into the tool path, though, so `sandbox_mode` is the enforcement that runs
-  today. See below and [SAFETY.md](../SAFETY.md).
+- **Fail-closed approval at the tool boundary.** A tool declares what it can touch —
+  read, write, or run a program — and `sandbox_mode` permits some of that outright.
+  A call outside that standing permission needs an exception: `ask` puts it to an
+  answerer and denies it when there is none, and `never` refuses it without asking
+  anyone. `ApprovalOutcome` allows only `AllowedOnce`, there is deliberately no
+  mode that means yes to everything, and a denial is a tool result the model can
+  read rather than a dropped call. See [SAFETY.md](../SAFETY.md).
+- **The model is told what it is running under.** The system prompt carries a
+  runtime section: the workspace root, the model, the approval policy, and the
+  sandbox mode.
 - **A sandbox mode is reported, not OS-enforced** — it governs whether writes
   are refused or confined by the tools, not what an approved program may do. See
   [SAFETY.md](../SAFETY.md) and [status](status.md#known-limits).
@@ -269,10 +274,10 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **Approval is not yet enforced.** `ApprovalPolicy`, `ApprovalRequest`, and
-  `ApprovalOutcome` exist and are described in [SAFETY.md](../SAFETY.md), but
-  nothing constructs a request or gates a call on a decision: the tool path
-  executes directly, and sandbox mode is what refuses or confines a write. See
+- **Approval has no answerer in the CLI or the interface yet.** The gate is
+  enforced — a call outside the sandbox is denied unless an answerer grants it —
+  but nothing constructs the prompt a person would see, so only calls the sandbox
+  permits run. See
   [the roadmap](roadmap.md#now-close-the-gap-between-what-is-written-and-what-runs).
 - **DeepSeek is the only provider.** The `LlmPort` seam is real, but no second
   adapter exists.

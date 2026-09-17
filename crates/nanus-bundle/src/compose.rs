@@ -111,6 +111,7 @@ impl Harness {
 /// convention someone has to remember.
 pub struct Pending {
     config: NanusConfig,
+    workspace: PathBuf,
     fs: FsHandle,
     shell: ShellHandle,
     clock: ClockHandle,
@@ -153,7 +154,7 @@ impl Pending {
     /// Returns [`BundleError::Kernel`] when a plugin fails to mount.
     pub fn start(self) -> Result<Harness, BundleError> {
         let context = mount(&self.fs, &self.shell, &self.clock, &self.store, &self.llm)?;
-        let runner = build_runner(&self.llm, &self.tools, &self.config)?;
+        let runner = build_runner(&self.llm, &self.tools, &self.config, &self.workspace)?;
         // Postcondition: the tool count the harness reports is the one it published.
         assert_eq!(runner.config().model, self.config.model);
         Ok(Harness {
@@ -203,6 +204,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
 
     Ok(Pending {
         config: config.clone(),
+        workspace,
         fs,
         shell,
         clock,
@@ -311,25 +313,47 @@ fn build_tools(fs: &FsHandle, shell: &ShellHandle) -> Result<Rc<ToolRegistry>, B
 }
 
 /// Builds the agent runner.
+///
+/// The runtime context is appended here rather than written into [`DEFAULT_SYSTEM_PROMPT`],
+/// for the same reason the step budget is appended by the runner: it describes *this*
+/// deployment — where the tools are rooted, which model answers, and what the two
+/// permission knobs are — and a user-supplied prompt must receive it too. A model that does
+/// not know it is writing under `read_only` cannot pace its work against that, and one that
+/// does not know the approval policy cannot tell a refusal it can ask about from one it
+/// cannot.
 fn build_runner(
     llm: &LlmHandle,
     tools: &Rc<ToolRegistry>,
     config: &NanusConfig,
+    workspace: &std::path::Path,
 ) -> Result<AgentRunner, BundleError> {
     let prompt = config
         .system_prompt
         .clone()
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
+    let runtime = nanus_domain::runtime_context(
+        &workspace.display().to_string(),
+        &config.model,
+        config.approval_policy,
+        config.sandbox_mode,
+    );
     let agent = AgentConfig::new(
         config.max_steps_per_turn,
         config.max_parallel_tools,
         config.model.clone(),
         AGENT_SYSTEM_PROMPT_MAX,
     )
-    .map_err(|error| BundleError::config(error.to_string()))?;
+    .map_err(|error| BundleError::config(error.to_string()))?
+    .with_approval(config.approval_policy)
+    .with_sandbox(config.sandbox_mode);
     // The runner shares the registry with the provider, so registering a tool later
     // is visible on the next request rather than requiring a rebuild.
-    AgentRunner::new(Rc::clone(llm), Rc::clone(tools), prompt, agent)
+    AgentRunner::new(
+        Rc::clone(llm),
+        Rc::clone(tools),
+        format!("{prompt}\n\n{runtime}"),
+        agent,
+    )
 }
 
 /// Mounts the adapters and the tool provider on a kernel.

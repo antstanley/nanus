@@ -10,8 +10,8 @@
 //! anywhere is an edit whose effect cannot be predicted from its arguments.
 
 use nanus_domain::{
-    ContentBlock, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolOutcome,
-    ToolResult, ToolSchema,
+    ContentBlock, ToolAccess, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
+    ToolOutcome, ToolResult, ToolSchema,
 };
 use nanus_ports::FsHandle;
 use serde_json::json;
@@ -53,7 +53,7 @@ pub fn edit_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, EditExecutor { fs })
+    ToolDefinition::new(schema, EditExecutor { fs }).with_access(ToolAccess::Write)
 }
 
 /// Executes `edit`.

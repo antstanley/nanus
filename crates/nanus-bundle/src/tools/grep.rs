@@ -12,8 +12,8 @@
 
 use core::fmt::Write as _;
 use nanus_domain::{
-    ContentBlock, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolOutcome,
-    ToolResult, ToolSchema,
+    ContentBlock, ToolAccess, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
+    ToolOutcome, ToolResult, ToolSchema,
 };
 use nanus_ports::{FsHandle, SearchQuery};
 use serde_json::json;
@@ -67,7 +67,7 @@ pub fn grep_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, GrepExecutor { fs })
+    ToolDefinition::new(schema, GrepExecutor { fs }).with_access(ToolAccess::Read)
 }
 
 /// Executes `grep`.

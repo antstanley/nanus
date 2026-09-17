@@ -7,8 +7,8 @@
 
 use core::fmt::Write as _;
 use nanus_domain::{
-    ContentBlock, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolOutcome,
-    ToolResult, ToolSchema,
+    ContentBlock, ToolAccess, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
+    ToolOutcome, ToolResult, ToolSchema,
 };
 use nanus_ports::{FsHandle, SearchKind, SearchQuery};
 use serde_json::json;
@@ -55,7 +55,7 @@ pub fn glob_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, GlobExecutor { fs })
+    ToolDefinition::new(schema, GlobExecutor { fs }).with_access(ToolAccess::Read)
 }
 
 /// Executes `glob`.

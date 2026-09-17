@@ -19,6 +19,7 @@ use core::pin::Pin;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::approval::ToolAccess;
 use crate::message::ToolCallId;
 
 /// Maximum length, in bytes, of a tool name.
@@ -552,20 +553,43 @@ pub trait ToolExecutor {
 pub struct ToolDefinition {
     /// The wire half.
     schema: ToolSchema,
+    /// What a call to this tool can touch, for the sandbox and the approval gate.
+    access: ToolAccess,
     /// The executable half.
     executor: Box<dyn ToolExecutor>,
 }
 
 impl ToolDefinition {
     /// Pairs a schema with its executor.
+    ///
+    /// The access defaults to [`ToolAccess::Execute`], the most restrictive class, so a
+    /// tool that does not declare what it can do is gated like one that can do anything.
+    /// Declare a narrower access with [`with_access`](Self::with_access).
     pub fn new(schema: ToolSchema, executor: impl ToolExecutor + 'static) -> Self {
         // Precondition: the schema's own name passed validation, which is what
         // lets the registry index it without re-validating.
         assert!(!schema.name.as_str().is_empty());
         Self {
             schema,
+            access: ToolAccess::default(),
             executor: Box::new(executor),
         }
+    }
+
+    /// Declares what a call to this tool can touch.
+    ///
+    /// A tool that reads files says so and runs under every sandbox mode without asking;
+    /// one that writes is gated by a mode that refuses writes; and one that runs a program
+    /// is gated by every mode short of full access.
+    pub const fn with_access(mut self, access: ToolAccess) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// Returns what a call to this tool can touch.
+    #[must_use]
+    pub const fn access(&self) -> ToolAccess {
+        self.access
     }
 
     /// Returns the tool's wire schema.
@@ -599,6 +623,7 @@ impl fmt::Debug for ToolDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolDefinition")
             .field("schema", &self.schema)
+            .field("access", &self.access)
             .field("executor", &"<boxed>")
             .finish()
     }
@@ -884,6 +909,21 @@ mod tests {
         assert!(result.is_success());
         assert_eq!(result.render_text(), "echoed");
         assert_eq!(result.outcome.value(), Some(&json!({ "path": "a" })));
+    }
+
+    #[test]
+    fn a_tool_that_declares_no_access_is_gated_as_a_program() {
+        // Fail-closed: the default is the widest class, so a tool that says nothing is
+        // treated as one that can do anything until it says otherwise.
+        let undefined = ToolDefinition::new(schema("read"), Echo { fail: false });
+        assert_eq!(undefined.access(), ToolAccess::Execute);
+
+        let declared =
+            ToolDefinition::new(schema("read"), Echo { fail: false }).with_access(ToolAccess::Read);
+        assert_eq!(declared.access(), ToolAccess::Read);
+        // The declaration is not part of the wire half: only the schema's three fields
+        // may reach a request.
+        assert_eq!(declared.schema().name.as_str(), "read");
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //! loses everything it did not think to reproduce.
 
 use nanus_domain::{
-    ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolOutcome, ToolResult,
-    ToolSchema,
+    ToolAccess, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolOutcome,
+    ToolResult, ToolSchema,
 };
 use nanus_ports::{FsHandle, WriteMode};
 use serde_json::json;
@@ -49,7 +49,7 @@ pub fn write_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, WriteExecutor { fs })
+    ToolDefinition::new(schema, WriteExecutor { fs }).with_access(ToolAccess::Write)
 }
 
 /// Executes `write`.

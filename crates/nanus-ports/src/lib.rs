@@ -87,7 +87,7 @@ pub use llm::{
     ChatRequest, FinishReason, LlmError, LlmEvent, LlmHandle, LlmPort, LlmResult, LlmStream,
     ReasoningEffort, ToolCallAssembler, error_body_snippet, truncate_chars,
 };
-pub use nanus_domain::{ApprovalOutcome, ApprovalPolicy, SandboxMode};
+pub use nanus_domain::{ApprovalOutcome, ApprovalPolicy, SandboxMode, ToolAccess};
 pub use shell::{
     Captured, DEFAULT_MAX_OUTPUT_BYTES, PLATFORM_SHELL, PLATFORM_SHELL_FLAG, SandboxPolicy,
     ShellError, ShellEvent, ShellHandle, ShellOutcome, ShellPort, ShellRequest, ShellResult,

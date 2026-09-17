@@ -209,8 +209,11 @@ fn runner(
     let llm = nanus_adapter_deepseek::DeepSeekLlm::new(adapter).expect("the adapter builds");
     let port: Box<dyn nanus_ports::LlmPort> = Box::new(llm);
 
+    // Full access, so the real tools run without an answerer: this test is about the wire,
+    // not the approval gate.
     let config = AgentConfig::new(8, 4, nanus_adapter_deepseek::MODEL_FLASH, 16_384)
-        .expect("a valid agent configuration");
+        .expect("a valid agent configuration")
+        .with_sandbox(nanus_domain::SandboxMode::DangerFullAccess);
     let runner =
         nanus_bundle::AgentRunner::new(Rc::new(port), Rc::new(registry), "you are a test", config)
             .expect("the runner builds");
@@ -242,6 +245,7 @@ async fn a_streamed_tool_call_runs_the_real_tool_and_produces_a_second_step() {
             &mut session,
             "list the rust files",
             &mut nanus_bundle::Silent,
+            None,
         )
         .await;
     let outcome = outcome.expect("the turn completes over a real socket");
@@ -298,7 +302,7 @@ async fn a_text_answer_over_a_real_socket_records_reasoning_and_usage() {
 
     let mut session = Session::new(SessionId::new("wire-text"), 0, "/tmp");
     let outcome = runner
-        .run_turn(&mut session, "say hi", &mut nanus_bundle::Silent)
+        .run_turn(&mut session, "say hi", &mut nanus_bundle::Silent, None)
         .await
         .expect("the turn completes");
 
@@ -363,7 +367,7 @@ async fn a_frame_whose_last_character_arrives_later_still_decodes() {
 
     let mut session = Session::new(SessionId::new("wire-split"), 0, "/tmp");
     let outcome = runner
-        .run_turn(&mut session, "say it", &mut nanus_bundle::Silent)
+        .run_turn(&mut session, "say it", &mut nanus_bundle::Silent, None)
         .await;
 
     // The first delivery stops inside a frame, so the response really is truncated. The
