@@ -38,14 +38,15 @@ instructions.
 
 ## Repository layout
 
-Eleven crates in a Cargo workspace. Dependencies point **inward**; this is enforced
+Fourteen crates in a Cargo workspace. Dependencies point **inward**; this is enforced
 by the manifests, not by review. `nanus-domain` has no `tokio`, no `reqwest`, and
 no filesystem, so agent decisions can be tested without a network.
 
 ```
 nanus-cli ──▶ nanus-link ◀── nanus-tui
     │                           │
-    └─────▶ nanus-bundle ─▶ adapters (deepseek, local, store, config)
+    └─────▶ nanus-bundle ─▶ adapters (deepseek, openai, anthropic, secret,
+                    │                 local, store, config)
                     │               │
                     ▼               ▼
               nanus-ports ◀──── nanus-kernel
@@ -65,6 +66,9 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 | `crates/nanus-domain` | Messages, the tool contract, the append-only session log, prompt assembly, approval policy, the turn machine. Pure. |
 | `crates/nanus-ports` | The boundary: port traits (`LlmPort`, `FsPort`, `ShellPort`, `StorePort`, `ClockPort`) and the service keys that let provider and consumer meet without sharing a value. No I/O. |
 | `crates/nanus-adapter-deepseek` | Request encoding, SSE decoding, streaming, tool-call reassembly. |
+| `crates/nanus-adapter-openai` | The same protocol for the OpenAI-compatible vendors, OpenAI and z.ai, which differ in a vendor table rather than per line. |
+| `crates/nanus-adapter-anthropic` | The Messages API: a top-level system field, tool results as user turns, event-typed streaming. |
+| `crates/nanus-adapter-secret` | The credential stores: a chain of `SecretBackend`s — the macOS keychain, a `0600` file, the environment — behind `SecretPort`. |
 | `crates/nanus-adapter-local` | Rooted filesystem, process-group shell, clamping clock. |
 | `crates/nanus-adapter-store` | Atomic JSONL session persistence with time-ordered ids. |
 | `crates/nanus-adapter-config` | TOML configuration with a real migration chain. |
@@ -117,7 +121,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 918 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 1179 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -164,8 +168,11 @@ Contract to preserve:
   *answer* is ever parsed: reasoning and tool output are drawn verbatim, so a diff cannot
   become a bulleted list. The renderer does no I/O — an image is a placeholder and a URL is
   never fetched — and `docs/tui.md` is the whole of it.
-- `DEEPSEEK_API_KEY` — provider key. Read from the environment on each use; it is
-  **never** stored in `NanusConfig`, serialised, or rendered by `Debug`.
+- `<PROVIDER>_API_KEY` (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`) — provider credentials, and the *last* store in the chain. A key
+  is normally stored with `nanus auth set <provider>` (the macOS keychain, then a
+  `0600` file under `<nanus home>/secrets/`). It is **never** stored in
+  `NanusConfig`, serialised, or rendered by `Debug`.
 - `NANUS_HOME` — override the session-store home. Sessions live under
   `$NANUS_HOME/sessions/` (default: the platform config dir).
 - `NO_COLOR` — when set to anything non-empty, the interface renders with no colour at all
@@ -272,6 +279,10 @@ design docs too.
   exception; it is not the default and must not become one.
 - **Retired model ids do not resolve.** `deepseek-chat` and `deepseek-reasoner`
   are gone; the supported ids are `deepseek-flash` and `deepseek-v4-pro`.
+- **A credential is not configuration, and its account is the provider's name.**
+  A key lives in the secret store behind `SecretPort`, is wrapped in a type that
+  redacts its own `Debug`, and is read out only by name. A plan this build cannot
+  honour is listed and refused with its reason rather than silently absent.
 - **Temporal composability:** unloading a plugin reverts its effects in reverse
   order. `nanus-kernel/tests/composition.rs` asserts the revert order, not just
   the end state.
@@ -313,13 +324,21 @@ array type, the `assert_eq!(registry.len(), 7, ...)` postcondition, and the
 name-list test — and you should seriously consider whether the tool meets the bar
 in `docs/design.md` (a mechanism the shell cannot do as well, not a convenience).
 
-**Add a model provider.** Implement `nanus_ports::LlmPort`, publish it under
-`llm_key()` with a plugin like `PortProvider` in `nanus-bundle/src/compose.rs`, and
-select it in `build_llm`. Nothing under `nanus-domain` or the tools should change
-— if it does, the seam is being crossed.
+**Add a model provider.** Implement `nanus_ports::LlmPort` in a new adapter crate,
+add a row to the table in `nanus-bundle/src/provider.rs` (name, credential variable,
+plans, models, output ceiling, whether the effort knob reaches it), and add the arm
+that builds it in `compose::build_llm`. The configuration schema does not change:
+`provider`, `plan`, `base_url`, and `model` are already optional strings, and
+`Selection` is what resolves them. Nothing under `nanus-domain` or the tools should
+change — if it does, the seam is being crossed.
+
+**Add a secret store.** Implement `nanus_adapter_secret::SecretBackend` and put it in
+the chain `Secrets::new` builds. Nothing above it changes: the port, the
+configuration, and the command line all speak account names.
 
 **Add a port.** Define the trait and `Handle` alias plus a `*_key()` function in
-`nanus-ports`, implement it in an adapter crate, and publish it as a plugin. Port
+`nanus-ports`, implement it in an adapter crate, and publish it as a plugin
+(`nanus-ports/src/secret.rs` is the smallest worked example). Port
 methods are written as ordinary functions returning `LocalBoxFuture` (not
 `async fn`) so the trait stays dyn-compatible; follow the existing pattern
 exactly.

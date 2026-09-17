@@ -17,6 +17,12 @@ nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }
 nanus-adapter-config = { workspace = true }
 nanus-adapter-deepseek = { workspace = true }
+# The other providers. This crate is the only one that names a concrete adapter, so
+# adding a provider means an entry in the table in `provider.rs` and a dependency
+# here, and nothing below changes.
+nanus-adapter-openai = { workspace = true }
+nanus-adapter-anthropic = { workspace = true }
+nanus-adapter-secret = { workspace = true }
 nanus-adapter-local = { workspace = true }
 nanus-adapter-store = { workspace = true }
 futures = { workspace = true }

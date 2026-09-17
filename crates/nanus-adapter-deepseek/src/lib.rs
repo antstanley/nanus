@@ -44,7 +44,7 @@ mod wire;
 
 pub use config::{
     API_KEY_ENV, DEFAULT_BASE_URL, DEFAULT_MAX_OUTPUT_TOKENS, DeepSeekConfig, MODEL_FLASH,
-    MODEL_PRO,
+    MODEL_PRO, PROVIDER,
 };
 pub use nanus_ports::ReasoningEffort;
 

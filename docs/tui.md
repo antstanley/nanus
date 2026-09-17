@@ -15,8 +15,9 @@ conversation is a recorded session, which is why it can be shown without a key.*
 ```sh
 cargo build --release          # builds both binaries
 
-# Talk to a model in the current directory.
-export DEEPSEEK_API_KEY=...
+# Talk to a model in the current directory. The key comes from the secret store
+# (`nanus auth set deepseek`), or from the environment as the last fallback.
+#   export DEEPSEEK_API_KEY=...
 ./target/release/nanus
 ```
 

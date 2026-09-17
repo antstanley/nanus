@@ -23,6 +23,7 @@
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::exit)]
 
 use nanus_adapter_config::NanusConfig;
+use nanus_bundle::Selection;
 use nanus_bundle::compose::{Pending, compose};
 use nanus_domain::AgentConfig;
 
@@ -107,14 +108,17 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     // The kernel published everything the harness needs.
     let stats = harness.context.stats();
     assert_eq!(
-        stats.active, 6,
-        "clock, fs, shell, store, llm and tools are active"
+        stats.active, 7,
+        "clock, fs, shell, store, llm, secrets and tools are active"
     );
     assert_eq!(stats.failed, 0, "nothing failed to mount");
     assert_eq!(harness.tool_count(), 7, "the shipped toolset is published");
 
-    // The model id is the configured one, and the loop is constructed.
-    assert_eq!(harness.llm.model(), settings.model);
+    // The model id is the resolved one, and the loop is constructed. Resolution is
+    // what turns an absent `model` into the provider's own default, so the two are
+    // asserted together: the adapter talks to what the configuration resolved to.
+    let selection = Selection::resolve(&settings).expect("the configuration resolves");
+    assert_eq!(harness.llm.model(), selection.model());
 
     // The prompt the model is sent describes this deployment: the workspace the tools are
     // rooted in, and the two permission knobs the gate enforces. The domain renders this
@@ -126,7 +130,7 @@ fn the_pending_split_mounts_and_runs_a_turn() {
         prompt.contains(&root.display().to_string()),
         "the prompt names the workspace root: {prompt}"
     );
-    assert!(prompt.contains(&settings.model), "{prompt}");
+    assert!(prompt.contains(selection.model()), "{prompt}");
 
     // A session can be created and saved, which is the CLI's post-run step.
     let session = harness.new_session(root);
@@ -136,7 +140,7 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     let origin = session
         .origin()
         .expect("a composed session records its origin");
-    assert_eq!(origin.model.as_deref(), Some(settings.model.as_str()));
+    assert_eq!(origin.model.as_deref(), Some(selection.model()));
     assert_eq!(
         origin.approval.as_deref(),
         Some(settings.approval_policy.as_str())
@@ -298,10 +302,11 @@ fn the_default_agent_configuration_is_usable() {
     // The harness builds an `AgentConfig` from `NanusConfig`; the defaults must satisfy
     // the constructor's validation, or every run would fail at the first step.
     let settings = NanusConfig::default();
+    let selection = Selection::resolve(&settings).expect("the defaults resolve");
     let agent = AgentConfig::new(
         settings.max_steps_per_turn,
         settings.max_parallel_tools,
-        settings.model,
+        selection.model().to_owned(),
         16_384,
     );
     assert!(agent.is_ok(), "the shipped defaults are valid: {agent:?}");

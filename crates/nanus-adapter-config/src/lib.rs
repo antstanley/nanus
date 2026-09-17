@@ -18,13 +18,17 @@
 //! silence is for absence and never for damage. A file whose `config_version` is
 //! newer than [`CONFIG_VERSION`] is refused outright rather than partially read.
 //!
-//! ## The API key is not configuration
+//! ## A credential is not configuration
 //!
-//! The provider key comes from `$DEEPSEEK_API_KEY` via [`api_key`] and is never a
-//! field of [`NanusConfig`]. This crate writes configuration to disk and has no
-//! code path that could write a key: the type the writer serialises has nowhere
-//! to put one, and a file that contains one is loaded with that key ignored. The
-//! `Debug` rendering of a loaded configuration therefore cannot contain a secret.
+//! A provider key is never a field of [`NanusConfig`]: it lives in the secret store
+//! `nanus auth` writes to, behind `nanus_ports::SecretPort`. This crate writes
+//! configuration to disk and has no code path that could write a key — the type the
+//! writer serialises has nowhere to put one, and a file that contains one is loaded
+//! with that key ignored. The `Debug` rendering of a loaded configuration therefore
+//! cannot contain a secret.
+//!
+//! What the file *does* name is which provider, plan, endpoint, and model to use;
+//! each is optional, and absent means "the provider's own answer applies".
 //!
 //! ## Migrations
 //!
@@ -45,8 +49,7 @@ mod config;
 mod error;
 
 pub use config::{
-    API_KEY_ENV, CONFIG_ENV, CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS,
-    DEFAULT_MAX_STEPS_PER_TURN, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, NanusConfig, ReasoningEffort,
-    TuiDetail, api_key,
+    CONFIG_ENV, CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN,
+    DEFAULT_MAX_TOKENS, NanusConfig, ReasoningEffort, TuiDetail,
 };
 pub use error::ConfigError;

@@ -102,6 +102,21 @@ moved, so every reference from 17 onwards still means what it said.
 | 15 | **`!` bash mode.** A line that opens with `!` is a shell command the interface runs itself, echoed into the transcript with its output bounded and its exit status named. It is a task rather than a blocking wait, so a slow command does not stop a running turn's frames being read, and the composer's mark becomes `$` so the mode is visible before `Enter`. Nothing about it reaches the session log or the model, and it is not confined — which is why the safety note landed first, in [SAFETY.md](../SAFETY.md) and [the interface](tui.md#running-a-command-yourself-with-). | `nanus-tui/src/{shell,command,runtime,view}.rs`, `SAFETY.md` |
 | 16 | **Selecting and copying text out of the transcript.** A drag with the mouse or `Shift` with a movement key selects rendered rows, `Ctrl+C` copies them, and `/copy` takes the newest answer without pointing at it. The clipboard is the platform's own tool with the terminal's `OSC 52` behind it, and the two are reported differently because only one of them can be confirmed. A copy that worked clears the selection, so `Ctrl+C` goes back to meaning stop. | `nanus-tui/src/{copy,view,runtime,command}.rs` |
 
+## Shipped: the provider seam and the secret store
+
+Items 23 and 26, plus the thing that made 26 more than a second adapter: providers are
+*selected*, not compiled in, so the answer to "can nanus talk to z.ai" is a configuration
+line rather than a fork.
+
+| # | Item | Where it landed |
+|---|---|---|
+| 23 | **Secret storage.** A `SecretPort` and a `SecretHandle` in `nanus-ports`, and a chain of stores in `nanus-adapter-secret`: the macOS keychain (through `/usr/bin/security`, the platform's own tool), a `0600` file under `<nanus home>/secrets/`, then the provider's environment variable. A read takes the first value any store can produce, so a locked keychain on a detached service does not hide a variable the service was started with; a write goes to the first store that will take it, so `nanus auth set` prefers the keychain and falls back to the file without the caller choosing. The store is pluggable in both directions: `SecretPort` is the port an adapter implements and `SecretBackend` is one store inside the chain, so another platform is an implementation plus a line. **macOS is the only platform store that ships** — Linux Secret Service and the Windows Credential Manager are the same trait and no implementation. The one exposure is stated rather than hidden: `security add-generic-password` takes the value as an argument, so for the few milliseconds that process lives the value is in its argument list; `SAFETY.md` says so. `nanus auth set` reads from standard input, never an argument. | `nanus-ports/src/secret.rs`, `nanus-adapter-secret/`, `nanus-cli/src/cli.rs`, `SAFETY.md` |
+| 26 | **A second model provider — and a provider table.** The plan called for one more adapter; what landed is a table in `nanus-bundle/src/provider.rs` that names each provider, its credential variable, its plans, the models it offers, and the ceiling it refuses to exceed, plus a `Selection` that resolves *what a configuration means*: provider, plan, endpoint, model. Every one of those is optional in the schema and absent means "the provider's own answer applies", so `provider = "openai"` alone gets OpenAI's host and model, and a `model` defaulted to a DeepSeek id can never be run against another provider. Three adapter crates carry it: `nanus-adapter-deepseek` (unchanged in behaviour), `nanus-adapter-openai` (OpenAI and z.ai, one protocol and a vendor table), and `nanus-adapter-anthropic` (the Messages API, which is not chat completions). A plan is an endpoint plus a default model, which is exactly what z.ai's coding subscription is; OpenAI's ChatGPT subscription tier is **listed and refused by name** with its reason, because it needs an OAuth token and the Responses API. Anthropic's extended thinking is not requested at all, and the adapter reports no effort rather than a plausible one. | `nanus-bundle/src/{provider,compose}.rs`, `nanus-adapter-{openai,anthropic}/`, `nanus-adapter-config/src/config.rs` |
+
+The two items the plan had left open in this area are recorded where they belong rather
+than being quietly dropped: OpenAI's subscription plan is in the table as a refusal, and
+the second platform secret store is a `SecretBackend` implementation nobody has written.
+
 ## Next: sessions and the link
 
 | # | Item | Size | Notes |
@@ -114,17 +129,17 @@ moved, so every reference from 17 onwards still means what it said.
 
 ## Next: new capabilities
 
-Four additions larger than a feature but short of a rewrite: a way to package
-behaviour, a way to hold a secret, a goal that outlives a turn, and a tool that
-starts another agent. Skills come first because `/goal` is a natural thing to
-ship as one.
+Three additions larger than a feature but short of a rewrite: a way to package
+behaviour, a goal that outlives a turn, and a tool that starts another agent.
+Skills come first because `/goal` is a natural thing to ship as one. (A fourth —
+a way to hold a secret — was on this list and has shipped; see
+[above](#shipped-the-provider-seam-and-the-secret-store).)
 
 | # | Item | Size | Notes |
 |---|---|---|---|
 | 22 | **Agent skills: `SKILL.md` discovery and progressive disclosure.** | **M** | A skill is a directory with a markdown file whose frontmatter names it and says when to use it; the body is loaded only when it applies. PrimeIntellect's [goal skill](https://github.com/PrimeIntellect-ai/prime-agent/blob/b6ac5d014d99401b55820835a4966584271e9a3c/packages/coding-agent/skills/goal/SKILL.md) is the reference shape. The pieces are a loader (a user directory under `<nanus home>/skills/`, optionally a workspace one), a frontmatter parser, and a way to reach the body: either a `skill` tool — which collides with the seven-tool invariant and would need a design note — or a prompt section, which is where the domain's unused `PromptBuilder` already points. A skill read from the workspace is untrusted input, as [SAFETY.md](../SAFETY.md) says of anything that reads files. Grows to **L** if a packaged core library and a tool are both wanted. |
-| 23 | **Secret storage: an OS keychain instead of `DEEPSEEK_API_KEY`.** | **L** | Move the provider key out of the environment and into the platform store — Keychain on macOS, Secret Service on Linux, Credential Manager on Windows — behind a new `SecretPort` in `nanus-ports` and a keyring adapter, with `nanus auth set` / `clear` / `status` and the `nanus config` presence line it already prints. The environment variable stays as a fallback for CI and containers. The hard part is the service: a detached `nanus service` may run with no unlocked keychain and no session bus, so the design needs a defined fallback (a `0600` file under `NANUS_HOME`) or a fail-closed refusal, and the key must never reach the config, a log, or `Debug` — guarantees the current design already keeps. |
 | 24 | **A goal: a durable objective that continues across turns (`/goal`).** | **L** | A session-scoped completion contract: one objective per session, persisted in the log, with a phase (`active` / `paused` / `blocked` / `complete`), a budget, and evidence-based completion. Three surfaces, which can land in stages: the state as a durable `goal/change` session event folded by the domain (the log is already the only source of model history); model tools to read, edit, and complete it; and a human `/goal` that needs a new link request, because the interface cannot mutate a session it does not own. Automatic continuation is an agent-side driver that queues one turn while the session is idle, bounded by the goal budget *and* the existing turn budget. See [the goal research note](goal-research.md). The largest of the three and the one with the most decisions left open; possibly **XL** if it lands whole. |
-| 25 | **An `agent` tool: spawn a sub-agent to do a task.** | **XL** | The model calls it with a `prompt`, a `provider`, a `model`, and a `reasoning_effort`, and gets the child's answer (or a handle) back; with a handle it can send follow-ups and check the child's progress on demand, without pulling a whole transcript into its own context. It is more than an eighth tool: it composes a second agent at runtime, with its own session, policy, and budget, and a channel the parent and child can talk over. Depends on a provider factory (item 26) and per-request effort (item 11). See [the detail below](#the-agent-tool-in-more-detail). |
+| 25 | **An `agent` tool: spawn a sub-agent to do a task.** | **XL** | The model calls it with a `prompt`, a `provider`, a `model`, and a `reasoning_effort`, and gets the child's answer (or a handle) back; with a handle it can send follow-ups and check the child's progress on demand, without pulling a whole transcript into its own context. It is more than an eighth tool: it composes a second agent at runtime, with its own session, policy, and budget, and a channel the parent and child can talk over. Both prerequisites have landed — per-request effort (item 11) and the provider table (item 26) — so what is left is the child's lifetime, its budgets, and the read a parent makes of it. See [the detail below](#the-agent-tool-in-more-detail). |
 
 ### The `agent` tool, in more detail
 
@@ -231,7 +246,6 @@ the question is only whether the child needs help.
 
 | # | Item | Size | Notes |
 |---|---|---|---|
-| 26 | **A second model provider.** | **M** | The `LlmPort` seam is real and an OpenAI-compatible adapter is mostly request and response encoding; a genuinely different protocol is more like an **L**. Nothing in the tools or the domain should change. |
 | 27 | **An OS-enforced sandbox.** | **XL** | Confinement is advisory: the tools refuse or confine writes, but an approved program can do anything the user can, including reach the network. Landlock or seccomp on Linux and `sandbox-exec` on macOS, with the platform and `unsafe` story written down first. |
 | 28 | **Network confinement.** | **XL** | Part of 27, and separable only if 27 lands as a mechanism with more than one policy. |
 | 29 | **Windows support.** | **XL** | The link is a Unix domain socket and the shell adapter depends on `nix` for process groups, so this is a transport plus a process-lifecycle story, not a build flag. |
@@ -259,8 +273,9 @@ the [design decisions](design.md) say why:
 - **A larger core toolset.** Seven tools is the design. A tool earns its place
   by being a mechanism the shell cannot provide as well, and convenience
   wrappers are not it.
-- **The API key in the configuration file.** It is read from the environment on
-  use and has no field to live in.
+- **A credential in the configuration file.** It lives in the secret store
+  `nanus auth` writes to — the platform keychain, then a `0600` file, then the
+  environment — and the configuration type has no field it could live in.
 - **An image fetch or a URL request from the markdown renderer.** The view is a
   pure function of the transcript; a remote fetch on a model's say-so is a
   request the reader did not ask for.

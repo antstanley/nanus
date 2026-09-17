@@ -58,26 +58,13 @@ pub mod args;
 pub mod compose;
 pub mod error;
 pub mod guard;
+pub mod provider;
 pub mod tools;
 
 pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
 pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, compose};
 pub use error::BundleError;
-
-/// The model ids this build offers a runtime switch between, in the order they cycle.
-///
-/// Here rather than in the link or the interface for the same reason the adapter is mounted
-/// here: this is the only crate that names a concrete provider. The link carries a choice
-/// somebody else made and the interface draws one, and neither may know that one of the ids
-/// is called `deepseek-flash` — a second place that knew the names would be a second place to
-/// change when a provider is added.
-#[must_use]
-pub fn model_ids() -> &'static [&'static str] {
-    &[
-        nanus_adapter_deepseek::MODEL_FLASH,
-        nanus_adapter_deepseek::MODEL_PRO,
-    ]
-}
+pub use provider::{Provider, Selection};
 
 #[cfg(test)]
 pub(crate) mod tests_support;
@@ -183,7 +170,7 @@ pub fn build_toolset(
 // so taking it by value costs a refcount and buys the lifetime the composition needs.
 #[allow(clippy::needless_pass_by_value)]
 pub fn tools_plugin(registry: ToolRegistryHandle) -> impl nanus_kernel::Plugin {
-    Provider {
+    ToolRegistryProvider {
         id: PluginId::new("tools").unwrap_or_else(|_| unreachable!("tools is a valid plugin id")),
         // The kernel's registry hands out clones of the published handle, so the
         // value it stores is an `Rc` of the handle.
@@ -192,14 +179,14 @@ pub fn tools_plugin(registry: ToolRegistryHandle) -> impl nanus_kernel::Plugin {
 }
 
 /// Publishes the tool registry as a service.
-struct Provider {
+struct ToolRegistryProvider {
     id: PluginId,
     /// Shared through the kernel's service registry, which lends clones rather than
     /// the value itself.
     registry: Rc<ToolRegistryHandle>,
 }
 
-impl nanus_kernel::Plugin for Provider {
+impl nanus_kernel::Plugin for ToolRegistryProvider {
     fn id(&self) -> PluginId {
         self.id
     }

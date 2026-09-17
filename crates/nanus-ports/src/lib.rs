@@ -2,8 +2,8 @@
 //!
 //! The hexagon's boundary: the traits nanus adapters implement and the harness
 //! consumes. Nothing here performs I/O. A port is a *declaration* of a
-//! capability — filesystem, shell, model, store, clock — and an adapter is a
-//! plugin that publishes an implementation of one under a key.
+//! capability — filesystem, shell, model, store, clock, secrets — and an adapter
+//! is a plugin that publishes an implementation of one under a key.
 //!
 //! ```
 //! use nanus_ports::{fs_key, FsHandle};
@@ -68,7 +68,9 @@ pub mod clock;
 pub mod error;
 pub mod fs;
 pub mod llm;
+pub mod secret;
 pub mod shell;
+pub mod sse;
 pub mod store;
 
 use core::future::Future;
@@ -88,11 +90,13 @@ pub use llm::{
     ReasoningEffort, ToolCallAssembler, error_body_snippet, truncate_chars,
 };
 pub use nanus_domain::{ApprovalOutcome, ApprovalPolicy, SandboxMode, ToolAccess};
+pub use secret::{Secret, SecretError, SecretHandle, SecretPort, SecretResult};
 pub use shell::{
     Captured, DEFAULT_MAX_OUTPUT_BYTES, PLATFORM_SHELL, PLATFORM_SHELL_FLAG, SandboxPolicy,
     ShellError, ShellEvent, ShellHandle, ShellOutcome, ShellPort, ShellRequest, ShellResult,
     ShellStream,
 };
+pub use sse::SseFrames;
 pub use store::{SessionSummary, StoreError, StoreHandle, StorePort, StoreResult};
 
 /// A boxed future that need not be `Send`.
@@ -135,6 +139,12 @@ pub fn clock_key() -> ServiceKey<ClockHandle> {
     ServiceKey::of("clock")
 }
 
+/// The key a secret store publishes itself under.
+#[must_use]
+pub fn secret_key() -> ServiceKey<SecretHandle> {
+    ServiceKey::of("secret")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,8 +158,9 @@ mod tests {
             shell_key().as_str(),
             store_key().as_str(),
             clock_key().as_str(),
+            secret_key().as_str(),
         ];
-        assert_eq!(names, ["llm", "fs", "shell", "store", "clock"]);
+        assert_eq!(names, ["llm", "fs", "shell", "store", "clock", "secret"]);
         // Negative space: identity is the pair (name, type), and every port has
         // its own type, so no two keys can be confused even if a name collided.
         let erased: Vec<AnyServiceKey> = vec![
@@ -158,6 +169,7 @@ mod tests {
             AnyServiceKey::from_typed(shell_key()),
             AnyServiceKey::from_typed(store_key()),
             AnyServiceKey::from_typed(clock_key()),
+            AnyServiceKey::from_typed(secret_key()),
         ];
         for (index, left) in erased.iter().enumerate() {
             for (other, right) in erased.iter().enumerate() {

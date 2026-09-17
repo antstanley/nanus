@@ -262,9 +262,11 @@ fn agent_over(dir: &Path, llm: Rc<Box<dyn LlmPort>>, model: &str) -> (Agent, Sto
         store: store.clone(),
         clock: SystemClock::new().handle(),
         workspace: dir.to_path_buf(),
-        // The shipped ids plus whatever this test scripts, so a switch has somewhere to go and
-        // the model in use is still in the list.
-        models: nanus_bundle::model_ids()
+        // The default provider's ids plus whatever this test scripts, so a switch has
+        // somewhere to go and the model in use is still in the list. The names live in
+        // the bundle's provider table, which is the only place that knows them.
+        models: nanus_bundle::provider::DEFAULT_PROVIDER
+            .models()
             .iter()
             .map(|id| (*id).to_owned())
             .collect(),

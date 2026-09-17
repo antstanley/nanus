@@ -9,7 +9,7 @@ filesystem, the shell, the session log, the model adapter, and the tool registry
 plugin you can remove, replace, or write yourself, and the loop over them is built from
 the handles they publish.
 
-[![tests](https://img.shields.io/badge/tests-918%20passing-brightgreen)](docs/testing.md)
+[![tests](https://img.shields.io/badge/tests-1179%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
@@ -55,8 +55,9 @@ goes away with it.
 That gives you three things that are hard to get any other way:
 
 **Replace the model without touching the tools.** The adapter is a plugin behind an
-`LlmPort`. Swapping DeepSeek for anything else is one provider, and the seven tools never
-learn about it.
+`LlmPort`. Four providers ship — DeepSeek, z.ai (API and coding plans), Anthropic, and
+OpenAI (API and coding plans) — and they are *selected*, not compiled in: one line in the
+configuration, and the seven tools never learn about it.
 
 **Replace the tools without touching the model.** Each tool is a plugin behind a
 `ToolExecutor`. Add one and its schema joins the prompt automatically. Remove one and it
@@ -107,7 +108,11 @@ git clone https://github.com/antstanley/nanus.git
 cd nanus
 cargo build --release --workspace   # two binaries: the core, and the interface
 
-export DEEPSEEK_API_KEY=...
+# Store a provider key: the macOS keychain, with a private file as the fallback.
+# Nothing is stored in the configuration file, and nothing is printed back.
+nanus auth set deepseek          # paste the key and press enter, or pipe it in
+# The provider's environment variable still works, and is the last fallback:
+#   export DEEPSEEK_API_KEY=...
 
 # One shot: print the answer and exit.
 ./target/release/nanus run "Summarise this repository."
@@ -147,16 +152,30 @@ thinks it is:
 
 ```console
 $ nanus config
+config file: /Users/you/.config/nanus/config.toml
+provider: deepseek (plan api)
 model: deepseek-flash
-max tokens: 128000
+endpoint: https://api.deepseek.com
+max tokens: 128000 (ceiling 256000)
 reasoning effort: Medium
 approval policy: per_call
 sandbox mode: ReadOnly
-max steps per turn: 32
+max steps per turn: 512
+max parallel tools: 4
+tui detail: compact
+markdown answers: true
+mermaid diagrams: true
 workspace root: <the current directory>
 service socket: /Users/you/.config/nanus/run/agent.sock
 service log: /Users/you/.config/nanus/nanus-service.log
-api key: not set
+credential: not set for deepseek (fallback DEEPSEEK_API_KEY)
+
+$ nanus auth status
+credential stores: keychain+file+environment
+  deepseek: not set  (fallback DEEPSEEK_API_KEY)
+  zai: not set  (fallback ZAI_API_KEY)
+  anthropic: not set  (fallback ANTHROPIC_API_KEY)
+  openai: not set  (fallback OPENAI_API_KEY)
 
 $ nanus sessions
 01a09558-9f82-720e-960b-8a587e072667  25 events  /Volumes/.../nanus  Use the glob tool to list the top-level Rust files…
@@ -168,7 +187,6 @@ $ nanus sessions
 Typing the program's name with a terminal starts the interface:
 
 ```sh
-export DEEPSEEK_API_KEY=...
 ./target/release/nanus
 ```
 
@@ -214,7 +232,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [5.3s] 918 tests run: 918 passed, 0 skipped
+Summary [44.0s] 1179 tests run: 1179 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed

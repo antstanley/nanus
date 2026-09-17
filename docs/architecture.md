@@ -27,13 +27,14 @@ without a network.
 ┌─────▼──────────┐            ┌─────────▼─────────┐             ┌─────────▼────────┐
 │  adapter-      │            │    nanus-ports    │             │   nanus-kernel   │
 │  deepseek      │            │                   │             │                  │
-│  adapter-local │───────────▶│  LlmPort  FsPort  │◀────────────│  context         │
-│  adapter-store │ implements │  ShellPort        │      uses   │  effects         │
-│  adapter-config│            │  StorePort        │             │  coeffects       │
-└────────────────┘            │  ClockPort        │             │  services        │
-                              └─────────┬─────────┘             │  typed events    │
-                                        │                       └──────────────────┘
-                              ┌─────────▼─────────┐
+│  adapter-openai│            │  LlmPort  FsPort  │             │  context         │
+│  adapter-      │───────────▶│  ShellPort        │◀────────────│  effects         │
+│  anthropic     │ implements │  StorePort        │      uses   │  coeffects       │
+│  adapter-secret│            │  ClockPort        │             │  services        │
+│  adapter-local │            │  SecretPort       │             │  typed events    │
+│  adapter-store │            └─────────┬─────────┘             └──────────────────┘
+│  adapter-config│                      │
+└────────────────┘            ┌─────────▼─────────┐
                               │   nanus-domain    │  pure: no tokio,
                               │  messages · tools │  no HTTP, no I/O
                               │  session · turn   │
@@ -53,14 +54,17 @@ is the only vocabulary the two share.
 |---|---|
 | [`nanus-kernel`](../crates/nanus-kernel) | The Cordis framework itself: a context of revertible effects and reactive coeffects, a typed service registry, five event dispatch modes, the plugin lifecycle. Depends on nothing in the tree but `tokio`, and is documented as a standalone library. |
 | [`nanus-domain`](../crates/nanus-domain) | Messages, the tool contract, the append-only session log, prompt assembly, approval policy, the turn machine. Pure. |
-| [`nanus-ports`](../crates/nanus-ports) | The boundary: five traits and the service keys that let a provider and a consumer agree without sharing a value. |
+| [`nanus-ports`](../crates/nanus-ports) | The boundary: the six port traits — model, filesystem, shell, store, clock, secrets — and the service keys that let a provider and a consumer agree without sharing a value. |
 | [`nanus-adapter-deepseek`](../crates/nanus-adapter-deepseek) | Request encoding, SSE decoding, streaming, tool-call reassembly. |
+| [`nanus-adapter-openai`](../crates/nanus-adapter-openai) | The same protocol for the OpenAI-compatible vendors: OpenAI and z.ai, kept one crate because the differences are a table rather than a branch per line. |
+| [`nanus-adapter-anthropic`](../crates/nanus-adapter-anthropic) | The Messages API, which is not chat completions: a top-level system field, tool results as user turns, event-typed streaming. |
+| [`nanus-adapter-secret`](../crates/nanus-adapter-secret) | Where a credential is kept: a chain of stores — the macOS keychain, a `0600` file, the environment — behind one port, with the store itself pluggable. |
 | [`nanus-adapter-local`](../crates/nanus-adapter-local) | Rooted filesystem, process-group shell, clamping clock. |
 | [`nanus-adapter-store`](../crates/nanus-adapter-store) | Atomic JSONL session persistence with time-ordered ids, and the names sessions are known by. |
 | [`nanus-adapter-config`](../crates/nanus-adapter-config) | TOML configuration with a real migration. |
 | [`nanus-bundle`](../crates/nanus-bundle) | The toolset, the agent loop, and the one place that names concrete adapters. |
 | [`nanus-link`](../crates/nanus-link) | The local link: the frame vocabulary, the Unix-socket transport, the client an interface uses, and — behind a `server` feature — the half that serves an agent and holds its sessions open. |
-| [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary: `run`, `service`, `config`, `sessions`, and the shell-scoped agent behind `tui`. It does not depend on `nanus-tui`. |
+| [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary: `run`, `service`, `config`, `sessions`, `auth`, and the shell-scoped agent behind `tui`. It does not depend on `nanus-tui`. |
 | [`nanus-tui`](../crates/nanus-tui) | The interface: the view, the input buffer, replay, and the terminal event loop. Its own binary (`nanus-tui`), a library for the parts that are testable without a terminal, and no dependency on the agent loop, a toolset, or a provider adapter — it links only the session store it reads recordings from and the configuration adapter it reads its own display preferences from. |
 
 ## Why the interface is a separate program

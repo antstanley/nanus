@@ -70,19 +70,68 @@ See [the toolset](../crates/nanus-bundle/src/tools/mod.rs).
 
 ## Model providers
 
-- **DeepSeek**, through `nanus-adapter-deepseek`. Supported ids are
-  `deepseek-flash` (the default) and `deepseek-v4-pro`; retired ids
-  (`deepseek-chat`, `deepseek-reasoner`) deliberately do not resolve.
+Four providers, selected with `provider` in the configuration. Each is an adapter
+that implements `LlmPort`, and nothing in the tools, the domain, or the loop knows
+which one is in use.
+
+| Provider | Adapter | Models offered | Plans |
+|---|---|---|---|
+| `deepseek` (default) | `nanus-adapter-deepseek` | `deepseek-flash`, `deepseek-v4-pro` | `api` |
+| `zai` | `nanus-adapter-openai` | `glm-4.5`, `glm-4.5-air`, `glm-4.5-flash` | `api`, `coding` |
+| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
+| `openai` | `nanus-adapter-openai` | `gpt-5`, `gpt-5-mini` | `api`, `coding`, `subscription`¹ |
+
+¹ The OpenAI `subscription` plan — the ChatGPT coding tier reached with an OAuth
+token — is listed and **refused with its reason** rather than silently absent: it
+needs an OAuth token and the Responses API, and this build does neither. The
+refusal says so.
+
+- **A plan is an endpoint plus a default model.** z.ai's `coding` plan is the same
+  key and protocol at a different host; OpenAI's `coding` plan is a coding model on
+  the same host. `base_url` overrides either, for a proxy or a gateway.
 - **Streaming responses** over SSE, with reasoning content and tool calls
-  reassembled from their frames.
-- **Tool calling**, including the reasoning passback the API requires when a
-  request carries tools, and an empty assistant turn sent as `content: ""`.
-- **Usage accounting** — prompt, cached, and generated tokens, including how
-  much of the generation was thinking.
-- **Request controls**: `max_tokens` (default 128000) and `reasoning_effort`
-  (`minimal` / `low` / `medium` / `high`, default `medium`).
-- **A real provider seam.** `LlmPort` is the boundary; a second provider is one
-  adapter plus a registration, and nothing in the tools or the domain changes.
+  reassembled from their frames. DeepSeek and z.ai send `data:`-framed chunks ending
+  in `[DONE]`; Anthropic sends event-typed frames ending in `message_stop`.
+- **Tool calling** for all four, including DeepSeek's reasoning passback and its
+  empty assistant turn sent as `content: ""`, and Anthropic's `tool_use` /
+  `tool_result` content blocks.
+- **Usage accounting** — prompt, cached, and generated tokens, including how much of
+  the generation was thinking, decoded from each provider's own spelling.
+- **Request controls**: `max_tokens` (default 128000, capped at the provider's
+  documented ceiling because a request above it is refused rather than truncated)
+  and `reasoning_effort` (`minimal` / `low` / `medium` / `high`, default `medium`).
+  The effort reaches DeepSeek, z.ai (as a thinking mode) and OpenAI (as its own
+  four-step scale); it is **not** sent to Anthropic, which is reported where it is
+  configured rather than silently ignored.
+- **Retired model ids do not resolve**, and a model id belongs to the provider that
+  offers it: naming a DeepSeek id with `provider = "openai"` is a request the
+  provider refuses rather than a quiet substitution.
+- **`nanus config` reports the resolution**, so which provider, plan, model, and
+  endpoint a run will use is answerable without running it.
+- **The provider seam is the boundary.** `LlmPort` is the port, `nanus-bundle`
+  owns the table of providers, and adding one is an adapter crate plus a row —
+  nothing in the tools or the domain changes.
+
+## Credentials
+
+A provider key is a secret, so it is not in the configuration file and not a
+field of any type that reaches a log.
+
+- **`nanus auth set <provider>`** reads a key from standard input and stores it;
+  `nanus auth clear <provider>` removes it, and `nanus auth status` reports which
+  providers have one. The value is never printed, and never taken as an argument,
+  so it does not appear in a process list.
+- **A chain of stores**, tried in order: the macOS keychain, a `0600` file under
+  `<nanus home>/secrets/`, then the provider's environment variable
+  (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). The
+  first store holding a value answers, and a store that cannot answer — a locked
+  keychain on a detached service — does not hide a value another store holds.
+- **The account is the provider's name**, so a key stored for one provider can
+  never be sent to another.
+- **The stores are a port.** `SecretPort` is the boundary and each store is a
+  `SecretBackend`, so another platform store is an implementation rather than a
+  change to the harness. Only the macOS keychain and the file and environment
+  fallbacks ship today. See [SAFETY.md](../SAFETY.md#secrets).
 
 ## Sessions
 
@@ -130,13 +179,22 @@ A session is the conversation, written down as it happens. See
 
 A flat TOML file at `<platform config dir>/nanus/config.toml`, every field
 defaulted, with a real `config_version` migration chain. Unknown keys are
-ignored, and there is no field that can hold the API key. See
+ignored, and there is no field that can hold a credential. See
 [configuration](../crates/nanus-adapter-config).
+
+Every provider field is optional, and absent means "the provider's own answer
+applies": a file that names none of them runs `deepseek` with its own host and
+model, and a file that sets `provider` alone gets that provider's host and model.
+An unknown provider or plan is refused at startup with a sentence naming the ones
+this build offers.
 
 | Field | Default | Values |
 |---|---|---|
-| `model` | `deepseek-flash` | `deepseek-flash`, `deepseek-v4-pro` |
-| `max_tokens` | `128000` | per-response budget |
+| `provider` | `deepseek` | `deepseek`, `zai`, `anthropic`, `openai` |
+| `plan` | the provider's default | `api`, `coding` (z.ai and OpenAI), `subscription` (listed, refused) |
+| `base_url` | the plan's endpoint | an override, for a proxy or a gateway |
+| `model` | the plan's or provider's default | any id the provider serves |
+| `max_tokens` | `128000` | per-response budget, capped at the provider's ceiling |
 | `reasoning_effort` | `medium` | `minimal`, `low`, `medium`, `high` |
 | `approval_policy` | `per_call` | `per_call`, `permitted`, `all_calls` |
 | `sandbox_mode` | `read_only` | `read_only`, `workspace_write`, `danger_full_access` |
@@ -155,7 +213,10 @@ Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `DEEPSEEK_API_KEY` | Provider key. Read on use; never stored, serialised, or rendered. |
+| `DEEPSEEK_API_KEY` | DeepSeek credential. The last store in the chain; never stored, serialised, or rendered by the harness. |
+| `ZAI_API_KEY` | z.ai credential, for the API and coding plans alike. |
+| `ANTHROPIC_API_KEY` | Anthropic credential. |
+| `OPENAI_API_KEY` | OpenAI credential, for the API and coding plans alike. |
 | `NANUS_CONFIG` | Override the configuration file path. |
 | `NANUS_HOME` | Override the session-store home (and the default socket and log paths). |
 | `NANUS_TUI` | Override the path to the interface binary. |
@@ -179,7 +240,10 @@ which asks for progress on stderr.
 | `nanus service start [--foreground] [--socket PATH] [--log PATH]` | Start a service, detached by default. |
 | `nanus service stop [--socket PATH]` | Ask a running service to stop. |
 | `nanus service status [--socket PATH]` | Report whether one is running, and which sessions it holds; non-zero when nothing answers. |
-| `nanus config` | Print the effective configuration; no key needed. |
+| `nanus config` | Print the effective configuration and the provider, plan, model, and endpoint it resolves to; no key needed. |
+| `nanus auth set <PROVIDER>` | Store a credential, read from standard input. |
+| `nanus auth clear <PROVIDER>` | Remove a stored credential. |
+| `nanus auth status` | Report which providers have a credential, and where it is read from; no key needed. |
 | `nanus sessions` | List recorded sessions, newest first; no key needed. |
 | `nanus sessions name <NAME> <SESSION>` | Record or change a session's name. |
 | `nanus sessions delete <NAME\|ID>` | Remove a session and release its name. |
@@ -343,9 +407,9 @@ The Cordis-style kernel is the framework underneath. See
 - **A sandbox mode is reported, not OS-enforced** — it governs whether writes
   are refused or confined by the tools, not what an approved program may do. See
   [SAFETY.md](../SAFETY.md) and [status](status.md#known-limits).
-- **Secrets never reach a log or a request body**: the API key is read from the
-  environment, is absent from the configuration type, and is redacted in
-  `Debug`.
+- **Secrets never reach a log or a request body**: a credential comes from the
+  secret store, is absent from the configuration type, is wrapped in a type that
+  redacts its own `Debug`, and is read out only where a request is built.
 - **Five quality gates** — `cargo fmt`, `cargo clippy`, `cargo nextest`, the
   doctests, and the interface's view layer built without its runtime half — with the
   tests that matter most and the bugs verification found in
@@ -355,8 +419,14 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **DeepSeek is the only provider.** The `LlmPort` seam is real, but no second
-  adapter exists.
+- **OpenAI's ChatGPT subscription plan is listed but refused.** It is reached with
+  an OAuth token and speaks the Responses API, and this build does neither; the
+  refusal says so rather than pretending an API key would work.
+- **Anthropic's extended thinking is not requested.** A tool-using turn requires
+  the signed thinking blocks of the previous turn replayed, and the message model
+  has no place for a signature, so `reasoning_effort` has no effect there.
+- **Only the macOS keychain ships as a platform store.** The port and the backend
+  trait are in place, so another is an implementation plus a line in the chain.
 - **The link is Unix-only and local.** No remote mode, no Windows, no
   authentication — there is no remote mode to secure.
 - **The sandbox is not OS-enforced.** Nothing confines an approved program's

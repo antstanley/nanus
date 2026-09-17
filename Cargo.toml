@@ -5,6 +5,9 @@ members = [
     "crates/nanus-domain",
     "crates/nanus-ports",
     "crates/nanus-adapter-deepseek",
+    "crates/nanus-adapter-openai",
+    "crates/nanus-adapter-anthropic",
+    "crates/nanus-adapter-secret",
     "crates/nanus-adapter-local",
     "crates/nanus-adapter-store",
     "crates/nanus-adapter-config",
@@ -33,6 +36,9 @@ nanus-kernel = { path = "crates/nanus-kernel" }
 nanus-domain = { path = "crates/nanus-domain" }
 nanus-ports = { path = "crates/nanus-ports" }
 nanus-adapter-deepseek = { path = "crates/nanus-adapter-deepseek" }
+nanus-adapter-openai = { path = "crates/nanus-adapter-openai" }
+nanus-adapter-anthropic = { path = "crates/nanus-adapter-anthropic" }
+nanus-adapter-secret = { path = "crates/nanus-adapter-secret" }
 nanus-adapter-local = { path = "crates/nanus-adapter-local" }
 nanus-adapter-store = { path = "crates/nanus-adapter-store" }
 nanus-adapter-config = { path = "crates/nanus-adapter-config" }

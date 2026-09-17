@@ -5,7 +5,7 @@ that runs as you. This is the mode for the case the other two cannot cover: an a
 has to outlive the shell that started it.
 
 ```sh
-export DEEPSEEK_API_KEY=...
+nanus auth set deepseek    # or export DEEPSEEK_API_KEY=...
 
 nanus service start        # detached; survives the shell
 nanus service status       # is it there, and what is it
@@ -26,6 +26,9 @@ form a supervisor wants:
 # /etc/systemd/system/nanus.service
 [Service]
 ExecStart=/usr/local/bin/nanus service start --foreground
+# A detached service has no session bus and no unlocked keychain, so the environment
+# is the fallback that fits here: a key stored in the file fallback works too, under
+# the home systemd gives the unit.
 Environment=DEEPSEEK_API_KEY=...
 Restart=on-failure
 ```

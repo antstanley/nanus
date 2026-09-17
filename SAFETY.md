@@ -117,11 +117,37 @@ model to run it — that is what the `bash` tool is, and it goes through the gat
 
 ## Secrets
 
-- The API key is read from the `DEEPSEEK_API_KEY` environment variable.
-- Configuration is stored in a file; the key is **never** written to it, and the
-  configuration's `Debug` rendering redacts it, because that rendering reaches logs.
+A provider key is the one value that must not reach a log, a transcript, or a
+process list. `nanus auth set <provider>` stores one, `nanus auth clear <provider>`
+removes it, and `nanus auth status` reports which providers have one without
+printing any value.
+
+- The stores are tried in order: **the macOS keychain**, then **a `0600` file**
+  under `$NANUS_HOME/secrets/` (its directory is `0700`), then **the provider's
+  environment variable** (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`). The first store holding a value answers. A store that cannot
+  answer — a locked keychain on a detached service — does not hide a value another
+  store holds, which is the case a service actually runs in.
+- The value is read from **standard input**, never from an argument, so it does
+  not appear in `ps` for the life of the command.
+- **One exception is stated rather than hidden:** the macOS keychain write runs
+  `/usr/bin/security add-generic-password`, which accepts the value only as an
+  argument or as a terminal prompt and does not read standard input (verified
+  against the shipped tool). So for the few milliseconds that process runs, the
+  value is in its argument list, readable by anything running as this user — who
+  could already read the keychain entry itself. The alternative, a file the tool
+  would have to read, is a worse place to leave a key.
+- Configuration is stored in a file; a credential is **never** written to it, and
+  the configuration has no field that could hold one. The wrapper a credential is
+  carried in redacts its own `Debug`, and the read is a method named `expose` so
+  every site that handles a raw value is greppable.
 - Session transcripts are stored under `$NANUS_HOME/sessions/`. A transcript
   contains everything the model saw and produced, including any secret it read.
+
+What this does **not** do: the file store is not encrypted, so a secret in it is
+readable by anything running as you — as the environment variable already was. The
+point of the store is to get a key *out* of the environment and out of the
+configuration file, not to defend it from the user's own processes.
 
 ## The agent's socket
 

@@ -2,7 +2,21 @@
 //!
 //! The schema is deliberately a single flat table: a partial file works because
 //! every field defaults, and the file is the *only* durable configuration state.
-//! The API key is not part of it and never will be — see [`api_key`].
+//! A credential is not part of it and never will be: it lives in the secret store
+//! `nanus auth` writes to, and this type has no field that could hold one.
+//!
+//! ## What is absent, and why absent is not defaulted
+//!
+//! The provider, the plan, the endpoint, and the model are all optional strings
+//! rather than enums and rather than defaulted values. Absent means "the provider's
+//! own answer applies": the composition resolves it, and the provider table is the
+//! one place that knows the names. A schema that named a provider would be a second
+//! place to change when one is added, and a `model` defaulted to the default
+//! provider's id would be a model that cannot be run whenever another provider is
+//! selected — so the default is `None`, which is the truth rather than a plausible
+//! value. The one thing that *is* checked here is the shape: a provider named in
+//! the file must be a name the composition can build, or the failure is a sentence
+//! naming the ones it can.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -22,15 +36,6 @@ pub const CONFIG_VERSION: u32 = 1;
 
 /// The environment variable that names an explicit configuration file.
 pub const CONFIG_ENV: &str = "NANUS_CONFIG";
-
-/// The environment variable that carries the provider API key.
-///
-/// The key is read from the environment on every use and is never stored in
-/// [`NanusConfig`], never serialised, and never rendered by `Debug`.
-pub const API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
-
-/// The model used when the configuration names none.
-pub const DEFAULT_MODEL: &str = "deepseek-flash";
 
 /// The per-response token budget used when the configuration names none.
 ///
@@ -169,8 +174,28 @@ impl core::fmt::Display for TuiDetail {
 pub struct NanusConfig {
     /// The schema version the file was written with.
     pub config_version: u32,
-    /// The model id to send requests to.
-    pub model: String,
+    /// The provider to talk to, when the file names one.
+    ///
+    /// Absent means the provider the composition defaults to. An unknown name is
+    /// refused by the composition, which is the crate that knows the names, rather
+    /// than by this schema, which deliberately does not.
+    pub provider: Option<String>,
+    /// The provider plan to use, when the file names one.
+    ///
+    /// A plan is what a provider calls the endpoint and default model a subscription
+    /// or a coding tier gets, so `zai`'s `coding` plan is a different host and
+    /// `openai`'s is a different default model. Absent means the provider's default
+    /// plan.
+    pub plan: Option<String>,
+    /// An override for the provider's endpoint, when the file names one.
+    ///
+    /// For a proxy, a gateway, or a plan the provider documents but this build does
+    /// not know by name. Absent means the plan's own endpoint.
+    pub base_url: Option<String>,
+    /// The model id to send requests to, when the file names one.
+    ///
+    /// Absent means the provider's (or the plan's) default model.
+    pub model: Option<String>,
     /// The per-response token budget.
     pub max_tokens: u32,
     /// How much reasoning to ask for.
@@ -218,7 +243,10 @@ impl Default for NanusConfig {
     fn default() -> Self {
         Self {
             config_version: CONFIG_VERSION,
-            model: DEFAULT_MODEL.to_owned(),
+            provider: None,
+            plan: None,
+            base_url: None,
+            model: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: ReasoningEffort::default(),
             approval_policy: ApprovalPolicy::default(),
@@ -263,17 +291,6 @@ fn rename_max_output_tokens(document: &mut Value) -> Result<(), nanus_kernel::Er
         table.entry("max_tokens").or_insert(legacy);
     }
     Ok(())
-}
-
-/// Reads the provider API key from the environment.
-///
-/// Returned to the caller and then forgotten: this crate has no place to put it,
-/// and deliberately no function that would write it to disk.
-#[must_use]
-pub fn api_key() -> Option<String> {
-    std::env::var(API_KEY_ENV)
-        .ok()
-        .filter(|key| !key.trim().is_empty())
 }
 
 impl NanusConfig {

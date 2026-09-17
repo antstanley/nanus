@@ -190,8 +190,8 @@ because they name the actual mechanism rather than a mood:
   staged in either order.
 
 Together they are why "everything below the loop is a plugin" is a mechanism here rather
-than a slogan. The clock, the filesystem, the shell, the session log, the model adapter, and
-the tool registry are services on the kernel, and the loop consumes them, so replacing the
+than a slogan. The clock, the filesystem, the shell, the session log, the model adapter, the
+credential stores, and the tool registry are services on the kernel, and the loop consumes them, so replacing the
 provider or the toolset needs no edit to the loop at all.
 
 The loop is not itself a plugin, and this page used to say it was. It is built — by

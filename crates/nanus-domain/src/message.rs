@@ -1,13 +1,19 @@
 //! The model conversation vocabulary.
 //!
-//! Everything here is shaped by one wire protocol: the `OpenAI` chat-completions
-//! body that the `DeepSeek` adapter sends. The domain owns that mapping rather
-//! than the adapter, because the mapping carries rules the whole harness must
-//! respect — for example that an assistant turn with no text serialises its
-//! `content` as `""` and never as `null`, which the live API rejects with a 400.
+//! The harness's own shape, which every adapter translates into its provider's. It
+//! began as the `OpenAI` chat-completions body and still serialises that way —
+//! `reasoning_content` beside `content`, a `tool_call_id` on a result — so an
+//! `OpenAI`-compatible adapter can use it as written, while a provider whose wire is
+//! different (Anthropic's Messages API) encodes these messages itself.
+//!
+//! The domain owns the shape rather than an adapter, because it carries rules the
+//! whole harness must respect — for example that an assistant turn with no text
+//! serialises its `content` as `""` and never as `null`, which the live `DeepSeek`
+//! API rejects with a 400.
 //!
 //! A [`Message`] is therefore not a neutral record: it is the model-visible
-//! projection of a session, and its serialisation is a contract.
+//! projection of a session, and its serialisation is a contract for the adapters that
+//! speak the same shape.
 
 use core::fmt;
 

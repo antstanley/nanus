@@ -6,6 +6,14 @@ use crate::error::DeepSeekError;
 // without depending on this adapter. It is re-exported from the crate root.
 use nanus_ports::ReasoningEffort;
 
+/// The provider name the harness knows this adapter by.
+///
+/// One word names the provider everywhere: the configuration's `provider` value, the
+/// secret-store account a `nanus auth` command files its key under, and the
+/// environment variable's stem. Stated here so the composition that builds the
+/// adapter reads it rather than repeating the string.
+pub const PROVIDER: &str = "deepseek";
+
 /// The current fast `DeepSeek` model.
 ///
 /// The retired ids — `deepseek-chat` and `deepseek-reasoner`, discontinued on

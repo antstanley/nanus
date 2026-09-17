@@ -25,7 +25,6 @@ nanus-kernel = { workspace = true }
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }
 nanus-adapter-config = { workspace = true }
-nanus-adapter-deepseek = { workspace = true }
 # `setsid`, so a detached service survives the shell that started it. A safe wrapper
 # rather than a raw syscall, because the workspace forbids `unsafe` everywhere.
 nix = { workspace = true }

@@ -15,19 +15,24 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use nanus_adapter_anthropic::{AnthropicConfig, AnthropicLlm};
 use nanus_adapter_config::{DEFAULT_MAX_TOKENS, NanusConfig};
 use nanus_adapter_deepseek::{DEFAULT_MAX_OUTPUT_TOKENS, DeepSeekConfig, DeepSeekLlm};
 use nanus_adapter_local::{LocalFs, LocalShell, SystemClock};
+use nanus_adapter_openai::{OpenAiConfig, OpenAiLlm, Vendor};
+use nanus_adapter_secret::Secrets;
 use nanus_adapter_store::JsonlStore;
 use nanus_domain::{AgentConfig, Origin, Session};
 use nanus_kernel::{Context, Kernel, MountContext, Plugin, PluginId};
 use nanus_ports::{
-    ClockHandle, FsHandle, LlmHandle, LlmPort, SandboxPolicy, ShellHandle, StoreHandle,
+    ClockHandle, FsHandle, LlmHandle, LlmPort, SandboxPolicy, Secret, SecretHandle, SecretPort,
+    ShellHandle, StoreHandle,
 };
 
 use crate::ToolRegistryHandle;
 use crate::agent_loop::AgentRunner;
 use crate::error::BundleError;
+use crate::provider::{Provider, Selection};
 
 /// The default system prompt.
 ///
@@ -61,9 +66,10 @@ pub struct Harness {
     pub llm: LlmHandle,
     /// The model ids a client may switch this harness between, in cycling order.
     ///
-    /// Taken from [`crate::model_ids`] rather than from the adapter, because which ids are
-    /// offered is a decision about this deployment and not about the provider: the adapter
-    /// accepts what it is told, and the list is what the interface may name.
+    /// Taken from the resolved [`Selection`] rather than from the adapter, because
+    /// which ids are offered is a decision about this deployment and not about the
+    /// provider: the adapter accepts what it is told, and the list is what the
+    /// interface may name.
     models: Vec<String>,
     /// What a session created here is being run under.
     ///
@@ -139,6 +145,10 @@ impl Harness {
 pub struct Pending {
     config: NanusConfig,
     workspace: PathBuf,
+    /// What the configuration resolved to: the provider, plan, model, and endpoint.
+    selection: Selection,
+    /// The credential stores, as the chain this composition consults.
+    secrets: SecretHandle,
     fs: FsHandle,
     shell: ShellHandle,
     clock: ClockHandle,
@@ -181,24 +191,23 @@ impl Pending {
     ///
     /// Returns [`BundleError::Kernel`] when a plugin fails to mount.
     pub fn start(self) -> Result<Harness, BundleError> {
-        let context = mount(
-            &self.fs,
-            &self.shell,
-            &self.clock,
-            &self.store,
+        let context = mount(&self)?;
+        let runner = build_runner(
             &self.llm,
             &self.tools,
+            &self.config,
+            &self.selection,
+            &self.workspace,
         )?;
-        let runner = build_runner(&self.llm, &self.tools, &self.config, &self.workspace)?;
         // Built before the adapters are moved into the harness, and from the same
-        // configuration the runner was built from, so the record cannot disagree with what
+        // selection the runner was built from, so the record cannot disagree with what
         // the run will do.
-        let origin = origin_of(&self.config, &self.llm);
-        // Postconditions: the request model is the configured one, and the registry the
+        let origin = origin_of(&self.config, &self.selection, &self.llm);
+        // Postconditions: the request model is the resolved one, and the registry the
         // runner dispatches from is the one the context published. The second is the
         // property this whole construction exists to hold — a runner over a *copy* of the
         // toolset would advertise tools it could not dispatch.
-        assert_eq!(runner.config().model, self.config.model);
+        assert_eq!(runner.config().model, self.selection.model());
         assert!(Rc::ptr_eq(
             &self.tools.0,
             &context
@@ -212,7 +221,9 @@ impl Pending {
             store: self.store,
             clock: self.clock,
             llm: self.llm,
-            models: crate::model_ids()
+            models: self
+                .selection
+                .models()
                 .iter()
                 .map(|id| (*id).to_owned())
                 .collect(),
@@ -223,14 +234,15 @@ impl Pending {
 
 /// Builds the record of what a session created here is being run under.
 ///
-/// Read from the same configuration the runner and the prompt are built from, so the
+/// Read from the same selection the runner and the prompt are built from, so the
 /// recorded facts are the ones in force rather than ones a caller restated. The effort is
 /// asked of the adapter instead, because an adapter fills in an unset effort from its own
 /// configuration — which is the only place the answer exists — and it is left absent when
-/// the adapter has no notion of one.
-fn origin_of(config: &NanusConfig, llm: &LlmHandle) -> Origin {
+/// the adapter has no notion of one. A provider without an effort knob (Anthropic) is
+/// therefore recorded as having no effort, which is an absence rather than a default.
+fn origin_of(config: &NanusConfig, selection: &Selection, llm: &LlmHandle) -> Origin {
     Origin {
-        model: Some(config.model.clone()),
+        model: Some(selection.model().to_owned()),
         effort: llm
             .reasoning_effort()
             .map(|effort| effort.as_str().to_owned()),
@@ -251,12 +263,15 @@ fn origin_of(config: &NanusConfig, llm: &LlmHandle) -> Origin {
 /// and [`BundleError::Session`] when the session store cannot be opened.
 pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
     let workspace = workspace_root(config)?;
-    let api_key = nanus_adapter_config::api_key().ok_or_else(|| {
-        BundleError::config(format!(
-            "no DeepSeek API key: set {}",
-            nanus_adapter_deepseek::API_KEY_ENV
-        ))
-    })?;
+    // Which provider, plan, model, and endpoint this run uses is decided before
+    // anything is built, because a configuration that cannot resolve is a sentence
+    // rather than a partly assembled harness.
+    let selection = Selection::resolve(config)?;
+    let home = store_home()?;
+    // The secret stores are consulted by *account*, which is the provider's name, so
+    // a key stored for one provider can never be sent to another.
+    let secrets = Secrets::new(&home).handle();
+    let credential = resolve_credential(&secrets, &selection).await?;
 
     // The adapters are built before the kernel mounts them, because several need to
     // await (opening a store) and a plugin's `mount` hook should not block on I/O that
@@ -268,16 +283,18 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
     let policy = SandboxPolicy::new(config.sandbox_mode, workspace.clone());
     let shell = LocalShell::new(policy).handle();
     let clock = SystemClock::new().handle();
-    let store = JsonlStore::new(store_home()?)
+    let store = JsonlStore::new(home)
         .await
         .map_err(|error| BundleError::session(error.to_string()))?
         .handle();
-    let llm = build_llm(config, &api_key)?;
+    let llm = build_llm(config, &selection, &credential)?;
     let tools = build_tools(&fs, &shell)?;
 
     Ok(Pending {
         config: config.clone(),
         workspace,
+        selection,
+        secrets,
         fs,
         shell,
         clock,
@@ -285,6 +302,52 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         llm,
         tools,
     })
+}
+
+/// Resolves the credential the selected provider needs.
+///
+/// One call covers every store: the chain is the platform keychain, then the private
+/// file, then the environment — so a keychain entry, a `nanus auth set` file, and a
+/// variable a CI job exports are all answered here, and the first one that has a value
+/// wins.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] when no store holds a credential, and the sentence
+/// names both ways to supply one, because either may be the one a reader can act on.
+async fn resolve_credential(
+    secrets: &SecretHandle,
+    selection: &Selection,
+) -> Result<Secret, BundleError> {
+    let account = selection.credential_account();
+    let env = selection.credential_env();
+    match secrets.get(account).await {
+        Ok(Some(secret)) if !secret.is_blank() => Ok(secret),
+        Ok(_) => Err(BundleError::config(format!(
+            "no credential for {account}: run `nanus auth set {account}`, or set {env}"
+        ))),
+        // The store failed rather than answering, so its own sentence is kept: a
+        // locked keychain is a different problem from an unset key, and the fix is
+        // different too.
+        Err(error) => Err(BundleError::config(format!(
+            "no credential for {account}: {error}; run `nanus auth set {account}`, or set {env}"
+        ))),
+    }
+}
+
+/// Opens the credential stores without composing a harness.
+///
+/// `nanus auth` needs the stores and nothing else — no model, no tools, no session
+/// store — and demanding a credential in order to *store* one would be a circle. The
+/// chain is the same one a run uses, so a key written here is found there.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Session`] when no home directory can be determined, which is
+/// where the private file store lives.
+pub fn open_secrets() -> Result<SecretHandle, BundleError> {
+    let home = store_home()?;
+    Ok(Secrets::new(&home).handle())
 }
 
 /// Opens the session store without composing a harness.
@@ -364,18 +427,78 @@ pub fn store_home() -> Result<PathBuf, BundleError> {
 /// because this is the only module where both numbers are in scope.
 const _: () = assert!(DEFAULT_MAX_TOKENS <= DEFAULT_MAX_OUTPUT_TOKENS);
 
-/// Builds the model adapter for `config`.
-fn build_llm(config: &NanusConfig, api_key: &str) -> Result<LlmHandle, BundleError> {
-    let mut adapter = DeepSeekConfig::new(config.model.clone(), api_key);
+/// Builds the model adapter the selection calls for.
+///
+/// This is the one place that maps a provider to an adapter, which is what keeps every
+/// other crate ignorant of which vendor speaks which protocol.
+fn build_llm(
+    config: &NanusConfig,
+    selection: &Selection,
+    key: &Secret,
+) -> Result<LlmHandle, BundleError> {
+    let port: Box<dyn LlmPort> = match selection.provider() {
+        Provider::DeepSeek => Box::new(build_deepseek(config, selection, key)?),
+        Provider::Zai => Box::new(build_compatible(Vendor::Zai, config, selection, key)?),
+        Provider::OpenAi => Box::new(build_compatible(Vendor::OpenAi, config, selection, key)?),
+        Provider::Anthropic => Box::new(build_anthropic(config, selection, key)?),
+    };
+    Ok(Rc::new(port))
+}
+
+/// Builds the `DeepSeek` adapter.
+fn build_deepseek(
+    config: &NanusConfig,
+    selection: &Selection,
+    key: &Secret,
+) -> Result<DeepSeekLlm, BundleError> {
+    let mut adapter =
+        DeepSeekConfig::with_base_url(selection.model(), key.expose(), selection.endpoint());
     adapter
         .set_max_tokens(config.max_tokens)
         .map_err(|error| BundleError::config(error.to_string()))?;
     // The configuration carries its own spelling of the effort so a TOML file can
     // name it; the adapter speaks the ports vocabulary.
     adapter.set_reasoning_effort(config.reasoning_effort.to_port());
-    let llm = DeepSeekLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))?;
-    let port: Box<dyn LlmPort> = Box::new(llm);
-    Ok(Rc::new(port))
+    DeepSeekLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
+}
+
+/// Builds an adapter for an `OpenAI`-compatible vendor.
+fn build_compatible(
+    vendor: Vendor,
+    config: &NanusConfig,
+    selection: &Selection,
+    key: &Secret,
+) -> Result<OpenAiLlm, BundleError> {
+    let mut adapter = OpenAiConfig::with_base_url(
+        vendor,
+        selection.model(),
+        key.expose(),
+        selection.endpoint(),
+    );
+    adapter
+        .set_max_tokens(config.max_tokens)
+        .map_err(|error| BundleError::config(error.to_string()))?;
+    adapter.set_reasoning_effort(config.reasoning_effort.to_port());
+    OpenAiLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
+}
+
+/// Builds the `Anthropic` adapter.
+///
+/// The configured reasoning effort is deliberately **not** applied: Anthropic's
+/// thinking needs the signed blocks of the previous turn replayed, which the message
+/// model has no place for, so the adapter never asks for thinking — see its crate
+/// documentation. Passing the effort in would imply it reached the wire.
+fn build_anthropic(
+    config: &NanusConfig,
+    selection: &Selection,
+    key: &Secret,
+) -> Result<AnthropicLlm, BundleError> {
+    let mut adapter =
+        AnthropicConfig::with_base_url(selection.model(), key.expose(), selection.endpoint());
+    adapter
+        .set_max_tokens(config.max_tokens)
+        .map_err(|error| BundleError::config(error.to_string()))?;
+    AnthropicLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
 }
 
 /// Builds the tool registry this composition shares.
@@ -402,6 +525,7 @@ fn build_runner(
     llm: &LlmHandle,
     tools: &ToolRegistryHandle,
     config: &NanusConfig,
+    selection: &Selection,
     workspace: &std::path::Path,
 ) -> Result<AgentRunner, BundleError> {
     let prompt = config
@@ -410,14 +534,14 @@ fn build_runner(
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
     let runtime = nanus_domain::runtime_context(
         &workspace.display().to_string(),
-        &config.model,
+        selection.model(),
         config.approval_policy,
         config.sandbox_mode,
     );
     let agent = AgentConfig::new(
         config.max_steps_per_turn,
         config.max_parallel_tools,
-        config.model.clone(),
+        selection.model().to_owned(),
         AGENT_SYSTEM_PROMPT_MAX,
     )
     .map_err(|error| BundleError::config(error.to_string()))?
@@ -438,21 +562,18 @@ fn build_runner(
 /// Synchronous on purpose: the kernel's activation sweep calls `block_on`, which would
 /// panic if this ran inside a runtime. [`Pending::start`] is the only caller, and it is
 /// documented as synchronous.
-fn mount(
-    fs: &FsHandle,
-    shell: &ShellHandle,
-    clock: &ClockHandle,
-    store: &StoreHandle,
-    llm: &LlmHandle,
-    tools: &ToolRegistryHandle,
-) -> Result<Context, BundleError> {
+fn mount(pending: &Pending) -> Result<Context, BundleError> {
     let kernel = Kernel::new()
-        .with_plugin(plugin_id("clock"), clock_provider(clock))
-        .with_plugin(plugin_id("fs"), fs_provider(fs))
-        .with_plugin(plugin_id("shell"), shell_provider(shell))
-        .with_plugin(plugin_id("store"), store_provider(store))
-        .with_plugin(plugin_id("llm"), llm_provider(llm))
-        .with_plugin(plugin_id("tools"), crate::tools_plugin(tools.clone()));
+        .with_plugin(plugin_id("clock"), clock_provider(&pending.clock))
+        .with_plugin(plugin_id("fs"), fs_provider(&pending.fs))
+        .with_plugin(plugin_id("shell"), shell_provider(&pending.shell))
+        .with_plugin(plugin_id("store"), store_provider(&pending.store))
+        .with_plugin(plugin_id("llm"), llm_provider(&pending.llm))
+        .with_plugin(plugin_id("secrets"), secret_provider(&pending.secrets))
+        .with_plugin(
+            plugin_id("tools"),
+            crate::tools_plugin(pending.tools.clone()),
+        );
     kernel
         .start()
         .map_err(|error| BundleError::Kernel(error.to_string()))
@@ -540,6 +661,16 @@ fn store_provider(store: &StoreHandle) -> PortProvider<Box<dyn nanus_ports::Stor
 /// Builds the plugin that publishes the model adapter.
 fn llm_provider(llm: &LlmHandle) -> PortProvider<Box<dyn LlmPort>> {
     PortProvider::new("llm", nanus_ports::llm_key(), llm.clone())
+}
+
+/// Builds the plugin that publishes the credential stores.
+///
+/// Published like every other port so the capability is a service rather than a value
+/// a caller has to be handed: nothing mounted today requires it — the composition
+/// resolves the credential before the kernel starts — but a plugin that later needs to
+/// read or write one finds it by key rather than by being passed it.
+fn secret_provider(secrets: &SecretHandle) -> PortProvider<Box<dyn SecretPort>> {
+    PortProvider::new("secrets", nanus_ports::secret_key(), secrets.clone())
 }
 
 /// Maximum size of an assembled system prompt.

@@ -40,7 +40,7 @@ use std::rc::Rc;
 use clap::{CommandFactory, Parser, Subcommand};
 use nanus_adapter_config::NanusConfig;
 use nanus_bundle::compose::open_store;
-use nanus_bundle::{Harness, compose};
+use nanus_bundle::{Harness, Provider, Selection, compose};
 use nanus_domain::ApprovalPolicy;
 use nanus_kernel::runtime::block_on as kernel_block_on;
 use std::ffi::OsString;
@@ -179,6 +179,19 @@ pub enum Command {
     /// Show the effective configuration.
     Config,
 
+    /// Manage the provider credentials nanus reads.
+    ///
+    /// A credential is stored in the platform's own store — the macOS keychain, with a
+    /// private file as the fallback — rather than in the configuration file or the
+    /// environment, so it is not in every subprocess's environment and not in `ps`
+    /// output. The environment variable remains the last fallback, for CI and
+    /// containers.
+    Auth {
+        /// What to do with the credentials.
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+
     /// List recorded sessions, newest first.
     Sessions {
         /// What to do with them other than listing.
@@ -229,6 +242,37 @@ pub enum SessionsAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// What to do with a stored credential.
+#[derive(Debug, Subcommand)]
+pub enum AuthAction {
+    /// Store a provider credential, read from standard input.
+    ///
+    /// The value is read from standard input rather than taken as an argument, so it
+    /// is never in this process's argument list for another process to read. Pipe it
+    /// in (`printf %s "$KEY" | nanus auth set openai`) or type it and press enter;
+    /// nothing is echoed in the second case, which is the same trade the platform's
+    /// own tools make.
+    Set {
+        /// The provider the credential is for: one of the names `nanus config` lists.
+        provider: String,
+    },
+
+    /// Remove a provider's stored credential.
+    ///
+    /// Removing one that is not stored is not an error; it is reported as having
+    /// removed nothing.
+    Clear {
+        /// The provider whose credential is removed.
+        provider: String,
+    },
+
+    /// Report which providers have a credential, and where they are read from.
+    ///
+    /// The credential itself is never printed: this output is routinely pasted into an
+    /// issue.
+    Status,
 }
 
 /// What to do with the service.
@@ -378,7 +422,8 @@ pub async fn prepare() -> Result<Ready, String> {
     match command {
         Command::Run { task, resume, name } => prepare_run(&options, &task, resume, name).await,
         // Showing the configuration prints and is finished.
-        Command::Config => show_config(&options).map(|()| Ready::Done),
+        Command::Config => show_config(&options).await.map(|()| Ready::Done),
+        Command::Auth { action } => prepare_auth(action).await,
         Command::Sessions { action } => prepare_sessions(action).await,
         Command::Tui {
             session,
@@ -1161,24 +1206,135 @@ fn finish_harness(harness: &Harness) -> Result<(), String> {
     harness.shutdown().map_err(|error| error.to_string())
 }
 
+/// Stores, removes, or reports the provider credentials.
+///
+/// Needs no model and no session store, so it works before anything is configured —
+/// which is the point: the first thing a new install does is store a key.
+async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
+    let secrets = compose::open_secrets().map_err(|error| error.to_string())?;
+    match action {
+        AuthAction::Set { provider } => {
+            let account = provider_account(&provider)?;
+            let credential = read_credential().await?;
+            secrets
+                .set(account, &credential)
+                .await
+                .map_err(|error| error.to_string())?;
+            // Which store answered is reported, because a fallback that is in use is
+            // something a reader should know rather than discover.
+            println!(
+                "nanus: stored a credential for {account} ({})",
+                secrets.backend()
+            );
+            Ok(Ready::Done)
+        }
+        AuthAction::Clear { provider } => {
+            let account = provider_account(&provider)?;
+            let removed = secrets
+                .clear(account)
+                .await
+                .map_err(|error| error.to_string())?;
+            if removed {
+                println!("nanus: removed the stored credential for {account}");
+            } else {
+                // The environment cannot be changed from here, so a reader whose key
+                // comes from a variable is told where to remove it rather than being
+                // left with a credential this command cannot see.
+                let provider = Provider::parse(account).map_or("", Provider::env_var);
+                println!(
+                    "nanus: no stored credential for {account}; if it comes from {provider}, unset it in the shell that sets it"
+                );
+            }
+            Ok(Ready::Done)
+        }
+        AuthAction::Status => {
+            println!("credential stores: {}", secrets.backend());
+            for provider in Provider::ALL {
+                let account = provider.name();
+                // The credential is never printed: this output is routinely pasted
+                // into an issue. A store that could not answer says so rather than
+                // reporting an absence it did not observe.
+                let state = match secrets.get(account).await {
+                    Ok(Some(credential)) if !credential.is_blank() => String::from("set"),
+                    Ok(_) => String::from("not set"),
+                    Err(error) => format!("not readable ({error})"),
+                };
+                println!("  {account}: {state}  (fallback {})", provider.env_var());
+            }
+            Ok(Ready::Done)
+        }
+    }
+}
+
+/// Resolves a provider name from the command line, or refuses it by name.
+///
+/// The account a credential is filed under is the provider's name, so the name is
+/// checked against the providers this build actually has: storing a key under a
+/// misspelling would be a credential nothing ever reads.
+fn provider_account(asked: &str) -> Result<&'static str, String> {
+    Provider::parse(asked).map(Provider::name).ok_or_else(|| {
+        format!(
+            "unknown provider {asked:?}: this build offers {}",
+            Provider::names().join(", ")
+        )
+    })
+}
+
+/// Reads one credential from standard input.
+///
+/// Standard input rather than an argument, so the value never appears in this
+/// process's argument list — and read asynchronously, because this runs inside the
+/// runtime.
+async fn read_credential() -> Result<String, String> {
+    use tokio::io::AsyncBufReadExt as _;
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let line = lines
+        .next_line()
+        .await
+        .map_err(|error| format!("could not read standard input: {error}"))?;
+    let Some(line) = line else {
+        return Err(String::from(
+            "no credential was given on standard input; pipe one in or type it and press enter",
+        ));
+    };
+    let credential = line.trim().to_owned();
+    if credential.is_empty() {
+        return Err(String::from("the credential is empty"));
+    }
+    Ok(credential)
+}
+
 /// Prints the effective configuration.
-fn show_config(args: &Options) -> Result<(), String> {
+async fn show_config(args: &Options) -> Result<(), String> {
     let config = load(args)?;
+    // Resolved rather than echoed: the file may name none of the provider, plan, or
+    // model, and what a run will actually use is the useful answer. A configuration
+    // that cannot resolve is refused here, with the same sentence a run would give.
+    let selection = Selection::resolve(&config).map_err(|error| error.to_string())?;
     let path = NanusConfig::source_path(args.config.as_deref()).map_or_else(
         |_| String::from("<unavailable>"),
         |path| path.display().to_string(),
     );
-    // Secrets are reported as present or absent, never printed: this output is
-    // routinely pasted into an issue.
-    let key = if nanus_adapter_config::api_key().is_some() {
-        "set"
-    } else {
-        "not set"
-    };
+    let credential = credential_state(&selection).await;
     println!("config file: {path}");
-    println!("model: {}", config.model);
-    println!("max tokens: {}", config.max_tokens);
-    println!("reasoning effort: {:?}", config.reasoning_effort);
+    println!(
+        "provider: {} (plan {})",
+        selection.provider(),
+        selection.plan().name
+    );
+    println!("model: {}", selection.model());
+    println!("endpoint: {}", selection.endpoint());
+    println!("max tokens: {}", max_tokens_display(&config, &selection));
+    if selection.provider().effort_applies() {
+        println!("reasoning effort: {:?}", config.reasoning_effort);
+    } else {
+        // An inert knob is named as inert rather than printed as though it were sent.
+        println!(
+            "reasoning effort: {:?} (not sent to {})",
+            config.reasoning_effort,
+            selection.provider()
+        );
+    }
     println!("approval policy: {}", config.approval_policy);
     println!("sandbox mode: {:?}", config.sandbox_mode);
     println!("max steps per turn: {}", config.max_steps_per_turn);
@@ -1197,8 +1353,37 @@ fn show_config(args: &Options) -> Result<(), String> {
         "service log: {}",
         resolved(&crate::service::log_path(&config, None))
     );
-    println!("api key: {key}");
+    println!(
+        "credential: {credential} for {} (fallback {})",
+        selection.credential_account(),
+        selection.credential_env()
+    );
     Ok(())
+}
+
+/// Reports whether a credential is present, without printing it.
+async fn credential_state(selection: &Selection) -> String {
+    let Ok(secrets) = compose::open_secrets() else {
+        return String::from("unknown (the credential stores are unavailable)");
+    };
+    match secrets.get(selection.credential_account()).await {
+        Ok(Some(credential)) if !credential.is_blank() => String::from("set"),
+        Ok(_) => String::from("not set"),
+        Err(error) => format!("not readable ({error})"),
+    }
+}
+
+/// Renders the token budget, naming the provider's ceiling when it caps it.
+fn max_tokens_display(config: &NanusConfig, selection: &Selection) -> String {
+    let ceiling = selection.max_output_tokens();
+    if config.max_tokens > ceiling {
+        return format!(
+            "{} (capped to {ceiling} by {})",
+            config.max_tokens,
+            selection.provider()
+        );
+    }
+    format!("{} (ceiling {ceiling})", config.max_tokens)
 }
 
 /// Renders a resolved path, or names the home when it cannot be resolved.

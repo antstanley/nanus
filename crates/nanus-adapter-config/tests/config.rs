@@ -13,7 +13,7 @@ use std::path::Path;
 
 use nanus_adapter_config::{
     CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN, DEFAULT_MAX_TOKENS,
-    DEFAULT_MODEL, NanusConfig, ReasoningEffort, TuiDetail, api_key,
+    NanusConfig, ReasoningEffort, TuiDetail,
 };
 use nanus_domain::{ApprovalPolicy, SandboxMode};
 
@@ -60,11 +60,12 @@ fn assert_child_ok(output: &std::process::Output) {
 #[test]
 fn the_built_in_defaults_are_the_documented_ones() {
     let config = NanusConfig::default();
-    assert_eq!(config.model, DEFAULT_MODEL);
-    assert_eq!(config.model, "deepseek-flash");
-    // The retired ids must not be what a fresh configuration selects.
-    assert_ne!(config.model, "deepseek-chat");
-    assert_ne!(config.model, "deepseek-reasoner");
+    // No model is named by default: absent means "the provider's own default", and a
+    // schema that named one provider's model would be unusable with another.
+    assert!(config.model.is_none(), "no model is named by default");
+    assert!(config.provider.is_none(), "no provider is named by default");
+    assert!(config.plan.is_none(), "no plan is named by default");
+    assert!(config.base_url.is_none(), "no endpoint is named by default");
     assert_eq!(config.max_tokens, DEFAULT_MAX_TOKENS);
     assert_eq!(config.max_steps_per_turn, DEFAULT_MAX_STEPS_PER_TURN);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
@@ -104,7 +105,7 @@ fn a_partial_file_uses_defaults_for_everything_else() {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, "model = \"deepseek-v4-pro\"\n").expect("seed");
     let config = NanusConfig::load(Some(&path)).expect("load");
-    assert_eq!(config.model, "deepseek-v4-pro");
+    assert_eq!(config.model.as_deref(), Some("deepseek-v4-pro"));
     assert_eq!(
         config.max_tokens, DEFAULT_MAX_TOKENS,
         "unset fields default"
@@ -298,19 +299,6 @@ fn toml_of(config: &NanusConfig) -> String {
     std::fs::read_to_string(&path).expect("read back")
 }
 
-#[test]
-fn the_api_key_comes_from_the_environment_only() {
-    // This process has no key set, so the accessor reports absence rather than a
-    // value smuggled in from a file.
-    let config = NanusConfig::default();
-    let rendered = format!("{config:?}");
-    assert!(!rendered.contains("DEEPSEEK_API_KEY"), "{rendered}");
-    assert!(
-        api_key().is_none() || api_key().is_some(),
-        "the accessor is total"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Saving.
 // ---------------------------------------------------------------------------
@@ -320,7 +308,10 @@ fn save_then_load_round_trips() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.toml");
     let original = NanusConfig {
-        model: String::from("deepseek-v4-pro"),
+        provider: Some(String::from("zai")),
+        plan: Some(String::from("coding")),
+        base_url: Some(String::from("https://api.z.ai/api/coding/paas/v4")),
+        model: Some(String::from("glm-4.5")),
         max_tokens: 1234,
         reasoning_effort: ReasoningEffort::Low,
         approval_policy: ApprovalPolicy::AllCalls,
@@ -382,7 +373,11 @@ fn an_explicit_path_wins_over_the_environment_variable() {
     let fixture = std::env::var(FIXTURE_DIR).expect("fixture dir");
     let explicit = Path::new(&fixture).join("explicit.toml");
     let config = NanusConfig::load(Some(&explicit)).expect("load");
-    assert_eq!(config.model, "explicit-model", "the explicit path won");
+    assert_eq!(
+        config.model.as_deref(),
+        Some("explicit-model"),
+        "the explicit path won"
+    );
 }
 
 /// Level 2: `$NANUS_CONFIG` beats the platform configuration path.
@@ -405,7 +400,11 @@ fn the_environment_variable_wins_over_the_platform_path() {
         return;
     }
     let config = NanusConfig::load(None).expect("load");
-    assert_eq!(config.model, "from-env", "NANUS_CONFIG was used");
+    assert_eq!(
+        config.model.as_deref(),
+        Some("from-env"),
+        "NANUS_CONFIG was used"
+    );
 }
 
 /// Level 3: the platform path is used when the environment variable is unset.
@@ -435,7 +434,7 @@ fn the_platform_path_is_used_when_the_environment_variable_is_unset() {
     std::fs::create_dir_all(platform.parent().expect("parent")).expect("mkdir");
     std::fs::write(&platform, "model = \"from-platform-path\"\n").expect("seed");
     let config = NanusConfig::load(None).expect("load");
-    assert_eq!(config.model, "from-platform-path");
+    assert_eq!(config.model.as_deref(), Some("from-platform-path"));
     // Postcondition: no explicit path and no environment variable were involved.
     assert!(std::env::var_os("NANUS_CONFIG").is_none());
 }
@@ -463,5 +462,5 @@ fn the_built_in_defaults_are_the_last_resort() {
         NanusConfig::default(),
         "an empty home yields defaults"
     );
-    assert_eq!(config.model, "deepseek-flash");
+    assert!(config.model.is_none(), "an empty home names no model");
 }
