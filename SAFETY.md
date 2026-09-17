@@ -99,9 +99,16 @@ not:
 - **It is not approved, because there is nobody to ask.** Approval exists because a
   *model* asked for a call and a person should decide. You are the person, and you
   typed it.
-- **It waits, and it can be stopped by leaving.** The command runs as a task so the
-  interface keeps drawing, but there is no key that kills it: the interface is not its
-  parent's supervisor, and a command that hangs hangs until it finishes or you quit.
+- **It does not read your keyboard.** Its standard input is closed rather than handed
+  the terminal, because the terminal's keystrokes are the composer's — a command that
+  read them would take characters out of the prompt you are typing. A command that wants
+  input takes it from a file or a pipe, and one that reads anyway gets an end of input
+  immediately rather than waiting for a `Ctrl+D` that belongs to the interface.
+- **It waits, and it outlives the interface.** The command runs as a task so the
+  interface keeps drawing, but there is no key that kills it, and nothing here is its
+  supervisor: a command that hangs hangs until it finishes, and one still running when
+  you quit keeps running after you have left. A command that should stop with the
+  interface is not one to run here.
 - **Its output is bounded.** The first rows are drawn and the rest counted, because a
   command that prints a great deal should not push the conversation out of reach.
 

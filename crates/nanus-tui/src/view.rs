@@ -1109,6 +1109,17 @@ impl ViewState {
         self.selection.is_some()
     }
 
+    /// Whether a dialogue that owns the keyboard is up.
+    ///
+    /// The pointer is guarded by the same question as the keyboard: what owns the keys owns the
+    /// click, because a click behind a dialogue the reader is answering would move a caret — or
+    /// start a selection — they cannot see. The mention menu is not one of these: it is attached to
+    /// a word being typed, so the composer behind it is still live.
+    #[must_use]
+    pub(crate) fn modal_open(&self) -> bool {
+        self.queue_open || self.help_open || self.permission_open || self.pending_approval.is_some()
+    }
+
     /// Drops the selection.
     pub(crate) fn clear_selection(&mut self) {
         self.selection = None;
@@ -1354,8 +1365,14 @@ impl ViewState {
 
     /// The lines the newest answer occupies, for a copy that does not need a mouse.
     ///
-    /// The answer is the last entry the *model* wrote: a reader asking for it by command means the
-    /// prose, not a tool line that happened to come after it.
+    /// The answer is the last entry the *model* wrote, and the range is that entry's own lines and
+    /// nothing else: a reader asking for it by command means the prose, not a tool line that happened
+    /// to come after it and not the role heading the view draws above it.
+    ///
+    /// Both ends come from the *prefix* of the transcript that ends at the answer. Counting to the end
+    /// of the transcript instead is the mistake that made a copy run on into whatever was drawn after
+    /// the answer — which, in a turn where the model writes a sentence and then calls a tool, is most
+    /// of the machinery that followed.
     #[must_use]
     pub(crate) fn last_answer_range(&self) -> Option<(Place, Place, u16)> {
         let width = self.drawn_width();
@@ -1363,10 +1380,17 @@ impl ViewState {
         let last = entries
             .iter()
             .rposition(|entry| entry.role() == Role::Assistant)?;
-        let from = self.lines_of(&entries[..last], width).len();
-        let total = self.lines_of(entries, width).len();
-        let end = total.saturating_sub(1);
-        (end > from).then_some((Place::start(from), Place::end(end), width))
+        // Every entry is drawn under a heading, and for an answer that heading is the view's own
+        // label rather than the model's words, so the copy starts on the line after it.
+        let from = self
+            .lines_of(&entries[..last], width)
+            .len()
+            .saturating_add(1);
+        let through_answer = self.lines_of(&entries[..=last], width).len();
+        // The answer's last own line; the blank row that separates one entry from the next is
+        // trimmed off a copy rather than being named here.
+        let end = through_answer.saturating_sub(1);
+        (end >= from).then_some((Place::start(from), Place::end(end), width))
     }
 
     /// Shows the files a mention offers.
@@ -4030,7 +4054,7 @@ mod tests {
     }
 
     /// `/copy` needs the newest *answer*, which is the last thing the model wrote — not a tool line
-    /// that happened to come after it.
+    /// that happened to come after it, and not the heading the view draws above it.
     #[test]
     fn the_newest_answer_is_the_range_a_command_copies() {
         let mut state = ViewState::new();
@@ -4049,9 +4073,29 @@ mod tests {
         let (anchor, head, width) = state.last_answer_range().expect("there is an answer");
         state.select_range(anchor, head, width);
         let copied = state.selected_text().expect("something is selected");
-        assert!(copied.contains("a better answer"), "{copied}");
-        assert!(!copied.contains("a question"), "{copied}");
-        assert!(!copied.contains("read"), "{copied}");
+        assert_eq!(
+            copied, "a better answer",
+            "the answer exactly: not the question before it, not the tool line either side of it, \
+             and not the heading it is drawn under"
+        );
+
+        // An answer with entries *after* it is still copied to its own end. The arrangement above
+        // cannot catch this: there the answer is last, which is the one case where counting to the
+        // end of the transcript happens to agree with counting to the end of the answer.
+        let mut followed = ViewState::new();
+        followed
+            .transcript
+            .push(Entry::prose(Role::Assistant, "an answer"));
+        followed
+            .transcript
+            .push(Entry::tool_call("read", "{\"file_path\":\"y\"}"));
+        followed
+            .transcript
+            .push(Entry::tool_result("read", false, "the file contents"));
+        let (anchor, head, width) = followed.last_answer_range().expect("there is an answer");
+        followed.select_range(anchor, head, width);
+        let copied = followed.selected_text().expect("something is selected");
+        assert_eq!(copied, "an answer", "what came after it is not part of it");
 
         // A transcript with nothing the model said has no answer to copy.
         let mut empty = ViewState::new();

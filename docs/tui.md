@@ -507,12 +507,12 @@ letting go leaves it standing; a click that never moved is not a selection, and 
 selection off, so the pointer is never left holding a highlight nobody meant.
 
 **With the keyboard**, `Shift` with any movement key — while no overlay is up, since an overlay
-owns the keys it uses, exactly as it does everywhere else: `Shift+Up` and `Shift+Down` take a row
-at a time, `Shift+PageUp`/`Shift+PageDown` a screenful, and `Shift+Home`/`Shift+End` to the
-end of the row the selection is on. The first press selects the line the reader is looking
-at — the newest text, not the blank row after it — and each press after that takes one more
-row in the direction being pressed. The transcript has no cursor of its own, so a selection
-is what those keys move; without `Shift` they are the composer's keys, exactly as before.
+owns the keys it uses, exactly as it does everywhere else: `Shift+Up` and `Shift+Down` take a row at
+a time, `Shift+PageUp`/`Shift+PageDown` the same jump `PageUp`/`PageDown` make, and
+`Shift+Home`/`Shift+End` to the end of the row the selection is on. The first press selects the line
+the reader is looking at — the newest text, not the blank row after it — and each press after that
+takes one more row in the direction being pressed. The transcript has no cursor of its own, so a
+selection is what those keys move; without `Shift` they are the composer's keys, exactly as before.
 
 **`Ctrl+C` copies what is selected**, and with nothing selected it is the key it always was:
 it stops the running turn, then cancels the prompt, then leaves. A copy that worked takes the
@@ -524,18 +524,22 @@ happened: how many lines went, or which failure it was.
 
 **`/copy` is the same thing for the commonest case**: the newest answer, selected and copied
 without having to point at it. It takes the last thing the *model* wrote rather than whatever
-came last, because a tool line after an answer is not what a reader means by it.
+came last, because a tool line after an answer is not what a reader means by it — and it takes that
+answer's own lines and no more, so the `──` line the view draws above it, which is a label rather
+than something the model wrote, is not in the copy either.
 
-A selection is a range of *rendered* rows, which has a consequence worth knowing: anything
-that re-renders the transcript drops it, rather than leaving a highlight over text nobody
-chose. A resize re-wraps every paragraph; `Ctrl+L` or `/clear` takes the lines away
-altogether; and the two summary toggles (`Ctrl+T`, `Ctrl+E`) and `Ctrl+O` change what the
-lines *are*. Making a selection after the toggle rather than before is the whole cost, and it
-is cheaper than a highlight that says one thing and copies another. And a line the *drawer* has to wrap — one wider than the terminal that
-the renderer did not wrap itself — is selected whole, because which character a wrapped row
-begins with is the drawing library's business and it does not report it. Every line a model's
-answer is made of is wrapped by the renderer, so this is rare, and it errs towards copying
-too much rather than too little.
+A selection is a range of *rendered* rows, which has a consequence worth knowing: anything *you* do
+that re-renders the transcript drops it, rather than leaving a highlight over text nobody chose. A
+resize re-wraps every paragraph; `Ctrl+L` or `/clear` takes the lines away altogether; and the two
+summary toggles (`Ctrl+T`, `Ctrl+E`) and `Ctrl+O` change what the lines *are*. Making a selection
+after the toggle rather than before is the whole cost, and it is cheaper than a highlight that says
+one thing and copies another. Text still streaming is the one thing that moves the rows under a
+highlight rather than dropping it — the answer grows and re-wraps as it arrives — and there the
+highlight is what a copy follows, so what a reader sees selected is what they get. And a line the
+*drawer* has to wrap — one wider than the terminal that the renderer did not wrap itself — is
+selected whole, because which character a wrapped row begins with is the drawing library's business
+and it does not report it. Every line a model's answer is made of is wrapped by the renderer, so
+this is rare, and it errs towards copying too much rather than too little.
 
 **The clipboard is the platform's own tool, or the terminal's.** `pbcopy` on macOS, `wl-copy`
 or `xclip` elsewhere; when none of those exists — a server reached over ssh, a session with no
@@ -566,7 +570,16 @@ full, because it is a safety decision rather than a feature.
 The command runs as a task rather than in the interface's own step, so a slow command does not stop
 the agent's frames being read — a turn that is running keeps arriving while `!find .` works. Its
 output is bounded to a few dozen lines and a few thousand characters, with a count of what was left
-and a `[exit N]` line when the exit status was not zero.
+and a `[exit N]` line when the exit status was not zero. It is echoed once, when it starts, and what
+came back is drawn under that echo: a command that printed nothing and succeeded is the one line, not
+a second empty one.
+
+It is given no standard input — the terminal's keystrokes belong to the composer, so a command that
+read them would be taking characters out of the prompt you are typing, and there is no `Ctrl+D` to
+give it that is not the interface's own key. A command that wants input reads a file or a pipe, and
+one that reads anyway gets an end of input rather than a wait. And a command you leave running when
+you quit keeps running: there is no key that kills it and nothing here that reaps it, which
+[SAFETY.md](../SAFETY.md#your-own-commands-the--escape) says in full.
 
 ### Naming a file with `@`
 
@@ -575,7 +588,9 @@ and a `[exit N]` line when the exit status was not zero.
 `docs/maintenance.md`, because the file's own name counts for more than the directory it is in.
 `Tab` completes the selected one, `Up`/`Down` choose (with or without `Shift`: the arrows are the
 menu's while it is up, as an overlay's keys are), `Esc` closes the menu and leaves the word alone,
-and typing another character narrows the list. Every other key still belongs to the
+and typing another character narrows the list. A click that moves the caret out of the word closes
+it too, for the same reason a keystroke does: the menu answers for the word the caret is in, not for
+one it has left. Every other key still belongs to the
 composer: a mention is a word being typed, not a mode, so `Enter` sends the sentence it is part of
 rather than accepting the completion.
 

@@ -49,6 +49,9 @@
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
 //! | `PageUp` / `PageDown` | scroll the transcript |
 //! | `Left` / `Right`, `Home` / `End` | move the cursor |
+//! | `?` | the key list, when the prompt is empty |
+//! | `@path` | name a file; `Tab` completes it |
+//! | `!command` | run a shell command here, without the model |
 //!
 //! The mouse navigates too: the wheel scrolls the conversation, and a left click in the
 //! composer puts the caret where it landed.
@@ -66,6 +69,7 @@ use std::path::Path;
 
 use crossterm::event::EventStream;
 use futures::StreamExt as _;
+use futures::future::LocalBoxFuture;
 use nanus_adapter_config::{NanusConfig, TuiDetail};
 use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
@@ -1031,6 +1035,11 @@ async fn event_loop(
                 // rather than moved so it is still there when it is not a mouse event.
                 if let TerminalEvent::Mouse(mouse) = &event {
                     handle_mouse(*mouse, &mut view);
+                    // A click moves the caret, and a mention is a property of the text: the
+                    // refresh is here for the pointer for the same reason it is below for the
+                    // keyboard — a menu raised for a word the caret has left is a menu that
+                    // answers for something nobody is pointing at any more.
+                    refresh_mentions(&mut view, &mut files, source.workspace());
                     continue;
                 }
                 let TerminalEvent::Key(key) = event else {
@@ -1079,7 +1088,7 @@ async fn event_loop(
                             };
                         }
                     }
-                    Outcome::Copy => copy_selection(&crate::copy::to_clipboard, &mut view),
+                    Outcome::Copy => copy_selection(&system_clipboard, &mut view).await,
                     Outcome::PasteImage => {
                         paste_image(&crate::paste::from_clipboard, source.workspace(), &mut view);
                     }
@@ -1103,8 +1112,10 @@ async fn event_loop(
                             source,
                             &mut view,
                             &shells,
-                            &crate::copy::to_clipboard,
-                        ) {
+                            &system_clipboard,
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -1206,7 +1217,7 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         }
         Submission::Unknown(name) => Routed::Say(format!(
             "no such command: {name} — this interface knows {}",
-            Command::NAMES.join(" and ")
+            Command::names().join(" and ")
         )),
         Submission::Prompt => {
             if accepts_prompts {
@@ -1310,12 +1321,12 @@ fn switch_model(requested: Option<String>, source: &mut dyn SessionSource, view:
 /// A function rather than a match arm, because the arm is every command the interface has and the
 /// loop is about waiting: this is where a submitted line stops being a string and becomes something
 /// that happened.
-fn submitted(
+async fn submitted(
     prompt: String,
     source: &mut dyn SessionSource,
     view: &mut ViewState,
     shells: &mpsc::UnboundedSender<crate::shell::Outcome>,
-    copier: &dyn Fn(&str) -> Result<crate::copy::Copied, String>,
+    copier: &Copier,
 ) -> bool {
     match route_submission(prompt, source.accepts_prompts()) {
         Routed::Leave => return true,
@@ -1326,7 +1337,7 @@ fn submitted(
             view.scroll_to_bottom();
         }
         Routed::Help => view.open_help(),
-        Routed::Copy => copy_last_answer(copier, view),
+        Routed::Copy => copy_last_answer(copier, view).await,
         // The transcript only: the draft in the composer and the toggles are about what the reader is
         // doing now, and `Ctrl+L` already means this.
         Routed::Clear => {
@@ -1350,9 +1361,18 @@ fn submitted(
 /// Nothing about it reaches the session: the log is the model's history, and a command the model
 /// neither asked for nor is shown is not part of it.
 fn shell_finished(outcome: &crate::shell::Outcome, view: &mut ViewState) {
-    view.transcript
-        .push(Entry::notice(crate::shell::report(outcome)));
-    view.scroll_to_bottom();
+    // The command is not named again here: it was echoed when it started, and that echo is the
+    // line this answers. A command that printed nothing therefore adds no entry at all, which is
+    // why the report is checked rather than pushed blindly.
+    let report = crate::shell::report(outcome);
+    if !report.trim().is_empty() {
+        view.transcript.push(Entry::notice(report));
+        // Followed rather than scrolled to, because this arrives whenever the command finishes
+        // rather than when the reader asked for it: a reader who scrolled away to read something
+        // while a slow command ran should not be dragged down by its output. That is the rule
+        // every frame follows; the echo is the reader's own action and is scrolled to.
+        view.follow();
+    }
     view.status = if outcome.succeeded() {
         String::from("ready")
     } else {
@@ -1373,6 +1393,8 @@ fn begin_shell(
     view: &mut ViewState,
 ) {
     view.transcript.push(Entry::notice(format!("$ {command}")));
+    // Scrolled to rather than followed, because this is the reader's own action — the same thing
+    // submitting a prompt does — so the echo is where they are looking.
     view.scroll_to_bottom();
     view.status = format!("running: {command}");
     let results = results.clone();
@@ -1384,24 +1406,30 @@ fn begin_shell(
     });
 }
 
-/// Puts the selection on the clipboard, or says why it could not.
+/// Where a copy is sent: the platform's clipboard, or a stub in a test.
 ///
-/// The copier is passed in so the decision — what to say when there is nothing to copy, and what to
-/// say when the clipboard refused — can be tested without a clipboard.
+/// A trait object rather than a direct call to [`crate::copy::to_clipboard`], so the decision — what
+/// to say when there is nothing to copy, and what to say when the clipboard refused — can be tested
+/// without a clipboard existing. Async because the real one runs a program.
+type Copier = dyn for<'a> Fn(&'a str) -> LocalBoxFuture<'a, Result<crate::copy::Copied, String>>;
+
+/// The platform's clipboard, as a [`Copier`].
+fn system_clipboard(text: &str) -> LocalBoxFuture<'_, Result<crate::copy::Copied, String>> {
+    Box::pin(crate::copy::to_clipboard(text))
+}
+
+/// Puts the selection on the clipboard, or says why it could not.
 ///
 /// A copy that worked drops the selection, so the next `Ctrl+C` is the key that stops a turn rather
 /// than a second copy of the same text. A copy that did not is left standing, because the reader's
 /// next move is to try again or to copy by hand.
-fn copy_selection(
-    copier: &dyn Fn(&str) -> Result<crate::copy::Copied, String>,
-    view: &mut ViewState,
-) {
+async fn copy_selection(copier: &Copier, view: &mut ViewState) {
     let Some(text) = view.selected_text() else {
         view.clear_selection();
         view.status = String::from("nothing is selected to copy");
         return;
     };
-    match copier(&text) {
+    match copier(&text).await {
         Ok(crate::copy::Copied::System) => {
             view.status = format!("copied {}", count_of(&text));
             view.clear_selection();
@@ -1434,16 +1462,13 @@ fn count_of(text: &str) -> String {
 /// Selecting rather than copying invisibly, because the highlight is what shows the reader *what* they
 /// got: an answer is often longer than the screen or shorter than they thought, and a copy with no
 /// evidence is one they have to paste somewhere to check.
-fn copy_last_answer(
-    copier: &dyn Fn(&str) -> Result<crate::copy::Copied, String>,
-    view: &mut ViewState,
-) {
+async fn copy_last_answer(copier: &Copier, view: &mut ViewState) {
     let Some((anchor, head, width)) = view.last_answer_range() else {
         view.status = String::from("there is no answer to copy yet");
         return;
     };
     view.select_range(anchor, head, width);
-    copy_selection(copier, view);
+    copy_selection(copier, view).await;
 }
 
 /// Puts a pasted image into the workspace and its path into the composer.
@@ -2197,12 +2222,15 @@ fn handle_selection_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome> 
 /// there: the transcript is read, not pointed at, so a click that misses the prompt is
 /// not a command.
 fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
+    // The overlay owns the keyboard, so it owns the pointer too: a click behind a modal dialogue
+    // should not move a caret — or start a selection — that the reader cannot see. A drag is guarded
+    // as well as a press, because a drag with no selection starts one, and a press that was ignored
+    // must not be turned into a selection by the movement after it.
+    let behind_a_dialogue = view.modal_open();
     match mouse.kind {
         MouseEventKind::ScrollUp => view.scroll(-MOUSE_SCROLL_ROWS),
         MouseEventKind::ScrollDown => view.scroll(MOUSE_SCROLL_ROWS),
-        // The overlay owns the keyboard, so it owns the pointer too: a click behind a
-        // modal dialogue should not move a caret the reader cannot see.
-        MouseEventKind::Down(MouseButton::Left) if !view.queue_open => {
+        MouseEventKind::Down(MouseButton::Left) if !behind_a_dialogue => {
             // The composer and the transcript are the two places a click means something: a caret in
             // the one, the start of a selection in the other. A click in the composer is not a
             // selection, so it takes any selection off.
@@ -2215,7 +2243,9 @@ fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
         // A drag extends the selection it started, and finishes it when the button comes up. Both are
         // reported as their own events because a terminal does not send a release for every pixel: the
         // drags are what draw the box, and the release is what says the reader has stopped.
-        MouseEventKind::Drag(MouseButton::Left) => view.drag_selection(mouse.column, mouse.row),
+        MouseEventKind::Drag(MouseButton::Left) if !behind_a_dialogue => {
+            view.drag_selection(mouse.column, mouse.row);
+        }
         MouseEventKind::Up(MouseButton::Left) => view.finish_selection(),
         // Scrolling sideways and every other button are not things this interface has
         // anywhere to put. Ignoring them is deliberate rather than an oversight.
@@ -3278,7 +3308,7 @@ mod tests {
         };
         assert!(message.contains("!ls"), "{message}");
 
-        let (status, echoed, reported) = nanus_kernel::runtime::block_on_local(async {
+        let (status, finished, drawn) = nanus_kernel::runtime::block_on_local(async {
             let (results, mut outcomes) = mpsc::unbounded_channel();
             let mut view = ViewState::new();
             begin_shell(String::from("printf 'hi'"), &results, &mut view);
@@ -3288,19 +3318,34 @@ mod tests {
                 .entries()
                 .last()
                 .map(|entry| entry.text().to_owned());
-            let reported = outcomes
-                .recv()
-                .await
-                .map(|outcome| crate::shell::report(&outcome));
-            (status, echoed, reported)
+            assert_eq!(
+                echoed.as_deref(),
+                Some("$ printf 'hi'"),
+                "it is echoed first"
+            );
+            if let Some(outcome) = outcomes.recv().await {
+                shell_finished(&outcome, &mut view);
+            }
+            let drawn = view
+                .transcript
+                .entries()
+                .iter()
+                .map(|entry| entry.text().to_owned())
+                .collect::<Vec<_>>();
+            (status, view.status.clone(), drawn)
         });
         assert_eq!(status, "running: printf 'hi'");
+        assert_eq!(finished, "ready");
         assert_eq!(
-            echoed.as_deref(),
-            Some("$ printf 'hi'"),
-            "it is echoed first"
+            drawn,
+            vec![String::from("$ printf 'hi'"), String::from("hi")],
+            "the echo, then what came back: one entry each"
         );
-        assert_eq!(reported.as_deref(), Some("$ printf 'hi'\nhi"));
+        assert_eq!(
+            drawn.iter().filter(|row| row.contains("$ printf")).count(),
+            1,
+            "the command is named once, by the echo that was already drawn"
+        );
     }
 
     /// A mention in a session with no workspace, and a mention that matches nothing, both close the
@@ -3433,19 +3478,28 @@ mod tests {
     type Copied = std::rc::Rc<std::cell::RefCell<String>>;
 
     /// A copier that records what it was asked to copy, and can be told to fail.
-    #[allow(clippy::type_complexity)]
-    fn recording_copier(
-        refuses: bool,
-    ) -> (Copied, impl Fn(&str) -> Result<crate::copy::Copied, String>) {
+    ///
+    /// Asynchronous like the real one, because that is what [`Copier`] is: the platform's clipboard is
+    /// a program, so the fake has to have the same shape for the decision around it to be the same
+    /// decision. Boxed and annotated rather than returned as `impl Fn`, because a closure that hands
+    /// back a future borrowing its own argument only generalises to `for<'a> Fn` when it is checked
+    /// against that type.
+    fn recording_copier(refuses: bool) -> (Copied, Box<Copier>) {
         let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
         let recorder = std::rc::Rc::clone(&copied);
-        let take = move |text: &str| {
-            if refuses {
-                return Err(String::from("no clipboard here"));
-            }
-            recorder.borrow_mut().push_str(text);
-            Ok(crate::copy::Copied::System)
-        };
+        let take: Box<Copier> = Box::new(
+            move |text: &str| -> LocalBoxFuture<'_, Result<crate::copy::Copied, String>> {
+                let recorder = std::rc::Rc::clone(&recorder);
+                let text = text.to_owned();
+                Box::pin(async move {
+                    if refuses {
+                        return Err(String::from("no clipboard here"));
+                    }
+                    recorder.borrow_mut().push_str(&text);
+                    Ok(crate::copy::Copied::System)
+                })
+            },
+        );
         (copied, take)
     }
 
@@ -3453,68 +3507,59 @@ mod tests {
     /// stops a turn rather than copying the same text twice.
     #[test]
     fn copying_reports_where_the_text_went() {
-        let mut view = ViewState::new();
-        view.select_range(crate::view::Place::start(0), crate::view::Place::end(0), 40);
-        // Nothing is drawn, so there are no lines to copy: the interface says so rather than copying
-        // an empty string.
         // Nothing is drawn, so there are no lines to copy: the interface says so rather than copying
         // an empty string, and drops the selection that no longer points at anything.
-        let rejected = |_: &str| Err(String::from("no clipboard"));
-        copy_selection(&rejected, &mut view);
-        assert!(
-            view.status.contains("nothing is selected"),
-            "{}",
-            view.status
-        );
-        assert!(!view.has_selection(), "and the stale selection is gone");
+        let (status, gone) = nanus_kernel::runtime::block_on_local(async {
+            let mut view = ViewState::new();
+            view.select_range(crate::view::Place::start(0), crate::view::Place::end(0), 40);
+            let (_, refused) = recording_copier(true);
+            copy_selection(&refused, &mut view).await;
+            (view.status.clone(), !view.has_selection())
+        });
+        assert!(status.contains("nothing is selected"), "{status}");
+        assert!(gone, "and the stale selection is gone");
 
         // A drawn answer can be selected and copied, and the copy says how much went.
-        let mut drawn_view = ViewState::new();
-        drawn_view
-            .transcript
+        let mut view = ViewState::new();
+        view.transcript
             .push(Entry::prose(Role::Assistant, "the answer"));
-        let text = drawn(&mut drawn_view, 60, 16);
+        let text = drawn(&mut view, 60, 16);
         let row = u16::try_from(
             text.lines()
                 .position(|line| line.contains("the answer"))
                 .expect("the answer is drawn"),
         )
         .expect("a row within a terminal");
-        let _ = drawn_view.begin_selection(0, row);
-        drawn_view.drag_selection(60, row);
+        let _ = view.begin_selection(0, row);
+        view.drag_selection(60, row);
         let (copied, send) = recording_copier(false);
-        copy_selection(&send, &mut drawn_view);
+        let status = nanus_kernel::runtime::block_on_local(async {
+            copy_selection(&send, &mut view).await;
+            view.status.clone()
+        });
         assert_eq!(copied.borrow().as_str(), "the answer");
+        assert!(status.contains("copied"), "{status}");
         assert!(
-            drawn_view.status.contains("copied"),
-            "{}",
-            drawn_view.status
-        );
-        assert!(
-            !drawn_view.has_selection(),
+            !view.has_selection(),
             "the highlight goes, so the next Ctrl+C stops a turn"
         );
 
         // A clipboard that refused says so, and leaves the selection standing so the reader can try
         // again or copy it by hand.
-        let mut refusing_view = ViewState::new();
-        refusing_view
+        let mut refusing = ViewState::new();
+        refusing
             .transcript
             .push(Entry::prose(Role::Assistant, "the answer"));
-        drawn(&mut refusing_view, 60, 16);
-        let _ = refusing_view.begin_selection(0, row);
-        refusing_view.drag_selection(60, row);
-        let (_, refusing) = recording_copier(true);
-        copy_selection(&refusing, &mut refusing_view);
-        assert!(
-            refusing_view.status.contains("not copied"),
-            "{}",
-            refusing_view.status
-        );
-        assert!(
-            refusing_view.has_selection(),
-            "the selection is still there"
-        );
+        drawn(&mut refusing, 60, 16);
+        let _ = refusing.begin_selection(0, row);
+        refusing.drag_selection(60, row);
+        let (_, refuses) = recording_copier(true);
+        let status = nanus_kernel::runtime::block_on_local(async {
+            copy_selection(&refuses, &mut refusing).await;
+            refusing.status.clone()
+        });
+        assert!(status.contains("not copied"), "{status}");
+        assert!(refusing.has_selection(), "the selection is still there");
     }
 
     /// `/copy` takes the newest answer without anyone having to point at it, which is the commonest
@@ -3533,7 +3578,9 @@ mod tests {
             .push(Entry::prose(Role::Assistant, "the answer"));
         drawn(&mut view, 60, 16);
         let (copied, send) = recording_copier(false);
-        copy_last_answer(&send, &mut view);
+        nanus_kernel::runtime::block_on_local(async {
+            copy_last_answer(&send, &mut view).await;
+        });
         assert!(
             copied.borrow().contains("the answer"),
             "{:?}",
@@ -3550,7 +3597,9 @@ mod tests {
         let mut empty = ViewState::new();
         drawn(&mut empty, 60, 16);
         let (nothing, send) = recording_copier(false);
-        copy_last_answer(&send, &mut empty);
+        nanus_kernel::runtime::block_on_local(async {
+            copy_last_answer(&send, &mut empty).await;
+        });
         assert!(nothing.borrow().is_empty());
         assert!(empty.status.contains("no answer"), "{}", empty.status);
     }
@@ -3619,6 +3668,84 @@ mod tests {
             !typing.has_selection(),
             "the composer is not the transcript"
         );
+    }
+
+    /// A click moves the caret, and a mention menu follows the caret rather than the text: clicking
+    /// away from the word being named closes it, which is what the event loop does by refreshing after
+    /// a mouse event as well as after a key.
+    #[test]
+    fn a_click_that_leaves_the_word_closes_the_mention_menu() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("main.rs"), "").expect("a file");
+        let mut view = ViewState::new();
+        let mut files = None;
+        view.input.insert_str("look at @main.rs");
+        refresh_mentions(&mut view, &mut files, dir.path().to_str());
+        assert!(view.mention_open(), "the word is named");
+
+        let text = drawn(&mut view, 60, 16);
+        let row = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("@main.rs"))
+                .expect("the prompt is drawn"),
+        )
+        .expect("a row within a terminal");
+        // Inside the composer, on the word before the mention rather than at its edge: the caret lands
+        // somewhere in `look`, which names nothing.
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, row),
+            &mut view,
+        );
+        refresh_mentions(&mut view, &mut files, dir.path().to_str());
+        assert!(
+            !view.mention_open(),
+            "the caret is before the `@`, so nothing is being named: {}",
+            view.input.text()
+        );
+    }
+
+    /// What owns the keyboard owns the pointer: a click behind a dialogue the reader is answering must
+    /// not move a caret, or start a selection, that they cannot see.
+    #[test]
+    fn a_click_behind_a_dialogue_is_ignored() {
+        let mut view = ViewState::new();
+        view.transcript
+            .push(Entry::prose(Role::Assistant, "some text"));
+        let text = drawn(&mut view, 60, 16);
+        let row = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("some text"))
+                .expect("the transcript is drawn"),
+        )
+        .expect("a row within a terminal");
+
+        // The same click with nothing in the way is a selection, which is what makes the guard below
+        // mean something rather than passing on a click that never did anything.
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, row),
+            &mut view,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 5, row),
+            &mut view,
+        );
+        assert!(
+            view.has_selection(),
+            "the transcript is not behind anything"
+        );
+
+        view.clear_selection();
+        view.open_help();
+        assert!(view.modal_open(), "the key list is up");
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, row),
+            &mut view,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 5, row),
+            &mut view,
+        );
+        assert!(!view.has_selection(), "the dialogue owns the pointer");
     }
 
     /// `Ctrl+V` writes the clipboard's image into the workspace and puts its path in the prompt.

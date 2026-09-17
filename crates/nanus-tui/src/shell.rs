@@ -21,6 +21,15 @@
 //! command ran, and a turn's stream would arrive in one lump afterwards — or not at all, since a
 //! full frame queue drops progress rather than blocking.
 //!
+//! ## Why the command has no input
+//!
+//! The command is given no standard input at all, and that is a decision rather than an
+//! omission: this program's standard input is the terminal, and the terminal belongs to the
+//! interface. It is in raw mode, so a command reading it would take keystrokes the composer is
+//! being given at the same time, and it could never be sent an end of file — `Ctrl+D` is this
+//! interface's own key. So a command that reads gets an end of input at once instead of
+//! hanging, and one that wants input takes it from a file or a pipe of its own making.
+//!
 //! ## Why the output is bounded
 //!
 //! `!find /` prints more than the transcript should hold. What is drawn is the first rows of it and
@@ -47,10 +56,11 @@ const MAX_LINES: usize = 40;
 const MAX_CHARS: usize = 4_000;
 
 /// What one command did.
+///
+/// The command itself is not carried: the interface echoes it when it starts, so nothing here has to
+/// say it again, and a field nobody reads is one that can drift from what was run.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Outcome {
-    /// The command, as it was typed, without its `!`.
-    pub(crate) command: String,
     /// What the command wrote to standard output.
     pub(crate) stdout: String,
     /// What it wrote to standard error.
@@ -66,9 +76,8 @@ pub(crate) struct Outcome {
 
 impl Outcome {
     /// Records a command that could not be started.
-    fn refused(command: &str, reason: String) -> Self {
+    fn refused(reason: String) -> Self {
         Self {
-            command: command.to_owned(),
             stdout: String::new(),
             stderr: String::new(),
             status: None,
@@ -98,50 +107,65 @@ pub(crate) async fn run(command: &str) -> Outcome {
         .arg("-c")
         .arg(command)
         // The streams are read rather than inherited, so the output can be drawn in the transcript
-        // rather than appearing behind the alternate screen the interface is drawing on.
+        // rather than appearing behind the alternate screen the interface is drawing on — and
+        // stdin is closed rather than inherited, so a command cannot take the keyboard the
+        // composer behind it is being typed into. See the module note.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await;
     match child {
         Ok(output) => Outcome {
-            command: command.to_owned(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             status: output.status.code(),
             failed: None,
         },
-        Err(error) => Outcome::refused(command, error.to_string()),
+        Err(error) => Outcome::refused(error.to_string()),
     }
 }
 
 /// Renders what a command did, as the text the transcript shows.
 ///
-/// The command itself leads, because a transcript of several commands otherwise shows output with
-/// nothing saying what produced it. A command that succeeded says nothing about that: it is the
-/// shell's own convention, and a line saying `[exit 0]` under every successful command is noise a
-/// reader learns to skip — which is exactly the line they would then skip when it said something
-/// else.
+/// The command is deliberately *not* repeated here. The interface echoes it when it starts the
+/// command — a command that takes a minute must not look like nothing happened — and that echo is
+/// the line this answers, so naming it again would draw the same line twice. What is here is what
+/// came back: the two streams, the exit status when it was not zero, and the reason when it could
+/// not be started at all.
+///
+/// A command that printed nothing and succeeded therefore answers with nothing. That is an answer
+/// rather than a gap — the echo above it already says what ran — and the runtime draws no entry for
+/// it rather than an empty one.
 #[must_use]
 pub(crate) fn report(outcome: &Outcome) -> String {
-    let mut text = format!("$ {}", outcome.command);
     if let Some(reason) = &outcome.failed {
-        let _ = write!(text, "\n{reason}");
-        return text;
+        return reason.clone();
     }
+    let mut text = String::new();
     for block in [&outcome.stdout, &outcome.stderr] {
         if block.trim().is_empty() {
             continue;
         }
-        text.push('\n');
+        if !text.is_empty() {
+            text.push('\n');
+        }
         text.push_str(&bounded(block));
     }
     match outcome.status {
         Some(0) => {}
         Some(code) => {
-            let _ = write!(text, "\n[exit {code}]");
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let _ = write!(text, "[exit {code}]");
         }
-        None => text.push_str("\n[killed]"),
+        None => {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[killed]");
+        }
     }
     text
 }
@@ -183,7 +207,6 @@ mod tests {
 
     fn outcome(stdout: &str, status: Option<i32>) -> Outcome {
         Outcome {
-            command: String::from("ls"),
             stdout: stdout.to_owned(),
             stderr: String::new(),
             status,
@@ -191,19 +214,20 @@ mod tests {
         }
     }
 
-    /// The command leads the report, because output with nothing saying what produced it is a
-    /// transcript a reader has to reconstruct.
+    /// The report is what came back, and nothing about what was run: the command is echoed when it
+    /// starts, so a report that named it too would draw the same line twice.
     #[test]
-    fn a_report_says_what_was_run_and_what_came_back() {
-        assert_eq!(report(&outcome("a\nb\n", Some(0))), "$ ls\na\nb");
+    fn a_report_says_what_came_back_and_not_what_was_run() {
+        assert_eq!(report(&outcome("a\nb\n", Some(0))), "a\nb");
         // A successful command says nothing else: `[exit 0]` under every one is noise.
         assert!(!report(&outcome("a\n", Some(0))).contains("exit"));
         // Anything else is said, and said where a reader is looking.
         assert!(report(&outcome("", Some(1))).contains("[exit 1]"));
         assert!(report(&outcome("", None)).contains("[killed]"));
 
-        // A command that printed nothing is one line: what was run, and nothing more.
-        assert_eq!(report(&outcome("", Some(0))), "$ ls");
+        // A command that printed nothing and succeeded answers with nothing: the echo above it is
+        // the whole of what the reader sees, and the runtime draws no second entry for it.
+        assert_eq!(report(&outcome("", Some(0))), "");
 
         // Standard error is shown too, because a command that failed usually explained why there.
         let mut complained = outcome("", Some(2));
@@ -215,10 +239,9 @@ mod tests {
 
     #[test]
     fn a_command_that_could_not_be_started_says_so() {
-        let refused = Outcome::refused("ls", String::from("no such file or directory"));
+        let refused = Outcome::refused(String::from("no such file or directory"));
         let text = report(&refused);
-        assert!(text.starts_with("$ ls"), "{text}");
-        assert!(text.contains("no such file or directory"), "{text}");
+        assert_eq!(text, "no such file or directory");
         assert!(!refused.succeeded());
     }
 
@@ -269,7 +292,7 @@ mod tests {
         });
         assert!(ran.0.succeeded(), "{:?}", ran.0);
         assert_eq!(ran.0.stdout, "hi");
-        assert_eq!(report(&ran.0), "$ printf 'hi'\nhi");
+        assert_eq!(report(&ran.0), "hi");
 
         assert_eq!(ran.1.status, Some(3));
         assert!(ran.1.stderr.contains("oops"), "{:?}", ran.1);
@@ -287,5 +310,16 @@ mod tests {
         });
         assert!(piped.succeeded(), "{piped:?}");
         assert_eq!(piped.stdout.trim(), "3");
+    }
+
+    /// The command gets no standard input, which is the difference between a command that reads and a
+    /// command that hangs: the interface's own standard input is a raw-mode terminal whose keystrokes
+    /// belong to the composer, and there is no end of file to give it. This test would never finish if
+    /// the terminal were inherited.
+    #[test]
+    fn a_command_that_reads_standard_input_gets_an_end_of_input() {
+        let read = nanus_kernel::runtime::block_on_local(async { run("cat").await });
+        assert!(read.succeeded(), "{read:?}");
+        assert_eq!(read.stdout, "", "there was nothing to read, and no wait");
     }
 }

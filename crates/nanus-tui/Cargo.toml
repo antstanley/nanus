@@ -66,6 +66,9 @@ tokio = { workspace = true, optional = true, features = [
     # carries the link's transport, so a child waited on synchronously would stop a running turn's
     # frames being read.
     "process",
+    # And the clipboard is the same argument in the other direction: putting a selection on it is a
+    # child process too, so its input is written to a pipe rather than through a blocking call.
+    "io-util",
 ] }
 
 [dev-dependencies]

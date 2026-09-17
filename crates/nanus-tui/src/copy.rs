@@ -17,14 +17,27 @@
 //! Nothing here can *confirm* the terminal took it: `OSC 52` is a request with no reply, and a
 //! terminal that does not implement it ignores it silently. That is why the two destinations are
 //! reported differently — see [`Copied`] — rather than both being called "copied".
+//!
+//! ## Why this is asynchronous
+//!
+//! The tool is a child process, and it is *awaited* rather than waited on. This runs from the
+//! interface's event loop, and that loop is the thread the link's transport is also read on: a child
+//! waited on synchronously would stop a running turn's frames arriving for as long as the tool took,
+//! and would freeze the interface outright if the tool never finished — which is exactly the argument
+//! `crate::shell` makes for the `!` escape it runs.
 
 // The module is private, so `pub(crate)` and `pub` are the same reachability; the explicit
 // `pub(crate)` says which surface these items are meant for, and this is the lint's counterpart —
 // the same allow `paste.rs`, `shell.rs`, `mentions.rs`, `help.rs`, and `markdown/mod.rs` carry.
 #![allow(clippy::redundant_pub_crate)]
 
+// Both: the clipboard tool's input is written through tokio's pipe, and the `OSC 52` escape goes to
+// this process's own standard output, which is an ordinary blocking handle.
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use tokio::io::AsyncWriteExt as _;
+use tokio::process::Command;
 
 /// Where a copy ended up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,12 +59,12 @@ pub(crate) enum Copied {
 /// Returns a message when the text is empty, or when neither a tool nor the terminal could be asked
 /// at all — which means the write to the interface's own output failed, and is worth reporting because
 /// it is the one failure a reader can act on.
-pub(crate) fn to_clipboard(text: &str) -> Result<Copied, String> {
+pub(crate) async fn to_clipboard(text: &str) -> Result<Copied, String> {
     if text.trim().is_empty() {
         return Err(String::from("there is nothing selected to copy"));
     }
     for (program, args) in writers() {
-        if let Some(copied) = pipe_to(program, &args, text) {
+        if let Some(copied) = pipe_to(program, &args, text).await {
             return Ok(copied);
         }
     }
@@ -70,7 +83,7 @@ fn writers() -> Vec<(&'static str, Vec<&'static str>)> {
 }
 
 /// Writes `text` to one tool's standard input, when that tool is there and took it.
-fn pipe_to(program: &str, args: &[&str], text: &str) -> Option<Copied> {
+async fn pipe_to(program: &str, args: &[&str], text: &str) -> Option<Copied> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -80,11 +93,11 @@ fn pipe_to(program: &str, args: &[&str], text: &str) -> Option<Copied> {
         .ok()?;
     {
         let mut stdin = child.stdin.take()?;
-        stdin.write_all(text.as_bytes()).ok()?;
+        stdin.write_all(text.as_bytes()).await.ok()?;
         // Dropped here rather than at the end of the function, because a clipboard tool reads until
         // its input closes: waiting for it before the pipe is shut is waiting forever.
     }
-    let status = child.wait().ok()?;
+    let status = child.wait().await.ok()?;
     status.success().then_some(Copied::System)
 }
 
@@ -178,21 +191,31 @@ mod tests {
     /// not have their clipboard emptied.
     #[test]
     fn an_empty_selection_is_refused() {
-        assert!(to_clipboard("").is_err());
-        assert!(to_clipboard("   \n ").is_err());
+        let (empty, blank) = nanus_kernel::runtime::block_on_local(async {
+            (to_clipboard("").await, to_clipboard("   \n ").await)
+        });
+        assert!(empty.is_err(), "{empty:?}");
+        assert!(blank.is_err(), "{blank:?}");
     }
 
     /// A tool that is not installed declines rather than failing the copy: this is the path that
     /// decides whether the terminal is asked, and on a machine with no `xclip` it is the ordinary one.
     #[test]
     fn a_clipboard_tool_that_is_not_there_declines() {
-        assert_eq!(pipe_to("definitely-not-a-clipboard-tool", &[], "x"), None);
+        let (absent, took_it, refused) = nanus_kernel::runtime::block_on_local(async {
+            (
+                pipe_to("definitely-not-a-clipboard-tool", &[], "x").await,
+                pipe_to("true", &[], "x").await,
+                pipe_to("false", &[], "x").await,
+            )
+        });
+        assert_eq!(absent, None);
         assert_eq!(
-            pipe_to("true", &[], "x"),
+            took_it,
             Some(Copied::System),
             "a tool that takes it says so"
         );
         // A tool that refused — a real one with nothing to select, say — is not a destination.
-        assert_eq!(pipe_to("false", &[], "x"), None);
+        assert_eq!(refused, None);
     }
 }

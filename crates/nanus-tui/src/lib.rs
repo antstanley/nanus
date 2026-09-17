@@ -48,10 +48,13 @@ mod paste;
 // query. Private because it is a detail of the composer rather than a surface of the crate.
 mod mentions;
 // The `!` escape. Private because it is the runtime's own shell rather than a display: nothing the
-// view draws is a function of it.
+// view draws is a function of it. Behind the runtime feature for the same reason, and because it is
+// the half that runs a process.
+#[cfg(feature = "runtime")]
 mod shell;
 // Putting a selection on the clipboard, which is the other direction from `paste`. Private for the
 // same reason: it is a side effect the runtime owns, not something the view draws.
+#[cfg(feature = "runtime")]
 mod copy;
 // The markdown renderer is an implementation detail of the view: it produces the same
 // `Line`s every other entry is drawn from, and nothing outside this crate needs to name

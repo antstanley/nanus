@@ -228,7 +228,7 @@ supports:
   Read from the log and from the interface's own measurements respectively, so the
   session's totals cover turns that ran before this interface opened. See
   [the interface](tui.md#commands).
-- **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, and `/model`.
+- **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, `/model`, and `/copy`.
   Anything else is named in the transcript rather than sent to the model.
 - **The key list on screen** (`?`, or `/help`), scrolled from one table so a
   binding cannot be documented in one place and forgotten in another.

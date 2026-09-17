@@ -37,12 +37,33 @@ pub enum Command {
 }
 
 impl Command {
-    /// Every command, by the names that reach it.
+    /// Every command, with the names that reach it.
     ///
-    /// The table is the list an unrecognised command is answered with, so a command added
-    /// here is documented by existing rather than by somebody remembering to update a
-    /// message.
-    pub const NAMES: &'static [&'static str] = &["/exit", "/quit", "/stats", "/help", "/clear"];
+    /// One table rather than two, because the two uses must not drift: this is what
+    /// [`submission_of`] resolves against *and* what an unrecognised command is answered with, so a
+    /// name cannot resolve without being offered, and a command cannot be offered without resolving.
+    /// `/model` and `/copy` were each added to the enum and to the resolver while this list stayed as
+    /// it was, which made the interface tell a reader who mistyped one that it did not exist.
+    ///
+    /// The variants are written out rather than derived, because the language cannot enumerate an
+    /// enum; the test below is what holds the table and the enum together.
+    const TABLE: &'static [(Self, &'static [&'static str])] = &[
+        (Self::Exit, &["/exit", "/quit"]),
+        (Self::Stats, &["/stats"]),
+        (Self::Help, &["/help"]),
+        (Self::Clear, &["/clear"]),
+        (Self::Model, &["/model"]),
+        (Self::Copy, &["/copy"]),
+    ];
+
+    /// Every name that reaches a command, in the order a refusal lists them.
+    #[must_use]
+    pub fn names() -> Vec<&'static str> {
+        Self::TABLE
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect()
+    }
 }
 
 /// What the interface makes of a line the reader submitted.
@@ -82,17 +103,17 @@ pub fn submission_of(text: &str) -> Submission {
     if !first.starts_with('/') {
         return Submission::Prompt;
     }
-    match first {
-        "/exit" | "/quit" => Submission::Run(Command::Exit),
-        "/stats" => Submission::Run(Command::Stats),
-        "/help" => Submission::Run(Command::Help),
-        "/clear" => Submission::Run(Command::Clear),
-        "/model" => Submission::Run(Command::Model),
-        "/copy" => Submission::Run(Command::Copy),
+    // Read from the table rather than matched again here, so the names that resolve and the names
+    // that are offered are the same list.
+    match Command::TABLE
+        .iter()
+        .find(|(_, names)| names.contains(&first))
+    {
+        Some((command, _)) => Submission::Run(*command),
         // A slash alone, or a path, or a typo: named as what was typed rather than
         // guessed at, because "no such command: /quitx" is what tells a reader they
         // fat-fingered it.
-        other => Submission::Unknown(other.to_owned()),
+        None => Submission::Unknown(first.to_owned()),
     }
 }
 
@@ -199,13 +220,50 @@ mod tests {
         );
     }
 
+    /// The table and the enum are one list: every command is in the table under the names that reach
+    /// it, every one of those names resolves back to its command, and the table holds nothing the enum
+    /// does not have.
+    ///
+    /// The variants are written out here because the language cannot enumerate them, and that written
+    /// list is exactly what this test exists to check — a command added to the enum and forgotten in
+    /// the table is a command the interface answers a typo by denying.
     #[test]
-    fn every_name_in_the_table_reaches_a_command() {
-        for name in Command::NAMES {
-            assert!(
-                matches!(submission_of(name), Submission::Run(_)),
-                "{name} is named but does not resolve"
-            );
+    fn every_command_is_named_and_every_name_reaches_its_command() {
+        let every = [
+            Command::Exit,
+            Command::Stats,
+            Command::Help,
+            Command::Clear,
+            Command::Model,
+            Command::Copy,
+        ];
+        for command in every {
+            let (_, names) = Command::TABLE
+                .iter()
+                .find(|(held, _)| *held == command)
+                .unwrap_or_else(|| panic!("{command:?} reaches nothing: it is not in the table"));
+            assert!(!names.is_empty(), "{command:?} has no name");
+            for name in *names {
+                assert_eq!(submission_of(name), Submission::Run(command), "{name}");
+            }
+        }
+        assert_eq!(
+            Command::TABLE.len(),
+            every.len(),
+            "the table holds a command the enum no longer has, or is missing one"
+        );
+
+        // And the sentence a typo is answered with lists all of them, which is the whole point of
+        // the table being one list rather than two.
+        let offered = Command::names();
+        assert_eq!(
+            offered,
+            vec![
+                "/exit", "/quit", "/stats", "/help", "/clear", "/model", "/copy"
+            ]
+        );
+        for name in offered {
+            assert!(matches!(submission_of(name), Submission::Run(_)), "{name}");
         }
     }
 }
