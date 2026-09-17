@@ -64,6 +64,23 @@ a reference.
 The findings in full, why the suite could not see them, and the tests that pin them are in
 [the bugs a certificate review found](testing.md#the-bugs-a-certificate-review-found).
 
+## Shipped: the readings a harness comparison needs
+
+A study of harness cost across models ([HarnessTax](https://harnesstax.github.io/)) measures a
+harness by two things nanus could not report: what a run *cost*, and what configuration
+produced it. Neither was a correctness bug; both were an instrumentation gap, and the data was
+already being recorded and then thrown away.
+
+| What landed | Where it lives |
+|---|---|
+| **`nanus sessions show [--json] <ref>` reports a run**, from the log alone: the configuration, the turns, steps and requests, prompt tokens split into cached and read, generated tokens and how many were thinking, a per-model breakdown, and why the last turn ended. It composes nothing and reads no key, and `nanus run --verbose` prints the same totals in one line on stderr as the turn finishes. The figures existed — `RunOutcome` already carried `usage_totals()` and nothing printed it. | `nanus-cli/src/cli.rs`, `nanus-domain/src/session.rs` |
+| **A session records what produced it.** The header carries the configured model, the reasoning effort, the sandbox mode, the approval policy and the release; each model turn carries the model and effort that produced it, because a session can be resumed against a different model and a header-only record would describe the first request as though it described all of them. The effort is asked of the adapter, which is the component that fills in an unset one. Every field is optional and absent means *not recorded*: the session format version did not move, because a header field is not a change to how the body is read, and moving it would have made every existing transcript unreadable. | `nanus-domain/src/session.rs`, `nanus-bundle/src/{compose,agent_loop}.rs`, `nanus-ports/src/llm.rs` |
+
+Still open from the same study, and deliberately not done here: no figure is denominated in
+money, so a run's cost is reported in tokens and whatever price list the reader brings; and
+there is no task suite to run a comparison *over*, which is the item that would turn these
+readings into a result.
+
 ## Next: what the interface needs to be a daily driver
 
 | # | Item | Size | Notes |

@@ -130,8 +130,42 @@ fn the_pending_split_mounts_and_runs_a_turn() {
 
     // A session can be created and saved, which is the CLI's post-run step.
     let session = harness.new_session(root);
+    // And it is stamped with the configuration the harness will actually run under, taken
+    // from the composition rather than restated by the caller. A session that could not say
+    // which model produced it is one no two runs can be compared through.
+    let origin = session
+        .origin()
+        .expect("a composed session records its origin");
+    assert_eq!(origin.model.as_deref(), Some(settings.model.as_str()));
+    assert_eq!(
+        origin.approval.as_deref(),
+        Some(settings.approval_policy.as_str())
+    );
+    assert_eq!(
+        origin.sandbox.as_deref(),
+        Some(settings.sandbox_mode.as_str())
+    );
+    assert_eq!(
+        origin.effort.as_deref(),
+        Some(settings.reasoning_effort.to_port().as_str()),
+        "the effort comes from the adapter, which is what fills in an unset one"
+    );
+    assert!(
+        origin
+            .harness
+            .as_deref()
+            .is_some_and(|version| version.starts_with("nanus/")),
+        "the release that wrote it is recorded: {origin:?}"
+    );
+
     let recorded = runtime.block_on(harness.store.save(&session));
     assert!(recorded.is_ok(), "the session is persisted: {recorded:?}");
+    // Read back from the store rather than from memory: the stamp has to survive the file,
+    // which is the only copy there is.
+    let reloaded = runtime
+        .block_on(harness.store.load(session.id()))
+        .expect("the session reads back");
+    assert_eq!(reloaded.origin(), Some(origin));
 
     // And the composition tears down cleanly, reverting every effect.
     let shutdown = harness.shutdown();
@@ -287,6 +321,8 @@ fn an_absent_usage_report_is_not_recorded_as_zero() {
         tool_calls: Vec::new(),
         usage: None,
         interrupted: false,
+        model: None,
+        effort: None,
     });
     // A session whose only turn reported nothing totals zero tokens, and — the point —
     // the log says the report was absent rather than empty.

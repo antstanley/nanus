@@ -14,9 +14,10 @@ nanus sessions name project-x 01a09a98…         # or rename it later
 ## What a session is
 
 An append-only log of events — turns, messages, tool calls and their results — plus the
-identity of the conversation: a store key, a creation time, and the directory it ran in.
-It is the only copy. Everything a client shows is derived from it, which is why the agent
-records before it answers and why a transcript is reproducible rather than reconstructed.
+identity of the conversation: a store key, a creation time, the directory it ran in, and the
+harness configuration it ran under. It is the only copy. Everything a client shows is derived
+from it, which is why the agent records before it answers and why a transcript is
+reproducible rather than reconstructed.
 
 ```text
 <nanus home>/
@@ -83,6 +84,40 @@ is left pointing at nothing. It is not reversible, and nothing here knows whethe
 somewhere is holding the session: a held session can still be saved again by the turn
 writing it, which recreates the directory. Stop the agent, or attach and let it go, before
 deleting one it is serving.
+
+## What a session says about itself
+
+A session records the configuration it was created under — the model, the reasoning effort,
+the sandbox mode, the approval policy, and the release that wrote it — in its header. It also
+records the model and effort on each model turn, because a session can be resumed against a
+different model: the header describes how the conversation *started*, and the per-turn record
+describes what produced each part of it. Resuming does not restamp the session, because the
+earlier turns really were produced by the earlier configuration.
+
+Every one of those fields is optional, and `absent` means *not recorded* rather than a
+default. A session written before this existed has none of them, and it reads back with the
+gap admitted instead of a plausible value invented for it. That is also why the session
+format version did not move: the version decides how the *body* is read, an older build
+ignores a header field it does not know, and treating a new header as an unreadable version
+would have made every existing transcript unopenable.
+
+## Reporting on a run
+
+```sh
+nanus sessions show nightly            # what it did and what it spent
+nanus sessions show --json nightly     # the same figures, for a script
+```
+
+Both read the log and nothing else, so they need no model and no API key, and the same
+session reports the same figures whenever it is asked. The report names the configuration
+above, the turns, steps and requests, the prompt tokens split into cached and read, the
+generated tokens and how many of them were thinking, a per-model breakdown when a session
+used more than one, and why the last turn ended.
+
+`nanus run --verbose` prints a one-line version of the same totals to stderr when the turn
+finishes, which is the reading somebody wants while watching. The command is the reading
+somebody wants afterwards, and the only one that works for a session the interface or a
+service produced.
 
 ## Resuming
 

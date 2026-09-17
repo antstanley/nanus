@@ -330,9 +330,30 @@ so leaving it stops nothing but the interface — which is the difference betwee
 window and stopping a server. A turn still running when the interface leaves is abandoned
 rather than finished: the agent aborts it, and an aborted turn is not recorded.
 
+**The session is summarised on the way out.** Leaving prints a table of what the session did
+and what it spent, on the screen the shell carries on from — the terminal is already back to
+its normal mode and off the alternate screen by the time it is written, so the figures stay
+where a reader can scroll back to them rather than disappearing with the interface.
+
+It is two tables because the figures have two scopes. The first is the session's: the model
+and the permission state it ran under, the turns, steps and requests, the prompt split into
+cached and read, the generated tokens and how many of them were thinking, a row per model
+when a session used more than one, and why the last turn ended. All of it is read from the
+log, so it covers the whole conversation — a session that was resumed includes the turns that
+ran before this interface existed.
+
+The second is the run's: the same rates and waits the row under the composer reports, as
+`last` and `average` side by side. Only the process that watched the responses arrive can know
+them, which is why they are not in the log beside the totals — and why the table is absent
+entirely when the interface watched nothing. Reading a recording with `--session` prints the
+first table and no second one, because nothing was measured; a table of dashes would say
+something had been measured and came back empty.
+
+A reading nobody took is a dash rather than a zero, and a session recorded before the
+configuration was written down says so once rather than showing five dashed rows.
+
 `Shift+Enter` needs a word, because how it reaches a program is not what you would expect.
 **It is not one key.** Two different things can happen when you press it:
-
 - **The terminal types a character.** A line feed, `0x0A`. This is what
   [Ghostty](https://ghostty.org) does by default: `shift+enter` is bound to "send a
   newline" rather than reported as a key, so nothing about key protocols is involved — the

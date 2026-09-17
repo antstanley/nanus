@@ -172,6 +172,8 @@ fn reasoning_is_replayed_when_a_turn_carries_tool_calls() {
         )],
         usage: None,
         interrupted: false,
+        model: None,
+        effort: None,
     });
     let messages = session.derive_messages();
     let Some(assistant) = messages.first() else {
@@ -211,6 +213,8 @@ fn the_fold_skips_empty_assistant_turns_and_keeps_tool_results() {
         tool_calls: Vec::new(),
         usage: Some(Usage::new(1, 0, 0, 0, 1)),
         interrupted: false,
+        model: None,
+        effort: None,
     });
     session.append(SessionEvent::AssistantMessage {
         text: Some("calling a tool".to_owned()),
@@ -218,6 +222,8 @@ fn the_fold_skips_empty_assistant_turns_and_keeps_tool_results() {
         tool_calls: vec![ToolCall::new(ToolCallId::new("c"), name("read"), json!({}))],
         usage: None,
         interrupted: false,
+        model: None,
+        effort: None,
     });
     session.append(SessionEvent::ToolResult {
         call_id: ToolCallId::new("c"),
@@ -264,6 +270,8 @@ fn populated_session() -> Session {
         )],
         usage: Some(Usage::new(10, 5, 2, 1, 9)),
         interrupted: false,
+        model: None,
+        effort: None,
     });
     session.append(SessionEvent::ToolCall {
         call_id: ToolCallId::new("c-1"),
@@ -592,32 +600,40 @@ fn event() -> impl Strategy<Value = SessionEvent> {
             prop::collection::vec((tool_name_text(), any::<bool>()), 0..3),
             prop::option::of(usage()),
             any::<bool>(),
+            // The provenance fields are generated too, so the round-trip property covers a
+            // recorded model and a recorded gap rather than only the absent case.
+            prop::option::of(text()),
+            prop::option::of(text()),
         )
-            .prop_map(|(text, reasoning, calls, usage, interrupted)| {
-                let tool_calls = calls
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (tool, object))| {
-                        let arguments = if object {
-                            json!({ "index": index })
-                        } else {
-                            json!({})
-                        };
-                        ToolCall::new(
-                            ToolCallId::new(format!("c-{index}")),
-                            name(&tool),
-                            arguments,
-                        )
-                    })
-                    .collect();
-                SessionEvent::AssistantMessage {
-                    text,
-                    reasoning,
-                    tool_calls,
-                    usage,
-                    interrupted,
-                }
-            }),
+            .prop_map(
+                |(text, reasoning, calls, usage, interrupted, model, effort)| {
+                    let tool_calls = calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (tool, object))| {
+                            let arguments = if object {
+                                json!({ "index": index })
+                            } else {
+                                json!({})
+                            };
+                            ToolCall::new(
+                                ToolCallId::new(format!("c-{index}")),
+                                name(&tool),
+                                arguments,
+                            )
+                        })
+                        .collect();
+                    SessionEvent::AssistantMessage {
+                        text,
+                        reasoning,
+                        tool_calls,
+                        usage,
+                        interrupted,
+                        model,
+                        effort,
+                    }
+                },
+            ),
         (text(), tool_name_text(), any::<bool>()).prop_map(|(call_id, tool, object)| {
             SessionEvent::ToolCall {
                 call_id: ToolCallId::new(call_id),

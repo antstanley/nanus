@@ -161,6 +161,10 @@ impl LlmPort for DeepSeekLlm {
         self.config.model()
     }
 
+    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        Some(self.config.reasoning_effort())
+    }
+
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
         let payload = self.encode(&request);
         let Ok(body) = serde_json::to_string(&payload) else {

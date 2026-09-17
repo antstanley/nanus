@@ -19,9 +19,11 @@ use nanus_adapter_config::{DEFAULT_MAX_TOKENS, NanusConfig};
 use nanus_adapter_deepseek::{DEFAULT_MAX_OUTPUT_TOKENS, DeepSeekConfig, DeepSeekLlm};
 use nanus_adapter_local::{LocalFs, LocalShell, SystemClock};
 use nanus_adapter_store::JsonlStore;
-use nanus_domain::{AgentConfig, Session};
+use nanus_domain::{AgentConfig, Origin, Session};
 use nanus_kernel::{Context, Kernel, MountContext, Plugin, PluginId};
-use nanus_ports::{ClockHandle, FsHandle, LlmHandle, SandboxPolicy, ShellHandle, StoreHandle};
+use nanus_ports::{
+    ClockHandle, FsHandle, LlmHandle, LlmPort, SandboxPolicy, ShellHandle, StoreHandle,
+};
 
 use crate::ToolRegistryHandle;
 use crate::agent_loop::AgentRunner;
@@ -57,6 +59,12 @@ pub struct Harness {
     pub clock: ClockHandle,
     /// The model adapter, for its model id.
     pub llm: LlmHandle,
+    /// What a session created here is being run under.
+    ///
+    /// Kept on the harness rather than passed to [`Harness::new_session`], so a session is
+    /// stamped by the composition that will actually run it: a caller cannot forget to
+    /// pass it, and cannot pass a different one than the runner is using.
+    origin: Origin,
 }
 
 impl core::fmt::Debug for Harness {
@@ -78,9 +86,15 @@ impl Harness {
     }
 
     /// Starts a new session.
+    ///
+    /// The session records what this composition is configured to do, so a transcript can
+    /// say which model and which permission state produced it. A session loaded from the
+    /// store keeps whatever it recorded when it was created: resuming does not restamp it,
+    /// because the earlier part of the conversation really was produced by the earlier
+    /// configuration and rewriting that would be a lie about the past.
     #[must_use]
     pub fn new_session(&self, workspace: &std::path::Path) -> Session {
-        new_session(&self.clock, workspace)
+        new_session(&self.clock, workspace).with_origin(self.origin.clone())
     }
 
     /// Tears the composition down, reverting every plugin's effects.
@@ -164,6 +178,10 @@ impl Pending {
             &self.tools,
         )?;
         let runner = build_runner(&self.llm, &self.tools, &self.config, &self.workspace)?;
+        // Built before the adapters are moved into the harness, and from the same
+        // configuration the runner was built from, so the record cannot disagree with what
+        // the run will do.
+        let origin = origin_of(&self.config, &self.llm);
         // Postconditions: the request model is the configured one, and the registry the
         // runner dispatches from is the one the context published. The second is the
         // property this whole construction exists to hold — a runner over a *copy* of the
@@ -182,7 +200,27 @@ impl Pending {
             store: self.store,
             clock: self.clock,
             llm: self.llm,
+            origin,
         })
+    }
+}
+
+/// Builds the record of what a session created here is being run under.
+///
+/// Read from the same configuration the runner and the prompt are built from, so the
+/// recorded facts are the ones in force rather than ones a caller restated. The effort is
+/// asked of the adapter instead, because an adapter fills in an unset effort from its own
+/// configuration — which is the only place the answer exists — and it is left absent when
+/// the adapter has no notion of one.
+fn origin_of(config: &NanusConfig, llm: &LlmHandle) -> Origin {
+    Origin {
+        model: Some(config.model.clone()),
+        effort: llm
+            .reasoning_effort()
+            .map(|effort| effort.as_str().to_owned()),
+        sandbox: Some(config.sandbox_mode.as_str().to_owned()),
+        approval: Some(config.approval_policy.as_str().to_owned()),
+        harness: Some(format!("nanus/{}", env!("CARGO_PKG_VERSION"))),
     }
 }
 
@@ -320,7 +358,7 @@ fn build_llm(config: &NanusConfig, api_key: &str) -> Result<LlmHandle, BundleErr
     // name it; the adapter speaks the ports vocabulary.
     adapter.set_reasoning_effort(config.reasoning_effort.to_port());
     let llm = DeepSeekLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))?;
-    let port: Box<dyn nanus_ports::LlmPort> = Box::new(llm);
+    let port: Box<dyn LlmPort> = Box::new(llm);
     Ok(Rc::new(port))
 }
 
@@ -484,7 +522,7 @@ fn store_provider(store: &StoreHandle) -> PortProvider<Box<dyn nanus_ports::Stor
 }
 
 /// Builds the plugin that publishes the model adapter.
-fn llm_provider(llm: &LlmHandle) -> PortProvider<Box<dyn nanus_ports::LlmPort>> {
+fn llm_provider(llm: &LlmHandle) -> PortProvider<Box<dyn LlmPort>> {
     PortProvider::new("llm", nanus_ports::llm_key(), llm.clone())
 }
 

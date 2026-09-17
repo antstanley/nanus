@@ -25,13 +25,23 @@
 //! A session file is a header line followed by one envelope per event:
 //!
 //! ```text
-//! {"format":"nanus.session","version":1,"id":"...","created_at_ms":0,"cwd":"/work"}
+//! {"format":"nanus.session","version":1,"id":"...","created_at_ms":0,"cwd":"/work",
+//!  "origin":{"model":"deepseek-flash","effort":"medium"}}
 //! {"seq":0,"event":{"type":"turn_start","turn":0}}
 //! {"seq":1,"event":{"type":"user_message","text":"hello"}}
 //! ```
 //!
 //! The sequence number is explicit in the file so a hole in it is detectable.
 //! Without it, a truncated write and a complete one are indistinguishable.
+//!
+//! ## What a header may gain
+//!
+//! `origin` is written on one line in the file; it is folded above to keep the
+//! example readable. A field added to the header is not a change to the *body*, so
+//! it does not move [`SESSION_FORMAT_VERSION`]: an older build ignores a header key
+//! it does not know, and a newer build reads one that is missing as the absence it
+//! is. The version moves when the shape of an *event* changes, which is what it
+//! promises to guard.
 
 use core::fmt;
 
@@ -239,6 +249,18 @@ pub enum SessionEvent {
         /// Whether the turn was cut short mid-stream.
         #[serde(default)]
         interrupted: bool,
+        /// The model id the request named, when it was recorded.
+        ///
+        /// Per message rather than only in the header, because a session can be resumed
+        /// against a different model and the header would then describe the first request
+        /// as though it described all of them. It sits beside `usage` for the same reason
+        /// `usage` is here: the two together are what a cost is attributed from, and a
+        /// reader should not have to join across events to pair them.
+        #[serde(default)]
+        model: Option<String>,
+        /// The reasoning effort the request carried, when the adapter reported one.
+        #[serde(default)]
+        effort: Option<String>,
     },
     /// Audit record of one tool call the model asked for.
     ///
@@ -430,6 +452,61 @@ impl SessionLog {
         total
     }
 
+    /// Sums usage per model, in first-seen order.
+    ///
+    /// A session can be resumed against a different model, so "what did this cost" has an
+    /// answer per model and not only overall. The key is the model the assistant message
+    /// recorded, which is `None` for a message from before that was recorded — kept as its
+    /// own bucket rather than folded into a named model, because a total attributed to the
+    /// wrong model is worse than one attributed to none.
+    #[must_use]
+    pub fn usage_by_model(&self) -> Vec<(Option<String>, Usage)> {
+        let mut totals: Vec<(Option<String>, Usage)> = Vec::new();
+        for event in &self.events {
+            let SessionEvent::AssistantMessage {
+                usage: Some(usage),
+                model,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            match totals.iter_mut().find(|(seen, _)| seen == model) {
+                Some((_, total)) => total.accumulate(usage),
+                None => totals.push((model.clone(), *usage)),
+            }
+        }
+        totals
+    }
+
+    /// Returns how many turns have started.
+    #[must_use]
+    pub fn turn_count(&self) -> u32 {
+        self.count_matching(|event| matches!(event, SessionEvent::TurnStart { .. }))
+    }
+
+    /// Returns how many steps have started, across every turn.
+    #[must_use]
+    pub fn step_count(&self) -> u32 {
+        self.count_matching(|event| matches!(event, SessionEvent::StepStart { .. }))
+    }
+
+    /// Returns how many model turns the log recorded.
+    ///
+    /// Not the same figure as [`SessionLog::step_count`]: a request that failed before it
+    /// answered produces a step and no assistant message, and the difference between the
+    /// two is exactly how many requests were not answered.
+    #[must_use]
+    pub fn request_count(&self) -> u32 {
+        self.count_matching(|event| matches!(event, SessionEvent::AssistantMessage { .. }))
+    }
+
+    /// Counts events a predicate accepts, saturating rather than wrapping.
+    fn count_matching(&self, accept: impl Fn(&SessionEvent) -> bool) -> u32 {
+        let count = self.events.iter().filter(|event| accept(event)).count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
     /// Returns the index of the turn currently in progress.
     ///
     /// Zero when no turn has started, which is the same value the first turn
@@ -492,6 +569,9 @@ impl SessionLog {
 }
 
 /// The header line of a session file.
+///
+/// Field order is the order they are written in, which is why the identity comes first:
+/// a reader scanning a header by eye sees *which* session before *what* ran it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionHeader {
     /// The format tag, which distinguishes a session file from any other JSONL.
@@ -504,6 +584,13 @@ struct SessionHeader {
     created_at_ms: u64,
     /// The working directory the session ran in.
     cwd: String,
+    /// The harness configuration, absent for a session recorded before there was one.
+    ///
+    /// Defaulted rather than required, so a header written by an older build still reads:
+    /// adding a field to the header is not a change to how the *body* is read, which is
+    /// what `version` guards, so an old log is not a version this build cannot accept.
+    #[serde(default)]
+    origin: Option<Origin>,
 }
 
 /// One event line, borrowing its event.
@@ -571,6 +658,54 @@ pub enum SessionError {
     },
 }
 
+/// The harness configuration a session was run under.
+///
+/// A transcript on its own does not say what produced it, and the readings a person
+/// compares runs by are exactly the ones a configuration changes: the same task under
+/// `deepseek-flash` at `minimal` and under `deepseek-v4-pro` at `high` produces two
+/// transcripts that look alike and cost different amounts. Recording the configuration
+/// is what makes a session comparable with another, and what lets a later reader tell
+/// which of the two they are looking at.
+///
+/// Every field is optional, and deliberately so. A session recorded before this existed
+/// has none of them, and "absent" means *not recorded* rather than a default: a default
+/// here would be a fabricated fact about a run nobody can now verify, which is worse than
+/// an admitted gap. Fields are added to this struct as they are needed, and the session
+/// format version does not move for it — a version decides how the *body* is read, and an
+/// older build ignores a header field it does not know.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// The model id the agent's requests named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The reasoning effort the requests carried, when the adapter reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The sandbox mode in force, by its config name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    /// The approval policy in force, by its config name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+    /// The release that recorded the session, as `nanus/<version>`.
+    ///
+    /// A release rather than a build: nothing at runtime knows which commit produced the
+    /// binary, so claiming a commit here would be a guess dressed as a fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+}
+
+impl Origin {
+    /// Returns `true` when nothing at all is known about the run.
+    ///
+    /// A session whose origin is empty is one recorded before any of this existed, so the
+    /// accessors that read a field can say "not recorded" without inventing a value.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// A session: its identity, its environment, and its append-only log.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
@@ -580,6 +715,8 @@ pub struct Session {
     created_at_ms: u64,
     /// The working directory the session ran in.
     cwd: String,
+    /// The harness configuration it was created under, when one was known.
+    origin: Option<Origin>,
     /// The event log.
     log: SessionLog,
 }
@@ -592,8 +729,35 @@ impl Session {
             id,
             created_at_ms,
             cwd: cwd.into(),
+            origin: None,
             log: SessionLog::new(),
         }
+    }
+
+    /// Records the harness configuration this session is being run under.
+    ///
+    /// A builder rather than a fourth parameter of [`Session::new`], because most callers
+    /// have nothing to say: a test that is about the shape of a log does not care which
+    /// model would have produced it, and a required argument would make every one of them
+    /// pass `None`. The caller that *does* know — the composition, which holds the whole
+    /// configuration — opts in.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        // Nothing known is the same fact as nothing recorded, and storing an empty origin
+        // would write a header line full of absences for a session whose reader then has
+        // two spellings of the same gap to handle.
+        self.origin = if origin.is_empty() {
+            None
+        } else {
+            Some(origin)
+        };
+        self
+    }
+
+    /// Returns the harness configuration, when one was recorded.
+    #[must_use]
+    pub const fn origin(&self) -> Option<&Origin> {
+        self.origin.as_ref()
     }
 
     /// Returns the session's store key.
@@ -671,6 +835,30 @@ impl Session {
         self.log.usage_totals()
     }
 
+    /// Sums usage per model, in first-seen order.
+    #[must_use]
+    pub fn usage_by_model(&self) -> Vec<(Option<String>, Usage)> {
+        self.log.usage_by_model()
+    }
+
+    /// Returns how many turns the session has started.
+    #[must_use]
+    pub fn turn_count(&self) -> u32 {
+        self.log.turn_count()
+    }
+
+    /// Returns how many steps the session has started, across every turn.
+    #[must_use]
+    pub fn step_count(&self) -> u32 {
+        self.log.step_count()
+    }
+
+    /// Returns how many model turns the session recorded.
+    #[must_use]
+    pub fn request_count(&self) -> u32 {
+        self.log.request_count()
+    }
+
     /// Derives a short title from the first human turn.
     ///
     /// Returns `None` until the session has a user message, so a listing never
@@ -707,6 +895,7 @@ impl Session {
             id: self.id.as_str().to_owned(),
             created_at_ms: self.created_at_ms,
             cwd: self.cwd.clone(),
+            origin: self.origin.clone(),
         };
         let mut out = encode(&header);
         assert!(!out.is_empty(), "the session header encodes");
@@ -767,6 +956,7 @@ impl Session {
             id: SessionId::new(header.id),
             created_at_ms: header.created_at_ms,
             cwd: header.cwd,
+            origin: header.origin,
             log,
         };
         // Postcondition: the decoded log has exactly the events the file numbered.
@@ -848,6 +1038,8 @@ mod tests {
             )],
             usage: Some(Usage::new(10, 5, 2, 0, 10)),
             interrupted: false,
+            model: None,
+            effort: None,
         });
         session.append(SessionEvent::ToolCall {
             call_id: ToolCallId::new("c-1"),
@@ -939,6 +1131,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             interrupted: false,
+            model: None,
+            effort: None,
         });
         session.append(SessionEvent::AssistantMessage {
             text: None,
@@ -946,6 +1140,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             interrupted: true,
+            model: None,
+            effort: None,
         });
         assert!(
             session.derive_messages().is_empty(),
@@ -1003,6 +1199,8 @@ mod tests {
             tool_calls: vec![unanswered, answered.clone()],
             usage: None,
             interrupted: false,
+            model: None,
+            effort: None,
         });
         log.append(SessionEvent::ToolResult {
             call_id: answered.id.clone(),
@@ -1037,6 +1235,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             interrupted: false,
+            model: None,
+            effort: None,
         });
         assert!(
             log.derive_messages().is_empty(),
@@ -1053,6 +1253,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: Some(Usage::new(10, 5, 0, 0, 10)),
             interrupted: false,
+            model: None,
+            effort: None,
         });
         session.append(SessionEvent::AssistantMessage {
             text: Some("b".to_owned()),
@@ -1060,6 +1262,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: Some(Usage::new(20, 7, 3, 0, 20)),
             interrupted: false,
+            model: None,
+            effort: None,
         });
         let total = session.usage_totals();
         assert_eq!(total.prompt_tokens, 30);
@@ -1150,6 +1354,106 @@ mod tests {
         let decoded = Session::from_jsonl(&encoded);
         assert!(decoded.is_ok(), "the session round-trips");
         assert_eq!(decoded.ok(), Some(original));
+    }
+
+    #[test]
+    fn a_session_remembers_what_it_ran_under() {
+        // The header carries the configuration, so a transcript read back months later can
+        // still say which model produced it.
+        let original = session().with_origin(Origin {
+            model: Some("deepseek-flash".to_owned()),
+            effort: Some("high".to_owned()),
+            sandbox: Some("read_only".to_owned()),
+            approval: Some("per_call".to_owned()),
+            harness: Some("nanus/0.1.0".to_owned()),
+        });
+        let decoded = Session::from_jsonl(&original.to_jsonl());
+        assert_eq!(decoded.ok(), Some(original.clone()));
+        let origin = original.origin().expect("the origin survives");
+        assert_eq!(origin.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(origin.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_header_with_no_origin_still_reads() {
+        // The compatibility rule, stated as a test rather than as a comment: a session
+        // recorded before the header had a configuration in it is not a version this build
+        // cannot read, because the field is an addition to the *header* and `version` is
+        // what decides how the *body* is read.
+        let raw = framed(&[]);
+        assert!(
+            !raw.contains("origin"),
+            "the fixture is an old-shaped header: {raw}"
+        );
+        let decoded = Session::from_jsonl(&raw);
+        assert!(decoded.is_ok(), "an old header still parses: {decoded:?}");
+        let Ok(decoded) = decoded else { return };
+        assert_eq!(
+            decoded.origin(),
+            None,
+            "nothing recorded is reported as nothing, not as a default"
+        );
+        assert_eq!(
+            SESSION_FORMAT_VERSION, 1,
+            "adding a header field is not a body change, so the version stays where it was"
+        );
+    }
+
+    #[test]
+    fn a_session_that_knows_nothing_records_nothing() {
+        // An empty origin and no origin are the same fact, and the header must not grow a
+        // row of absences for it.
+        let bare = session();
+        let annotated = session().with_origin(Origin::default());
+        assert_eq!(annotated.origin(), None);
+        assert_eq!(bare.to_jsonl(), annotated.to_jsonl());
+    }
+
+    #[test]
+    fn usage_is_split_by_the_model_that_produced_it() {
+        // A session resumed against a different model has a cost per model, and the bucket
+        // for a message that recorded no model stays its own rather than being attributed
+        // to a named one.
+        let mut session = session();
+        for (model, usage) in [
+            (Some("deepseek-flash"), Usage::new(100, 10, 0, 60, 40)),
+            (Some("deepseek-v4-pro"), Usage::new(50, 5, 0, 25, 25)),
+            (Some("deepseek-flash"), Usage::new(10, 1, 0, 10, 0)),
+            (None, Usage::new(7, 1, 0, 0, 7)),
+        ] {
+            session.append(SessionEvent::AssistantMessage {
+                text: Some(String::from("a")),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: Some(usage),
+                interrupted: false,
+                model: model.map(str::to_owned),
+                effort: None,
+            });
+        }
+        let by_model = session.usage_by_model();
+        let model_of = |index: usize| by_model.get(index).map(|(model, _)| model.clone());
+        assert_eq!(model_of(0), Some(Some(String::from("deepseek-flash"))));
+        assert_eq!(model_of(1), Some(Some(String::from("deepseek-v4-pro"))));
+        assert_eq!(model_of(2), Some(None), "the unrecorded bucket comes last");
+        assert_eq!(by_model.len(), 3, "flash is one bucket, not two");
+        assert_eq!(
+            by_model.first().map(|(_, usage)| usage.prompt_tokens),
+            Some(110)
+        );
+        assert_eq!(session.usage_totals().prompt_tokens, 167);
+    }
+
+    #[test]
+    fn the_counts_report_what_the_log_recorded() {
+        let mut session = session();
+        assert_eq!(session.turn_count(), 0);
+        assert_eq!(session.step_count(), 0);
+        assert_eq!(session.request_count(), 0);
+        record_read_turn(&mut session);
+        assert_eq!(session.turn_count(), 1);
+        assert_eq!(session.step_count(), 1);
+        assert_eq!(session.request_count(), 1);
     }
 
     #[test]

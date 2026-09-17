@@ -211,6 +211,24 @@ pub enum SessionsAction {
         /// The session to remove: an id, or a name it already answers to.
         session: String,
     },
+
+    /// Report what a session did and what it spent.
+    ///
+    /// Read from the log rather than from an agent, so it needs no model and no key: the
+    /// figures were written down as the turn ran. The reference resolves exactly as naming
+    /// resolves one.
+    Show {
+        /// The session to report: an id, or a name it already answers to.
+        session: String,
+
+        /// Emit a JSON object instead of the readable report.
+        ///
+        /// For a script comparing runs, which is the reader this command exists for: the
+        /// numbers a harness is judged by are the ones a script has to be able to read
+        /// without parsing prose.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// What to do with the service.
@@ -416,6 +434,15 @@ pub enum Ready {
         /// The session to remove: an id, or a name it answers to.
         session: String,
     },
+    /// A session is ready to be reported on.
+    Show {
+        /// The store that holds it.
+        store: nanus_ports::StoreHandle,
+        /// The session to report: an id, or a name it answers to.
+        session: String,
+        /// Whether to emit JSON rather than the readable report.
+        json: bool,
+    },
     /// A composition is built for a shell-scoped agent the interface will talk to.
     Tui {
         /// The adapters, ready to mount.
@@ -485,6 +512,11 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             session,
         } => record_name(&store, &name, &session),
         Ready::Delete { store, session } => delete_session(&store, &session),
+        Ready::Show {
+            store,
+            session,
+            json,
+        } => print_session_report(&store, &session, json),
         Ready::Tui {
             pending,
             workspace,
@@ -814,6 +846,14 @@ fn run_turn(
         println!();
     }
 
+    // The totals, on stderr and only when progress was asked for: stdout stays exactly the
+    // answer, and a caller who did not ask to watch the run did not ask to be told about it
+    // either. Printed before the failure branch, because a run that stopped early is exactly
+    // the one whose cost somebody wants to see.
+    if verbose {
+        eprintln!("{}", run_summary(outcome.steps, &outcome.usage));
+    }
+
     if outcome.is_success() {
         return Ok(());
     }
@@ -900,6 +940,208 @@ fn delete_session(store: &nanus_ports::StoreHandle, reference: &str) -> Result<(
         .map_or_else(String::new, |name| format!(" ({name})"));
     println!("nanus: deleted session {}{name}", id.as_str());
     Ok(())
+}
+
+/// The one-line totals a watched run ends with.
+///
+/// The same figures `nanus sessions show` reports afterwards, laid out for somebody
+/// watching rather than for a script — which is the whole difference between the two
+/// commands, and not a difference in what they count.
+fn run_summary(steps: u32, usage: &nanus_domain::Usage) -> String {
+    format!(
+        "nanus: {steps} steps \u{b7} {} prompt ({} cached, {} read) + {} generated ({} thinking)",
+        usage.prompt_tokens,
+        usage.cache_hit_tokens,
+        usage.cache_miss_tokens,
+        usage.completion_tokens,
+        usage.reasoning_tokens
+    )
+}
+
+/// Reports what a recorded session did and what it spent.
+///
+/// Everything here is read from the log, so it needs no model and no API key — the numbers
+/// were written down as the turn ran, and reading them back is a file operation. That is
+/// what makes this the command a comparison between two runs is built from: the same session
+/// reported twice gives the same figures, whether the run happened a minute ago or last week.
+fn print_session_report(
+    store: &nanus_ports::StoreHandle,
+    reference: &str,
+    json: bool,
+) -> Result<(), String> {
+    let id = resolve_id(store, reference)?;
+    // Loaded rather than summarised: the totals live in the events, and a summary carries
+    // only what a picker needs to draw a row.
+    let session = kernel_block_on(store.load(&id)).map_err(|error| error.to_string())?;
+    // The name is a separate file beside the log, so it is read from the listing. A failure
+    // to read it costs the name and not the report, which is why it is not a `?`.
+    let name = kernel_block_on(store.list()).ok().and_then(|listed| {
+        listed
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .and_then(|summary| summary.name)
+    });
+
+    if json {
+        println!("{}", session_report_json(&session, name.as_deref()));
+        return Ok(());
+    }
+    print!("{}", session_report_text(&session, name.as_deref()));
+    Ok(())
+}
+
+/// Renders the report as a JSON object.
+///
+/// Field names are the ones the log uses, so a reader who has a session file open and a
+/// reader who has this output agree on what each number is called.
+fn session_report_json(session: &nanus_domain::Session, name: Option<&str>) -> String {
+    let usage = session.usage_totals();
+    let origin = session.origin();
+    let value = serde_json::json!({
+        "session": session.id().as_str(),
+        "name": name,
+        "created_at_ms": session.created_at_ms(),
+        "workspace": session.cwd(),
+        "origin": origin,
+        "turns": session.turn_count(),
+        "steps": session.step_count(),
+        "requests": session.request_count(),
+        "ended": session.log().last_turn_end().map(nanus_domain::TurnEndReason::label),
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "cache_hit_tokens": usage.cache_hit_tokens,
+            "cache_miss_tokens": usage.cache_miss_tokens,
+            "total_tokens": usage.total_tokens(),
+        },
+        "by_model": session
+            .usage_by_model()
+            .iter()
+            .map(|(model, totals)| serde_json::json!({
+                "model": model,
+                "prompt_tokens": totals.prompt_tokens,
+                "completion_tokens": totals.completion_tokens,
+                "reasoning_tokens": totals.reasoning_tokens,
+                "cache_hit_tokens": totals.cache_hit_tokens,
+                "cache_miss_tokens": totals.cache_miss_tokens,
+                "total_tokens": totals.total_tokens(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    // A value that cannot encode would be a bug in the shape above rather than bad input,
+    // so the fallback is an empty object rather than a panic in a reporting command.
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| String::from("{}"))
+}
+
+/// Renders the report as the rows a person reads.
+///
+/// Deliberately not the interface's `/stats` panel even though the two overlap: the panel
+/// reports a *live* request, so it has figures the log never recorded — time to first token,
+/// a decode rate — while this has history the panel does not.
+fn session_report_text(session: &nanus_domain::Session, name: Option<&str>) -> String {
+    let usage = session.usage_totals();
+    let row = |label: &str, reading: String| format!("  {label:<11} {reading}");
+    let mut lines: Vec<String> = vec![String::from("session report")];
+
+    let name = name.map_or_else(String::new, |name| format!("  [{name}]"));
+    lines.push(row("session", format!("{}{name}", session.id().as_str())));
+    lines.push(row(
+        "created",
+        session
+            .created_at_rfc3339()
+            .unwrap_or_else(|| format!("{} (ms since the epoch)", session.created_at_ms())),
+    ));
+    lines.push(row("workspace", session.cwd().to_owned()));
+    lines.push(row("origin", origin_line(session.origin())));
+    lines.push(row(
+        "activity",
+        format!(
+            "{} turns · {} steps · {} requests",
+            session.turn_count(),
+            session.step_count(),
+            session.request_count()
+        ),
+    ));
+    lines.push(row(
+        "prompt",
+        format!(
+            "{} tokens · {} cached, {} read · {} hit",
+            usage.prompt_tokens,
+            usage.cache_hit_tokens,
+            usage.cache_miss_tokens,
+            share(usage.cache_hit_tokens, usage.prompt_tokens)
+        ),
+    ));
+    lines.push(row(
+        "generated",
+        format!(
+            "{} tokens · {} thinking",
+            usage.completion_tokens,
+            share(usage.reasoning_tokens, usage.completion_tokens)
+        ),
+    ));
+    // Only worth a row when there is more than one, which is the case a resumed session
+    // changes the model in: one line per model is what makes the two comparable.
+    let by_model = session.usage_by_model();
+    if by_model.len() > 1 {
+        let models: Vec<String> = by_model
+            .iter()
+            .map(|(model, totals)| {
+                row(
+                    "  model",
+                    format!(
+                        "{} · {} prompt ({} cached) + {} generated",
+                        model.as_deref().unwrap_or("<not recorded>"),
+                        totals.prompt_tokens,
+                        totals.cache_hit_tokens,
+                        totals.completion_tokens
+                    ),
+                )
+            })
+            .collect();
+        lines.extend(models);
+    }
+    lines.push(row(
+        "ended",
+        session.log().last_turn_end().map_or_else(
+            || String::from("<still open>"),
+            |reason| reason.label().to_owned(),
+        ),
+    ));
+    lines.join("\n") + "\n"
+}
+
+/// Renders the harness configuration a session recorded.
+///
+/// A session recorded before any of this existed has nothing to show, and saying so is the
+/// point: reporting a default here would attribute the run to a configuration nobody chose.
+fn origin_line(origin: Option<&nanus_domain::Origin>) -> String {
+    let Some(origin) = origin else {
+        return String::from("<not recorded>");
+    };
+    let field = |label: &str, value: Option<&str>| {
+        value.map_or_else(
+            || format!("{label} <not recorded>"),
+            |value| format!("{label} {value}"),
+        )
+    };
+    [
+        field("model", origin.model.as_deref()),
+        field("effort", origin.effort.as_deref()),
+        field("sandbox", origin.sandbox.as_deref()),
+        field("approval", origin.approval.as_deref()),
+        field("harness", origin.harness.as_deref()),
+    ]
+    .join(" · ")
+}
+
+/// Renders `part` as a percentage of `whole`, or a dash when there is no whole.
+fn share(part: u32, whole: u32) -> String {
+    u64::from(part)
+        .checked_mul(100)
+        .and_then(|scaled| scaled.checked_div(u64::from(whole)))
+        .map_or_else(|| String::from("-"), |percent| format!("{percent}%"))
 }
 
 /// Persists the session, reporting a failure rather than losing it silently.
@@ -989,6 +1231,11 @@ async fn prepare_sessions(action: Option<SessionsAction>) -> Result<Ready, Strin
             session,
         }),
         Some(SessionsAction::Delete { session }) => Ok(Ready::Delete { store, session }),
+        Some(SessionsAction::Show { session, json }) => Ok(Ready::Show {
+            store,
+            session,
+            json,
+        }),
     }
 }
 
@@ -1138,6 +1385,145 @@ mod tests {
         assert!(
             Args::try_parse_from(["nanus", "sessions", "delete", "a", "b"]).is_err(),
             "a second reference is a usage error rather than a silent second deletion"
+        );
+
+        let shown = Args::try_parse_from(["nanus", "sessions", "show", "nightly"]);
+        assert!(shown.is_ok(), "{shown:?}");
+        let Ok(shown) = shown else { return };
+        let Some(Command::Sessions {
+            action: Some(SessionsAction::Show { session, json }),
+        }) = shown.command
+        else {
+            panic!("expected a show action");
+        };
+        assert_eq!(session, "nightly");
+        assert!(!json, "the readable report is the default");
+
+        let as_json = Args::try_parse_from(["nanus", "sessions", "show", "--json", "nightly"]);
+        assert!(as_json.is_ok(), "{as_json:?}");
+        let Ok(as_json) = as_json else { return };
+        let Some(Command::Sessions {
+            action: Some(SessionsAction::Show { json, .. }),
+        }) = as_json.command
+        else {
+            panic!("expected a show action");
+        };
+        assert!(json, "--json asks for the machine-readable shape");
+        assert!(Args::try_parse_from(["nanus", "sessions", "show"]).is_err());
+    }
+
+    /// A session with one answered turn, for the report renderers.
+    fn reported_session() -> nanus_domain::Session {
+        use nanus_domain::{Origin, SessionEvent, SessionId, Usage};
+
+        let mut session =
+            nanus_domain::Session::new(SessionId::new("s-1"), 1_700_000_000_000, "/work")
+                .with_origin(Origin {
+                    model: Some("deepseek-flash".to_owned()),
+                    effort: Some("medium".to_owned()),
+                    sandbox: Some("read_only".to_owned()),
+                    approval: Some("per_call".to_owned()),
+                    harness: Some("nanus/0.1.0".to_owned()),
+                });
+        session.append(SessionEvent::TurnStart { turn: 0 });
+        session.append(SessionEvent::StepStart { turn: 0, step: 0 });
+        session.append(SessionEvent::UserMessage {
+            text: "read the file".to_owned(),
+        });
+        session.append(SessionEvent::AssistantMessage {
+            text: Some(String::from("done")),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: Some(Usage::new(1_000, 100, 40, 800, 200)),
+            interrupted: false,
+            model: Some("deepseek-flash".to_owned()),
+            effort: Some("medium".to_owned()),
+        });
+        session.append(SessionEvent::StepEnd { turn: 0, step: 0 });
+        session.append(SessionEvent::TurnEnd {
+            turn: 0,
+            reason: nanus_domain::TurnEndReason::Completed,
+        });
+        session
+    }
+
+    #[test]
+    fn the_report_states_the_configuration_and_the_cost() {
+        // The two figures the command exists for: what produced the run, and what it spent.
+        // Both are read back from the log, so a report is comparable between two runs.
+        let session = reported_session();
+        let text = session_report_text(&session, Some("nightly"));
+        assert!(text.contains("deepseek-flash"), "{text}");
+        assert!(text.contains("medium"), "the effort is reported: {text}");
+        assert!(text.contains("1 turns"), "{text}");
+        assert!(text.contains("[nightly]"), "{text}");
+        assert!(
+            text.contains("800 cached, 200 read"),
+            "the cache split is the cost driver and has to be visible: {text}"
+        );
+        assert!(text.contains("80% hit"), "{text}");
+        assert!(text.contains("completed"), "{text}");
+    }
+
+    #[test]
+    fn the_json_report_carries_the_same_figures_as_the_text_one() {
+        let session = reported_session();
+        let raw = session_report_json(&session, Some("nightly"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("the report is valid JSON");
+        assert_eq!(parsed["session"], serde_json::json!("s-1"));
+        assert_eq!(parsed["name"], serde_json::json!("nightly"));
+        assert_eq!(
+            parsed["origin"]["model"],
+            serde_json::json!("deepseek-flash")
+        );
+        assert_eq!(parsed["origin"]["effort"], serde_json::json!("medium"));
+        assert_eq!(parsed["turns"], serde_json::json!(1));
+        assert_eq!(parsed["usage"]["prompt_tokens"], serde_json::json!(1_000));
+        assert_eq!(parsed["usage"]["cache_hit_tokens"], serde_json::json!(800));
+        assert_eq!(parsed["ended"], serde_json::json!("completed"));
+        assert_eq!(
+            parsed["by_model"][0]["model"],
+            serde_json::json!("deepseek-flash")
+        );
+    }
+
+    #[test]
+    fn a_session_that_recorded_no_origin_says_so_rather_than_guessing() {
+        // The reading this must not produce is a plausible default: attributing a run to a
+        // configuration nobody chose is worse than admitting the gap.
+        let bare = nanus_domain::Session::new(
+            nanus_domain::SessionId::new("s-2"),
+            1_700_000_000_000,
+            "/work",
+        );
+        assert!(session_report_text(&bare, None).contains("<not recorded>"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&session_report_json(&bare, None)).expect("valid JSON");
+        assert_eq!(parsed["origin"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_share_with_no_whole_is_a_dash_rather_than_a_division() {
+        assert_eq!(share(0, 0), "-");
+        assert_eq!(share(5, 0), "-");
+        assert_eq!(share(1, 4), "25%");
+        assert_eq!(share(4, 4), "100%");
+    }
+
+    #[test]
+    fn the_run_summary_carries_the_cache_split_not_only_a_total() {
+        // A prompt total on its own cannot tell a reader whether the run was cheap: the
+        // cache split is the difference between a prefix the provider had already read and
+        // one it had to read again.
+        let usage = nanus_domain::Usage::new(12_000, 900, 300, 10_500, 1_500);
+        let summary = run_summary(7, &usage);
+        assert!(summary.contains("7 steps"), "{summary}");
+        assert!(summary.contains("12000 prompt"), "{summary}");
+        assert!(summary.contains("10500 cached, 1500 read"), "{summary}");
+        assert!(
+            summary.contains("900 generated (300 thinking)"),
+            "{summary}"
         );
     }
 

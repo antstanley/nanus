@@ -100,6 +100,18 @@ A session is the conversation, written down as it happens. See
 - **Deleting a session**, with `nanus sessions delete <name|id>`. The reference is
   resolved the way naming resolves one, a reference that answers to nothing is
   refused rather than reported as a deletion, and the session's name goes with it.
+- **Reporting on a run**, with `nanus sessions show [--json] <name|id>`: the
+  configuration it ran under, the turns, steps and requests, the prompt tokens
+  split into cached and read, the generated tokens and how many were thinking, a
+  per-model breakdown, and why the last turn ended. Read from the log, so it needs
+  no model and no key, and `nanus run --verbose` prints the same totals in one line
+  on stderr when the turn finishes.
+- **What produced a run is recorded.** The session header carries the model that
+  was configured, the reasoning effort, the sandbox mode, the approval policy and
+  the release that wrote it; each model turn carries the model and effort that
+  produced it, since a session can be resumed against a different model. Absent
+  means not recorded rather than a default, so a session from before a field
+  existed reports the gap instead of inventing a value for it.
 - **Resuming** by name or id: `--resume` on `run` and `tui`, including against a
   service that is already holding the session.
 - **Live sessions.** An agent holds sessions open, a turn runs in its own task
@@ -170,6 +182,7 @@ which asks for progress on stderr.
 | `nanus sessions` | List recorded sessions, newest first; no key needed. |
 | `nanus sessions name <NAME> <SESSION>` | Record or change a session's name. |
 | `nanus sessions delete <NAME\|ID>` | Remove a session and release its name. |
+| `nanus sessions show [--json] <NAME\|ID>` | Report what a session ran under and what it spent; no key needed. |
 
 A bare `nanus` starts the interface when there is a terminal and prints usage
 when there is not. The usage text is built from the same parser the commands
@@ -206,6 +219,13 @@ supports:
   does not parse.
 - **Live session figures**: last and average token rates, time to first token,
   cache hit share, and a `/stats` breakdown.
+- **A session summary on exit.** Leaving the interface prints a table of what the
+  session did and what it spent: the model and permission state it ran under, the
+  turns, steps and requests, the prompt split into cached and read, the generated
+  tokens and how many were thinking, and the rates and waits this run measured.
+  Read from the log and from the interface's own measurements respectively, so the
+  session's totals cover turns that ran before this interface opened. See
+  [the interface](tui.md#commands).
 - **Slash commands**: `/exit`, `/quit`, and `/stats`. Anything else is named in
   the transcript rather than sent to the model.
 - **No colour leaks**: `NO_COLOR` switches to a monochrome theme that keeps

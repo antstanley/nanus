@@ -56,7 +56,7 @@
 
 use core::future::Future;
 use std::ffi::OsStr;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write as _};
 use std::path::Path;
 
 use crossterm::event::EventStream;
@@ -76,7 +76,7 @@ use tokio::sync::mpsc;
 use crate::command::{Command, Submission, submission_of};
 use crate::compact::Detail;
 use crate::notice::{self, Ending};
-use crate::stats::Generation;
+use crate::stats::{Generation, Throughput};
 use crate::transcript::{Entry, Role};
 use crate::view::{PendingApproval, Theme, ViewState};
 
@@ -754,7 +754,25 @@ pub fn run_source(source: &mut dyn SessionSource) -> io::Result<()> {
     if let Err(error) = source.shutdown() {
         tracing::warn!(%error, "the source did not shut down cleanly");
     }
-    outcome
+    // The summary, printed here rather than in the loop because this is where the terminal is
+    // known to be the reader's again: the guard that put it into raw mode and the alternate
+    // screen was dropped when the loop returned, so these lines land on the screen the shell
+    // will carry on from rather than on a screen about to be erased.
+    //
+    // Only on a clean exit. A loop that failed is reported as the failure it is, and a table
+    // of figures in front of that error would bury the one line that says what went wrong.
+    if let Ok(stats) = &outcome {
+        let summary = crate::summary::session_summary(source.session(), source.label(), stats);
+        // Written rather than printed: a library does not own the process's stdout — the
+        // workspace forbids the `print!` that would assume it does — and a write that fails
+        // is not worth failing the run for. The interface has already done its work; the
+        // summary is what it leaves behind, and a reader whose stdout has gone away has
+        // bigger things to be told about than this.
+        let mut out = io::stdout();
+        let _ = out.write_all(summary.as_bytes());
+        let _ = out.flush();
+    }
+    outcome.map(|_stats| ())
 }
 
 /// Builds the view the interface opens with, from the source and the configuration.
@@ -811,10 +829,16 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
 /// sleeping for a redraw tick — would stop the agent's frames from being read at all. The
 /// interface would show a frozen turn and then deliver the entire answer at once, which
 /// is exactly the freeze the local task exists to prevent.
+/// Runs the interface until the reader leaves it.
+///
+/// Returns what the interface measured while it was open, which is what the summary printed
+/// on the way out reports alongside the session's own totals. It cannot be read off the
+/// session afterwards: only the process that watched the responses arrive knows how fast they
+/// arrived, and that process is this one.
 async fn event_loop(
     source: &mut dyn SessionSource,
     mut frames: mpsc::Receiver<Frame>,
-) -> io::Result<()> {
+) -> io::Result<Throughput> {
     // Built before the terminal is taken, so a configuration that cannot be read is a
     // sentence on stderr rather than an abort with a screen already in raw mode.
     let mut view = opening_view(source)?;
@@ -932,7 +956,7 @@ async fn event_loop(
             }
         }
     }
-    Ok(())
+    Ok(view.stats)
 }
 
 /// What the event loop should do with a submitted line.

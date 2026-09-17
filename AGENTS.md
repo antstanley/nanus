@@ -287,6 +287,12 @@ design docs too.
 - **A name is an alias for a store key, and one session has one name.** Naming is
   refused rather than moved when the name is held, and the alias lives in the
   session's own directory (`name`), so it cannot be lost with a shared table.
+- **A session records what produced it, and "absent" is not "default".** The header
+  carries the configuration and each model turn carries the model and effort that
+  produced it, both optional: a session recorded before a field existed reports the
+  gap rather than a plausible value. `SESSION_FORMAT_VERSION` guards how the *body*
+  is read, so adding a header field does not move it — moving it would make every
+  existing transcript unreadable, and the log is the only copy there is.
 
 ## How to make common changes
 

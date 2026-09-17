@@ -34,7 +34,7 @@ fn rate(tokens: u64, millis: u64) -> Option<u64> {
 ///
 /// `None` when the whole is zero, which is the "nothing was counted" case rather than a
 /// quantity that happens to be empty.
-fn percent(part: u64, whole: u64) -> Option<u64> {
+pub(crate) fn percent(part: u64, whole: u64) -> Option<u64> {
     part.checked_mul(100)?.checked_div(whole)
 }
 

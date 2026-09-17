@@ -88,8 +88,8 @@ pub use error::{DomainError, DomainResult};
 pub use message::{Message, Role, ToolCallId, Usage};
 pub use prompt::{PromptBuilder, PromptError, PromptSection, runtime_context};
 pub use session::{
-    SESSION_FORMAT_TAG, SESSION_FORMAT_VERSION, Session, SessionError, SessionEvent, SessionId,
-    SessionLog, SessionSeq, TurnEndReason,
+    Origin, SESSION_FORMAT_TAG, SESSION_FORMAT_VERSION, Session, SessionError, SessionEvent,
+    SessionId, SessionLog, SessionSeq, TurnEndReason,
 };
 pub use tool::{
     ContentBlock, TOOL_NAME_MAX_LEN, ToolCall, ToolDefinition, ToolError, ToolExecutor, ToolFuture,

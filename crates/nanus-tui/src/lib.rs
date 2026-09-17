@@ -44,6 +44,7 @@ mod markdown;
 pub mod notice;
 pub mod replay;
 pub mod stats;
+pub mod summary;
 pub mod transcript;
 pub mod view;
 

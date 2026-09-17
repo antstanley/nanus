@@ -489,6 +489,15 @@ impl AgentRunner {
             tool_calls: assembled.calls.clone(),
             usage: assembled.usage,
             interrupted: assembled.interrupted,
+            // What produced this message, recorded beside what it cost. The model is the
+            // one the request named; the effort comes from the adapter, which is the
+            // component that fills in an unset effort and so the only one that knows what
+            // was actually asked for.
+            model: Some(self.config.model.clone()),
+            effort: self
+                .llm
+                .reasoning_effort()
+                .map(|effort| effort.as_str().to_owned()),
         });
 
         // An interrupted step is *interrupted*, not a step that called tools: what the
@@ -1434,6 +1443,20 @@ mod tests {
                 }
             )),
             "and the step says it was cut short rather than ending on its own"
+        );
+        // An interrupted message is still attributed: it cost what it cost, and a session
+        // that recorded the cut short turn without saying what produced it would leave that
+        // spend unattributable.
+        assert!(
+            session.log().events().iter().any(|event| matches!(
+                event,
+                SessionEvent::AssistantMessage {
+                    interrupted: true,
+                    model: Some(_),
+                    ..
+                }
+            )),
+            "the cut short turn still records the model that produced it"
         );
     }
 

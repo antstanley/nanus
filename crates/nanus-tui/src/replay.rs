@@ -270,6 +270,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             interrupted: false,
+            model: None,
+            effort: None,
         }]);
         let transcript = transcript_of(&session);
         let roles: Vec<Role> = transcript.entries().iter().map(Entry::role).collect();
@@ -285,6 +287,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             interrupted: false,
+            model: None,
+            effort: None,
         }]);
         let transcript = transcript_of(&session);
         // An absent field is not an empty entry.
@@ -478,6 +482,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             interrupted: true,
+            model: None,
+            effort: None,
         }]);
         let transcript = transcript_of(&session);
         assert!(
@@ -514,6 +520,8 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     interrupted: false,
+                    model: None,
+                    effort: None,
                 },
                 SessionEvent::StepEnd { turn: 1, step: 1 },
                 SessionEvent::TurnEnd {
@@ -544,6 +552,8 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 interrupted: false,
+                model: None,
+                effort: None,
             },
             SessionEvent::StepEnd { turn: 1, step: 1 },
             SessionEvent::TurnEnd {
@@ -603,6 +613,8 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             interrupted: false,
+            model: None,
+            effort: None,
         }]);
         // A cursor on a finished conversation would suggest it was still arriving.
         assert!(!transcript_of(&session).is_streaming());
