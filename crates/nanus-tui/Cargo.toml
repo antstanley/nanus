@@ -57,7 +57,16 @@ tracing = { workspace = true }
 # The markdown renderer wraps by display width, so it agrees with the terminal about how
 # many columns a character takes.
 unicode-width = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["rt", "macros", "sync", "time"] }
+tokio = { workspace = true, optional = true, features = [
+    "rt",
+    "macros",
+    "sync",
+    "time",
+    # The `!` escape runs a child process, and it has to be a *task*: the interface's one thread also
+    # carries the link's transport, so a child waited on synchronously would stop a running turn's
+    # frames being read.
+    "process",
+] }
 
 [dev-dependencies]
 proptest = { workspace = true }

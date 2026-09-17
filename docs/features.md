@@ -212,9 +212,10 @@ supports:
   are compact by default; `Ctrl+O` or `tui_detail = "full"` shows whole argument
   blocks and reasoning segments, and `Ctrl+T` / `Ctrl+E` fold runs of them away.
 - **Markdown answers**: headings, emphasis, inline code, links, fenced code
-  blocks, ordered/unordered/task lists, blockquotes, horizontal rules, pipe
-  tables, images (as placeholders), and TOML frontmatter stripping. Only the
-  model's answer is parsed; reasoning and tool output are verbatim.
+  blocks — highlighted for the handful of languages a coding answer is written in —
+  ordered/unordered/task lists, blockquotes, horizontal rules, pipe tables, images
+  (as placeholders), and TOML frontmatter stripping. Only the model's answer is
+  parsed; reasoning and tool output are verbatim.
 - **Mermaid as text diagrams**: flowcharts, sequence, pie, gantt, state, class,
   quadrant, and block diagrams, falling back to the fence source when a diagram
   does not parse.
@@ -227,8 +228,23 @@ supports:
   Read from the log and from the interface's own measurements respectively, so the
   session's totals cover turns that ran before this interface opened. See
   [the interface](tui.md#commands).
-- **Slash commands**: `/exit`, `/quit`, and `/stats`. Anything else is named in
-  the transcript rather than sent to the model.
+- **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, and `/model`.
+  Anything else is named in the transcript rather than sent to the model.
+- **The key list on screen** (`?`, or `/help`), scrolled from one table so a
+  binding cannot be documented in one place and forgotten in another.
+- **The settings a key changes**: the approval state (`Shift+Tab`, in a dialog that
+  says what each state grants), the model (`Alt+P`, or `/model <id>`), and the
+  reasoning effort (`Alt+T`). Each is drawn where a reader can see which is in
+  force.
+- **`@` file mentions**, completed from the workspace by `Tab` and expanded to the
+  path — the model reads the file with a tool rather than being handed its
+  contents.
+- **Pasting an image** (`Ctrl+V`): the clipboard is read by the platform's own
+  tool, the bytes are checked by their magic number, and the file is written inside
+  the workspace so `read_image` can reach it.
+- **`!` for your own commands**: a line that opens with `!` is a shell command the
+  interface runs itself, echoed into the transcript. It is not the model's, is not
+  recorded, and is not confined — see [SAFETY.md](../SAFETY.md).
 - **No colour leaks**: `NO_COLOR` switches to a monochrome theme that keeps
   modifiers, so the caret and bold/italic still render. The markdown renderer
   does no I/O and strips control characters at the parse boundary.
@@ -345,6 +361,5 @@ The honest list lives in [status](status.md#known-limits); the headline items:
 - **No remote fetch from the renderer**: a fenced block is highlighted by a lexer
   inside the view, and an image is a placeholder or a pasted file, never a URL
   fetched on a model's say-so.
-- **No `!` bash mode** in the interface. The approval state is chosen with
-  `Shift+Tab`, the model switches with `Alt+P` or `/model`, the reasoning effort steps
-  with `Alt+T`, and `@` completes a file's path from the workspace.
+- **The interface's `!` command is not recorded and not confined.** It is your
+  shell rather than the agent's: see [SAFETY.md](../SAFETY.md).

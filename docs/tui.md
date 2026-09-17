@@ -222,6 +222,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Alt+T` | ask for the next step of reasoning effort |
 | `Ctrl+V` | paste an image from the clipboard, as a path |
 | `@` | name a file; the menu completes it with `Tab` |
+| `!command` | run a shell command here, without the model |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
@@ -349,9 +350,10 @@ inventing a purpose for a key would be worse than leaving it alone:
   may touch, and changing it mid-turn would make the prompt the model was sent a lie. The
   dialog says so where a reader is choosing, rather than leaving the difference to be found
   in a document.
-- **Background tasks** (`Ctrl+B`) — there are none to background.
-- **`!` bash mode** is an input *mode* rather than a shortcut. Slash commands have begun, and
-  `@` mentions are below.
+- **Background tasks** (`Ctrl+B`) — there are none to background. A `!` command is not one: it
+  runs as a task so the interface keeps drawing, but it is not a job this interface can list,
+  wait on, or kill, and inventing a list for one command at a time would be a task model rather
+  than a key.
 
 ### Commands
 
@@ -490,6 +492,26 @@ own name, and the alternative — rebuilding the prompt on every switch — woul
 conversation the model is being sent no longer matches the one recorded against it. The live
 value is the one in the title bar; the recorded one is what the session says produced it, and the
 two are the same thing until somebody switches.
+
+### Running a command yourself with `!`
+
+A prompt that opens with `!` is a shell command rather than a prompt. The interface echoes it,
+runs it, and draws its output in the transcript as a notice, and the composer's mark changes from
+`›` to `$` while the draft is one — so which `Enter` you are about to press is visible before you
+press it.
+
+**It is your command, not the agent's.** It runs with your environment and your privileges in the
+directory the interface was started in, it is not sandboxed, it is not approved (there is nobody to
+ask), and *nothing about it is recorded*: the model is never shown it, and the session log — the
+model's history — does not have it. A command you want the model to see, or want confined to the
+workspace, is one you should ask it to run: that is the `bash` tool, and it goes through the gate.
+[SAFETY.md](../SAFETY.md#your-own-commands-the--escape) is where that argument is written out in
+full, because it is a safety decision rather than a feature.
+
+The command runs as a task rather than in the interface's own step, so a slow command does not stop
+the agent's frames being read — a turn that is running keeps arriving while `!find .` works. Its
+output is bounded to a few dozen lines and a few thousand characters, with a count of what was left
+and a `[exit N]` line when the exit status was not zero.
 
 ### Naming a file with `@`
 

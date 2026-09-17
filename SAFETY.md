@@ -80,6 +80,34 @@ local decision, and it means what it says.
 - **The model sees what it reads.** A file you let it read is a file whose contents
   leave your machine in the next request to the provider.
 
+## Your own commands: the `!` escape
+
+The interactive interface has one escape hatch that does not go through the model. A
+prompt that opens with `!` is a shell command **you** are running: the interface echoes
+it, runs it with `sh -c` in the directory it was started in, and draws what came back.
+
+This is not the agent acting, and it is worth being clear about what it therefore is
+not:
+
+- **It is not recorded.** The session log is the model's history — what it was told and
+  what it said — and a command the model neither asked for nor is shown is not part of
+  it. Nothing about a `!` command reaches the transcript the model is given, and the
+  model cannot see what you ran.
+- **It is not confined.** The tools are rooted at the workspace; your shell is rooted
+  where you are. `!cd /` is a shell command, and so is `!rm -rf` with the path of your
+  choosing. It is exactly what typing the same line into your terminal would do.
+- **It is not approved, because there is nobody to ask.** Approval exists because a
+  *model* asked for a call and a person should decide. You are the person, and you
+  typed it.
+- **It waits, and it can be stopped by leaving.** The command runs as a task so the
+  interface keeps drawing, but there is no key that kills it: the interface is not its
+  parent's supervisor, and a command that hangs hangs until it finishes or you quit.
+- **Its output is bounded.** The first rows are drawn and the rest counted, because a
+  command that prints a great deal should not push the conversation out of reach.
+
+If you want a command to be recorded, sandboxed, and visible to the model, ask the
+model to run it — that is what the `bash` tool is, and it goes through the gate above.
+
 ## Secrets
 
 - The API key is read from the `DEEPSEEK_API_KEY` environment variable.

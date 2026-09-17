@@ -62,6 +62,7 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("Alt+T", "ask for the next step of reasoning effort"),
     ("Ctrl+V", "paste an image from the clipboard, as a path"),
     ("@path", "name a file; Tab completes it"),
+    ("!command", "run a shell command here, without the model"),
     ("?", "show this list, when the prompt is empty"),
     ("", "while an approval dialog is up"),
     ("y", "allow the call once"),

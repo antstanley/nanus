@@ -2151,7 +2151,7 @@ impl ViewState {
     fn composer_layout(&self, inner_width: u16) -> ComposerLayout {
         let usable = usize::from(inner_width.max(1));
         let (cursor_line, cursor_column) = self.input.cursor_line_col();
-        let prompt = Self::prompt(self.busy).to_owned();
+        let prompt = Self::prompt(self.busy, self.is_shell_draft()).to_owned();
         let indent = " ".repeat(Self::PROMPT_WIDTH);
         let mut rows: Vec<ComposerRow> = Vec::new();
         let mut caret_row = 0;
@@ -2272,8 +2272,27 @@ impl ViewState {
     }
 
     /// The prompt drawn before the composer's first line.
-    fn prompt(busy: bool) -> &'static str {
-        if busy { "… " } else { "› " }
+    ///
+    /// A `!` line is a shell command rather than a prompt, and it is drawn with a shell's own mark:
+    /// a reader who typed the escape and has second thoughts can see which `Enter` they are about to
+    /// press rather than finding out from the transcript afterwards.
+    fn prompt(busy: bool, shell: bool) -> &'static str {
+        if shell {
+            "$ "
+        } else if busy {
+            "… "
+        } else {
+            "› "
+        }
+    }
+
+    /// Whether the draft is a shell command rather than a prompt.
+    ///
+    /// The same rule [`crate::command::submission_of`] applies, read here so the two cannot disagree
+    /// about what a line is: a leading `!` on the trimmed draft.
+    #[must_use]
+    pub fn is_shell_draft(&self) -> bool {
+        self.input.text().trim_start().starts_with('!')
     }
 
     /// The columns the prompt occupies, which is also the continuation indent.
@@ -3288,6 +3307,32 @@ mod tests {
             !text.contains("second line"),
             "the rest is left to the overlay: {text}"
         );
+    }
+
+    /// A draft that opens with `!` is drawn with a shell's own mark, so which `Enter` is about to be
+    /// pressed is visible before it is pressed.
+    ///
+    /// The `!` itself stays in the drawn text: it is what the reader typed, and hiding a character
+    /// the composer is holding would make the caret's column disagree with the text it is drawn in.
+    #[test]
+    fn a_shell_draft_is_drawn_with_a_shell_s_prompt() {
+        let mut state = ViewState::new();
+        state.input.insert_str("!ls -la");
+        assert!(state.is_shell_draft());
+        let text = rendered(&mut state, 60, 12);
+        assert!(text.contains("$ !ls -la"), "{text}");
+        assert!(!text.contains('›'), "the prompt mark is replaced: {text}");
+
+        // Anything else is a prompt, however it is indented or punctuated.
+        for draft in ["ls -la", "why! ", "!"] {
+            let mut other = ViewState::new();
+            other.input.insert_str(draft);
+            assert_eq!(
+                other.is_shell_draft(),
+                draft.starts_with('!'),
+                "{draft:?} is judged by its first character"
+            );
+        }
     }
 
     /// The menu is drawn above the composer, marked, and its heading carries the key that accepts

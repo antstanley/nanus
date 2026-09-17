@@ -998,6 +998,9 @@ async fn event_loop(
     source: &mut dyn SessionSource,
     mut frames: mpsc::Receiver<Frame>,
 ) -> io::Result<Throughput> {
+    // What `!` commands report, on a channel of its own: a command is a task, and its answer arrives
+    // whenever it finishes rather than in step with anything else happening here.
+    let (shells, mut ran) = mpsc::unbounded_channel::<crate::shell::Outcome>();
     // Built before the terminal is taken, so a configuration that cannot be read is a
     // sentence on stderr rather than an abort with a screen already in raw mode.
     let mut view = opening_view(source)?;
@@ -1092,32 +1095,16 @@ async fn event_loop(
                         source.set_approval(policy);
                     }
                     Outcome::Submit(prompt) => {
-                        match route_submission(prompt, source.accepts_prompts()) {
-                            Routed::Leave => break,
-                            Routed::Stats => {
-                                // A notice rather than prose: the model did not say this, the
-                                // interface did, and the colour is how a reader tells them apart.
-                                view.transcript.push(Entry::notice(view.stats.report()));
-                                view.scroll_to_bottom();
-                            }
-                            Routed::SetModel(requested) => {
-                                switch_model(requested, source, &mut view);
-                            }
-                            Routed::Help => view.open_help(),
-                            Routed::Clear => {
-                                // The transcript only: the draft in the composer and the
-                                // toggles are about what the reader is doing now, and `Ctrl+L`
-                                // already means this.
-                                view.transcript.clear();
-                            }
-                            Routed::Say(message) => {
-                                view.transcript.push(Entry::notice(message));
-                                view.scroll_to_bottom();
-                            }
-                            Routed::Send(prompt) => send_or_queue(prompt, source, &mut view),
+                        if submitted(prompt, source, &mut view, &shells) {
+                            break;
                         }
                     }
                     Outcome::Continue => {}
+                }
+            }
+            outcome = ran.recv() => {
+                if let Some(outcome) = outcome {
+                    shell_finished(&outcome, &mut view);
                 }
             }
             frame = frames.recv() => {
@@ -1164,6 +1151,11 @@ enum Routed {
     /// Routed for the same reason as [`Routed::Stats`]: the draft and the toggles are the
     /// view's state, and clearing one of them is not something a router can do.
     Clear,
+    /// Run this shell command, in the interface's own shell rather than the agent's.
+    ///
+    /// Routed for the same reason as [`Routed::Stats`]: the transcript entry and the status line are
+    /// the view's, and the router is a pure function of the line.
+    Shell(String),
     /// Switch to this model, or cycle when nothing is named.
     ///
     /// Routed for the same reason as [`Routed::Stats`]: which models exist is the agent's
@@ -1188,6 +1180,15 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         // The argument is the rest of the line: `/model` cycles and `/model <id>` names one,
         // which is the pair a command with a useful default and a useful argument offers.
         Submission::Run(Command::Model) => Routed::SetModel(model_argument(&prompt)),
+        Submission::Shell(command) => {
+            if command.trim().is_empty() {
+                Routed::Say(String::from(
+                    "a `!` with nothing after it is not a command — try `!ls`",
+                ))
+            } else {
+                Routed::Shell(command)
+            }
+        }
         Submission::Unknown(name) => Routed::Say(format!(
             "no such command: {name} — this interface knows {}",
             Command::NAMES.join(" and ")
@@ -1287,6 +1288,79 @@ fn switch_model(requested: Option<String>, source: &mut dyn SessionSource, view:
     view.model = Some(chosen.clone());
     view.status = format!("model: {chosen}");
     source.set_model(&chosen);
+}
+
+/// Applies a submitted line, returning whether it asked to leave.
+///
+/// A function rather than a match arm, because the arm is every command the interface has and the
+/// loop is about waiting: this is where a submitted line stops being a string and becomes something
+/// that happened.
+fn submitted(
+    prompt: String,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+    shells: &mpsc::UnboundedSender<crate::shell::Outcome>,
+) -> bool {
+    match route_submission(prompt, source.accepts_prompts()) {
+        Routed::Leave => return true,
+        // A notice rather than prose: the model did not say this, the interface did, and the colour
+        // is how a reader tells them apart.
+        Routed::Stats => {
+            view.transcript.push(Entry::notice(view.stats.report()));
+            view.scroll_to_bottom();
+        }
+        Routed::Help => view.open_help(),
+        // The transcript only: the draft in the composer and the toggles are about what the reader is
+        // doing now, and `Ctrl+L` already means this.
+        Routed::Clear => view.transcript.clear(),
+        Routed::Shell(command) => begin_shell(command, shells, view),
+        Routed::SetModel(requested) => switch_model(requested, source, view),
+        Routed::Say(message) => {
+            view.transcript.push(Entry::notice(message));
+            view.scroll_to_bottom();
+        }
+        Routed::Send(prompt) => send_or_queue(prompt, source, view),
+    }
+    false
+}
+
+/// Draws what a `!` command did, when it comes back.
+///
+/// Nothing about it reaches the session: the log is the model's history, and a command the model
+/// neither asked for nor is shown is not part of it.
+fn shell_finished(outcome: &crate::shell::Outcome, view: &mut ViewState) {
+    view.transcript
+        .push(Entry::notice(crate::shell::report(outcome)));
+    view.scroll_to_bottom();
+    view.status = if outcome.succeeded() {
+        String::from("ready")
+    } else {
+        outcome.status.map_or_else(
+            || String::from("the command did not finish"),
+            |code| format!("the command exited {code}"),
+        )
+    };
+}
+
+/// Shows a shell command and starts it.
+///
+/// The command is echoed before it runs, because a command that takes a minute should not look like
+/// nothing happened; its output arrives later on the same channel every other result does.
+fn begin_shell(
+    command: String,
+    results: &mpsc::UnboundedSender<crate::shell::Outcome>,
+    view: &mut ViewState,
+) {
+    view.transcript.push(Entry::notice(format!("$ {command}")));
+    view.scroll_to_bottom();
+    view.status = format!("running: {command}");
+    let results = results.clone();
+    // A local task rather than a blocking wait: the interface's thread also carries the link, so a
+    // child waited on here would stop a running turn's frames being read for as long as it took.
+    tokio::task::spawn_local(async move {
+        let outcome = crate::shell::run(&command).await;
+        let _ = results.send(outcome);
+    });
 }
 
 /// Puts a pasted image into the workspace and its path into the composer.
@@ -3027,6 +3101,53 @@ mod tests {
         let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut plain);
         assert_eq!(plain.mention_selection, 0);
         assert_eq!(plain.input.text(), "a draft");
+    }
+
+    /// A `!` line is echoed, run by the interface rather than sent anywhere, and its output is
+    /// drawn when it comes back — which is the whole point of the escape: the model never sees it.
+    ///
+    /// The command is a real child process, and it runs as a task rather than a blocking wait: the
+    /// interface's thread also reads the agent's frames.
+    #[test]
+    fn a_bang_line_runs_in_the_interface_and_is_drawn() {
+        // It is the interface's own line, in every mode: no agent is needed to run a shell command,
+        // and a reader browsing a recording still has a shell.
+        for accepts in [true, false] {
+            assert_eq!(
+                route_submission(String::from("!echo hi"), accepts),
+                Routed::Shell(String::from("echo hi"))
+            );
+        }
+        // A `!` with nothing after it is refused rather than run: an empty shell line is a mistake,
+        // and the sentence says what one looks like.
+        let Routed::Say(message) = route_submission(String::from("!"), true) else {
+            panic!("an empty command is answered rather than run");
+        };
+        assert!(message.contains("!ls"), "{message}");
+
+        let (status, echoed, reported) = nanus_kernel::runtime::block_on_local(async {
+            let (results, mut outcomes) = mpsc::unbounded_channel();
+            let mut view = ViewState::new();
+            begin_shell(String::from("printf 'hi'"), &results, &mut view);
+            let status = view.status.clone();
+            let echoed = view
+                .transcript
+                .entries()
+                .last()
+                .map(|entry| entry.text().to_owned());
+            let reported = outcomes
+                .recv()
+                .await
+                .map(|outcome| crate::shell::report(&outcome));
+            (status, echoed, reported)
+        });
+        assert_eq!(status, "running: printf 'hi'");
+        assert_eq!(
+            echoed.as_deref(),
+            Some("$ printf 'hi'"),
+            "it is echoed first"
+        );
+        assert_eq!(reported.as_deref(), Some("$ printf 'hi'\nhi"));
     }
 
     /// A mention in a session with no workspace, and a mention that matches nothing, both close the

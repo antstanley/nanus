@@ -47,6 +47,9 @@ mod paste;
 // `@` mentions: which word the caret is in, what the workspace holds, and which file answers the
 // query. Private because it is a detail of the composer rather than a surface of the crate.
 mod mentions;
+// The `!` escape. Private because it is the runtime's own shell rather than a display: nothing the
+// view draws is a function of it.
+mod shell;
 // The markdown renderer is an implementation detail of the view: it produces the same
 // `Line`s every other entry is drawn from, and nothing outside this crate needs to name
 // it. Keeping it private is what stops it becoming a second public rendering surface.

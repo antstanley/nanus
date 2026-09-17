@@ -44,6 +44,13 @@ impl Command {
 pub enum Submission {
     /// Not a command: it belongs to the model.
     Prompt,
+    /// A command the interface runs itself.
+    ///
+    /// Not a command *for* the interface and not a prompt: `!` is the escape hatch that does not go
+    /// through the model, so the line is handed to a shell rather than to anything here. The whole
+    /// line is the command, unlike a slash command, where only the first word is read: a shell
+    /// command is a command *line*.
+    Shell(String),
     /// A command the interface answers itself.
     Run(Command),
     /// Something that looks like a command and is not one, by the name that was typed.
@@ -56,7 +63,13 @@ pub enum Submission {
 /// reader who types a word after a command has not asked for something else.
 #[must_use]
 pub fn submission_of(text: &str) -> Submission {
-    let mut words = text.split_whitespace();
+    let trimmed = text.trim_start();
+    // `!` leads, and everything after it is the command: what follows is a command line rather than
+    // a word, so the leading space a reader typed is theirs to leave out.
+    if let Some(command) = trimmed.strip_prefix('!') {
+        return Submission::Shell(command.trim_start().to_owned());
+    }
+    let mut words = trimmed.split_whitespace();
     let Some(first) = words.next() else {
         return Submission::Prompt;
     };
@@ -119,6 +132,33 @@ mod tests {
             submission_of("/model deepseek-v4-pro"),
             Submission::Run(Command::Model)
         );
+    }
+
+    /// `!` is the escape hatch: the line is a shell command rather than a prompt, and the whole line
+    /// is the command rather than the first word.
+    #[test]
+    fn a_bang_line_is_a_shell_command() {
+        assert_eq!(
+            submission_of("!ls -la | wc -l"),
+            Submission::Shell(String::from("ls -la | wc -l"))
+        );
+        // The space after the `!` is the reader's, not part of the command.
+        assert_eq!(
+            submission_of("! pwd"),
+            Submission::Shell(String::from("pwd"))
+        );
+        // Leading whitespace does not make it prose: a reader who indented their command meant it.
+        assert_eq!(
+            submission_of("  !git status"),
+            Submission::Shell(String::from("git status"))
+        );
+        // A `!` with nothing after it is a command with nothing in it, which the interface refuses
+        // rather than running: an empty shell line is not a mistake worth guessing at.
+        assert_eq!(submission_of("!"), Submission::Shell(String::new()));
+        assert_eq!(submission_of("!  "), Submission::Shell(String::new()));
+        // And a `!` that is not the first character is just punctuation in a sentence.
+        assert_eq!(submission_of("that was exciting!"), Submission::Prompt);
+        assert_eq!(submission_of("wow! /exit"), Submission::Prompt);
     }
 
     #[test]
