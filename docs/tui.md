@@ -217,9 +217,21 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Ctrl+W` | delete the previous word |
 | `Alt+B` / `Alt+F` | move the cursor a word back / forward |
 | `Ctrl+L` | clear the transcript |
+| `?` | show the key list, when the prompt is empty |
 | `Up` / `Down` | move between lines, then browse submitted prompts |
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
+
+**`?` opens the key list**, which is this table drawn on the screen: a reader who does not
+know a binding exists has no way to find it, and documentation they are not looking at is
+not a list. The gate is the composer: `?` opens the list only when there is nothing being
+typed, because a prompt needs `?` to be a `?` — `why?` is a question, not a command. Nothing
+being typed means nothing but whitespace, so a prompt holding only spaces still gives the
+key to the list. The overlay owns the keyboard while it is up — `Esc`, `Enter`, `Ctrl+C`,
+`q`, or `?` again closes it, `Up` and `Down` scroll it, and every other key does nothing
+rather than typing into the composer behind it — and the list scrolls rather than being cut,
+because a binding that fell off the bottom of a short terminal would be exactly the one a
+reader opened the list to find.
 
 **While an approval dialog is up, four answers are possible and every other key is
 swallowed.** The dialog is drawn over the interface, names the tool and the harness's reason,
@@ -335,9 +347,6 @@ inventing a purpose for a key would be worse than leaving it alone:
   decisions with no request to carry them.
 - **Background tasks** (`Ctrl+B`) — there are none to background.
 - **Pasting an image** (`Ctrl+V`) would need clipboard access this program does not have.
-- **`?` for a key list** is not implemented: the composer needs `?` to be a `?`, and
-  swallowing it on an empty prompt is a cost this interface is not willing to pay for a
-  list that is one `Ctrl+L` away from being off screen anyway. This table is that list.
 - **`@` mentions and `!` bash mode** are input *modes* rather than shortcuts, and each is a
   feature in its own right. Slash commands have begun — see below.
 

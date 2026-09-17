@@ -89,12 +89,12 @@ numbers are the plan's, kept because later items refer to them.
 | # | Item | Where it landed |
 |---|---|---|
 | 7 | **Syntax highlighting in fenced code blocks.** A lexer inside the view rather than a highlighting crate: nothing is read from disk to draw an answer, a construct that spans lines stays itself across them, and a language it does not know is drawn verbatim. The classes borrow the role styles, so `NO_COLOR` keeps the modifiers and loses only the colours. | `nanus-tui/src/markdown/{highlight,theme,render,wrap}.rs` |
+| 8 | **A help overlay for the key list (`?`).** One table in the crate, drawn as an overlay and scrollable, opened by `?` on an empty prompt and closed by the keys that leave any other dialogue. The gate is the composer: `?` is still a `?` in a prompt. | `nanus-tui/src/help.rs`, `view.rs`, `runtime.rs` |
 
 ## Next: what the interface needs to be a daily driver
 
 | # | Item | Size | Notes |
 |---|---|---|---|
-| 8 | **A help overlay for the key list (`?`).** | **XS** | The [key table](tui.md#keys) is the list; this draws it, gated so `?` is still a `?` in a prompt. |
 | 9 | **More slash commands.** | **S** each | Only `/exit`, `/quit`, and `/stats` exist. `/help`, `/clear`, and eventually `/model` and `/compact` are the obvious next ones; an unrecognised command is already named rather than sent to the model. |
 | 10 | **Switch model at runtime (`Alt+P`).** | **M** | A config-and-restart decision today. Needs the request to carry the switch and a rule for whether it persists; depends on the provider seam. |
 | 11 | **Extended-thinking toggle (`Alt+T`).** | **S** | Needs the same request plumbing as 10. `reasoning_effort` is already a per-request control. |

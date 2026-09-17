@@ -1149,6 +1149,12 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     if view.pending_approval.is_some() {
         return handle_approval_key(key, view);
     }
+    // The key list is what the reader asked to look at, and it is drawn over the composer, so
+    // it owns the keyboard while it is up — as the queue overlay does. A key that reached the
+    // text behind it would be typed into a prompt nobody can see.
+    if view.help_open {
+        return handle_help_key(key, view);
+    }
     // A running search rewrites what every key means: the composer is showing a match
     // rather than the reader's own text, so typing extends the *query* and the keys that
     // would normally edit the prompt end the search instead. Routing it before anything
@@ -1219,6 +1225,32 @@ fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
         },
         _ => Outcome::Continue,
     }
+}
+
+/// Routes a key while the key list is open.
+///
+/// Three things and nothing else: close it, scroll it, or ignore the key. Closing takes the
+/// keys that mean "leave what is in front of me" everywhere else in this interface — `Esc`,
+/// `Ctrl+C` — and the key that opened it, so a reader who pressed `?` to look closes it the
+/// same way. Ignoring everything else is what stops a stray `d` from typing into a prompt
+/// behind the overlay.
+fn handle_help_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        // `Esc` and `Ctrl+C` are how a dialogue is left everywhere else in this interface,
+        // `Enter` is how one is accepted, and `?` is the key that opened this one. `q` and `Q`
+        // are here because the queue overlay closes on them and a reader should not have to
+        // remember which overlay they are looking at: `Q` matches because a terminal that
+        // reports modifiers may send a capital with Shift held.
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q' | 'Q') => view.close_help(),
+        KeyCode::Char('c' | 'C') if control => view.close_help(),
+        KeyCode::Up => view.scroll_help(-1),
+        KeyCode::Down => view.scroll_help(1),
+        KeyCode::PageUp => view.scroll_help(-PAGE_ROWS),
+        KeyCode::PageDown => view.scroll_help(PAGE_ROWS),
+        _ => {}
+    }
+    Outcome::Continue
 }
 
 /// Routes a key while the queue overlay is open.
@@ -1414,6 +1446,19 @@ fn handle_plain_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         }
         KeyCode::Char('f' | 'F') if alt => {
             view.input.move_word_right();
+            Outcome::Continue
+        }
+        // `?` is the key list, and only on an empty prompt. The gate is the price of the
+        // binding: a prompt may open with a question mark, and swallowing it would make this
+        // interface unable to ask a question that starts with one. A reader who means to type
+        // it types anything else first — a space, a word — and it is a `?` again.
+        //
+        // The key *code* is matched and the modifiers are not, which is what makes this work
+        // at all: a terminal that reports modifiers sends `?` as `Char('?')` with Shift held,
+        // and a binding that compared whole key events would fail for exactly the keys a
+        // person tests by pressing them.
+        KeyCode::Char('?') if view.input.is_empty() => {
+            view.open_help();
             Outcome::Continue
         }
         KeyCode::Char(character) => {
@@ -2208,13 +2253,13 @@ mod tests {
         // the key *code* and ignores the modifiers when inserting text. The terminal has
         // already decided which character the key produced.
         let mut view = ViewState::new();
-        for character in ['?', '!', '@', '#', 'A'] {
+        for character in ['!', '@', '#', '?', 'A'] {
             let _ = handle_key(
                 key(KeyCode::Char(character), KeyModifiers::SHIFT),
                 &mut view,
             );
         }
-        assert_eq!(view.input.text(), "?!@#A");
+        assert_eq!(view.input.text(), "!@#?A");
     }
 
     #[test]
@@ -2263,8 +2308,91 @@ mod tests {
         assert_eq!(view.input.text(), "t", "a bare letter is still text");
     }
 
-    /// The two-step exit: a key that means "stop" must not be able to lose a prompt that
-    /// somebody is halfway through writing.
+    /// `?` opens the key list, and it is still a `?` in a prompt.
+    ///
+    /// The gate is the whole design of the binding: the composer needs `?` to be a `?`, so
+    /// the list only opens when there is nothing being typed.
+    #[test]
+    fn question_mark_opens_the_key_list_only_on_an_empty_prompt() {
+        let mut view = ViewState::new();
+        let _ = handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT), &mut view);
+        assert!(view.help_open, "an empty prompt gives the key to the list");
+        assert!(view.input.is_empty(), "and nothing was typed");
+
+        // In a prompt it is the character, whatever modifiers the terminal reported with it.
+        let mut typing = ViewState::new();
+        typing.input.insert_str("why");
+        let _ = handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT), &mut typing);
+        assert!(!typing.help_open);
+        assert_eq!(
+            typing.input.text(),
+            "why?",
+            "in a prompt it is the character"
+        );
+
+        // A leading one is typed the same way, because the gate is emptiness rather than
+        // position: one other character is enough to make it a prompt. Whitespace is not
+        // one — a prompt that is only spaces is still empty — which is the same rule the
+        // composer uses everywhere else.
+        let mut leading = ViewState::new();
+        leading.input.insert('x');
+        let _ = handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT), &mut leading);
+        assert!(!leading.help_open);
+        assert_eq!(leading.input.text(), "x?");
+    }
+
+    /// The list is modal while it is up: keys that are not its own neither type nor act.
+    #[test]
+    fn the_key_list_swallows_keys_that_are_not_its_own() {
+        let mut view = ViewState::new();
+        let _ = handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT), &mut view);
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Char('d'),
+            KeyCode::Char('t'),
+            KeyCode::Backspace,
+        ] {
+            let _ = handle_key(key(code, KeyModifiers::NONE), &mut view);
+        }
+        assert!(view.input.is_empty(), "no key reached the composer");
+        assert!(!view.collapse_tools, "and no key reached a toggle");
+
+        // Up and Down scroll it, which is what makes the whole list reachable on a short
+        // terminal.
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.help_scroll, 1);
+        assert!(view.help_open, "scrolling is not closing");
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.help_scroll, 0);
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.help_scroll, 0, "and it does not scroll above the top");
+    }
+
+    #[test]
+    fn the_keys_that_close_the_key_list_are_the_ones_that_leave_a_dialog() {
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('?'),
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+        ] {
+            let mut view = ViewState::new();
+            view.open_help();
+            let _ = handle_key(key(code, KeyModifiers::NONE), &mut view);
+            assert!(!view.help_open, "{code:?} closes the list");
+        }
+        let mut view = ViewState::new();
+        view.open_help();
+        let _ = handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view);
+        assert!(!view.help_open, "Ctrl-C closes it, as it closes the queue");
+
+        // And a reader who closes it does not leave with it: the prompt is still there.
+        let mut view = ViewState::new();
+        view.input.insert_str("a draft");
+        let _ = handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT), &mut view);
+        assert!(!view.help_open, "a prompt means the key is text");
+    }
+
     /// The stop key means the thing that is happening now: with a turn running it asks the
     /// agent to stop, and only with nothing running does it reach the prompt and the
     /// session.

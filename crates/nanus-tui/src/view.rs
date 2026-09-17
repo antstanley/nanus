@@ -297,6 +297,20 @@ pub struct ViewState {
     /// instead: see [`crate::queue`].
     pub queue_editor: Option<QueueEdit>,
 
+    /// Whether the key list is open.
+    ///
+    /// While it is set the overlay owns the keyboard, as the approval dialog and the queue
+    /// overlay do: the composer is not taking text, so a key pressed while reading the list
+    /// cannot end up in a prompt nobody is looking at.
+    pub help_open: bool,
+
+    /// How many rows into the key list the overlay starts.
+    ///
+    /// The list is longer than a short terminal, so it is scrolled rather than cut: an
+    /// offset past the end is clamped when it is drawn, which is where the height of the
+    /// window is known.
+    pub help_scroll: u16,
+
     /// The transcript area the view last drew into, if it has drawn.
     ///
     /// Recorded because "the bottom" is not a constant: it depends on how many rows
@@ -339,6 +353,8 @@ impl Default for ViewState {
             queue_open: false,
             queue_selection: 0,
             queue_editor: None,
+            help_open: false,
+            help_scroll: 0,
             last_viewport: None,
             last_composer: None,
         }
@@ -731,6 +747,39 @@ impl ViewState {
         self.queue_open = false;
     }
 
+    /// Opens the key list, from the top.
+    ///
+    /// Always from the top rather than where it was left: the list is short and a reader who
+    /// opens it is looking for a key, so starting where a previous look ended would hide the
+    /// beginning of the list for no reason.
+    pub fn open_help(&mut self) {
+        self.help_open = true;
+        self.help_scroll = 0;
+    }
+
+    /// Closes the key list.
+    pub fn close_help(&mut self) {
+        self.help_open = false;
+    }
+
+    /// Scrolls the key list by `rows`, which may be negative.
+    ///
+    /// The result is allowed to run past the end: the offset that is *correct* depends on
+    /// how tall the terminal is, which the view knows only when it draws, so the clamp
+    /// happens there and this one only keeps the value in range.
+    pub fn scroll_help(&mut self, rows: i32) {
+        let moved = i32::from(self.help_scroll).saturating_add(rows).max(0);
+        self.help_scroll = u16::try_from(moved).unwrap_or(u16::MAX);
+    }
+
+    /// The rows of the key list that fit in `height`, and where they start.
+    #[must_use]
+    fn help_window(&self, height: u16) -> (usize, usize) {
+        let room = usize::from(height);
+        let offset = usize::from(self.help_scroll).min(crate::help::height().saturating_sub(room));
+        (offset, room)
+    }
+
     /// Moves the overlay's selection toward the front of the queue.
     pub fn queue_up(&mut self) {
         self.queue_selection = self.queue_selection.saturating_sub(1);
@@ -1033,6 +1082,11 @@ impl ViewState {
         if self.queue_open {
             self.render_queue_dialog(frame, area);
         }
+        // The key list is a reference a reader opened deliberately, so it goes over the
+        // transcript and under the two things the agent is waiting on.
+        if self.help_open {
+            self.render_help(frame, area);
+        }
         // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
         // be the thing a reader sees, not a dialogue behind the transcript.
         if self.pending_approval.is_some() {
@@ -1256,6 +1310,64 @@ impl ViewState {
         let paragraph = Paragraph::new(Text::from(lines))
             .block(block)
             .wrap(Wrap { trim: false })
+            .style(self.theme.notice);
+        // Cleared first, so the transcript behind the dialog does not show through the gaps
+        // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(paragraph, dialog);
+    }
+
+    /// Draws the key list over the interface.
+    ///
+    /// It is a reference rather than a question, so it is drawn over the transcript and under
+    /// the two overlays the agent can be blocked on. The list is longer than a short terminal
+    /// holds, so it scrolls rather than being cut: a binding that fell off the bottom would be
+    /// exactly the one a reader was looking for.
+    fn render_help(&self, frame: &mut Frame<'_>, area: Rect) {
+        let width = area.width.saturating_sub(4).clamp(24, 76);
+        let height = area.height.saturating_sub(4).max(4);
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        // The borders and the footer are not list rows, so the window is measured against what
+        // is left rather than against the dialog.
+        let inner = usize::from(width.saturating_sub(2));
+        let (offset, room) = self.help_window(height.saturating_sub(3));
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for row in crate::help::rows(offset, room, inner) {
+            match row {
+                crate::help::Row::Heading(text) => lines.push(Line::from(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                crate::help::Row::Keys { key, effect } => lines.push(Line::from(vec![
+                    Span::styled(key, self.theme.notice.add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {effect}"), Style::default()),
+                ])),
+            }
+        }
+        // The footer is part of the dialog rather than a row of the list, so it stays where it
+        // is while the list scrolls: the thing a reader needs after reading is how to leave.
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.notice)
+            .title(Line::from(Span::styled(
+                crate::help::TITLE,
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .title_bottom(Line::from(Span::styled(
+                crate::help::FOOTER,
+                Style::default().fg(Color::DarkGray),
+            )));
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(block)
             .style(self.theme.notice);
         // Cleared first, so the transcript behind the dialog does not show through the gaps
         // between its letters.
@@ -2753,6 +2865,64 @@ mod tests {
             !text.contains("second line"),
             "the rest is left to the overlay: {text}"
         );
+    }
+
+    /// The key list is drawn over the transcript, with the bindings and a way out.
+    #[test]
+    fn the_key_list_is_drawn_over_the_conversation() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::prose(
+            Role::User,
+            String::from("a prompt that must not show through"),
+        ));
+        state.open_help();
+        let text = rendered(&mut state, 80, 24);
+        assert!(text.contains("keys"), "{text}");
+        assert!(text.contains("Ctrl+T"), "a binding is listed: {text}");
+        assert!(text.contains("summarise"), "with what it does: {text}");
+        assert!(text.contains("Esc closes"), "and how to leave: {text}");
+        assert!(
+            !text.contains("must not show through"),
+            "the dialog covers the transcript: {text}"
+        );
+    }
+
+    /// The list is longer than a short terminal, and scrolling is how the rest of it is read:
+    /// a binding that could not be brought into view would be the one a reader came for.
+    #[test]
+    fn the_key_list_scrolls_rather_than_being_cut() {
+        let mut open = ViewState::new();
+        open.open_help();
+        let first = rendered(&mut open, 60, 12);
+        open.scroll_help(6);
+        let later = rendered(&mut open, 60, 12);
+        assert_ne!(first, later, "the window moved");
+        assert!(first.contains("submit"), "{first}");
+        assert!(
+            !later.contains("submit"),
+            "the first rows scrolled away: {later}"
+        );
+
+        // Scrolling past the end lands on the last page rather than on blank rows.
+        open.scroll_help(10_000);
+        let last = rendered(&mut open, 60, 12);
+        assert!(last.contains("while an approval dialog is up"), "{last}");
+        assert!(
+            last.contains("deny it and stop"),
+            "the last row is reachable: {last}"
+        );
+    }
+
+    /// Reopening starts at the top, whatever a previous look was scrolled to: the list is
+    /// short, and a reader opening it is looking for a key rather than resuming a read.
+    #[test]
+    fn the_key_list_opens_at_the_top() {
+        let mut state = ViewState::new();
+        state.open_help();
+        state.scroll_help(5);
+        state.close_help();
+        state.open_help();
+        assert_eq!(state.help_scroll, 0);
     }
 
     /// The overlay lists every prompt, marks the selection, and spells out the keys — a
