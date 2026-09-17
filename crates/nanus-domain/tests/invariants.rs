@@ -430,7 +430,10 @@ fn an_unbounded_tool_loop_is_stopped_by_the_budget() {
 
 #[test]
 fn permission_defaults_are_fail_closed() {
-    assert_eq!(PermissionPreset::default().approval, ApprovalPolicy::Ask);
+    assert_eq!(
+        PermissionPreset::default().approval,
+        ApprovalPolicy::PerCall
+    );
     assert_eq!(PermissionPreset::default().sandbox, SandboxMode::ReadOnly);
     assert!(!ApprovalOutcome::Cancelled.is_allowed());
     assert!(!ApprovalOutcome::Unavailable.is_allowed());

@@ -28,20 +28,35 @@ and the **approval policy** decides what happens to a call *outside* it.
   needs approval, because a workspace root cannot confine what a program does.
 - `danger-full-access` — every call runs; nothing needs approval.
 
-**Approval policy** (`ask` by default).
+**Approval policy** (`per_call` by default).
 
-- `ask` — a call the sandbox does not permit prompts you. If no answerer is
+- `per_call` — a call the sandbox does not permit prompts you. If no answerer is
   available, or the prompt cannot be delivered, the call is **denied** rather than
-  allowed. Approval is one-shot: answering once does not approve the next call.
-- `never` — every call the sandbox does not permit is **rejected immediately**,
-  without consulting anyone. This is not "approve everything": it means no
-  exception is ever granted, which is the setting to choose for an unattended run
-  where nobody can answer. It only leaves tools usable alongside
-  `danger-full-access`, where nothing needs an exception.
+  allowed. Approval is one-shot unless you choose otherwise.
+- `permitted` — a call that cannot destroy anything runs without asking. A call
+  that looks destructive — a command that deletes or overwrites — still prompts,
+  *unless* every path it names is inside a temporary directory, where a destructive
+  command is the ordinary way to clean up. Prefer this over `per_call` when you
+  want the agent to work without being asked about every read-only shell command,
+  but still want a person in the loop for a deletion.
+- `all_calls` — every call the sandbox does not permit runs without asking. This is
+  a free for all, and it is only safe where the *environment* is the containment:
+  a container, a virtual machine, or a machine whose contents are disposable. Do
+  not choose it on a laptop with your work on it, and note that it does not
+  enforce anything itself — it removes the gate rather than adding a wall.
+
+Every prompt offers a standing "always allow", which records the tool for the rest
+of the session. It is per session and in memory, and it is wider than one call:
+granting `bash` means every later `bash` call in that conversation runs without
+asking, including a destructive one.
+
+The state is shown in the interface's status line and cycles with `Shift+Tab`; it
+can be chosen at startup with `--approval`. A state chosen in the interface reaches
+the agent that owns the gate, so it is not merely cosmetic.
 
 A tool's declared access decides which of the three sandbox questions it is: the
 read tools and the search tools read, `write` and `edit` write, and `bash` runs a
-program. There is deliberately no "auto-approve" or "always allow" policy.
+program.
 
 Who is asked depends on where you are. `nanus run` prompts on the terminal, and
 only when stdin is a terminal: a redirected stdin is not an answerer, so a script
@@ -105,7 +120,8 @@ fixture, a web page. Treat the model's instructions as untrusted input, not as y
 instructions. Concretely:
 
 - Prefer `read-only` or `workspace-write` over `danger-full-access`.
-- Prefer `ask` when a human is watching.
+- Prefer `per_call` (the default) or `permitted` when a human is watching, and keep
+  `all_calls` for an environment that contains the blast radius.
 - Review what a run did, not only what it said. The session log is the record.
 
 ## Reporting

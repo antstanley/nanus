@@ -29,7 +29,7 @@ use nanus_domain::{
     ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolRegistry,
     ToolResult, ToolSchema, Usage,
 };
-use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
+use nanus_link::protocol::{ApprovalState, Frame, Request, SessionInfo, TurnEnd};
 use nanus_link::server::{Agent, Parts};
 use nanus_link::{Client, LinkError};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, StoreHandle};
@@ -1577,7 +1577,7 @@ async fn until_approval(client: &mut Client, frames: &mut Vec<Frame>) -> Option<
 #[test]
 fn an_approval_question_reaches_the_client_and_its_answer_runs_the_call() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::Ask);
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
     let socket = dir.path().join("agent.sock");
     let socket_for_client = socket.clone();
 
@@ -1607,6 +1607,7 @@ fn an_approval_question_reaches_the_client_and_its_answer_runs_the_call() {
             .send(&Request::Approve {
                 call_id,
                 allow: true,
+                always: false,
             })
             .await
             .expect("the answer is sent");
@@ -1634,7 +1635,7 @@ fn an_approval_question_reaches_the_client_and_its_answer_runs_the_call() {
 #[test]
 fn a_refused_approval_denies_the_call_and_the_turn_finishes() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::Ask);
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
     let socket = dir.path().join("agent.sock");
     let socket_for_client = socket.clone();
 
@@ -1663,6 +1664,7 @@ fn a_refused_approval_denies_the_call_and_the_turn_finishes() {
             .send(&Request::Approve {
                 call_id,
                 allow: false,
+                always: false,
             })
             .await
             .expect("the refusal is sent");
@@ -1689,11 +1691,11 @@ fn a_refused_approval_denies_the_call_and_the_turn_finishes() {
     assert_eq!(reason_of(&frames), Some(&TurnEnd::Completed));
 }
 
-/// `never` refuses the call without asking anyone, so no question crosses the link at all.
+/// `all_calls` grants the call without asking anyone, so no question crosses the link.
 #[test]
-fn a_never_policy_denies_the_call_without_asking_the_client() {
+fn an_all_calls_state_grants_the_call_without_asking_the_client() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::Never);
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::AllCalls);
     let socket = dir.path().join("agent.sock");
     let socket_for_client = socket.clone();
 
@@ -1726,13 +1728,147 @@ fn a_never_policy_denies_the_call_without_asking_the_client() {
         !frames
             .iter()
             .any(|frame| matches!(frame, Frame::Approval { .. })),
-        "`never` consults nobody: {frames:?}"
+        "`all_calls` consults nobody: {frames:?}"
     );
     assert!(
         frames
             .iter()
-            .any(|frame| matches!(frame, Frame::ToolDone { error: true, .. })),
-        "the call was refused rather than run: {frames:?}"
+            .any(|frame| matches!(frame, Frame::ToolDone { error: false, .. })),
+        "the call ran: {frames:?}"
     );
     assert_eq!(reason_of(&frames), Some(&TurnEnd::Completed));
+}
+
+/// An `always` answer is a standing grant: the next turn does not ask about the same tool.
+#[test]
+fn an_always_answer_is_not_asked_again_in_the_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+
+        // The first turn asks, and the answer is a standing permission for the tool.
+        client
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mut frames = Vec::new();
+        let Some((call_id, _)) = until_approval(&mut client, &mut frames).await else {
+            panic!("the first call is asked about: {frames:?}");
+        };
+        client
+            .send(&Request::Approve {
+                call_id,
+                allow: true,
+                always: true,
+            })
+            .await
+            .expect("the standing answer is sent");
+        frames.extend(turn_frames(&mut client).await);
+
+        // The second turn calls the same tool, and nobody is asked this time.
+        client
+            .send(&Request::Prompt {
+                text: "again".to_owned(),
+            })
+            .await
+            .expect("the second prompt is sent");
+        let second = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        (frames, second)
+    });
+
+    let (first, second) = frames;
+    assert!(
+        first
+            .iter()
+            .any(|frame| matches!(frame, Frame::Approval { .. })),
+        "the first call is a question: {first:?}"
+    );
+    assert!(
+        !second
+            .iter()
+            .any(|frame| matches!(frame, Frame::Approval { .. })),
+        "the granted tool is not asked about again: {second:?}"
+    );
+}
+
+/// The interface can change the agent's state; the change is acknowledged, and the next call
+/// is decided by the new state rather than the configured one.
+#[test]
+fn setting_the_approval_state_changes_how_the_next_call_is_decided() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+        client
+            .send(&Request::SetApproval {
+                state: ApprovalState::AllCalls,
+            })
+            .await
+            .expect("the state is sent");
+        client
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        frames
+    });
+
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            Frame::ApprovalChanged {
+                state: ApprovalState::AllCalls
+            }
+        )),
+        "the change is acknowledged: {frames:?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Approval { .. })),
+        "the new state granted the call: {frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ToolDone { error: false, .. })),
+        "the call ran: {frames:?}"
+    );
 }

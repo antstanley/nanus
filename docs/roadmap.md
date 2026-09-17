@@ -34,7 +34,7 @@ entry says where the work lives rather than what it was going to be.
 
 | # | Item | Where it landed |
 |---|---|---|
-| 1 | **Approval is enforced at the tool boundary.** A tool declares what it can touch, the sandbox decides what runs unasked, and a call outside it is denied unless an answerer grants it — `never` without asking anyone, and `ask` failing closed when nobody can answer. The system prompt carries the runtime policy. | `nanus-domain/src/approval.rs`, `nanus-bundle/src/agent_loop.rs` |
+| 1 | **Approval is enforced at the tool boundary.** A tool declares what it can touch, the sandbox decides what runs unasked, and a call outside it is denied unless an answerer grants it — `per_call` failing closed when nobody can answer, `permitted` granting the non-destructive exceptions, and `all_calls` granting every exception. The system prompt carries the runtime policy. | `nanus-domain/src/approval.rs`, `nanus-bundle/src/agent_loop.rs` |
 | 2 | **The interface and the CLI answer it.** An `approval` frame and an `approve` request cross the link, the interface draws a dialog and answers, and `nanus run` prompts on the terminal — or denies, when stdin is not one. | `nanus-link/src/{protocol,server}.rs`, `nanus-tui/src/{runtime,view}.rs`, `nanus-cli/src/approve.rs` |
 | 3 | **A step's tool calls run together, bounded by `max_parallel_tools`.** Cooperative concurrency with results recorded in call order, and decisions kept sequential so an approval question is asked one at a time. | `nanus-bundle/src/agent_loop.rs` |
 | 4 | **The live tool-call frames are verified.** A real `api.deepseek.com` tool-call response is replayed byte for byte; it decoded with no change to the wire. | `nanus-bundle/tests/data/`, `live_wire.rs` |
@@ -138,7 +138,7 @@ Two communication shapes are worth keeping distinct:
   should be recorded as coming from the parent rather than from a person.
 
 The questions to settle before the code are the policy ones: whether a child
-inherits the parent's sandbox and approval policy (it should), whether an `ask`
+inherits the parent's sandbox and approval state (it should), whether a prompt
 the user cannot be shown from inside a child denies the call (it must, fail
 closed), whether a child may itself call `agent` (a depth limit, or a flag), and
 how a child's session is linked to its parent so `nanus sessions` can show a
@@ -220,9 +220,11 @@ the question is only whether the child needs help.
 These appear on other projects' roadmaps. They are absent here on purpose, and
 the [design decisions](design.md) say why:
 
-- **An auto-approve or "always allow" policy.** A mode that means yes to
-  everything is how an `rm -rf` reaches a bug report. The policy set is `ask`
-  and `never` and stays that way.
+- **A policy that means yes to everything** was on this list, and is now shipped as the
+  explicit `all_calls` state (and the session-scoped "always allow" answer). It is never
+  the default, the status line names it, and
+  [design.md](design.md#approval-is-a-three-state-axis-fail-closed-at-the-default) argues
+  the reversal.
 - **Aliases for retired model ids.** `deepseek-chat` and `deepseek-reasoner` do
   not resolve, because silently mapping a retired name onto a new model changes
   a user's output without saying so.

@@ -84,6 +84,23 @@ pub enum TurnEnd {
     Interrupted,
 }
 
+/// How much an agent asks before running a call the sandbox refused.
+///
+/// The link's own vocabulary rather than the domain's approval policy, for the same reason
+/// [`TurnEnd`] is its own: a client that only draws and answers links the protocol and not
+/// the domain. The server translates, and the translation is an exhaustive match, so a
+/// state the domain grows cannot quietly fail to cross.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalState {
+    /// Ask about every exception.
+    PerCall,
+    /// Grant a non-destructive exception without asking; ask about the rest.
+    Permitted,
+    /// Grant every exception without asking.
+    AllCalls,
+}
+
 /// What a client asks an agent to do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -140,13 +157,30 @@ pub enum Request {
     /// The agent asks with [`Frame::Approval`] and waits; this is the answer. It is a
     /// *request* rather than a keystroke for the same reason [`Request::Interrupt`] is:
     /// the turn belongs to the session, not to the connection, and any client watching may
-    /// be the one to answer. The first answer wins, and one is enough — the question is
-    /// whether a single call may run once, not a standing permission.
+    /// be the one to answer. The first answer wins, and one is enough.
     Approve {
         /// The call the question was about, exactly as the approval frame named it.
         call_id: String,
         /// Whether the call may run.
         allow: bool,
+        /// Whether the answer is a standing permission for this session.
+        ///
+        /// `true` records the tool so the same question is not asked again in this session;
+        /// `false` grants the one call. Defaulted on the way in, so a client that predates
+        /// the option sends an allow-once answer, which is what it always meant.
+        #[serde(default)]
+        always: bool,
+    },
+
+    /// Replace the agent's approval state for the rest of the session.
+    ///
+    /// The interface's own toggle, sent when a reader cycles the state. It is a request
+    /// rather than part of a prompt because the *agent* owns the gate: the state decides how
+    /// a call in a turn that is already running is treated, so it has to reach the loop
+    /// rather than ride along with the next thing the model is asked.
+    SetApproval {
+        /// The state the agent should use from now on.
+        state: ApprovalState,
     },
 
     /// Describe the agent without changing anything.
@@ -256,10 +290,11 @@ pub enum Frame {
 
     /// The agent is asking whether one tool call may run.
     ///
-    /// Sent when the loop reaches a call the sandbox does not already permit and the policy
-    /// is `ask`, and sent to every client attached to the session — so a watcher sees both
-    /// the question and, in the transcript that follows, what was decided. The turn waits
-    /// for [`Request::Approve`], and a question nobody answers leaves the call denied.
+    /// Sent when the loop reaches a call the sandbox does not already permit and the state
+    /// is not granting it, and sent to every client attached to the session — so a watcher
+    /// sees both the question and, in the transcript that follows, what was decided. The
+    /// turn waits for [`Request::Approve`], and a question nobody answers leaves the call
+    /// denied.
     ///
     /// Only the tool and the harness's own reason cross the link. The arguments do not:
     /// the domain's approval request deliberately carries none, so model-controlled text
@@ -274,6 +309,16 @@ pub enum Frame {
         /// Defaulted on the way in, so a reason-less question still decodes.
         #[serde(default)]
         reason: Option<String>,
+    },
+
+    /// The agent's approval state, for an interface to draw and cycle from.
+    ///
+    /// Sent once when a client attaches, so the interface knows the state before it draws
+    /// anything, and again whenever any client changes it, so two views of one session do
+    /// not disagree about what the next call will do.
+    ApprovalChanged {
+        /// The state the agent is using now.
+        state: ApprovalState,
     },
 
     /// Usage was reported for the request that just completed.
@@ -425,7 +470,7 @@ impl Frame {
 /// The field is optional on the wire and defaults to zero, which is what a build that
 /// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
 /// rather than assuming compatibility.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -570,6 +615,15 @@ mod tests {
                 tool: "bash".to_owned(),
                 reason: Some("the sandbox mode `read_only` does not permit execute".to_owned()),
             },
+            Frame::ApprovalChanged {
+                state: ApprovalState::PerCall,
+            },
+            Frame::ApprovalChanged {
+                state: ApprovalState::Permitted,
+            },
+            Frame::ApprovalChanged {
+                state: ApprovalState::AllCalls,
+            },
             Frame::Usage {
                 tokens: 1234,
                 completion_tokens: 90,
@@ -620,10 +674,20 @@ mod tests {
             Request::Approve {
                 call_id: "call-1".to_owned(),
                 allow: true,
+                always: false,
+            },
+            Request::Approve {
+                call_id: "call-1".to_owned(),
+                allow: true,
+                always: true,
             },
             Request::Approve {
                 call_id: "call-1".to_owned(),
                 allow: false,
+                always: false,
+            },
+            Request::SetApproval {
+                state: ApprovalState::AllCalls,
             },
             Request::Sessions,
             Request::Status,

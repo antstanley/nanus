@@ -23,7 +23,9 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::error::{LinkError, LinkResult};
-use crate::protocol::{AgentInfo, Frame, PROTOCOL_VERSION, Request, SessionInfo, encode};
+use crate::protocol::{
+    AgentInfo, ApprovalState, Frame, PROTOCOL_VERSION, Request, SessionInfo, encode,
+};
 use crate::wire::read_message;
 
 /// A connection to an agent.
@@ -153,13 +155,46 @@ impl Client {
     /// [`LinkError::Closed`] when the agent hung up instead of answering.
     pub async fn sessions(&mut self) -> LinkResult<Vec<SessionInfo>> {
         self.send(&Request::Sessions).await?;
-        match self.next().await? {
-            Some(Frame::Sessions { held }) => Ok(held),
-            Some(other) => Err(LinkError::protocol(format!(
-                "expected a listing, got {other:?}"
-            ))),
-            None => Err(LinkError::Closed),
+        // Frames that are not the reply are discarded rather than reported: an attached
+        // connection is pushed frames the agent decides to send — the approval state, a
+        // prompt somebody else typed — and a client asking a question of its own should not
+        // fail because one of them arrived first. This is the same rule `attached` follows.
+        loop {
+            match self.next().await? {
+                Some(Frame::Sessions { held }) => return Ok(held),
+                Some(Frame::Failed { message }) => return Err(LinkError::agent(message)),
+                Some(other) => {
+                    tracing::debug!(frame = ?other, "discarding a frame that is not the listing");
+                }
+                None => return Err(LinkError::Closed),
+            }
         }
+    }
+
+    /// Answers an approval question.
+    ///
+    /// `always` records the tool for the session rather than granting the one call, which is
+    /// the option an interface offers as "always allow".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Io`] when the write fails.
+    pub async fn approve(&mut self, call_id: &str, allow: bool, always: bool) -> LinkResult<()> {
+        self.send(&Request::Approve {
+            call_id: call_id.to_owned(),
+            allow,
+            always,
+        })
+        .await
+    }
+
+    /// Replaces the agent's approval state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Io`] when the write fails.
+    pub async fn set_approval(&mut self, state: ApprovalState) -> LinkResult<()> {
+        self.send(&Request::SetApproval { state }).await
     }
 
     /// Reads the reply to a `New` or an `Attach`.
@@ -212,12 +247,16 @@ impl Client {
     /// description that was asked for.
     pub async fn ask_status(&mut self) -> LinkResult<AgentInfo> {
         self.send(&Request::Status).await?;
-        match self.next().await? {
-            Some(Frame::Status(info)) => Ok(info),
-            Some(other) => Err(LinkError::protocol(format!(
-                "expected a status reply, got {other:?}"
-            ))),
-            None => Err(LinkError::Closed),
+        // As `sessions`: a pushed frame is not a reason to fail a question this client asked.
+        loop {
+            match self.next().await? {
+                Some(Frame::Status(info)) => return Ok(info),
+                Some(Frame::Failed { message }) => return Err(LinkError::agent(message)),
+                Some(other) => {
+                    tracing::debug!(frame = ?other, "discarding a frame that is not the status");
+                }
+                None => return Err(LinkError::Closed),
+            }
         }
     }
 

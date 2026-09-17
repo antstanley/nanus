@@ -60,10 +60,10 @@ pub struct AgentConfig {
     pub model: String,
     /// Maximum size, in bytes, of an assembled system prompt.
     pub system_prompt_max: usize,
-    /// Whether a tool call outside the sandbox asks a human first.
+    /// How a tool call outside the sandbox is approved.
     ///
     /// Defaulted on the way in so a configuration written before the gate existed still
-    /// decodes, and defaulted to [`ApprovalPolicy::Ask`], the fail-closed value.
+    /// decodes, and defaulted to [`ApprovalPolicy::PerCall`], the fail-closed value.
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
     /// What a tool call may touch, which is the standing permission the approval gate

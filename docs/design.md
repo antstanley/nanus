@@ -61,16 +61,31 @@ This is not a convention, it is a property of the types: the executable half is 
 session id can be encoded into a request body. The allowlist is carried by the compiler,
 and a test asserts the serialised key set is exactly those three.
 
-### Approval is fail-closed, and there is no "auto"
+### Approval is a three-state axis, fail-closed at the default
 
-`ApprovalPolicy` is `Ask | Never`. `ApprovalOutcome` is
+`ApprovalPolicy` is `PerCall | Permitted | AllCalls`. `ApprovalOutcome` is
 `AllowedOnce | Rejected | Cancelled | Unavailable`. Anything other than `AllowedOnce`
 denies — a harness that cannot obtain an answer denies rather than proceeding.
 
-`Never` deterministically rejects *without consulting anyone*, so a later-registered
-policy cannot bypass it. There is deliberately no auto-approve mode, because a mode
-that means "yes to everything" is a mode that ends with someone's `rm -rf` in a bug
-report.
+`PerCall` is the default and asks about every exception; with no answerer it is a denial,
+so an unattended run still fails closed. `Permitted` grants the exceptions that cannot
+destroy anything and asks about the rest, except that a destructive call whose targets are
+all inside a temporary directory is granted too — that is where a destructive command is
+the ordinary way to clean up. `AllCalls` grants every exception without asking, and it is
+for an environment that enforces its own containment: a container, a virtual machine, a
+machine whose contents are disposable.
+
+The two permissive states are explicit names a human has to choose, and the default is the
+restrictive one, which is the part of "fail closed" that still holds. `AllCalls` is the
+state this design used to rule out, and it exists because the honest alternative was not
+"safer": an operator who wants a free-for-all environment arranges one, and a harness that
+refuses to name the state only hides where it was chosen. Nothing about it is silent — the
+status line always says which state is in force, and Shift+Tab cycles them.
+
+An answer may also be *standing*: the interface's "always allow" records the tool for the
+session, so the same question is not asked again for the rest of that conversation. The
+record is per session and in memory, so nothing about it is written to the log or outlives
+the agent.
 
 ### A budget, because unattended loops are a cost hazard
 

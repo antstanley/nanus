@@ -42,6 +42,7 @@ use nanus_domain::{
 };
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort};
 
+use crate::guard;
 use crate::{BundleError, ToolRegistryHandle};
 
 /// What a completed run produced.
@@ -180,12 +181,19 @@ pub trait Approver {
 ///
 /// The prompt is deliberately told the tool and the reason and *not* the arguments, so
 /// model-controlled text cannot be put in front of the decision. This sentence is the
-/// harness's own, and it names the knob that made the call an exception.
-fn approval_reason(sandbox: SandboxMode, access: ToolAccess) -> String {
-    format!(
+/// harness's own, and it names the knobs that made the call an exception: the sandbox that
+/// refused it, its access class, and — in the `permitted` state — whether it looked
+/// destructive.
+fn approval_reason(sandbox: SandboxMode, access: ToolAccess, destructive: bool) -> String {
+    let base = format!(
         "the sandbox mode `{sandbox}` does not permit {} calls without approval",
         access.as_str()
-    )
+    );
+    if destructive {
+        format!("{base}; the call looks destructive")
+    } else {
+        base
+    }
 }
 
 /// The result a denied call leaves in the log.
@@ -197,7 +205,7 @@ fn approval_reason(sandbox: SandboxMode, access: ToolAccess) -> String {
 fn denied_result(call: &ToolCall, reason: &str, outcome: ApprovalOutcome) -> ToolResult {
     let detail = match outcome {
         ApprovalOutcome::AllowedOnce => "it was allowed once",
-        ApprovalOutcome::Rejected => "the approval policy `never` grants no exceptions",
+        ApprovalOutcome::Rejected => "it was denied",
         ApprovalOutcome::Cancelled => "the approval prompt was cancelled",
         ApprovalOutcome::Unavailable => "nobody was available to approve it",
     };
@@ -245,6 +253,14 @@ pub struct AgentRunner {
     tools: ToolRegistryHandle,
     system_prompt: String,
     config: AgentConfig,
+    /// The approval state the gate consults, shared so a caller can change it mid-session.
+    ///
+    /// The configuration carries the *startup* value, and this is that value as a cell the
+    /// link can turn: an interface toggling the state has to affect the next call of a turn
+    /// already running, which a value copied into the runner at construction could not do.
+    /// It is a `Cell` rather than an `Atomic` because the kernel is single-threaded by
+    /// design and the runner is `!Send` with it.
+    approval: Rc<core::cell::Cell<ApprovalPolicy>>,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -287,6 +303,7 @@ impl AgentRunner {
             llm,
             tools,
             system_prompt,
+            approval: Rc::new(core::cell::Cell::new(config.approval_policy)),
             config,
         })
     }
@@ -295,6 +312,21 @@ impl AgentRunner {
     #[must_use]
     pub const fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// Returns the approval state the gate is consulting right now.
+    #[must_use]
+    pub fn approval(&self) -> ApprovalPolicy {
+        self.approval.get()
+    }
+
+    /// Replaces the approval state for the rest of the session.
+    ///
+    /// The change takes effect on the next call the gate decides, including a call in a turn
+    /// that is already running: an interface toggling the state while the model works is the
+    /// case this exists for.
+    pub fn set_approval(&self, policy: ApprovalPolicy) {
+        self.approval.set(policy);
     }
 
     /// Returns the tool registry this runner dispatches from.
@@ -665,13 +697,20 @@ impl AgentRunner {
             .max(1)
     }
 
-    /// Enforces the sandbox and approval policy for one call.
+    /// Enforces the sandbox and approval state for one call.
     ///
     /// Returns `Some` with the failure to record when the call must not run, and `None` when
     /// it may. The sandbox is the standing permission, so a call it already permits is never
-    /// put to a human; a call outside it needs an exception, and the policy says how one is
-    /// obtained. `never` answers no without consulting anyone, so a later answerer cannot
-    /// bypass it, and `ask` with no answerer is denied too — fail closed either way.
+    /// put to a human whatever the state is. A call outside it needs an exception, and the
+    /// state says how one is obtained:
+    ///
+    /// - `per_call` asks every time.
+    /// - `permitted` grants a call that cannot destroy anything, and a destructive one whose
+    ///   targets are all inside a temporary directory; it asks about the rest.
+    /// - `all_calls` grants every exception, for an environment that enforces its own
+    ///   containment.
+    ///
+    /// With no answerer the outcome is `Unavailable`, which denies — fail closed either way.
     async fn gate(&self, call: &ToolCall, approver: Option<&dyn Approver>) -> Option<ToolResult> {
         // The access is copied out and the borrow released before anything is awaited: the
         // decision below can take as long as a person takes, and a registry borrow held that
@@ -684,23 +723,40 @@ impl AgentRunner {
         if sandbox.permits(access) {
             return None;
         }
-        let reason = approval_reason(sandbox, access);
-        let outcome = match self.config.approval_policy {
-            ApprovalPolicy::Never => ApprovalOutcome::Rejected,
-            ApprovalPolicy::Ask => match approver {
-                Some(approver) => {
-                    let request = ApprovalRequest::new(call.name.clone())
-                        .with_call_id(call.id.clone())
-                        .with_reason(reason.clone());
-                    approver.decide(request).await
-                }
-                None => ApprovalOutcome::Unavailable,
-            },
+        let policy = self.approval();
+        if exempt(policy, call) {
+            return None;
+        }
+        let reason = approval_reason(sandbox, access, guard::is_destructive(call));
+        let outcome = match approver {
+            Some(approver) => {
+                let request = ApprovalRequest::new(call.name.clone())
+                    .with_call_id(call.id.clone())
+                    .with_reason(reason.clone());
+                approver.decide(request).await
+            }
+            None => ApprovalOutcome::Unavailable,
         };
         if outcome.is_allowed() {
             return None;
         }
         Some(denied_result(call, &reason, outcome))
+    }
+}
+
+/// Returns whether an approval state grants a call the sandbox refused, without asking.
+///
+/// `per_call` grants nothing, so every exception goes to a person. `all_calls` grants every
+/// exception. `permitted` grants one unless it looks destructive, and grants even that when
+/// every path it names is inside a temporary directory — which is where a destructive
+/// command is the ordinary way to clean up rather than something to be asked about.
+fn exempt(policy: ApprovalPolicy, call: &ToolCall) -> bool {
+    match policy {
+        ApprovalPolicy::PerCall => false,
+        ApprovalPolicy::AllCalls => true,
+        ApprovalPolicy::Permitted => {
+            !guard::is_destructive(call) || guard::targets_are_temporary(call)
+        }
     }
 }
 
@@ -1839,6 +1895,29 @@ mod tests {
         ])
     }
 
+    /// A model that calls `name` once with `arguments` and then answers.
+    fn calls_then_answers_with(name: &str, arguments: &serde_json::Value) -> Rc<Box<dyn LlmPort>> {
+        ScriptedLlm::handle(vec![
+            vec![
+                LlmEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some(ToolCallId::new("c1")),
+                    name: Some(ToolName::new(name).unwrap_or_else(|_| unreachable!("valid"))),
+                    arguments_delta: arguments.to_string(),
+                },
+                LlmEvent::Finished {
+                    reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                LlmEvent::TextDelta("done".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ],
+        ])
+    }
+
     /// Builds a runner over a sandbox mode and an approval policy.
     fn gated_runner(
         llm: Rc<Box<dyn LlmPort>>,
@@ -1864,7 +1943,7 @@ mod tests {
             calls_then_answers("reader"),
             tools,
             SandboxMode::ReadOnly,
-            ApprovalPolicy::Ask,
+            ApprovalPolicy::PerCall,
         ) else {
             return;
         };
@@ -1890,7 +1969,7 @@ mod tests {
             calls_then_answers("runner"),
             tools,
             SandboxMode::WorkspaceWrite,
-            ApprovalPolicy::Ask,
+            ApprovalPolicy::PerCall,
         ) else {
             return;
         };
@@ -1927,7 +2006,7 @@ mod tests {
             calls_then_answers("runner"),
             tools,
             SandboxMode::WorkspaceWrite,
-            ApprovalPolicy::Ask,
+            ApprovalPolicy::PerCall,
         ) else {
             return;
         };
@@ -1959,16 +2038,16 @@ mod tests {
         );
     }
 
-    /// `never` answers no without consulting anyone, so a later answerer cannot bypass it.
+    /// `all_calls` grants every exception without consulting anyone.
     #[tokio::test]
-    async fn never_denies_without_consulting_the_answerer() {
+    async fn all_calls_grants_without_consulting_the_answerer() {
         let (tools, runs) = registry_with_counted("runner", ToolAccess::Execute);
-        let approver = ScriptedApprover::new(ApprovalOutcome::AllowedOnce);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
         let Some(runner) = gated_runner(
             calls_then_answers("runner"),
             tools,
             SandboxMode::WorkspaceWrite,
-            ApprovalPolicy::Never,
+            ApprovalPolicy::AllCalls,
         ) else {
             return;
         };
@@ -1977,10 +2056,116 @@ mod tests {
             .run_turn(&mut session, "go", &mut Silent, Some(&approver))
             .await;
         assert!(outcome.is_ok(), "{outcome:?}");
-        assert_eq!(runs.get(), 0, "the call was refused");
+        assert_eq!(runs.get(), 1, "the call ran without being asked about");
         assert!(
             approver.asked().is_empty(),
-            "`never` is deterministic and consults nobody"
+            "`all_calls` is a free for all and consults nobody"
+        );
+    }
+
+    /// `permitted` runs a call that cannot destroy anything without asking.
+    #[tokio::test]
+    async fn permitted_grants_a_non_destructive_call() {
+        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers_with("bash", &json!({ "command": "ls -la" })),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Permitted,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 1, "a harmless command runs");
+        assert!(approver.asked().is_empty(), "nobody was asked");
+    }
+
+    /// The other direction: a destructive command outside a temporary directory is asked
+    /// about, and a refusal stops it. This is what `permitted` is holding back.
+    #[tokio::test]
+    async fn permitted_asks_about_a_destructive_call() {
+        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers_with("bash", &json!({ "command": "rm -rf /work/src" })),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Permitted,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "a refused destructive call does not run");
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 1, "the destructive call was put to a human");
+        assert!(
+            asked
+                .first()
+                .and_then(|request| request.reason.as_deref())
+                .is_some_and(|reason| reason.contains("destructive")),
+            "the reason says the call looks destructive: {asked:?}"
+        );
+    }
+
+    /// A destructive command whose targets are all inside a temporary directory is the
+    /// ordinary way to clean up, and `permitted` runs it without asking.
+    #[tokio::test]
+    async fn permitted_grants_a_destructive_call_in_a_temporary_directory() {
+        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers_with("bash", &json!({ "command": "rm -rf /tmp/nanus-build" })),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Permitted,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 1, "a temporary destructive command runs");
+        assert!(approver.asked().is_empty(), "nobody was asked");
+    }
+
+    /// The state can be changed while a session is live, which is what the interface's
+    /// toggle needs: the next call consults the new state rather than the one the runner
+    /// was built with.
+    #[tokio::test]
+    async fn the_approval_state_can_be_changed_after_construction() {
+        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers_with("bash", &json!({ "command": "rm -rf /work/src" })),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::PerCall,
+        ) else {
+            return;
+        };
+        assert_eq!(runner.approval(), ApprovalPolicy::PerCall);
+        runner.set_approval(ApprovalPolicy::AllCalls);
+        assert_eq!(runner.approval(), ApprovalPolicy::AllCalls);
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 1, "the new state granted the call");
+        assert!(
+            approver.asked().is_empty(),
+            "the old state would have asked"
         );
     }
 
@@ -1992,7 +2177,7 @@ mod tests {
             calls_then_answers("runner"),
             tools,
             SandboxMode::WorkspaceWrite,
-            ApprovalPolicy::Ask,
+            ApprovalPolicy::PerCall,
         ) else {
             return;
         };
@@ -2019,7 +2204,7 @@ mod tests {
             calls_then_answers("nope"),
             ToolRegistryHandle::new(ToolRegistry::new()),
             SandboxMode::ReadOnly,
-            ApprovalPolicy::Ask,
+            ApprovalPolicy::PerCall,
         ) else {
             return;
         };

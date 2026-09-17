@@ -125,7 +125,7 @@ ignored, and there is no field that can hold the API key. See
 | `model` | `deepseek-flash` | `deepseek-flash`, `deepseek-v4-pro` |
 | `max_tokens` | `128000` | per-response budget |
 | `reasoning_effort` | `medium` | `minimal`, `low`, `medium`, `high` |
-| `approval_policy` | `ask` | `ask`, `never` |
+| `approval_policy` | `per_call` | `per_call`, `permitted`, `all_calls` |
 | `sandbox_mode` | `read_only` | `read_only`, `workspace_write`, `danger_full_access` |
 | `max_steps_per_turn` | `512` | steps in one turn |
 | `max_parallel_tools` | `4` | how many of a step's calls may be in flight at once |
@@ -281,11 +281,17 @@ The Cordis-style kernel is the framework underneath. See
   `assert!` is the sanctioned invariant. See [style](style.md).
 - **Fail-closed approval at the tool boundary.** A tool declares what it can touch —
   read, write, or run a program — and `sandbox_mode` permits some of that outright.
-  A call outside that standing permission needs an exception: `ask` puts it to an
-  answerer and denies it when there is none, and `never` refuses it without asking
-  anyone. `ApprovalOutcome` allows only `AllowedOnce`, there is deliberately no
-  mode that means yes to everything, and a denial is a tool result the model can
-  read rather than a dropped call. See [SAFETY.md](../SAFETY.md).
+  A call outside that standing permission needs an exception: `per_call` puts it to
+  an answerer and denies it when there is none, `permitted` grants the ones that
+  cannot destroy anything (and destructive ones aimed only at a temporary
+  directory), and `all_calls` grants every exception. The default is `per_call`, so
+  a harness that cannot obtain an answer denies; `ApprovalOutcome` allows only
+  `AllowedOnce`; and a denial is a tool result the model can read rather than a
+  dropped call. See [SAFETY.md](../SAFETY.md).
+- **A standing "always allow" answer.** An approval dialog offers to record the
+  tool for the session, so a person answering the same question for the fourth
+  time can say yes once for the rest of the conversation. The record is per session
+  and in memory, so it is not written to the log and does not outlive the agent.
 - **Someone to ask, wherever a person is watching.** `nanus run` prompts on the
   terminal when stdin is one, and the interface draws a dialog over the
   conversation and answers the agent over the link. Both deny when nobody is
@@ -317,5 +323,6 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   to a live session is the supported way to share one.
 - **No syntax highlighting** in fenced code blocks, and no image paste; the
   markdown renderer performs no I/O.
-- **No vim mode, `@` mentions, or `!` bash mode** in the interface, and no
-  permission or model switching from a key.
+- **No vim mode, `@` mentions, or `!` bash mode** in the interface, and no model
+  switching from a key. The approval state does cycle from the keyboard, with
+  `Shift+Tab`.

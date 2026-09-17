@@ -36,6 +36,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use nanus_adapter_store::{JsonlStore, resolve_home};
+use nanus_domain::ApprovalPolicy;
 use nanus_link::paths::service_socket;
 use nanus_ports::StoreHandle;
 use nanus_tui::runtime::{Remote, Target, run_source, view};
@@ -90,6 +91,13 @@ struct Args {
     /// part way into.
     #[arg(long, value_name = "ROWS", default_value_t = 0)]
     scroll: u32,
+
+    /// Show this approval state, and ask the agent to use it.
+    ///
+    /// `per_call`, `permitted`, or `all_calls`. `nanus tui` passes this through when the
+    /// flag was given to it; Shift+Tab cycles the state afterwards.
+    #[arg(long, value_name = "STATE")]
+    approval: Option<ApprovalPolicy>,
 }
 
 fn main() -> ExitCode {
@@ -126,7 +134,7 @@ fn run(args: &Args) -> Result<(), String> {
         ));
     }
     if let Some(requested) = &args.session {
-        return view(&store, requested.as_deref(), args.scroll);
+        return view(&store, requested.as_deref(), args.scroll, args.approval);
     }
     let socket = args.socket()?;
     let target = args.resume.as_ref().map_or_else(
@@ -135,18 +143,19 @@ fn run(args: &Args) -> Result<(), String> {
         },
         |reference| Target::Resume(reference.clone()),
     );
-    let mut remote = block_on(Remote::connect(&socket, &store, target)).map_err(|error| {
-        if args.link.is_some() {
-            error
-        } else {
-            // Connecting to an agent nobody started is the common failure here, and the
-            // useful answer is what to do about it rather than which syscall failed.
-            format!(
-                "{error}\nstart one with `nanus service start`, or run `nanus tui` for an \
+    let mut remote =
+        block_on(Remote::connect(&socket, &store, target, args.approval)).map_err(|error| {
+            if args.link.is_some() {
+                error
+            } else {
+                // Connecting to an agent nobody started is the common failure here, and the
+                // useful answer is what to do about it rather than which syscall failed.
+                format!(
+                    "{error}\nstart one with `nanus service start`, or run `nanus tui` for an \
                  agent scoped to this shell"
-            )
-        }
-    })?;
+                )
+            }
+        })?;
     run_source(&mut remote).map_err(|error| error.to_string())
 }
 

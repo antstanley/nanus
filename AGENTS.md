@@ -258,8 +258,10 @@ design docs too.
   serialised to the model. The executable half of a `ToolDefinition` is not
   `Serialize`, so this is a type-level guarantee; a test asserts the serialised
   key set.
-- **Approval is fail-closed:** only `AllowedOnce` proceeds; `Ask | Never` are the
-  only policies and there is deliberately no auto-approve.
+- **Approval is fail-closed by default:** only `AllowedOnce` proceeds, `per_call` is
+  the default state and denies when nobody can answer, and the permissive states
+  (`permitted`, `all_calls`) are names a human chooses. `all_calls` grants every
+  exception; it is not the default and must not become one.
 - **Retired model ids do not resolve.** `deepseek-chat` and `deepseek-reasoner`
   are gone; the supported ids are `deepseek-flash` and `deepseek-v4-pro`.
 - **Temporal composability:** unloading a plugin reverts its effects in reverse

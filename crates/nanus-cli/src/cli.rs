@@ -41,6 +41,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use nanus_adapter_config::NanusConfig;
 use nanus_bundle::compose::open_store;
 use nanus_bundle::{Harness, compose};
+use nanus_domain::ApprovalPolicy;
 use nanus_kernel::runtime::block_on as kernel_block_on;
 use std::ffi::OsString;
 
@@ -73,6 +74,14 @@ pub struct Args {
     /// precedence rule to remember.
     #[arg(long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
+
+    /// How a tool call outside the sandbox is approved at startup.
+    ///
+    /// `per_call` asks about every exception, `permitted` grants the non-destructive ones
+    /// and asks about the rest, and `all_calls` grants every exception. Overrides the
+    /// configuration file, and the interface can still cycle the state with Shift+Tab.
+    #[arg(long, global = true, value_name = "STATE")]
+    pub approval: Option<ApprovalPolicy>,
 
     /// Load configuration from this file instead of the default location.
     #[arg(long, global = true, value_name = "PATH")]
@@ -308,11 +317,13 @@ pub async fn prepare() -> Result<Ready, String> {
     let Args {
         verbose,
         quiet: _,
+        approval,
         config,
         command,
     } = args;
     let options = Options {
         verbose,
+        approval,
         config: config.clone(),
     };
     let command = match command {
@@ -493,12 +504,21 @@ pub fn finish(ready: Ready) -> Result<(), String> {
 /// The global options, separated from the subcommand.
 struct Options {
     verbose: bool,
+    /// An approval state from the command line, which overrides the configuration file.
+    approval: Option<ApprovalPolicy>,
     config: Option<PathBuf>,
 }
 
 /// Loads the configuration, reporting a malformed file rather than defaulting.
 fn load(args: &Options) -> Result<NanusConfig, String> {
-    NanusConfig::load(args.config.as_deref()).map_err(|error| error.to_string())
+    let mut config =
+        NanusConfig::load(args.config.as_deref()).map_err(|error| error.to_string())?;
+    // The flag wins over the file, because it is the more specific instruction: a person who
+    // typed `--approval all_calls` on this command meant it for this run.
+    if let Some(approval) = args.approval {
+        config.approval_policy = approval;
+    }
+    Ok(config)
 }
 
 /// Awaits the adapters one task needs.
@@ -586,10 +606,12 @@ async fn prepare_tui(
             arguments.push(OsString::from("--scroll"));
             arguments.push(OsString::from(scroll.to_string()));
         }
-        return Ok(Ready::Spawn { arguments });
+        return Ok(Ready::Spawn {
+            arguments: with_approval(arguments, args.approval),
+        });
     }
     // Which conversation, carried through to the interface's own command line.
-    let choice = conversation(resume, name);
+    let choice = with_approval(conversation(resume, name), args.approval);
     if !connect {
         let pending = compose(&config).await.map_err(|error| error.to_string())?;
         let workspace = compose::workspace_root(&config).map_err(|error| error.to_string())?;
@@ -631,6 +653,20 @@ fn conversation(resume: Option<String>, name: Option<String>) -> Vec<OsString> {
         (None, Some(name)) => vec![OsString::from("--name"), OsString::from(name)],
         (None, None) => Vec::new(),
     }
+}
+
+/// Adds the interface's own `--approval` instruction to its command line.
+///
+/// The interface is a separate program, so a state named at startup travels as an argument
+/// like everything else it is told. It is passed even for an agent this process started —
+/// the agent already has the state, and the interface draws it immediately rather than
+/// waiting for the frame that would follow the attachment.
+fn with_approval(mut arguments: Vec<OsString>, approval: Option<ApprovalPolicy>) -> Vec<OsString> {
+    if let Some(approval) = approval {
+        arguments.push(OsString::from("--approval"));
+        arguments.push(OsString::from(approval.as_str()));
+    }
+    arguments
 }
 
 /// Decides what the service subcommand should do.
@@ -901,7 +937,7 @@ fn show_config(args: &Options) -> Result<(), String> {
     println!("model: {}", config.model);
     println!("max tokens: {}", config.max_tokens);
     println!("reasoning effort: {:?}", config.reasoning_effort);
-    println!("approval policy: {:?}", config.approval_policy);
+    println!("approval policy: {}", config.approval_policy);
     println!("sandbox mode: {:?}", config.sandbox_mode);
     println!("max steps per turn: {}", config.max_steps_per_turn);
     println!("max parallel tools: {}", config.max_parallel_tools);
@@ -1204,6 +1240,7 @@ mod tests {
         let refused = prepare_tui(
             &Options {
                 verbose: false,
+                approval: None,
                 config: None,
             },
             None,

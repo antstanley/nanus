@@ -9,6 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use nanus_domain::ApprovalPolicy;
+
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
 use crate::markdown::{self, MarkdownTheme};
@@ -227,8 +229,15 @@ pub struct ViewState {
     /// The approval question the agent is waiting on, if one is open.
     ///
     /// While it is set, the dialog owns the keyboard: the composer is not taking text, and
-    /// the only keys that do anything are the two answers.
+    /// the only keys that do anything are the answers.
     pub pending_approval: Option<PendingApproval>,
+
+    /// How the agent decides a call the sandbox refused, as last told to it.
+    ///
+    /// Drawn in the status line so a reader can see which state Shift+Tab is in, and so a
+    /// state chosen at startup is visible rather than something to infer from whether a
+    /// prompt appears.
+    pub approval: ApprovalPolicy,
 
     /// The transcript area the view last drew into, if it has drawn.
     ///
@@ -267,6 +276,7 @@ impl Default for ViewState {
             mermaid: true,
             pending_scroll_back: None,
             pending_approval: None,
+            approval: ApprovalPolicy::default(),
             last_viewport: None,
             last_composer: None,
         }
@@ -829,8 +839,31 @@ impl ViewState {
             )));
         }
         lines.push(Line::from(""));
+        // The options are spelled out, each with the key that selects it: a prompt that says
+        // "approve?" and leaves the reader to guess is a prompt they will answer wrong.
+        lines.push(Line::from(vec![
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" allow once    "),
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" always allow    "),
+            Span::styled(
+                "n",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" deny"),
+        ]));
         lines.push(Line::from(Span::styled(
-            "y allow once  ·  n or Esc deny",
+            "always allow skips this question for the rest of the session · Esc denies",
             Style::default().fg(Color::DarkGray),
         )));
         let height = u16::try_from(lines.len())
@@ -1459,6 +1492,12 @@ impl ViewState {
             format!("  ·  {} tokens", self.tokens_used),
             Style::default().fg(Color::DarkGray),
         );
+        // The state Shift+Tab cycles, always shown: the point of a three-state toggle is
+        // that a reader can see which state they are in without pressing the key to find out.
+        let permission = Span::styled(
+            format!("  ·  approval: {} (Shift+Tab)", self.approval.label()),
+            Style::default().fg(Color::DarkGray),
+        );
         let step = if self.step > 0 {
             Span::styled(
                 format!("  ·  step {}", self.step),
@@ -1485,7 +1524,7 @@ impl ViewState {
             Span::raw("")
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![busy, step, usage, collapsed])),
+            Paragraph::new(Line::from(vec![busy, step, permission, usage, collapsed])),
             area,
         );
     }
@@ -1774,8 +1813,35 @@ mod tests {
             text.contains("read_only"),
             "and the harness's reason is shown: {text}"
         );
-        assert!(text.contains("y allow once"), "{text}");
+        // Every option is named with the key that selects it, including the standing one:
+        // a prompt that does not say what `a` does is a prompt a reader answers wrong.
+        assert!(text.contains("allow once"), "{text}");
+        assert!(text.contains("always allow"), "{text}");
         assert!(text.contains("deny"), "{text}");
+        assert!(
+            text.contains("Shift+Tab") || text.contains("session"),
+            "{text}"
+        );
+    }
+
+    /// The status line always says which approval state the interface is in, so the toggle
+    /// is a thing a reader can see rather than a thing they have to remember.
+    #[test]
+    fn the_status_line_shows_the_approval_state() {
+        let mut state = ViewState::new();
+        state.approval = ApprovalPolicy::PerCall;
+        let text = rendered(&mut state, 80, 12);
+        assert!(
+            text.contains("approval: per call"),
+            "the default state is drawn: {text}"
+        );
+
+        state.approval = ApprovalPolicy::AllCalls;
+        let text = rendered(&mut state, 80, 12);
+        assert!(
+            text.contains("approval: all calls"),
+            "the changed state is drawn: {text}"
+        );
     }
 
     /// And the other direction: with no question open, nothing that looks like one is drawn.

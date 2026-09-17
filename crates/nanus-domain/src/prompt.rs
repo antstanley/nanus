@@ -475,12 +475,12 @@ mod tests {
         let text = runtime_context(
             "/work",
             "deepseek-flash",
-            ApprovalPolicy::Ask,
+            ApprovalPolicy::PerCall,
             SandboxMode::WorkspaceWrite,
         );
         assert!(text.contains("/work"));
         assert!(text.contains("deepseek-flash"));
-        assert!(text.contains("ask"));
+        assert!(text.contains("per_call"));
         assert!(text.contains("workspace_write"));
         assert!(text.starts_with("## Runtime"));
     }
@@ -490,7 +490,7 @@ mod tests {
         let text = runtime_context(
             "/work",
             "deepseek-flash",
-            ApprovalPolicy::Never,
+            ApprovalPolicy::AllCalls,
             SandboxMode::DangerFullAccess,
         );
         let prompt = PromptBuilder::new().section("runtime", -100, text);

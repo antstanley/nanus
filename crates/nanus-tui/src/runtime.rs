@@ -62,9 +62,9 @@ use std::path::Path;
 use crossterm::event::EventStream;
 use futures::StreamExt as _;
 use nanus_adapter_config::{NanusConfig, TuiDetail};
-use nanus_domain::{Session, SessionId};
+use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
-use nanus_link::protocol::{Frame, Request, SessionInfo, TurnEnd};
+use nanus_link::protocol::{ApprovalState, Frame, Request, SessionInfo, TurnEnd};
 use nanus_ports::{StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -299,6 +299,16 @@ pub trait SessionSource {
         false
     }
 
+    /// The approval state to draw before the agent says anything, if one was asked for.
+    ///
+    /// `None` leaves the default in place, which is what the interface does when it was
+    /// told nothing. A live conversation is corrected by the agent's own
+    /// [`Frame::ApprovalChanged`] as soon as it attaches, so this only has to be right for
+    /// the moment before that frame arrives — and for a recording, which has no agent.
+    fn initial_approval(&self) -> Option<ApprovalPolicy> {
+        None
+    }
+
     /// Starts whatever background work the source needs, inside the interface's task set.
     ///
     /// Called once, after the event loop's own channel exists and before the first frame
@@ -319,9 +329,16 @@ pub trait SessionSource {
 
     /// Answers the agent's approval question about one call.
     ///
-    /// A default of doing nothing, for the same reason as [`SessionSource::interrupt`]: a
+    /// `always` is a standing permission for the session rather than for this call alone. A
+    /// default of doing nothing, for the same reason as [`SessionSource::interrupt`]: a
     /// recording is never asked anything.
-    fn answer(&mut self, _call_id: &str, _allow: bool) {}
+    fn answer(&mut self, _call_id: &str, _allow: bool, _always: bool) {}
+
+    /// Tells the agent which approval state to use from now on.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::interrupt`]: a
+    /// recording has no agent to tell, and its displayed state is whatever the flag said.
+    fn set_approval(&mut self, _policy: ApprovalPolicy) {}
 
     /// Releases whatever the source owns.
     ///
@@ -344,7 +361,12 @@ pub trait SessionSource {
 /// Returns a message when the store cannot be read or the session does not exist. An id
 /// that does not exist is only reported as missing — `nanus sessions` is what lists the
 /// ones that do, so a mistyped uuid is worth checking against it.
-pub fn view(store: &StoreHandle, id: Option<&str>, scroll_back: u32) -> Result<(), String> {
+pub fn view(
+    store: &StoreHandle,
+    id: Option<&str>,
+    scroll_back: u32,
+    approval: Option<ApprovalPolicy>,
+) -> Result<(), String> {
     let store = std::rc::Rc::clone(store);
     let requested = id.map(str::to_owned);
     let session = block_on(async move {
@@ -363,7 +385,9 @@ pub fn view(store: &StoreHandle, id: Option<&str>, scroll_back: u32) -> Result<(
         };
         store.load(&id).await.map_err(|error| error.to_string())
     })?;
-    let mut recording = Recording::new(session).scrolled_back(scroll_back);
+    let mut recording = Recording::new(session)
+        .scrolled_back(scroll_back)
+        .approving(approval);
     run_source(&mut recording).map_err(|error| error.to_string())
 }
 
@@ -380,6 +404,8 @@ pub struct Recording {
     session: Session,
     /// Rows to scroll back from the end when the interface opens.
     scroll_back: u32,
+    /// The approval state to draw, from a startup flag.
+    approval: Option<ApprovalPolicy>,
 }
 
 impl Recording {
@@ -389,6 +415,7 @@ impl Recording {
         Self {
             session,
             scroll_back: 0,
+            approval: None,
         }
     }
 
@@ -396,6 +423,13 @@ impl Recording {
     #[must_use]
     pub const fn scrolled_back(mut self, rows: u32) -> Self {
         self.scroll_back = rows;
+        self
+    }
+
+    /// Draws this approval state before anything else is known.
+    #[must_use]
+    pub const fn approving(mut self, approval: Option<ApprovalPolicy>) -> Self {
+        self.approval = approval;
         self
     }
 }
@@ -407,6 +441,10 @@ impl SessionSource for Recording {
 
     fn initial_scroll(&self) -> u32 {
         self.scroll_back
+    }
+
+    fn initial_approval(&self) -> Option<ApprovalPolicy> {
+        self.approval
     }
 }
 
@@ -434,6 +472,8 @@ pub struct Remote {
     client: Option<Client>,
     requests: mpsc::UnboundedSender<Request>,
     pending: Option<mpsc::UnboundedReceiver<Request>>,
+    /// The approval state a startup flag asked for, sent once the agent is attached.
+    approval: Option<ApprovalPolicy>,
 }
 
 impl Remote {
@@ -444,7 +484,12 @@ impl Remote {
     /// Returns a message when nothing is listening, the agent refuses the session, or the
     /// store cannot be read. The message is already user-facing, so it is not wrapped
     /// again.
-    pub async fn connect(path: &Path, store: &StoreHandle, target: Target) -> Result<Self, String> {
+    pub async fn connect(
+        path: &Path,
+        store: &StoreHandle,
+        target: Target,
+        approval: Option<ApprovalPolicy>,
+    ) -> Result<Self, String> {
         let mut client = Client::connect(path)
             .await
             .map_err(|error| error.to_string())?;
@@ -454,6 +499,15 @@ impl Remote {
             Target::Resume(reference) => client.attach(&reference).await,
         }
         .map_err(|error| error.to_string())?;
+        // A state named at startup is sent to the agent before the interface draws, so a
+        // reader who asked for `all_calls` is not asked about the first call while the
+        // request is still in flight. The agent answers with its own state either way.
+        if let Some(policy) = approval {
+            client
+                .set_approval(wire_state(policy))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let session = history(store, &attached, &agent.workspace).await;
         let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
         let (requests, pending) = mpsc::unbounded_channel();
@@ -463,6 +517,7 @@ impl Remote {
             client: Some(client),
             requests,
             pending: Some(pending),
+            approval,
         })
     }
 }
@@ -514,6 +569,10 @@ impl SessionSource for Remote {
         true
     }
 
+    fn initial_approval(&self) -> Option<ApprovalPolicy> {
+        self.approval
+    }
+
     fn attach(&mut self, frames: &mpsc::Sender<Frame>) {
         let (Some(client), Some(requests)) = (self.client.take(), self.pending.take()) else {
             // Attaching twice is a caller's mistake, not a reason to take the terminal
@@ -533,11 +592,39 @@ impl SessionSource for Remote {
         self.send(Request::Interrupt);
     }
 
-    fn answer(&mut self, call_id: &str, allow: bool) {
+    fn answer(&mut self, call_id: &str, allow: bool, always: bool) {
         self.send(Request::Approve {
             call_id: call_id.to_owned(),
             allow,
+            always,
         });
+    }
+
+    fn set_approval(&mut self, policy: ApprovalPolicy) {
+        self.send(Request::SetApproval {
+            state: wire_state(policy),
+        });
+    }
+}
+
+/// Renders the interface's approval state in the link's vocabulary.
+///
+/// An exhaustive match, so a state the domain grows is a compile error here rather than a
+/// state the interface draws wrongly.
+const fn wire_state(policy: ApprovalPolicy) -> ApprovalState {
+    match policy {
+        ApprovalPolicy::PerCall => ApprovalState::PerCall,
+        ApprovalPolicy::Permitted => ApprovalState::Permitted,
+        ApprovalPolicy::AllCalls => ApprovalState::AllCalls,
+    }
+}
+
+/// Reads the link's approval state into the interface's vocabulary.
+const fn view_policy(state: ApprovalState) -> ApprovalPolicy {
+    match state {
+        ApprovalState::PerCall => ApprovalPolicy::PerCall,
+        ApprovalState::Permitted => ApprovalPolicy::Permitted,
+        ApprovalState::AllCalls => ApprovalPolicy::AllCalls,
     }
 }
 
@@ -670,21 +757,18 @@ pub fn run_source(source: &mut dyn SessionSource) -> io::Result<()> {
     outcome
 }
 
-/// The event loop: draw, then wait for a keystroke or for the agent to say something.
+/// Builds the view the interface opens with, from the source and the configuration.
 ///
-/// Asynchronous rather than a blocking poll for input, and that is the whole point. The
-/// link is a local task on this same thread, so waiting synchronously for a key — or
-/// sleeping for a redraw tick — would stop the agent's frames from being read at all. The
-/// interface would show a frozen turn and then deliver the entire answer at once, which
-/// is exactly the freeze the local task exists to prevent.
-async fn event_loop(
-    source: &mut dyn SessionSource,
-    mut frames: mpsc::Receiver<Frame>,
-) -> io::Result<()> {
-    // Read before the terminal is taken, so a configuration that cannot be read is a
-    // sentence on stderr rather than an abort with a screen already in raw mode.
+/// Separate from the event loop so the loop is about waiting on two sources rather than
+/// about assembling a view, and so the terminal is taken only once a view exists: a
+/// configuration that cannot be read is then a sentence on stderr rather than an abort with
+/// a screen already in raw mode.
+///
+/// # Errors
+///
+/// Returns the error from reading the configuration.
+fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     let preferences = configured_preferences()?;
-    let mut guard = TerminalGuard::enter();
     let mut view = ViewState::new();
     view.detail = preferences.detail;
     view.markdown = preferences.markdown;
@@ -709,9 +793,32 @@ async fn event_loop(
     // render, when the viewport it is measured against is known.
     view.pending_scroll_back = Some(source.initial_scroll());
     view.label = source.label().map(str::to_owned);
+    // Only when one was asked for: the default is already the fail-closed state, and a live
+    // conversation overwrites this with the agent's own answer as soon as it is attached.
+    if let Some(policy) = source.initial_approval() {
+        view.approval = policy;
+    }
     if viewing_only {
         view.status = String::from("viewing a recorded session · Ctrl-C quits");
     }
+    Ok(view)
+}
+
+/// The event loop: draw, then wait for a keystroke or for the agent to say something.
+///
+/// Asynchronous rather than a blocking poll for input, and that is the whole point. The
+/// link is a local task on this same thread, so waiting synchronously for a key — or
+/// sleeping for a redraw tick — would stop the agent's frames from being read at all. The
+/// interface would show a frozen turn and then deliver the entire answer at once, which
+/// is exactly the freeze the local task exists to prevent.
+async fn event_loop(
+    source: &mut dyn SessionSource,
+    mut frames: mpsc::Receiver<Frame>,
+) -> io::Result<()> {
+    // Built before the terminal is taken, so a configuration that cannot be read is a
+    // sentence on stderr rather than an abort with a screen already in raw mode.
+    let mut view = opening_view(source)?;
+    let mut guard = TerminalGuard::enter();
 
     let mut events = EventStream::new();
 
@@ -754,6 +861,7 @@ async fn event_loop(
                     Outcome::Answer {
                         call_id,
                         allow,
+                        always,
                         stop,
                     } => {
                         // Cleared before the answer is sent, so a reader cannot press `y`
@@ -763,17 +871,25 @@ async fn event_loop(
                         // The answer is sent first, because it is what the turn is waiting
                         // for: the stop it may also be asking for is read at the turn's next
                         // checkpoint, which it cannot reach until the question is settled.
-                        source.answer(&call_id, allow);
+                        source.answer(&call_id, allow, always);
                         if stop {
                             view.status = String::from("denied; stopping the turn");
                             source.interrupt();
                         } else {
-                            view.status = if allow {
-                                String::from("allowed once; the turn is running")
-                            } else {
-                                String::from("denied; the model is told")
+                            view.status = match (allow, always) {
+                                (true, true) => String::from("always allowed; the turn is running"),
+                                (true, false) => String::from("allowed once; the turn is running"),
+                                (false, _) => String::from("denied; the model is told"),
                             };
                         }
+                    }
+                    Outcome::SetApproval(policy) => {
+                        // Applied locally first, so the status line answers the keypress
+                        // immediately, and sent to the agent, which owns the gate: the state
+                        // has to reach the loop rather than the next prompt.
+                        view.approval = policy;
+                        view.status = format!("approval: {}", policy.label());
+                        source.set_approval(policy);
                     }
                     Outcome::Submit(prompt) => {
                         match route_submission(prompt, source.accepts_prompts()) {
@@ -878,6 +994,8 @@ enum Outcome {
         call_id: String,
         /// Whether it may run once.
         allow: bool,
+        /// Whether the answer is a standing permission for the session.
+        always: bool,
         /// Whether the reader also asked for the turn to stop.
         ///
         /// True for `Ctrl-C` alone. The key a reader reaches for when they want everything to
@@ -886,13 +1004,26 @@ enum Outcome {
         /// out and the reader would have to press the key again afterwards.
         stop: bool,
     },
+    /// Tell the agent to use this approval state from now on.
+    SetApproval(ApprovalPolicy),
 }
 
 /// Applies one keystroke to the view.
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    // An approval question owns the keyboard while it is up. Its two answers are the only
-    // things a reader can mean, and letting a `y` reach the composer would answer a
-    // question *and* type a letter into a prompt nobody asked for.
+    // Shift+Tab cycles the approval state wherever the focus is. It is a setting rather than
+    // an edit, so it is routed before the approval dialog takes the keyboard: a reader who
+    // wants to stop being asked must not have to answer a question first.
+    //
+    // Terminals disagree about how they spell it: most send `BackTab`, and one that speaks
+    // an enhanced keyboard protocol may send `Tab` with Shift held. Both mean the key.
+    if matches!(key.code, KeyCode::BackTab)
+        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        return Outcome::SetApproval(view.approval.next());
+    }
+    // An approval question owns the keyboard while it is up. Its answers are the only things
+    // a reader can mean, and letting a `y` reach the composer would answer a question *and*
+    // type a letter into a prompt nobody asked for.
     if view.pending_approval.is_some() {
         return handle_approval_key(key, view);
     }
@@ -929,16 +1060,28 @@ fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
         KeyCode::Char('y' | 'Y') => Outcome::Answer {
             call_id,
             allow: true,
+            always: false,
+            stop: false,
+        },
+        // "Always allow": the tool is granted for the rest of the session, so the same
+        // question is not put to the reader again. It is a separate key from `y` because it
+        // is a bigger decision, and one a stray keypress must not make.
+        KeyCode::Char('a' | 'A') => Outcome::Answer {
+            call_id,
+            allow: true,
+            always: true,
             stop: false,
         },
         KeyCode::Char('c' | 'C') if control => Outcome::Answer {
             call_id,
             allow: false,
+            always: false,
             stop: true,
         },
         KeyCode::Char('n' | 'N') | KeyCode::Esc => Outcome::Answer {
             call_id,
             allow: false,
+            always: false,
             stop: false,
         },
         _ => Outcome::Continue,
@@ -1250,6 +1393,12 @@ fn apply(frame: Frame, view: &mut ViewState) {
                 tool,
                 reason,
             });
+        }
+        Frame::ApprovalChanged { state } => {
+            // The agent is the authority on the state, so this is applied even to the client
+            // that just changed it: two views of one session agree, and a state chosen at
+            // startup is drawn without the reader pressing anything.
+            view.approval = view_policy(state);
         }
         Frame::Tool {
             call_id,
@@ -2677,6 +2826,24 @@ mod tests {
             Outcome::Answer {
                 call_id,
                 allow: true,
+                always: false,
+                stop: false
+            } if call_id == "a1"
+        ));
+
+        // `a` is the standing answer: it runs the call *and* records the tool for the rest of
+        // the session, which is a different thing from `y` and a separate key.
+        view.pending_approval = Some(PendingApproval {
+            call_id: "a1".to_owned(),
+            tool: "bash".to_owned(),
+            reason: None,
+        });
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE), &mut view),
+            Outcome::Answer {
+                call_id,
+                allow: true,
+                always: true,
                 stop: false
             } if call_id == "a1"
         ));
@@ -2693,6 +2860,7 @@ mod tests {
             Outcome::Answer {
                 call_id,
                 allow: false,
+                always: false,
                 stop: false
             } if call_id == "a2"
         ));
@@ -2701,6 +2869,7 @@ mod tests {
             Outcome::Answer {
                 call_id,
                 allow: false,
+                always: false,
                 stop: false
             } if call_id == "a2"
         ));
@@ -2713,6 +2882,7 @@ mod tests {
             Outcome::Answer {
                 call_id,
                 allow: false,
+                always: false,
                 stop: true
             } if call_id == "a2"
         ));
@@ -2722,6 +2892,78 @@ mod tests {
             handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE), &mut view),
             Outcome::Continue
         ));
+    }
+
+    /// Shift+Tab cycles the approval state, and it is routed before the dialog takes the
+    /// keyboard: a reader who wants to stop being asked must not have to answer first.
+    #[test]
+    fn shift_tab_cycles_the_approval_state_from_anywhere() {
+        let mut view = ViewState::new();
+        assert_eq!(view.approval, ApprovalPolicy::PerCall);
+
+        // `BackTab` is how a terminal spells Shift+Tab, and the first press moves from the
+        // default to the next state.
+        assert!(matches!(
+            handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &mut view),
+            Outcome::SetApproval(ApprovalPolicy::Permitted)
+        ));
+
+        // A terminal that speaks the enhanced keyboard protocol may send `Tab` with Shift
+        // held instead; it means the same key.
+        view.approval = ApprovalPolicy::Permitted;
+        assert!(matches!(
+            handle_key(key(KeyCode::Tab, KeyModifiers::SHIFT), &mut view),
+            Outcome::SetApproval(ApprovalPolicy::AllCalls)
+        ));
+        view.approval = ApprovalPolicy::AllCalls;
+        assert!(matches!(
+            handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &mut view),
+            Outcome::SetApproval(ApprovalPolicy::PerCall)
+        ));
+
+        // A bare Tab is not the key: it is the composer's own key and must stay one.
+        view.approval = ApprovalPolicy::PerCall;
+        assert!(matches!(
+            handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+
+        // And with a question open, the key still cycles rather than answering.
+        view.pending_approval = Some(PendingApproval {
+            call_id: "a1".to_owned(),
+            tool: "bash".to_owned(),
+            reason: None,
+        });
+        assert!(matches!(
+            handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &mut view),
+            Outcome::SetApproval(ApprovalPolicy::Permitted)
+        ));
+        assert!(
+            view.pending_approval.is_some(),
+            "cycling the state does not answer the question"
+        );
+    }
+
+    /// The agent's own state is what the interface draws, so a state chosen elsewhere — a
+    /// second view, or a startup flag the agent applied — reaches this one.
+    #[test]
+    fn an_approval_change_frame_sets_the_drawn_state() {
+        let mut view = ViewState::new();
+        apply(
+            Frame::ApprovalChanged {
+                state: ApprovalState::AllCalls,
+            },
+            &mut view,
+        );
+        assert_eq!(view.approval, ApprovalPolicy::AllCalls);
+
+        apply(
+            Frame::ApprovalChanged {
+                state: ApprovalState::PerCall,
+            },
+            &mut view,
+        );
+        assert_eq!(view.approval, ApprovalPolicy::PerCall);
     }
 
     /// A turn that ends takes any open question with it, so the reader is not asked to decide
@@ -2878,7 +3120,12 @@ mod tests {
     fn connecting_to_a_socket_nobody_is_serving_is_an_error_rather_than_a_panic() {
         let missing = Path::new("/definitely/not/a/socket");
         let store = nanus_kernel::runtime::block_on(open_store_for_test());
-        let outcome = block_on(Remote::connect(missing, &store, Target::New { name: None }));
+        let outcome = block_on(Remote::connect(
+            missing,
+            &store,
+            Target::New { name: None },
+            None,
+        ));
         assert!(outcome.is_err(), "a missing socket is refused");
         let Err(error) = outcome else { return };
         assert!(error.contains("/definitely/not/a/socket"), "{error}");

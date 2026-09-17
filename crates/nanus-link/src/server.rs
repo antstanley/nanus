@@ -35,7 +35,7 @@
 //! finished would wait forever.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -45,8 +45,8 @@ use std::time::{Duration, Instant};
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{AgentRunner, Approver, Harness, Progress};
 use nanus_domain::{
-    ApprovalOutcome, ApprovalRequest, Session, SessionId, ToolCallId, ToolName, TurnEndReason,
-    Usage,
+    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Session, SessionId, ToolCallId, ToolName,
+    TurnEndReason, Usage,
 };
 use nanus_ports::{ClockHandle, StoreHandle};
 use tokio::io::BufReader;
@@ -56,7 +56,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::error::{LinkError, LinkResult};
-use crate::protocol::{AgentInfo, Frame, Request, SessionInfo, TurnEnd};
+use crate::protocol::{AgentInfo, ApprovalState, Frame, Request, SessionInfo, TurnEnd};
 use crate::wire::{read_request, write_frame};
 
 /// How many frames may be queued to one client before progress is dropped.
@@ -208,6 +208,18 @@ struct Headline {
     events: u64,
 }
 
+/// An approval question this session is waiting on.
+///
+/// The tool is kept beside the sender because an answer may be *standing*: a client that
+/// says "always" is granting that tool for the session, and which tool it was is not
+/// recoverable from the question's id.
+struct Question {
+    /// The tool the question is about.
+    tool: ToolName,
+    /// How the answer reaches the turn.
+    sender: oneshot::Sender<ApprovalOutcome>,
+}
+
 /// A session an agent is holding open.
 struct Held {
     /// The store key, kept here so a listing never has to borrow the session for it.
@@ -237,7 +249,13 @@ struct Held {
     /// session is let go, and when a turn ends with a question still open — is what makes
     /// a question nobody answers a *denial* rather than a hang: the approver's receiver
     /// ends and it reports `Unavailable`.
-    approvals: RefCell<BTreeMap<String, oneshot::Sender<ApprovalOutcome>>>,
+    approvals: RefCell<BTreeMap<String, Question>>,
+    /// Tools a client has granted for this session with an *always* answer.
+    ///
+    /// Session state rather than agent state, because the grant was given about this
+    /// conversation: a second session on the same agent is a different person's trust. It
+    /// lives as long as the held session, which is what "for this session" means.
+    approved: RefCell<BTreeSet<ToolName>>,
     /// The next approval question's id, so ids stay unique even across turns.
     approval_seq: Cell<u64>,
     /// When it was last used, for letting an idle session go.
@@ -284,12 +302,19 @@ impl Held {
     }
 
     /// Opens an approval question and returns the id a client answers with.
-    fn ask(&self, sender: oneshot::Sender<ApprovalOutcome>) -> String {
+    fn ask(&self, tool: ToolName, sender: oneshot::Sender<ApprovalOutcome>) -> String {
         let next = self.approval_seq.get().saturating_add(1);
         self.approval_seq.set(next);
         let call_id = format!("a{next}");
-        self.approvals.borrow_mut().insert(call_id.clone(), sender);
+        self.approvals
+            .borrow_mut()
+            .insert(call_id.clone(), Question { tool, sender });
         call_id
+    }
+
+    /// Returns whether a tool was granted for this session with an *always* answer.
+    fn is_approved(&self, tool: &ToolName) -> bool {
+        self.approved.borrow().contains(tool)
     }
 
     /// Delivers a client's answer, if the question is still open.
@@ -297,16 +322,25 @@ impl Held {
     /// Returns whether it was delivered: the first answer wins, and an answer to a question
     /// another client already settled — or one the turn abandoned — is dropped rather than
     /// reported, because by then there is nothing left to decide.
-    fn answer(&self, call_id: &str, allow: bool) -> bool {
-        let Some(sender) = self.approvals.borrow_mut().remove(call_id) else {
+    ///
+    /// An `always` answer also records the tool, which is what makes the next call to it run
+    /// without asking for the rest of the session. Recording happens even if the receiver is
+    /// gone: the grant is about the session, not about the one call the question named, and
+    /// a turn that ended a moment before the answer arrived should still leave the session
+    /// remembering what a person granted.
+    fn answer(&self, call_id: &str, allow: bool, always: bool) -> bool {
+        let Some(question) = self.approvals.borrow_mut().remove(call_id) else {
             return false;
         };
+        if allow && always {
+            self.approved.borrow_mut().insert(question.tool);
+        }
         let outcome = if allow {
             ApprovalOutcome::AllowedOnce
         } else {
             ApprovalOutcome::Rejected
         };
-        sender.send(outcome).is_ok()
+        question.sender.send(outcome).is_ok()
     }
 
     /// Abandons every question still open.
@@ -377,6 +411,7 @@ impl Registry {
             busy: Cell::new(false),
             stop: Cell::new(false),
             approvals: RefCell::new(BTreeMap::new()),
+            approved: RefCell::new(BTreeSet::new()),
             approval_seq: Cell::new(0),
             touched: Cell::new(self.stamp()),
         });
@@ -486,6 +521,18 @@ impl Registry {
         turns.spawn_local(task);
     }
 
+    /// Tells every attached client what the agent's approval state is now.
+    ///
+    /// The state is the agent's rather than a session's, so every session's viewers are told;
+    /// a client that toggled it and a client watching another conversation then agree about
+    /// what the next call will do.
+    async fn broadcast_approval(&self, state: ApprovalState) {
+        let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
+        for entry in held {
+            broadcast_awaited(&entry, Frame::ApprovalChanged { state }, None).await;
+        }
+    }
+
     /// Lets idle sessions go until the agent is holding no more than it should.
     ///
     /// `incoming` is how many sessions the caller is about to add. Counting them before
@@ -539,6 +586,28 @@ impl From<&TurnEndReason> for TurnEnd {
     }
 }
 
+/// Renders the domain's approval policy in the link's vocabulary.
+///
+/// An exhaustive match, for the same reason [`From<&TurnEndReason> for TurnEnd`] is one: a
+/// state the domain grows has to be a compile error here rather than a state the interface
+/// silently never shows.
+const fn wire_state(policy: ApprovalPolicy) -> ApprovalState {
+    match policy {
+        ApprovalPolicy::PerCall => ApprovalState::PerCall,
+        ApprovalPolicy::Permitted => ApprovalState::Permitted,
+        ApprovalPolicy::AllCalls => ApprovalState::AllCalls,
+    }
+}
+
+/// Reads the link's approval state into the domain's vocabulary.
+const fn domain_policy(state: ApprovalState) -> ApprovalPolicy {
+    match state {
+        ApprovalState::PerCall => ApprovalPolicy::PerCall,
+        ApprovalState::Permitted => ApprovalPolicy::Permitted,
+        ApprovalState::AllCalls => ApprovalPolicy::AllCalls,
+    }
+}
+
 /// Asks the clients attached to a session to approve one call.
 ///
 /// The link's answerer, and the reason the approval gate means something when a person is
@@ -556,13 +625,19 @@ struct LinkApprover<'a> {
 impl Approver for LinkApprover<'_> {
     fn decide(&self, request: ApprovalRequest) -> nanus_ports::LocalBoxFuture<'_, ApprovalOutcome> {
         Box::pin(async move {
+            // A tool already granted for this session is not a question any more: an
+            // "always" answer recorded it, and asking again would be asking a person the
+            // same thing they have already answered once.
+            if self.held.is_approved(&request.tool) {
+                return ApprovalOutcome::AllowedOnce;
+            }
             // Asked before the question is queued, so a turn with nobody watching does not
             // put a frame nowhere and wait for an answer that cannot arrive.
             if self.held.viewers.borrow().is_empty() {
                 return ApprovalOutcome::Unavailable;
             }
             let (sender, receiver) = oneshot::channel();
-            let call_id = self.held.ask(sender);
+            let call_id = self.held.ask(request.tool.clone(), sender);
             broadcast_awaited(
                 self.held,
                 Frame::Approval {
@@ -1124,7 +1199,11 @@ async fn serve_connection(
                 let held = registry.listing();
                 send(&frames, Frame::Sessions { held }).await;
             }
-            Request::Approve { call_id, allow } => {
+            Request::Approve {
+                call_id,
+                allow,
+                always,
+            } => {
                 // Delivered only against the session this connection is watching: an answer
                 // is about a question that session asked, and a connection that is not
                 // attached has not been asked anything. An id nobody is waiting on is
@@ -1132,10 +1211,19 @@ async fn serve_connection(
                 // the turn ended — and saying so would only be noise on a client's screen.
                 let delivered = watching
                     .as_ref()
-                    .is_some_and(|(_, held)| held.answer(&call_id, allow));
+                    .is_some_and(|(_, held)| held.answer(&call_id, allow, always));
                 if !delivered {
                     tracing::debug!(call = %call_id, "an approval answer matched no open question");
                 }
+            }
+            Request::SetApproval { state } => {
+                // The state belongs to the agent rather than to the session: the runner the
+                // gate consults is one object shared by every session the agent holds, and a
+                // per-session state would need the gate to be handed one on every call.
+                // Every viewer is told, not only the connection that changed it, so two
+                // views of the same agent cannot disagree about what the next call will do.
+                registry.agent.runner().set_approval(domain_policy(state));
+                registry.broadcast_approval(state).await;
             }
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
@@ -1189,6 +1277,11 @@ async fn attach(
 ) -> (u64, Rc<Held>) {
     let viewer = registry.view(held, frames);
     send(frames, Frame::Attached(held.info())).await;
+    // The state follows the attachment, so an interface knows what the toggle is showing
+    // before a reader can press the key. Sent after `Attached` and not before, because the
+    // client reads frames until the attachment and would discard one that arrived first.
+    let state = wire_state(registry.agent.runner().approval());
+    send(frames, Frame::ApprovalChanged { state }).await;
     (viewer, Rc::clone(held))
 }
 
@@ -1333,6 +1426,7 @@ mod tests {
             busy: Cell::new(false),
             stop: Cell::new(false),
             approvals: RefCell::new(BTreeMap::new()),
+            approved: RefCell::new(BTreeSet::new()),
             approval_seq: Cell::new(0),
             touched: Cell::new(0),
         })
@@ -1521,12 +1615,12 @@ mod tests {
                 "and so is the second: every client sees the question"
             );
             assert!(
-                session.answer(&call_id, true),
+                session.answer(&call_id, true, false),
                 "the first answer settles the question"
             );
             // The first answer wins: a second one finds nothing to settle.
             assert!(
-                !session.answer(&call_id, false),
+                !session.answer(&call_id, false, false),
                 "the question is already settled"
             );
         };
@@ -1536,6 +1630,46 @@ mod tests {
             session.approvals.borrow().is_empty(),
             "no answered question is left waiting"
         );
+    }
+
+    /// An `always` answer grants the tool for the session: the next question about the same
+    /// tool is not asked, and a different tool still is.
+    #[tokio::test]
+    async fn an_always_answer_records_the_tool_for_the_session() {
+        let session = held("always");
+        let (sender, _receiver) = oneshot::channel();
+        let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let call_id = session.ask(bash.clone(), sender);
+        assert!(
+            session.answer(&call_id, true, true),
+            "the answer settles the question"
+        );
+        assert!(session.is_approved(&bash), "the tool is granted");
+        let read = ToolName::new("read").unwrap_or_else(|_| panic!("a valid tool name"));
+        assert!(
+            !session.is_approved(&read),
+            "a different tool was not granted by answering about bash"
+        );
+
+        // A subsequent question about the granted tool is answered without asking anyone.
+        let approver = LinkApprover { held: &session };
+        let outcome = approver.decide(ApprovalRequest::new(bash)).await;
+        assert_eq!(outcome, ApprovalOutcome::AllowedOnce);
+        assert!(
+            session.approvals.borrow().is_empty(),
+            "a granted tool opens no question"
+        );
+    }
+
+    /// `always` on a denial grants nothing: the toggle to remember is only on an allow.
+    #[tokio::test]
+    async fn an_always_answer_on_a_refusal_records_nothing() {
+        let session = held("refused-always");
+        let (sender, _receiver) = oneshot::channel();
+        let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let call_id = session.ask(bash.clone(), sender);
+        assert!(session.answer(&call_id, false, true));
+        assert!(!session.is_approved(&bash), "a refusal grants nothing");
     }
 
     /// Nobody attached means nobody to answer, and the turn is told so rather than left
@@ -1560,11 +1694,12 @@ mod tests {
     async fn an_abandoned_question_cannot_be_answered() {
         let session = held("abandoned");
         let (sender, receiver) = oneshot::channel();
-        let call_id = session.ask(sender);
+        let name = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let call_id = session.ask(name, sender);
         assert_eq!(session.approvals.borrow().len(), 1, "the question is open");
         session.abandon_approvals();
         assert!(
-            !session.answer(&call_id, true),
+            !session.answer(&call_id, true, false),
             "the abandoned question is gone"
         );
         assert!(

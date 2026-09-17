@@ -120,7 +120,7 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     // rooted in, and the two permission knobs the gate enforces. The domain renders this
     // text; the failure this asserts against is the bundle never asking it to.
     let prompt = harness.runner.system_prompt();
-    assert!(prompt.contains("Approval policy: ask"), "{prompt}");
+    assert!(prompt.contains("Approval policy: per_call"), "{prompt}");
     assert!(prompt.contains("Sandbox: read_only"), "{prompt}");
     assert!(
         prompt.contains(&root.display().to_string()),

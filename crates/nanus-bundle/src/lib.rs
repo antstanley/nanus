@@ -57,6 +57,7 @@ pub mod agent_loop;
 pub mod args;
 pub mod compose;
 pub mod error;
+pub mod guard;
 pub mod tools;
 
 pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};

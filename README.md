@@ -150,7 +150,7 @@ $ nanus config
 model: deepseek-flash
 max tokens: 128000
 reasoning effort: Medium
-approval policy: Ask
+approval policy: per_call
 sandbox mode: ReadOnly
 max steps per turn: 32
 workspace root: <the current directory>

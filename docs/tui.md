@@ -52,6 +52,10 @@ And which conversation it opens:
 | `--resume X` | An existing session, by name or id — the live one if the agent is holding it. |
 | neither | A new, unnamed session. |
 
+`--approval` takes `per_call`, `permitted`, or `all_calls` and is the state the interface
+opens in — and, for a live conversation, the state it asks the agent to use. The status
+line always names the state in force, and `Shift+Tab` cycles it.
+
 The session's name is shown in the title bar, because two terminals can be attached to two
 different conversations and a reader should be able to tell which is which. See
 [sessions](sessions.md) for what resuming and attaching mean.
@@ -114,16 +118,18 @@ rather than assumed compatible. `nanus service status` prints the version the ru
 reported.
 
 **A tool call outside the sandbox is decided by whoever is watching.** When the loop
-reaches a call the sandbox does not already permit and the policy is `ask`, the agent sends
-an `approval` frame to every client attached to the session and the turn waits. The frame
-carries the tool and the harness's own reason and deliberately *not* the call's arguments:
-the domain's approval request carries none, so model-controlled text cannot be placed in
-front of the person deciding, and the transcript already shows what the call is. A client
-answers with an `approve` request naming the question; the first answer wins, and denying
-is the safe reading of everything else. Nobody attached, or a last client that detaches
-while a question is open, is an unavailable answerer — the call is denied rather than left
-waiting for a decision that cannot arrive. `never` never reaches the link at all: it
-refuses without asking anyone.
+reaches a call the sandbox does not already permit and the state does not grant it — `per
+call` grants nothing, and `permitted calls` grants the non-destructive ones — the agent
+sends an `approval` frame to every client attached to the session and the turn waits. The
+frame carries the tool and the harness's own reason and deliberately *not* the call's
+arguments: the domain's approval request carries none, so model-controlled text cannot be
+placed in front of the person deciding, and the transcript already shows what the call is.
+A client answers with an `approve` request naming the question; the first answer wins, and
+denying is the safe reading of everything else. An answer may be standing: the "always
+allow" option records the tool for the session, so the same question is not asked again.
+Nobody attached, or a last client that detaches while a question is open, is an unavailable
+answerer — the call is denied rather than left waiting for a decision that cannot arrive.
+`all calls` never reaches the link at all: it grants every exception without asking.
 
 **The ending says why the turn ended, not only that it did.** A turn can stop for reasons
 that are not the model finishing — it can run out of steps, hit its token ceiling, be
@@ -188,8 +194,11 @@ second set. Where it does not, the divergence is named rather than papered over.
 
 | Key | Effect |
 |---|---|
-| `y` / `n` (or `Esc`) | while an approval dialog is up: allow the call once, or deny it |
+| `y` | while an approval dialog is up: allow the call once |
+| `a` | while an approval dialog is up: allow the call and record the tool for the session |
+| `n` (or `Esc`) | while an approval dialog is up: deny it |
 | `Ctrl+C` | while an approval dialog is up: deny it *and* stop the turn |
+| `Shift+Tab` | cycle the approval state: per call → permitted calls → all calls |
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
@@ -209,13 +218,15 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
 
-**While an approval dialog is up, three answers are possible and every other key is
+**While an approval dialog is up, four answers are possible and every other key is
 swallowed.** The dialog is drawn over the interface, names the tool and the harness's reason,
-and `y` allows that one call, `n` or `Esc` denies it, and `Ctrl+C` denies it *and* asks the
-turn to stop — because the turn is asleep on this answer, so the key that means "stop
-everything" everywhere else would otherwise do nothing at all here. A stray keypress cannot
-approve a command. The status line says what is being waited for, and the dialog closes when
-the turn ends — an answer cannot outlive the question.
+and names every option with the key that selects it. `y` allows that one call, `a` allows it
+and records the tool for the rest of the session so the question is not asked again, `n` or
+`Esc` denies it, and `Ctrl+C` denies it *and* asks the turn to stop — because the turn is
+asleep on this answer, so the key that means "stop everything" everywhere else would
+otherwise do nothing at all here. A stray keypress cannot approve a command. The status line
+says what is being waited for, and the dialog closes when the turn ends — an answer cannot
+outlive the question.
 
 **`Ctrl+R` searches the history** rather than toggling anything, because that is what it is
 in every interface that has one — including the one these bindings are modelled on, where
@@ -274,9 +285,9 @@ full-screen terminal program pays.
 Claude Code's mode has more bindings than this interface has things to bind them to, and
 inventing a purpose for a key would be worse than leaving it alone:
 
-- **Permission modes** (`Shift+Tab`) — the sandbox and approval policy are set in
-  configuration. The interface *answers* the agent's approval questions (see the keys
-  table), but it does not switch the policy they are asked under.
+- **The sandbox mode** is set in configuration rather than from the keyboard: the approval
+  state cycles with `Shift+Tab`, but `sandbox_mode` is a standing decision about what the
+  tools may touch, and changing it mid-turn would make the prompt the model was sent a lie.
 - **Model switching** (`Alt+P`) and **extended thinking** (`Alt+T`) are agent-side
   decisions with no request to carry them.
 - **Background tasks** (`Ctrl+B`) — there are none to background.

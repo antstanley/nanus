@@ -18,12 +18,26 @@ use crate::error::DomainError;
 use crate::message::ToolCallId;
 use crate::tool::ToolName;
 
-/// Whether a tool call needs a human decision before it runs.
+/// How much a tool call outside the sandbox is asked about before it runs.
 ///
 /// The policy is about *exceptions to the sandbox*, not about every call: a call the
-/// sandbox mode already permits runs without asking either way. What the policy decides is
-/// what happens to a call outside that standing permission — [`Ask`](Self::Ask) lets a
-/// human grant it once, and [`Never`](Self::Never) refuses it without consulting anyone.
+/// sandbox mode already permits runs without asking whatever the policy is. What the policy
+/// decides is what happens to a call outside that standing permission. There are three
+/// states, and they are a single axis rather than a pair of flags:
+///
+/// - [`PerCall`](Self::PerCall) asks a human about every exception, every time. It is the
+///   default because it is the only state under which the sandbox is the whole of the
+///   control.
+/// - [`Permitted`](Self::Permitted) grants the exceptions that are plainly not destructive
+///   without asking, and still asks about a call that deletes or overwrites something — or
+///   asks about nothing at all when the call's targets are all inside a temporary
+///   directory, where a destructive call is what the directory is for.
+/// - [`AllCalls`](Self::AllCalls) grants every exception without asking. It is a free for
+///   all, and it is meant for an environment that enforces its own containment: a
+///   container, a virtual machine, or a machine whose only contents are disposable.
+///
+/// The enum is fail-closed in the direction that matters: its default is the most
+/// restrictive value, and the two permissive arms are explicit names a human has to choose.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -31,13 +45,12 @@ use crate::tool::ToolName;
 pub enum ApprovalPolicy {
     /// Every call outside the sandbox asks a human first.
     #[default]
-    Ask,
-    /// No call ever asks, so every call outside the sandbox is refused.
-    ///
-    /// Not "approve everything": `never` answers *no* to every request for an exception,
-    /// without consulting anyone. It is the setting for an unattended run, where nobody can
-    /// answer, and the sandbox is therefore the whole of the control.
-    Never,
+    #[serde(alias = "ask", alias = "never")]
+    PerCall,
+    /// Non-destructive calls outside the sandbox run without asking; a destructive one asks.
+    Permitted,
+    /// Every call outside the sandbox runs without asking.
+    AllCalls,
 }
 
 impl ApprovalPolicy {
@@ -45,27 +58,71 @@ impl ApprovalPolicy {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Ask => "ask",
-            Self::Never => "never",
+            Self::PerCall => "per_call",
+            Self::Permitted => "permitted",
+            Self::AllCalls => "all_calls",
+        }
+    }
+
+    /// Returns the phrase the interface shows for the policy.
+    ///
+    /// Separate from [`ApprovalPolicy::as_str`] because the two are read by different
+    /// readers: the config name is a token a person types, and this is a sentence fragment
+    /// the interface draws in a status line.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PerCall => "per call",
+            Self::Permitted => "permitted calls",
+            Self::AllCalls => "all calls",
+        }
+    }
+
+    /// Returns the next state in the interface's toggle order, wrapping round.
+    ///
+    /// The order is by increasing permissiveness, so one key walks a reader in the
+    /// direction they meant and the wrap is a full cycle rather than a jump back to the
+    /// most restrictive state from the middle.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::PerCall => Self::Permitted,
+            Self::Permitted => Self::AllCalls,
+            Self::AllCalls => Self::PerCall,
         }
     }
 
     /// Parses a policy from its config name.
     ///
+    /// `"ask"` and `"never"` are accepted as legacy spellings of [`PerCall`](Self::PerCall):
+    /// the old `ask` meant exactly that, and the old `never` meant "grant no exception",
+    /// whose fail-closed reading under the three-state axis is to ask and let the answer be
+    /// no when nobody can give one.
+    ///
     /// # Errors
     ///
     /// Returns [`DomainError::Validation`] for any other name. An unknown policy
     /// is never silently degraded to a default, because the default is
-    /// "ask" and a typo must not turn prompts off.
+    /// "per call" and a typo must not turn prompts off.
     pub fn parse(raw: &str) -> Result<Self, DomainError> {
         match raw {
-            "ask" => Ok(Self::Ask),
-            "never" => Ok(Self::Never),
+            "ask" | "never" | "per_call" => Ok(Self::PerCall),
+            "permitted" => Ok(Self::Permitted),
+            "all_calls" => Ok(Self::AllCalls),
             other => Err(DomainError::Validation {
                 field: "approval_policy",
                 reason: format!("unknown approval policy {other:?}"),
             }),
         }
+    }
+}
+
+impl core::str::FromStr for ApprovalPolicy {
+    type Err = DomainError;
+
+    /// Parses the config spelling, so a command-line flag can name a policy directly.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw)
     }
 }
 
@@ -371,7 +428,7 @@ impl PermissionPreset {
     #[must_use]
     pub const fn read_only() -> Self {
         Self {
-            approval: ApprovalPolicy::Ask,
+            approval: ApprovalPolicy::PerCall,
             sandbox: SandboxMode::ReadOnly,
         }
     }
@@ -380,22 +437,22 @@ impl PermissionPreset {
     #[must_use]
     pub const fn workspace_write() -> Self {
         Self {
-            approval: ApprovalPolicy::Ask,
+            approval: ApprovalPolicy::PerCall,
             sandbox: SandboxMode::WorkspaceWrite,
         }
     }
 
-    /// The danger-full-access preset: unconfined, and never asking.
+    /// The danger-full-access preset: unconfined, and granting every exception.
     ///
     /// The pairing is the point, and it is the only way to run tools unattended. The
-    /// sandbox permits every access, so nothing needs an exception and `never` has nothing
-    /// to refuse; the human who chose this preset has already decided. Paired with any
-    /// confined mode, `never` would instead refuse every call the sandbox does not already
-    /// permit, which is what makes that a different — and much safer — bundle.
+    /// sandbox permits every access, so nothing needs an exception and `all_calls` has
+    /// nothing to grant; the human who chose this preset has already decided. Paired with a
+    /// confined mode, `all_calls` would instead grant every call the sandbox refuses, which
+    /// is what makes that a different — and much more permissive — bundle.
     #[must_use]
     pub const fn danger_full_access() -> Self {
         Self {
-            approval: ApprovalPolicy::Never,
+            approval: ApprovalPolicy::AllCalls,
             sandbox: SandboxMode::DangerFullAccess,
         }
     }
@@ -410,10 +467,14 @@ impl PermissionPreset {
     #[must_use]
     pub const fn name(self) -> PresetName {
         match (self.approval, self.sandbox) {
-            (ApprovalPolicy::Ask, SandboxMode::ReadOnly) => PresetName::ReadOnly,
-            (ApprovalPolicy::Ask, SandboxMode::WorkspaceWrite) => PresetName::WorkspaceWrite,
-            (ApprovalPolicy::Never, SandboxMode::DangerFullAccess) => PresetName::DangerFullAccess,
-            (ApprovalPolicy::Ask | ApprovalPolicy::Never, _) => PresetName::Custom,
+            (ApprovalPolicy::PerCall, SandboxMode::ReadOnly) => PresetName::ReadOnly,
+            (ApprovalPolicy::PerCall, SandboxMode::WorkspaceWrite) => PresetName::WorkspaceWrite,
+            (ApprovalPolicy::AllCalls, SandboxMode::DangerFullAccess) => {
+                PresetName::DangerFullAccess
+            }
+            (ApprovalPolicy::PerCall | ApprovalPolicy::Permitted | ApprovalPolicy::AllCalls, _) => {
+                PresetName::Custom
+            }
         }
     }
 
@@ -447,9 +508,40 @@ mod tests {
     fn the_defaults_are_the_most_restrictive_values() {
         // Fail-closed: a default that permitted a write would make every missing
         // configuration decision a security decision.
-        assert_eq!(ApprovalPolicy::default(), ApprovalPolicy::Ask);
+        assert_eq!(ApprovalPolicy::default(), ApprovalPolicy::PerCall);
         assert_eq!(SandboxMode::default(), SandboxMode::ReadOnly);
         assert_eq!(PermissionPreset::default(), PermissionPreset::read_only());
+    }
+
+    #[test]
+    fn the_toggle_walks_the_states_in_order_and_wraps_round() {
+        // Shift-Tab cycles one way; a reader who overshoots gets back to the start rather
+        // than being stuck, and the order is by increasing permissiveness.
+        assert_eq!(ApprovalPolicy::PerCall.next(), ApprovalPolicy::Permitted);
+        assert_eq!(ApprovalPolicy::Permitted.next(), ApprovalPolicy::AllCalls);
+        assert_eq!(ApprovalPolicy::AllCalls.next(), ApprovalPolicy::PerCall);
+    }
+
+    #[test]
+    fn every_policy_has_a_config_name_a_label_and_round_trips() {
+        for policy in [
+            ApprovalPolicy::PerCall,
+            ApprovalPolicy::Permitted,
+            ApprovalPolicy::AllCalls,
+        ] {
+            assert_eq!(ApprovalPolicy::parse(policy.as_str()), Ok(policy));
+            assert_eq!(policy.to_string(), policy.as_str());
+            assert!(!policy.label().is_empty());
+        }
+        // The three states are distinct, which is the whole point of having three.
+        assert_ne!(
+            ApprovalPolicy::PerCall.label(),
+            ApprovalPolicy::Permitted.label()
+        );
+        assert_ne!(
+            ApprovalPolicy::Permitted.label(),
+            ApprovalPolicy::AllCalls.label()
+        );
     }
 
     #[test]
@@ -478,7 +570,7 @@ mod tests {
 
     #[test]
     fn a_mixed_bundle_is_custom_and_has_no_switch_target() {
-        let mixed = PermissionPreset::custom(ApprovalPolicy::Never, SandboxMode::WorkspaceWrite);
+        let mixed = PermissionPreset::custom(ApprovalPolicy::AllCalls, SandboxMode::WorkspaceWrite);
         assert_eq!(mixed.name(), PresetName::Custom);
         // Negative space: the derived name is not selectable, so a config file
         // cannot ask for a bundle that some other code chose.
@@ -492,7 +584,17 @@ mod tests {
         assert!(ApprovalPolicy::parse("sometimes").is_err());
         assert!(SandboxMode::parse("readonly").is_err());
         assert!(PresetName::parse("yolo").is_err());
-        assert_eq!(ApprovalPolicy::parse("never"), Ok(ApprovalPolicy::Never));
+        assert_eq!(
+            ApprovalPolicy::parse("permitted"),
+            Ok(ApprovalPolicy::Permitted)
+        );
+        assert_eq!(
+            ApprovalPolicy::parse("all_calls"),
+            Ok(ApprovalPolicy::AllCalls)
+        );
+        // Legacy spellings are read as the fail-closed state rather than rejected outright.
+        assert_eq!(ApprovalPolicy::parse("ask"), Ok(ApprovalPolicy::PerCall));
+        assert_eq!(ApprovalPolicy::parse("never"), Ok(ApprovalPolicy::PerCall));
         assert_eq!(
             SandboxMode::parse("danger_full_access"),
             Ok(SandboxMode::DangerFullAccess)
@@ -541,10 +643,10 @@ mod tests {
     fn the_knobs_are_orthogonal() {
         // If the two were one axis, these four bundles could not exist.
         let bundles = [
-            PermissionPreset::custom(ApprovalPolicy::Ask, SandboxMode::ReadOnly),
-            PermissionPreset::custom(ApprovalPolicy::Ask, SandboxMode::DangerFullAccess),
-            PermissionPreset::custom(ApprovalPolicy::Never, SandboxMode::ReadOnly),
-            PermissionPreset::custom(ApprovalPolicy::Never, SandboxMode::DangerFullAccess),
+            PermissionPreset::custom(ApprovalPolicy::PerCall, SandboxMode::ReadOnly),
+            PermissionPreset::custom(ApprovalPolicy::PerCall, SandboxMode::DangerFullAccess),
+            PermissionPreset::custom(ApprovalPolicy::AllCalls, SandboxMode::ReadOnly),
+            PermissionPreset::custom(ApprovalPolicy::AllCalls, SandboxMode::DangerFullAccess),
         ];
         assert_eq!(bundles.len(), 4);
         assert_eq!(
@@ -580,8 +682,8 @@ mod tests {
 
     #[test]
     fn with_helpers_replace_one_knob_at_a_time() {
-        let preset = PermissionPreset::workspace_write().with_approval(ApprovalPolicy::Never);
-        assert_eq!(preset.approval, ApprovalPolicy::Never);
+        let preset = PermissionPreset::workspace_write().with_approval(ApprovalPolicy::AllCalls);
+        assert_eq!(preset.approval, ApprovalPolicy::AllCalls);
         assert_eq!(preset.sandbox, SandboxMode::WorkspaceWrite);
         assert_eq!(preset.name(), PresetName::Custom);
     }

@@ -73,7 +73,7 @@ fn the_built_in_defaults_are_the_documented_ones() {
         config.reasoning_effort.to_port(),
         nanus_ports::ReasoningEffort::Medium
     );
-    assert_eq!(config.approval_policy, ApprovalPolicy::Ask);
+    assert_eq!(config.approval_policy, ApprovalPolicy::PerCall);
     assert_eq!(config.sandbox_mode, SandboxMode::ReadOnly);
     assert_eq!(
         config.tui_detail,
@@ -162,13 +162,13 @@ fn the_permission_and_effort_spellings_parse() {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
-        "reasoning_effort = \"minimal\"\napproval_policy = \"never\"\nsandbox_mode = \"workspace_write\"\n",
+        "reasoning_effort = \"minimal\"\napproval_policy = \"permitted\"\nsandbox_mode = \"workspace_write\"\n",
     )
     .expect("seed");
     let config = NanusConfig::load(Some(&path)).expect("load");
     assert_eq!(config.reasoning_effort, ReasoningEffort::Minimal);
     assert_eq!(config.reasoning_effort.as_wire(), "minimal");
-    assert_eq!(config.approval_policy, ApprovalPolicy::Never);
+    assert_eq!(config.approval_policy, ApprovalPolicy::Permitted);
     assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
 }
 
@@ -323,7 +323,7 @@ fn save_then_load_round_trips() {
         model: String::from("deepseek-v4-pro"),
         max_tokens: 1234,
         reasoning_effort: ReasoningEffort::Low,
-        approval_policy: ApprovalPolicy::Never,
+        approval_policy: ApprovalPolicy::AllCalls,
         sandbox_mode: SandboxMode::DangerFullAccess,
         system_prompt: Some(String::from("be terse")),
         workspace_root: Some(dir.path().to_path_buf()),
