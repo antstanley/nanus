@@ -950,6 +950,13 @@ async fn event_loop(
                                 view.transcript.push(Entry::notice(view.stats.report()));
                                 view.scroll_to_bottom();
                             }
+                            Routed::Help => view.open_help(),
+                            Routed::Clear => {
+                                // The transcript only: the draft in the composer and the
+                                // toggles are about what the reader is doing now, and `Ctrl+L`
+                                // already means this.
+                                view.transcript.clear();
+                            }
                             Routed::Say(message) => {
                                 view.transcript.push(Entry::notice(message));
                                 view.scroll_to_bottom();
@@ -994,6 +1001,16 @@ enum Routed {
     /// Routed rather than said, because the text is not known until the view is: the router is a
     /// pure function of the line and what the source accepts, and the figures are state.
     Stats,
+    /// Draw the key list.
+    ///
+    /// Routed for the same reason as [`Routed::Stats`]: the list is an overlay the view owns,
+    /// and the router is a pure function of the line.
+    Help,
+    /// Empty the transcript.
+    ///
+    /// Routed for the same reason as [`Routed::Stats`]: the draft and the toggles are the
+    /// view's state, and clearing one of them is not something a router can do.
+    Clear,
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1007,6 +1024,8 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
     match submission_of(&prompt) {
         Submission::Run(Command::Exit) => Routed::Leave,
         Submission::Run(Command::Stats) => Routed::Stats,
+        Submission::Run(Command::Help) => Routed::Help,
+        Submission::Run(Command::Clear) => Routed::Clear,
         Submission::Unknown(name) => Routed::Say(format!(
             "no such command: {name} — this interface knows {}",
             Command::NAMES.join(" and ")
@@ -2451,7 +2470,10 @@ mod tests {
         };
         assert!(message.contains("/quitx"), "it names the typo: {message}");
         assert!(
-            message.contains("/exit") && message.contains("/quit"),
+            message.contains("/exit")
+                && message.contains("/quit")
+                && message.contains("/help")
+                && message.contains("/clear"),
             "and the commands that exist: {message}"
         );
 
@@ -2462,6 +2484,21 @@ mod tests {
                 route_submission(String::from("/stats"), accepts),
                 Routed::Stats,
                 "the figures are the interface's to report"
+            );
+        }
+
+        // The key list and the transcript are the interface's own, and both work in a
+        // recording: neither needs an agent, and a reader browsing one still has a keyboard.
+        for accepts in [true, false] {
+            assert_eq!(
+                route_submission(String::from("/help"), accepts),
+                Routed::Help,
+                "the key list is the interface's to draw"
+            );
+            assert_eq!(
+                route_submission(String::from("/clear"), accepts),
+                Routed::Clear,
+                "clearing the transcript is the interface's to do"
             );
         }
 

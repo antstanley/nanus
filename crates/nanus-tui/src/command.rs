@@ -14,6 +14,17 @@ pub enum Command {
     Exit,
     /// Write the session's model figures into the transcript.
     Stats,
+    /// Draw the key list.
+    ///
+    /// The same overlay `?` opens, so a reader who reaches for a command rather than a key
+    /// gets the same list rather than a second one that says almost the same thing.
+    Help,
+    /// Empty the transcript.
+    ///
+    /// The keys and the draft survive, because this is about the conversation on screen and
+    /// not about what is being typed: the panel is a view, and the session it views is
+    /// untouched.
+    Clear,
 }
 
 impl Command {
@@ -22,7 +33,7 @@ impl Command {
     /// The table is the list an unrecognised command is answered with, so a command added
     /// here is documented by existing rather than by somebody remembering to update a
     /// message.
-    pub const NAMES: &'static [&'static str] = &["/exit", "/quit", "/stats"];
+    pub const NAMES: &'static [&'static str] = &["/exit", "/quit", "/stats", "/help", "/clear"];
 }
 
 /// What the interface makes of a line the reader submitted.
@@ -52,6 +63,8 @@ pub fn submission_of(text: &str) -> Submission {
     match first {
         "/exit" | "/quit" => Submission::Run(Command::Exit),
         "/stats" => Submission::Run(Command::Stats),
+        "/help" => Submission::Run(Command::Help),
+        "/clear" => Submission::Run(Command::Clear),
         // A slash alone, or a path, or a typo: named as what was typed rather than
         // guessed at, because "no such command: /quitx" is what tells a reader they
         // fat-fingered it.
@@ -80,6 +93,17 @@ mod tests {
         assert_eq!(submission_of("  /stats  "), Submission::Run(Command::Stats));
         // Only the first word is read, so a word after it changes nothing.
         assert_eq!(submission_of("/stats now"), Submission::Run(Command::Stats));
+    }
+
+    /// The two commands that act on the screen rather than on the session: they are the
+    /// interface's, and they are answered in a recording too, where there is no agent at all.
+    #[test]
+    fn help_and_clear_are_commands() {
+        assert_eq!(submission_of("/help"), Submission::Run(Command::Help));
+        assert_eq!(submission_of("/clear"), Submission::Run(Command::Clear));
+        // Only the first word is read, so a word after either changes nothing.
+        assert_eq!(submission_of("/clear now"), Submission::Run(Command::Clear));
+        assert_eq!(submission_of("/help me"), Submission::Run(Command::Help));
     }
 
     #[test]

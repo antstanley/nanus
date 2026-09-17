@@ -360,6 +360,8 @@ than sending it to the model.
 | `/exit` | leave the interface |
 | `/quit` | the same command under its other name |
 | `/stats` | write the session's model figures into the transcript |
+| `/help` | draw the key list, the same one `?` opens |
+| `/clear` | empty the transcript, leaving the draft and the toggles alone |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
 on a glanceable line and the session has more than four: the report adds the totals, the
@@ -367,6 +369,13 @@ prompt broken into cached and read, how much of what was generated was thinking,
 tokens per second while waiting. It is a notice rather than prose — the model did not say it,
 the interface did — and it reports the session rather than the last request, so it is worth
 reading after a few turns and not before the first.
+
+`/help` and `/clear` are the screen's business rather than the session's, which is why they
+are answered in a recorded session too: neither needs an agent, and a reader browsing a
+transcript still has a keyboard. `/help` opens the same overlay `?` does rather than a second
+list that says almost the same thing. `/clear` empties the transcript and nothing else — the
+draft in the composer and the two summary toggles are about what the reader is doing now, and
+`Ctrl+L` already means exactly this.
 
 Nothing else is a command yet, and an unrecognised one is not sent to the model: it is
 named in the transcript along with the commands that do exist, because a typo should say so
