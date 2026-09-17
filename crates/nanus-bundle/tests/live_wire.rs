@@ -226,9 +226,13 @@ fn runner(
     let config = AgentConfig::new(8, 4, nanus_adapter_deepseek::MODEL_FLASH, 16_384)
         .expect("a valid agent configuration")
         .with_sandbox(nanus_domain::SandboxMode::DangerFullAccess);
-    let runner =
-        nanus_bundle::AgentRunner::new(Rc::new(port), Rc::new(registry), "you are a test", config)
-            .expect("the runner builds");
+    let runner = nanus_bundle::AgentRunner::new(
+        Rc::new(port),
+        nanus_bundle::ToolRegistryHandle::new(registry),
+        "you are a test",
+        config,
+    )
+    .expect("the runner builds");
     (runner, shell)
 }
 

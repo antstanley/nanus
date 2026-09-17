@@ -10,7 +10,9 @@
 //! every entry comes from an event, so a transcript cannot drift from the log it was
 //! built from.
 
-use nanus_domain::{Session, SessionEvent};
+use std::collections::BTreeMap;
+
+use nanus_domain::{Session, SessionEvent, ToolCallId};
 
 use crate::notice::{self, Ending};
 
@@ -53,8 +55,13 @@ fn build(session: &Session, banner: Option<String>) -> Transcript {
         .iter()
         .any(|event| matches!(event, SessionEvent::TurnEnd { .. }));
     let mut steps = 0_u32;
+    // Which tool each call id named, so a result can be paired with the call it answers.
+    // The pairing is by id and not by position because the log does not interleave them: a
+    // step writes every call it made and *then* every result, so the entry before a result
+    // is the last call of the batch rather than the one that result answers.
+    let mut calls: BTreeMap<ToolCallId, String> = BTreeMap::new();
     for event in events {
-        apply(&mut transcript, event, closed, &mut steps);
+        apply(&mut transcript, event, closed, &mut steps, &mut calls);
     }
     // The last entry may still be marked streaming, which would draw a cursor on a
     // finished conversation.
@@ -86,8 +93,15 @@ fn header(session: &Session) -> String {
 /// needs when it stopped early, and the live view has always said so — so a recording that
 /// stayed silent made a turn cut off at its budget read as a finished one, which is the same
 /// defect the live view was fixed for, one layer down. `steps` counts the steps of the turn
-/// being folded, for the notice that names them.
-fn apply(transcript: &mut Transcript, event: &SessionEvent, closed: bool, steps: &mut u32) {
+/// being folded, for the notice that names them, and `calls` is the id-to-name index the
+/// results are paired through.
+fn apply(
+    transcript: &mut Transcript,
+    event: &SessionEvent,
+    closed: bool,
+    steps: &mut u32,
+    calls: &mut BTreeMap<ToolCallId, String>,
+) {
     match event {
         SessionEvent::UserMessage { text } => {
             transcript.push(Entry::prose(Role::User, text.clone()));
@@ -118,19 +132,32 @@ fn apply(transcript: &mut Transcript, event: &SessionEvent, closed: bool, steps:
             }
         }
         SessionEvent::ToolCall {
-            name, arguments, ..
+            call_id,
+            name,
+            arguments,
         } => {
+            // Remembered under the id the result will name, which is the only thing that
+            // pairs the two: a step's calls are all written before any of its results, so
+            // position cannot.
+            calls.insert(call_id.clone(), name.as_str().to_owned());
             transcript.push(Entry::tool_call(
                 name.as_str().to_owned(),
                 render_arguments(arguments),
             ));
         }
         SessionEvent::ToolResult {
-            content, is_error, ..
+            call_id,
+            content,
+            is_error,
         } => {
-            // The result is paired with the call it answers by position, which is what
-            // the log guarantees: a result is appended immediately after its call.
-            let name = last_tool_name(transcript).unwrap_or_else(|| String::from("tool"));
+            // The name comes from the call this result *names*. Reaching for the last call
+            // in the transcript instead gave every result of a multi-call step the last
+            // call's name — which then made the interface draw the first call as still
+            // running, its output under the next tool, and the last result twice.
+            let name = calls
+                .get(call_id)
+                .cloned()
+                .unwrap_or_else(|| String::from("tool"));
             transcript.push(Entry::tool_result(name, *is_error, summarise(content)));
         }
         SessionEvent::TurnStart { .. } => *steps = 0,
@@ -149,18 +176,6 @@ fn render_arguments(arguments: &serde_json::Value) -> String {
     // Single-line and unwrapped: an entry's own rendering decides how to fit it, and a
     // pretty-printed object would occupy a screen per call.
     arguments.to_string()
-}
-
-/// Returns the name of the most recent tool call, for pairing a result with its call.
-fn last_tool_name(transcript: &Transcript) -> Option<String> {
-    transcript
-        .entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry.kind() {
-            crate::transcript::EntryKind::ToolCall { name, .. } => Some(name.clone()),
-            _ => None,
-        })
 }
 
 /// Shortens a tool result to something worth showing in a transcript.
@@ -299,6 +314,100 @@ mod tests {
             transcript.entries()[1].kind(),
             crate::transcript::EntryKind::ToolResult { name, is_error: false, .. } if name == "glob"
         ));
+    }
+
+    /// Every result of a multi-call step carries the name of the call it answers.
+    ///
+    /// A step writes all of its calls and then all of its results, in call order — so the
+    /// entry before a result is the *last* call of the batch, not the one that result
+    /// answers. Pairing by adjacency therefore gave the first call's output the second
+    /// call's name, which in the interface made the first call draw as still running
+    /// forever and the last result draw under a heading of its own.
+    #[test]
+    fn a_step_of_several_calls_pairs_every_result_with_its_own_call() {
+        let session = session_with(vec![
+            SessionEvent::ToolCall {
+                call_id: ToolCallId::new("c-read"),
+                name: name("read"),
+                arguments: json!({ "file_path": "a.rs" }),
+            },
+            SessionEvent::ToolCall {
+                call_id: ToolCallId::new("c-grep"),
+                name: name("grep"),
+                arguments: json!({ "pattern": "fn" }),
+            },
+            SessionEvent::ToolResult {
+                call_id: ToolCallId::new("c-read"),
+                content: "the read output".to_owned(),
+                is_error: false,
+            },
+            SessionEvent::ToolResult {
+                call_id: ToolCallId::new("c-grep"),
+                content: "the grep output".to_owned(),
+                is_error: false,
+            },
+        ]);
+        let transcript = transcript_of(&session);
+        let pairs: Vec<(String, String)> = transcript
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry.kind() {
+                crate::transcript::EntryKind::ToolResult { name, content, .. } => {
+                    Some((name.clone(), content.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (String::from("read"), String::from("the read output")),
+                (String::from("grep"), String::from("the grep output")),
+            ],
+            "each result is named by the call whose id it carries"
+        );
+    }
+
+    /// The other direction, and the reason the pairing cannot be positional: a result may
+    /// name a call that is not the one before it, including one from an earlier step.
+    #[test]
+    fn a_result_naming_an_earlier_call_is_named_by_that_call() {
+        let session = session_with(vec![
+            SessionEvent::ToolCall {
+                call_id: ToolCallId::new("c-first"),
+                name: name("glob"),
+                arguments: json!({ "pattern": "*.rs" }),
+            },
+            SessionEvent::ToolCall {
+                call_id: ToolCallId::new("c-second"),
+                name: name("read"),
+                arguments: json!({ "file_path": "a.rs" }),
+            },
+            SessionEvent::ToolResult {
+                call_id: ToolCallId::new("c-second"),
+                content: "read first".to_owned(),
+                is_error: false,
+            },
+            SessionEvent::ToolResult {
+                call_id: ToolCallId::new("c-first"),
+                content: "glob second".to_owned(),
+                is_error: false,
+            },
+        ]);
+        let transcript = transcript_of(&session);
+        let names: Vec<String> = transcript
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry.kind() {
+                crate::transcript::EntryKind::ToolResult { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![String::from("read"), String::from("glob")],
+            "a result is named by the call it names, whatever order they were written in"
+        );
     }
 
     #[test]

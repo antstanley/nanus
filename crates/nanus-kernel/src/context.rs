@@ -40,6 +40,28 @@ pub(crate) struct ContextInner {
     pub(crate) activations: u64,
     /// Guards against re-entrant activation sweeps.
     pub(crate) refreshing: bool,
+    /// Plugins whose bindings and effects are retired but not yet withdrawn.
+    ///
+    /// A deactivation happens *inside* a sweep, and its dependents are deactivated by
+    /// later iterations of that same sweep. Removing the deactivated plugin's bindings
+    /// where it is deactivated would therefore take them away from the dependents that
+    /// the removal is what makes stale — the one ordering this framework exists to get
+    /// right. So the withdrawal is parked here, the bindings are only *retired* (they
+    /// stop satisfying requirements but still resolve), and [`Context::refresh`] finishes
+    /// each one once the sweep has reached a fixed point: by then every plugin the
+    /// withdrawal caused to deactivate has already run its `unmount`.
+    pub(crate) withdrawals: Vec<Withdrawal>,
+}
+
+/// A deactivation waiting for the sweep it happened in to settle.
+pub(crate) struct Withdrawal {
+    /// The plugin being withdrawn.
+    pub(crate) id: PluginId,
+    /// Its effects, which are reverted at the fixed point rather than here.
+    pub(crate) disposer: Disposer,
+    /// The listener registrations its mount context made, retained so the fixed point
+    /// can unregister them exactly as an explicit unload does.
+    pub(crate) guards: Vec<Rc<EventGuard>>,
 }
 
 /// A plugin staged on a kernel but not yet mounted.
@@ -120,6 +142,7 @@ impl Context {
                 started: false,
                 activations: 0,
                 refreshing: false,
+                withdrawals: Vec::new(),
             })),
         }
     }
@@ -219,13 +242,15 @@ impl Context {
 
     /// Dispatches an event through `serial`, returning the first decision.
     ///
-    /// Every listener gets a turn until one returns `Some`.
+    /// Every listener gets a turn — including the ones after the first that decided — and the
+    /// first decision is what the caller receives. A listener that must not run once somebody
+    /// has decided is what [`bail`](Context::bail) is for.
     #[must_use]
     pub fn serial<K: 'static, R: 'static>(&self, key: EventKey<K>, payload: &K) -> Option<R> {
         self.inner.borrow().events.dispatch_serial(key, payload)
     }
 
-    /// Dispatches an event through `bail`, returning the first decision.
+    /// Dispatches an event through `bail`, stopping at the first decision.
     ///
     /// The chain stops at the first listener that returns `Some`, so a policy
     /// listener can own a decision outright.
@@ -335,17 +360,81 @@ impl Context {
             inner.refreshing = true;
         }
         let sweeps_max = self.inner().plugins.len().saturating_add(1);
-        for _ in 0..sweeps_max {
-            let activated = self.activate_ready();
-            let deactivated = self.deactivate_stale();
-            if !activated && !deactivated {
+        // Two nested loops, and the nesting is the ordering guarantee.
+        //
+        // The inner loop is the coeffect sweep, run to a fixed point with every deactivated
+        // plugin's bindings still *retired* rather than gone: retiring is what makes a
+        // dependent stale, so a whole cascade — however deep — is discovered and torn down
+        // while every binding it might still need is resolvable. Only once nothing is left
+        // to activate or deactivate is anything actually withdrawn, because *that* is the
+        // step that takes a capability away for good.
+        //
+        // Finishing a withdrawal can change what is stale or ready — a reverted effect may
+        // withdraw a service of its own — so the outer loop runs the sweep again. It is
+        // bounded because each round finishes at least one withdrawal and a plugin is parked
+        // at most once per round.
+        loop {
+            for _ in 0..sweeps_max {
+                let activated = self.activate_ready();
+                let deactivated = self.deactivate_stale();
+                if !activated && !deactivated {
+                    break;
+                }
+            }
+            if !self.finish_withdrawals() {
                 break;
             }
         }
         let mut inner = self.inner_mut();
         inner.refreshing = false;
+        // Postcondition: the sweep leaves nothing parked, so a parked withdrawal cannot
+        // outlive the sweep that made it and be finished by some later, unrelated one.
+        assert!(
+            inner.withdrawals.is_empty(),
+            "a finished sweep has no withdrawal left to complete"
+        );
         drop(inner);
         self.report_pending();
+    }
+
+    /// Reverts the effects of every plugin deactivated since the last pass and withdraws
+    /// what they published.
+    ///
+    /// Returns whether anything was finished, which is what makes the caller sweep again.
+    ///
+    /// The order inside one withdrawal is the same one [`Context::unload`] uses — effects
+    /// first, then the name- and owner-scoped removal — and it is done here rather than
+    /// where the plugin was deactivated because *this* is the point at which the unbinding
+    /// can no longer take a capability away from a dependent that has not finished with it.
+    fn finish_withdrawals(&self) -> bool {
+        let parked: Vec<Withdrawal> = {
+            let mut inner = self.inner_mut();
+            core::mem::take(&mut inner.withdrawals)
+        };
+        if parked.is_empty() {
+            return false;
+        }
+        for withdrawal in parked {
+            let id = withdrawal.id;
+            let mut disposer = withdrawal.disposer;
+            let guards = withdrawal.guards;
+            let registered: Vec<ServiceName> = guards.iter().map(|guard| guard.key()).collect();
+            if let Err(error) = disposer.revert(self) {
+                tracing::warn!(plugin = %id, error = %error, "deactivation reverted incompletely");
+            }
+            self.inner_mut().services.remove_owned_by(id);
+            {
+                let inner = self.inner();
+                for name in registered {
+                    inner.events.remove_named(name, id);
+                }
+            }
+            // Dropped after the named removal, so the guards' own unregistration finds
+            // nothing left to do rather than racing it.
+            drop(guards);
+            tracing::debug!(plugin = %id, "deactivation finished and its services withdrawn");
+        }
+        true
     }
 
     /// Records which requirements are currently unmet, for diagnostics.
@@ -404,28 +493,37 @@ impl Context {
         let deactivated = !stale.is_empty();
         for id in stale {
             tracing::debug!(plugin = %id, "requirements withdrawn, deactivating");
-            // The plugin is removed from the active set either way, so a revert
-            // failure is reported and the sweep continues rather than aborting.
-            if let Err(error) = self.unload_deferred(id) {
-                tracing::warn!(plugin = %id, error = %error, "deactivation reverted incompletely");
-            }
+            self.unload_deferred(id);
         }
         deactivated
     }
 
-    /// Unloads a plugin without triggering a nested sweep.
+    /// Deactivates a plugin without triggering a nested sweep.
     ///
-    /// [`refresh`](Context::refresh) is already sweeping, and its own
-    /// re-entrancy guard would swallow the nested call; doing the work inline
-    /// keeps the outer loop's bookkeeping correct.
-    fn unload_deferred(&self, id: PluginId) -> Result<(), Error> {
+    /// [`refresh`](Context::refresh) is already sweeping, and its own re-entrancy guard
+    /// would swallow the nested call; doing the work inline keeps the outer loop's
+    /// bookkeeping correct.
+    ///
+    /// What "inline" means is the *beginning* of a teardown rather than the whole of it.
+    /// The plugin's bindings are retired and its `unmount` runs — both of which have to
+    /// happen while the thing it borrowed still resolves — and its effects are then parked
+    /// on the sweep instead of being reverted here, because reverting them is what takes
+    /// the bindings away and the sweep has not yet visited the dependents that removal is
+    /// what makes stale. [`Context::finish_withdrawals`] completes it at the fixed point,
+    /// which is the same ordering [`Context::unload`] gets by retiring first and reverting
+    /// last.
+    fn unload_deferred(&self, id: PluginId) {
         let mut record = {
             let mut inner = self.inner_mut();
             match inner.plugins.iter().position(|record| record.id == id) {
                 Some(index) => inner.plugins.remove(index),
-                None => return Ok(()),
+                None => return,
             }
         };
+        // Retired before the `unmount`, so the plugin's own teardown — and every dependent's
+        // teardown that follows in this sweep — still resolves what it borrowed from the
+        // thing going away, while nothing new can be satisfied by it.
+        self.inner().services.retire_owned_by(id);
         let outcome = {
             let mut borrowed = record.plugin.borrow_mut();
             crate::runtime::block_on(borrowed.unmount(self))
@@ -433,26 +531,17 @@ impl Context {
         if let Err(error) = outcome {
             tracing::warn!(plugin = %id, error = %error, "unmount hook failed");
         }
-        let registered: Vec<ServiceName> = record
-            .guards
-            .borrow()
-            .iter()
-            .map(|guard| guard.key())
-            .collect();
-        self.inner_mut().services.remove_owned_by(id);
-        {
-            let inner = self.inner();
-            for name in registered {
-                inner.events.remove_named(name, id);
-            }
-        }
-        record.guards.borrow_mut().clear();
-        let revert = record.disposer.revert(self);
+        let guards = core::mem::take(&mut *record.guards.borrow_mut());
+        let disposer = core::mem::take(&mut record.disposer);
         record.state = PluginState::Pending;
-        self.inner_mut().plugins.push(record);
-        match revert {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error),
+        {
+            let mut inner = self.inner_mut();
+            inner.withdrawals.push(Withdrawal {
+                id,
+                disposer,
+                guards,
+            });
+            inner.plugins.push(record);
         }
     }
 

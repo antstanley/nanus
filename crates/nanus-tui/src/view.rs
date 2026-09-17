@@ -307,6 +307,97 @@ fn indented(text: &str, depth: usize, style: Style) -> Vec<Line<'static>> {
 /// The separator between two readings on the stats row.
 const STATS_SEPARATOR: &str = "  \u{b7}  ";
 
+/// Which call each result answers, and which result answers each call.
+///
+/// The pairing cannot be positional. A step writes — or sends — every call it made and only
+/// then every result, so the entry before a result is the *last* call of the batch rather
+/// than the one that result answers. Reading it that way made a step of two or more calls
+/// draw every call as still running and every result as a block of its own with a redundant
+/// name on it, which is precisely the state the compact form's mark exists to avoid.
+///
+/// Nor is the call's id available here: the link carries a tool's *name*, and a transcript
+/// entry does not hold an id even in the recorded path, where the log does have one. So the
+/// pairing is by name and then by order: the k-th result named `read` answers the k-th call
+/// named `read`. That is exact rather than a guess — the agent loop records a step's results
+/// in call order, so the k-th result of a name is the k-th call of it, whether the two names
+/// alternate or repeat.
+struct Pairing {
+    /// For each entry, the index of the call it answers or of the result that answers it.
+    partner: Vec<Option<usize>>,
+}
+
+impl Pairing {
+    /// Pairs every result with a call, by name and by order.
+    fn of(entries: &[Entry]) -> Self {
+        let mut partner: Vec<Option<usize>> = vec![None; entries.len()];
+        // Each call is available at most once: two calls to `read` in one step need two
+        // results to answer them, and a third result named `read` is an orphan.
+        let mut taken: Vec<bool> = vec![false; entries.len()];
+        let calls: Vec<(usize, &str)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry.kind() {
+                EntryKind::ToolCall { name, .. } => Some((index, name.as_str())),
+                _ => None,
+            })
+            .collect();
+        for (result, entry) in entries.iter().enumerate() {
+            let EntryKind::ToolResult { name, .. } = entry.kind() else {
+                continue;
+            };
+            let matched = calls
+                .iter()
+                .position(|(call, call_name)| !taken[*call] && call_name == name);
+            let Some(position) = matched else {
+                continue;
+            };
+            let (call, _) = calls[position];
+            taken[call] = true;
+            partner[call] = Some(result);
+            partner[result] = Some(call);
+        }
+        Self { partner }
+    }
+
+    /// Returns how the call at `index` ended, as far as the transcript knows.
+    ///
+    /// A call with no result is still running, which is a state the line has to be able to
+    /// show: a call that looked finished while it was running would be a worse lie than a
+    /// missing mark.
+    fn state_of_call(&self, entries: &[Entry], index: usize) -> compact::ToolState {
+        let Some(result) = self.partner.get(index).copied().flatten() else {
+            return compact::ToolState::Running;
+        };
+        match entries.get(result).map(Entry::kind) {
+            Some(EntryKind::ToolResult { is_error, .. }) => {
+                if *is_error {
+                    compact::ToolState::Failed
+                } else {
+                    compact::ToolState::Ok
+                }
+            }
+            // A call's partner is a result by construction; anything else is not a state to
+            // invent, so the line stays honest and says the call is still running.
+            _ => compact::ToolState::Running,
+        }
+    }
+
+    /// Returns whether the entry at `index` is the result of a call it has been paired with.
+    ///
+    /// The other half of [`Pairing::state_of_call`]: this is the result asking whether its
+    /// mark is already on the call's line, so that it does not draw a second one. A call
+    /// always precedes the result that answers it, so a partner *earlier* than this entry is
+    /// what makes the entry a result rather than a call; an orphan result has no partner and
+    /// draws itself.
+    fn answers_a_call(&self, index: usize) -> bool {
+        self.partner
+            .get(index)
+            .copied()
+            .flatten()
+            .is_some_and(|call| call < index)
+    }
+}
+
 impl ViewState {
     /// Creates an empty view.
     #[must_use]
@@ -783,6 +874,10 @@ impl ViewState {
     pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let entries = self.transcript.entries();
+        // Which call each result answers and which result answers each call, worked out once
+        // for the whole transcript rather than asked of the entry above: a step's calls and its
+        // results do not interleave, so adjacency cannot pair them.
+        let pairing = Pairing::of(entries);
         let mut index = 0;
         while let Some(entry) = entries.get(index) {
             // A *run* is what gets summarised, not each entry: six tool calls in a row
@@ -810,7 +905,7 @@ impl ViewState {
             // [`Detail::Full`].
             if self.detail == Detail::Compact {
                 if let EntryKind::ToolCall { name, arguments } = entry.kind() {
-                    let state = Self::tool_state(entries, index, name);
+                    let state = pairing.state_of_call(entries, index);
                     lines.push(self.compact_tool_line(state, name, arguments, width));
                     index = index.saturating_add(1);
                     continue;
@@ -819,7 +914,7 @@ impl ViewState {
                 // contributes only what the tool *said*. In the live view it says nothing
                 // — the frame has no room for output — and the call is then exactly the one
                 // line the compact form promises.
-                if Self::answers_call_before(entries, index) {
+                if pairing.answers_a_call(index) {
                     let EntryKind::ToolResult { content, .. } = entry.kind() else {
                         unreachable!("only a result answers a call")
                     };
@@ -848,51 +943,6 @@ impl ViewState {
             index = index.saturating_add(1);
         }
         lines
-    }
-
-    /// Returns how the call at `index` ended, as far as the transcript knows.
-    ///
-    /// Adjacency is the pairing: a result is appended immediately after the call it
-    /// answers, which is what the session log guarantees by construction and what the link
-    /// does by sending one `Tool` and then one `ToolDone`. A call with no result after it
-    /// is still running, which is a state the line has to be able to show — a call that
-    /// looked finished while it was running would be a worse lie than a missing mark.
-    fn tool_state(entries: &[Entry], index: usize, name: &str) -> compact::ToolState {
-        let result = entries.get(index.saturating_add(1)).map(Entry::kind);
-        match result {
-            Some(EntryKind::ToolResult {
-                name: result_name,
-                is_error,
-                ..
-            }) if result_name == name => {
-                if *is_error {
-                    compact::ToolState::Failed
-                } else {
-                    compact::ToolState::Ok
-                }
-            }
-            _ => compact::ToolState::Running,
-        }
-    }
-
-    /// Returns whether the entry at `index` is the result of the call before it.
-    ///
-    /// The other half of [`ViewState::tool_state`]: this is the result asking whether its
-    /// mark is already on the line above, so that it does not draw a second one.
-    fn answers_call_before(entries: &[Entry], index: usize) -> bool {
-        let Some(previous) = index
-            .checked_sub(1)
-            .and_then(|previous| entries.get(previous))
-        else {
-            return false;
-        };
-        match (previous.kind(), entries.get(index).map(Entry::kind)) {
-            (
-                EntryKind::ToolCall { name: call, .. },
-                Some(EntryKind::ToolResult { name: result, .. }),
-            ) => call == result,
-            _ => false,
-        }
     }
 
     /// Counts the entries from `start` that carry `role`, consecutively.
@@ -3212,5 +3262,155 @@ mod markdown_tests {
         ));
         let rendered = text(&state, 60);
         assert!(rendered.contains("not a diagram"), "{rendered}");
+    }
+}
+
+/// A step's calls and results are drawn as pairs, however many the step made.
+///
+/// This is the shape a reader sees, and it is worth pinning here rather than only in the
+/// pairing's own terms: the failure it guards against — two calls that never finish, each
+/// with a redundant name line under it — looked like a rendering bug and was a pairing one.
+#[cfg(test)]
+mod multi_call_step_tests {
+    use super::*;
+
+    /// Draws a transcript and returns its non-empty rows.
+    fn rows(state: &ViewState) -> Vec<String> {
+        state
+            .transcript_lines(100)
+            .iter()
+            .map(ToString::to_string)
+            .map(|line| line.trim_end().to_owned())
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    }
+
+    /// The live shape: the calls arrive first, then a result carrying no output at all.
+    #[test]
+    fn a_live_step_of_two_calls_marks_each_call_and_adds_no_line_of_its_own() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::tool_call(
+            "read",
+            r#"{"file_path":"a.rs"}"#.to_owned(),
+        ));
+        state
+            .transcript
+            .push(Entry::tool_call("grep", r#"{"pattern":"fn"}"#.to_owned()));
+        state.transcript.push(Entry::tool_result("read", false, ""));
+        state.transcript.push(Entry::tool_result("grep", false, ""));
+
+        assert_eq!(
+            rows(&state),
+            vec!["✓ Read File · a.rs", "✓ Grep · fn"],
+            "each call is one line, marked with its own outcome"
+        );
+    }
+
+    /// The recorded shape: the results carry what the tools said.
+    #[test]
+    fn a_recorded_step_of_two_calls_draws_each_output_under_its_own_call() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::tool_call(
+            "read",
+            r#"{"file_path":"a.rs"}"#.to_owned(),
+        ));
+        state
+            .transcript
+            .push(Entry::tool_call("grep", r#"{"pattern":"fn"}"#.to_owned()));
+        state
+            .transcript
+            .push(Entry::tool_result("read", false, "THE-READ-OUTPUT"));
+        state
+            .transcript
+            .push(Entry::tool_result("grep", false, "THE-GREP-OUTPUT"));
+
+        // The calls are drawn first and their outputs after, because that is the order the
+        // log records them in and the fold invents nothing: what the mark adds is the
+        // *outcome* of each call, which position alone could never say.
+        assert_eq!(
+            rows(&state),
+            vec![
+                "✓ Read File · a.rs",
+                "✓ Grep · fn",
+                "  THE-READ-OUTPUT",
+                "  THE-GREP-OUTPUT",
+            ],
+            "each call is marked, and each output is drawn exactly once"
+        );
+    }
+
+    /// A failure marks its own call rather than the next one, which is what a reader
+    /// scanning for the thing that broke depends on.
+    #[test]
+    fn a_failed_call_is_marked_where_it_is() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::tool_call(
+            "read",
+            r#"{"file_path":"a.rs"}"#.to_owned(),
+        ));
+        state
+            .transcript
+            .push(Entry::tool_call("grep", r#"{"pattern":"fn"}"#.to_owned()));
+        state
+            .transcript
+            .push(Entry::tool_result("read", false, "read fine"));
+        state
+            .transcript
+            .push(Entry::tool_result("grep", true, "grep broke"));
+
+        let drawn = rows(&state).join("\n");
+        assert!(drawn.contains("✓ Read File · a.rs"), "{drawn}");
+        assert!(drawn.contains("✗ Grep · fn"), "{drawn}");
+    }
+
+    /// Two calls to the same tool in one step each answer their own call, in order.
+    #[test]
+    fn two_calls_to_one_tool_are_paired_in_order() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::tool_call(
+            "read",
+            r#"{"file_path":"a.rs"}"#.to_owned(),
+        ));
+        state.transcript.push(Entry::tool_call(
+            "read",
+            r#"{"file_path":"b.rs"}"#.to_owned(),
+        ));
+        state
+            .transcript
+            .push(Entry::tool_result("read", false, "first file"));
+        state
+            .transcript
+            .push(Entry::tool_result("read", true, "second file"));
+
+        assert_eq!(
+            rows(&state),
+            vec![
+                "✓ Read File · a.rs",
+                "✗ Read File · b.rs",
+                "  first file",
+                "  second file",
+            ],
+            "the k-th result of a name answers the k-th call of it, so the first succeeded and the second failed"
+        );
+    }
+
+    /// A call nothing answered still says it is running, and a result nothing called still
+    /// draws itself: the two orphan directions must not be paired with each other.
+    #[test]
+    fn an_unanswered_call_and_an_uncalled_result_are_both_shown() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::tool_call(
+            "read",
+            r#"{"file_path":"a.rs"}"#.to_owned(),
+        ));
+        state
+            .transcript
+            .push(Entry::tool_result("grep", false, "nobody called grep"));
+
+        assert_eq!(
+            rows(&state),
+            vec!["⚙ Read File · a.rs", "✓ grep", "  nobody called grep"],
+            "a call with no result is running, and a result with no call draws itself"
+        );
     }
 }

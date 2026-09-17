@@ -81,15 +81,14 @@ async fn glob_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
     if pattern.trim().is_empty() {
         return ToolResult::new(id, ToolOutcome::failure("glob: the pattern is empty"));
     }
-    let root = arguments
-        .optional_str("path")
-        .unwrap_or(None)
-        .unwrap_or_else(|| ".".to_owned());
-    let limit = arguments
-        .optional_u32("limit")
-        .unwrap_or(None)
-        .unwrap_or(DEFAULT_MATCH_LIMIT)
-        .min(MAX_MATCH_LIMIT);
+    let root = match arguments.optional_str("path") {
+        Ok(root) => root.unwrap_or_else(|| ".".to_owned()),
+        Err(failure) => return ToolResult::new(id, failure),
+    };
+    let limit = match arguments.optional_u32("limit") {
+        Ok(limit) => limit.unwrap_or(DEFAULT_MATCH_LIMIT).min(MAX_MATCH_LIMIT),
+        Err(failure) => return ToolResult::new(id, failure),
+    };
     // A cap of zero is refused rather than reinterpreted, for the same reason `read`
     // refuses one: it is a nonsense request, and the adapter's `SearchQuery` has a
     // precondition that the cap is positive.
@@ -151,6 +150,36 @@ pub fn render_matches(paths: &[String], truncated: bool, limit: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanus_domain::{ToolCall, ToolCallId};
+    use nanus_ports::FsPort;
+
+    fn glob_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall::new(
+            ToolCallId::new("c-glob"),
+            ToolName::new("glob").unwrap_or_else(|_| unreachable!("glob is valid")),
+            arguments,
+        )
+    }
+
+    /// A wrongly typed optional argument is refused, not folded into its default.
+    #[tokio::test]
+    async fn a_wrongly_typed_filter_is_reported_rather_than_defaulted() {
+        let port: Box<dyn FsPort> = Box::new(crate::tests_support::UnusedFs);
+        let tool = glob_tool(std::rc::Rc::new(port));
+        for arguments in [
+            json!({ "pattern": "*.rs", "limit": "many" }),
+            json!({ "pattern": "*.rs", "path": 7 }),
+        ] {
+            let result = tool.execute(glob_call(arguments.clone())).await;
+            let ToolOutcome::Failure { message, .. } = &result.outcome else {
+                panic!("{arguments} must be refused: {:?}", result.outcome);
+            };
+            assert!(
+                message.contains("limit") || message.contains("path"),
+                "{message}"
+            );
+        }
+    }
 
     #[test]
     fn an_empty_result_says_so() {

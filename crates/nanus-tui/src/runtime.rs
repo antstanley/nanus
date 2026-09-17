@@ -751,17 +751,29 @@ async fn event_loop(
                         view.status = String::from("stopping");
                         source.interrupt();
                     }
-                    Outcome::Answer { call_id, allow } => {
+                    Outcome::Answer {
+                        call_id,
+                        allow,
+                        stop,
+                    } => {
                         // Cleared before the answer is sent, so a reader cannot press `y`
                         // twice and have the second press land on whatever question comes
                         // next — answers are keyed by id, but the dialog is not.
                         view.pending_approval = None;
-                        view.status = if allow {
-                            String::from("allowed once; the turn is running")
-                        } else {
-                            String::from("denied; the model is told")
-                        };
+                        // The answer is sent first, because it is what the turn is waiting
+                        // for: the stop it may also be asking for is read at the turn's next
+                        // checkpoint, which it cannot reach until the question is settled.
                         source.answer(&call_id, allow);
+                        if stop {
+                            view.status = String::from("denied; stopping the turn");
+                            source.interrupt();
+                        } else {
+                            view.status = if allow {
+                                String::from("allowed once; the turn is running")
+                            } else {
+                                String::from("denied; the model is told")
+                            };
+                        }
                     }
                     Outcome::Submit(prompt) => {
                         match route_submission(prompt, source.accepts_prompts()) {
@@ -866,6 +878,13 @@ enum Outcome {
         call_id: String,
         /// Whether it may run once.
         allow: bool,
+        /// Whether the reader also asked for the turn to stop.
+        ///
+        /// True for `Ctrl-C` alone. The key a reader reaches for when they want everything to
+        /// stop must not be the one key that does nothing here: the turn is parked inside the
+        /// question, so without asking for the stop as well, answering would be the only way
+        /// out and the reader would have to press the key again afterwards.
+        stop: bool,
     },
 }
 
@@ -895,19 +914,32 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 /// `y` allows the call once, and `n` or `Esc` denies it. Nothing else does anything: a
 /// stray keypress must not approve a command, and it must not close the question either,
 /// so the one key a reader has to get right is `y`.
+///
+/// The exception is `Ctrl-C`, which means "stop everything" everywhere else in this
+/// interface and means it here too: it denies the call *and* asks the turn to stop. The turn
+/// is waiting on this answer, so a key that only set a flag would appear to do nothing —
+/// which is exactly what it used to do.
 fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
     let Some(approval) = view.pending_approval.as_ref() else {
         return Outcome::Continue;
     };
     let call_id = approval.call_id.clone();
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char('y' | 'Y') => Outcome::Answer {
             call_id,
             allow: true,
+            stop: false,
+        },
+        KeyCode::Char('c' | 'C') if control => Outcome::Answer {
+            call_id,
+            allow: false,
+            stop: true,
         },
         KeyCode::Char('n' | 'N') | KeyCode::Esc => Outcome::Answer {
             call_id,
             allow: false,
+            stop: false,
         },
         _ => Outcome::Continue,
     }
@@ -2581,10 +2613,15 @@ mod tests {
 
         assert!(matches!(
             handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
-            Outcome::Answer { call_id, allow: true } if call_id == "a1"
+            Outcome::Answer {
+                call_id,
+                allow: true,
+                stop: false
+            } if call_id == "a1"
         ));
 
-        // The denial keys, in the other direction.
+        // The denial keys, in the other direction. `Esc` and `n` deny the call and leave the
+        // turn running.
         view.pending_approval = Some(PendingApproval {
             call_id: "a2".to_owned(),
             tool: "write".to_owned(),
@@ -2592,11 +2629,37 @@ mod tests {
         });
         assert!(matches!(
             handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
-            Outcome::Answer { call_id, allow: false } if call_id == "a2"
+            Outcome::Answer {
+                call_id,
+                allow: false,
+                stop: false
+            } if call_id == "a2"
         ));
         assert!(matches!(
             handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE), &mut view),
-            Outcome::Answer { call_id, allow: false } if call_id == "a2"
+            Outcome::Answer {
+                call_id,
+                allow: false,
+                stop: false
+            } if call_id == "a2"
+        ));
+
+        // And `Ctrl-C`: the whole of stopping, from a question. It denies the call *and*
+        // asks for the turn to stop, because the turn is asleep on this answer and a stop
+        // flag alone would not reach it.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Answer {
+                call_id,
+                allow: false,
+                stop: true
+            } if call_id == "a2"
+        ));
+        // The other direction: a bare `c` is not a Ctrl-C, so it approves nothing and stops
+        // nothing — the question stays open for a real answer.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE), &mut view),
+            Outcome::Continue
         ));
     }
 

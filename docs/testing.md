@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [3.0s] 773 tests run: 773 passed, 0 skipped
+Summary [5.2s] 915 tests run: 915 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
@@ -143,6 +143,70 @@ The lesson both times was the same, and it is about tests rather than code: a re
 test is only a regression test if it fails against the code it was written for. Each of
 these was checked by reverting the fix and watching the test fail — and two of the four
 did not, which is how the tests got rewritten.
+
+
+## The bugs a certificate review found
+
+A later pass over the whole tree — every crate read in dependency order, then each finding
+confirmed by running something — turned up six more. What they have in common is that they
+are all *cross-scope*: each one is a disagreement between two parts that are individually
+correct and individually tested.
+
+**A deactivation cascade could not hand its own binding back.** Unloading a provider retires
+its bindings and reverts its effects only after the sweep, so a consumer that required them
+still resolves them while it is being torn down — the ordering the first review fixed. But a
+consumer that *also provides* something had its own binding removed the moment it was
+deactivated, and the sweep only reached the plugin that required it on the next pass. So in
+a chain of three, the far end's `unmount` resolved nothing. The fix is the same discipline
+one level up: a deactivation retires and parks, the sweep runs to a fixed point with every
+binding still resolvable, and only then is anything withdrawn — a withdrawal waits for the
+deactivations it causes, at any depth. The suite could not see it because every fixture in
+`nanus-kernel/tests/composition.rs` was a *pair*: no test had a plugin that both requires and
+provides, so no test had a cascade. There is a three-plugin chain now, and it fails against
+the old kernel.
+
+**A tool result was paired with the wrong call.** A step writes every call it made and then
+every result, so the entry before a result is the last call of the batch rather than the one
+it answers. The recorded transcript therefore labelled a result with the *next* call's name —
+which is not cosmetic: the interface pairs a result with the call above it, so a two-call
+step drew the first call as still running, drew its output under the second tool, and drew
+the last result twice. The log had the answer all along in `call_id`, which nothing used.
+The replay now pairs by id; the view pairs by name and order, because the link carries names
+rather than ids; and both are tested against a two-call step, since a one-call step cannot
+tell either of them apart.
+
+**`bash` ran in the wrong directory.** The tool's schema says its working directory defaults
+to the workspace root, and the system prompt repeats it. It sent no working directory at all,
+so the child inherited the *process's* — identical while the workspace root is unset, and
+different the moment it is configured, which is also the whole of the difference for a
+service. Every test ran with the two the same.
+
+**The agent advertised a toolset it could not dispatch.** The runner was built over one
+`ToolRegistry` and the plugin published a second, both built from the same ports. Nothing
+looked wrong until something registered an eighth tool: the count in the handshake — what
+`nanus service status` prints — went up, and the schemas on the next request did not.
+`compose` now builds one registry and hands the same handle to the runner and to the
+publisher, and the invariant is a `ptr_eq` postcondition in `Pending::start` rather than a
+comment.
+
+**Every tool discarded the correction it had just built.** `Arguments` exists so a malformed
+call becomes a message the model can act on, and it says so in its own documentation — but
+every caller read an optional field with `unwrap_or(None)`, so `{"limit": "ten"}` quietly
+meant the default and the model learned nothing. The `finish` helper written for this was
+dead code, used only by its own test. The reads propagate their failures now, and `finish` and
+`result_of` are gone rather than left as a shape nobody adopted.
+
+**Two dispatch modes were one function.** `Context::serial` and `Context::bail` shared a body,
+so both stopped at the first decision while three doc comments promised that `serial` gives
+every listener a turn. They differ now, and the test that claimed to compare them actually
+calls both.
+
+Three smaller ones, recorded because they are the same kind of thing: `Ctrl+C` at an approval
+prompt did nothing (the turn is asleep on the answer, so the stop flag never reached its
+checkpoint — the key now denies the call *and* asks for the stop), `--scroll` without
+`--session` was accepted and ignored, and a capped search reported `truncated` whenever the
+cap was *reached* rather than when a match was dropped, which is a confident falsehood a
+model cannot check.
 
 ## The bug a terminal found
 

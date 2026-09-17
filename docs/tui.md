@@ -180,6 +180,7 @@ second set. Where it does not, the divergence is named rather than papered over.
 | Key | Effect |
 |---|---|
 | `y` / `n` (or `Esc`) | while an approval dialog is up: allow the call once, or deny it |
+| `Ctrl+C` | while an approval dialog is up: deny it *and* stop the turn |
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
@@ -199,11 +200,13 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `PageUp` / `PageDown` | scroll back and forward through the conversation |
 | `Left` / `Right`, `Home` / `End` | move the cursor |
 
-**While an approval dialog is up, `y` and `n` are the only keys that do anything.** The
-dialog is drawn over the interface, names the tool and the harness's reason, and `y` allows
-that one call while `n` or `Esc` denies it; every other key is swallowed, so a stray
-keypress cannot approve a command. The status line says what is being waited for, and the
-dialog closes when the turn ends — an answer cannot outlive the question.
+**While an approval dialog is up, three answers are possible and every other key is
+swallowed.** The dialog is drawn over the interface, names the tool and the harness's reason,
+and `y` allows that one call, `n` or `Esc` denies it, and `Ctrl+C` denies it *and* asks the
+turn to stop — because the turn is asleep on this answer, so the key that means "stop
+everything" everywhere else would otherwise do nothing at all here. A stray keypress cannot
+approve a command. The status line says what is being waited for, and the dialog closes when
+the turn ends — an answer cannot outlive the question.
 
 **`Ctrl+R` searches the history** rather than toggling anything, because that is what it is
 in every interface that has one — including the one these bindings are modelled on, where

@@ -115,6 +115,14 @@ impl fmt::Display for ToolAccess {
 }
 
 /// What a tool call may touch.
+///
+/// Two questions are answered together here, and they are not the same one: whether a call
+/// needs an exception (`permits`), and whether a *working directory* may lie outside the
+/// workspace root. The second is the shell's business alone — a program is unconfined once it
+/// starts, so the only thing a sandbox mode can decide about one is where it is asked to
+/// begin. The filesystem tools are rooted at the workspace root in every mode, because that
+/// root is the filesystem port's own boundary rather than a setting: `danger_full_access`
+/// lifts the *question*, not the root.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -125,7 +133,8 @@ pub enum SandboxMode {
     ReadOnly,
     /// Writes are confined to the workspace root.
     WorkspaceWrite,
-    /// No confinement. Only ever selected explicitly by a human.
+    /// Every call is permitted, and no working directory is confined. Only ever selected
+    /// explicitly by a human.
     DangerFullAccess,
 }
 

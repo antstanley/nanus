@@ -1335,7 +1335,7 @@ mod tests {
         let config = AgentConfig::new(4, 1, "silent", 4096).expect("a valid config");
         let runner = AgentRunner::new(
             Rc::new(Box::new(SilentLlm)),
-            Rc::new(ToolRegistry::new()),
+            nanus_bundle::ToolRegistryHandle::new(ToolRegistry::new()),
             "a test",
             config,
         )

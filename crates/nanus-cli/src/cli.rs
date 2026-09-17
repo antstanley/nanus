@@ -558,6 +558,14 @@ async fn prepare_tui(
     name: Option<String>,
 ) -> Result<Ready, String> {
     let config = load(args)?;
+    // `--scroll` addresses a recorded transcript, and a live conversation has nothing to open
+    // part way into. Refused rather than ignored: a reader who asked to open fifty rows back
+    // and got the bottom of the conversation has been told something untrue by silence.
+    if scroll > 0 && session.is_none() {
+        return Err(String::from(
+            "--scroll opens a recorded session part way back, so it needs --session",
+        ));
+    }
     // Reading a transcript needs no agent and no key, so that mode stops here.
     if let Some(id) = session {
         let mut arguments: Vec<OsString> = vec![OsString::from("--session")];
@@ -665,13 +673,39 @@ async fn prepare_service(args: &Options, action: ServiceAction) -> Result<Ready,
 /// Resolves when the signal arrives, or immediately when it cannot be watched for at all — a
 /// platform without the signal, in which case the turn simply runs to completion as it did
 /// before. Nothing here prints: what the reader sees is the turn's own ending.
-async fn watch_for_interrupt(stop: Rc<Cell<bool>>) {
+async fn watch_for_interrupt(stop: Rc<Stop>) {
     use tokio::signal::unix::{SignalKind, signal};
     let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
         return;
     };
     interrupt.recv().await;
-    stop.set(true);
+    stop.raise();
+}
+
+/// The interrupt a headless run watches for.
+///
+/// Two shapes of one fact, because two things wait on it differently: the turn *polls* it
+/// between steps and between tokens, which is a `Cell`, and an open approval question is
+/// *asleep* in a blocking read, which needs a wake-up. Both are raised together so the key
+/// means one thing.
+#[derive(Default)]
+struct Stop {
+    /// Polled by the turn through its reporter.
+    raised: Rc<Cell<bool>>,
+    /// Woken by the interrupt, so a question in progress is abandoned rather than answered.
+    woken: Rc<tokio::sync::Notify>,
+}
+
+impl Stop {
+    /// Raises the stop: the turn learns at its next checkpoint, and a question that is open
+    /// right now stops waiting for an answer nobody is going to give.
+    fn raise(&self) {
+        self.raised.set(true);
+        // `notify_one` rather than `notify_waiters`: a permit is stored if nobody is
+        // waiting yet, so an interrupt that arrives a moment before the question opens is
+        // not lost.
+        self.woken.notify_one();
+    }
 }
 
 /// Mounts a harness and runs one turn, synchronously.
@@ -697,12 +731,15 @@ fn run_turn(
     // A headless run is the one mode with no interface to press a key in, so the interrupt is
     // watched for here and handed to the turn through its reporter: it stops at the next
     // checkpoint, the session is recorded, and the exit code says the turn did not complete.
-    let interrupted = Rc::new(Cell::new(false));
-    let mut reporter = StderrProgress::new(verbose, verbose).stopping_when(Rc::clone(&interrupted));
+    let stop = Rc::new(Stop::default());
+    let mut reporter = StderrProgress::new(verbose, verbose).stopping_when(Rc::clone(&stop.raised));
     // A headless run is the one mode with no interface to press a key in, so the approval
     // gate asks *here*. With no terminal on stdin there is nobody to ask, and the loop
-    // denies what the sandbox does not already permit rather than proceeding unasked.
-    let approver = crate::approve::TerminalApprover::standard();
+    // denies what the sandbox does not already permit rather than proceeding unasked. An
+    // interrupt abandons a question that is open, so `Ctrl-C` stops a run that is waiting to
+    // be asked something rather than having to be answered first.
+    let approver =
+        crate::approve::TerminalApprover::standard().abandoned_when(Rc::clone(&stop.woken));
 
     let outcome = crate::block_on_local(async {
         // The watcher is a task of its own rather than half of a `join!`. Joining made the
@@ -710,7 +747,7 @@ fn run_turn(
         // `nanus run` printed nothing and exited only after a Ctrl-C, which is not a
         // behaviour anyone could mistake for a long model call. The turn is the thing being
         // awaited; the watcher exists to set the flag the turn reads at its next checkpoint.
-        tokio::task::spawn_local(watch_for_interrupt(Rc::clone(&interrupted)));
+        tokio::task::spawn_local(watch_for_interrupt(Rc::clone(&stop)));
         harness
             .runner
             .run_turn(&mut session, prompt, &mut reporter, Some(&approver))
@@ -1148,6 +1185,32 @@ mod tests {
         };
         assert_eq!(session, Some(None));
         assert_eq!(scroll, 50);
+    }
+
+    /// A scroll offset is meaningless without a recording, and the parser is not the place to
+    /// decide it: `--scroll` has a default, so clap cannot tell "not given" from "given as
+    /// zero". The refusal is therefore in the mode's own preparation.
+    #[tokio::test]
+    async fn scrolling_without_a_session_is_refused() {
+        // `/definitely/not/a/directory` would fail for a different reason, so the refusal is
+        // asserted on the message rather than on the error being present.
+        let refused = prepare_tui(
+            &Options {
+                verbose: false,
+                config: None,
+            },
+            None,
+            50,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+        match refused {
+            Err(message) => assert!(message.contains("--scroll"), "{message}"),
+            Ok(_) => panic!("a scroll offset without --session must be refused"),
+        }
     }
 
     #[test]

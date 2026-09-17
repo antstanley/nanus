@@ -10,7 +10,7 @@
 //! The reported message is deliberately specific: it is the model's only signal
 //! about how to fix its call, and "invalid arguments" teaches it nothing.
 
-use nanus_domain::{ToolOutcome, ToolResult};
+use nanus_domain::ToolOutcome;
 use serde_json::Value;
 
 /// The arguments of one call, with typed accessors.
@@ -139,31 +139,8 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
-/// Wraps an outcome as the result of a call.
-#[must_use]
-pub fn result_of(call_id: nanus_domain::ToolCallId, outcome: ToolOutcome) -> ToolResult {
-    ToolResult::new(call_id, outcome)
-}
-
-/// Unwraps a `Result` whose error is already a model-facing outcome.
-///
-/// The shape the extractors produce is "either a value or a finished failure", so
-/// this collapses it into the single [`ToolResult`] a tool must return.
-#[must_use]
-pub fn finish<T>(
-    call_id: nanus_domain::ToolCallId,
-    outcome: Result<T, ToolOutcome>,
-    on_ok: impl FnOnce(T) -> ToolOutcome,
-) -> ToolResult {
-    match outcome {
-        Ok(value) => ToolResult::new(call_id, on_ok(value)),
-        Err(failure) => ToolResult::new(call_id, failure),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use nanus_domain::ToolCallId;
     use serde_json::json;
 
     use super::*;
@@ -257,20 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn finish_unwraps_either_side() {
-        let id = ToolCallId::new("call-1");
-        let ok = finish(id.clone(), Ok(3_u32), |value: u32| {
-            ToolOutcome::success(json!(value))
-        });
-        assert!(ok.is_success());
-
-        let failure = finish(id, Err(ToolOutcome::failure("bad")), |value: u32| {
-            ToolOutcome::success(json!(value))
-        });
-        assert!(!failure.is_success());
-    }
-
-    #[test]
     fn json_kinds_are_named_for_a_reader() {
         assert_eq!(json_kind(&json!(null)), "null");
         assert_eq!(json_kind(&json!(true)), "a boolean");
@@ -278,12 +241,5 @@ mod tests {
         assert_eq!(json_kind(&json!("x")), "a string");
         assert_eq!(json_kind(&json!([])), "an array");
         assert_eq!(json_kind(&json!({})), "an object");
-    }
-
-    #[test]
-    fn result_of_carries_the_call_id() {
-        let id = ToolCallId::new("call-9");
-        let result = result_of(id, ToolOutcome::success(json!(1)));
-        assert_eq!(result.call_id.as_str(), "call-9");
     }
 }

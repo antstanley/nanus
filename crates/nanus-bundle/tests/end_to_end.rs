@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use nanus_bundle::{AgentRunner, Progress, Silent};
-use nanus_domain::{AgentConfig, Session, SessionId, ToolCallId, ToolName, ToolRegistry, Usage};
+use nanus_domain::{AgentConfig, Session, SessionId, ToolCallId, ToolName, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, SandboxPolicy};
 
 /// A model that replays a script of event batches, one per request.
@@ -118,7 +118,9 @@ fn answer(text: &str) -> Vec<LlmEvent> {
 }
 
 /// Composes the shipped toolset over a temporary workspace.
-fn workspace_tools(root: &std::path::Path) -> (Rc<ToolRegistry>, nanus_ports::ShellHandle) {
+fn workspace_tools(
+    root: &std::path::Path,
+) -> (nanus_bundle::ToolRegistryHandle, nanus_ports::ShellHandle) {
     let fs = nanus_adapter_local::LocalFs::new(root)
         .unwrap_or_else(|error| panic!("a temporary workspace is readable: {error}"))
         .handle();
@@ -129,7 +131,7 @@ fn workspace_tools(root: &std::path::Path) -> (Rc<ToolRegistry>, nanus_ports::Sh
     .handle();
     let registry = nanus_bundle::build_toolset(&fs, &shell)
         .unwrap_or_else(|error| panic!("the shipped toolset builds: {error}"));
-    (Rc::new(registry), shell)
+    (nanus_bundle::ToolRegistryHandle::new(registry), shell)
 }
 
 fn config() -> AgentConfig {
@@ -144,7 +146,7 @@ fn config() -> AgentConfig {
 /// Runs one turn and returns the outcome.
 async fn run(
     model: Rc<Box<dyn LlmPort>>,
-    tools: Rc<ToolRegistry>,
+    tools: nanus_bundle::ToolRegistryHandle,
     prompt: &str,
 ) -> nanus_bundle::RunOutcome {
     let runner = AgentRunner::new(model, tools, "you are a test", config())
@@ -284,6 +286,82 @@ async fn a_shell_command_runs_and_a_non_zero_exit_is_not_a_failure() {
     // Nothing is left running, which is what `kill_all` is for.
     let reaped = shell.kill_all().await;
     assert!(reaped.is_ok());
+}
+
+/// A command with no `workdir` runs in the workspace root, which is what the tool's schema
+/// and the system prompt both promise.
+///
+/// The tool used to hand the adapter no working directory at all, so the child inherited the
+/// *process's* — a different directory whenever the workspace root is configured, and the
+/// whole of the difference for a service, whose own directory is wherever it was started.
+#[tokio::test]
+async fn a_command_runs_in_the_workspace_root_by_default() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let root = dir.path();
+    let (tools, shell) = workspace_tools(root);
+    let root_path = root
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("the temp dir canonicalizes: {error}"));
+    let process_cwd = std::env::current_dir()
+        .unwrap_or_else(|error| panic!("a cwd: {error}"))
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("the cwd canonicalizes: {error}"));
+    assert_ne!(
+        root_path, process_cwd,
+        "the fixture is only meaningful while the two differ"
+    );
+
+    // `pwd -P` for the physical path, so a symlinked temporary directory cannot make this
+    // assert on a spelling rather than on the directory.
+    let printed = shell_pwd(&tools, serde_json::json!({ "command": "pwd -P" })).await;
+    assert_eq!(
+        printed,
+        root_path.display().to_string(),
+        "no workdir means the workspace root, not the process's directory"
+    );
+
+    // Pair assertion: an explicit relative workdir still resolves under the root, which is
+    // the other half of the same promise.
+    std::fs::create_dir(root.join("sub")).unwrap_or_else(|error| panic!("sub dir: {error}"));
+    let printed = shell_pwd(
+        &tools,
+        serde_json::json!({ "command": "pwd -P", "workdir": "sub" }),
+    )
+    .await;
+    assert_eq!(printed, root_path.join("sub").display().to_string());
+
+    let reaped = shell.kill_all().await;
+    assert!(reaped.is_ok());
+}
+
+/// Runs one `bash` call through the real tool and returns the line it printed starting with
+/// a slash, which for `pwd -P` is the directory the command ran in.
+async fn shell_pwd(
+    tools: &nanus_bundle::ToolRegistryHandle,
+    arguments: serde_json::Value,
+) -> String {
+    let call = nanus_domain::ToolCall::new(
+        ToolCallId::new("c-pwd"),
+        ToolName::new("bash").unwrap_or_else(|error| panic!("bash is valid: {error}")),
+        arguments,
+    );
+    // Dispatched inside its own scope so the registry borrow is released before the tool
+    // runs: a `ToolFuture` owns what it needs, and holding a `RefCell` borrow across an await
+    // is how a registration elsewhere would find the registry busy.
+    let result = {
+        let registry = tools.borrow();
+        registry.execute(call)
+    }
+    .await;
+    let text = result.render_text();
+    let Some(printed) = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('/'))
+    else {
+        panic!("no path in the output:\n{text}");
+    };
+    printed.to_owned()
 }
 
 #[tokio::test]
@@ -557,7 +635,14 @@ async fn the_glob_tool_anchors_a_bare_pattern_to_the_workspace_root() {
         ToolName::new("glob").unwrap_or_else(|error| panic!("glob is valid: {error}")),
         serde_json::json!({ "pattern": "*.rs" }),
     );
-    let result = tools.execute(call).await;
+    // Dispatched inside its own scope so the registry borrow is released before the tool
+    // runs: a `ToolFuture` owns what it needs, and holding a `RefCell` borrow across an await
+    // is how a registration elsewhere would find the registry busy.
+    let result = {
+        let registry = tools.borrow();
+        registry.execute(call)
+    }
+    .await;
     let text = result
         .outcome
         .content()
@@ -582,7 +667,14 @@ async fn the_glob_tool_anchors_a_bare_pattern_to_the_workspace_root() {
         ToolName::new("glob").unwrap_or_else(|error| panic!("glob is valid: {error}")),
         serde_json::json!({ "pattern": "**/*.rs" }),
     );
-    let result = tools.execute(call).await;
+    // Dispatched inside its own scope so the registry borrow is released before the tool
+    // runs: a `ToolFuture` owns what it needs, and holding a `RefCell` borrow across an await
+    // is how a registration elsewhere would find the registry busy.
+    let result = {
+        let registry = tools.borrow();
+        registry.execute(call)
+    }
+    .await;
     let text = result
         .outcome
         .content()

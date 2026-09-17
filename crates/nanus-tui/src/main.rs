@@ -118,6 +118,13 @@ fn run(args: &Args) -> Result<(), String> {
     // reads its history out of it — the agent owns the session, but the store is where
     // what it has already said is written down.
     let store = block_on(open_store())?;
+    // A live conversation has no history to open part way into, so `--scroll` without
+    // `--session` is a request that cannot be honoured. Refused rather than ignored.
+    if args.scroll > 0 && args.session.is_none() {
+        return Err(String::from(
+            "--scroll opens a recorded session part way back, so it needs --session",
+        ));
+    }
     if let Some(requested) = &args.session {
         return view(&store, requested.as_deref(), args.scroll);
     }

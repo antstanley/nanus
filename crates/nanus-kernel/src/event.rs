@@ -696,8 +696,44 @@ impl Registry {
         crate::runtime::block_on(async move { futures::future::join_all(futures).await });
     }
 
-    /// Dispatches `payload` through `serial`, returning the first decision.
+    /// Dispatches `payload` through `serial`, giving every listener a turn.
+    ///
+    /// The first non-`None` decision is what the caller receives, but no listener is
+    /// *skipped* because an earlier one decided. That is what makes the mode usable for
+    /// observers that also vote: a listener registered after a decider still sees the event,
+    /// which a decision-then-stop mode would deny it.
     pub(crate) fn dispatch_serial<K: 'static, R: 'static>(
+        &self,
+        key: EventKey<K>,
+        payload: &K,
+    ) -> Option<R> {
+        let chain = self.snapshot(key);
+        let event = EventErased {
+            name: key.as_str(),
+            dispatcher: None,
+        };
+        let mut first: Option<Box<dyn Any>> = None;
+        for handler in &chain {
+            if let HandlerKind::Decide(callback) = &handler.kind {
+                let decision = callback(&event, payload);
+                if first.is_none() {
+                    first = decision;
+                }
+            } else {
+                tracing::error!(event = key.as_str(), "listener kind mismatch on serial");
+            }
+        }
+        first.and_then(|boxed| boxed.downcast::<R>().ok().map(|value| *value))
+    }
+
+    /// Dispatches `payload` through `bail`, stopping at the first decision.
+    ///
+    /// The difference from [`dispatch_serial`](Self::dispatch_serial) is not the return type
+    /// — both hand back one decision — but who runs: `bail` is for a listener that owns the
+    /// answer outright, so nothing after it is consulted at all. `serial` is for a chain in
+    /// which every listener is entitled to see the event. Sharing one body between them made
+    /// the two modes indistinguishable and left both documented contracts untrue.
+    pub(crate) fn dispatch_bail<K: 'static, R: 'static>(
         &self,
         key: EventKey<K>,
         payload: &K,
@@ -713,26 +749,10 @@ impl Registry {
                     return boxed.downcast::<R>().ok().map(|value| *value);
                 }
             } else {
-                tracing::error!(event = key.as_str(), "listener kind mismatch on serial");
+                tracing::error!(event = key.as_str(), "listener kind mismatch on bail");
             }
         }
         None
-    }
-
-    /// Dispatches `payload` through `bail`, returning the first non-`None`
-    /// decision.
-    ///
-    /// `bail` and `serial` share a body because the difference between them is
-    /// the *contract*, not the mechanics: `serial` promises every listener a turn
-    /// and every listener may contribute; `bail` promises to stop at the first
-    /// decision. The mode the caller chose lives on the context method, where it
-    /// is visible in the call site.
-    pub(crate) fn dispatch_bail<K: 'static, R: 'static>(
-        &self,
-        key: EventKey<K>,
-        payload: &K,
-    ) -> Option<R> {
-        self.dispatch_serial::<K, R>(key, payload)
     }
 }
 

@@ -38,11 +38,11 @@ use std::rc::Rc;
 use nanus_domain::{
     AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ContentBlock, SandboxMode,
     Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId, ToolName,
-    ToolRegistry, ToolResult, TurnEndReason, TurnMachine, Usage,
+    ToolResult, TurnEndReason, TurnMachine, Usage,
 };
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort};
 
-use crate::BundleError;
+use crate::{BundleError, ToolRegistryHandle};
 
 /// What a completed run produced.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -226,7 +226,13 @@ fn with_step_budget(prompt: &str, budget: u32) -> String {
 /// observable and resumable.
 pub struct AgentRunner {
     llm: Rc<Box<dyn LlmPort>>,
-    tools: Rc<ToolRegistry>,
+    /// The tools the model is offered, shared rather than owned.
+    ///
+    /// The same handle the bundle publishes as the `tools` service, deliberately: the
+    /// registry a runner dispatches from and the registry a caller inspects have to be one
+    /// object, or a tool registered through the published handle would change the count an
+    /// agent advertises without changing the schemas it sends.
+    tools: ToolRegistryHandle,
     system_prompt: String,
     config: AgentConfig,
 }
@@ -235,14 +241,14 @@ impl core::fmt::Debug for AgentRunner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AgentRunner")
             .field("model", &self.config.model)
-            .field("tools", &self.tools.len())
+            .field("tools", &self.tools.borrow().len())
             .field("max_steps_per_turn", &self.config.max_steps_per_turn)
             .finish_non_exhaustive()
     }
 }
 
 impl AgentRunner {
-    /// Builds a runner.
+    /// Builds a runner over the shared tool registry.
     ///
     /// # Errors
     ///
@@ -250,7 +256,7 @@ impl AgentRunner {
     /// unusable runner cannot be constructed and then consulted.
     pub fn new(
         llm: Rc<Box<dyn LlmPort>>,
-        tools: Rc<ToolRegistry>,
+        tools: ToolRegistryHandle,
         system_prompt: impl Into<String>,
         config: AgentConfig,
     ) -> Result<Self, BundleError> {
@@ -279,6 +285,18 @@ impl AgentRunner {
     #[must_use]
     pub const fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// Returns the tool registry this runner dispatches from.
+    ///
+    /// The same handle the composition publishes as the `tools` service, so a caller may
+    /// register a tool through either and the other sees it. Handing out the shared handle
+    /// rather than a count is deliberate: a count cannot be used to *add* anything, and a
+    /// caller that wanted to add one would otherwise be tempted to keep a registry of its
+    /// own — which is the divergence this accessor exists to make impossible.
+    #[must_use]
+    pub const fn tools(&self) -> &ToolRegistryHandle {
+        &self.tools
     }
 
     /// Returns the assembled system prompt every request carries.
@@ -457,8 +475,13 @@ impl AgentRunner {
     fn build_request(&self, session: &Session) -> ChatRequest {
         let mut messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
         messages.extend(session.derive_messages());
-        let tools: Vec<nanus_domain::ToolSchema> =
-            self.tools.schemas().into_iter().cloned().collect();
+        // The borrow ends with the statement, which is what keeps a tool registered through
+        // the published handle visible on the very next request rather than only after a
+        // rebuild.
+        let tools: Vec<nanus_domain::ToolSchema> = {
+            let registry = self.tools.borrow();
+            registry.schemas().into_iter().cloned().collect()
+        };
         let mut request = ChatRequest::new(self.config.model.clone(), messages);
         request.tools = tools;
         request
@@ -576,10 +599,18 @@ impl AgentRunner {
             // `join_all` polls the batch together on this thread, so a call that awaits
             // leaves the others room to run: cooperative concurrency rather than
             // parallelism, because the kernel and its futures are deliberately `!Send`.
-            let running: Vec<nanus_domain::ToolFuture> = batch
-                .iter()
-                .map(|index| self.tools.execute(calls[*index].clone()))
-                .collect();
+            //
+            // The registry is borrowed for the *dispatch* and not for the await that
+            // follows: a `ToolFuture` is `'static` and owns whatever it needs, so holding a
+            // borrow across the batch would only risk meeting the borrow a registration
+            // takes.
+            let running: Vec<nanus_domain::ToolFuture> = {
+                let registry = self.tools.borrow();
+                batch
+                    .iter()
+                    .map(|index| registry.execute(calls[*index].clone()))
+                    .collect()
+            };
             let finished = futures::future::join_all(running).await;
             for (index, result) in batch.iter().zip(finished) {
                 let is_error = !result.outcome.is_success();
@@ -632,8 +663,13 @@ impl AgentRunner {
     /// obtained. `never` answers no without consulting anyone, so a later answerer cannot
     /// bypass it, and `ask` with no answerer is denied too — fail closed either way.
     async fn gate(&self, call: &ToolCall, approver: Option<&dyn Approver>) -> Option<ToolResult> {
-        let definition = self.tools.get(&call.name)?;
-        let access = definition.access();
+        // The access is copied out and the borrow released before anything is awaited: the
+        // decision below can take as long as a person takes, and a registry borrow held that
+        // long would refuse the registration that answers it.
+        let access = {
+            let registry = self.tools.borrow();
+            registry.get(&call.name)?.access()
+        };
         let sandbox = self.config.sandbox_mode;
         if sandbox.permits(access) {
             return None;
@@ -837,7 +873,7 @@ pub use nanus_ports::FinishReason as ModelFinishReason;
 
 #[cfg(test)]
 mod tests {
-    use nanus_domain::{ToolOutcome, ToolSchema};
+    use nanus_domain::{ToolOutcome, ToolRegistry, ToolSchema};
     use nanus_ports::{ChatRequest, LlmStream};
     use serde_json::json;
 
@@ -897,7 +933,7 @@ mod tests {
         }
     }
 
-    fn registry_with_echo() -> Rc<ToolRegistry> {
+    fn registry_with_echo() -> ToolRegistryHandle {
         let mut registry = ToolRegistry::new();
         let schema = ToolSchema {
             name: ToolName::new("echo").unwrap_or_else(|_| unreachable!("echo is valid")),
@@ -909,7 +945,7 @@ mod tests {
                 .register(nanus_domain::ToolDefinition::new(schema, Echo))
                 .is_ok()
         );
-        Rc::new(registry)
+        ToolRegistryHandle::new(registry)
     }
 
     /// A configuration whose sandbox permits everything the stub tools declare.
@@ -927,7 +963,7 @@ mod tests {
         Session::new(SessionId::new("s-1"), 0, "/tmp")
     }
 
-    fn runner(llm: Rc<Box<dyn LlmPort>>, tools: Rc<ToolRegistry>) -> Option<AgentRunner> {
+    fn runner(llm: Rc<Box<dyn LlmPort>>, tools: ToolRegistryHandle) -> Option<AgentRunner> {
         AgentRunner::new(llm, tools, "you are a test", config()).ok()
     }
 
@@ -966,7 +1002,7 @@ mod tests {
         assert!(
             AgentRunner::new(
                 ScriptedLlm::handle(Vec::new()),
-                Rc::new(ToolRegistry::new()),
+                ToolRegistryHandle::new(ToolRegistry::new()),
                 fits.clone(),
                 config(),
             )
@@ -977,7 +1013,7 @@ mod tests {
         // about the caller's part of the prompt.
         let _ = AgentRunner::new(
             ScriptedLlm::handle(Vec::new()),
-            Rc::new(ToolRegistry::new()),
+            ToolRegistryHandle::new(ToolRegistry::new()),
             format!("{fits}x"),
             config(),
         );
@@ -1247,7 +1283,10 @@ mod tests {
     #[tokio::test]
     async fn a_stop_asked_for_between_steps_closes_the_turn() {
         let llm = ScriptedLlm::handle(vec![vec![LlmEvent::TextDelta("never asked".to_owned())]]);
-        let Some(runner) = runner(Rc::clone(&llm), Rc::new(ToolRegistry::new())) else {
+        let Some(runner) = runner(
+            Rc::clone(&llm),
+            ToolRegistryHandle::new(ToolRegistry::new()),
+        ) else {
             return;
         };
         let mut session = session();
@@ -1343,7 +1382,7 @@ mod tests {
                 reason: FinishReason::Stop,
             }],
         ]);
-        let Some(runner) = runner(llm, Rc::new(ToolRegistry::new())) else {
+        let Some(runner) = runner(llm, ToolRegistryHandle::new(ToolRegistry::new())) else {
             return;
         };
         let mut session = session();
@@ -1360,7 +1399,7 @@ mod tests {
                 reason: FinishReason::Stop,
             }],
         ]);
-        let Some(runner) = runner(llm, Rc::new(ToolRegistry::new())) else {
+        let Some(runner) = runner(llm, ToolRegistryHandle::new(ToolRegistry::new())) else {
             return;
         };
         let mut session = session();
@@ -1452,7 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn a_model_failure_is_reported() {
         let llm = ScriptedLlm::handle(vec![vec![LlmEvent::Error("upstream is down".to_owned())]]);
-        let Some(runner) = runner(llm, Rc::new(ToolRegistry::new())) else {
+        let Some(runner) = runner(llm, ToolRegistryHandle::new(ToolRegistry::new())) else {
             return;
         };
         let mut session = session();
@@ -1506,7 +1545,7 @@ mod tests {
                 },
             ],
         ]);
-        let Some(runner) = runner(llm, Rc::new(ToolRegistry::new())) else {
+        let Some(runner) = runner(llm, ToolRegistryHandle::new(ToolRegistry::new())) else {
             return;
         };
         let mut session = session();
@@ -1689,7 +1728,7 @@ mod tests {
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
         };
-        let outcome = AgentRunner::new(llm, Rc::new(ToolRegistry::new()), "p", bad);
+        let outcome = AgentRunner::new(llm, ToolRegistryHandle::new(ToolRegistry::new()), "p", bad);
         assert!(outcome.is_err());
     }
 
@@ -1743,7 +1782,7 @@ mod tests {
     fn registry_with_counted(
         name: &str,
         access: ToolAccess,
-    ) -> (Rc<ToolRegistry>, Rc<std::cell::Cell<u32>>) {
+    ) -> (ToolRegistryHandle, Rc<std::cell::Cell<u32>>) {
         let runs = Rc::new(std::cell::Cell::new(0));
         let schema = ToolSchema {
             name: ToolName::new(name).unwrap_or_else(|_| unreachable!("a valid test tool name")),
@@ -1764,7 +1803,7 @@ mod tests {
                 )
                 .is_ok()
         );
-        (Rc::new(registry), runs)
+        (ToolRegistryHandle::new(registry), runs)
     }
 
     /// A model that calls `name` once and then answers.
@@ -1793,7 +1832,7 @@ mod tests {
     /// Builds a runner over a sandbox mode and an approval policy.
     fn gated_runner(
         llm: Rc<Box<dyn LlmPort>>,
-        tools: Rc<ToolRegistry>,
+        tools: ToolRegistryHandle,
         sandbox: SandboxMode,
         approval: ApprovalPolicy,
     ) -> Option<AgentRunner> {
@@ -1968,7 +2007,7 @@ mod tests {
         let approver = ScriptedApprover::new(ApprovalOutcome::AllowedOnce);
         let Some(runner) = gated_runner(
             calls_then_answers("nope"),
-            Rc::new(ToolRegistry::new()),
+            ToolRegistryHandle::new(ToolRegistry::new()),
             SandboxMode::ReadOnly,
             ApprovalPolicy::Ask,
         ) else {
@@ -2032,7 +2071,9 @@ mod tests {
     }
 
     /// Builds a registry of read-only tracked tools, named and delayed as given.
-    fn registry_with_tracked(specs: &[(&str, &'static str, u64)]) -> (Rc<ToolRegistry>, Tracking) {
+    fn registry_with_tracked(
+        specs: &[(&str, &'static str, u64)],
+    ) -> (ToolRegistryHandle, Tracking) {
         let in_flight = Rc::new(std::cell::Cell::new(0));
         let peak = Rc::new(std::cell::Cell::new(0));
         let finished = Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -2060,7 +2101,10 @@ mod tests {
                     .is_ok()
             );
         }
-        (Rc::new(registry), Tracking { peak, finished })
+        (
+            ToolRegistryHandle::new(registry),
+            Tracking { peak, finished },
+        )
     }
 
     /// A model that calls every named tool in one step and then answers.
@@ -2091,7 +2135,7 @@ mod tests {
     /// A runner whose step may run `parallel` tools at once, over tools the sandbox permits.
     fn parallel_runner(
         llm: Rc<Box<dyn LlmPort>>,
-        tools: Rc<ToolRegistry>,
+        tools: ToolRegistryHandle,
         parallel: u32,
     ) -> Option<AgentRunner> {
         let config = AgentConfig::new(8, parallel, "test-model", 4096)

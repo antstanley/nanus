@@ -55,9 +55,9 @@ cannot provide as well, not a convenience wrapper. See
 | `write` | Creates or replaces a file. |
 | `edit` | Replaces text, requiring `old_string` to occur exactly once unless `replace_all` is set — an ambiguous or absent match is refused rather than guessed. |
 | `read_image` | Attaches a PNG, JPEG, WebP, or GIF to the conversation as an image content block. |
-| `glob` | Finds files by path pattern, anchored to the workspace root (`*.rs` for the top level, `**/*.rs` at any depth), with a result cap and a notice when it is hit. |
+| `glob` | Finds files by path pattern, anchored to the workspace root (`*.rs` for the top level, `**/*.rs` at any depth), with a result cap — and a notice naming the cap when matches were dropped, rather than whenever the cap was reached. |
 | `grep` | Finds text inside files, grouped by file, optionally narrowed by one `include` glob, with capped matches and truncated lines that say so. |
-| `bash` | Runs a program with an optional timeout, reporting stdout, stderr, and the exit code. A non-zero exit is a result, not a failure; output is capped and truncated with a notice; the whole process group is killed so grandchildren are not orphaned. |
+| `bash` | Runs a program in the workspace root unless a `workdir` says otherwise, with an optional timeout, reporting stdout, stderr, and the exit code. A non-zero exit is a result, not a failure; output is capped and truncated with a notice; the whole process group is killed so grandchildren are not orphaned. |
 
 Only a tool's `name`, `description`, and `parameters` may reach the model; the
 executable half is not serialisable, so the allowlist is carried by the types.

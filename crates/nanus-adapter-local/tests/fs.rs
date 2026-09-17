@@ -289,6 +289,54 @@ async fn glob_search_reports_truncation_at_the_cap() {
     assert!(outcome.truncated, "hitting the cap is reported");
 }
 
+/// Truncation is a claim about what was *dropped*, and a result that happens to fill the cap
+/// without anything left over is complete.
+///
+/// The walk used to stop the moment the cap filled, which reported truncation whenever any
+/// file remained to look at — even when none of the rest matched. The message a model then
+/// read was "more than 5 matches" for a directory holding exactly five.
+#[tokio::test]
+async fn a_search_that_exactly_fills_its_cap_is_not_truncated() {
+    let (dir, fs) = workspace();
+    for index in 0..5 {
+        std::fs::write(dir.path().join(format!("f{index}.txt")), "x").expect("seed");
+    }
+    let query = SearchQuery::glob(".", "*.txt").with_max_results(5);
+    let outcome = fs.search(&query).await.expect("search");
+    assert_eq!(outcome.matches.len(), 5);
+    assert!(
+        !outcome.truncated,
+        "five matches and no more is a complete answer"
+    );
+
+    // The other direction: a sixth file makes the same query genuinely truncated, and the
+    // match that would not fit is the one that says so.
+    std::fs::write(dir.path().join("f5.txt"), "x").expect("seed");
+    let outcome = fs.search(&query).await.expect("search");
+    assert_eq!(outcome.matches.len(), 5);
+    assert!(outcome.truncated, "a sixth match was dropped");
+}
+
+/// The same rule for a content search: a match beyond the cap is what truncation means.
+#[tokio::test]
+async fn a_literal_search_is_truncated_only_when_a_match_is_dropped() {
+    let (dir, fs) = workspace();
+    std::fs::write(dir.path().join("one.txt"), "needle\nneedle\n").expect("seed");
+    let query = SearchQuery::literal(".", "needle").with_max_results(2);
+    let outcome = fs.search(&query).await.expect("search");
+    assert_eq!(outcome.matches.len(), 2);
+    assert!(
+        !outcome.truncated,
+        "two matches and no more is a complete answer"
+    );
+
+    std::fs::write(dir.path().join("two.txt"), "needle\n").expect("seed");
+    let query = SearchQuery::literal(".", "needle").with_max_results(2);
+    let outcome = fs.search(&query).await.expect("search");
+    assert_eq!(outcome.matches.len(), 2);
+    assert!(outcome.truncated, "a third match was dropped");
+}
+
 #[tokio::test]
 async fn literal_search_finds_lines() {
     let (dir, fs) = workspace();

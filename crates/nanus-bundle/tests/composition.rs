@@ -138,6 +138,77 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
 }
 
+/// A tool registered through one door is visible through the other.
+///
+/// The runner used to be built over its own `ToolRegistry` while the plugin published a
+/// second one built from the same ports. Both held the same seven tools, so nothing looked
+/// wrong until something registered an eighth: the count an agent advertises — which is
+/// what `nanus service status` prints and what the handshake carries — went up, and the
+/// schemas sent on the next request did not. There is one registry now, and this is the
+/// property that says so.
+#[test]
+fn the_runners_registry_is_the_one_the_context_publishes() {
+    in_child_process("the_runners_registry_is_the_one_the_context_publishes");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let settings = config(dir.path());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let pending = runtime.block_on(compose(&settings)).expect("composes");
+    let harness = pending.start().expect("mounts");
+    assert_eq!(harness.tool_count(), 7, "the shipped toolset");
+
+    // Register through the *runner's* handle, then look through the published service.
+    let schema = nanus_domain::ToolSchema {
+        name: nanus_domain::ToolName::new("eighth")
+            .unwrap_or_else(|error| panic!("a valid tool name: {error}")),
+        description: "registered after composition".to_owned(),
+        parameters: serde_json::json!({ "type": "object" }),
+    };
+    let registered = harness
+        .runner
+        .tools()
+        .borrow_mut()
+        .register(nanus_domain::ToolDefinition::new(schema, Unused));
+    assert!(registered.is_ok(), "the tool registers: {registered:?}");
+
+    // The published count follows, which it can only do if the two are one object.
+    assert_eq!(
+        harness.tool_count(),
+        8,
+        "the service the context publishes is the registry the runner dispatches from"
+    );
+    // And the reverse door: what was registered through the service is what the runner
+    // will send.
+    let published = harness
+        .context
+        .get(nanus_bundle::tools_key())
+        .expect("the tools service resolves");
+    assert!(
+        published
+            .borrow()
+            .names()
+            .iter()
+            .any(|name| name.as_str() == "eighth"),
+        "the runner's registry carries the name: {:?}",
+        published.borrow().names()
+    );
+
+    let shutdown = harness.shutdown();
+    assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
+}
+
+/// A tool that does nothing, for a registration that is only ever inspected.
+struct Unused;
+
+impl nanus_domain::ToolExecutor for Unused {
+    fn execute(&self, call: nanus_domain::ToolCall) -> nanus_domain::ToolFuture {
+        Box::pin(async move { nanus_domain::ToolResult::success(call.id, serde_json::json!({})) })
+    }
+}
+
 #[test]
 fn mounting_from_inside_a_runtime_fails_loudly() {
     in_child_process("mounting_from_inside_a_runtime_fails_loudly");

@@ -250,8 +250,13 @@ fn agent_over(dir: &Path, llm: Rc<Box<dyn LlmPort>>, model: &str) -> (Agent, Sto
             .handle()
     });
     let config = AgentConfig::new(4, 1, model, 4096).expect("a valid agent config");
-    let runner = AgentRunner::new(llm, Rc::new(ToolRegistry::new()), "you are a test", config)
-        .expect("a valid runner");
+    let runner = AgentRunner::new(
+        llm,
+        nanus_bundle::ToolRegistryHandle::new(ToolRegistry::new()),
+        "you are a test",
+        config,
+    )
+    .expect("a valid runner");
     let agent = Agent::from_parts(Parts {
         runner: Rc::new(runner),
         store: store.clone(),
@@ -342,7 +347,7 @@ fn gated_agent(dir: &Path, approval: ApprovalPolicy) -> (Agent, StoreHandle) {
         Rc::new(Box::new(CallingLlm {
             step: std::cell::Cell::new(0),
         })),
-        Rc::new(registry),
+        nanus_bundle::ToolRegistryHandle::new(registry),
         "you are a test",
         config,
     )

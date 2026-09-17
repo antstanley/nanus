@@ -19,10 +19,11 @@ use nanus_adapter_config::{DEFAULT_MAX_TOKENS, NanusConfig};
 use nanus_adapter_deepseek::{DEFAULT_MAX_OUTPUT_TOKENS, DeepSeekConfig, DeepSeekLlm};
 use nanus_adapter_local::{LocalFs, LocalShell, SystemClock};
 use nanus_adapter_store::JsonlStore;
-use nanus_domain::{AgentConfig, Session, ToolRegistry};
+use nanus_domain::{AgentConfig, Session};
 use nanus_kernel::{Context, Kernel, MountContext, Plugin, PluginId};
 use nanus_ports::{ClockHandle, FsHandle, LlmHandle, SandboxPolicy, ShellHandle, StoreHandle};
 
+use crate::ToolRegistryHandle;
 use crate::agent_loop::AgentRunner;
 use crate::error::BundleError;
 
@@ -117,14 +118,15 @@ pub struct Pending {
     clock: ClockHandle,
     store: StoreHandle,
     llm: LlmHandle,
-    tools: Rc<ToolRegistry>,
+    /// The one tool registry this composition has: the runner's and the published service's.
+    tools: ToolRegistryHandle,
 }
 
 impl core::fmt::Debug for Pending {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Pending")
             .field("model", &self.llm.model())
-            .field("tools", &self.tools.len())
+            .field("tools", &self.tools.borrow().len())
             .finish_non_exhaustive()
     }
 }
@@ -153,10 +155,27 @@ impl Pending {
     ///
     /// Returns [`BundleError::Kernel`] when a plugin fails to mount.
     pub fn start(self) -> Result<Harness, BundleError> {
-        let context = mount(&self.fs, &self.shell, &self.clock, &self.store, &self.llm)?;
+        let context = mount(
+            &self.fs,
+            &self.shell,
+            &self.clock,
+            &self.store,
+            &self.llm,
+            &self.tools,
+        )?;
         let runner = build_runner(&self.llm, &self.tools, &self.config, &self.workspace)?;
-        // Postcondition: the tool count the harness reports is the one it published.
+        // Postconditions: the request model is the configured one, and the registry the
+        // runner dispatches from is the one the context published. The second is the
+        // property this whole construction exists to hold — a runner over a *copy* of the
+        // toolset would advertise tools it could not dispatch.
         assert_eq!(runner.config().model, self.config.model);
+        assert!(Rc::ptr_eq(
+            &self.tools.0,
+            &context
+                .get(crate::tools_key())
+                .map_err(|error| BundleError::Kernel(error.to_string()))?
+                .0
+        ));
         Ok(Harness {
             context,
             runner: Rc::new(runner),
@@ -305,10 +324,14 @@ fn build_llm(config: &NanusConfig, api_key: &str) -> Result<LlmHandle, BundleErr
     Ok(Rc::new(port))
 }
 
-/// Builds the tool registry.
-fn build_tools(fs: &FsHandle, shell: &ShellHandle) -> Result<Rc<ToolRegistry>, BundleError> {
+/// Builds the tool registry this composition shares.
+///
+/// Built once, here, and handed to both the runner and the plugin that publishes it: the
+/// registry the model is offered and the registry an agent advertises have to be one object
+/// or the two can disagree.
+fn build_tools(fs: &FsHandle, shell: &ShellHandle) -> Result<ToolRegistryHandle, BundleError> {
     crate::build_toolset(fs, shell)
-        .map(Rc::new)
+        .map(ToolRegistryHandle::new)
         .map_err(|error| BundleError::config(format!("the toolset could not be built: {error}")))
 }
 
@@ -323,7 +346,7 @@ fn build_tools(fs: &FsHandle, shell: &ShellHandle) -> Result<Rc<ToolRegistry>, B
 /// cannot.
 fn build_runner(
     llm: &LlmHandle,
-    tools: &Rc<ToolRegistry>,
+    tools: &ToolRegistryHandle,
     config: &NanusConfig,
     workspace: &std::path::Path,
 ) -> Result<AgentRunner, BundleError> {
@@ -346,11 +369,11 @@ fn build_runner(
     .map_err(|error| BundleError::config(error.to_string()))?
     .with_approval(config.approval_policy)
     .with_sandbox(config.sandbox_mode);
-    // The runner shares the registry with the provider, so registering a tool later
-    // is visible on the next request rather than requiring a rebuild.
+    // The runner is given the same handle the context publishes, so registering a tool
+    // later is visible on the next request rather than requiring a rebuild.
     AgentRunner::new(
         Rc::clone(llm),
-        Rc::clone(tools),
+        tools.clone(),
         format!("{prompt}\n\n{runtime}"),
         agent,
     )
@@ -367,6 +390,7 @@ fn mount(
     clock: &ClockHandle,
     store: &StoreHandle,
     llm: &LlmHandle,
+    tools: &ToolRegistryHandle,
 ) -> Result<Context, BundleError> {
     let kernel = Kernel::new()
         .with_plugin(plugin_id("clock"), clock_provider(clock))
@@ -374,10 +398,7 @@ fn mount(
         .with_plugin(plugin_id("shell"), shell_provider(shell))
         .with_plugin(plugin_id("store"), store_provider(store))
         .with_plugin(plugin_id("llm"), llm_provider(llm))
-        .with_plugin(
-            plugin_id("tools"),
-            crate::tools_plugin(fs.clone(), shell.clone()),
-        );
+        .with_plugin(plugin_id("tools"), crate::tools_plugin(tools.clone()));
     kernel
         .start()
         .map_err(|error| BundleError::Kernel(error.to_string()))

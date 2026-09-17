@@ -151,27 +151,27 @@ pub fn build_toolset(
 
 /// The plugin that publishes the model-facing toolset.
 ///
-/// Requires the filesystem and shell ports, so the kernel activates it only once a
-/// provider for each exists. That is the whole of its boot ordering: nothing calls
-/// "mount the tools now".
-// The handles are taken by value because the returned plugin must be `'static`: a
-// borrowing plugin could not be staged on a kernel that outlives this call. The clones
-// are of `Rc`, so taking them by value costs a refcount and buys the lifetime the
-// composition needs.
+/// It publishes the registry it is handed rather than building one, which is the whole
+/// point: the registry a runner dispatches from and the registry an agent advertises have
+/// to be the same object. A plugin that built its own would give every caller a *copy*, so
+/// a tool registered through the published handle would change the count in the handshake
+/// and nothing about the requests — and a failure to build the toolset would be a log line
+/// and an agent with no tools rather than an error the composition reports.
+///
+/// It still *requires* the filesystem and the shell, even though it no longer touches them:
+/// what the requirement declares is that the toolset is only in service once the ports its
+/// tools run on exist, so a consumer of `tools` is activated after them and deactivated
+/// with them.
+// The handle is held by value because the returned plugin must be `'static`: a borrowing
+// plugin could not be staged on a kernel that outlives this call. The handle is `Rc`-shared,
+// so taking it by value costs a refcount and buys the lifetime the composition needs.
 #[allow(clippy::needless_pass_by_value)]
-pub fn tools_plugin(fs: FsHandle, shell: ShellHandle) -> impl nanus_kernel::Plugin {
-    let ready = match build_toolset(&fs, &shell) {
-        Ok(built) => built,
-        Err(error) => {
-            tracing::error!(error = %error, "the shipped toolset could not be built");
-            ToolRegistry::new()
-        }
-    };
+pub fn tools_plugin(registry: ToolRegistryHandle) -> impl nanus_kernel::Plugin {
     Provider {
         id: PluginId::new("tools").unwrap_or_else(|_| unreachable!("tools is a valid plugin id")),
         // The kernel's registry hands out clones of the published handle, so the
         // value it stores is an `Rc` of the handle.
-        registry: Rc::new(ToolRegistryHandle::new(ready)),
+        registry: Rc::new(registry),
     }
 }
 

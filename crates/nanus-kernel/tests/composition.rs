@@ -198,6 +198,118 @@ impl Plugin for Consumer {
     }
 }
 
+/// The capability a relay publishes.
+struct StubCounter;
+
+impl Counter for StubCounter {
+    fn count(&self) -> u32 {
+        11
+    }
+}
+
+/// A plugin that requires the greeter and publishes the counter: the middle of a chain.
+///
+/// It exists because a chain of two cannot see the ordering defect this file's last
+/// deactivation test pins. The deactivation of a *provider* retires its bindings before the
+/// sweep, so a consumer that requires them resolves them in its own teardown whatever
+/// happens next; a consumer that also *provides* has a binding of its own, and whether
+/// *that* binding is still resolvable by the time its dependent is torn down is a different
+/// question — one the sweep has to answer by withdrawing it only after the dependents it
+/// caused have finished.
+struct Relay {
+    id: PluginId,
+    trace: Rc<Trace>,
+}
+
+impl Relay {
+    const fn new(id: PluginId, trace: Rc<Trace>) -> Self {
+        Self { id, trace }
+    }
+}
+
+impl Plugin for Relay {
+    fn id(&self) -> PluginId {
+        self.id
+    }
+
+    fn description(&self) -> &'static str {
+        "requires a greeter, publishes a counter"
+    }
+
+    fn requirements(&self) -> Vec<AnyServiceKey> {
+        vec![AnyServiceKey::from_typed(greeter_key())]
+    }
+
+    fn init(&mut self, _cx: &Context) -> nanus_kernel::PluginFuture {
+        self.trace.record(format!("{}.init", self.id));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn mount(&mut self, cx: &mut MountContext<'_>) -> nanus_kernel::PluginFuture {
+        self.trace.record(format!("{}.mount", self.id));
+        let greeted = cx.services().get(greeter_key()).is_ok();
+        self.trace
+            .record(format!("{}.mount-saw-greeter:{greeted}", self.id));
+        let provided = cx.provide(counter_key(), Rc::new(Rc::new(StubCounter)));
+        Box::pin(async move { provided })
+    }
+
+    fn unmount(&mut self, cx: &Context) -> nanus_kernel::PluginFuture {
+        self.trace.record(format!("{}.unmount", self.id));
+        let saw = cx.get(greeter_key()).is_ok();
+        self.trace
+            .record(format!("{}.unmount-saw-greeter:{saw}", self.id));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A plugin that requires the counter: the far end of a chain.
+struct CounterConsumer {
+    id: PluginId,
+    trace: Rc<Trace>,
+}
+
+impl CounterConsumer {
+    const fn new(id: PluginId, trace: Rc<Trace>) -> Self {
+        Self { id, trace }
+    }
+}
+
+impl Plugin for CounterConsumer {
+    fn id(&self) -> PluginId {
+        self.id
+    }
+
+    fn description(&self) -> &'static str {
+        "consumes a counter"
+    }
+
+    fn requirements(&self) -> Vec<AnyServiceKey> {
+        vec![AnyServiceKey::from_typed(counter_key())]
+    }
+
+    fn init(&mut self, _cx: &Context) -> nanus_kernel::PluginFuture {
+        self.trace.record(format!("{}.init", self.id));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn mount(&mut self, cx: &mut MountContext<'_>) -> nanus_kernel::PluginFuture {
+        self.trace.record(format!("{}.mount", self.id));
+        let counted = cx.services().get(counter_key()).is_ok();
+        self.trace
+            .record(format!("{}.mount-saw-counter:{counted}", self.id));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn unmount(&mut self, cx: &Context) -> nanus_kernel::PluginFuture {
+        self.trace.record(format!("{}.unmount", self.id));
+        let saw = cx.get(counter_key()).is_ok();
+        self.trace
+            .record(format!("{}.unmount-saw-counter:{saw}", self.id));
+        Box::pin(async { Ok(()) })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Temporal composability: effects revert, in LIFO order.
 // ---------------------------------------------------------------------------
@@ -534,6 +646,61 @@ fn a_dependent_resolves_the_service_of_the_provider_being_removed() {
         "and the binding is withdrawn once everyone is done with it"
     );
 }
+
+/// A deactivation cascade hands the *middle* binding back too, not only the first one.
+///
+/// The withdrawal of a provider retires its bindings before the sweep, so a consumer that
+/// required them still resolves them in its own teardown — that much a two-plugin chain
+/// shows. But the consumer being deactivated may itself publish something, and *that*
+/// binding was withdrawn where the deactivation happened: the removal runs the moment the
+/// middle plugin tears down, and the sweep only reaches the plugin that required it on the
+/// next pass, so the far end of the chain resolved nothing while unmounting. The withdrawal
+/// now waits for the sweep to settle, which is what this asserts at the far end.
+#[test]
+fn a_three_plugin_cascade_hands_every_binding_back_to_its_dependent() {
+    let trace = Rc::new(Trace::default());
+    // Declared leaf-first, so activation order is the reverse of declaration order and the
+    // cascade is not accidentally the same thing as the declaration order.
+    let kernel = Kernel::new()
+        .with_plugin(
+            plugin_id("leaf"),
+            CounterConsumer::new(plugin_id("leaf"), Rc::clone(&trace)),
+        )
+        .with_plugin(
+            plugin_id("relay"),
+            Relay::new(plugin_id("relay"), Rc::clone(&trace)),
+        )
+        .with_plugin(
+            plugin_id("base"),
+            Publisher::new(plugin_id("base"), Rc::clone(&trace), 2),
+        );
+    let started = kernel.start();
+    assert!(started.is_ok(), "all three mount: {started:?}");
+    let Ok(context) = started else {
+        return;
+    };
+    assert_eq!(context.stats().active, 3, "{:?}", trace.entries());
+
+    let unloaded = context.unload(plugin_id("base"));
+    assert!(unloaded.is_ok(), "{unloaded:?}");
+
+    let entries = trace.entries();
+    assert!(
+        entries.contains(&"relay.unmount-saw-greeter:true".to_owned()),
+        "the middle plugin resolves what it borrowed from the provider being removed: {entries:?}"
+    );
+    assert!(
+        entries.contains(&"leaf.unmount-saw-counter:true".to_owned()),
+        "and the far end resolves the middle plugin's binding while it is being unwound: \
+         {entries:?}"
+    );
+    // Withdrawal is finished, not merely deferred: after the sweep settles there is nothing
+    // left that a plugin could still resolve.
+    assert!(
+        context.get(greeter_key()).is_err() && context.get(counter_key()).is_err(),
+        "every binding is gone once the cascade has run"
+    );
+}
 #[test]
 fn a_provider_that_replaces_itself_is_observed() {
     let trace = Rc::new(Trace::default());
@@ -724,57 +891,91 @@ fn a_waterfall_passes_the_payload_through_when_nothing_listens() {
 }
 
 #[test]
-fn serial_returns_the_first_decision_and_bail_stops_at_it() {
+fn serial_gives_every_listener_a_turn_and_bail_stops_at_the_first_decision() {
     #[derive(Clone)]
     struct Decision {
         value: Option<u32>,
     }
     const DECIDE: EventKey<Decision> = EventKey::<Decision>::of("decision.make");
 
+    /// Two deciders over one event, answering 5 → 6 and 5 → 10.
+    ///
+    /// The second's answer is not the first's, so which one the caller receives says which
+    /// mode ran, and the trace says who was consulted.
+    fn two_deciders(trace: &Rc<Trace>) -> Kernel {
+        let first = Rc::clone(trace);
+        let second = Rc::clone(trace);
+        Kernel::new()
+            .with_plugin(
+                plugin_id("decider-one"),
+                nanus_kernel::Hook::new(plugin_id("decider-one"), "decides", move |cx| {
+                    let trace = Rc::clone(&first);
+                    cx.serial(DECIDE, move |_event, payload| {
+                        trace.record(format!("one:{:?}", payload.value));
+                        payload.value.map(|value| value.saturating_add(1))
+                    });
+                    Ok(())
+                }),
+            )
+            .with_plugin(
+                plugin_id("decider-two"),
+                nanus_kernel::Hook::new(plugin_id("decider-two"), "decides", move |cx| {
+                    let trace = Rc::clone(&second);
+                    cx.serial(DECIDE, move |_event, payload| {
+                        trace.record(format!("two:{:?}", payload.value));
+                        payload.value.map(|value| value.saturating_mul(2))
+                    });
+                    Ok(())
+                }),
+            )
+    }
+
+    // `serial` promises every listener a turn: the second decider is consulted even though
+    // the first has already answered, and the caller receives the first answer.
     let trace = Rc::new(Trace::default());
-    let trace_first = Rc::clone(&trace);
-    let trace_second = Rc::clone(&trace);
-    let kernel = Kernel::new()
-        .with_plugin(
-            plugin_id("decider-one"),
-            nanus_kernel::Hook::new(plugin_id("decider-one"), "decides", move |cx| {
-                let trace = Rc::clone(&trace_first);
-                cx.serial(DECIDE, move |_event, payload| {
-                    trace.record(format!("one:{:?}", payload.value));
-                    payload.value.map(|value| value.saturating_add(1))
-                });
-                Ok(())
-            }),
-        )
-        .with_plugin(
-            plugin_id("decider-two"),
-            nanus_kernel::Hook::new(plugin_id("decider-two"), "decides", move |cx| {
-                let trace = Rc::clone(&trace_second);
-                cx.serial(DECIDE, move |_event, payload| {
-                    trace.record(format!("two:{:?}", payload.value));
-                    payload.value.map(|value| value.saturating_mul(2))
-                });
-                Ok(())
-            }),
-        );
-    let started = kernel.start();
+    let started = two_deciders(&trace).start();
     assert!(started.is_ok());
     let Ok(context) = started else {
         return;
     };
-
     let decision: Option<u32> = context.serial(DECIDE, &Decision { value: Some(5) });
     assert_eq!(decision, Some(6), "the first listener's decision wins");
+    assert_eq!(
+        trace.entries(),
+        vec!["one:Some(5)", "two:Some(5)"],
+        "and the second listener was still given its turn"
+    );
 
-    // Pair assertion: only the deciding listener ran, because `serial` stops at
-    // the first non-`None` answer. That is the whole difference from a mode that
-    // gives every listener a turn.
-    assert_eq!(trace.entries(), vec!["one:Some(5)"]);
-
-    // Negative space: when the first listener abstains, the second decides.
+    // The other direction: nobody deciding is not an error, and both are still consulted.
     trace.entries.borrow_mut().clear();
-    let decision: Option<u32> = context.serial(DECIDE, &Decision { value: None });
-    assert_eq!(decision, None, "nobody decided");
+    let undecided: Option<u32> = context.serial(DECIDE, &Decision { value: None });
+    assert_eq!(undecided, None, "nobody decided");
+    assert_eq!(trace.entries(), vec!["one:None", "two:None"]);
+
+    // `bail` stops at the first decision, which is what a listener that owns the answer
+    // outright needs: nothing after it runs at all.
+    let trace = Rc::new(Trace::default());
+    let started = two_deciders(&trace).start();
+    assert!(started.is_ok());
+    let Ok(context) = started else {
+        return;
+    };
+    let decided: Option<u32> = context.bail(DECIDE, &Decision { value: Some(5) });
+    assert_eq!(
+        decided,
+        Some(6),
+        "the first listener's decision wins here too"
+    );
+    assert_eq!(
+        trace.entries(),
+        vec!["one:Some(5)"],
+        "and the second listener is not consulted at all"
+    );
+
+    // With nobody deciding, `bail` has to reach the end of the chain to find that out.
+    trace.entries.borrow_mut().clear();
+    let undecided: Option<u32> = context.bail(DECIDE, &Decision { value: None });
+    assert_eq!(undecided, None);
     assert_eq!(trace.entries(), vec!["one:None", "two:None"]);
 }
 

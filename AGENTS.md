@@ -107,7 +107,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 773 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 915 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 
@@ -263,6 +263,12 @@ design docs too.
 - **Temporal composability:** unloading a plugin reverts its effects in reverse
   order. `nanus-kernel/tests/composition.rs` asserts the revert order, not just
   the end state.
+- **A withdrawal waits for the deactivations it causes.** Unloading a provider retires
+  its bindings (they stop satisfying requirements but still resolve), sweeps the whole
+  cascade, and only then takes them away — so a dependent at *any* depth can hand back
+  what it borrowed in its `unmount`. A three-plugin chain is what pins it:
+  `a_three_plugin_cascade_hands_every_binding_back_to_its_dependent`. A two-plugin chain
+  cannot see this, which is how the defect survived the first review of the kernel.
 - **The core does not depend on the interface.** `nanus-cli` has no dependency on
   `nanus-tui`, and `nanus-tui` has none on `nanus-bundle`. The manifests enforce
   it, so adding one is a deliberate architectural change rather than a quick fix.

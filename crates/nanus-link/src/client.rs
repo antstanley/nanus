@@ -1,19 +1,20 @@
 //! The client half of the link: an interface talking to an agent.
 //!
-//! ## Why a connection is a conversation
-//!
-//! The agent keeps one session per connection, and that is not an implementation detail
-//! — it is the lifecycle. An interface that opens a connection owns a conversation; when
-//! it exits, the connection closes and the conversation is over. Multi-turn work is
-//! therefore a matter of sending another [`Request::Prompt`] on the same client, and a
-//! client that reconnects starts a new session because it asked for one.
-//!
 //! ## Why the handshake is read in `connect`
 //!
 //! A socket that accepts a connection and then says nothing is indistinguishable from a
 //! hung agent. Reading the `Ready` frame before returning means a client that has a
-//! [`Client`] has proof of an agent: the session id, the workspace, and the model are in
-//! hand, and a socket that was something else entirely has already failed.
+//! [`Client`] has proof of an agent — its workspace, its model, and the version it speaks —
+//! and a socket that was something else entirely has already failed.
+//!
+//! ## Why attaching is a request
+//!
+//! A connection used to *be* a conversation: connect, and you had a session. That is a
+//! pleasant default and it made the lifetimes work, but it left no way to say which
+//! conversation you wanted. So a client sends [`Request::New`] or [`Request::Attach`] and is
+//! told what it got in a [`Frame::Attached`]; a connection may re-attach, and the session it
+//! leaves keeps running without it because the *agent* holds the session, not the
+//! connection. [`crate::protocol`] argues the trade in full.
 
 use std::path::Path;
 

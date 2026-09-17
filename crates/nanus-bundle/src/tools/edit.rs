@@ -84,7 +84,10 @@ async fn edit_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         Ok(new) => new,
         Err(failure) => return ToolResult::new(id, failure),
     };
-    let replace_all = arguments.flag("replace_all").unwrap_or(false);
+    let replace_all = match arguments.flag("replace_all") {
+        Ok(replace_all) => replace_all,
+        Err(failure) => return ToolResult::new(id, failure),
+    };
 
     if old.is_empty() {
         // Replacing the empty string would insert at every position, which no model
@@ -165,6 +168,26 @@ mod tests {
             schema.contains("\"required\":[\"file_path\",\"old_string\",\"new_string\"]"),
             "{schema}"
         );
+    }
+
+    /// A wrongly typed `replace_all` is refused rather than read as false, which would edit
+    /// one occurrence of a pattern the model asked to replace everywhere.
+    #[tokio::test]
+    async fn a_wrongly_typed_replace_all_is_reported_rather_than_defaulted() {
+        let definition = edit_tool(fs_handle());
+        let result = definition
+            .execute(call(json!({
+                "file_path": "a.txt",
+                "old_string": "a",
+                "new_string": "b",
+                "replace_all": "yes"
+            })))
+            .await;
+        let ToolOutcome::Failure { message, .. } = &result.outcome else {
+            panic!("a string is not a boolean: {:?}", result.outcome);
+        };
+        assert!(message.contains("replace_all"), "{message}");
+        assert!(message.contains("boolean"), "{message}");
     }
 
     #[tokio::test]

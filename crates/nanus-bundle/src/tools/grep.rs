@@ -94,10 +94,10 @@ async fn grep_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         // An empty literal matches every line of every file.
         return ToolResult::new(id, ToolOutcome::failure("grep: the pattern is empty"));
     }
-    let root = arguments
-        .optional_str("path")
-        .unwrap_or(None)
-        .unwrap_or_else(|| ".".to_owned());
+    let root = match arguments.optional_str("path") {
+        Ok(root) => root.unwrap_or_else(|| ".".to_owned()),
+        Err(failure) => return ToolResult::new(id, failure),
+    };
     let include = match arguments.optional_str("include") {
         Ok(include) => include,
         Err(failure) => return ToolResult::new(id, failure),
@@ -107,11 +107,10 @@ async fn grep_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
     {
         return ToolResult::new(id, ToolOutcome::failure(format!("grep: {reason}")));
     }
-    let limit = arguments
-        .optional_u32("limit")
-        .unwrap_or(None)
-        .unwrap_or(DEFAULT_MATCH_LIMIT)
-        .min(MAX_MATCH_LIMIT);
+    let limit = match arguments.optional_u32("limit") {
+        Ok(limit) => limit.unwrap_or(DEFAULT_MATCH_LIMIT).min(MAX_MATCH_LIMIT),
+        Err(failure) => return ToolResult::new(id, failure),
+    };
     // A cap of zero is refused rather than reinterpreted, for the same reason `read`
     // refuses one: it is a nonsense request, and the adapter's `SearchQuery` has a
     // precondition that the cap is positive.
@@ -135,7 +134,10 @@ async fn grep_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
     };
 
     let hits = filter_by_include(outcome.matches, include.as_deref());
-    let truncated = outcome.truncated || hits.len() >= search_limit;
+    // The port's flag alone, and not "the result filled the cap": a search that found exactly
+    // its cap and then ran out of text is complete, and calling it truncated would send the
+    // model hunting for matches that do not exist.
+    let truncated = outcome.truncated;
     let value = json!({
         "pattern": pattern,
         "root": root,
@@ -259,8 +261,35 @@ fn truncate_line(line: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nanus_ports::SearchMatch;
+    use nanus_domain::ToolCallId;
+    use nanus_ports::{FsPort, SearchMatch};
     use std::path::PathBuf;
+
+    /// A wrongly typed optional argument is refused, not folded into its default.
+    #[tokio::test]
+    async fn a_wrongly_typed_filter_is_reported_rather_than_defaulted() {
+        let port: Box<dyn FsPort> = Box::new(crate::tests_support::UnusedFs);
+        let tool = grep_tool(std::rc::Rc::new(port));
+        for arguments in [
+            json!({ "pattern": "fn", "limit": "many" }),
+            json!({ "pattern": "fn", "path": 7 }),
+        ] {
+            let result = tool
+                .execute(ToolCall::new(
+                    ToolCallId::new("c-grep"),
+                    ToolName::new("grep").unwrap_or_else(|_| unreachable!("grep is valid")),
+                    arguments.clone(),
+                ))
+                .await;
+            let ToolOutcome::Failure { message, .. } = &result.outcome else {
+                panic!("{arguments} must be refused: {:?}", result.outcome);
+            };
+            assert!(
+                message.contains("limit") || message.contains("path"),
+                "{message}"
+            );
+        }
+    }
 
     fn found(path: &str, line_number: u64, line: &str) -> SearchMatch {
         SearchMatch {

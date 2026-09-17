@@ -92,19 +92,29 @@ async fn bash_outcome(shell: ShellHandle, call: ToolCall) -> ToolResult {
     if command.trim().is_empty() {
         return ToolResult::new(id, ToolOutcome::failure("bash: the command is empty"));
     }
-    let workdir = arguments
-        .optional_str("workdir")
-        .unwrap_or(None)
-        .map(std::path::PathBuf::from);
-    let timeout_ms = arguments
-        .optional_u32("timeout_ms")
-        .unwrap_or(None)
-        .map_or(DEFAULT_TIMEOUT_MS, u64::from);
+    // A field that is present and wrongly typed is a correction the model can act on, so it
+    // is reported rather than folded into the default: `"timeout_ms": "fast"` silently
+    // meaning two minutes is how a model learns nothing from its own mistake.
+    let workdir = match arguments.optional_str("workdir") {
+        Ok(workdir) => workdir,
+        Err(failure) => return ToolResult::new(id, failure),
+    };
+    let timeout_ms = match arguments.optional_u32("timeout_ms") {
+        Ok(timeout) => timeout.map_or(DEFAULT_TIMEOUT_MS, u64::from),
+        Err(failure) => return ToolResult::new(id, failure),
+    };
+    // The schema documents the default as the workspace root, and the process's own
+    // directory is not it: a run started elsewhere, or a service, would otherwise execute
+    // the command somewhere the model was told it would not. The root comes from the port,
+    // so the directory the command runs in and the directory the sandbox reasons about are
+    // the same one.
+    let workspace_root = shell.sandbox().workspace_root;
+    let cwd = workdir.map_or(workspace_root, std::path::PathBuf::from);
 
     let request = ShellRequest {
         timeout: Some(Duration::from_millis(timeout_ms)),
         max_output_bytes: MAX_OUTPUT_BYTES,
-        ..ShellRequest::shell(command, workdir)
+        ..ShellRequest::shell(command, Some(cwd))
     };
     let outcome = shell.run(request).await;
     let outcome = match outcome {
@@ -263,6 +273,48 @@ mod tests {
         let rendered = render_outcome(&outcome("no trailing newline", "", Some(0), false, false));
         // The status line must not run into the output.
         assert!(rendered.contains("newline\n[exit code: 0]"), "{rendered}");
+    }
+
+    /// A wrongly typed optional argument is refused, not folded into its default.
+    ///
+    /// `Arguments` exists to turn a model's malformed call into a correction it can read;
+    /// every tool used to discard that correction with `unwrap_or(None)`, so `"timeout_ms":
+    /// "fast"` quietly meant two minutes and the model learned nothing.
+    #[tokio::test]
+    async fn a_wrongly_typed_timeout_is_reported_rather_than_defaulted() {
+        let port: Box<dyn nanus_ports::ShellPort> = Box::new(crate::tests_support::UnusedShell);
+        let shell: ShellHandle = std::rc::Rc::new(port);
+        let tool = bash_tool(shell);
+        let result = tool
+            .execute(ToolCall::new(
+                ToolCallId::new("c1"),
+                ToolName::new("bash").unwrap_or_else(|_| unreachable!("bash is valid")),
+                json!({ "command": "true", "timeout_ms": "fast" }),
+            ))
+            .await;
+        let ToolOutcome::Failure { message, .. } = &result.outcome else {
+            panic!("a wrong type is a failure: {:?}", result.outcome);
+        };
+        assert!(message.contains("timeout_ms"), "{message}");
+        assert!(
+            !message.contains("never run"),
+            "the call is refused before the port is reached: {message}"
+        );
+
+        // Pair assertion: the same call without the field reaches the port, so the refusal
+        // above is the argument's type rather than the call.
+        let reached = tool
+            .execute(ToolCall::new(
+                ToolCallId::new("c2"),
+                ToolName::new("bash").unwrap_or_else(|_| unreachable!("bash is valid")),
+                json!({ "command": "true" }),
+            ))
+            .await;
+        let ToolOutcome::Failure { message, .. } = &reached.outcome else {
+            panic!("the stub port cannot run anything");
+        };
+        assert!(message.contains("never run"), "{message}");
+        assert!(!message.contains("timeout_ms"), "{message}");
     }
 
     #[test]

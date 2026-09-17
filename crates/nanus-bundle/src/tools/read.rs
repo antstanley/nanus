@@ -111,15 +111,14 @@ async fn read_outcome(fs: FsHandle, id: ToolCallId, arguments: &Arguments<'_>) -
         Ok(path) => path,
         Err(failure) => return ToolResult::new(id, failure),
     };
-    let offset = arguments
-        .optional_u32("offset")
-        .unwrap_or(None)
-        .unwrap_or(1)
-        .max(1);
-    let requested = arguments
-        .optional_u32("limit")
-        .unwrap_or(None)
-        .unwrap_or(DEFAULT_READ_LIMIT);
+    let offset = match arguments.optional_u32("offset") {
+        Ok(offset) => offset.unwrap_or(1).max(1),
+        Err(failure) => return ToolResult::new(id, failure),
+    };
+    let requested = match arguments.optional_u32("limit") {
+        Ok(limit) => limit.unwrap_or(DEFAULT_READ_LIMIT),
+        Err(failure) => return ToolResult::new(id, failure),
+    };
     // A zero-line window is nonsense, and the workspace's habit is to refuse a nonsense
     // budget rather than reinterpret it: `AgentConfig::validate` rejects a zero step budget
     // for the same reason. Reinterpreting it as one would answer a question the model did
@@ -347,6 +346,43 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanus_domain::ToolCallId;
+    use nanus_ports::FsPort;
+
+    /// A filesystem handle for the argument paths, which never reaches the port.
+    fn fs_handle() -> FsHandle {
+        let port: Box<dyn FsPort> = Box::new(crate::tests_support::UnusedFs);
+        std::rc::Rc::new(port)
+    }
+
+    /// A wrongly typed optional argument is refused, not folded into its default.
+    #[tokio::test]
+    async fn a_wrongly_typed_window_is_reported_rather_than_defaulted() {
+        let tool = read_tool(fs_handle());
+        for arguments in [
+            json!({ "file_path": "a.txt", "offset": "first" }),
+            json!({ "file_path": "a.txt", "limit": "all of it" }),
+        ] {
+            let result = tool
+                .execute(ToolCall::new(
+                    ToolCallId::new("c1"),
+                    ToolName::new("read").unwrap_or_else(|_| unreachable!("read is valid")),
+                    arguments.clone(),
+                ))
+                .await;
+            let ToolOutcome::Failure { message, .. } = &result.outcome else {
+                panic!("{arguments} must be refused: {:?}", result.outcome);
+            };
+            assert!(
+                message.contains("offset") || message.contains("limit"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("does not exist"),
+                "the call is refused before any file is looked for: {message}"
+            );
+        }
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

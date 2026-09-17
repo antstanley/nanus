@@ -308,23 +308,29 @@ impl LocalFs {
             truncated: false,
             files_scanned: 0,
         };
-        for file in Self::walk(&root, query.include_hidden) {
-            if outcome.matches.len() >= query.max_results {
-                outcome.truncated = true;
-                break;
-            }
+        // `truncated` is a claim about what was *dropped*, so the cap is checked where a
+        // match is about to be added rather than at the top of a loop. Stopping as soon as
+        // the cap filled up said "more than {cap} matches" whenever any file remained to
+        // walk — including when none of the rest matched at all, which is a confident
+        // falsehood a model cannot check.
+        'files: for file in Self::walk(&root, query.include_hidden) {
             match &matcher {
                 Matcher::Glob { set } => {
                     // Matched against the path *relative to the search root*, so the
                     // pattern anchors where the caller asked it to.
                     let relative = file.strip_prefix(&root).unwrap_or(&file);
-                    if matches_glob(set, relative) {
-                        outcome.matches.push(SearchMatch {
-                            path: file,
-                            line_number: 0,
-                            line: String::new(),
-                        });
+                    if !matches_glob(set, relative) {
+                        continue;
                     }
+                    if outcome.matches.len() >= query.max_results {
+                        outcome.truncated = true;
+                        break 'files;
+                    }
+                    outcome.matches.push(SearchMatch {
+                        path: file,
+                        line_number: 0,
+                        line: String::new(),
+                    });
                 }
                 Matcher::Literal(needle) => {
                     if let Some(len) = metadata_len(&file)
@@ -337,7 +343,7 @@ impl LocalFs {
                     };
                     outcome.files_scanned = outcome.files_scanned.saturating_add(1);
                     if collect_literal(&file, &text, needle, query, &mut outcome) {
-                        break;
+                        break 'files;
                     }
                 }
             }
@@ -416,7 +422,12 @@ fn text_for_search(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Appends the matching lines of one file, returning whether the cap was reached.
+/// Appends the matching lines of one file, returning whether the cap dropped a match.
+///
+/// A `true` means a match was found beyond the cap and is *not* in the result, which is the
+/// only thing that makes the search truncated. Finding exactly the cap's worth of matches and
+/// then running out of text is a complete result, and reporting it as truncated would send a
+/// model looking for something that is not there.
 fn collect_literal(
     path: &Path,
     text: &str,
@@ -433,15 +444,15 @@ fn collect_literal(
         if !haystack.contains(needle) {
             continue;
         }
+        if outcome.matches.len() >= query.max_results {
+            outcome.truncated = true;
+            return true;
+        }
         outcome.matches.push(SearchMatch {
             path: path.to_path_buf(),
             line_number: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
             line: line.to_owned(),
         });
-        if outcome.matches.len() >= query.max_results {
-            outcome.truncated = true;
-            return true;
-        }
     }
     false
 }

@@ -21,11 +21,13 @@
 //! — because nobody is.
 
 use std::io::IsTerminal as _;
+use std::rc::Rc;
 
 use nanus_bundle::Approver;
 use nanus_domain::{ApprovalOutcome, ApprovalRequest};
 use nanus_ports::LocalBoxFuture;
 use tokio::io::AsyncReadExt as _;
+use tokio::sync::Notify;
 
 /// The longest answer worth reading, in bytes.
 ///
@@ -38,6 +40,8 @@ const MAX_ANSWER_BYTES: usize = 64;
 pub struct TerminalApprover {
     /// Whether stdin is a terminal worth asking.
     interactive: bool,
+    /// Woken when the run is asked to stop, which abandons the question.
+    stop: Option<Rc<Notify>>,
 }
 
 impl TerminalApprover {
@@ -49,7 +53,21 @@ impl TerminalApprover {
             // keyboard. A run whose *output* is redirected but whose input is a terminal is
             // still a person watching.
             interactive: std::io::stdin().is_terminal(),
+            stop: None,
         }
+    }
+
+    /// Abandons the question when `stop` is woken, which is how `Ctrl-C` gets out of a
+    /// prompt.
+    ///
+    /// Without this the key set the turn's stop flag and then *nothing happened*: the turn is
+    /// parked inside this question, so it never reaches the checkpoint that reads the flag.
+    /// The reader's one key for "stop" appeared to do nothing while the question was up, and
+    /// they had to answer it before stopping for real.
+    #[must_use]
+    pub fn abandoned_when(mut self, stop: Rc<Notify>) -> Self {
+        self.stop = Some(stop);
+        self
     }
 }
 
@@ -60,7 +78,19 @@ impl Approver for TerminalApprover {
                 return ApprovalOutcome::Unavailable;
             }
             ask(&request);
-            answer_of(&read_answer().await)
+            let answer = match self.stop.as_ref() {
+                Some(stop) => {
+                    tokio::select! {
+                        answer = read_answer() => answer,
+                        // An interrupt is not an answer, and it denies the call: the reader
+                        // asked to stop, and `Cancelled` says exactly that while the turn
+                        // reads its flag at the next checkpoint.
+                        () = stop.notified() => Vec::new(),
+                    }
+                }
+                None => read_answer().await,
+            };
+            answer_of(&answer)
         })
     }
 }
@@ -150,10 +180,54 @@ mod tests {
     async fn without_a_terminal_the_answer_is_unavailable() {
         // A piped stdin is not an answerer, and the loop denies what it cannot have
         // approved — the same outcome as nobody being at the keyboard.
-        let approver = TerminalApprover { interactive: false };
-        let name =
-            nanus_domain::ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
-        let outcome = approver.decide(ApprovalRequest::new(name)).await;
+        let approver = TerminalApprover {
+            interactive: false,
+            stop: None,
+        };
+        let outcome = approver.decide(ApprovalRequest::new(tool())).await;
         assert_eq!(outcome, ApprovalOutcome::Unavailable);
+    }
+
+    fn tool() -> nanus_domain::ToolName {
+        nanus_domain::ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"))
+    }
+
+    /// An interrupt abandons the question instead of leaving the reader stuck in it.
+    ///
+    /// Note the order: the question is *already* open and nobody is typing, because that is
+    /// the state a reader is in when they press `Ctrl-C` here.
+    #[tokio::test]
+    async fn an_interrupt_abandons_an_open_question() {
+        let stop = Rc::new(Notify::new());
+        let approver = TerminalApprover {
+            interactive: true,
+            stop: Some(Rc::clone(&stop)),
+        };
+        let asking = approver.decide(ApprovalRequest::new(tool()));
+        let answering = async {
+            // Let the question open, then raise the interrupt.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            stop.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(asking, answering);
+        // Cancelled rather than `Rejected`: the reader did not answer, which is a different
+        // thing to have said — and both deny the call.
+        assert_eq!(outcome, ApprovalOutcome::Cancelled);
+        assert!(!outcome.is_allowed());
+    }
+
+    /// An interrupt raised *before* the question opens is still honoured, which is what makes
+    /// the key reliable rather than a race: `notify_one` stores a permit, so a waiter that
+    /// arrives late finds it.
+    #[tokio::test]
+    async fn an_interrupt_before_the_question_is_not_lost() {
+        let stop = Rc::new(Notify::new());
+        stop.notify_one();
+        let approver = TerminalApprover {
+            interactive: true,
+            stop: Some(Rc::clone(&stop)),
+        };
+        let outcome = approver.decide(ApprovalRequest::new(tool())).await;
+        assert_eq!(outcome, ApprovalOutcome::Cancelled);
     }
 }
