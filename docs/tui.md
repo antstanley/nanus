@@ -525,10 +525,12 @@ happened: how many lines went, or which failure it was.
 without having to point at it. It takes the last thing the *model* wrote rather than whatever
 came last, because a tool line after an answer is not what a reader means by it.
 
-A selection is a range of *rendered* rows, which has two consequences worth knowing. A resize
-re-wraps every paragraph, so the same range would mean different text: the selection is
-dropped rather than left to highlight something nobody chose, and so is a selection when the
-transcript is cleared. And a line the *drawer* has to wrap — one wider than the terminal that
+A selection is a range of *rendered* rows, which has a consequence worth knowing: anything
+that re-renders the transcript drops it, rather than leaving a highlight over text nobody
+chose. A resize re-wraps every paragraph; `Ctrl+L` or `/clear` takes the lines away
+altogether; and the two summary toggles (`Ctrl+T`, `Ctrl+E`) and `Ctrl+O` change what the
+lines *are*. Making a selection after the toggle rather than before is the whole cost, and it
+is cheaper than a highlight that says one thing and copies another. And a line the *drawer* has to wrap — one wider than the terminal that
 the renderer did not wrap itself — is selected whole, because which character a wrapped row
 begins with is the drawing library's business and it does not report it. Every line a model's
 answer is made of is wrapped by the renderer, so this is rare, and it errs towards copying

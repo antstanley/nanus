@@ -1977,6 +1977,9 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         // one-line form for a reader skimming, the whole call for a reader studying it.
         KeyCode::Char('o' | 'O') => {
             view.toggle_detail();
+            // The transcript is re-rendered, so a selection made against the old one is a range of
+            // lines that no longer say what they said.
+            view.clear_selection();
             Outcome::Continue
         }
         // `Ctrl+V` pastes an image, which a terminal may well have claimed for itself: one that
@@ -2001,12 +2004,14 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         }
         KeyCode::Char('t' | 'T') => {
             view.collapse_tools = !view.collapse_tools;
+            view.clear_selection();
             Outcome::Continue
         }
         // `Ctrl+E` rather than `Ctrl+R`: `Ctrl+R` is the reverse history search, which is
         // what it is in every interface that has one, including the one this mirrors.
         KeyCode::Char('e' | 'E') => {
             view.collapse_reasoning = !view.collapse_reasoning;
+            view.clear_selection();
             Outcome::Continue
         }
         KeyCode::Char('r' | 'R') => {
@@ -3548,6 +3553,25 @@ mod tests {
         copy_last_answer(&send, &mut empty);
         assert!(nothing.borrow().is_empty());
         assert!(empty.status.contains("no answer"), "{}", empty.status);
+    }
+
+    /// A key that re-renders the transcript drops the selection, because the lines it named are not
+    /// the lines it named any more.
+    #[test]
+    fn a_toggle_that_re_renders_drops_the_selection() {
+        for code in ['o', 't', 'e', 'l'] {
+            let mut view = ViewState::new();
+            view.transcript
+                .push(Entry::prose(Role::Assistant, "an answer"));
+            drawn(&mut view, 60, 16);
+            view.select_range(crate::view::Place::start(0), crate::view::Place::end(1), 60);
+            assert!(view.has_selection(), "the selection is made");
+            let _ = handle_key(key(KeyCode::Char(code), KeyModifiers::CONTROL), &mut view);
+            assert!(
+                !view.has_selection(),
+                "Ctrl+{code} re-renders, so the selection goes"
+            );
+        }
     }
 
     /// The mouse: a press in the transcript starts a selection, a drag draws it, and the release ends
