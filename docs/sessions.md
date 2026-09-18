@@ -164,9 +164,21 @@ session: 01a09a9d-8aa2-7736-86a6-7c6d3dedaa7a  shared-work  idle  2 attached  3 
   a busy session is refused with a message rather than queued — the model has not seen the
   first answer yet, and pretending otherwise would reorder the conversation.
 
-A client that attaches mid-turn sees the rest of that turn rather than all of it, because
-the frames before it went out to clients that were already there. Its transcript is still
-whole: the agent records the turn, and the store is where a client reads history.
+A client that attaches mid-turn **catches up with the turn it landed in**. The frames
+before it arrived went out to clients that were already there, and the store does not have
+the turn yet — the log is written when a turn ends — so the agent hands it the part of the
+running turn nothing else holds: the prompt, the steps, and the deltas so far, in order, as
+one `Backlog` frame immediately after the attachment. The turn is then already on screen,
+and the live frames continue from there rather than beginning in the middle of a sentence.
+
+That batch is not history and does not become a second copy of it. It holds exactly what
+the store has not got, it is folded where folding changes nothing (two adjacent deltas of
+one kind are one piece of text either way), and it is emptied the moment the turn is
+written down — so a client attaching at any instant sees a finished turn in the store and a
+running one in the backlog, never both and never neither. A question the turn is waiting on
+crosses the same way, because it is state rather than history: a client arriving after the
+question went out is shown it, with the reason the first client was given, and can answer
+it.
 
 The agent holds at most [`MAX_HELD_SESSIONS`](../crates/nanus-link/src/server.rs) open, and
 lets the least recently used *idle* one go when it needs room. The bound yields to the work:
@@ -182,6 +194,7 @@ A session is the agent's; a client's view of it is a handful of frames.
 |---|---|
 | `Ready` | What the agent is — workspace, model, tool count. |
 | `Attached` | Which session this connection is now a view of. |
+| `Backlog` | The turn that was already running, so a client that attached in the middle of one has the whole turn rather than its tail. |
 | `Sessions` | The sessions the agent is holding. |
 | `User` | Somebody asked something, sent to every view but the one that asked. |
 | `Text`, `Reasoning`, `Step`, `Tool`, `ToolDone`, `Usage` | The turn, as it happens. |
@@ -190,7 +203,8 @@ A session is the agent's; a client's view of it is a handful of frames.
 
 Deliberately not a session log. A client that wants the conversation reads it from the
 store, where it is already durable, rather than receiving a second copy over a socket that
-would then be a second source of truth.
+would then be a second source of truth — which is why `Backlog` holds only the turn in
+flight and is emptied as soon as that turn is in the log.
 
 ## Known limits
 

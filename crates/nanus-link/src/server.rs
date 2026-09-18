@@ -256,6 +256,12 @@ struct Headline {
 struct Question {
     /// The tool the question is about.
     tool: ToolName,
+    /// Why the harness is asking, in its own words.
+    ///
+    /// Kept because the question may be *re-sent*: a client that attaches while the turn
+    /// waits on this question is shown it, and a question replayed without its reason would
+    /// ask a person to decide on less than the first client was told.
+    reason: Option<String>,
     /// How the answer reaches the turn.
     sender: oneshot::Sender<ApprovalOutcome>,
 }
@@ -282,6 +288,15 @@ struct Held {
     /// it has not. Cleared when a turn starts, so a request that arrived a moment after the
     /// last turn ended cannot stop the next one before it begins.
     stop: Cell<bool>,
+    /// The frames of the turn in progress, so a client that attaches in the middle of one
+    /// can be shown the whole turn rather than its tail.
+    ///
+    /// This is exactly the part of the turn the store does not have yet, and no more: the
+    /// log is written when a turn ends, so a turn that is running is the one thing a client
+    /// cannot read anywhere else. Cleared the moment the turn is saved. Adjacent deltas are
+    /// folded together as they arrive, which bounds this by the number of *segments* a turn
+    /// has rather than by the number of tokens it streamed.
+    turn: RefCell<Vec<Frame>>,
     /// Approval questions this session is waiting on, keyed by the id sent to clients.
     ///
     /// The sender is how a client's answer reaches the turn: `Request::Approve` looks the
@@ -341,14 +356,72 @@ impl Held {
         };
     }
 
+    /// Records one frame of the turn in progress.
+    ///
+    /// Two adjacent deltas of the same kind are one piece of text however they were
+    /// divided, so they are folded here: a client replays the same answer either way, and
+    /// this keeps a long turn from being thousands of frames in memory. Everything else is
+    /// pushed as it came, because the order of a turn is the turn.
+    fn seen(&self, frame: &Frame) {
+        let mut turn = self.turn.borrow_mut();
+        match (turn.last_mut(), frame) {
+            (Some(Frame::Text { delta: held }), Frame::Text { delta: more }) => held.push_str(more),
+            (Some(Frame::Reasoning { delta: held }), Frame::Reasoning { delta: more }) => {
+                held.push_str(more);
+            }
+            _ => turn.push(frame.clone()),
+        }
+    }
+
+    /// Returns the frames of the turn in progress, oldest first.
+    fn turn_frames(&self) -> Vec<Frame> {
+        self.turn.borrow().clone()
+    }
+
+    /// Notes that the session has been written down.
+    ///
+    /// Called immediately after a *successful* save and never after a failed one: what this
+    /// holds is what the store does not have, so a turn the store failed to record is
+    /// exactly what a later client still needs to be caught up with.
+    fn saved(&self) {
+        self.turn.borrow_mut().clear();
+    }
+
+    /// Returns a question frame for every approval this session is still waiting on.
+    ///
+    /// Questions are state rather than history. One that has been answered is over and must
+    /// not be asked again; one that is still open is blocking the turn, so a client arriving
+    /// now is shown it — and can answer it, because the answer is looked up by id here.
+    fn open_questions(&self) -> Vec<Frame> {
+        self.approvals
+            .borrow()
+            .iter()
+            .map(|(call_id, question)| Frame::Approval {
+                call_id: call_id.clone(),
+                tool: question.tool.as_str().to_owned(),
+                reason: question.reason.clone(),
+            })
+            .collect()
+    }
+
     /// Opens an approval question and returns the id a client answers with.
-    fn ask(&self, tool: ToolName, sender: oneshot::Sender<ApprovalOutcome>) -> String {
+    fn ask(
+        &self,
+        tool: ToolName,
+        reason: Option<String>,
+        sender: oneshot::Sender<ApprovalOutcome>,
+    ) -> String {
         let next = self.approval_seq.get().saturating_add(1);
         self.approval_seq.set(next);
         let call_id = format!("a{next}");
-        self.approvals
-            .borrow_mut()
-            .insert(call_id.clone(), Question { tool, sender });
+        self.approvals.borrow_mut().insert(
+            call_id.clone(),
+            Question {
+                tool,
+                reason,
+                sender,
+            },
+        );
         call_id
     }
 
@@ -447,6 +520,7 @@ impl Registry {
             headline: RefCell::new(Headline::default()),
             session: RefCell::new(session),
             name,
+            turn: RefCell::new(Vec::new()),
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),
             stop: Cell::new(false),
@@ -729,7 +803,9 @@ impl Approver for LinkApprover<'_> {
                 return ApprovalOutcome::Unavailable;
             }
             let (sender, receiver) = oneshot::channel();
-            let call_id = self.held.ask(request.tool.clone(), sender);
+            let call_id = self
+                .held
+                .ask(request.tool.clone(), request.reason.clone(), sender);
             broadcast_awaited(
                 self.held,
                 Frame::Approval {
@@ -793,10 +869,16 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
         // not a completed turn, and only the reason says so: without it the interface
         // draws the last thing the model happened to say as though it were an answer.
         Ok(result) => match agent.record(&session).await {
-            Ok(()) => Frame::Done {
-                answer: result.answer,
-                reason: TurnEnd::from(&result.reason),
-            },
+            // Cleared with no await in between, so the backlog and the log cannot both be
+            // behind or ahead: a client attaching at any instant sees the turn either in the
+            // store or in the backlog, and never in both and never in neither.
+            Ok(()) => {
+                held.saved();
+                Frame::Done {
+                    answer: result.answer,
+                    reason: TurnEnd::from(&result.reason),
+                }
+            }
             Err(error) => Frame::Failed {
                 message: format!("the session could not be recorded: {error}"),
             },
@@ -805,8 +887,11 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
         // failed is what the next attempt has to work from, and a conversation that
         // silently forgot its own failure would repeat it.
         Err(error) => {
-            if let Err(recorded) = agent.record(&session).await {
-                tracing::warn!(%recorded, "a failed turn could not be recorded");
+            match agent.record(&session).await {
+                // Cleared here for the same reason and in the same place: a turn that failed
+                // is still written down, and once it is, the log has it.
+                Ok(()) => held.saved(),
+                Err(recorded) => tracing::warn!(%recorded, "a failed turn could not be recorded"),
             }
             Frame::Failed {
                 message: error.to_string(),
@@ -876,6 +961,9 @@ impl Broadcast<'_> {
     /// frame: the store holds the conversation, so a missing delta costs a re-read rather
     /// than a fact.
     fn push(&self, frame: &Frame) {
+        // Recorded before it is queued, so the backlog holds every frame any viewer was
+        // sent: a client that attaches after this one goes out is caught up with it.
+        self.held.seen(frame);
         self.held.viewers.borrow_mut().retain(|(_, sender)| {
             !matches!(
                 sender.try_send(frame.clone()),
@@ -1404,8 +1492,29 @@ async fn attach(
     held: &Rc<Held>,
     frames: &mpsc::Sender<Frame>,
 ) -> (u64, Rc<Held>) {
+    // One synchronous region: the backlog is snapshotted, the reply that explains it and the
+    // batch itself are queued, and the viewer is registered — with no await anywhere in
+    // between. That is what makes catching up exact rather than nearly exact:
+    //
+    //   * every frame the turn produced before this instant is in the backlog,
+    //   * every frame it produces after goes to the registered viewer,
+    //   * and the batch is queued before any live frame can be, so the turn is drawn in
+    //     order rather than from its middle.
+    //
+    // An await in here would open a window where a live frame could be queued ahead of the
+    // backlog — the newest delta drawn before the text it continues.
+    let backlog = held.turn_frames();
     let viewer = registry.view(held, frames);
-    send(frames, Frame::Attached(held.info())).await;
+    queue_now(frames, Frame::Attached(held.info()));
+    if !backlog.is_empty() {
+        queue_now(frames, Frame::Backlog { frames: backlog });
+    }
+    // A question the turn is waiting on is state rather than history: a client that arrived
+    // after it went out is shown it here, and can answer it, because the answer is matched
+    // by id against the session's open questions.
+    for question in held.open_questions() {
+        send(frames, question).await;
+    }
     // The state follows the attachment, so an interface knows what the toggle is showing
     // before a reader can press the key. Sent after `Attached` and not before, because the
     // client reads frames until the attachment and would discard one that arrived first.
@@ -1495,7 +1604,11 @@ async fn start_turn(
     // Waited for rather than dropped on a full queue: a watcher that misses the prompt
     // reads an answer to a question it never saw, which the protocol promises cannot
     // happen.
-    broadcast_awaited(held, Frame::User { text: text.clone() }, Some(viewer)).await;
+    let asked = Frame::User { text: text.clone() };
+    // The prompt is part of the turn, so a client that arrives after it goes out is shown
+    // it too: an answer to a question a reader never saw is the conversation unreadable.
+    held.seen(&asked);
+    broadcast_awaited(held, asked, Some(viewer)).await;
     held.touched.set(registry.stamp());
     // Two handles: one for the task to own, one to hand the task to. Building the future
     // before borrowing the task set is what keeps the move of the first out of the
@@ -1504,6 +1617,17 @@ async fn start_turn(
     let held = Rc::clone(held);
     let task = async move { run_turn(&owner.agent, &held, text).await };
     registry.spawn_turn(task);
+}
+
+/// Queues one frame without waiting.
+///
+/// For the two frames of an attachment, which must be queued in a region that cannot yield:
+/// a full queue there is a client that has stopped reading and a closed one is a client that
+/// has gone, and neither is worth waiting for.
+fn queue_now(frames: &mpsc::Sender<Frame>, frame: Frame) {
+    if let Err(error) = frames.try_send(frame) {
+        tracing::debug!(%error, "a frame could not be queued without waiting");
+    }
 }
 
 /// Queues one frame, waiting rather than dropping when the queue is full.
@@ -1561,6 +1685,7 @@ mod tests {
             session: RefCell::new(session),
             name: None,
             headline: RefCell::new(Headline::default()),
+            turn: RefCell::new(Vec::new()),
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),
             stop: Cell::new(false),
@@ -1593,6 +1718,69 @@ mod tests {
             models: vec![String::from("silent")],
             tools: 0,
         }))))
+    }
+
+    /// The backlog is the turn in progress: everything a late client needs, in order, folded
+    /// where folding changes nothing, and emptied when the store has the turn instead.
+    #[test]
+    fn the_turn_in_progress_is_kept_for_a_client_that_has_not_arrived_yet() {
+        let session = held("catch-up");
+        session.seen(&Frame::User {
+            text: "do it".to_owned(),
+        });
+        session.seen(&Frame::Step { step: 1 });
+        session.seen(&Frame::Text {
+            delta: "Hel".to_owned(),
+        });
+        session.seen(&Frame::Text {
+            delta: "lo".to_owned(),
+        });
+        session.seen(&Frame::Reasoning {
+            delta: "hmm".to_owned(),
+        });
+        session.seen(&Frame::Reasoning {
+            delta: " more".to_owned(),
+        });
+        session.seen(&Frame::Text {
+            delta: "!".to_owned(),
+        });
+
+        let frames = session.turn_frames();
+        // Five, not seven: two adjacent deltas of one kind are one piece of text either way,
+        // and a non-delta frame between them keeps them apart.
+        assert_eq!(frames.len(), 5, "{frames:?}");
+        assert!(
+            matches!(frames.first(), Some(Frame::User { text }) if text == "do it"),
+            "the prompt comes first: {frames:?}"
+        );
+        assert!(matches!(frames.get(1), Some(Frame::Step { step: 1 })));
+        assert!(matches!(frames.get(2), Some(Frame::Text { delta }) if delta == "Hello"));
+        assert!(matches!(frames.get(3), Some(Frame::Reasoning { delta }) if delta == "hmm more"));
+        assert!(matches!(frames.get(4), Some(Frame::Text { delta }) if delta == "!"));
+
+        // A question the turn is waiting on is state, so a client arriving now is shown it —
+        // with the words the first client was given — and can answer it.
+        let (sender, _receiver) = oneshot::channel();
+        let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let reason = String::from("the sandbox mode `read_only` does not permit execute");
+        let call_id = session.ask(bash, Some(reason.clone()), sender);
+        let questions = session.open_questions();
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert!(
+            matches!(
+                questions.first(),
+                Some(Frame::Approval { call_id: asked, tool, reason: Some(why) })
+                    if asked == &call_id && tool == "bash" && why == &reason
+            ),
+            "{questions:?}"
+        );
+        // Answered, it is over, and it must not be asked a second time.
+        assert!(session.answer(&call_id, true, false));
+        assert!(session.open_questions().is_empty());
+
+        // Written down, there is nothing left that the store does not have.
+        session.saved();
+        assert!(session.turn_frames().is_empty());
     }
 
     #[tokio::test]
@@ -1778,7 +1966,7 @@ mod tests {
         let session = held("always");
         let (sender, _receiver) = oneshot::channel();
         let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
-        let call_id = session.ask(bash.clone(), sender);
+        let call_id = session.ask(bash.clone(), None, sender);
         assert!(
             session.answer(&call_id, true, true),
             "the answer settles the question"
@@ -1806,7 +1994,7 @@ mod tests {
         let session = held("refused-always");
         let (sender, _receiver) = oneshot::channel();
         let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
-        let call_id = session.ask(bash.clone(), sender);
+        let call_id = session.ask(bash.clone(), None, sender);
         assert!(session.answer(&call_id, false, true));
         assert!(!session.is_approved(&bash), "a refusal grants nothing");
     }
@@ -1834,7 +2022,7 @@ mod tests {
         let session = held("abandoned");
         let (sender, receiver) = oneshot::channel();
         let name = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
-        let call_id = session.ask(name, sender);
+        let call_id = session.ask(name, Some(String::from("a test reason")), sender);
         assert_eq!(session.approvals.borrow().len(), 1, "the question is open");
         session.abandon_approvals();
         assert!(

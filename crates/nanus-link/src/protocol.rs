@@ -508,6 +508,27 @@ pub enum Frame {
     /// A reply to [`Request::Status`].
     Status(AgentInfo),
 
+    /// The turn that was already running when this client attached, so far.
+    ///
+    /// Sent once, immediately after [`Frame::Attached`] and before any live frame of that
+    /// turn, and only when there is a turn in flight. The frames inside are the ones a
+    /// client that had been attached all along would already have seen — in the same order,
+    /// with adjacent deltas folded together — so the client replays them and its transcript
+    /// is whole rather than beginning mid-turn.
+    ///
+    /// It is *not* history. A turn that has ended is in the session log, which is where a
+    /// client reads it from; this carries only the part of a running turn that the log does
+    /// not have yet, because the log is written when the turn ends. Empty for an attachment
+    /// to an idle session, which needs nothing.
+    ///
+    /// Nesting frames rather than repeating them as ordinary ones is what keeps the batch
+    /// atomic: it is one item on the client's queue, so no live frame can slip between the
+    /// frames it carries and reorder the turn.
+    Backlog {
+        /// The turn so far, oldest first.
+        frames: Vec<Self>,
+    },
+
     /// The agent is stopping.
     Bye,
 }
@@ -531,12 +552,13 @@ impl Frame {
 /// happening (a stale `NANUS_TUI`, a partial rebuild), and without a version the first
 /// frame that changed shape is a decode error naming a field rather than a sentence naming
 /// the mismatch. Bump this when a frame's meaning changes in a way an older peer would
-/// misread.
+/// misread — including when a variant is *added*, because an unknown variant is a decode
+/// error rather than something an older peer can ignore.
 ///
 /// The field is optional on the wire and defaults to zero, which is what a build that
 /// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
 /// rather than assuming compatibility.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -743,6 +765,33 @@ mod tests {
             Frame::Bye,
         ];
         for frame in frames {
+            let encoded = encode(&frame);
+            assert!(encoded.is_ok(), "encodes: {encoded:?}");
+            let Ok(encoded) = encoded else { return };
+            let decoded = decode::<Frame>(&encoded);
+            assert_eq!(decoded.ok(), Some(frame.clone()), "round trip of {frame:?}");
+        }
+    }
+
+    /// A backlog is the one recursive shape here — a frame that carries frames — so it gets
+    /// its own round trip: empty, for an attachment to an idle session, and carrying a turn,
+    /// which is what a late client is actually sent.
+    #[test]
+    fn a_backlog_round_trips_the_frames_it_carries() {
+        for frame in [
+            Frame::Backlog { frames: Vec::new() },
+            Frame::Backlog {
+                frames: vec![
+                    Frame::User {
+                        text: "what is this".to_owned(),
+                    },
+                    Frame::Step { step: 1 },
+                    Frame::Text {
+                        delta: "hello".to_owned(),
+                    },
+                ],
+            },
+        ] {
             let encoded = encode(&frame);
             assert!(encoded.is_ok(), "encodes: {encoded:?}");
             let Ok(encoded) = encoded else { return };

@@ -17,6 +17,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 // For `chain`, which is how the slow model delays its answer.
 use futures::StreamExt as _;
@@ -70,6 +71,37 @@ impl LlmPort for SlowLlm {
                 reason: FinishReason::Stop,
             }])),
         )
+    }
+}
+
+/// A model that holds its turn open until the test lets it answer.
+///
+/// What makes "a client attaches in the middle of a turn" a fact rather than a race: the
+/// test waits for the permit the stream takes on entry, and the turn is then inside the
+/// model's response — with its steps already broadcast — until the release permit is given.
+struct WaitingLlm {
+    /// Given by the stream when it is entered, so the test knows the turn is in flight.
+    entered: Arc<tokio::sync::Semaphore>,
+    /// Awaited by the stream, so the turn stays in flight until the test says otherwise.
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl LlmPort for WaitingLlm {
+    fn model(&self) -> &'static str {
+        "waiting"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        let held = futures::stream::once(async move {
+            entered.add_permits(1);
+            let _permit = release.acquire().await;
+            LlmEvent::TextDelta("the rest".to_owned())
+        });
+        Box::pin(held.chain(futures::stream::iter(vec![LlmEvent::Finished {
+            reason: FinishReason::Stop,
+        }])))
     }
 }
 
@@ -1009,6 +1041,140 @@ fn a_running_session_can_be_listed_and_joined() {
     assert_eq!(text_of(&owner_frames), "hello back");
     assert_eq!(text_of(&watcher_frames), "hello back");
     assert_eq!(answer_of(&watcher_frames), Some("hello back"));
+}
+
+/// A client that attaches while a turn is running is shown the whole turn, not its tail.
+///
+/// The turn's frames went to the clients that were there, and the store does not have the
+/// turn yet — it is written when the turn ends — so a client arriving in the middle of one
+/// has nothing to read. The agent therefore hands it the part of the running turn that the
+/// log cannot: the prompt, the steps, and the deltas so far, in order, followed by the live
+/// turn from there.
+#[test]
+fn a_client_that_attaches_mid_turn_catches_up() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (agent, _store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(WaitingLlm {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })),
+        "waiting",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+
+        let mut owner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let mine = owner.start(None).await.expect("a session starts");
+        owner
+            .send(&Request::Prompt {
+                text: "do the thing".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        // The turn is now inside the model's response: the prompt and the step have been
+        // broadcast, and nothing else has been produced.
+        let _permit = entered.acquire().await.expect("the turn reached the model");
+
+        let mut joiner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        joiner.attach(&mine.session).await.expect("joins");
+
+        // The backlog is the first thing after the attachment, and it holds the turn so far.
+        let first = joiner.next().await.expect("frames are readable");
+        let Some(Frame::Backlog { frames }) = first else {
+            panic!("expected the turn in flight, got {first:?}");
+        };
+        let mut asked = None;
+        let mut stepped = None;
+        let mut text = String::new();
+        for frame in &frames {
+            match frame {
+                Frame::User { text } => asked = Some(text.clone()),
+                Frame::Step { step } => stepped = Some(*step),
+                Frame::Text { delta } => text.push_str(delta),
+                _ => {}
+            }
+        }
+        // The asking client never sees its own prompt on the wire, so this is the only
+        // record a late attacher can be given of what the turn is answering.
+        assert_eq!(asked.as_deref(), Some("do the thing"));
+        assert_eq!(stepped, Some(1));
+        assert!(text.is_empty(), "the model has not answered yet: {text:?}");
+
+        // Released, the rest of the turn reaches both views, and the joiner's transcript
+        // reads as one turn rather than as one beginning halfway through.
+        release.add_permits(1);
+        let rest = turn_frames(&mut joiner).await;
+        assert_eq!(text_of(&rest), "the rest");
+        assert_eq!(answer_of(&rest), Some("the rest"));
+        let owner_frames = turn_frames(&mut owner).await;
+        assert_eq!(text_of(&owner_frames), "the rest");
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
+/// A turn that has ended is not sent twice: a client attaching to an idle session is given
+/// no backlog, because the store is where a finished turn lives.
+#[test]
+fn an_idle_session_catches_nobody_up() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+
+        let mut owner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let mine = owner.start(None).await.expect("a session starts");
+        owner
+            .send(&Request::Prompt {
+                text: "hello".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let _ = turn_frames(&mut owner).await;
+
+        let mut joiner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        joiner.attach(&mine.session).await.expect("joins");
+        // Everything the joiner is sent after the attachment is one of the attachment's own
+        // frames: the turn is over, so there is nothing to catch it up with.
+        while let Some(frame) = joiner.next().await.expect("frames are readable") {
+            assert!(
+                !matches!(frame, Frame::Backlog { .. }),
+                "an idle session has no turn in flight: {frame:?}"
+            );
+            if matches!(frame, Frame::ModelChanged { .. }) {
+                break;
+            }
+        }
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
 }
 
 #[test]

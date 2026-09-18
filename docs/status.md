@@ -62,9 +62,12 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 - **A session is held in memory while an agent holds it.** Bounded at 32 idle sessions,
   least-recently-used first, and never at the cost of a running turn or an attached
   client. A session that is let go is still on disk and reloads on the next attach.
-- **A client that attaches mid-turn sees the rest of it.** The frames before it went to
-  clients that were already there. The transcript is still whole — the store is where
-  history comes from — but a watcher joining late has a gap until the turn ends.
+- **A client that attaches mid-turn is caught up with that turn, and no further.** The
+  turn in flight crosses as one `Backlog` frame — the prompt, the steps, the deltas so far,
+  and any question the turn is waiting on — and the live turn continues from there. The
+  frames *inside* the batch are folded (adjacent deltas joined), so a client that was
+  attached all along and one that arrived late hold the same text but not necessarily the
+  same number of frames.
 - **One agent, one thread.** A service serves several clients and their turns interleave
   cooperatively, because the kernel is single-threaded and its futures are not `Send`.
   Concurrency is not parallelism, and there is no worker pool. A step's tool calls do run

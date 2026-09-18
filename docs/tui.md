@@ -159,6 +159,15 @@ is held and sent when the agent is ready, which is [queuing a prompt](#queuing-a
 history a client shows comes from the store, where it is already durable. A socket that
 also carried the log would be a second source of truth for something that has one.
 
+The one exception is the turn that is *running*, because the log does not have it yet: the
+store is written when a turn ends, so a client that attaches in the middle of one has
+nothing to read. The agent sends that client a `backlog` frame — the frames of the turn so
+far, in order, folded where folding changes nothing — and the interface replays them through
+the same rendering the live frames use, so a reader who joins mid-turn sees the whole turn
+rather than a transcript beginning halfway through it. The batch is one item on the
+connection's queue, so no live frame can slip inside it and reorder the turn, and it empties
+the instant the turn reaches the log.
+
 **The session is recorded before the ending is sent.** A client that has seen the answer
 is holding one whose transcript is already on disk, which is the same contract `nanus run`
 keeps with its own stdout.

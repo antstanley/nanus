@@ -348,6 +348,11 @@ The only thing the core and the interface share. See
   question or prompt, the progress of a turn (text, reasoning, step boundaries,
   tool call and result, usage), an approval question and its answer, the ending and
   its reason, and interrupt, status, and shutdown requests.
+- **A client that attaches mid-turn catches up.** The turn in flight crosses as one
+  backlog frame — the prompt, the steps, the deltas so far, and any question the turn
+  is waiting on — so a transcript read from a joined session begins at the beginning of
+  the turn rather than in its middle. A turn that has ended is read from the store as
+  before, so nothing travels twice.
 - **A tool call and its result are identifiable.** Both tool frames carry the call's
   id, so a client pairs them by identity rather than by the order two frames happened
   to arrive in — a step sends every call before any result, and its results arrive in

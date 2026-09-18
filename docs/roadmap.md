@@ -117,11 +117,19 @@ The two items the plan had left open in this area are recorded where they belong
 than being quietly dropped: OpenAI's subscription plan is in the table as a refusal, and
 the second platform secret store is a `SecretBackend` implementation nobody has written.
 
+## Shipped: sessions and the link
+
+The first block of the session work, taken in the order it was worth doing. The numbers are
+the plan's, kept because later items refer to them.
+
+| # | Item | Where it landed |
+|---|---|---|
+| 17 | **A client attaching mid-turn catches up.** The turn in flight is the one thing a client cannot read anywhere else — the store is written when a turn *ends* — so the agent keeps, per held session, exactly the frames of the running turn that the log does not have yet, and hands them to a client that attaches in the middle of one. They cross as a single `Backlog` frame right after `Attached`, which is what makes the batch atomic: one item on the connection's queue, so no live frame can slip inside it and draw the newest delta before the text it continues. The snapshot and the viewer's registration happen in one synchronous region, so every frame is either in the batch or in the live stream and never in both. The batch is folded where folding changes nothing (adjacent deltas joined, which bounds it by segments rather than tokens) and emptied in the same instant the turn reaches the log, so a client sees a finished turn in the store and a running one in the batch, never both and never neither. A question the turn is waiting on travels the same way, because it is state rather than history: a client arriving after it went out is shown it, with the reason the first client was given, and can answer it. `PROTOCOL_VERSION` moved to 3, because an added frame variant is a decode error for an older peer rather than something it can ignore. | `nanus-link/src/{protocol,server}.rs`, `nanus-tui/src/runtime.rs`, `docs/sessions.md` |
+
 ## Next: sessions and the link
 
 | # | Item | Size | Notes |
 |---|---|---|---|
-| 17 | **Let a client attaching mid-turn catch up.** | **M** | A client that joins late sees the rest of the turn and no more. The transcript is already in the store, so this is a decision about seeding the view from the log rather than a new source of truth. |
 | 18 | **Propagate a rename to a held session.** | **S** | The store updates immediately and resolving works; a *listing* of held sessions can show the old name until the agent next opens it. |
 | 19 | **Lock a session, or refuse a second writer.** | **M** | Two agents can resume one conversation and the second save wins. A lock file or a store-level check with a clear error, keeping attaching to a live session as the supported path. |
 | 20 | **Decide names: namespaces and case.** | **S** | Names are flat and case-sensitive today, so `Nightly` and `nightly` are two names. Small to change; mostly a decision. |

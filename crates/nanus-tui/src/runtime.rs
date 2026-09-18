@@ -2350,6 +2350,7 @@ fn stopping_notice(reason: &TurnEnd, step: u32) -> Option<String> {
 /// Applies one frame from the agent to the view.
 fn apply(frame: Frame, view: &mut ViewState) {
     match frame {
+        Frame::Backlog { frames } => apply_backlog(frames, view),
         Frame::Text { delta } => {
             view.transcript
                 .append_stream(Role::Assistant, &delta, false);
@@ -2361,8 +2362,8 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.follow();
         }
         Frame::User { text } => {
-            // Somebody else's prompt in a session this interface is watching: the
-            // reader needs to see the question before the answer.
+            // Somebody else's prompt in a session this interface is watching: the reader
+            // needs to see the question before the answer.
             view.transcript.push(Entry::prose(Role::User, text));
             view.begin_turn(1);
             // Somebody else's prompt is not a reason to drag a reader who is looking
@@ -2423,10 +2424,10 @@ fn apply(frame: Frame, view: &mut ViewState) {
             error,
         } => {
             // No content, because the frame carries none: a tool's output is in the
-            // session log, and this frame says only that the call is over and how it
-            // went. A placeholder here used to put the word "done" under every tool call
-            // in a live transcript — a line of screen saying nothing — and with the
-            // outcome moved onto the call's own line it would have said it twice.
+            // session log, and this frame says only that the call is over and how it went.
+            // A placeholder here used to put the word "done" under every tool call in a
+            // live transcript — a line of screen saying nothing — and with the outcome
+            // moved onto the call's own line it would have said it twice.
             view.transcript
                 .push(call_entry(Entry::tool_result(name, error, ""), call_id));
             view.follow();
@@ -2458,35 +2459,53 @@ fn apply(frame: Frame, view: &mut ViewState) {
                 duration_ms,
             });
         }
-        // A turn that stopped early is not a turn that finished, and the reason is the
-        // only thing that says which one this is. Drawing the answer either way is how a
-        // turn that ran out of steps came to look like a completed one: the last thing
-        // the model happened to say was put on screen as its conclusion, and the reader
-        // was left to work out from the silence that the work had been cut off.
-        Frame::Done { answer, reason } => {
-            if let Some(notice) = stopping_notice(&reason, view.step) {
-                view.transcript.settle_tail();
-                view.transcript.push(Entry::notice(notice));
-            } else {
-                // Reconciliation rather than a second copy: the answer already streamed in
-                // delta by delta, and settling that entry is what stops the same paragraph
-                // being drawn twice.
-                view.transcript.settle_with(Role::Assistant, &answer);
-            }
-            closed(view);
-        }
+        Frame::Done { answer, reason } => apply_done(&answer, &reason, view),
         Frame::Failed { message } => {
             view.transcript.push(Entry::notice(message));
             closed(view);
         }
-        // Frames that describe the connection rather than the conversation. The interface
-        // learned what it needed from the handshake and the attachment before it drew
-        // anything, and a `Bye` is the transport's business, not the transcript's.
+        // Frames that describe the connection rather than the conversation: the handshake,
+        // the attachment, a listing, a status, and the goodbye. The interface learned what it
+        // needed from the first two before it drew anything, and a `Bye` is the transport's
+        // business rather than the transcript's.
         Frame::Ready(_)
         | Frame::Attached(_)
         | Frame::Sessions { .. }
         | Frame::Status(_)
         | Frame::Bye => {}
+    }
+}
+
+/// Draws the end of a turn: the answer, or why there is none.
+///
+/// A turn that stopped early is not a turn that finished, and the reason is the only thing
+/// that says which one this is. Drawing the answer either way is how a turn that ran out of
+/// steps came to look like a completed one: the last thing the model happened to say was put
+/// on screen as its conclusion, and the reader was left to work out from the silence that the
+/// work had been cut off.
+fn apply_done(answer: &str, reason: &TurnEnd, view: &mut ViewState) {
+    if let Some(notice) = stopping_notice(reason, view.step) {
+        view.transcript.settle_tail();
+        view.transcript.push(Entry::notice(notice));
+    } else {
+        // Reconciliation rather than a second copy: the answer already streamed in delta by
+        // delta, and settling that entry is what stops the same paragraph being drawn twice.
+        view.transcript.settle_with(Role::Assistant, answer);
+    }
+    closed(view);
+}
+
+/// Draws the turn a client caught up with, by applying the frames it was sent.
+///
+/// The frames inside a backlog are the ones a client that had been attached all along would
+/// already have applied, in the order it would have applied them, folded where the agent
+/// folded them. Replaying them is what makes an attachment in the middle of a turn *catch
+/// up*: the reader sees the prompt, the steps and the answer so far, and the live turn then
+/// continues from there. There is no second rendering path for any of it, which is the point
+/// — a caught-up transcript and a watched one are the same transcript.
+fn apply_backlog(frames: Vec<Frame>, view: &mut ViewState) {
+    for frame in frames {
+        apply(frame, view);
     }
 }
 
@@ -5146,6 +5165,56 @@ mod tests {
         ));
         assert!(!view.permission_open);
         assert_eq!(view.approval, ApprovalPolicy::PerCall);
+    }
+
+    /// A client that attached in the middle of a turn draws the whole turn.
+    ///
+    /// The frames inside a backlog are the ones a client that had been there all along would
+    /// have applied, in the order it would have applied them, so the reader sees the prompt,
+    /// the tool call and the answer so far — and then the live turn continues underneath.
+    /// Without this the transcript of a joined session began mid-sentence.
+    #[test]
+    fn a_backlog_frame_draws_the_turn_it_caught_up_with() {
+        let mut view = ViewState::new();
+        apply(
+            Frame::Backlog {
+                frames: vec![
+                    Frame::User {
+                        text: "do the thing".to_owned(),
+                    },
+                    Frame::Step { step: 1 },
+                    Frame::Text {
+                        delta: "the answer so far".to_owned(),
+                    },
+                ],
+            },
+            &mut view,
+        );
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(
+            said,
+            vec!["do the thing", "the answer so far"],
+            "the prompt and the answer, in that order"
+        );
+        assert_eq!(view.step, 1, "the step it was in the middle of");
+
+        // The live turn continues from there rather than starting a second answer.
+        apply(
+            Frame::Text {
+                delta: ", and the rest".to_owned(),
+            },
+            &mut view,
+        );
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(
+            said,
+            vec!["do the thing", "the answer so far, and the rest"]
+        );
+
+        // An empty backlog — an attachment to an idle session — draws nothing at all.
+        let mut view = ViewState::new();
+        apply(Frame::Backlog { frames: Vec::new() }, &mut view);
+        assert!(view.transcript.entries().is_empty());
     }
 
     /// The agent's own state is what the interface draws, so a state chosen elsewhere — a
