@@ -127,6 +127,8 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     // asserted together: the adapter talks to what the configuration resolved to.
     let selection = Selection::resolve(&settings).expect("the configuration resolves");
     assert_eq!(harness.switch.model(), selection.model());
+    assert_eq!(harness.llm().model(), selection.model());
+    assert!(harness.configured(), "the key was found");
 
     // The prompt the model is sent describes this deployment: the workspace the tools are
     // rooted in, and the two permission knobs the gate enforces. The domain renders this
@@ -286,7 +288,7 @@ fn mounting_from_inside_a_runtime_fails_loudly() {
 }
 
 #[test]
-fn a_configuration_without_a_key_is_refused_before_anything_mounts() {
+fn a_configuration_without_a_key_still_composes_unconfigured() {
     let dir = tempfile::tempdir().expect("temp dir");
     let settings = config(dir.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -294,11 +296,13 @@ fn a_configuration_without_a_key_is_refused_before_anything_mounts() {
         .build()
         .expect("runtime");
 
-    // Composing without a credential fails at the credential check rather than after mounting a
-    // half-built harness. A machine that already holds one — exported, in the keychain, or in the
-    // file store — is not the case under test, because composing *succeeds* there and that is the
-    // correct behaviour: the guard asks the stores rather than the variable alone, or a developer
-    // who once ran `nanus auth set deepseek` would see this test fail for doing its job.
+    // A missing credential is the one failure an agent may start *through*: the composition
+    // substitutes a placeholder adapter that reports the sentence naming `nanus auth set` on the
+    // first request, so the interface opens and the reader can configure a provider with
+    // `/provider`. A machine that already holds one — exported, in the keychain, or in the file
+    // store — is not the case under test, because composing then finds the real adapter and that
+    // is the correct behaviour: the guard asks the stores rather than the variable alone, or a
+    // developer who once ran `nanus auth set deepseek` would see this test fail for doing its job.
     let account = Selection::resolve(&settings)
         .expect("the default configuration resolves")
         .credential_account()
@@ -306,10 +310,10 @@ fn a_configuration_without_a_key_is_refused_before_anything_mounts() {
     let had_key = std::env::var(KEY_ENV).is_ok_and(|value| !value.is_empty())
         || runtime.block_on(stored_credential(&account));
     if !had_key {
-        let outcome = runtime.block_on(compose(&settings));
-        assert!(outcome.is_err(), "a missing key is refused");
-        let Err(error) = outcome else { return };
-        assert!(error.to_string().contains(KEY_ENV), "{error}");
+        let pending = runtime
+            .block_on(compose(&settings))
+            .expect("an unconfigured agent composes");
+        assert!(!pending.configured(), "no credential was found");
     }
 }
 

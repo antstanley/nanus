@@ -13,6 +13,15 @@ pub enum BundleError {
     #[error("invalid configuration: {0}")]
     Config(String),
 
+    /// No credential is stored for the selected provider.
+    ///
+    /// Discrete from [`BundleError::Config`] because it is the one configuration failure an
+    /// agent may *start* through: an interface that opens without a credential lets the reader
+    /// configure one, so the composition substitutes a placeholder adapter and reports this to
+    /// it rather than refusing to start. Every other configuration failure still refuses.
+    #[error("{0}")]
+    Credential(String),
+
     /// A required service was not published.
     ///
     /// This is a composition mistake rather than a runtime condition: the kernel
@@ -61,6 +70,11 @@ impl BundleError {
     /// Builds a [`BundleError::Config`].
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
+    }
+
+    /// Builds a [`BundleError::Credential`].
+    pub fn credential(message: impl Into<String>) -> Self {
+        Self::Credential(message.into())
     }
 
     /// Builds a [`BundleError::Model`].

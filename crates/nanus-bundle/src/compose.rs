@@ -26,8 +26,8 @@ use nanus_adapter_store::JsonlStore;
 use nanus_domain::{AgentConfig, Origin, Session};
 use nanus_kernel::{Context, Kernel, MountContext, Plugin, PluginId};
 use nanus_ports::{
-    ClockHandle, FsHandle, LlmHandle, LlmPort, SandboxPolicy, Secret, SecretHandle, SecretPort,
-    ShellHandle, StoreHandle,
+    ClockHandle, FsHandle, LlmEvent, LlmHandle, LlmPort, LlmStream, SandboxPolicy, Secret,
+    SecretHandle, SecretPort, ShellHandle, StoreHandle,
 };
 
 use crate::ToolRegistryHandle;
@@ -50,6 +50,36 @@ verify your work. Prefer finding out to assuming.
 Your working directory is the workspace root. A non-zero exit code from `bash` is \
 a result, not a failure of the tool: read the output and decide what to do next.";
 
+/// The model adapter a composition falls back to when no provider credential is available.
+///
+/// It is not a provider and it never answers: every request fails with the sentence that says
+/// how to configure one. It exists so an agent can *start* without a credential, so the
+/// interface opens and the reader can run `/provider` — the failure then arrives where it can
+/// be acted on, rather than as a refusal to open the program at all.
+///
+/// The model id it reports is the one the configuration resolved to, so the title bar still
+/// names what *would* answer once a credential is supplied.
+struct UnconfiguredLlm {
+    /// The model id the resolved selection named.
+    model: String,
+    /// How to configure a provider, in the words the reader needs.
+    reason: String,
+}
+
+impl LlmPort for UnconfiguredLlm {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn stream_chat(&self, _request: nanus_ports::ChatRequest) -> LlmStream {
+        // A stream that fails once, rather than a panic: the loop reads it like any other
+        // model failure and reports it to whoever asked. Nothing is surfaced until a request
+        // is made, which is what lets the agent start and the interface open first.
+        let error = LlmEvent::Error(self.reason.clone());
+        Box::pin(futures::stream::once(async move { error }))
+    }
+}
+
 /// A composed harness: the kernel context, the runner, and the service handles.
 ///
 /// The handles are kept so a caller can reach the store (to list sessions) or the
@@ -68,6 +98,12 @@ pub struct Harness {
     /// Replaces a bare adapter handle: the switch owns the model adapter the runner issues requests
     /// through, so a provider change reaches the loop rather than being a fact kept beside it.
     pub switch: Rc<ProviderSwitch>,
+    /// Whether a provider credential was found, and therefore whether a request can run.
+    ///
+    /// `false` is the unconfigured agent: it started, and the interface it serves can configure
+    /// a provider with `/provider`. The adapter in force is the placeholder that reports the
+    /// missing credential on the first request.
+    configured: bool,
     /// What a session created here is being run under.
     ///
     /// Kept on the harness rather than passed to [`Harness::new_session`], so a session is
@@ -98,6 +134,24 @@ impl Harness {
     #[must_use]
     pub fn models(&self) -> Vec<String> {
         self.switch.models()
+    }
+
+    /// Returns the model adapter in force, for its model id.
+    ///
+    /// Read through the runner rather than kept beside it: a client may switch providers, which
+    /// replaces the adapter, and a copy here would be a second answer to a question that has one.
+    #[must_use]
+    pub fn llm(&self) -> LlmHandle {
+        self.runner.llm()
+    }
+
+    /// Returns whether a provider credential was found when this harness was built.
+    ///
+    /// `false` means the agent started unconfigured: it can be told to switch to a provider whose
+    /// credential is stored, and until it is, every request fails with the sentence that says so.
+    #[must_use]
+    pub const fn configured(&self) -> bool {
+        self.configured
     }
 
     /// Starts a new session.
@@ -144,6 +198,11 @@ pub struct Pending {
     workspace: PathBuf,
     /// What the configuration resolved to: the provider, plan, model, and endpoint.
     selection: Selection,
+    /// Whether a credential was found for the selected provider.
+    ///
+    /// Carried from [`compose`] to [`Pending::start`], where it decides whether the harness
+    /// reports itself configured.
+    configured: bool,
     /// The credential stores, as the chain this composition consults.
     secrets: SecretHandle,
     fs: FsHandle,
@@ -165,6 +224,15 @@ impl core::fmt::Debug for Pending {
 }
 
 impl Pending {
+    /// Returns whether a provider credential was found for the selected provider.
+    ///
+    /// `false` is the unconfigured agent: it will mount, and every request through it fails
+    /// with the sentence naming the command that stores a credential.
+    #[must_use]
+    pub const fn configured(&self) -> bool {
+        self.configured
+    }
+
     /// Mounts the composition and returns the running harness.
     ///
     /// Must be called **outside** any async runtime, because the kernel drives plugin
@@ -225,6 +293,7 @@ impl Pending {
             store: self.store,
             clock: self.clock,
             switch,
+            configured: self.configured,
             origin,
         })
     }
@@ -423,7 +492,20 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
     // The secret stores are consulted by *account*, which is the provider's name, so
     // a key stored for one provider can never be sent to another.
     let secrets = Secrets::new(&home).handle();
-    let credential = resolve_credential(&secrets, &selection).await?;
+    // A missing credential is the one failure an agent may start *through*: the interface opens
+    // so the reader can supply one with `/provider`, and the placeholder reports it on the first
+    // request. Every other failure still refuses to compose.
+    let (llm, configured) = match build_adapter(config, &selection, &secrets).await {
+        Ok(llm) => (llm, true),
+        Err(BundleError::Credential(reason)) => {
+            let placeholder: LlmHandle = Rc::new(Box::new(UnconfiguredLlm {
+                model: selection.model().to_owned(),
+                reason,
+            }));
+            (placeholder, false)
+        }
+        Err(other) => return Err(other),
+    };
 
     // The adapters are built before the kernel mounts them, because several need to
     // await (opening a store) and a plugin's `mount` hook should not block on I/O that
@@ -439,13 +521,13 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         .await
         .map_err(|error| BundleError::session(error.to_string()))?
         .handle();
-    let llm = build_llm(config, &selection, &credential)?;
     let tools = build_tools(&fs, &shell)?;
 
     Ok(Pending {
         config: config.clone(),
         workspace,
         selection,
+        configured,
         secrets,
         fs,
         shell,
@@ -454,6 +536,23 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         llm,
         tools,
     })
+}
+
+/// Builds the adapter for a resolved selection, reading the credential it needs.
+///
+/// The one place a selection becomes a runnable adapter.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Credential`] when no store holds a credential for the provider, and
+/// [`BundleError::Config`] when the adapter rejects the configuration.
+async fn build_adapter(
+    config: &NanusConfig,
+    selection: &Selection,
+    secrets: &SecretHandle,
+) -> Result<LlmHandle, BundleError> {
+    let credential = resolve_credential(secrets, selection).await?;
+    build_llm(config, selection, &credential)
 }
 
 /// Resolves the credential the selected provider needs.
@@ -465,7 +564,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
 ///
 /// # Errors
 ///
-/// Returns [`BundleError::Config`] when no store holds a credential, and the sentence
+/// Returns [`BundleError::Credential`] when no store holds a credential, and the sentence
 /// names both ways to supply one, because either may be the one a reader can act on.
 async fn resolve_credential(
     secrets: &SecretHandle,
@@ -493,13 +592,13 @@ async fn resolve_credential(
                 Ok(secret)
             }
         }
-        Ok(_) => Err(BundleError::config(format!(
+        Ok(_) => Err(BundleError::credential(format!(
             "no credential for {account}: {hint}"
         ))),
         // The store failed rather than answering, so its own sentence is kept: a
         // locked keychain is a different problem from an unset key, and the fix is
         // different too.
-        Err(error) => Err(BundleError::config(format!(
+        Err(error) => Err(BundleError::credential(format!(
             "no credential for {account}: {error}; {hint}"
         ))),
     }
@@ -923,6 +1022,12 @@ fn store_provider(store: &StoreHandle) -> PortProvider<Box<dyn nanus_ports::Stor
 }
 
 /// Builds the plugin that publishes the model adapter.
+///
+/// The published handle is the adapter the composition *started* with. A `/provider` replaces the
+/// one the runner issues requests through (see [`AgentRunner::set_llm`]), and the runner is the
+/// authority for everything about a request — so this service is a description of the deployment
+/// rather than a live view of the adapter in force, and nothing mounted reads it. It is published
+/// so a future plugin finds the capability by key rather than by being handed it.
 fn llm_provider(llm: &LlmHandle) -> PortProvider<Box<dyn LlmPort>> {
     PortProvider::new("llm", nanus_ports::llm_key(), llm.clone())
 }
@@ -985,5 +1090,75 @@ mod tests {
         let config = NanusConfig::default();
         let outcome = workspace_root(&config);
         assert!(outcome.is_ok());
+    }
+
+    /// The placeholder an unconfigured agent talks through: it names the model that would answer
+    /// and reports the missing credential on the first request rather than panicking or hanging.
+    ///
+    /// Polling the stream is what a turn does, so this is the path a reader's first prompt takes.
+    #[test]
+    fn an_unconfigured_adapter_reports_the_missing_credential_when_asked() {
+        use futures::StreamExt as _;
+        let adapter = UnconfiguredLlm {
+            model: String::from("deepseek-flash"),
+            reason: String::from("no credential for deepseek: run `nanus auth set deepseek`"),
+        };
+        // Nothing is surfaced until a request is made: the model is named, so an interface has
+        // something to draw, and no failure has happened yet.
+        assert_eq!(adapter.model(), "deepseek-flash");
+        let request = nanus_ports::ChatRequest::new("deepseek-flash", Vec::new());
+        let collected: Vec<LlmEvent> =
+            nanus_kernel::runtime::block_on(adapter.stream_chat(request).collect());
+        assert!(
+            matches!(collected.as_slice(), [LlmEvent::Error(message)]
+                if message.contains("nanus auth set deepseek")),
+            "{collected:?}"
+        );
+    }
+
+    /// A `SecretPort` holding nothing, so the unconfigured case does not depend on whether the
+    /// machine running the test happens to have a key in its keychain or environment.
+    struct NoSecrets;
+
+    impl SecretPort for NoSecrets {
+        fn get<'a>(
+            &'a self,
+            _account: &'a str,
+        ) -> nanus_ports::LocalBoxFuture<'a, nanus_ports::SecretResult<Option<Secret>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn set<'a>(
+            &'a self,
+            _account: &'a str,
+            _secret: &'a str,
+        ) -> nanus_ports::LocalBoxFuture<'a, nanus_ports::SecretResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn clear<'a>(
+            &'a self,
+            _account: &'a str,
+        ) -> nanus_ports::LocalBoxFuture<'a, nanus_ports::SecretResult<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn backend(&self) -> &'static str {
+            "none"
+        }
+    }
+
+    /// A missing credential is the one configuration failure the composition distinguishes: it is
+    /// reported as [`BundleError::Credential`], which is what lets [`compose`] start unconfigured
+    /// instead of refusing. The sentence names the command that stores one.
+    #[test]
+    fn a_missing_credential_is_reported_as_a_credential_error() {
+        let selection = Selection::resolve(&NanusConfig::default()).expect("the default resolves");
+        let secrets: SecretHandle = Rc::new(Box::new(NoSecrets));
+        let outcome = nanus_kernel::runtime::block_on(resolve_credential(&secrets, &selection));
+        let Err(BundleError::Credential(message)) = outcome else {
+            panic!("a missing credential is reported as a credential error");
+        };
+        assert!(message.contains("nanus auth set"), "{message}");
     }
 }

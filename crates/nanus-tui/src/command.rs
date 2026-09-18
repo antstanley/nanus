@@ -182,6 +182,31 @@ mod tests {
         );
     }
 
+    /// The effort has the same shape as the model: `Alt+T` cycles and `/effort <state>` names a
+    /// step, which is what a command with a useful default and a useful argument offers.
+    #[test]
+    fn effort_is_a_command() {
+        assert_eq!(submission_of("/effort"), Submission::Run(Command::Effort));
+        assert_eq!(
+            submission_of("/effort high"),
+            Submission::Run(Command::Effort)
+        );
+    }
+
+    /// The provider is the command that configures a vendor, and it is a command rather than a
+    /// key because it has a list to read before one is named.
+    #[test]
+    fn provider_is_a_command() {
+        assert_eq!(
+            submission_of("/provider"),
+            Submission::Run(Command::Provider)
+        );
+        assert_eq!(
+            submission_of("/provider anthropic"),
+            Submission::Run(Command::Provider)
+        );
+    }
+
     /// `!` is the escape hatch: the line is a shell command rather than a prompt, and the whole line
     /// is the command rather than the first word.
     #[test]

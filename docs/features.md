@@ -124,6 +124,12 @@ renewed from the refresh token rather than sent and refused.
 - **Retired model ids do not resolve**, and a model id belongs to the provider that
   offers it: naming a DeepSeek id with `provider = "openai"` is a request the
   provider refuses rather than a quiet substitution.
+- **An agent whose provider has no credential still starts.** The composition
+  substitutes a placeholder adapter that names the model that would answer and reports
+  the missing credential on the first request, so the interface opens and the reader can
+  configure a provider with `/provider` rather than being refused the program. Every
+  other failure to compose still refuses. See
+  [switching providers](tui.md#switching-providers).
 - **`nanus config` reports the resolution**, so which provider, plan, model, and
   endpoint a run will use is answerable without running it.
 - **The provider seam is the boundary.** `LlmPort` is the port, `nanus-bundle`

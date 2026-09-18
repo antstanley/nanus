@@ -251,6 +251,12 @@ fn with_step_budget(prompt: &str, budget: u32) -> String {
 /// session. Everything mutable lives in the [`Session`], which is what makes the run
 /// observable and resumable.
 pub struct AgentRunner {
+    /// The model adapter every request goes to, shared so a caller can switch providers mid-session.
+    ///
+    /// A `RefCell` around the handle rather than the handle alone, because `/provider` replaces
+    /// the whole adapter: an interface choosing a different provider is not choosing a different
+    /// model id within one vendor, it is choosing a different host and protocol, and the runner is
+    /// what issues the request. The kernel is single-threaded, so there is no lock to take.
     llm: Rc<core::cell::RefCell<LlmHandle>>,
     /// The tools the model is offered, shared rather than owned.
     ///
@@ -427,8 +433,18 @@ impl AgentRunner {
     /// the thing that issues the request is replaced. It takes effect on the next request,
     /// including the next step of a turn already running, exactly as [`AgentRunner::set_model`]
     /// does — a reader switching providers mid-turn is saying what they want the next step to be.
+    ///
+    /// The effort override is the caller's to clear: the new adapter may have no notion of
+    /// effort at all (Anthropic), and a standing choice that outlived the provider it was made
+    /// for would be reported as in force where it cannot be honoured.
     pub fn set_llm(&self, llm: LlmHandle) {
         *self.llm.borrow_mut() = llm;
+    }
+
+    /// Returns the model adapter in force.
+    #[must_use]
+    pub fn llm(&self) -> LlmHandle {
+        Rc::clone(&self.llm.borrow())
     }
 
     /// Returns the tool registry this runner dispatches from.
