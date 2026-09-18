@@ -48,6 +48,15 @@ pub const CONFIG_ENV: &str = "NANUS_CONFIG";
 /// ceiling.
 pub const DEFAULT_MAX_TOKENS: u32 = 128_000;
 
+/// The prompt budget in estimated tokens, for one request, when the configuration names none.
+///
+/// A conversation longer than this has its oldest turns dropped — with a notice the model reads
+/// — rather than being sent to a provider that would refuse it, and a turn whose *newest* part
+/// does not fit is refused with a sentence naming this field. The estimate is approximate by
+/// design (see `nanus-domain`'s context module), which is why the default sits well below every
+/// provider's window rather than at it.
+pub const DEFAULT_CONTEXT_BUDGET: u32 = 64_000;
+
 /// The step budget for one turn used when the configuration names none.
 ///
 /// The number exists to bound a *runaway* loop, and every value it has had was chosen to
@@ -206,6 +215,8 @@ pub struct NanusConfig {
     pub sandbox_mode: SandboxMode,
     /// How many model steps one turn may take.
     pub max_steps_per_turn: u32,
+    /// The prompt budget in estimated tokens, for one request.
+    pub context_budget: u32,
     /// How many tool calls may run at once.
     pub max_parallel_tools: u32,
     /// How much of a tool call and a thinking segment the interface draws.
@@ -252,6 +263,7 @@ impl Default for NanusConfig {
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,
+            context_budget: DEFAULT_CONTEXT_BUDGET,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             tui_detail: TuiDetail::default(),
             markdown: true,

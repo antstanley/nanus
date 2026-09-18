@@ -141,6 +141,14 @@ pub trait Progress {
     /// Usage was reported.
     fn usage(&mut self, _usage: &Usage) {}
 
+    /// The prompt for this step had its oldest turns dropped to fit the context budget.
+    ///
+    /// Reported rather than only logged, because a reader watching a turn needs to know that
+    /// the model is answering from part of the conversation: an answer that contradicts
+    /// something dropped earlier is not the model being wrong, and a reader who was not told
+    /// cannot tell the difference.
+    fn elided(&mut self, _elision: &nanus_domain::Elision) {}
+
     /// Whether the turn should stop.
     ///
     /// Asked between steps and between the tokens of a model response, so a driver that
@@ -536,7 +544,10 @@ impl AgentRunner {
         approver: Option<&dyn Approver>,
     ) -> Result<StepOutcome, BundleError> {
         session.append(SessionEvent::StepStart { turn, step });
-        let request = self.build_request(session);
+        let (request, elision) = self.build_request(session)?;
+        if let Some(elision) = &elision {
+            progress.elided(elision);
+        }
         let mut stream = self.llm.stream_chat(request);
         let assembled = match self.consume_stream(&mut stream, progress).await {
             Ok(assembled) => assembled,
@@ -591,10 +602,24 @@ impl AgentRunner {
         Ok(step_outcome)
     }
 
-    /// Assembles the request the model sees.
-    fn build_request(&self, session: &Session) -> ChatRequest {
+    /// Assembles the request the model sees, fitted to the prompt budget.
+    ///
+    /// The whole log is replayed and then trimmed: the oldest turns are dropped when the
+    /// conversation no longer fits, with a notice the model reads, and the turn is *refused*
+    /// when even the newest turn does not fit. See [`nanus_domain::context`] for the policy and
+    /// why it is a policy rather than a tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Context`] when the prompt cannot be made to fit.
+    fn build_request(
+        &self,
+        session: &Session,
+    ) -> Result<(ChatRequest, Option<nanus_domain::Elision>), BundleError> {
         let mut messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
         messages.extend(session.derive_messages());
+        let fitted = nanus_domain::fit(messages, self.config.context_budget)
+            .map_err(|error| BundleError::context(error.to_string()))?;
         // The borrow ends with the statement, which is what keeps a tool registered through
         // the published handle visible on the very next request rather than only after a
         // rebuild.
@@ -602,14 +627,14 @@ impl AgentRunner {
             let registry = self.tools.borrow();
             registry.schemas().into_iter().cloned().collect()
         };
-        let mut request = ChatRequest::new(self.model(), messages);
+        let mut request = ChatRequest::new(self.model(), fitted.messages);
         request.tools = tools;
         // Set only when a caller chose one: an unset effort is the adapter filling in its own
         // default, which is what a request that says nothing has always meant.
         if let Some(effort) = self.effort.get() {
             request = request.with_reasoning_effort(effort);
         }
-        request
+        Ok((request, fitted.elision))
     }
 
     /// Consumes a model stream into an assembled assistant turn.
@@ -2011,6 +2036,7 @@ mod tests {
             max_parallel_tools: 1,
             model: "m".to_owned(),
             system_prompt_max: 1024,
+            context_budget: nanus_domain::DEFAULT_CONTEXT_BUDGET,
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
         };

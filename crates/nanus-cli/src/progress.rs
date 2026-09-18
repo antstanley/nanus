@@ -85,6 +85,16 @@ impl Progress for StderrProgress {
         // echoing it here would print it twice.
     }
 
+    fn elided(&mut self, elision: &nanus_domain::Elision) {
+        // Printed whatever else is off: a reader who asked for no progress at all still needs to
+        // know that the model is answering from part of the conversation, because an answer that
+        // contradicts a dropped turn is not the model being wrong.
+        Self::note(&format!(
+            "nanus: the conversation was trimmed to fit the prompt budget: {} messages across {} turns dropped, {} estimated tokens sent",
+            elision.dropped_messages, elision.dropped_turns, elision.kept_tokens
+        ));
+    }
+
     fn step_started(&mut self, step: u32) {
         if self.reasoning || self.tools {
             Self::note(&format!("nanus: step {step}"));

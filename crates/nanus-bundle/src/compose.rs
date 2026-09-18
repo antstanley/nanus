@@ -545,6 +545,8 @@ fn build_runner(
         AGENT_SYSTEM_PROMPT_MAX,
     )
     .map_err(|error| BundleError::config(error.to_string()))?
+    .with_context_budget(config.context_budget)
+    .map_err(|error| BundleError::config(error.to_string()))?
     .with_approval(config.approval_policy)
     .with_sandbox(config.sandbox_mode);
     // The runner is given the same handle the context publishes, so registering a tool

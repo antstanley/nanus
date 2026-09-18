@@ -49,7 +49,7 @@ mod config;
 mod error;
 
 pub use config::{
-    CONFIG_ENV, CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN,
-    DEFAULT_MAX_TOKENS, NanusConfig, ReasoningEffort, TuiDetail,
+    CONFIG_ENV, CONFIG_VERSION, DEFAULT_CONTEXT_BUDGET, DEFAULT_MAX_PARALLEL_TOOLS,
+    DEFAULT_MAX_STEPS_PER_TURN, DEFAULT_MAX_TOKENS, NanusConfig, ReasoningEffort, TuiDetail,
 };
 pub use error::ConfigError;

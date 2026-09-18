@@ -2371,6 +2371,10 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.follow();
         }
         Frame::Step { step } => view.begin_turn(step),
+        Frame::Elided {
+            dropped_messages,
+            dropped_turns,
+        } => apply_elided(dropped_messages, dropped_turns, view),
         Frame::Approval {
             call_id,
             tool,
@@ -2474,6 +2478,20 @@ fn apply(frame: Frame, view: &mut ViewState) {
         | Frame::Status(_)
         | Frame::Bye => {}
     }
+}
+
+/// Draws the notice that part of the conversation was left out of the prompt.
+///
+/// A notice in the transcript rather than a status line: it is part of what happened in this
+/// turn, and a reader who scrolls back should find it where the missing part would have been. An
+/// answer that contradicts something dropped is not the model being wrong, and a reader who was
+/// not told cannot tell the difference.
+fn apply_elided(dropped_messages: u32, dropped_turns: u32, view: &mut ViewState) {
+    view.transcript.push(Entry::notice(format!(
+        "the conversation was trimmed to fit the prompt budget: {dropped_messages} messages \
+         across {dropped_turns} turns are not shown"
+    )));
+    view.follow();
 }
 
 /// Draws the end of a turn: the answer, or why there is none.
@@ -5215,6 +5233,30 @@ mod tests {
         let mut view = ViewState::new();
         apply(Frame::Backlog { frames: Vec::new() }, &mut view);
         assert!(view.transcript.entries().is_empty());
+    }
+
+    /// A trimmed prompt is drawn where the gap is, because an answer that contradicts
+    /// something dropped is not the model being wrong.
+    #[test]
+    fn an_elision_frame_is_drawn_as_a_notice() {
+        let mut view = ViewState::new();
+        apply(
+            Frame::Elided {
+                dropped_messages: 12,
+                dropped_turns: 2,
+            },
+            &mut view,
+        );
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        let notice = said.first().copied().unwrap_or_default();
+        assert!(notice.contains("12"), "{notice}");
+        assert!(notice.contains("2 turns"), "{notice}");
+        // It is a notice rather than prose: nothing here is the model's words.
+        assert_eq!(
+            view.transcript.entries().first().map(Entry::kind),
+            Some(&EntryKind::Notice)
+        );
     }
 
     /// The agent's own state is what the interface draws, so a state chosen elsewhere — a

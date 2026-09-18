@@ -40,6 +40,14 @@ pub enum BundleError {
         message: String,
     },
 
+    /// The conversation does not fit the prompt budget.
+    ///
+    /// Discrete from [`BundleError::Model`]: the model was never asked. The harness refused to
+    /// send a prompt that could not be made to fit, which is a statement about the session and
+    /// the configured budget rather than about the provider.
+    #[error("the conversation does not fit the context budget: {0}")]
+    Context(String),
+
     /// A session could not be read or written.
     #[error("session storage failed: {0}")]
     Session(String),
@@ -58,6 +66,12 @@ impl BundleError {
     /// Builds a [`BundleError::Model`].
     pub fn model(message: impl Into<String>) -> Self {
         Self::Model(message.into())
+    }
+
+    /// Builds a [`BundleError::Context`].
+    #[must_use]
+    pub fn context(message: impl Into<String>) -> Self {
+        Self::Context(message.into())
     }
 
     /// Builds a [`BundleError::Session`].

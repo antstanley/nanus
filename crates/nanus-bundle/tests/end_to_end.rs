@@ -16,7 +16,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use nanus_bundle::{AgentRunner, Progress, Silent};
-use nanus_domain::{AgentConfig, Session, SessionId, ToolCallId, ToolName, Usage};
+use nanus_domain::{
+    AgentConfig, Session, SessionEvent, SessionId, ToolCallId, ToolName, TurnEndReason, Usage,
+};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, SandboxPolicy};
 
 /// A model that replays a script of event batches, one per request.
@@ -156,6 +158,80 @@ async fn run(
         .run_turn(&mut session, prompt, &mut Silent, None)
         .await
         .unwrap_or_else(|error| panic!("the turn completes: {error}"))
+}
+
+/// A conversation longer than the budget is trimmed, and the model is told what is missing.
+///
+/// The turn still runs — that is the point of a policy over a refusal — but it runs on part of
+/// the conversation, with a notice at the gap, and the request that went out is inside the
+/// budget rather than over it.
+#[tokio::test]
+async fn a_conversation_longer_than_the_budget_is_trimmed_with_a_notice() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let (tools, _shell) = workspace_tools(dir.path());
+    let model = ScriptedModel::new(vec![answer("ok")]);
+    let budget = 400_u32;
+    let settings = config()
+        .with_context_budget(budget)
+        .unwrap_or_else(|error| panic!("a small budget is valid: {error}"));
+    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", settings)
+        .unwrap_or_else(|error| panic!("the runner builds: {error}"));
+
+    // Five completed turns, each far too large for the budget to hold.
+    let mut session = Session::new(SessionId::new("long"), 0, "/tmp");
+    for turn in 0..5_u32 {
+        session.append(SessionEvent::TurnStart { turn });
+        session.append(SessionEvent::UserMessage {
+            text: format!("question {turn} {}", "x".repeat(300)),
+        });
+        session.append(SessionEvent::AssistantMessage {
+            text: Some(format!("answer {turn} {}", "y".repeat(300))),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+            model: None,
+            effort: None,
+        });
+        session.append(SessionEvent::TurnEnd {
+            turn,
+            reason: TurnEndReason::Completed,
+        });
+    }
+
+    let outcome = runner
+        .run_turn(&mut session, "the newest question", &mut Silent, None)
+        .await
+        .unwrap_or_else(|error| panic!("the trimmed turn completes: {error}"));
+    assert_eq!(outcome.answer, "ok");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let said: Vec<String> = requests[0]
+        .messages
+        .iter()
+        .filter_map(|message| message.text().map(str::to_owned))
+        .collect();
+    // The oldest turns are gone, the question being answered is there, and the model was told
+    // rather than left to infer a beginning that was never sent.
+    assert!(
+        !said.iter().any(|text| text.contains("question 0")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter().any(|text| text.contains("the newest question")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter().any(|text| text.contains("not shown")),
+        "the model is told what is missing: {said:?}"
+    );
+    // And what was sent is inside the budget, notice included.
+    assert!(
+        nanus_domain::estimate(&requests[0].messages) <= budget,
+        "{} > {budget}",
+        nanus_domain::estimate(&requests[0].messages)
+    );
 }
 
 #[tokio::test]

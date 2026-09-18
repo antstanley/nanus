@@ -1175,6 +1175,18 @@ impl Progress for Broadcast<'_> {
         self.held.stop.get()
     }
 
+    /// Reports that this step's prompt had part of the conversation dropped.
+    ///
+    /// Pushed like progress rather than queued like a control frame, and recorded in the backlog
+    /// with it: a client that attached after the trim was made is watching the same partial
+    /// conversation, so the notice belongs to the turn it happened in.
+    fn elided(&mut self, elision: &nanus_domain::Elision) {
+        self.push(&Frame::Elided {
+            dropped_messages: elision.dropped_messages,
+            dropped_turns: elision.dropped_turns,
+        });
+    }
+
     fn usage(&mut self, usage: &Usage) {
         let now = Instant::now();
         let started = self.started.take();
@@ -1919,6 +1931,48 @@ mod tests {
         // Written down, there is nothing left that the store does not have.
         session.saved();
         assert!(session.turn_frames().is_empty());
+    }
+
+    /// A step whose prompt was trimmed tells every client watching, and the notice is part of
+    /// the turn they would be caught up with.
+    #[tokio::test]
+    async fn a_trimmed_prompt_reaches_every_viewer_and_the_backlog() {
+        let session = held("trimmed");
+        let (frames, mut queued) = mpsc::channel(FRAME_BUFFER);
+        session.viewers.borrow_mut().push((1, frames));
+
+        let elision = nanus_domain::Elision {
+            dropped_messages: 12,
+            dropped_turns: 2,
+            kept_tokens: 100,
+            budget: 200,
+        };
+        Broadcast {
+            held: &session,
+            started: None,
+            head: None,
+            first_token: None,
+            last_token: None,
+        }
+        .elided(&elision);
+
+        match queued.try_recv() {
+            Ok(Frame::Elided {
+                dropped_messages,
+                dropped_turns,
+            }) => {
+                assert_eq!(dropped_messages, 12);
+                assert_eq!(dropped_turns, 2);
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        // And a client that attaches after the trim is caught up with it: the notice belongs to
+        // the turn it happened in.
+        assert!(
+            matches!(session.turn_frames().first(), Some(Frame::Elided { .. })),
+            "{:?}",
+            session.turn_frames()
+        );
     }
 
     #[tokio::test]

@@ -1354,6 +1354,10 @@ async fn show_config(args: &Options) -> Result<(), String> {
     println!("approval policy: {}", config.approval_policy);
     println!("sandbox mode: {:?}", config.sandbox_mode);
     println!("max steps per turn: {}", config.max_steps_per_turn);
+    println!(
+        "context budget: {} estimated tokens (older turns are dropped past it)",
+        config.context_budget
+    );
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
     println!("markdown answers: {}", config.markdown);

@@ -70,6 +70,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod context;
 pub mod error;
 pub mod message;
 pub mod prompt;
@@ -77,13 +78,14 @@ pub mod session;
 pub mod tool;
 
 pub use agent::{
-    AgentConfig, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN, DEFAULT_SYSTEM_PROMPT_MAX,
-    StepOutcome, TurnMachine, TurnOutcome,
+    AgentConfig, DEFAULT_CONTEXT_BUDGET, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN,
+    DEFAULT_SYSTEM_PROMPT_MAX, StepOutcome, TurnMachine, TurnOutcome,
 };
 pub use approval::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionPreset, PresetName, SandboxMode,
     ToolAccess,
 };
+pub use context::{Elision, FitError, Fitted, estimate, fit};
 pub use error::{DomainError, DomainResult};
 pub use message::{Message, Role, ToolCallId, Usage};
 pub use prompt::{PromptBuilder, PromptError, PromptSection, runtime_context};

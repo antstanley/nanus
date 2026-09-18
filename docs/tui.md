@@ -159,6 +159,13 @@ is held and sent when the agent is ready, which is [queuing a prompt](#queuing-a
 history a client shows comes from the store, where it is already durable. A socket that
 also carried the log would be a second source of truth for something that has one.
 
+**A trimmed prompt is drawn where the gap is.** A conversation longer than the context budget
+has its oldest turns dropped before the request goes out, and the interface is sent an `elided`
+frame saying how much: it becomes a notice in the transcript rather than a status line, because
+a reader who scrolls back should find it where the missing part would have been. An answer that
+contradicts something dropped is not the model being wrong, and a reader who was not told cannot
+tell the difference.
+
 The one exception is the turn that is *running*, because the log does not have it yet: the
 store is written when a turn ends, so a client that attaches in the middle of one has
 nothing to read. The agent sends that client a `backlog` frame — the frames of the turn so

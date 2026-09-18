@@ -49,6 +49,19 @@ pub const DEFAULT_MAX_PARALLEL_TOOLS: u32 = 4;
 /// Default ceiling, in bytes, on an assembled system prompt.
 pub const DEFAULT_SYSTEM_PROMPT_MAX: usize = 32_768;
 
+/// The prompt budget in estimated tokens, when a caller names none.
+///
+/// 64000 rather than a provider's window: the estimate in [`crate::context`] is generous for
+/// code and JSON, and the point of a budget is to leave the model room to answer. A model with a
+/// larger window can be given more of the conversation by raising it, and one with a smaller
+/// window is protected by it — which is the direction that matters.
+pub const DEFAULT_CONTEXT_BUDGET: u32 = 64_000;
+
+/// The serde default for [`AgentConfig::context_budget`].
+fn default_context_budget() -> u32 {
+    DEFAULT_CONTEXT_BUDGET
+}
+
 /// The knobs the turn machine and its callers share.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -60,6 +73,15 @@ pub struct AgentConfig {
     pub model: String,
     /// Maximum size, in bytes, of an assembled system prompt.
     pub system_prompt_max: usize,
+    /// The prompt budget, in estimated tokens, for one request.
+    ///
+    /// A conversation longer than this has its oldest turns dropped, with a notice, rather than
+    /// being sent to a provider that would refuse it — see [`crate::context`]. Deliberately
+    /// below every provider's window, because an estimate that is generous for code is a reason
+    /// to leave room rather than to spend it. Defaulted on the way in, so a configuration
+    /// written before this existed still decodes.
+    #[serde(default = "default_context_budget")]
+    pub context_budget: u32,
     /// How a tool call outside the sandbox is approved.
     ///
     /// Defaulted on the way in so a configuration written before the gate existed still
@@ -93,6 +115,7 @@ impl AgentConfig {
             max_parallel_tools,
             model,
             system_prompt_max,
+            context_budget: DEFAULT_CONTEXT_BUDGET,
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
         };
@@ -108,9 +131,27 @@ impl AgentConfig {
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             model: model.into(),
             system_prompt_max: DEFAULT_SYSTEM_PROMPT_MAX,
+            context_budget: DEFAULT_CONTEXT_BUDGET,
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
         }
+    }
+
+    /// Replaces the prompt budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Validation`] when the budget is zero, which would mean "no
+    /// conversation can be sent" rather than "a small one".
+    pub fn with_context_budget(mut self, context_budget: u32) -> Result<Self, DomainError> {
+        if context_budget == 0 {
+            return Err(DomainError::Validation {
+                field: "context_budget",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        self.context_budget = context_budget;
+        Ok(self)
     }
 
     /// Replaces the approval policy.
@@ -156,6 +197,12 @@ impl AgentConfig {
             return Err(DomainError::Validation {
                 field: "system_prompt_max",
                 reason: String::from("a prompt has a non-zero ceiling"),
+            });
+        }
+        if self.context_budget == 0 {
+            return Err(DomainError::Validation {
+                field: "context_budget",
+                reason: String::from("a prompt budget of zero would refuse every conversation"),
             });
         }
         // Postcondition: an accepted configuration never carries an empty model.

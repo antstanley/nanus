@@ -121,7 +121,7 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 1179 tests, 10 doctests, 0 clippy warnings. If you change
+The current baseline is 1204 tests, 10 doctests, 0 clippy warnings. If you change
 that number, note that a few prose files quote it (the README badge/transcript
 and `docs/testing.md`); agents should not chase those numbers unless asked.
 

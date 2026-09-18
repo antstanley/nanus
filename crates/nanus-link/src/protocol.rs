@@ -529,6 +529,19 @@ pub enum Frame {
         frames: Vec<Self>,
     },
 
+    /// The prompt for the step that is starting had its oldest turns dropped.
+    ///
+    /// Sent before the step's own frames, once per step that was trimmed, because a reader
+    /// following a conversation needs to know that the model is answering from part of it: the
+    /// gap explains an answer that contradicts something said earlier, which otherwise looks
+    /// like the model being wrong.
+    Elided {
+        /// How many messages were left out.
+        dropped_messages: u32,
+        /// How many turns those messages made up.
+        dropped_turns: u32,
+    },
+
     /// The agent is stopping.
     Bye,
 }
@@ -558,7 +571,7 @@ impl Frame {
 /// The field is optional on the wire and defaults to zero, which is what a build that
 /// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
 /// rather than assuming compatibility.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -762,6 +775,14 @@ mod tests {
                 message: "boom".to_owned(),
             },
             Frame::Status(info()),
+            Frame::Elided {
+                dropped_messages: 12,
+                dropped_turns: 2,
+            },
+            Frame::Elided {
+                dropped_messages: 0,
+                dropped_turns: 0,
+            },
             Frame::Bye,
         ];
         for frame in frames {

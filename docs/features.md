@@ -31,6 +31,17 @@ that runs a turn.
   errored, at the token ceiling, out of steps, or interrupted. Those five are what
   the harness produces; the domain's vocabulary carries two more, a policy block
   and a human abort, that nothing mints yet.
+- **A bounded prompt.** Every step replays the whole log, so a long session
+  eventually exceeds the model's window. `context_budget` (default 64000 estimated
+  tokens) is the ceiling for one request: past it the *oldest turns* are dropped,
+  whole, with a notice the model reads where the gap is, and the reader is told —
+  the CLI on stderr and the interface as a notice in the transcript. A turn whose
+  *newest* part does not fit is refused with a sentence naming the field rather
+  than sent to a provider that would refuse the request. The estimate is
+  characters over four plus a small per-message cost, deliberately approximate:
+  there is no tokenizer here, the provider reports the real count with every
+  response, and the default sits well below every provider's window. See
+  [context fitting](../crates/nanus-domain/src/context.rs).
 - **Interruptible turns.** `Ctrl+C` / `Esc` in the interface and `SIGINT` on a
   headless run ask the turn to stop at the next safe point.
 - **A step's tool calls run together, bounded.** `max_parallel_tools` (default 4)
@@ -201,6 +212,7 @@ this build offers.
 | `approval_policy` | `per_call` | `per_call`, `permitted`, `all_calls` |
 | `sandbox_mode` | `read_only` | `read_only`, `workspace_write`, `danger_full_access` |
 | `max_steps_per_turn` | `512` | steps in one turn |
+| `context_budget` | `64000` | estimated prompt tokens for one request |
 | `max_parallel_tools` | `4` | how many of a step's calls may be in flight at once |
 | `tui_detail` | `compact` | `compact`, `full` |
 | `markdown` | `true` | render the model's answers as markdown |
