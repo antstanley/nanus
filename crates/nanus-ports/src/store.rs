@@ -52,12 +52,22 @@ pub trait StorePort {
     /// Setting the name a session already has is not an error. Setting a name
     /// another session already holds is: silently moving an alias would make a
     /// script resume someone else's conversation.
+    ///
+    /// Two names are the same name when they differ only in case, so `Nightly` and
+    /// `nightly` are one alias rather than two: the failure this prevents is a reader
+    /// naming a second conversation with a word they believe names the first. What is
+    /// *stored* is the spelling the session was named with, so a rename is how a name
+    /// changes case, and leading and trailing whitespace is not part of a name.
     fn name<'a>(&'a self, id: &'a SessionId, name: &'a str) -> LocalBoxFuture<'a, StoreResult<()>>;
 
     /// Resolves a name to the session it aliases.
     ///
     /// `None` is not an error: a name that nobody has taken is the ordinary
     /// state of a name a user is about to choose.
+    ///
+    /// Resolution ignores case, so a name finds the session it was typed as. A store that
+    /// somehow holds two names folding to one answers with the same session every time
+    /// rather than with whichever the directory listing offered first.
     fn resolve<'a>(&'a self, name: &'a str) -> LocalBoxFuture<'a, StoreResult<Option<SessionId>>>;
 
     /// Returns the name a session answers to.

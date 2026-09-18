@@ -19,6 +19,22 @@
 //! cost is that resolving a name reads a directory, which is the same walk
 //! [`StorePort::list`] already does.
 //!
+//! ## A name is one word, and case does not make a second one
+//!
+//! Two decisions are recorded here because they are the store's to make, and because the
+//! failure mode of getting either wrong is a reader opening a conversation they did not mean:
+//!
+//! - **A name is a single word, not a path.** There are no namespaces: a name is an alias for
+//!   one store key, the store is one flat directory, and a name containing `/` would suggest a
+//!   tree that does not exist. A user who wants grouping writes it into the name
+//!   (`project.nightly`), because the punctuation is part of the word rather than a level.
+//! - **A name is folded for comparison and stored as typed.** `Nightly` and `nightly` are one
+//!   name: naming a session with the second is refused and names the session that holds it, and
+//!   resolving either spelling finds that session. What is *stored* is the spelling a session
+//!   was named with, so a rename is how a name changes case and a listing shows what a person
+//!   typed. Leading and trailing whitespace is trimmed on the way in, because it is invisible
+//!   and a name nobody can see is a name nobody can type.
+//!
 //! ## Why the directory name is encoded
 //!
 //! A session id is store-opaque text (the domain does not validate it), so an id
@@ -327,6 +343,9 @@ impl JsonlStore {
 
     /// Records `name` for `id`, refusing a name another session already holds.
     async fn name_blocking(&self, id: &SessionId, name: &str) -> StoreResult<()> {
+        // Trimmed before it is validated and written: a name is a word a person types back, and
+        // invisible whitespace at either end is a name that cannot be typed.
+        let name = name.trim();
         validate_name(name)?;
         let dir = self.session_dir(id)?;
         refuse_symlinked_dir(&dir).await?;
@@ -338,7 +357,10 @@ impl JsonlStore {
             return Err(not_found(id));
         }
         for (other, held) in self.session_names().await? {
-            if other != *id && held == name {
+            // Folded, so `Nightly` and `nightly` cannot both exist: two names a person reads as
+            // the same word would let them name a second conversation with the word they think
+            // names the first.
+            if other != *id && fold(&held) == fold(name) {
                 return Err(StoreError::NameTaken {
                     name: name.to_owned(),
                     id: other.as_str().to_owned(),
@@ -352,20 +374,24 @@ impl JsonlStore {
 
     /// Resolves a name to the session that answers to it.
     async fn resolve_blocking(&self, name: &str) -> StoreResult<Option<SessionId>> {
+        let name = name.trim();
         if validate_name(name).is_err() {
             // A name that could never have been recorded is held by nobody, so the
             // answer is "no session" rather than an error: the question has a true
             // answer, and a caller checking whether a name is free wants it.
             return Ok(None);
         }
-        // Lowest id wins when two directories somehow hold one name. The store
-        // never writes two, and a store edited by hand should still answer the
-        // same way twice.
+        // Folded, so a name resolves whatever case it is typed in.
+        //
+        // Lowest id wins when two directories somehow fold to one name. The store refuses to
+        // write two, so that is a store edited by hand or one written before this rule; either
+        // way it should answer the same way twice rather than at a directory listing's mercy.
+        let asked = fold(name);
         Ok(self
             .session_names()
             .await?
             .into_iter()
-            .filter(|(_, held)| held == name)
+            .filter(|(_, held)| fold(held) == asked)
             .map(|(id, _)| id)
             .min())
     }
@@ -722,6 +748,16 @@ async fn read_name(dir: &Path) -> Option<String> {
             None
         }
     }
+}
+
+/// Folds a name for comparison.
+///
+/// Two names a person reads as the same word must be the same name, or a reader can name a
+/// second conversation with a word they believe names the first — and then cannot tell which
+/// one `--resume` opens. The fold is Unicode's, the one `str::to_lowercase` performs, because a
+/// name is text: a rule that knew only ASCII would make `Ä` and `ä` two names.
+fn fold(name: &str) -> String {
+    name.to_lowercase()
 }
 
 /// Checks that `name` can be an alias for a session.

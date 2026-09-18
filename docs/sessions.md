@@ -46,6 +46,20 @@ A name is how a session is found again, so it is taken for good: starting a seco
 with a name that is already held is refused, not moved. Silently reassigning an alias would
 make `--resume nightly` open somebody else's conversation.
 
+Two decisions are worth stating, because both are about the same failure — a reader opening a
+conversation they did not mean:
+
+- **A name is one word, not a path.** There are no namespaces: a name is an alias for one
+  store key, the store is one flat directory, and a `/` in a name would suggest a tree that
+  does not exist. A user who wants grouping writes it into the name (`project.nightly`,
+  `project:nightly`), because the punctuation is part of the word rather than a level.
+- **Case does not make a second name.** `Nightly` and `nightly` are one name: naming a second
+  session with the other case is refused and names the session that holds it, and resolving
+  either spelling finds that session. What is *stored* is the spelling the session was named
+  with, so a rename is how a name changes case and a listing shows what a person typed.
+  Leading and trailing whitespace is trimmed on the way in, because a name nobody can see is a
+  name nobody can type back.
+
 ```console
 $ nanus run --name nightly "…"
 $ nanus run --name nightly "…"
@@ -240,6 +254,7 @@ flight and is emptied as soon as that turn is in the log.
 - **No deletion in the interface.** `nanus sessions delete <ref>` removes a session and
   releases its name; the interface has no key for it yet, so a conversation is removed from
   the CLI rather than from the screen it is being read on.
-- **Names are flat and case-sensitive.** `Nightly` and `nightly` are two names, and there
-  is no namespacing.
+- **Names are flat, and case does not distinguish them.** `Nightly` and `nightly` are one
+  name and resolving either spelling finds it, while the spelling a session was named with is
+  what a listing shows. There is no namespacing: grouping lives in the name itself.
 - **A name is per store, not per machine.** `$NANUS_HOME` decides which names exist.

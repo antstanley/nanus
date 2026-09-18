@@ -802,3 +802,103 @@ async fn a_claim_is_invisible_to_reads() {
     store.release_lock(saved.id());
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// One name, however it is spelled.
+// ---------------------------------------------------------------------------
+
+/// Case does not make a second name, and the spelling a session was named with is kept.
+#[tokio::test]
+async fn a_name_is_one_name_however_it_is_cased() {
+    let (dir, store) = store().await;
+    let first = session("first", 10, &["one"]);
+    let second = session("second", 20, &["two"]);
+    store.save(&first).await.expect("save");
+    store.save(&second).await.expect("save");
+
+    store.name(first.id(), "nightly").await.expect("named");
+    // The same word in another case is the *same* name: refused, and refused by naming the
+    // session that holds it, because that is what the reader has to be told.
+    match store.name(second.id(), "Nightly").await {
+        Err(StoreError::NameTaken { name, id }) => {
+            assert_eq!(name, "Nightly");
+            assert_eq!(id, "first");
+        }
+        other => panic!("a case-differing name must be refused: {other:?}"),
+    }
+
+    // Either spelling resolves to it, so a reader who types it differently is not told the
+    // name does not exist.
+    assert_eq!(
+        store.resolve("nightly").await.expect("resolve"),
+        Some(first.id().clone())
+    );
+    assert_eq!(
+        store.resolve("NIGHTLY").await.expect("resolve"),
+        Some(first.id().clone())
+    );
+
+    // What is stored is what was typed, so a listing shows the spelling a person chose and a
+    // rename is how the case changes.
+    assert_eq!(
+        store.name_of(first.id()).await.expect("name_of"),
+        Some(String::from("nightly"))
+    );
+    store.name(first.id(), "Nightly").await.expect("renamed");
+    assert_eq!(
+        store.name_of(first.id()).await.expect("name_of"),
+        Some(String::from("Nightly")),
+        "renaming is how a name changes case"
+    );
+    drop(dir);
+}
+
+/// Whitespace at either end is not part of a name, because a name nobody can see is a name
+/// nobody can type back.
+#[tokio::test]
+async fn a_name_is_trimmed_on_the_way_in_and_on_the_way_out() {
+    let (dir, store) = store().await;
+    let saved = session("padded", 10, &["one"]);
+    store.save(&saved).await.expect("save");
+
+    store.name(saved.id(), "  nightly  ").await.expect("named");
+    assert_eq!(
+        store.name_of(saved.id()).await.expect("name_of"),
+        Some(String::from("nightly"))
+    );
+    assert_eq!(
+        store.resolve(" nightly").await.expect("resolve"),
+        Some(saved.id().clone())
+    );
+    // And the trimmed form is what a second session cannot take.
+    let other = session("other", 20, &["two"]);
+    store.save(&other).await.expect("save");
+    assert!(store.name(other.id(), "nightly ").await.is_err());
+    drop(dir);
+}
+
+/// A store somehow holding two names that fold to one answers the same way every time.
+#[tokio::test]
+async fn a_folded_clash_resolves_to_the_lowest_id() {
+    let (dir, store) = store().await;
+    let lower = session("aaa", 10, &["one"]);
+    let higher = session("zzz", 20, &["two"]);
+    store.save(&lower).await.expect("save");
+    store.save(&higher).await.expect("save");
+    // Written straight to the files, because `name` refuses the second — which is the rule
+    // under test. A store written before this rule, or edited by hand, is what this stands in
+    // for.
+    for (id, name) in [(lower.id(), "Nightly"), (higher.id(), "nightly")] {
+        std::fs::write(
+            store.name_file(id).expect("a name path"),
+            format!("{name}\n"),
+        )
+        .expect("write");
+    }
+    assert_eq!(
+        store.resolve("NIGHTLY").await.expect("resolve"),
+        Some(lower.id().clone()),
+        "the same session every time, rather than the listing's order"
+    );
+    drop(dir);
+}

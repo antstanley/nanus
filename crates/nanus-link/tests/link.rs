@@ -976,15 +976,34 @@ fn a_name_another_session_holds_is_refused_and_creates_nothing() {
             .await
             .expect("the first name is free");
         let refused = client.start(Some("mine".to_owned())).await;
+        // Another case is the same name: the agent resolves a name through the store, so
+        // `MINE` finds the session called `mine` and is refused rather than starting a second
+        // conversation a reader would believe was the first.
+        let cased = client.start(Some("MINE".to_owned())).await;
+        // And the same word, typed in another case, attaches to it rather than being refused as
+        // unknown.
+        let attached = client.attach("MiNe").await;
         let _ = stop_tx.send(());
         serving.await.expect("joined").expect("clean");
-        refused
+        (refused, cased, attached)
     });
 
-    match refused {
-        Err(LinkError::Agent(message)) => assert!(message.contains("mine"), "{message}"),
-        other => panic!("expected a refusal, got {other:?}"),
+    let (refused, cased, attached) = refused;
+    for refusal in [refused, cased] {
+        match refusal {
+            // The sentence echoes the name as it was typed, so the check is on the word rather
+            // than on its case.
+            Err(LinkError::Agent(message)) => {
+                assert!(message.to_lowercase().contains("mine"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
+    assert_eq!(
+        attached.map(|info| info.name).ok().flatten().as_deref(),
+        Some("mine"),
+        "a name resolves whatever case it is typed in"
+    );
     // The negative half that matters: a refused name must not leave an orphan session
     // behind, or every typo would add a conversation to the store.
     let listed = nanus_kernel::runtime::block_on(store.list()).expect("the store lists");

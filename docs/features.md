@@ -145,7 +145,9 @@ A session is the conversation, written down as it happens. See
 - **Named sessions**, with `--name` on `run` and `tui`, and
   `nanus sessions name <name> <session>` to rename later. A name is an alias for
   a store key: one session has one name, and a held name is refused rather than
-  moved.
+  moved. A name is a single word — no namespaces — and case does not make a second
+  one: `Nightly` and `nightly` are the same name, resolved either way, with the
+  spelling a session was named with kept for display.
 - **Deleting a session**, with `nanus sessions delete <name|id>`. The reference is
   resolved the way naming resolves one, a reference that answers to nothing is
   refused rather than reported as a deletion, and the session's name goes with it.
