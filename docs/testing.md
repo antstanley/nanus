@@ -11,7 +11,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [51.4s] 1204 tests run: 1204 passed, 0 skipped
+Summary [55.2s] 1210 tests run: 1210 passed, 0 skipped
 
 $ cargo test --workspace --doc
 10 doctests passed
@@ -223,6 +223,66 @@ checkpoint — the key now denies the call *and* asks for the stop), `--scroll` 
 `--session` was accepted and ignored, and a capped search reported `truncated` whenever the
 cap was *reached* rather than when a match was dropped, which is a confident falsehood a
 model cannot check.
+
+## The defects a second certificate review found
+
+A review of the provider and session work — the commits that shipped items 17 to 21 and 23 to
+26 — found six defects, all of them at a seam rather than inside a component. Each one is
+pinned by a test now, and the two that were reachable were reproduced before they were fixed.
+
+**A client attaching as a turn ended drew the turn twice.** The agent snapshots the running turn
+when it answers an attachment; the interface reads the log from the store a moment later. A turn
+that *ended* between those two instants is in the log, and the backlog that carries it was still
+delivered, so the prompt and the answer were drawn once from the store and again from the batch.
+The claim the design rests on — "a client finds a finished turn in the store and a running one in
+the batch, never both and never neither" — was true of the agent's own two stores and false for
+the client's two reads. The attachment now carries the log's position when the batch was taken,
+and the client, which reads the log *after*, recognises a log that has moved past it and drops
+the redundant batch. Pinned by
+[`backlog_is_redundant`](../crates/nanus-tui/src/runtime.rs) with the frame itself
+(`forwarded`), and by a socket test that asserts the count an attachment reports is the log's own
+rather than the running turn's — the property the comparison depends on.
+
+**A message the fold kept was one no adapter could encode.** `derive_messages` kept an assistant
+turn whose text was absent and whose calls had all gone unanswered, because it had reasoning and
+had once had calls. Dropping the calls left a message with neither text nor a call — and every
+request encoder asserts that an assistant turn carries one of the two, so a resumed session would
+have aborted in the encoder rather than in a sentence. Nothing in the shipped store produces such
+a log today (writes are whole-file and atomic, and nothing saves mid-turn), which is why only a
+reading of both sides finds it: the fold's own comment claimed the log was producible and the
+encoders' comments claimed the fold could not produce it. The message is now skipped with the
+calls it was kept for, and the invariant test that had been asserting the unencodable shape has
+its call answered so that it tests what it says: the reasoning of a *tool-using* turn survives.
+
+**An attachment's own reply could be dropped silently.** `Attached` and `Backlog` are queued
+without waiting, because a wait inside the attachment's synchronous region would let a live frame
+in ahead of them. A client whose queue was already full then never received the reply it was
+waiting for, and the frames it *did* receive were discarded as belonging to the session it was
+leaving — a hang with nothing to read. A connection with no room is now unregistered and refused
+on the awaiting path, which the client's own reading makes room for.
+
+**Taking over a stale claim was not a decision between two processes.** The claim promised that
+`O_EXCL` decided a race, and it did — for a *fresh* claim. A claim whose holder was gone was
+taken over with an atomic *replace*, which is not exclusive: two writers starting at the same
+instant, both finding the same dead pid, both replaced it and both believed they were first.
+That is the silent overwrite the claim exists to prevent, in the crash-and-restart case it exists
+to survive. The claim is now the operating system's own `flock`: atomic between processes,
+released by the kernel when the holder exits however it exits, so a stale claim is not a state a
+reader has to detect at all. The file stays as the *label* that names the holder for the refusal
+sentence, and the store's own map is what makes a re-claim from the process that already holds it
+a non-conflict rather than a self-refusal. The socket test that used to write a claim file by
+hand now holds a real lock from a second store, because a file nobody holds is exactly what it
+means not to be claimed.
+
+**A plan ran a model the agent did not offer.** `Selection` resolves `plan = "coding"` for
+`openai` to `gpt-5-codex`, and the offered list was `gpt-5` and `gpt-5-mini`. A client could
+cycle away from the coding model and never back — the cycle treats an unknown current id as a
+fresh start — and `SetModel` would have refused the id the session was already running. The
+model is now in the offered list, and the provider table's invariant test checks *every* plan's
+default rather than only the default plan.
+
+**A doc comment landed on the wrong function.** `domain_policy` lost its own first line to
+`wire_effort` above it. Private items are not covered by `missing_docs`, so nothing could see it.
 
 ## The bug a terminal found
 

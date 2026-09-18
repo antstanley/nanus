@@ -173,7 +173,11 @@ far, in order, folded where folding changes nothing — and the interface replay
 the same rendering the live frames use, so a reader who joins mid-turn sees the whole turn
 rather than a transcript beginning halfway through it. The batch is one item on the
 connection's queue, so no live frame can slip inside it and reorder the turn, and it empties
-the instant the turn reaches the log.
+the instant the turn reaches the log. A reader's copy of the log and that batch are read at
+two different instants — the agent takes the batch when it answers the attachment, and the
+interface reads the log a moment later — so the attachment carries the log's position at that
+instant, and an interface whose log has moved past it drops the batch rather than drawing the
+turn twice.
 
 **The session is recorded before the ending is sent.** A client that has seen the answer
 is holding one whose transcript is already on disk, which is the same contract `nanus run`

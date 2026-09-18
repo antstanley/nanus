@@ -566,6 +566,13 @@ pub struct Remote {
     effort: Option<ReasoningEffort>,
     /// Whether a turn was already running in the session when it was attached to.
     busy: bool,
+    /// Whether the backlog the agent sent is already in the log this client read.
+    ///
+    /// The two are read at different instants — the agent snapshots the running turn when it
+    /// answers the attachment, and this client reads the log afterwards — so a turn that ended
+    /// in between is in both. Applying the backlog then draws it twice; see
+    /// [`backlog_is_redundant`].
+    redundant_backlog: bool,
 }
 
 impl Remote {
@@ -604,6 +611,13 @@ impl Remote {
         let session = history(store, &attached, &agent.workspace).await;
         let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
         let busy = attached.busy;
+        // The backlog the agent is about to send was snapshotted when it answered the
+        // attachment, and the log was read a moment later. A turn that ended in between is in
+        // both, and the log is where a finished turn belongs.
+        let redundant_backlog = backlog_is_redundant(
+            attached.events,
+            u64::try_from(session.event_count()).unwrap_or(u64::MAX),
+        );
         let (requests, pending) = mpsc::unbounded_channel();
         Ok(Self {
             session,
@@ -617,8 +631,26 @@ impl Remote {
             models: agent.models.clone(),
             effort: agent.effort.map(view_effort),
             busy,
+            redundant_backlog,
         })
     }
+}
+
+/// Whether the backlog an agent sent is already in the log the client read.
+///
+/// The agent snapshots the running turn when it answers an attachment, and this client reads
+/// the log from the store afterwards. The log only grows when a turn *ends*, so:
+///
+/// - a log that holds exactly what the agent said it held ends where the backlog begins, and
+///   the backlog is the rest of the turn;
+/// - a log that has moved past that point already contains the turn the backlog carries — the
+///   turn ended between the two reads — so applying the backlog would draw it a second time.
+///
+/// The count the agent reports is the one it snapshotted, which is why this is a comparison
+/// rather than a guess: it is what makes catching up exact when the two reads are not one
+/// instant.
+fn backlog_is_redundant(snapshot_events: u64, stored_events: u64) -> bool {
+    stored_events > snapshot_events
 }
 
 /// The first few characters of a session id, for a title bar.
@@ -700,7 +732,10 @@ impl SessionSource for Remote {
             return;
         };
         let frames = frames.clone();
-        tokio::task::spawn_local(async move { pump(client, requests, frames).await });
+        let redundant_backlog = self.redundant_backlog;
+        tokio::task::spawn_local(
+            async move { pump(client, requests, frames, redundant_backlog).await },
+        );
     }
 
     fn submit(&mut self, prompt: String) {
@@ -803,6 +838,7 @@ async fn pump(
     client: Client,
     mut requests: mpsc::UnboundedReceiver<Request>,
     frames: mpsc::Sender<Frame>,
+    redundant_backlog: bool,
 ) {
     // Split, because the two directions run at once and one borrow cannot serve both.
     let (mut reader, mut sender) = client.split();
@@ -821,6 +857,9 @@ async fn pump(
             frame = reader.next() => {
                 match frame {
                     Ok(Some(frame)) => {
+                        if !forwarded(&frame, redundant_backlog) {
+                            continue;
+                        }
                         // A receiver that has gone away means the interface is closing, so
                         // there is nobody left to tell.
                         if frames.send(frame).await.is_err() {
@@ -839,6 +878,15 @@ async fn pump(
             }
         }
     }
+}
+
+/// Whether a frame the link sent should reach the interface.
+///
+/// The one frame that can arrive already answered: a turn that ended between the agent's
+/// snapshot of it and this client's read of the log is in the log, and the transcript was built
+/// from that — so the backlog that carries it is dropped rather than drawn on top of it.
+fn forwarded(frame: &Frame, redundant_backlog: bool) -> bool {
+    !(redundant_backlog && matches!(frame, Frame::Backlog { .. }))
 }
 
 /// Tells the interface that the conversation ended, when it is still there to hear it.
@@ -5233,6 +5281,47 @@ mod tests {
         let mut view = ViewState::new();
         apply(Frame::Backlog { frames: Vec::new() }, &mut view);
         assert!(view.transcript.entries().is_empty());
+    }
+
+    /// A backlog the log already holds is dropped on its way to the interface.
+    #[test]
+    fn a_redundant_backlog_does_not_reach_the_view() {
+        let backlog = Frame::Backlog {
+            frames: vec![Frame::Text {
+                delta: "already there".to_owned(),
+            }],
+        };
+        assert!(!forwarded(&backlog, true), "the turn is in the log");
+        assert!(
+            forwarded(&backlog, false),
+            "and reaches a client that needs it"
+        );
+        // Everything else is forwarded either way: the flag is about one frame, not a mode.
+        for frame in [Frame::Step { step: 2 }, Frame::Bye] {
+            assert!(forwarded(&frame, true), "{frame:?}");
+            assert!(forwarded(&frame, false), "{frame:?}");
+        }
+    }
+
+    /// A backlog is dropped when the log this client read already holds the turn.
+    ///
+    /// The agent snapshots the running turn when it answers the attachment, and the log is read
+    /// a moment later, so a turn that ends in between is in both — and applying the backlog on
+    /// top of a transcript built from the log draws the prompt and the answer twice. The count
+    /// the agent reports is the one it snapshotted, which is what makes the comparison exact:
+    /// the log only grows when a turn ends.
+    #[test]
+    fn a_backlog_the_log_already_holds_is_redundant() {
+        // The ordinary case: the log ends where the backlog begins.
+        assert!(!backlog_is_redundant(4, 4));
+        // A brand-new session the store has never seen: the agent reported nothing and the log
+        // read nothing, so the backlog is the whole conversation.
+        assert!(!backlog_is_redundant(0, 0));
+        // The turn ended between the snapshot and the read, so the log gained its events.
+        assert!(backlog_is_redundant(4, 9));
+        // A log that somehow holds less than the agent said is not treated as redundant: the
+        // backlog is the only source for the turn that was running.
+        assert!(!backlog_is_redundant(4, 2));
     }
 
     /// A trimmed prompt is drawn where the gap is, because an answer that contradicts

@@ -91,15 +91,15 @@ pub trait StorePort {
     /// its own stale copy. *Attaching* to a session is not a claim: many clients watch one
     /// session, and one of them is what holds it.
     ///
-    /// A claim is *advisory* in the sense that any process can ignore it by writing the log
-    /// directly. What it defends against is another `nanus` — the ordinary way two writers
-    /// meet — not a deliberate one.
+    /// The decision is the operating system's: an adapter takes a lock the kernel arbitrates and
+    /// releases when the holder exits, so a claim a crashed writer left behind is not an owner a
+    /// reader has to detect — it is already gone. A claim is *advisory* in the sense that any
+    /// process can ignore it by writing the log directly: what it defends against is another
+    /// `nanus`, the ordinary way two writers meet, not a deliberate one.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Locked`] when another live process holds it. A claim whose holder
-    /// is gone is taken over rather than honoured: a lock a crashed process left behind is not
-    /// an owner, and honouring it would wedge a session for good.
+    /// Returns [`StoreError::Locked`] when another process holds it.
     fn lock<'a>(&'a self, id: &'a SessionId, owner: &'a str)
     -> LocalBoxFuture<'a, StoreResult<()>>;
 
@@ -108,11 +108,10 @@ pub trait StorePort {
     /// Synchronous, unlike everything else here, because its caller is a `Drop`: a claim that
     /// outlived the thing that held it would refuse the next writer for as long as this process
     /// runs, and a release that cannot happen at the instant the holder goes is a lock that
-    /// leaks. Removing one small file is not worth a future to await.
+    /// leaks. Letting go of a lock is not worth a future to await.
     ///
-    /// Releasing a claim this process does not hold does nothing. A claim taken over from a
-    /// crashed process belongs to whoever took it over, and one held by another live process is
-    /// not ours to remove.
+    /// Releasing a claim this process does not hold does nothing: the holder is whoever the
+    /// operating system says it is, and a claim held by another process is not ours to release.
     fn release_lock(&self, id: &SessionId);
 }
 
@@ -193,11 +192,16 @@ pub enum StoreError {
         id: String,
     },
 
-    /// Another live process holds the session for writing.
+    /// Another process holds the session for writing.
     ///
     /// Deliberately not merged with [`StoreError::Io`]: this is a *decision* the store made,
     /// and the caller's answer to it is to wait, to stop the other agent, or to attach to it —
     /// not to retry the same write.
+    ///
+    /// The holder is named from the claim's own label, which the holder writes as it takes the
+    /// lock. A refusal that arrives in the same instant as a fresh claim may therefore name the
+    /// process before it — and one whose label cannot be read is reported as `another process`
+    /// with a pid of zero. What is refused is exact; who is named is a courtesy.
     #[error("session {id} is being written by {owner} (pid {pid})")]
     Locked {
         /// The contested session.

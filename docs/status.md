@@ -65,9 +65,11 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 - **A session is claimed, not locked.** A writer claims the session it holds — a `nanus run`
   for its run, an agent for as long as it holds the session — and a second writer is refused
   with a sentence naming the holder, so `nanus run --resume x` against a service serving `x`
-  says what to do instead of overwriting it. The claim is a file beside the log holding a pid,
-  so it is advisory: a process that writes the log directly is not stopped, a claim whose
-  holder is gone is taken over, and `nanus sessions delete` does not consult it. Attaching to
+  says what to do instead of overwriting it. The claim is a file beside the log that the
+  operating system locks while a writer holds it, so it is exact between `nanus` processes and
+  advisory against everything else: a process that writes the log directly is not stopped, a
+  holder that exits releases the lock by exiting, and `nanus sessions delete` does not consult
+  it. Attaching to
   a live session is still the supported way to share one, and it is what the interface does.
 - **A session is held in memory while an agent holds it.** Bounded at 32 idle sessions,
   least-recently-used first, and never at the cost of a running turn or an attached

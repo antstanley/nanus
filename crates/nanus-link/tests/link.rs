@@ -1200,6 +1200,104 @@ fn an_idle_session_catches_nobody_up() {
     });
 }
 
+/// The count an attachment carries is the log's, taken where the backlog begins.
+///
+/// A client reads the log itself, a moment after the agent snapshotted the running turn, and
+/// compares the two: a log that has moved past the count already holds the turn the backlog
+/// carries, and the backlog is dropped rather than drawn on top of it. That comparison is only
+/// exact if the count is the *log's* own at the instant of the snapshot — not the running
+/// turn's, which the log does not have yet — so the number is asserted here against the store
+/// rather than inferred from the frames.
+#[test]
+fn an_attachment_reports_the_log_position_the_backlog_continues_from() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (agent, store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(WaitingLlm {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })),
+        "waiting",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    // A session with history of its own, as a resumed conversation has: the log holds events
+    // *before* the turn that will be running.
+    let saved = SessionId::new("positioned");
+    let held_turn = nanus_kernel::runtime::block_on(async {
+        let mut session = Session::new(saved.clone(), 1, "/work");
+        session.append(SessionEvent::UserMessage {
+            text: "an earlier question".to_owned(),
+        });
+        session.append(SessionEvent::AssistantMessage {
+            text: Some("an earlier answer".to_owned()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+            model: None,
+            effort: None,
+        });
+        store.save(&session).await.expect("the history is recorded");
+        u64::try_from(session.event_count()).unwrap_or(u64::MAX)
+    });
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+
+        let mut owner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let attached = owner.attach(saved.as_str()).await.expect("resumes");
+        assert_eq!(
+            attached.events, held_turn,
+            "an idle session reports what its log holds"
+        );
+        owner
+            .send(&Request::Prompt {
+                text: "and now this".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let _permit = entered.acquire().await.expect("the turn reached the model");
+
+        let mut joiner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let mid_turn = joiner.attach(saved.as_str()).await.expect("joins");
+        // The running turn is in the backlog and *not* in the count, which is what lets the
+        // joiner tell "the log ends here" from "the log already has this turn".
+        assert_eq!(
+            mid_turn.events, held_turn,
+            "a running turn does not move the log's position"
+        );
+        let stored = store
+            .load(&saved)
+            .await
+            .expect("the history is readable")
+            .event_count();
+        assert_eq!(
+            u64::try_from(stored).unwrap_or(u64::MAX),
+            mid_turn.events,
+            "the count is the log's own, so a client can compare against what it read"
+        );
+
+        release.add_permits(1);
+        let rest = turn_frames(&mut joiner).await;
+        assert!(answer_of(&rest).is_some(), "the turn ended: {rest:?}");
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
 /// A rename reaches everything the agent reports about a session it is holding.
 ///
 /// `nanus sessions name` writes the store and tells nobody — it does not connect to the link —
@@ -1540,11 +1638,15 @@ fn a_session_another_agent_is_writing_is_refused() {
         session.id().clone()
     });
 
-    // Another live process's claim, written where the store keeps it. Pid 1 is running by
-    // definition and is not this process, so it stands in for the second agent.
-    let lock = store.lock_file(&saved).expect("a lock path");
-    std::fs::write(&lock, r#"{"pid":1,"owner":"nanus at /tmp/other.sock"}"#).expect("the claim");
+    // Another agent's claim. A store of its own takes the lock the operating system arbitrates,
+    // which is what a second process's claim is — a hand-written file would not be one, because
+    // the label is not the lock.
+    let other = nanus_kernel::runtime::block_on(JsonlStore::new(dir.path().to_path_buf()))
+        .expect("the second store opens");
+    nanus_kernel::runtime::block_on(other.lock(&saved, "nanus at /tmp/other.sock"))
+        .expect("the other agent holds it");
 
+    let saved_after = saved.clone();
     let message = nanus_kernel::runtime::block_on_local(async move {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let listener = nanus_link::bind(&socket).await.expect("the socket binds");
@@ -1579,10 +1681,19 @@ fn a_session_another_agent_is_writing_is_refused() {
     // leaves a reader with nowhere to go.
     assert!(message.contains("nanus at /tmp/other.sock"), "{message}");
     assert!(message.contains("--connect"), "{message}");
+    // A refusal must not take the other agent's claim away: a third writer still cannot have it.
+    let third = nanus_kernel::runtime::block_on(JsonlStore::new(dir.path().to_path_buf()))
+        .expect("the third store opens");
     assert!(
-        lock.exists(),
-        "a refusal must not take the other agent's claim away"
+        nanus_kernel::runtime::block_on(third.lock(&saved_after, "a third writer")).is_err(),
+        "the other agent's claim survives the refusal"
     );
+    nanus_kernel::runtime::block_on(other.lock(&saved_after, "nanus at /tmp/other.sock"))
+        .expect("the holder re-claims its own");
+    other.release_lock(&saved_after);
+    nanus_kernel::runtime::block_on(third.lock(&saved_after, "a third writer"))
+        .expect("released, the session is claimable");
+    third.release_lock(&saved_after);
 }
 
 #[test]

@@ -38,7 +38,12 @@ pub const ZAI_API_KEY_ENV: &str = "ZAI_API_KEY";
 /// reports thinking wants a model that produces it. A non-reasoning id set by hand
 /// still works, but the provider refuses the effort field — which is why the
 /// offered list is the reasoning family.
-static OPENAI_MODELS: [&str; 2] = ["gpt-5", "gpt-5-mini"];
+///
+/// The coding model is in the list because the composition's `coding` plan resolves to
+/// it: a plan whose default model the agent does not offer would put a client on a model
+/// it could cycle away from and never back to, and `SetModel` would refuse the id the
+/// session was already running.
+static OPENAI_MODELS: [&str; 3] = ["gpt-5", "gpt-5-mini", "gpt-5-codex"];
 
 /// The models offered for z.ai, in cycling order.
 static ZAI_MODELS: [&str; 3] = ["glm-4.5", "glm-4.5-air", "glm-4.5-flash"];
@@ -413,7 +418,10 @@ mod tests {
     /// vendor's.
     #[test]
     fn the_offered_models_belong_to_their_vendor() {
-        assert_eq!(Vendor::OpenAi.models(), ["gpt-5", "gpt-5-mini"]);
+        assert_eq!(
+            Vendor::OpenAi.models(),
+            ["gpt-5", "gpt-5-mini", "gpt-5-codex"]
+        );
         assert_eq!(
             Vendor::Zai.models(),
             ["glm-4.5", "glm-4.5-air", "glm-4.5-flash"]
@@ -421,6 +429,10 @@ mod tests {
         for model in Vendor::OpenAi.models() {
             assert!(!model.contains("glm"), "{model}");
         }
+        // The default is the first, and it stays the general model rather than the
+        // coding one: the coding model is reachable by the plan that names it, and by
+        // a cycle, without becoming what a configuration that names nothing gets.
+        assert_eq!(Vendor::OpenAi.models().first().copied(), Some("gpt-5"));
     }
 
     /// The budget sent is capped at the provider's documented ceiling, because a

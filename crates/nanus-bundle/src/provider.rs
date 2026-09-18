@@ -578,6 +578,19 @@ mod tests {
             for model in provider.models() {
                 assert!(!model.is_empty(), "{provider} lists a real model");
             }
+            // Every plan's own default model has to be one the agent offers, or a run under
+            // that plan starts on an id a client cannot name and `SetModel` would refuse — and
+            // the cycle, which treats an unknown current model as a fresh start, could leave it
+            // and never return. A plan with no model of its own is a refusal, checked elsewhere.
+            for plan in provider.plans() {
+                if let Some(model) = plan.model {
+                    assert!(
+                        provider.models().contains(&model),
+                        "{provider}'s {:?} plan resolves to {model}, which it does not offer",
+                        plan.name
+                    );
+                }
+            }
         }
         assert_eq!(accounts, Provider::names());
     }

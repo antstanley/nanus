@@ -700,7 +700,11 @@ async fn a_name_that_is_not_readable_leaves_the_session_unnamed() {
 // Claims: one writer per session.
 // ---------------------------------------------------------------------------
 
-/// Writes a claim as another process would have left it.
+/// Writes a claim label, as a process that left the file behind would have left it.
+///
+/// The label is not the lock — the operating system's lock is — so a file written by hand is a
+/// file *nobody holds*, which is exactly the state a crashed writer leaves: the kernel released
+/// its lock as it exited.
 async fn write_claim(store: &JsonlStore, id: &SessionId, pid: u32, owner: &str) {
     let path = store.lock_file(id).expect("a lock path");
     tokio::fs::create_dir_all(path.parent().expect("a parent"))
@@ -711,49 +715,85 @@ async fn write_claim(store: &JsonlStore, id: &SessionId, pid: u32, owner: &str) 
         .expect("the claim");
 }
 
-/// A live holder keeps a second writer out; a holder that is gone does not.
+/// A second writer of the same session is refused, and the refusal names the holder.
+///
+/// Two stores over one home stand in for two processes: the lock the first takes is one the
+/// second cannot take, which is the whole of what makes a second writer impossible rather than
+/// merely discouraged.
 #[tokio::test]
-async fn a_claim_refuses_a_live_holder_and_takes_over_a_dead_one() {
-    let (dir, store) = store().await;
+async fn a_claim_refuses_a_second_writer_and_names_it() {
+    let (dir, first) = store().await;
     let id = SessionId::new("contested");
-
-    // Nobody holds it, so the claim is taken and written down.
-    store.lock(&id, "the first writer").await.expect("claimed");
-    let path = store.lock_file(&id).expect("a lock path");
+    first
+        .lock(&id, "nanus at /tmp/first.sock")
+        .await
+        .expect("claimed");
+    let path = first.lock_file(&id).expect("a lock path");
     assert!(path.exists(), "a claim is a file beside the log");
+    let label = std::fs::read_to_string(&path).expect("the label reads");
+    assert!(
+        label.contains("first.sock"),
+        "the holder writes its label: {label:?}"
+    );
 
-    // Claiming it again from the same process is not a conflict: an agent re-holding a
-    // session it already holds must not refuse itself.
-    store
-        .lock(&id, "the first writer")
+    // Claiming it again from the same store is not a conflict: an agent re-holding a session it
+    // already holds must not refuse itself.
+    first
+        .lock(&id, "nanus at /tmp/first.sock")
         .await
         .expect("re-claimed");
 
-    // A live holder is refused, and the refusal names it. Pid 1 is running by definition,
-    // and is not this process, so it stands in for another agent.
-    write_claim(&store, &id, 1, "nanus at /tmp/other.sock").await;
-    match store.lock(&id, "the second writer").await {
+    // A second writer is refused, and the sentence says who has it.
+    let second = JsonlStore::new(dir.path()).await.expect("a second store");
+    match second.lock(&id, "nanus run").await {
         Err(StoreError::Locked { id, owner, pid }) => {
             assert_eq!(id, "contested");
-            assert_eq!(owner, "nanus at /tmp/other.sock");
-            assert_eq!(pid, 1);
+            assert_eq!(owner, "nanus at /tmp/first.sock");
+            assert_eq!(pid, std::process::id(), "the holder is this process");
         }
         other => panic!("a live holder must refuse the claim: {other:?}"),
     }
+    // And the refusal did not take the holder's claim away.
+    assert!(
+        second
+            .lock(&id, "nanus run")
+            .await
+            .is_err_and(|error| matches!(error, StoreError::Locked { .. })),
+        "the claim is still the first writer's"
+    );
 
-    // A holder that is gone is no holder at all. Pid 0 is not a process, so a claim naming
-    // it stands in for one a crashed writer left behind — the case that would otherwise
-    // wedge a session for good.
+    // Released, it is claimable — by the second writer, which is what a handover looks like.
+    first.release_lock(&id);
+    second
+        .lock(&id, "nanus run")
+        .await
+        .expect("the session is claimable once released");
+    second.release_lock(&id);
+    drop(dir);
+}
+
+/// A claim a writer that is gone left behind is not a holder.
+///
+/// This is the case the lock makes automatic rather than a decision: the kernel releases a
+/// claim when its holder exits, however it exits, so a session a crashed writer had open is
+/// simply not locked. A file whose label names a process that no longer exists stands in for
+/// one, and it must not wedge the session for good.
+#[tokio::test]
+async fn a_claim_a_crashed_writer_left_behind_is_not_a_holder() {
+    let (dir, store) = store().await;
+    let id = SessionId::new("abandoned");
     write_claim(&store, &id, 0, "a writer that crashed").await;
+
     store
         .lock(&id, "the next writer")
         .await
-        .expect("a dead holder is taken over");
+        .expect("a claim nobody holds is not a claim");
+    // The taker's own label replaces the crashed writer's, so the next refusal names the holder
+    // that is actually there.
+    let path = store.lock_file(&id).expect("a lock path");
+    let label = std::fs::read_to_string(&path).expect("the label");
+    assert!(label.contains("the next writer"), "{label}");
 
-    // Releasing removes it, and leaves the session claimable.
-    store.release_lock(&id);
-    assert!(!path.exists(), "the claim is gone");
-    store.lock(&id, "another writer").await.expect("claimable");
     store.release_lock(&id);
     drop(dir);
 }
@@ -761,16 +801,24 @@ async fn a_claim_refuses_a_live_holder_and_takes_over_a_dead_one() {
 /// A claim this process does not hold is not this process's to release.
 #[tokio::test]
 async fn releasing_a_claim_belonging_to_somebody_else_leaves_it_alone() {
-    let (dir, store) = store().await;
+    let (dir, holder) = store().await;
     let id = SessionId::new("theirs");
-    write_claim(&store, &id, 1, "nanus at /tmp/other.sock").await;
+    holder
+        .lock(&id, "nanus at /tmp/other.sock")
+        .await
+        .expect("claimed");
 
-    store.release_lock(&id);
-    let path = store.lock_file(&id).expect("a lock path");
+    // A process that does not hold it releasing it must not hand the session to a third writer.
+    let bystander = JsonlStore::new(dir.path()).await.expect("a second store");
+    bystander.release_lock(&id);
+    let third = JsonlStore::new(dir.path()).await.expect("a third store");
     assert!(
-        path.exists(),
-        "a claim held by another process must survive this process releasing"
+        third.lock(&id, "an interloper").await.is_err(),
+        "another process's claim survives this process releasing"
     );
+    let path = holder.lock_file(&id).expect("a lock path");
+    assert!(path.exists(), "the claim file is still there");
+    holder.release_lock(&id);
     drop(dir);
 }
 
@@ -788,8 +836,9 @@ async fn a_claim_is_invisible_to_reads() {
     let listed = store.list().await.expect("list");
     assert_eq!(listed.len(), 1, "a claim is not a session");
 
-    // And a damaged claim is no claim rather than a corrupt store: a file a person edited by
-    // hand must not make a session unusable.
+    // And a damaged label is no label rather than a corrupt store: a file a person edited by
+    // hand must not make a session unusable, because the lock — not the label — decides.
+    store.release_lock(saved.id());
     std::fs::write(
         store.lock_file(saved.id()).expect("a lock path"),
         "not json",
@@ -798,7 +847,7 @@ async fn a_claim_is_invisible_to_reads() {
     store
         .lock(saved.id(), "a writer")
         .await
-        .expect("a damaged claim is replaced");
+        .expect("a damaged label is not a holder");
     store.release_lock(saved.id());
     drop(dir);
 }

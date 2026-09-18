@@ -160,7 +160,7 @@ fn an_assistant_turn_with_no_text_never_sends_null_content() {
 #[test]
 fn reasoning_is_replayed_when_a_turn_carries_tool_calls() {
     // DeepSeek requires prior reasoning_content back when tools are present, so
-    // the fold must not drop it.
+    // the fold must not drop it from a tool-using turn.
     let mut session = Session::new(SessionId::new("s"), 0, "/work");
     session.append(SessionEvent::AssistantMessage {
         text: None,
@@ -175,6 +175,14 @@ fn reasoning_is_replayed_when_a_turn_carries_tool_calls() {
         model: None,
         effort: None,
     });
+    // The call has to be answered for the turn to be a tool-using one: a call nothing answers
+    // cannot travel, and the reasoning of a turn whose calls are all dropped is dropped with
+    // them, because a message with neither text nor a call is one no encoder can send.
+    session.append(SessionEvent::ToolResult {
+        call_id: ToolCallId::new("c"),
+        content: String::from("the file"),
+        is_error: false,
+    });
     let messages = session.derive_messages();
     let Some(assistant) = messages.first() else {
         panic!("the assistant turn is model-visible");
@@ -182,6 +190,7 @@ fn reasoning_is_replayed_when_a_turn_carries_tool_calls() {
     assert_eq!(assistant.role(), Role::Assistant);
     assert_eq!(assistant.reasoning(), Some("I need to read the file"));
     assert_eq!(assistant.text(), None);
+    assert_eq!(assistant.tool_calls().len(), 1, "the answered call travels");
     let encoded = serde_json::to_value(assistant).unwrap_or(Value::Null);
     assert_eq!(
         encoded.get("content"),

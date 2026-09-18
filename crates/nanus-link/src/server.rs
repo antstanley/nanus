@@ -852,7 +852,6 @@ const fn wire_state(policy: ApprovalPolicy) -> ApprovalState {
     }
 }
 
-/// Reads the link's approval state into the domain's vocabulary.
 /// Renders a reasoning effort in the link's vocabulary.
 ///
 /// An exhaustive match, so a step the ports scale grows cannot quietly fail to cross.
@@ -875,6 +874,10 @@ const fn domain_effort(state: EffortState) -> nanus_ports::ReasoningEffort {
     }
 }
 
+/// Reads the link's approval state into the domain's vocabulary.
+///
+/// An exhaustive match, for the same reason [`wire_state`] is one: a state the link grows has
+/// to be a compile error here rather than a state the agent silently never applies.
 const fn domain_policy(state: ApprovalState) -> ApprovalPolicy {
     match state {
         ApprovalState::PerCall => ApprovalPolicy::PerCall,
@@ -1414,9 +1417,15 @@ async fn watch_opened(
     frames: &mpsc::Sender<Frame>,
     opened: Result<Rc<Held>, String>,
 ) -> Option<(u64, Rc<Held>)> {
-    match opened {
-        Ok(held) => Some(attach(registry, &held, frames).await),
+    let attached = match opened {
+        Ok(held) => attach(registry, &held, frames).await,
+        Err(message) => Err(message),
+    };
+    match attached {
+        Ok(watching) => Some(watching),
         Err(message) => {
+            // Queued on the awaiting path rather than the droppable one: a refusal is the
+            // answer to the request, and the client is reading for it.
             send(frames, Frame::Failed { message }).await;
             None
         }
@@ -1626,11 +1635,21 @@ fn release(watching: &mut Option<(u64, Rc<Held>)>) {
 ///    running cannot have a frame queued past a viewer that is not there yet.
 /// 2. The reply is queued before the connection task can yield, so no frame of that turn
 ///    can arrive ahead of the attachment that explains it.
+///
+/// # Errors
+///
+/// Returns a message when the connection cannot be told what it was attached to. The two
+/// frames of an attachment are queued without waiting, because a wait inside the region would
+/// let a live frame in ahead of them — but a client whose queue is already full has not been
+/// reading, and the registration is taken back rather than left standing: a viewer that is
+/// registered and unanswered would receive the turn while waiting for a reply that was
+/// dropped, which is a hang with no diagnosis. The refusal travels the awaiting path, which
+/// the client's own reading makes room for.
 async fn attach(
     registry: &Rc<Registry>,
     held: &Rc<Held>,
     frames: &mpsc::Sender<Frame>,
-) -> (u64, Rc<Held>) {
+) -> Result<(u64, Rc<Held>), String> {
     // A name another process may have changed since this session was opened, read before the
     // region below rather than inside it. Awaiting *here* is safe for catching up — a frame
     // produced during it is recorded in the backlog and this viewer is not registered yet, so
@@ -1649,9 +1668,18 @@ async fn attach(
     // backlog — the newest delta drawn before the text it continues.
     let backlog = held.turn_frames();
     let viewer = registry.view(held, frames);
-    queue_now(frames, Frame::Attached(held.info()));
-    if !backlog.is_empty() {
-        queue_now(frames, Frame::Backlog { frames: backlog });
+    if !queue_now(frames, Frame::Attached(held.info())) {
+        held.unview(viewer);
+        return Err(String::from(
+            "this connection has fallen too far behind to be attached; reconnect and attach again",
+        ));
+    }
+    if !backlog.is_empty() && !queue_now(frames, Frame::Backlog { frames: backlog }) {
+        held.unview(viewer);
+        return Err(String::from(
+            "this connection has fallen too far behind to catch up with the running turn; \
+             reconnect and attach again",
+        ));
     }
     // A question the turn is waiting on is state rather than history: a client that arrived
     // after it went out is shown it here, and can answer it, because the answer is matched
@@ -1674,7 +1702,7 @@ async fn attach(
     if let Some(state) = registry.agent.effort() {
         send(frames, Frame::EffortChanged { state }).await;
     }
-    (viewer, Rc::clone(held))
+    Ok((viewer, Rc::clone(held)))
 }
 
 /// Starts a session for a client, named if it was asked for by name.
@@ -1766,11 +1794,19 @@ async fn start_turn(
 /// Queues one frame without waiting.
 ///
 /// For the two frames of an attachment, which must be queued in a region that cannot yield:
-/// a full queue there is a client that has stopped reading and a closed one is a client that
-/// has gone, and neither is worth waiting for.
-fn queue_now(frames: &mpsc::Sender<Frame>, frame: Frame) {
-    if let Err(error) = frames.try_send(frame) {
-        tracing::debug!(%error, "a frame could not be queued without waiting");
+/// the reply that explains the attachment and the batch that follows it. A full queue means a
+/// client that has stopped reading, which is not a client any more — and the caller takes the
+/// attachment back rather than leaving it half delivered, so the reply is a refusal the client
+/// can read rather than a stream it cannot be caught up with.
+///
+/// Returns whether the frame was queued.
+fn queue_now(frames: &mpsc::Sender<Frame>, frame: Frame) -> bool {
+    match frames.try_send(frame) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(%error, "a frame could not be queued without waiting");
+            false
+        }
     }
 }
 
@@ -1973,6 +2009,41 @@ mod tests {
             "{:?}",
             session.turn_frames()
         );
+    }
+
+    /// A connection with no room for the reply is refused rather than half attached.
+    ///
+    /// The attachment's own two frames are queued without waiting, because a wait there would
+    /// let a live frame in ahead of them. A client that cannot take them has stopped reading,
+    /// and it is *unregistered* rather than left subscribed: a viewer registered and unanswered
+    /// would receive the turn while waiting for a reply that was dropped, which is a hang with
+    /// nothing to read. The refusal goes out on the awaiting path instead, which the client's
+    /// own reading makes room for.
+    #[test]
+    fn a_connection_with_no_room_for_the_reply_is_refused_rather_than_attached() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        nanus_kernel::runtime::block_on_local(async move {
+            let registry = registry_over(dir.path()).await;
+            let session = held("no-room");
+            // Room for one frame, already taken: what a client that has fallen behind looks
+            // like. The receiver is held rather than drained, so the queue is still full when
+            // the attachment tries to answer.
+            let (frames, _queued) = mpsc::channel(1);
+            frames.try_send(Frame::Bye).expect("the one slot");
+
+            // The refusal must not wait for the room it cannot have: it is returned here, and the
+            // reply it becomes travels the awaiting path in `watch_opened`, which the client's
+            // own reading makes room for — the path a refused claim already takes, asserted end
+            // to end in `nanus-link`'s socket tests.
+            let Err(message) = attach(&registry, &session, &frames).await else {
+                panic!("a connection with no room cannot be attached");
+            };
+            assert!(message.contains("too far behind"), "{message}");
+            assert!(
+                session.viewers.borrow().is_empty(),
+                "the registration is taken back rather than left standing"
+            );
+        });
     }
 
     #[tokio::test]

@@ -90,7 +90,7 @@ which one is in use.
 | `deepseek` (default) | `nanus-adapter-deepseek` | `deepseek-flash`, `deepseek-v4-pro` | `api` |
 | `zai` | `nanus-adapter-openai` | `glm-4.5`, `glm-4.5-air`, `glm-4.5-flash` | `api`, `coding` |
 | `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
-| `openai` | `nanus-adapter-openai` | `gpt-5`, `gpt-5-mini` | `api`, `coding`, `subscription`¹ |
+| `openai` | `nanus-adapter-openai` | `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `coding`, `subscription`¹ |
 
 ¹ The OpenAI `subscription` plan — the ChatGPT coding tier reached with an OAuth
 token — is listed and **refused with its reason** rather than silently absent: it
@@ -452,9 +452,9 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   writes, its network access, or its process table.
 - **A session is claimed for writing.** Two writers on one log cannot silently lose a turn:
   the second is refused with a sentence naming the holder, and attaching to a live session
-  remains the supported way to share one. The claim is a file beside the log, so it is
-  advisory rather than a lock the operating system enforces. Attaching
-  to a live session is the supported way to share one.
+  attaching to a live session is the supported way to share one. The claim is a lock the
+  operating system holds on a file beside the log, so it is exact between `nanus` processes
+  and advisory against the rest: a process that writes the log directly is not stopped.
 - **No remote fetch from the renderer**: a fenced block is highlighted by a lexer
   inside the view, and an image is a placeholder or a pasted file, never a URL
   fetched on a model's say-so.

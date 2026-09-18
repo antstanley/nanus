@@ -68,7 +68,7 @@ futures = "0.3"
 # Process-group signalling. Used instead of raw libc so the whole workspace keeps
 # `unsafe_code = "forbid"`: a shell tool spawns grandchildren, and only killing the
 # process group reaps them.
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["fs", "signal", "process"] }
 
 # Serialization.
 serde = { version = "1.0", features = ["derive"] }

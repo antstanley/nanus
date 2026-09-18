@@ -59,6 +59,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use etcetera::BaseStrategy as _;
@@ -129,10 +130,18 @@ pub fn resolve_home(explicit: Option<&Path>) -> StoreResult<PathBuf> {
 }
 
 /// A session store rooted at a nanus home.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct JsonlStore {
     /// The nanus home every session lives under.
     home: PathBuf,
+    /// The write claims this process holds, one open file per session it is writing.
+    ///
+    /// The file is the claim: it is locked with `flock` for as long as it is open here, and the
+    /// kernel drops that lock when this process exits — which is why the map is what a release
+    /// consults. It is a map rather than a field of the returned claim because the port's
+    /// release is synchronous and the caller is a `Drop`: the open file has to outlive the call
+    /// that opened it, and this is the thing that outlives it.
+    locks: Mutex<BTreeMap<SessionId, std::fs::File>>,
 }
 
 impl JsonlStore {
@@ -144,7 +153,10 @@ impl JsonlStore {
     pub async fn new(home: impl Into<PathBuf>) -> StoreResult<Self> {
         let home = home.into();
         assert!(!home.as_os_str().is_empty(), "a store home is named");
-        let store = Self { home };
+        let store = Self {
+            home,
+            locks: Mutex::new(BTreeMap::new()),
+        };
         let root = store.sessions_root();
         fs::create_dir_all(&root)
             .await
@@ -228,15 +240,30 @@ impl JsonlStore {
 
     /// Claims a session for this process.
     ///
+    /// The exclusion is the operating system's, not this module's arithmetic. The lock file is
+    /// held open and locked with `flock`, which is atomic between processes and which the kernel
+    /// releases when the holder exits — so a claim a crashed writer left behind is not a state
+    /// to be detected and taken over, it is already gone. Two processes that start at the same
+    /// instant cannot both be first: one takes the lock, and the other is refused.
+    ///
+    /// The file's *body* is a label rather than the decision: it names the holder so a refused
+    /// writer can be told who has the conversation. It is written after the lock is taken, so a
+    /// refusal that arrives in the same instant as a fresh claim may name the holder before it.
+    /// The refusal itself is exact.
+    ///
+    /// Synchronous, unlike the rest of the store: the map is consulted and the lock taken in one
+    /// critical section, because a claim decision that yielded in the middle could see the map
+    /// empty twice and open two handles to one file — and a second handle is a second holder.
+    /// The work is one `open` and one `flock`, neither of which blocks: `flock` here is
+    /// non-blocking by construction.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Locked`] when another live process holds it.
-    async fn lock_blocking(&self, id: &SessionId, owner: &str) -> StoreResult<()> {
+    /// Returns [`StoreError::Locked`] when another process holds the session.
+    fn lock_blocking(&self, id: &SessionId, owner: &str) -> StoreResult<()> {
         let path = self.lock_file(id)?;
         let dir = self.session_dir(id)?;
-        fs::create_dir_all(&dir)
-            .await
-            .map_err(|source| io_error(&dir, &source))?;
+        std::fs::create_dir_all(&dir).map_err(|source| io_error(&dir, &source))?;
         let body = serde_json::to_string(&Claim {
             pid: std::process::id(),
             owner: owner.to_owned(),
@@ -245,50 +272,54 @@ impl JsonlStore {
             path: path.clone(),
             message: source.to_string(),
         })?;
-        // Created, not written: `O_EXCL` is what decides a race between two processes starting
-        // at the same instant, rather than both reading an absent file and both believing they
-        // are the first. The loser finds one and asks whose it is.
-        match create_claim(&path, &body).await {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Some(held) = read_claim(&path).await?
-                    && held.pid != std::process::id()
-                    && is_running(held.pid)
-                {
-                    return Err(StoreError::Locked {
-                        id: id.as_str().to_owned(),
-                        owner: held.owner,
-                        pid: held.pid,
-                    });
-                }
-                // Either this process already holds it — re-claiming is not a conflict, which is
-                // what lets an agent hold a session it has just claimed — or the holder is gone,
-                // and a claim a crashed writer left behind is not an owner.
-                write_atomic(&path, &body).await
-            }
-            Err(source) => Err(io_error(&path, &source)),
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-claiming a session this process already holds is not a conflict: one process is one
+        // writer, and the second connection to open the conversation an agent is already holding
+        // must be given *that* holder rather than told somebody else has it. The map is what says
+        // so, which is why the same shape cannot reach the OS lock below: `flock` is per open
+        // file, so a second handle would refuse *this* process.
+        if let Some(held) = locks.get(id) {
+            return write_claim(held, &body, &path);
         }
+        let Some(file) = take_claim(&path)? else {
+            // The lock is what refuses; the label is only how the refusal is worded. A label that
+            // cannot be read is a holder that has not written it yet, which is a sentence about an
+            // unnamed process rather than a reason to proceed.
+            let claim = read_claim(&path);
+            return Err(StoreError::Locked {
+                id: id.as_str().to_owned(),
+                owner: claim.as_ref().map_or_else(
+                    || String::from("another process"),
+                    |claim| claim.owner.clone(),
+                ),
+                pid: claim.map_or(0, |claim| claim.pid),
+            });
+        };
+        write_claim(&file, &body, &path)?;
+        locks.insert(id.clone(), file);
+        drop(locks);
+        Ok(())
     }
 
     /// Releases the claim this process holds, without waiting.
     ///
-    /// Blocking on purpose: the caller is a `Drop`, which cannot await. Only a claim this
-    /// process wrote is removed — one taken over from a crashed process, or held by another,
-    /// is not ours — which is why the file is read rather than simply unlinked.
+    /// Blocking on purpose: the caller is a `Drop`, which cannot await. Closing the file is the
+    /// whole of it — the kernel drops the lock with the last handle to the file — and the file
+    /// itself stays where it is: it is the lock a later writer takes, and unlinking it would
+    /// hand a second writer a lock on an inode nobody else can see.
+    ///
+    /// A claim this process does not hold is left alone, because it is not in the map: one taken
+    /// from another process's release was never ours to begin with.
     fn release_lock_blocking(&self, id: &SessionId) {
-        let Ok(path) = self.lock_file(id) else {
-            return;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let ours =
-            serde_json::from_str::<Claim>(&text).is_ok_and(|claim| claim.pid == std::process::id());
-        if !ours {
-            return;
-        }
-        if let Err(source) = std::fs::remove_file(&path) {
-            tracing::debug!(%source, "a session claim could not be removed");
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if locks.remove(id).is_none() {
+            tracing::debug!(session = %id.as_str(), "a claim this process does not hold");
         }
     }
 
@@ -528,7 +559,7 @@ impl StorePort for JsonlStore {
         id: &'a SessionId,
         owner: &'a str,
     ) -> LocalBoxFuture<'a, StoreResult<()>> {
-        Box::pin(async move { self.lock_blocking(id, owner).await })
+        Box::pin(async move { self.lock_blocking(id, owner) })
     }
 
     fn release_lock(&self, id: &SessionId) {
@@ -536,22 +567,94 @@ impl StorePort for JsonlStore {
     }
 }
 
-/// Creates a claim file, failing if one is already there.
-async fn create_claim(path: &Path, body: &str) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
+/// Takes the claim on `path`, or reports that another writer already holds it.
+///
+/// `flock` is the operating system's own lock, and it is the reason a claim needs no liveness
+/// check: it is atomic between processes, and the kernel drops it when the last handle closes —
+/// when the holder exits, however it exits. A claim a crashed writer left behind is therefore
+/// not a stale file to be detected and taken over; it is already unlocked, and this takes it.
+///
+/// The returned file *is* the claim: dropping it releases the lock, which is why the caller keeps
+/// it for as long as it is writing.
+///
+/// Returns `None` when another open file description holds it.
+#[cfg(unix)]
+fn take_claim(path: &Path) -> StoreResult<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
+        .create(true)
+        // Not truncated on open: the file is opened *before* the lock is attempted, and a label
+        // blanked on the way in would erase the holder's name for whoever reads it next. The
+        // holder replaces the label itself once the lock is its own.
+        .truncate(false)
         .open(path)
-        .await?;
-    file.write_all(body.as_bytes()).await?;
-    file.flush().await
+        .map_err(|source| io_error(path, &source))?;
+    // The free function rather than `Flock`: the guard's `Drop` panics when its own unlock fails,
+    // and a library must not panic on the way out of a scope — here, on the way out of an idle
+    // session's eviction. Closing the returned file releases the lock, which needs no syscall of
+    // its own.
+    #[allow(deprecated)]
+    // Non-blocking: a writer this process cannot have is a refusal, not a queue to wait in.
+    match nix::fcntl::flock(
+        file.as_raw_fd(),
+        nix::fcntl::FlockArg::LockExclusiveNonblock,
+    ) {
+        Ok(()) => Ok(Some(file)),
+        Err(nix::errno::Errno::EWOULDBLOCK) => Ok(None),
+        Err(source) => Err(io_error(
+            path,
+            &std::io::Error::from_raw_os_error(source as i32),
+        )),
+    }
+}
+
+/// Takes a claim where the platform has no lock to take.
+///
+/// Windows support is not a goal — the link is a Unix domain socket — so this fails closed by
+/// creating the file exclusively: the first writer holds it and a second is refused. A claim a
+/// crashed writer left behind has to be removed by hand, which is worse than the Unix behaviour
+/// and better than two writers sharing a log.
+#[cfg(not(unix))]
+fn take_claim(path: &Path) -> StoreResult<Option<std::fs::File>> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(source) => Err(io_error(path, &source)),
+    }
+}
+
+/// Writes a claim's label, replacing whatever was there.
+///
+/// The label is not the lock — the open file is — so this is a plain write rather than an atomic
+/// replacement: the holder is the only process that can be writing it. The seek is what makes it
+/// a *replacement*: the file has been written to before (a crashed writer's label, or this
+/// process's own), and a write at the old offset would leave the previous label's bytes in front
+/// of the new one.
+fn write_claim(file: &std::fs::File, body: &str, path: &Path) -> StoreResult<()> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let mut file = file;
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.set_len(0))
+        .and_then(|()| file.write_all(body.as_bytes()))
+        .and_then(|()| file.flush())
+        .map_err(|source| io_error(path, &source))
 }
 
 /// A session's write claim, as it is written down.
 ///
 /// The owner is a word for a person rather than for a program: the sentence a refused writer
-/// reads is "session X is being written by nanus at /path/to.sock (pid 1234)", and the pid is
-/// what makes the claim expirable.
+/// reads is "session X is being written by nanus at /path/to.sock (pid 1234)". The pid is a
+/// label rather than the decision — the lock is what refuses — and knowing whose process it was
+/// is what makes the sentence worth reading.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Claim {
     /// The process that holds it.
@@ -560,58 +663,20 @@ struct Claim {
     owner: String,
 }
 
-/// Reads a claim, treating one that cannot be read as no claim at all.
+/// Reads a claim's label, treating one that cannot be read as no label at all.
 ///
-/// A damaged lock file is not an owner: the atomic write makes that unlikely, and a file a
-/// person edited by hand should not wedge a session for good.
-async fn read_claim(path: &Path) -> StoreResult<Option<Claim>> {
-    let text = match fs::read_to_string(path).await {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(io_error(path, &source)),
-    };
+/// Only ever called on the refusal path, where the answer is a sentence rather than a decision:
+/// a label a person edited by hand costs a reader the holder's name, and cannot change who holds
+/// the conversation.
+fn read_claim(path: &Path) -> Option<Claim> {
+    let text = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str(&text) {
-        Ok(claim) => Ok(Some(claim)),
+        Ok(claim) => Some(claim),
         Err(source) => {
-            tracing::warn!(%source, path = %path.display(), "a session claim could not be read");
-            Ok(None)
+            tracing::debug!(%source, path = %path.display(), "a session claim has no label");
+            None
         }
     }
-}
-
-/// Returns whether a process is still running.
-///
-/// `kill(pid, 0)` asks whether a process exists without touching it: no signal is delivered.
-/// `EPERM` means it exists and belongs to somebody else, which is alive for this purpose — the
-/// check fails closed, so a claim is honoured unless its holder is *certainly* gone.
-///
-/// A pid of zero or less is not a process: signalling it would address the caller's own process
-/// group, which would report this process as alive and wedge the session.
-#[cfg(unix)]
-fn is_running(pid: u32) -> bool {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    let Ok(raw) = i32::try_from(pid) else {
-        return false;
-    };
-    if raw <= 0 {
-        return false;
-    }
-    match kill(Pid::from_raw(raw), None) {
-        Ok(()) | Err(Errno::EPERM) => true,
-        Err(_) => false,
-    }
-}
-
-/// Assumes a claim is live where the platform cannot say.
-///
-/// Windows support is not a goal (the link is a Unix socket), so this keeps the crate building
-/// and fails closed rather than silently ignoring every claim.
-#[cfg(not(unix))]
-fn is_running(_pid: u32) -> bool {
-    true
 }
 
 /// Builds the port's not-found error for `id`.

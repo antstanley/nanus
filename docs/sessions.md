@@ -164,12 +164,14 @@ nanus: session 01a0b1a2… is being written by nanus at /Users/you/.config/nanus
 That is the supported way to continue a live conversation anyway: attach to the agent that
 holds it, below. The claim is what makes that the *only* way, rather than the polite one.
 
-Two things about the claim are worth knowing. It is a file beside the log (`lock`), holding
-the holder's pid and a word for what it is, and a claim whose holder is gone is taken over
-rather than honoured — a lock a crashed process left behind is not an owner. And it is
-advisory: any process can write a session's log directly, and `nanus sessions delete` does
-not consult it. What it defends against is another `nanus` — the ordinary way two writers
-meet — not a deliberate one.
+Two things about the claim are worth knowing. It is a file beside the log (`lock`) that the
+operating system locks while the holder has it open, labelled with the holder's pid and a
+word for what it is. The lock is what decides — it is atomic, so two writers starting at the
+same instant cannot both be first — and the kernel releases it when the holder exits, however
+it exits, so a lock a crashed process left behind is not an owner anybody has to detect. And
+it is advisory: any process can write a session's log directly, and `nanus sessions delete`
+does not consult it. What it defends against is another `nanus` — the ordinary way two
+writers meet — not a deliberate one.
 
 Reading without continuing is `nanus tui --session`, which needs no agent and no key,
 because a transcript that has already been written down is just a file.
@@ -211,7 +213,11 @@ That batch is not history and does not become a second copy of it. It holds exac
 the store has not got, it is folded where folding changes nothing (two adjacent deltas of
 one kind are one piece of text either way), and it is emptied the moment the turn is
 written down — so a client attaching at any instant sees a finished turn in the store and a
-running one in the backlog, never both and never neither. A question the turn is waiting on
+running one in the backlog, never both and never neither. Neither is a guess: the attachment
+carries the log's own position when the batch was taken, and the client reads the log
+afterwards, so a turn that ended in between is recognised as already recorded and the batch
+that carries it is dropped rather than drawn on top of the log. The two reads are not one
+instant, and that number is what makes them agree. A question the turn is waiting on
 crosses the same way, because it is state rather than history: a client arriving after the
 question went out is shown it, with the reason the first client was given, and can answer
 it.
@@ -245,10 +251,11 @@ flight and is emptied as soon as that turn is in the log.
 ## Known limits
 
 - **The claim is advisory and process-scoped.** A session is claimed for writing, so a second
-  `nanus` is refused by name; a process that writes the log directly is not. A claim says
-  "this *process* is writing this session", so two holders in one process — which is what an
-  agent holding a session and a connection racing to open the same one would be — see one
-  claim between them. That is correct for the shipped agents, which are one per process.
+  `nanus` is refused by name; a process that writes the log directly is not. The lock is held
+  for *the process* that took it, so two holders inside one process — which is what an agent
+  holding a session and a connection racing to open the same one would be — are one claim
+  rather than two, and the store answers a re-claim from the process that already has it.
+  That is correct for the shipped agents, which are one per process.
 - **Deleting does not consult the claim.** `nanus sessions delete` removes a session another
   agent is writing, and the holder's next save recreates the directory. Stop the agent first.
 - **No deletion in the interface.** `nanus sessions delete <ref>` removes a session and

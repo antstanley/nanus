@@ -394,7 +394,6 @@ impl SessionLog {
                     ..
                 } => {
                     let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
-                    let has_reasoning = reasoning.as_ref().is_some_and(|value| !value.is_empty());
                     // A call that no result answers cannot travel: the provider refuses a request
                     // whose assistant message names a call with nothing answering it. A log can
                     // hold one — a step records its calls and runs them, so anything that stopped
@@ -402,19 +401,20 @@ impl SessionLog {
                     // would then send a request no provider accepts, failing every turn from a log
                     // it can never repair. So the unanswered calls are dropped.
                     //
-                    // The *message* stays when it has something to say: its text, a call that
-                    // survived, or the reasoning of a turn that had calls at all. That last clause
-                    // is why the condition is not simply "text or calls": the provider wants a
-                    // tool-using turn's reasoning back, and dropping the calls must not take the
-                    // reasoning with them. A message with nothing but reasoning and no calls is
-                    // still skipped, because it carries nothing a model reads.
-                    let had_calls = !tool_calls.is_empty();
+                    // The *message* stays when it has something to say: its text, or a call that
+                    // survived. The reasoning of a tool-using turn travels with the calls it was
+                    // kept for, which is why the condition is not "text only": the provider wants
+                    // that reasoning replayed beside the calls. A turn whose calls *all* went
+                    // unanswered has no such calls, so its reasoning is skipped with them — a
+                    // message carrying nothing but reasoning is one no adapter can encode, and
+                    // keeping it would turn a damaged log into a request that panics the encoder
+                    // rather than into a conversation that resumes.
                     let calls: Vec<ToolCall> = tool_calls
                         .iter()
                         .filter(|call| answered.contains(&&call.id))
                         .cloned()
                         .collect();
-                    if has_text || !calls.is_empty() || (had_calls && has_reasoning) {
+                    if has_text || !calls.is_empty() {
                         messages.push(Message::assistant(text.clone(), reasoning.clone(), calls));
                     }
                 }
@@ -1176,8 +1176,8 @@ mod tests {
     /// The provider refuses an assistant message whose calls have no results, so a log holding
     /// one — the calls are recorded before they run, so anything that stopped the process
     /// between the two left it behind — would make every request of the resumed session invalid.
-    /// Dropping the call is the fix; dropping the *message* would take the turn's reasoning with
-    /// it, which the provider wants back.
+    /// Dropping the call is the fix; the message stays because of its text, and its reasoning
+    /// travels with the calls that survived.
     #[test]
     fn a_tool_call_with_no_result_is_not_replayed() {
         let call = |id: &str| {
@@ -1241,6 +1241,50 @@ mod tests {
         assert!(
             log.derive_messages().is_empty(),
             "reasoning without a call is not model-visible on its own"
+        );
+    }
+
+    /// The same rule holds when the calls *were* there and every one of them went unanswered.
+    ///
+    /// This is the shape a log takes when a process stopped between recording a step's calls and
+    /// running them. Dropping the calls and keeping the reasoning would leave a message with
+    /// neither text nor a call, which is not a message any provider can be sent — the request
+    /// encoders assert on it, so the resumed session would fail at the encoder rather than in a
+    /// sentence. The reasoning is skipped with the calls it was kept for.
+    #[test]
+    fn a_reasoning_only_turn_with_no_surviving_call_is_skipped() {
+        let mut log = SessionLog::new();
+        log.append(SessionEvent::UserMessage {
+            text: String::from("hi"),
+        });
+        log.append(SessionEvent::AssistantMessage {
+            text: None,
+            reasoning: Some(String::from("I should read it")),
+            tool_calls: vec![ToolCall::new(
+                ToolCallId::new("c1"),
+                ToolName::new("read").unwrap_or_else(|_| unreachable!("valid")),
+                serde_json::json!({}),
+            )],
+            usage: None,
+            interrupted: false,
+            model: None,
+            effort: None,
+        });
+        // The process died before the call ran, so no result answers it.
+
+        let messages = log.derive_messages();
+        assert!(
+            messages.iter().all(|message| match message {
+                Message::Assistant {
+                    text, tool_calls, ..
+                } => text.is_some() || !tool_calls.is_empty(),
+                _ => true,
+            }),
+            "no assistant message carries neither text nor a call: {messages:?}"
+        );
+        assert!(
+            messages.len() == 1,
+            "the prompt survives and the unencodable turn does not: {messages:?}"
         );
     }
 

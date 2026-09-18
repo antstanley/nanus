@@ -26,9 +26,9 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# Safe wrappers for `kill(pid, 0)`, the existence check a session claim needs to tell a live
-# holder from one a crashed process left behind. The same reason `nanus-adapter-local` uses
-# `nix`: the workspace forbids `unsafe` everywhere.
+# `nix::fcntl::flock`, the operating system's own lock, which is what decides a session's write
+# claim between two processes and what the kernel releases when one of them exits. The same
+# reason `nanus-adapter-local` uses `nix`: the workspace forbids `unsafe` everywhere.
 nix = { workspace = true }
 
 [dev-dependencies]
