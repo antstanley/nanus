@@ -119,8 +119,9 @@ the second platform secret store is a `SecretBackend` implementation nobody has 
 
 ## Shipped: sessions and the link
 
-The first block of the session work, taken in the order it was worth doing. The numbers are
-the plan's, kept because later items refer to them.
+All five items of the session work, taken in the order they were worth doing. The numbers are the
+plan's, kept because later items refer to them (item 25 depends on the provider table, item 22 on
+the prompt sections that item 21 touched).
 
 | # | Item | Where it landed |
 |---|---|---|
@@ -129,15 +130,6 @@ the plan's, kept because later items refer to them.
 | 19 | **A session is claimed for writing, so a second writer is refused.** A writer claims the session it holds — a `nanus run` for the length of its run, an agent for as long as it holds the session, and *not* a client attaching to one — and a second writer is refused with a sentence naming the holder and what to do instead. The claim is a file beside the log, holding a pid and a word for the holder; it is created with `O_EXCL`, which is what decides a race between two processes rather than letting both read an absent file and both believe they are first; a claim whose holder is gone is taken over, so a crash cannot wedge a session; and releasing it happens in a `Drop`, which is why it is a field of the held session rather than something a caller remembers — a claim that outlived its holder would refuse the next writer for the life of the process. A `StorePort` release is synchronous for exactly that reason: a `Drop` cannot await. | `nanus-ports/src/store.rs`, `nanus-adapter-store/src/store.rs`, `nanus-link/src/server.rs`, `nanus-cli/src/cli.rs`, `docs/sessions.md` |
 | 20 | **Names: one word, and case does not make a second one.** The decision the item asked for, taken and written down where it belongs. **No namespaces**: a name is an alias for one store key, the store is one flat directory, and a `/` in a name would suggest a tree that does not exist — a user who wants grouping writes it into the name, because punctuation is part of the word rather than a level. **Case-insensitively unique, case-preserving**: naming a session `Nightly` when `nightly` is held is refused and names the session that holds it, resolving either spelling finds it, and what is stored is the spelling a session was named with, so a rename is how a name changes case. Leading and trailing whitespace is trimmed, because a name nobody can see is one nobody can type back. A store that somehow holds two names folding to one answers with the same session every time rather than at a directory listing's mercy. | `nanus-ports/src/store.rs`, `nanus-adapter-store/src/store.rs`, `docs/sessions.md` |
 | 21 | **Manage the context window.** Prompt assembly replays the whole log, so a long session eventually asks for more tokens than the model has. The policy is in `nanus-domain`'s `context` module and is deliberately two things: **deterministic** (the same messages and the same budget always produce the same prompt, because a session exists to be comparable) and **visible** (the model reads a notice at the gap, and the reader is told through the CLI and the interface). The unit dropped is a **whole turn**, oldest first, so a tool call can never be separated from the result answering it — which a provider refuses outright — and neither the system prompt nor the newest turn is ever dropped. A prompt that cannot be shortened enough is **refused** with a sentence naming `context_budget`, because the alternatives are a provider refusing the request with a message about the request, or a turn quietly answering from half a conversation. There is no tokenizer and there will not be one: the estimate is characters over four plus a per-message cost, which is why the default budget sits below every provider's window, and the provider's own usage report is the real number to check a budget against. | `nanus-domain/src/{context,agent}.rs`, `nanus-bundle/src/{agent_loop,error}.rs`, `nanus-adapter-config/src/config.rs`, `nanus-cli/src/progress.rs`, `nanus-link/src/{protocol,server}.rs`, `nanus-tui/src/runtime.rs` |
-
-## Next: sessions and the link
-
-| # | Item | Size | Notes |
-|---|---|---|---|
-| 18 | **Propagate a rename to a held session.** | **S** | The store updates immediately and resolving works; a *listing* of held sessions can show the old name until the agent next opens it. |
-| 19 | **Lock a session, or refuse a second writer.** | **M** | Two agents can resume one conversation and the second save wins. A lock file or a store-level check with a clear error, keeping attaching to a live session as the supported path. |
-| 20 | **Decide names: namespaces and case.** | **S** | Names are flat and case-sensitive today, so `Nightly` and `nightly` are two names. Small to change; mostly a decision. |
-| 21 | **Manage the context window.** | **L** | Not in [features.md](features.md), but implied by it: prompt assembly replays the whole log, so a long session eventually exceeds the model's window. A summarise-or-drop policy, deterministic and tested, because a silent truncation is worse than a refusal. |
 
 ## Next: new capabilities
 

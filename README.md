@@ -161,6 +161,7 @@ reasoning effort: Medium
 approval policy: per_call
 sandbox mode: ReadOnly
 max steps per turn: 512
+context budget: 64000 estimated tokens (older turns are dropped past it)
 max parallel tools: 4
 tui detail: compact
 markdown answers: true
