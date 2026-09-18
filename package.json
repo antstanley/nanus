@@ -1,0 +1,10 @@
+{
+  "name": "nanus",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "//": "The docs site lives in apps/website (see pnpm-workspace.yaml). This root manifest exists so the workspace has one lockfile and one blogwright install: the docs-publishing workflows run `pnpm install --frozen-lockfile` here, then `pnpm exec blogwright deploy`. The Rust workspace is unaffected - cargo ignores this file.",
+  "devDependencies": {
+    "blogwright": "^0.3.3"
+  }
+}

@@ -25,6 +25,16 @@
 .env
 *.local.toml
 
+# Node tooling for the docs site.
+#
+# The docs site (apps/website) is an Astro + Starlight project built and installed
+# with pnpm. Dependencies, the Astro-generated types, and the build output are all
+# machine-generated and are rebuilt from the lockfile, so they are ignored rather
+# than committed. These patterns have no leading slash, so they match at any depth.
+node_modules/
+dist/
+.astro/
+
 # Jujutsu's working state is not tracked; `.jj/` is written by `jj git init` itself and
 # is already listed in its own ignore file, so it is named here only for clarity.
 /.jj/

@@ -1,0 +1,22 @@
+{
+  "name": "@nanus/website",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "//": "The nanus docs site. Built with Astro + Starlight; published to nanus.iamstan.dev by blogwright, which runs `pnpm install --frozen-lockfile --prod=false && pnpm run build` in paths.app (apps/website) inside a Lambda MicroVM.",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "typecheck": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.41.3",
+    "astro": "^7.1.3",
+    "sharp": "^0.35.2"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.9",
+    "typescript": "^6"
+  }
+}

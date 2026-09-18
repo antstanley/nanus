@@ -1,0 +1,13 @@
+# The docs site is the only Node workspace member. It is an Astro + Starlight app
+# under apps/website, published to AWS by blogwright (see config/production.jsonc).
+packages:
+  - "apps/*"
+
+allowBuilds:
+  # core-js (transitive via blogwright -> @atproto/oauth-client-node) only prints a
+  # funding banner in its postinstall. Never run it.
+  core-js: false
+  # Real build steps: esbuild (via vite) and sharp (via astro) ship binaries their
+  # postinstall scripts must fetch.
+  esbuild: true
+  sharp: true

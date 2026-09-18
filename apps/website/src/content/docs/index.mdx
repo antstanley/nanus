@@ -1,0 +1,54 @@
+---
+title: nanus
+description: A coding agent you can take apart - a harness in safe Rust whose kernel, tools, adapters, and session log are plugins over a Cordis kernel.
+template: splash
+hero:
+  tagline: A coding agent you can take apart.
+  actions:
+    - text: Get started
+      link: /getting-started/introduction/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/antstanley/nanus
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <Card title="Small by design" icon="puzzle">
+    Fourteen crates of safe Rust and a seven-tool toolset - each tool a mechanism a
+    shell cannot provide as well, not a convenience wrapper.
+  </Card>
+  <Card title="Replace the model, keep the tools" icon="setting">
+    Four providers behind one `LlmPort`, selected by a line of configuration. The
+    tools never learn which one is in use.
+  </Card>
+  <Card title="Unload a component, get the system back" icon="refresh">
+    Every registration is recorded with its inverse, so unloading a plugin reverts
+    its effects in reverse order - no stale state, no restart to get clean.
+  </Card>
+  <Card title="One agent, three lifetimes" icon="laptop">
+    `run` for a single turn, `tui` while the interface is open, `service` until you
+    stop it. All three reach the same agent over the same local link.
+  </Card>
+</CardGrid>
+
+## From zero to a running agent
+
+```sh
+git clone https://github.com/antstanley/nanus.git
+cd nanus
+cargo build --release --workspace
+
+nanus auth set deepseek            # store a provider key (or export DEEPSEEK_API_KEY)
+./target/release/nanus run "Summarise this repository."
+```
+
+The [introduction](/getting-started/introduction/) says what nanus is and why it is
+built this way; the [quickstart](/getting-started/quickstart/) takes it from a fresh
+clone to a named, resumable session.
+
+Reading by machine? Every page is Markdown - append `.md` to any URL, or start from
+[/llms.txt](/llms.txt).
