@@ -25,7 +25,8 @@ Start here if you want to see it working.
 
 What a conversation is on disk, how it is named and renamed, how it is resumed, and what
 it means to attach to one that is still running. Includes the store layout, the frames
-involved, and the limits — a session is not locked, so two writers can lose a turn.
+involved, and the limits — a session is claimed for writing while an agent holds it, so a
+second writer is refused rather than silently overwriting a turn.
 
 Start here if you want to come back to work tomorrow.
 

@@ -138,8 +138,11 @@ configuration file and select the file with `--config`.
   the same user can connect — and a process running as that user can already read the
   workspace and the session log. The frame-size cap is about not handing unbounded
   *parsing* to a confused peer, not about defending against a hostile one.
-- **A session is not locked.** Two agents can be told to resume the same conversation, and
-  the second save wins. Attaching to a live session is the supported way to share one.
+- **A session is claimed, not locked.** The agent claims every session it holds, for as long
+  as it holds it, so a second `nanus` — a `run --resume`, another service — is refused with a
+  sentence naming this agent's socket. The claim is a file beside the log holding a pid, so a
+  claim whose holder died is taken over and a process that writes the log directly is not
+  stopped. Attaching to the agent that holds it stays the supported way to share a session.
 - **A session is not *locked*, but a name is re-read rather than trusted.** The agent
   refreshes a held session's name from the store for every listing and attachment, and
   resolves a name through the store rather than against its own copy, so a rename made by

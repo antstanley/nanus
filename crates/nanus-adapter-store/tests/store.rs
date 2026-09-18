@@ -695,3 +695,110 @@ async fn a_name_that_is_not_readable_leaves_the_session_unnamed() {
     );
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// Claims: one writer per session.
+// ---------------------------------------------------------------------------
+
+/// Writes a claim as another process would have left it.
+async fn write_claim(store: &JsonlStore, id: &SessionId, pid: u32, owner: &str) {
+    let path = store.lock_file(id).expect("a lock path");
+    tokio::fs::create_dir_all(path.parent().expect("a parent"))
+        .await
+        .expect("the session directory");
+    tokio::fs::write(&path, format!("{{\"pid\":{pid},\"owner\":{owner:?}}}"))
+        .await
+        .expect("the claim");
+}
+
+/// A live holder keeps a second writer out; a holder that is gone does not.
+#[tokio::test]
+async fn a_claim_refuses_a_live_holder_and_takes_over_a_dead_one() {
+    let (dir, store) = store().await;
+    let id = SessionId::new("contested");
+
+    // Nobody holds it, so the claim is taken and written down.
+    store.lock(&id, "the first writer").await.expect("claimed");
+    let path = store.lock_file(&id).expect("a lock path");
+    assert!(path.exists(), "a claim is a file beside the log");
+
+    // Claiming it again from the same process is not a conflict: an agent re-holding a
+    // session it already holds must not refuse itself.
+    store
+        .lock(&id, "the first writer")
+        .await
+        .expect("re-claimed");
+
+    // A live holder is refused, and the refusal names it. Pid 1 is running by definition,
+    // and is not this process, so it stands in for another agent.
+    write_claim(&store, &id, 1, "nanus at /tmp/other.sock").await;
+    match store.lock(&id, "the second writer").await {
+        Err(StoreError::Locked { id, owner, pid }) => {
+            assert_eq!(id, "contested");
+            assert_eq!(owner, "nanus at /tmp/other.sock");
+            assert_eq!(pid, 1);
+        }
+        other => panic!("a live holder must refuse the claim: {other:?}"),
+    }
+
+    // A holder that is gone is no holder at all. Pid 0 is not a process, so a claim naming
+    // it stands in for one a crashed writer left behind — the case that would otherwise
+    // wedge a session for good.
+    write_claim(&store, &id, 0, "a writer that crashed").await;
+    store
+        .lock(&id, "the next writer")
+        .await
+        .expect("a dead holder is taken over");
+
+    // Releasing removes it, and leaves the session claimable.
+    store.release_lock(&id);
+    assert!(!path.exists(), "the claim is gone");
+    store.lock(&id, "another writer").await.expect("claimable");
+    store.release_lock(&id);
+    drop(dir);
+}
+
+/// A claim this process does not hold is not this process's to release.
+#[tokio::test]
+async fn releasing_a_claim_belonging_to_somebody_else_leaves_it_alone() {
+    let (dir, store) = store().await;
+    let id = SessionId::new("theirs");
+    write_claim(&store, &id, 1, "nanus at /tmp/other.sock").await;
+
+    store.release_lock(&id);
+    let path = store.lock_file(&id).expect("a lock path");
+    assert!(
+        path.exists(),
+        "a claim held by another process must survive this process releasing"
+    );
+    drop(dir);
+}
+
+/// A claim does not disturb what the store says about the session: it is not an event, and
+/// not a second session.
+#[tokio::test]
+async fn a_claim_is_invisible_to_reads() {
+    let (dir, store) = store().await;
+    let saved = session("claimed", 10, &["hello"]);
+    store.save(&saved).await.expect("save");
+    store.lock(saved.id(), "a writer").await.expect("claimed");
+
+    let loaded = store.load(saved.id()).await.expect("the log still reads");
+    assert_eq!(loaded.event_count(), saved.event_count());
+    let listed = store.list().await.expect("list");
+    assert_eq!(listed.len(), 1, "a claim is not a session");
+
+    // And a damaged claim is no claim rather than a corrupt store: a file a person edited by
+    // hand must not make a session unusable.
+    std::fs::write(
+        store.lock_file(saved.id()).expect("a lock path"),
+        "not json",
+    )
+    .expect("write");
+    store
+        .lock(saved.id(), "a writer")
+        .await
+        .expect("a damaged claim is replaced");
+    store.release_lock(saved.id());
+    drop(dir);
+}

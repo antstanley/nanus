@@ -33,7 +33,11 @@ use nanus_domain::{
 use nanus_link::protocol::{ApprovalState, EffortState, Frame, Request, SessionInfo, TurnEnd};
 use nanus_link::server::{Agent, Parts};
 use nanus_link::{Client, LinkError};
-use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, StoreHandle};
+// `StorePort` is in scope for the concrete store the claim test writes through: `save` and
+// `name` live on the port, and `lock_file` on the adapter.
+use nanus_ports::{
+    ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, StoreHandle, StorePort as _,
+};
 
 /// A model that answers every request the same way, without a network.
 struct ScriptedLlm;
@@ -1486,6 +1490,80 @@ fn a_session_that_was_never_held_is_loaded_from_the_store() {
 
     assert_eq!(attached.session, saved);
     assert_eq!(attached.events, 1, "the stored log came with it");
+}
+
+/// A session another live agent is writing is refused, naming the holder.
+///
+/// The agent claims every session it holds, so this is what a second `nanus tui --resume`
+/// meets — and what a `nanus run --resume` meets against a running service. Without the claim
+/// the second agent loads its own copy and the two take turns overwriting each other's log,
+/// with the loser's turn simply gone.
+#[test]
+fn a_session_another_agent_is_writing_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _handle) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    // The concrete store, rather than the handle the agent was built over, because the test
+    // needs to write where a claim lives.
+    let store = nanus_kernel::runtime::block_on(JsonlStore::new(dir.path().to_path_buf()))
+        .expect("the store opens");
+
+    // A session on disk that this agent is not holding, as a second agent would find it.
+    let saved = nanus_kernel::runtime::block_on(async {
+        let mut session = Session::new(SessionId::new("contested"), 1, "/work");
+        session.append(SessionEvent::UserMessage {
+            text: "nobody has this open yet".to_owned(),
+        });
+        store.save(&session).await.expect("save");
+        store.name(session.id(), "shared-work").await.expect("name");
+        session.id().clone()
+    });
+
+    // Another live process's claim, written where the store keeps it. Pid 1 is running by
+    // definition and is not this process, so it stands in for the second agent.
+    let lock = store.lock_file(&saved).expect("a lock path");
+    std::fs::write(&lock, r#"{"pid":1,"owner":"nanus at /tmp/other.sock"}"#).expect("the claim");
+
+    let message = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        // Refused by name and by id: a name resolves to the id that is claimed.
+        let by_name = client.attach("shared-work").await;
+        let message = match by_name {
+            Err(error) => error.to_string(),
+            Ok(attached) => panic!("the claim must refuse this: {attached:?}"),
+        };
+
+        let mut by_id = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let refused = by_id.attach(saved.as_str()).await;
+        assert!(
+            refused.is_err(),
+            "a claimed session is refused: {refused:?}"
+        );
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        message
+    });
+
+    // The sentence names what is writing it and what to do instead, because "locked" on its own
+    // leaves a reader with nowhere to go.
+    assert!(message.contains("nanus at /tmp/other.sock"), "{message}");
+    assert!(message.contains("--connect"), "{message}");
+    assert!(
+        lock.exists(),
+        "a refusal must not take the other agent's claim away"
+    );
 }
 
 #[test]

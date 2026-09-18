@@ -69,6 +69,41 @@ pub trait StorePort {
 
     /// Returns the harness's home directory, creating it if needed.
     fn home(&self) -> LocalBoxFuture<'_, StoreResult<PathBuf>>;
+
+    /// Claims `id` for this process to write.
+    ///
+    /// A session is one conversation with one log, and a store cannot merge two writers: the
+    /// second save replaces the first, so a turn is lost by whichever agent wrote first. The
+    /// claim is what turns that from a silent overwrite into a sentence naming the holder.
+    ///
+    /// A claim is held for as long as the holder has the session open — a turn's duration is
+    /// not enough, because the loser's next turn would overwrite the winner's whole log from
+    /// its own stale copy. *Attaching* to a session is not a claim: many clients watch one
+    /// session, and one of them is what holds it.
+    ///
+    /// A claim is *advisory* in the sense that any process can ignore it by writing the log
+    /// directly. What it defends against is another `nanus` — the ordinary way two writers
+    /// meet — not a deliberate one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Locked`] when another live process holds it. A claim whose holder
+    /// is gone is taken over rather than honoured: a lock a crashed process left behind is not
+    /// an owner, and honouring it would wedge a session for good.
+    fn lock<'a>(&'a self, id: &'a SessionId, owner: &'a str)
+    -> LocalBoxFuture<'a, StoreResult<()>>;
+
+    /// Releases the claim this process holds on `id`.
+    ///
+    /// Synchronous, unlike everything else here, because its caller is a `Drop`: a claim that
+    /// outlived the thing that held it would refuse the next writer for as long as this process
+    /// runs, and a release that cannot happen at the instant the holder goes is a lock that
+    /// leaks. Removing one small file is not worth a future to await.
+    ///
+    /// Releasing a claim this process does not hold does nothing. A claim taken over from a
+    /// crashed process belongs to whoever took it over, and one held by another live process is
+    /// not ours to remove.
+    fn release_lock(&self, id: &SessionId);
 }
 
 /// The result type of every store operation.
@@ -146,6 +181,21 @@ pub enum StoreError {
         name: String,
         /// The session that already holds it.
         id: String,
+    },
+
+    /// Another live process holds the session for writing.
+    ///
+    /// Deliberately not merged with [`StoreError::Io`]: this is a *decision* the store made,
+    /// and the caller's answer to it is to wait, to stop the other agent, or to attach to it —
+    /// not to retry the same write.
+    #[error("session {id} is being written by {owner} (pid {pid})")]
+    Locked {
+        /// The contested session.
+        id: String,
+        /// What the holder calls itself.
+        owner: String,
+        /// The holding process.
+        pid: u32,
     },
 
     /// The harness home could not be determined or created.

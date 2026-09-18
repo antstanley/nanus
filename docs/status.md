@@ -56,9 +56,13 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   already depends on `nix` for process groups), and no defence against a process already
   running as the same user — such a process can read the workspace and the session log
   regardless. See [the service page](service.md#known-limits).
-- **A session is not locked.** `nanus run --resume x` and a service holding `x` are two
-  writers on one log, and the second save wins. Attaching to a live session is the
-  supported way to share one, and it is what the interface does.
+- **A session is claimed, not locked.** A writer claims the session it holds — a `nanus run`
+  for its run, an agent for as long as it holds the session — and a second writer is refused
+  with a sentence naming the holder, so `nanus run --resume x` against a service serving `x`
+  says what to do instead of overwriting it. The claim is a file beside the log holding a pid,
+  so it is advisory: a process that writes the log directly is not stopped, a claim whose
+  holder is gone is taken over, and `nanus sessions delete` does not consult it. Attaching to
+  a live session is still the supported way to share one, and it is what the interface does.
 - **A session is held in memory while an agent holds it.** Bounded at 32 idle sessions,
   least-recently-used first, and never at the cost of a running turn or an attached
   client. A session that is let go is still on disk and reloads on the next attach.

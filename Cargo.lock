@@ -1561,6 +1561,7 @@ dependencies = [
  "etcetera",
  "nanus-domain",
  "nanus-ports",
+ "nix 0.31.3",
  "proptest",
  "serde",
  "serde_json",

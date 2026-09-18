@@ -5,6 +5,7 @@
 //! ```text
 //! <home>/sessions/<encoded-session-id>/session.jsonl
 //! <home>/sessions/<encoded-session-id>/name           (optional)
+//! <home>/sessions/<encoded-session-id>/lock           (optional, while held for writing)
 //! ```
 //!
 //! `<home>` is `$NANUS_HOME` when set, and `<config dir>/nanus` otherwise.
@@ -65,6 +66,9 @@ const SESSION_FILE: &str = "session.jsonl";
 /// A fixed file name inside the session's own directory, so a name is *content*
 /// and never a path component: no name can escape the directory it lives in.
 const NAME_FILE: &str = "name";
+
+/// The file name of one session's write claim.
+const LOCK_FILE: &str = "lock";
 
 /// The longest session name accepted.
 ///
@@ -195,6 +199,81 @@ impl JsonlStore {
     /// As [`JsonlStore::session_dir`].
     pub fn name_file(&self, id: &SessionId) -> StoreResult<PathBuf> {
         Ok(self.session_dir(id)?.join(NAME_FILE))
+    }
+
+    /// Returns the path of the file that holds one session's write claim.
+    ///
+    /// # Errors
+    ///
+    /// As [`JsonlStore::session_dir`].
+    pub fn lock_file(&self, id: &SessionId) -> StoreResult<PathBuf> {
+        Ok(self.session_dir(id)?.join(LOCK_FILE))
+    }
+
+    /// Claims a session for this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Locked`] when another live process holds it.
+    async fn lock_blocking(&self, id: &SessionId, owner: &str) -> StoreResult<()> {
+        let path = self.lock_file(id)?;
+        let dir = self.session_dir(id)?;
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|source| io_error(&dir, &source))?;
+        let body = serde_json::to_string(&Claim {
+            pid: std::process::id(),
+            owner: owner.to_owned(),
+        })
+        .map_err(|source| StoreError::Io {
+            path: path.clone(),
+            message: source.to_string(),
+        })?;
+        // Created, not written: `O_EXCL` is what decides a race between two processes starting
+        // at the same instant, rather than both reading an absent file and both believing they
+        // are the first. The loser finds one and asks whose it is.
+        match create_claim(&path, &body).await {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(held) = read_claim(&path).await?
+                    && held.pid != std::process::id()
+                    && is_running(held.pid)
+                {
+                    return Err(StoreError::Locked {
+                        id: id.as_str().to_owned(),
+                        owner: held.owner,
+                        pid: held.pid,
+                    });
+                }
+                // Either this process already holds it — re-claiming is not a conflict, which is
+                // what lets an agent hold a session it has just claimed — or the holder is gone,
+                // and a claim a crashed writer left behind is not an owner.
+                write_atomic(&path, &body).await
+            }
+            Err(source) => Err(io_error(&path, &source)),
+        }
+    }
+
+    /// Releases the claim this process holds, without waiting.
+    ///
+    /// Blocking on purpose: the caller is a `Drop`, which cannot await. Only a claim this
+    /// process wrote is removed — one taken over from a crashed process, or held by another,
+    /// is not ours — which is why the file is read rather than simply unlinked.
+    fn release_lock_blocking(&self, id: &SessionId) {
+        let Ok(path) = self.lock_file(id) else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let ours =
+            serde_json::from_str::<Claim>(&text).is_ok_and(|claim| claim.pid == std::process::id());
+        if !ours {
+            return;
+        }
+        if let Err(source) = std::fs::remove_file(&path) {
+            tracing::debug!(%source, "a session claim could not be removed");
+        }
     }
 
     /// Writes `session` atomically, replacing any existing log for its id.
@@ -417,6 +496,96 @@ impl StorePort for JsonlStore {
             Ok(self.home.clone())
         })
     }
+
+    fn lock<'a>(
+        &'a self,
+        id: &'a SessionId,
+        owner: &'a str,
+    ) -> LocalBoxFuture<'a, StoreResult<()>> {
+        Box::pin(async move { self.lock_blocking(id, owner).await })
+    }
+
+    fn release_lock(&self, id: &SessionId) {
+        self.release_lock_blocking(id);
+    }
+}
+
+/// Creates a claim file, failing if one is already there.
+async fn create_claim(path: &Path, body: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await?;
+    file.write_all(body.as_bytes()).await?;
+    file.flush().await
+}
+
+/// A session's write claim, as it is written down.
+///
+/// The owner is a word for a person rather than for a program: the sentence a refused writer
+/// reads is "session X is being written by nanus at /path/to.sock (pid 1234)", and the pid is
+/// what makes the claim expirable.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct Claim {
+    /// The process that holds it.
+    pid: u32,
+    /// What that process calls itself.
+    owner: String,
+}
+
+/// Reads a claim, treating one that cannot be read as no claim at all.
+///
+/// A damaged lock file is not an owner: the atomic write makes that unlikely, and a file a
+/// person edited by hand should not wedge a session for good.
+async fn read_claim(path: &Path) -> StoreResult<Option<Claim>> {
+    let text = match fs::read_to_string(path).await {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error(path, &source)),
+    };
+    match serde_json::from_str(&text) {
+        Ok(claim) => Ok(Some(claim)),
+        Err(source) => {
+            tracing::warn!(%source, path = %path.display(), "a session claim could not be read");
+            Ok(None)
+        }
+    }
+}
+
+/// Returns whether a process is still running.
+///
+/// `kill(pid, 0)` asks whether a process exists without touching it: no signal is delivered.
+/// `EPERM` means it exists and belongs to somebody else, which is alive for this purpose — the
+/// check fails closed, so a claim is honoured unless its holder is *certainly* gone.
+///
+/// A pid of zero or less is not a process: signalling it would address the caller's own process
+/// group, which would report this process as alive and wedge the session.
+#[cfg(unix)]
+fn is_running(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    if raw <= 0 {
+        return false;
+    }
+    match kill(Pid::from_raw(raw), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+/// Assumes a claim is live where the platform cannot say.
+///
+/// Windows support is not a goal (the link is a Unix socket), so this keeps the crate building
+/// and fails closed rather than silently ignoring every claim.
+#[cfg(not(unix))]
+fn is_running(_pid: u32) -> bool {
+    true
 }
 
 /// Builds the port's not-found error for `id`.

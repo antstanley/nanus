@@ -436,7 +436,10 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   authentication — there is no remote mode to secure.
 - **The sandbox is not OS-enforced.** Nothing confines an approved program's
   writes, its network access, or its process table.
-- **Sessions are not locked.** Two writers on one log can lose a turn; attaching
+- **A session is claimed for writing.** Two writers on one log cannot silently lose a turn:
+  the second is refused with a sentence naming the holder, and attaching to a live session
+  remains the supported way to share one. The claim is a file beside the log, so it is
+  advisory rather than a lock the operating system enforces. Attaching
   to a live session is the supported way to share one.
 - **No remote fetch from the renderer**: a fenced block is highlighted by a lexer
   inside the view, and an image is a placeholder or a pasted file, never a URL

@@ -25,6 +25,12 @@ tokio = { workspace = true }
 # `Ulid::generate` does not guarantee sort order within a millisecond.
 uuid = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for `kill(pid, 0)`, the existence check a session claim needs to tell a live
+# holder from one a crashed process left behind. The same reason `nanus-adapter-local` uses
+# `nix`: the workspace forbids `unsafe` everywhere.
+nix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }

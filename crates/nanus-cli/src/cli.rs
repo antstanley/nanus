@@ -578,6 +578,12 @@ pub fn finish(ready: Ready) -> Result<(), String> {
     }
 }
 
+/// What a one-shot run calls itself in the claim it takes on its session.
+///
+/// A word for a person rather than for a program: the pid is in the claim already, and the
+/// sentence another writer reads has to say *what* is holding the conversation.
+const RUN_CLAIM: &str = "nanus run";
+
 /// The global options, separated from the subcommand.
 struct Options {
     verbose: bool,
@@ -848,6 +854,13 @@ fn run_turn(
         Some(reference) => load_session(&harness, reference)?,
         None => harness.new_session(workspace),
     };
+    // Claimed for the whole run: this is the window in which an agent answering a *different*
+    // command could overwrite the same log, and a session two writers share is a conversation
+    // that loses a turn. A refusal means somebody else is holding it — most often a service —
+    // so the sentence says what to do instead of just what happened.
+    let id = session.id().clone();
+    kernel_block_on(harness.store.lock(&id, RUN_CLAIM))
+        .map_err(|error| format!("{error}; attach to it with `nanus tui --connect`"))?;
     // A headless run is the one mode with no interface to press a key in, so the interrupt is
     // watched for here and handed to the turn through its reporter: it stops at the next
     // checkpoint, the session is recorded, and the exit code says the turn did not complete.
@@ -879,6 +892,9 @@ fn run_turn(
     // that *failed* is exactly the one worth being able to resume — what the model said
     // before it failed is what the next attempt has to work from.
     let recorded = record_after(&harness, &session, name);
+    // Released before the harness is torn down, and after the log has been written: the claim
+    // covers exactly the time this process could have written it.
+    harness.store.release_lock(&id);
     finish_harness(&harness)?;
     recorded?;
 

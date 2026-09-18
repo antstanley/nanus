@@ -266,6 +266,40 @@ struct Question {
     sender: oneshot::Sender<ApprovalOutcome>,
 }
 
+/// A session claimed for writing, released when the agent lets the session go.
+///
+/// Dropping it releases the claim, which is why it is a field of [`Held`] rather than something
+/// a caller is expected to remember: every path that lets a session go — an idle eviction, a
+/// failed hold, a shutdown — drops the entry, and a claim that outlived its holder would refuse
+/// the next writer for as long as this process runs.
+struct Claim {
+    /// The store the claim lives in.
+    store: StoreHandle,
+    /// The session it is about.
+    id: SessionId,
+    /// Whether this claim is the one to release.
+    ///
+    /// A claim that lost a race to hold the same session is *disarmed* rather than released,
+    /// because a claim is one file per session and the loser's release would remove the
+    /// winner's. A claim records a process, not a claimant.
+    armed: Cell<bool>,
+}
+
+impl Claim {
+    /// Marks the claim as one this process no longer needs to release.
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if self.armed.get() {
+            self.store.release_lock(&self.id);
+        }
+    }
+}
+
 /// A session an agent is holding open.
 struct Held {
     /// The store key, kept here so a listing never has to borrow the session for it.
@@ -292,6 +326,12 @@ struct Held {
     /// it has not. Cleared when a turn starts, so a request that arrived a moment after the
     /// last turn ended cannot stop the next one before it begins.
     stop: Cell<bool>,
+    /// The claim this agent holds on the session, for as long as it holds the session.
+    ///
+    /// `None` only where no store is involved at all: the unit tests build a bare `Held` to
+    /// exercise the bookkeeping of who is watching, and a `Registry` — which is the only thing
+    /// that makes one — always claims first.
+    claim: Option<Claim>,
     /// The frames of the turn in progress, so a client that attaches in the middle of one
     /// can be shown the whole turn rather than its tail.
     ///
@@ -483,6 +523,11 @@ impl Held {
 struct Registry {
     /// The agent every session belongs to.
     agent: Rc<Agent>,
+    /// What this agent calls itself in a session claim.
+    ///
+    /// A word for a person rather than for a program — the socket it is reachable on — because
+    /// the sentence a refused writer reads has to tell them what to do next, and a pid does not.
+    owner: String,
     /// The held sessions, by store key, so a listing is ordered by creation.
     held: RefCell<BTreeMap<SessionId, Rc<Held>>>,
     /// Turns still running, so a shutdown can stop them.
@@ -494,10 +539,11 @@ struct Registry {
 }
 
 impl Registry {
-    /// Wraps an agent.
-    fn new(agent: Rc<Agent>) -> Self {
+    /// Wraps an agent, which will claim the sessions it holds as `owner`.
+    fn new(agent: Rc<Agent>, owner: String) -> Self {
         Self {
             agent,
+            owner,
             held: RefCell::new(BTreeMap::new()),
             turns: RefCell::new(JoinSet::new()),
             tick: Cell::new(0),
@@ -520,8 +566,26 @@ impl Registry {
     }
 
     /// Holds a session open, letting idle ones go if the agent holds too many.
-    fn hold(&self, session: Session, name: Option<String>) -> Rc<Held> {
+    ///
+    /// Claiming is what makes a second agent refuse to hold the same conversation rather than
+    /// overwrite it, and it happens *before* anything else here: a session this agent cannot
+    /// claim must not evict an idle one on its way to failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when another live process is writing the session.
+    async fn hold(&self, session: Session, name: Option<String>) -> Result<Rc<Held>, String> {
         let id = session.id().clone();
+        // Already held: the session is this agent's, and re-claiming it would be claiming it
+        // from itself. Answered before the map is touched, so the common case costs nothing.
+        if let Some(existing) = self.get(&id) {
+            return Ok(existing);
+        }
+        self.agent
+            .store
+            .lock(&id, &self.owner)
+            .await
+            .map_err(|error| error.to_string())?;
         // Room is made *before* the newcomer is in the map, so that the session being
         // opened can never be the one let go. A client would otherwise be handed a
         // conversation the agent no longer held: nothing else could attach to it, a
@@ -530,6 +594,11 @@ impl Registry {
         self.evict_idle(1);
         let entry = Rc::new(Held {
             id: id.clone(),
+            claim: Some(Claim {
+                store: Rc::clone(&self.agent.store),
+                id: id.clone(),
+                armed: Cell::new(true),
+            }),
             headline: RefCell::new(Headline::default()),
             session: RefCell::new(session),
             name: RefCell::new(name),
@@ -551,11 +620,18 @@ impl Registry {
         // nothing else can see, `busy` no longer gating either copy, and both recording the
         // same store key over each other.
         if let Some(existing) = held.get(&id) {
-            return Rc::clone(existing);
+            // Another connection won the race to hold it: both waited on the store between the
+            // check above and here. This entry is dropped rather than kept, and its claim is
+            // disarmed first — the file it would remove is the *winner's* claim on the very same
+            // session, because a claim records a process rather than a holder.
+            if let Some(claim) = &entry.claim {
+                claim.disarm();
+            }
+            return Ok(Rc::clone(existing));
         }
         held.insert(id, Rc::clone(&entry));
         drop(held);
-        entry
+        Ok(entry)
     }
 
     /// Returns the held session with `id`, if it is held.
@@ -621,7 +697,14 @@ impl Registry {
                 None
             }
         };
-        Ok(self.hold(session, name))
+        // A session this agent is not already holding has to be claimed, and a refusal here is
+        // another *agent* writing the same conversation: the reader's answer is to attach to
+        // that one rather than to start a second, so the message says so.
+        self.hold(session, name).await.map_err(|error| {
+            format!(
+                "{error}; attach to it with `nanus tui --connect`, or stop the agent that holds it"
+            )
+        })
     }
 
     /// Attaches a client to a session and returns the id it unsubscribes by.
@@ -1261,7 +1344,18 @@ pub async fn serve(
     agent: Rc<Agent>,
     stop: impl Future<Output = ()>,
 ) -> LinkResult<()> {
-    let registry = Rc::new(Registry::new(agent));
+    // What this agent calls itself in the claim it takes on each session it holds: the socket it
+    // answers on, because the sentence a refused writer reads should say *where* the conversation
+    // is being written and what to do about it, and a pid does not.
+    let owner = listener
+        .local_addr()
+        .ok()
+        .and_then(|socket| socket.as_pathname().map(Path::to_path_buf))
+        .map_or_else(
+            || format!("a nanus agent (pid {})", std::process::id()),
+            |socket| format!("nanus at {}", socket.display()),
+        );
+    let registry = Rc::new(Registry::new(agent, owner));
     let shutdown = Rc::new(Notify::new());
     let mut connections: JoinSet<()> = JoinSet::new();
     tokio::pin!(stop);
@@ -1602,7 +1696,7 @@ async fn new_session_of(registry: &Rc<Registry>, name: Option<String>) -> Result
             return Err(error.to_string());
         }
     }
-    let held = registry.hold(session, name.clone());
+    let held = registry.hold(session, name.clone()).await?;
     if let Some(asked) = name
         && let Err(error) = registry.agent.store.name(&id, &asked).await
     {
@@ -1720,6 +1814,9 @@ mod tests {
         let session = Session::new(SessionId::new(id), 0, "/work");
         Rc::new(Held {
             id: session.id().clone(),
+            // No claim: these tests exercise who a session is talking to, and a `Registry` — the
+            // only thing that produces a `Held` in service — always claims first.
+            claim: None,
             session: RefCell::new(session),
             name: RefCell::new(None),
             headline: RefCell::new(Headline::default()),
@@ -1748,14 +1845,17 @@ mod tests {
             config,
         )
         .expect("a valid runner");
-        Rc::new(Registry::new(Rc::new(Agent::from_parts(Parts {
-            runner: Rc::new(runner),
-            store,
-            clock: SystemClock::new().handle(),
-            workspace: dir.to_path_buf(),
-            models: vec![String::from("silent")],
-            tools: 0,
-        }))))
+        Rc::new(Registry::new(
+            Rc::new(Agent::from_parts(Parts {
+                runner: Rc::new(runner),
+                store,
+                clock: SystemClock::new().handle(),
+                workspace: dir.to_path_buf(),
+                models: vec![String::from("silent")],
+                tools: 0,
+            })),
+            String::from("a test agent"),
+        ))
     }
 
     /// The backlog is the turn in progress: everything a late client needs, in order, folded

@@ -25,6 +25,7 @@ reproducible rather than reconstructed.
     01a09a98-d8c4-73d7-b11d-638077efeeca/
       session.jsonl      the conversation
       name               "nightly"           (optional)
+      lock               the writer's pid    (optional, while held for writing)
 ```
 
 The key is a time-ordered uuid, so a directory listing sorts by creation. The name is a
@@ -136,10 +137,25 @@ service produced.
 The reference is a name or a session id, and a name wins if both could match: a name is the
 human-facing key, so a session somebody named is the one they meant.
 
-Resuming is not read-only. It continues the conversation, which means it writes to the same
-log — and a session is not locked. Resuming a session that another agent is holding open,
-or that a `nanus service` is serving, is two writers on one file: the last save wins and the
-other turn is lost. The safe way to continue a live conversation is to attach to it, below.
+Resuming is not read-only: it continues the conversation, which means it writes to the same
+log. A writer therefore **claims** the session first, and a claim is held for as long as the
+writer has it open — a `nanus run` for the length of its run, an agent for as long as it
+holds the session. A second writer is refused, by name:
+
+```console
+$ nanus run --resume nightly "…"
+nanus: session 01a0b1a2… is being written by nanus at /Users/you/.config/nanus/run/agent.sock (pid 41207); attach to it with `nanus tui --connect`
+```
+
+That is the supported way to continue a live conversation anyway: attach to the agent that
+holds it, below. The claim is what makes that the *only* way, rather than the polite one.
+
+Two things about the claim are worth knowing. It is a file beside the log (`lock`), holding
+the holder's pid and a word for what it is, and a claim whose holder is gone is taken over
+rather than honoured — a lock a crashed process left behind is not an owner. And it is
+advisory: any process can write a session's log directly, and `nanus sessions delete` does
+not consult it. What it defends against is another `nanus` — the ordinary way two writers
+meet — not a deliberate one.
 
 Reading without continuing is `nanus tui --session`, which needs no agent and no key,
 because a transcript that has already been written down is just a file.
@@ -214,8 +230,13 @@ flight and is emptied as soon as that turn is in the log.
 
 ## Known limits
 
-- **No locking.** Two agents can be told to resume the same session, and the second save
-  wins. Attaching to a live session is the supported way to share one.
+- **The claim is advisory and process-scoped.** A session is claimed for writing, so a second
+  `nanus` is refused by name; a process that writes the log directly is not. A claim says
+  "this *process* is writing this session", so two holders in one process — which is what an
+  agent holding a session and a connection racing to open the same one would be — see one
+  claim between them. That is correct for the shipped agents, which are one per process.
+- **Deleting does not consult the claim.** `nanus sessions delete` removes a session another
+  agent is writing, and the holder's next save recreates the directory. Stop the agent first.
 - **No deletion in the interface.** `nanus sessions delete <ref>` removes a session and
   releases its name; the interface has no key for it yet, so a conversation is removed from
   the CLI rather than from the screen it is being read on.
