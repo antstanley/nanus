@@ -140,6 +140,7 @@ configuration file and select the file with `--config`.
   *parsing* to a confused peer, not about defending against a hostile one.
 - **A session is not locked.** Two agents can be told to resume the same conversation, and
   the second save wins. Attaching to a live session is the supported way to share one.
-- **A name rename reaches a held session late.** The store is updated immediately and
-  resolving the new name works; a listing of held sessions can show the old one until the
-  agent next opens it.
+- **A session is not *locked*, but a name is re-read rather than trusted.** The agent
+  refreshes a held session's name from the store for every listing and attachment, and
+  resolves a name through the store rather than against its own copy, so a rename made by
+  `nanus sessions name` is visible everywhere at once.

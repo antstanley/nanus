@@ -60,10 +60,16 @@ Renaming releases the old name:
 nanus sessions name project-x 01a09a98-d8c4-73d7-b11d-638077efeeca
 ```
 
-A session can be renamed while an agent is holding it. The rename is durable immediately,
-and the agent picks up the new name the next time it opens the session — a listing of
-*held* sessions can show the name it was opened under until then. Resuming by the new name
-works straight away, because resolving a reference falls through to the store.
+A session can be renamed while an agent is holding it, and the name a command writes is the
+name everything shows: the store is durable immediately, and the agent re-reads the name
+from it whenever it *reports* on a session — a listing, and the attachment that labels a
+client's screen. Its cached copy is a probably rather than a fact, because the command that
+renames a session does not connect to the link and has nothing to tell the agent through.
+
+A name is also **resolved** through the store rather than against that cache, which is the
+half that matters more: `--resume` on a name that has moved on would otherwise join the
+conversation it used to belong to. Only an id is answered from memory, because an id is a
+store key rather than an alias.
 
 ## Deleting
 

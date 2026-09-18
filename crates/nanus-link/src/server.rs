@@ -273,7 +273,11 @@ struct Held {
     /// The conversation.
     session: RefCell<Session>,
     /// The name a user gave it, if any.
-    name: Option<String>,
+    ///
+    /// A cache of what the store says, not a fact: a rename is written straight to the store
+    /// by a command that knows nothing about the agent holding the session, so every report
+    /// the agent makes about a session refreshes this first — see [`Registry::refresh_name`].
+    name: RefCell<Option<String>>,
     /// What a listing shows about it.
     headline: RefCell<Headline>,
     /// One queue per attached client, with the id that connection unsubscribes by.
@@ -323,12 +327,21 @@ impl Held {
         let headline = self.headline.borrow();
         SessionInfo {
             session: self.id.as_str().to_owned(),
-            name: self.name.clone(),
+            name: self.name.borrow().clone(),
             title: headline.title.clone(),
             events: headline.events,
             busy: self.busy.get(),
             viewers: self.viewers.borrow().len(),
         }
+    }
+
+    /// Replaces the cached name.
+    ///
+    /// The store is the authority on what a session is called, so this is called with what
+    /// the store answered rather than with what a caller believes: a name read from disk that
+    /// has since been removed clears the cache, which is what makes a rename visible here.
+    fn set_name(&self, name: Option<String>) {
+        *self.name.borrow_mut() = name;
     }
 
     /// Returns whether `viewer` is still being sent this session's frames.
@@ -519,7 +532,7 @@ impl Registry {
             id: id.clone(),
             headline: RefCell::new(Headline::default()),
             session: RefCell::new(session),
-            name,
+            name: RefCell::new(name),
             turn: RefCell::new(Vec::new()),
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),
@@ -550,30 +563,38 @@ impl Registry {
         self.held.borrow().get(id).map(Rc::clone)
     }
 
-    /// Finds a held session by name and then by id.
-    fn find(&self, reference: &str) -> Option<Rc<Held>> {
-        let held = self.held.borrow();
-        if let Some(found) = held
-            .values()
-            .find(|entry| entry.name.as_deref() == Some(reference))
-        {
-            return Some(Rc::clone(found));
+    /// Re-reads a held session's name from the store.
+    ///
+    /// A name is a file beside the log, and `nanus sessions name` writes it without telling
+    /// the agent — there is nothing to tell it through: the command does not connect to the
+    /// link. So the cached name is a *probably* rather than a fact, and everything the agent
+    /// *reports* about a held session refreshes it first: a listing, and the attachment that
+    /// tells a client which conversation it is in.
+    ///
+    /// A name that cannot be read leaves the cache alone rather than clearing it: an
+    /// unreadable alias is worth a line in the log, not a session that appears nameless until
+    /// the next successful read.
+    async fn refresh_name(&self, held: &Rc<Held>) {
+        match self.agent.store.name_of(&held.id).await {
+            Ok(name) => held.set_name(name),
+            Err(error) => tracing::warn!(%error, "a session's name could not be read"),
         }
-        held.get(&SessionId::new(reference)).map(Rc::clone)
     }
 
     /// Finds the session a reference names, loading it from the store if it is not held.
     ///
-    /// A name is tried before an id, and a session the agent is already holding before one
-    /// on disk: attaching to a running conversation should join it rather than load a
-    /// stale copy of it.
+    /// A name is resolved by the store and never by matching the agent's cached copy of one:
+    /// the store is where a name lives, and a cache that a rename has not reached yet would
+    /// otherwise *join the wrong session* — `--resume` on a name that has moved on would open
+    /// the conversation it used to belong to. An id the agent is holding is answered without
+    /// the store, because an id is a store key rather than an alias.
     ///
     /// # Errors
     ///
     /// Returns a message when the store cannot be read, or nothing answers to the
     /// reference.
     async fn open_reference(&self, reference: &str) -> Result<Rc<Held>, String> {
-        if let Some(found) = self.find(reference) {
+        if let Some(found) = self.get(&SessionId::new(reference)) {
             return Ok(found);
         }
         let named = match self.agent.store.resolve(reference).await {
@@ -612,11 +633,16 @@ impl Registry {
     }
 
     /// Describes every held session, most recently used first.
-    fn listing(&self) -> Vec<SessionInfo> {
-        let mut described: Vec<(u64, SessionInfo)> = self
-            .held
-            .borrow()
-            .values()
+    ///
+    /// Names are refreshed from the store first, so a listing shows what a session is called
+    /// *now* rather than what it was called when the agent opened it.
+    async fn listing(&self) -> Vec<SessionInfo> {
+        let sessions: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
+        for held in &sessions {
+            self.refresh_name(held).await;
+        }
+        let mut described: Vec<(u64, SessionInfo)> = sessions
+            .iter()
             .map(|entry| (entry.touched.get(), entry.info()))
             .collect();
         described.sort_by_key(|described| std::cmp::Reverse(described.0));
@@ -1369,10 +1395,7 @@ async fn serve_connection(
                     refuse_unattached(&frames).await;
                 }
             }
-            Request::Sessions => {
-                let held = registry.listing();
-                send(&frames, Frame::Sessions { held }).await;
-            }
+            Request::Sessions => list_sessions(&registry, &frames).await,
             Request::Approve {
                 call_id,
                 allow,
@@ -1427,6 +1450,16 @@ fn answer_approval(watching: Option<&(u64, Rc<Held>)>, call_id: &str, allow: boo
     if !delivered {
         tracing::debug!(call = %call_id, "an approval answer matched no open question");
     }
+}
+
+/// Answers a listing of the sessions the agent is holding.
+///
+/// A function rather than a few lines in the request loop, because reading the names back from
+/// the store is an await and the loop is already at its complexity ceiling: the refreshing
+/// belongs to the listing anyway, and a listing is one thing to answer.
+async fn list_sessions(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>) {
+    let held = registry.listing().await;
+    send(frames, Frame::Sessions { held }).await;
 }
 
 /// Refuses a request that needs a session on a connection that has not attached to one.
@@ -1492,6 +1525,11 @@ async fn attach(
     held: &Rc<Held>,
     frames: &mpsc::Sender<Frame>,
 ) -> (u64, Rc<Held>) {
+    // A name another process may have changed since this session was opened, read before the
+    // region below rather than inside it. Awaiting *here* is safe for catching up — a frame
+    // produced during it is recorded in the backlog and this viewer is not registered yet, so
+    // it is caught up with rather than missed — but an await inside the region would not be.
+    registry.refresh_name(held).await;
     // One synchronous region: the backlog is snapshotted, the reply that explains it and the
     // batch itself are queued, and the viewer is registered — with no await anywhere in
     // between. That is what makes catching up exact rather than nearly exact:
@@ -1683,7 +1721,7 @@ mod tests {
         Rc::new(Held {
             id: session.id().clone(),
             session: RefCell::new(session),
-            name: None,
+            name: RefCell::new(None),
             headline: RefCell::new(Headline::default()),
             turn: RefCell::new(Vec::new()),
             viewers: RefCell::new(Vec::new()),

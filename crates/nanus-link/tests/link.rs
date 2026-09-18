@@ -1177,6 +1177,75 @@ fn an_idle_session_catches_nobody_up() {
     });
 }
 
+/// A rename reaches everything the agent reports about a session it is holding.
+///
+/// `nanus sessions name` writes the store and tells nobody — it does not connect to the link —
+/// so the agent's copy of the name is what goes stale. A listing is where that shows, and an
+/// attachment labels the client's screen with the same word, so both refresh from the store
+/// rather than trusting the cache. The other half matters more: a name is *resolved* through
+/// the store too, so the name a session used to have cannot be used to join it.
+#[test]
+fn a_rename_reaches_a_held_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+
+        let mut owner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let mine = owner
+            .start(Some("first-name".to_owned()))
+            .await
+            .expect("a session starts");
+        assert_eq!(mine.name.as_deref(), Some("first-name"));
+        assert!(!mine.busy);
+
+        // Renamed behind the agent's back, exactly as the CLI does it.
+        store
+            .name(&SessionId::new(&mine.session), "second-name")
+            .await
+            .expect("the store records the name");
+
+        // A listing shows what the session is called now.
+        let listed = owner.sessions().await.expect("the agent lists");
+        let entry = listed
+            .iter()
+            .find(|entry| entry.session == mine.session)
+            .expect("the session is listed");
+        assert_eq!(
+            entry.name.as_deref(),
+            Some("second-name"),
+            "the listing refreshed the name"
+        );
+
+        // And so does the attachment that labels a client's screen.
+        let mut joiner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let attached = joiner.attach(&mine.session).await.expect("joins");
+        assert_eq!(attached.name.as_deref(), Some("second-name"));
+
+        // The name it used to have names nothing, and resolving through the store is what
+        // makes that true: matching the agent's cache would have joined this session.
+        let mut stale = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let refused = stale.attach("first-name").await;
+        assert!(refused.is_err(), "the old name is gone: {refused:?}");
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
 #[test]
 fn a_turn_finishes_after_the_client_that_asked_for_it_leaves() {
     let dir = tempfile::tempdir().expect("temp dir");
