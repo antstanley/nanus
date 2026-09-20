@@ -27,9 +27,10 @@ with `--verbose`. `--config <PATH>` points at an explicit configuration file, ov
 | `nanus service stop [--socket PATH]` | Ask a running service to stop. |
 | `nanus service status [--socket PATH]` | Report whether one is running, and which sessions it holds; non-zero when nothing answers. |
 | `nanus config` | Print the effective configuration and the provider, plan, model, and endpoint it resolves to; no key needed. |
-| `nanus auth set <PROVIDER>` | Store a credential, read from standard input. |
-| `nanus auth clear <PROVIDER>` | Remove a stored credential. |
-| `nanus auth status` | Report which providers have a credential, and where it is read from; no key needed. |
+| `nanus auth set <PROVIDER>[:<PLAN>]` | Store a key, read from standard input. |
+| `nanus auth login <PROVIDER>[:<PLAN>]` | Authorize a plan that is reached with a browser rather than a key; waits for the service. |
+| `nanus auth clear <PROVIDER>[:<PLAN>]` | Remove a stored credential, key or authorization. |
+| `nanus auth status` | Report which providers and plans have a credential, and where a key is read from; no key needed. |
 | `nanus sessions` | List recorded sessions, newest first; no key needed. |
 | `nanus sessions name <NAME> <SESSION>` | Record or change a session's name. |
 | `nanus sessions delete <NAME\|ID>` | Remove a session and release its name. |

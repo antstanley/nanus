@@ -671,9 +671,9 @@ impl std::fmt::Debug for ViewState {
 /// One switchable choice the provider chooser offers: a provider and one of its plans.
 ///
 /// A tuple rather than a provider with a submenu, because a plan is what a request actually goes to:
-/// z.ai's `api` and `coding` are two hosts, and `OpenAI`'s `subscription` is a plan this build
-/// refuses. Flattening them means one keypress chooses both, and a refused plan is a row that says
-/// why rather than a submenu that cannot be entered.
+/// z.ai's `api` and `coding` are two hosts, and `OpenAI`'s `subscription` is another host, another
+/// wire, and a credential of its own. Flattening them means one keypress chooses both, and a refused
+/// plan is a row that says why rather than a submenu that cannot be entered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderChoice {
     /// The provider's name, as a configuration and the link spell it.
@@ -1954,16 +1954,32 @@ impl ViewState {
         code.clone_into(&mut self.auth_code);
     }
 
-    /// Hides the authorization prompt without stopping the flow.
+    /// Hides the authorization prompt without losing it, or stopping the flow.
     ///
-    /// The agent keeps polling: closing this only stops the note being drawn, because the
-    /// authorization is the service's to confirm and may complete after the reader looks away.
+    /// The agent keeps polling, and the page and the code stay here: a reader who hides the note to
+    /// read the transcript can still see what to type, because the status line names the code and
+    /// the transcript keeps the sentence. Forgetting them is [`ViewState::close_auth`], which is for
+    /// a flow that has ended rather than one that is still running.
+    pub fn hide_auth(&mut self) {
+        self.auth_open = false;
+    }
+
+    /// Forgets the authorization, for a flow that has ended.
+    ///
+    /// Called when the agent reports the provider it switched to, or a failure: either way there is
+    /// no code left to enter, so keeping one would be a stale note drawn over a live conversation.
     pub fn close_auth(&mut self) {
         self.auth_open = false;
         self.auth_provider = None;
         self.auth_plan = None;
         self.auth_url.clear();
         self.auth_code.clear();
+    }
+
+    /// The page and the code, as a sentence the transcript or the status line can carry.
+    #[must_use]
+    pub fn auth_instructions(&self) -> String {
+        format!("visit {} and enter code {}", self.auth_url, self.auth_code)
     }
 
     /// The provider-and-plan the authorization prompt names.
@@ -5123,7 +5139,7 @@ mod tests {
                 plan: String::from("subscription"),
                 label: String::from("openai · subscription"),
                 env: String::from("OPENAI_API_KEY"),
-                refused: Some(String::from("needs an OAuth token")),
+                refused: Some(String::from("needs a wire this build does not speak")),
             },
         ];
         assert!(state.open_providers());
@@ -5133,7 +5149,7 @@ mod tests {
         assert!(text.contains("deepseek"), "{text}");
         assert!(text.contains("openai · subscription"), "{text}");
         assert!(
-            text.contains("needs an OAuth token"),
+            text.contains("needs a wire this build does not speak"),
             "the reason is shown: {text}"
         );
         // The row in force is marked.
@@ -5144,7 +5160,7 @@ mod tests {
         assert!(marked.contains("deepseek"), "{marked}");
     }
 
-    /// The authorization prompt shows the page and the code, and closes without a secret.
+    /// The authorization prompt shows the page and the code, hiding keeps them, and closing forgets.
     #[test]
     fn the_authorization_prompt_shows_the_page_and_code() {
         let mut state = ViewState::new();
@@ -5160,9 +5176,23 @@ mod tests {
         assert!(text.contains("auth.openai.com/codex/device"), "{text}");
         assert!(text.contains("ABCD-EFGH"), "{text}");
         assert!(text.contains("waiting for authorization"), "{text}");
+
+        // Hiding the note leaves the flow, and the code, where they were: it is only the prompt that
+        // goes, so a reader who hid it can still read what to type.
+        state.hide_auth();
+        assert!(!state.auth_open);
+        assert_eq!(state.auth_code, "ABCD-EFGH", "the code survives hiding");
+        assert_eq!(state.auth_label(), "openai · subscription");
+        assert_eq!(
+            state.auth_instructions(),
+            "visit https://auth.openai.com/codex/device and enter code ABCD-EFGH"
+        );
+
+        // Closing is for a flow that has ended, and forgets the code with it.
         state.close_auth();
         assert!(!state.auth_open);
         assert!(state.auth_code.is_empty(), "the code is not kept");
+        assert!(!state.auth_instructions().contains("ABCD-EFGH"));
     }
 
     /// The key field names the plan whose key is wanted, and never draws the secret.

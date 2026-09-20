@@ -36,7 +36,7 @@ is refused at startup with a sentence naming the ones the build offers.
 | Field | Default | Values |
 | --- | --- | --- |
 | `provider` | `deepseek` | `deepseek`, `zai`, `anthropic`, `openai` |
-| `plan` | the provider's default | `api`, `coding` (z.ai and OpenAI), `subscription` (listed, refused) |
+| `plan` | the provider's default | `api`, `coding` (z.ai), `subscription` (OpenAI, authorized with OAuth) |
 | `base_url` | the plan's endpoint | an override, for a proxy or a gateway |
 | `model` | the plan's or provider's default | any id the provider serves |
 | `max_tokens` | `128000` | per-response budget, capped at the provider's ceiling |
@@ -79,9 +79,11 @@ provider that would reject it.
 | `NANUS_HOME` | Override the session-store home, and the default socket and log paths. |
 | `NANUS_TUI` | Override the path to the interface binary. |
 | `DEEPSEEK_API_KEY` | DeepSeek credential; the last store in the chain. |
-| `ZAI_API_KEY` | z.ai credential, for the API and coding plans alike. |
+| `ZAI_API_KEY` | z.ai credential, for the `api` plan. The `coding` plan has its own
+  (`ZAI_CODING_API_KEY`). |
 | `ANTHROPIC_API_KEY` | Anthropic credential. |
-| `OPENAI_API_KEY` | OpenAI credential, for the API and coding plans alike. |
+| `OPENAI_API_KEY` | OpenAI credential, for the `api` plan. The `subscription` plan is authorized,
+  not keyed: see `nanus auth login`. |
 | `NO_COLOR` | Render with no colour at all, keeping bold and italic. |
 | `RUST_LOG` | Tracing filter for the service and core logs. |
 

@@ -61,7 +61,11 @@ pub struct Pending {
 }
 
 /// A token set, as the service returns it and as it is stored.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `Debug` is implemented by hand rather than derived, as `Secret`'s is: a token set *is* the
+/// credential, so a derived one would put the access and refresh tokens into whatever log line
+/// formats it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Tokens {
     /// The short-lived token a request carries.
     pub access_token: String,
@@ -70,44 +74,58 @@ pub struct Tokens {
     /// The identity token, whose claims name the account.
     #[serde(default)]
     pub id_token: String,
-    /// How long the access token lasts, in seconds, when the service says.
+    /// When the access token stops being accepted, as a Unix instant in milliseconds.
+    ///
+    /// Absolute rather than the service's own `expires_in`, because a stored set is read back long
+    /// after it was minted: a lifetime described relative to a moment nobody recorded cannot answer
+    /// whether it has passed, so a set that recorded one would look freshly minted for ever.
+    ///
+    /// `None` when the service stated no lifetime, which [`Tokens::is_expired`] reads as expired —
+    /// the grant is then renewed rather than sent and refused.
     #[serde(default)]
-    pub expires_in: Option<u64>,
+    pub expires_at: Option<u64>,
     /// The `ChatGPT` account the tokens belong to, read from their claims.
     #[serde(default)]
     pub account_id: Option<String>,
 }
 
-impl Tokens {
-    /// Returns the access token's expiry as a Unix instant in milliseconds, when it is known.
-    #[must_use]
-    pub fn expires_at(&self) -> Option<u64> {
-        let seconds = self.expires_in?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|since| u64::try_from(since.as_millis()).ok())?;
-        // Saturating rather than wrapping: an expiry a very long way out must not read as one in
-        // the past.
-        Some(now.saturating_add(seconds.saturating_mul(1_000)))
+impl core::fmt::Debug for Tokens {
+    /// Renders the shape without the grant.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Tokens")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field(
+                "id_token",
+                &if self.id_token.is_empty() {
+                    "<absent>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("expires_at", &self.expires_at)
+            .field("account_id", &self.account_id)
+            .finish()
     }
+}
 
+impl Tokens {
     /// Returns `true` when the access token is expired or within `margin` of it.
     ///
-    /// A token with no stated lifetime is treated as expired, so it is renewed rather than sent and
-    /// refused: the flow that produced it knows the lifetime, and its absence means the token was
-    /// written by something that did not.
+    /// A set whose expiry was never recorded — or one written before the expiry was recorded at all
+    /// — is treated as expired, so it is renewed rather than sent and refused.
     #[must_use]
     pub fn is_expired(&self, margin: Duration) -> bool {
-        let Some(expires_at) = self.expires_at() else {
+        let Some(expires_at) = self.expires_at else {
             return true;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|since| u64::try_from(since.as_millis()).ok())
-            .unwrap_or(u64::MAX);
-        now.saturating_add(margin.as_millis().try_into().unwrap_or(u64::MAX)) >= expires_at
+        // A clock that cannot be read is not a reason to trust a token: renewing costs a request,
+        // and sending an expired one costs the turn.
+        let Some(now) = now_ms() else {
+            return true;
+        };
+        let margin = u64::try_from(margin.as_millis()).unwrap_or(u64::MAX);
+        now.saturating_add(margin) >= expires_at
     }
 
     /// Renders the token set as the single string the credential store holds.
@@ -133,6 +151,29 @@ impl Tokens {
             OAuthError::Transport(format!("the stored token set is unreadable: {error}"))
         })
     }
+}
+
+/// The current Unix instant in milliseconds, when the clock can say.
+///
+/// A clock that cannot be read answers nothing, and every caller treats that as "renew rather than
+/// trust": the cost of one extra request is smaller than the cost of a turn spent on a token the
+/// provider has stopped accepting.
+fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+}
+
+/// The instant a stated lifetime ends, as a Unix instant in milliseconds.
+///
+/// This is where the service's relative `expires_in` becomes the absolute instant the store holds,
+/// recorded once, at the moment the token was minted.
+fn expiry_of(lifetime: Option<u64>) -> Option<u64> {
+    // Saturating rather than wrapping: an expiry a very long way out must not read as one in the
+    // past.
+    let seconds = lifetime?;
+    Some(now_ms()?.saturating_add(seconds.saturating_mul(1_000)))
 }
 
 /// What the device endpoint answers with.
@@ -280,7 +321,7 @@ async fn exchange(
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         id_token: tokens.id_token,
-        expires_in: tokens.expires_in,
+        expires_at: expiry_of(tokens.expires_in),
     })
 }
 
@@ -356,7 +397,9 @@ pub async fn refresh(issuer: &str, tokens: &Tokens) -> Result<Tokens, OAuthError
             refreshed.refresh_token
         },
         id_token: refreshed.id_token,
-        expires_in: refreshed.expires_in,
+        // A response that states no lifetime leaves the new expiry unknown, so the next read renews
+        // again rather than trusting a token whose life nobody recorded.
+        expires_at: expiry_of(refreshed.expires_in),
     })
 }
 
@@ -483,7 +526,7 @@ mod tests {
             access_token: String::from("access"),
             refresh_token: String::from("refresh"),
             id_token: String::from("id"),
-            expires_in: Some(3600),
+            expires_at: Some(1_700_000_000_000),
             account_id: Some(String::from("acct-1")),
         };
         let encoded = tokens.encode().expect("the token set encodes");
@@ -491,8 +534,88 @@ mod tests {
         assert_eq!(decoded.access_token, "access");
         assert_eq!(decoded.refresh_token, "refresh");
         assert_eq!(decoded.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(
+            decoded.expires_at,
+            Some(1_700_000_000_000),
+            "the instant is stored, not a lifetime measured from whenever it is read"
+        );
         // Something that is not a token set is refused rather than read as empty fields.
         assert!(Tokens::decode("not json").is_err());
+    }
+
+    /// The grant is renewed when its life has run out, and only then.
+    ///
+    /// This is the property that made the relative form useless: a lifetime recorded as "an hour"
+    /// reads as an hour from whenever it is *read*, so a set filed a day ago looked fresh and an
+    /// expired access token was sent until the provider refused the turn.
+    #[test]
+    fn a_grant_is_renewed_once_its_lifetime_has_passed() {
+        let now = now_ms().expect("a clock");
+        let margin = Duration::from_mins(5);
+        let set = |expires_at| Tokens {
+            access_token: String::from("access"),
+            refresh_token: String::from("refresh"),
+            id_token: String::new(),
+            expires_at,
+            account_id: None,
+        };
+        // An hour of life granted two hours ago: the hour has passed, so it is renewed.
+        assert!(
+            set(Some(now.saturating_sub(2 * 60 * 60 * 1_000))).is_expired(margin),
+            "an expired grant is renewed"
+        );
+        // An hour of life left: sent rather than renewed.
+        assert!(
+            !set(Some(now.saturating_add(60 * 60 * 1_000))).is_expired(margin),
+            "a live grant is used"
+        );
+        // Inside the margin, a request that leaves now would arrive after the expiry.
+        assert!(
+            set(Some(now.saturating_add(60 * 1_000))).is_expired(margin),
+            "a grant about to expire is renewed early"
+        );
+        // Nothing recorded: renewed rather than trusted.
+        assert!(set(None).is_expired(margin), "an unrecorded expiry renews");
+    }
+
+    /// A lifetime from the service becomes an instant on the clock, recorded once.
+    #[test]
+    fn a_stated_lifetime_becomes_an_absolute_instant() {
+        let before = now_ms().expect("a clock");
+        let instant = expiry_of(Some(3_600)).expect("an hour becomes an instant");
+        let after = now_ms().expect("a clock");
+        assert!(
+            (before + 3_600_000..=after + 3_600_000).contains(&instant),
+            "the instant is an hour from the moment it was minted: {instant} not in {before}..={after}"
+        );
+        assert_eq!(
+            expiry_of(None),
+            None,
+            "a service that states no lifetime leaves it unrecorded, which reads as expired"
+        );
+    }
+
+    /// The `Debug` of a token set names the shape and keeps the grant out of a log line.
+    #[test]
+    fn the_debug_of_a_token_set_keeps_the_grant_out() {
+        let tokens = Tokens {
+            access_token: String::from("access-secret"),
+            refresh_token: String::from("refresh-secret"),
+            id_token: String::from("id-secret"),
+            expires_at: Some(1_700_000_000_000),
+            account_id: Some(String::from("acct-1")),
+        };
+        let rendered = format!("{tokens:?}");
+        for secret in ["access-secret", "refresh-secret", "id-secret"] {
+            assert!(
+                !rendered.contains(secret),
+                "{secret} reached a log: {rendered}"
+            );
+        }
+        // The shape is still useful: what is present, and when it expires.
+        assert!(rendered.contains("expires_at"), "{rendered}");
+        assert!(rendered.contains("acct-1"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     /// Test-side base64url, independent of the decoder under test.

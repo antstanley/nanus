@@ -39,10 +39,10 @@ pub const ZAI_API_KEY_ENV: &str = "ZAI_API_KEY";
 /// still works, but the provider refuses the effort field — which is why the
 /// offered list is the reasoning family.
 ///
-/// The coding model is in the list because the composition's `coding` plan resolves to
-/// it: a plan whose default model the agent does not offer would put a client on a model
-/// it could cycle away from and never back to, and `SetModel` would refuse the id the
-/// session was already running.
+/// The coding model is in the list because a plan resolves to it: the `subscription` plan's
+/// default model is `gpt-5.3-codex`, and a plan whose default model the agent does not offer
+/// would put a client on a model it could cycle away from and never back to, and `SetModel`
+/// would refuse the id the session was already running.
 ///
 /// The current flagships come first, so the fallback default is one of them, and the
 /// previous generation stays behind them rather than being dropped: a session resumed

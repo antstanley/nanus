@@ -328,7 +328,7 @@ impl ProviderSwitch {
         provider: Provider,
         plan: Option<&str>,
     ) -> Result<crate::authorize::PendingAuth, BundleError> {
-        crate::authorize::begin(provider, plan, oauth::ISSUER).await
+        crate::authorize::begin_for(provider, plan).await
     }
 
     /// Polls an authorization once, filing the token set when the user has finished.
@@ -472,10 +472,15 @@ async fn resolve_credential(
     selection: &Selection,
 ) -> Result<Secret, BundleError> {
     let account = selection.credential_account();
-    // A plan reached with an authorization has no variable to name: it is completed in a browser,
-    // so the sentence points at the flow rather than at a shell.
+    // A plan reached with an authorization has no variable to name and nothing to type: it is
+    // completed in a browser, whichever door the reader came through, so the sentence names the two
+    // commands that start it rather than a shell variable that does not exist.
     let hint = selection.credential_env().map_or_else(
-        || String::from("authorize it from the provider chooser"),
+        || {
+            format!(
+                "run `nanus auth login {account}` or choose it in the interface to authorize it"
+            )
+        },
         |env| format!("run `nanus auth set {account}`, or set {env}"),
     );
     match secrets.get(account).await {
@@ -524,7 +529,8 @@ async fn renew(
     }
     let renewed = oauth::refresh(oauth::ISSUER, &tokens).await.map_err(|error| {
         BundleError::config(format!(
-            "{account} could not be renewed: {error}; authorize it again from the provider chooser"
+            "{account} could not be renewed: {error}; run `nanus auth login {account}` to authorize \
+             it again"
         ))
     })?;
     let encoded = renewed
@@ -641,9 +647,10 @@ fn build_llm(
     let port: Box<dyn LlmPort> = match selection.provider() {
         Provider::DeepSeek => Box::new(build_deepseek(config, selection, key)?),
         Provider::Zai => Box::new(build_compatible(Vendor::Zai, config, selection, key)?),
-        // A `ChatGPT` subscription is reached through the Responses API, with the grant's access
-        // token as the bearer and the account named in its own header.
-        Provider::OpenAi if selection.credential_is_oauth() => {
+        // Which wire an `OpenAI` request takes is the *plan's* fact, not the credential's: the
+        // `ChatGPT` backend serves the Responses API because that is the endpoint it is, and the
+        // subscription plan names it. The credential decides only how the request authenticates.
+        Provider::OpenAi if matches!(selection.protocol(), Protocol::Responses) => {
             Box::new(build_responses(config, selection, key)?)
         }
         Provider::OpenAi => Box::new(build_compatible(Vendor::OpenAi, config, selection, key)?),
@@ -662,6 +669,11 @@ fn build_llm(
 ///
 /// Returns [`BundleError::Config`] when the stored credential is not a token set — which is a
 /// credential filed by something else, not a subscription — or when the adapter cannot be built.
+/// Builds the client an OAuth-authorized `OpenAI` plan needs: the grant's access token as the
+/// bearer, and the `ChatGPT` account named in its own header.
+///
+/// The wire is not set here — it comes from the plan, as it does for a keyed request — so the only
+/// thing this adds is where the credential comes from: a token set rather than a key.
 fn build_responses(
     config: &NanusConfig,
     selection: &Selection,
@@ -669,20 +681,10 @@ fn build_responses(
 ) -> Result<OpenAiLlm, BundleError> {
     let tokens = oauth::Tokens::decode(key.expose())
         .map_err(|error| BundleError::config(error.to_string()))?;
-    let mut adapter = OpenAiConfig::with_base_url(
-        Vendor::OpenAi,
-        selection.model(),
-        tokens.access_token,
-        selection.endpoint(),
-    );
-    adapter.set_protocol(Protocol::Responses);
+    let mut adapter = compatible_config(Vendor::OpenAi, config, selection, &tokens.access_token)?;
     if let Some(account_id) = tokens.account_id {
         adapter.set_account_id(account_id);
     }
-    adapter
-        .set_max_tokens(config.max_tokens)
-        .map_err(|error| BundleError::config(error.to_string()))?;
-    adapter.set_reasoning_effort(config.reasoning_effort.to_port());
     OpenAiLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
 }
 
@@ -710,17 +712,36 @@ fn build_compatible(
     selection: &Selection,
     key: &Secret,
 ) -> Result<OpenAiLlm, BundleError> {
-    let mut adapter = OpenAiConfig::with_base_url(
-        vendor,
-        selection.model(),
-        key.expose(),
-        selection.endpoint(),
-    );
+    let adapter = compatible_config(vendor, config, selection, key.expose())?;
+    OpenAiLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
+}
+
+/// Builds the configuration an `OpenAI`-compatible request is made from.
+///
+/// Shared by the two builders here, so the facts a plan carries — the endpoint, the wire it serves,
+/// the output ceiling, the effort — are applied once, whichever way the request authenticates. The
+/// wire is the plan's and not the credential's: an API endpoint serves `chat/completions` and the
+/// `ChatGPT` backend serves `responses`, and a subscription is that backend whether the grant
+/// arrives as a key or as a token set.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] when the configuration asks for more output than the adapter's
+/// ceiling permits.
+fn compatible_config(
+    vendor: Vendor,
+    config: &NanusConfig,
+    selection: &Selection,
+    key: &str,
+) -> Result<OpenAiConfig, BundleError> {
+    let mut adapter =
+        OpenAiConfig::with_base_url(vendor, selection.model(), key, selection.endpoint());
+    adapter.set_protocol(selection.protocol());
     adapter
         .set_max_tokens(config.max_tokens)
         .map_err(|error| BundleError::config(error.to_string()))?;
     adapter.set_reasoning_effort(config.reasoning_effort.to_port());
-    OpenAiLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
+    Ok(adapter)
 }
 
 /// Builds the `Anthropic` adapter.

@@ -85,21 +85,21 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   Concurrency is not parallelism, and there is no worker pool. A step's tool calls do run
   together — cooperatively, capped by `max_parallel_tools`, and interleaved at their await
   points — but a call that blocks the thread blocks all of them.
-- **Four providers, with one plan refused.** `deepseek`, `zai` (API and coding plans),
-  `anthropic`, and `openai` (API and coding plans) all run; OpenAI's ChatGPT
-  *subscription* plan is listed and refused by name, because it needs an OAuth token and
-  the Responses API. Anthropic's extended thinking is not requested — a tool-using turn
-  requires the signed thinking blocks of the previous turn replayed, and the message
-  model has no place for a signature — so `reasoning_effort` has no effect there; the
-  absence is recorded rather than a plausible value.
+- **Four providers, every plan they ship usable.** `deepseek`, `zai` (its API and a coding plan
+  with a key of its own), `anthropic`, and `openai` (its API and a `ChatGPT` subscription
+  authorized over OAuth, which speaks the Responses API through an encoder of its own) all run.
+  Anthropic's extended thinking is not requested — a tool-using turn requires the signed thinking
+  blocks of the previous turn replayed, and the message model has no place for a signature — so
+  `reasoning_effort` has no effect there; the absence is recorded rather than a plausible value.
 - **Only the macOS keychain ships as a platform secret store.** `SecretPort` and the
   `SecretBackend` trait are the seam, and a `0600` file and the environment are the
   fallbacks that work everywhere, but a Linux Secret Service or a Windows Credential
   Manager store is an implementation that does not exist yet.
-- **The z.ai and OpenAI coding plans are endpoints, not subscriptions.** z.ai's coding
-  plan is the same key and protocol at a different host, which is what makes it work;
-  OpenAI's coding plan is a coding model on the same API. A tier that needs its own
-  authorisation flow does not.
+- **A plan is an endpoint, a wire, and a credential.** z.ai's coding plan is the same protocol
+  and a different key at a different host; `OpenAI`'s subscription is a `ChatGPT` account,
+  authorized in a browser, whose grant is a token set the agent renews rather than a key it sends.
+  The wire a request takes is read from the plan and not from how the credential was obtained, so
+  pointing a `base_url` somewhere else moves the request without changing what it is.
 - **The sandbox is reported, not OS-enforced.** `nanus-adapter-local` checks the working
   directory and returns the policy, but installs no OS-level confinement. See
   [SAFETY.md](../SAFETY.md).

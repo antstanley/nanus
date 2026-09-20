@@ -2318,20 +2318,31 @@ fn handle_pointer(
 /// Routes a key while the authorization prompt is open.
 ///
 /// There is nothing to type and nothing to send — the agent is polling the authorization service —
-/// so the only key that does anything closes the note. The flow itself keeps running, and the agent
-/// switches and broadcasts when the service confirms.
+/// so the only key that does anything hides the note. What it cannot do is lose it: the page and the
+/// code stay in the view and are written to the transcript, because a reader who hides the note to
+/// read the conversation has not finished authorizing, and the flow may still be waiting on the code
+/// they have just stopped looking at.
 fn handle_auth_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'Q') => {
-            view.close_auth();
-            view.status =
-                String::from("the authorization continues; the agent will switch when it lands");
-        }
-        KeyCode::Char('c' | 'C') if control => view.close_auth(),
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'Q') => hide_auth(view),
+        KeyCode::Char('c' | 'C') if control => hide_auth(view),
         _ => {}
     }
     Outcome::Continue
+}
+
+/// Hides the authorization note, keeping the page and the code within reach.
+fn hide_auth(view: &mut ViewState) {
+    let instructions = format!(
+        "authorize {}: {}; the agent keeps polling, and switches when the service confirms",
+        view.auth_label(),
+        view.auth_instructions(),
+    );
+    view.hide_auth();
+    view.status = format!("the authorization continues · code {}", view.auth_code);
+    view.transcript.push(Entry::notice(instructions));
+    view.follow();
 }
 
 /// Opens the provider chooser, or says the agent offers none.
@@ -4799,7 +4810,7 @@ mod tests {
                 plan: String::from("subscription"),
                 label: String::from("openai · subscription"),
                 env: String::from("OPENAI_API_KEY"),
-                refused: Some(String::from("needs an OAuth token")),
+                refused: Some(String::from("needs a wire this build does not speak")),
             },
         ];
         let mut source = Scripted::new(Vec::new());
@@ -4882,7 +4893,7 @@ mod tests {
         assert!(view.key_input.is_empty(), "the key is not kept");
     }
 
-    /// An authorization prompt names the page and the code, and hiding it leaves the flow running.
+    /// An authorization prompt names the page and the code, and hiding it keeps both within reach.
     #[test]
     fn an_authorization_prompt_names_the_page_and_the_code() {
         let mut view = ViewState::new();
@@ -4899,12 +4910,27 @@ mod tests {
         assert_eq!(view.auth_label(), "openai · subscription");
         assert_eq!(view.auth_code, "ABCD-EFGH");
 
-        // Esc hides the note; the agent keeps polling.
+        // Esc hides the note; the agent keeps polling, and the page and the code are still here:
+        // the status line names the code and the transcript keeps the whole sentence, so a reader
+        // who looked away before writing the code down has not lost it.
         let _ = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
         assert!(!view.auth_open);
         assert!(view.status.contains("continues"), "{}", view.status);
+        assert!(view.status.contains("ABCD-EFGH"), "{}", view.status);
+        assert_eq!(view.auth_code, "ABCD-EFGH", "the code is kept, not dropped");
+        let kept: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert!(
+            kept.iter()
+                .any(|said| said.contains("auth.openai.com/codex/device")),
+            "{kept:?}"
+        );
+        assert!(
+            kept.iter().any(|said| said.contains("ABCD-EFGH")),
+            "{kept:?}"
+        );
 
-        // A failure closes it too, because its refusal is the answer the prompt waited for.
+        // A failure forgets it, because its refusal is the answer the prompt waited for and there
+        // is no code left to enter.
         apply(
             Frame::AuthPrompt {
                 provider: String::from("openai"),
@@ -4921,6 +4947,10 @@ mod tests {
             &mut view,
         );
         assert!(!view.auth_open);
+        assert!(
+            view.auth_code.is_empty(),
+            "the code is not kept past the flow"
+        );
     }
 
     /// A refused plan is a row that says why rather than a switch.
@@ -4932,7 +4962,7 @@ mod tests {
             plan: String::from("subscription"),
             label: String::from("openai · subscription"),
             env: String::from("OPENAI_API_KEY"),
-            refused: Some(String::from("needs an OAuth token")),
+            refused: Some(String::from("needs a wire this build does not speak")),
         }];
         open_provider_chooser(&mut view);
         let outcome = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);

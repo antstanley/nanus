@@ -56,13 +56,21 @@ fn config(root: &std::path::Path) -> NanusConfig {
 /// forced by two constraints: `set_var` is `unsafe` in edition 2024, this workspace
 /// forbids `unsafe`, and a test that required the caller to export a key would fail in
 /// CI.
+///
+/// The scratch home the child writes into is named for `name` as well as the parent, because the
+/// tests in this file run beside each other and each parent deletes its own child's home when it
+/// returns.
 fn in_child_process(name: &str) {
     if std::env::var(CHILD_MARKER).is_ok() {
         // Already the child: nothing to do. Its home was pointed at a scratch directory
         // by the parent, so nothing it writes reaches the real one.
         return;
     }
-    let home = std::env::temp_dir().join(format!("nanus-composition-{}", std::process::id()));
+    // A harness home of its own, and one per test: the tests in this file run beside each other,
+    // and a home named for the *parent* process alone is shared by every child, so the first test
+    // to finish would delete the directory another child was still writing sessions into.
+    let home =
+        std::env::temp_dir().join(format!("nanus-composition-{}-{name}", std::process::id()));
     let exe = std::env::current_exe().expect("the test binary has a path");
     let status = std::process::Command::new(exe)
         // Exact match, so the marker does not leak into sibling tests.
@@ -286,15 +294,33 @@ fn a_configuration_without_a_key_is_refused_before_anything_mounts() {
         .build()
         .expect("runtime");
 
-    // With the variable emptied for this thread's view, composing fails at the
-    // credential check rather than after mounting a half-built harness.
-    let had_key = std::env::var(KEY_ENV).is_ok_and(|value| !value.is_empty());
+    // Composing without a credential fails at the credential check rather than after mounting a
+    // half-built harness. A machine that already holds one — exported, in the keychain, or in the
+    // file store — is not the case under test, because composing *succeeds* there and that is the
+    // correct behaviour: the guard asks the stores rather than the variable alone, or a developer
+    // who once ran `nanus auth set deepseek` would see this test fail for doing its job.
+    let account = Selection::resolve(&settings)
+        .expect("the default configuration resolves")
+        .credential_account()
+        .to_owned();
+    let had_key = std::env::var(KEY_ENV).is_ok_and(|value| !value.is_empty())
+        || runtime.block_on(stored_credential(&account));
     if !had_key {
         let outcome = runtime.block_on(compose(&settings));
         assert!(outcome.is_err(), "a missing key is refused");
         let Err(error) = outcome else { return };
         assert!(error.to_string().contains(KEY_ENV), "{error}");
     }
+}
+
+/// Whether any store already holds a credential for `account`.
+///
+/// Asked through the same chain a run uses, so the answer is the one composition will act on.
+async fn stored_credential(account: &str) -> bool {
+    let Ok(secrets) = nanus_bundle::compose::open_secrets() else {
+        return false;
+    };
+    matches!(secrets.get(account).await, Ok(Some(secret)) if !secret.is_blank())
 }
 
 #[test]

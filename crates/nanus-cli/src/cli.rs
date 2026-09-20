@@ -36,11 +36,13 @@ use std::cell::Cell;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use nanus_adapter_config::NanusConfig;
+use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::open_store;
-use nanus_bundle::{Harness, Provider, Selection, compose};
+use nanus_bundle::{Harness, Provider, Selection, authorize, compose};
 use nanus_domain::ApprovalPolicy;
 use nanus_kernel::runtime::block_on as kernel_block_on;
 use std::ffi::OsString;
@@ -254,9 +256,22 @@ pub enum AuthAction {
     /// in (`printf %s "$KEY" | nanus auth set openai`) or type it and press enter;
     /// nothing is echoed in the second case, which is the same trade the platform's
     /// own tools make.
+    ///
+    /// A plan filed by an authorization rather than a key is refused by name rather than
+    /// had a key stored under it: it is completed in a browser, with `nanus auth login`.
     Set {
         /// The provider the credential is for, or `provider:plan` for a plan with a key of its
         /// own (`zai:coding`): one of the names `nanus auth status` lists.
+        provider: String,
+    },
+
+    /// Authorize a plan that is reached with a browser rather than a key.
+    ///
+    /// The device flow: the page and the code are printed, the reader authorizes on any machine, and
+    /// this waits until the service confirms before filing the token set. The name is a provider
+    /// whose plan takes an authorization (`openai`), or `provider:plan` to name one of several.
+    Login {
+        /// The provider to authorize, or `provider:plan` for the plan to authorize.
         provider: String,
     },
 
@@ -1231,7 +1246,7 @@ async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
     let secrets = compose::open_secrets().map_err(|error| error.to_string())?;
     match action {
         AuthAction::Set { provider } => {
-            let account = provider_account(&provider)?;
+            let account = key_account(&provider)?;
             let credential = read_credential().await?;
             secrets
                 .set(account, &credential)
@@ -1244,6 +1259,45 @@ async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
                 secrets.backend()
             );
             Ok(Ready::Done)
+        }
+        AuthAction::Login { provider } => {
+            let (provider, plan) = authorization_target(&provider)?;
+            let pending = authorize::begin_for(provider, Some(plan))
+                .await
+                .map_err(|error| error.to_string())?;
+            println!(
+                "nanus: authorize {} at {}",
+                pending.account(),
+                pending.url()
+            );
+            println!("nanus: enter the code {}", pending.code());
+            // The service's own interval, plus a margin, so a poll that arrives a moment early is
+            // not read as the reader having not finished. The wait is theirs to take; the deadline
+            // is the service's own code expiring under it.
+            let wait = pending.interval().saturating_add(POLL_MARGIN);
+            let deadline = Instant::now()
+                .checked_add(AUTHORIZATION_TIMEOUT)
+                .unwrap_or_else(Instant::now);
+            loop {
+                tokio::time::sleep(wait).await;
+                if authorize::poll(&secrets, &pending)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    println!(
+                        "nanus: authorized {} and stored the token set ({})",
+                        pending.account(),
+                        secrets.backend()
+                    );
+                    return Ok(Ready::Done);
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "the authorization for {} was not completed in time",
+                        pending.account()
+                    ));
+                }
+            }
         }
         AuthAction::Clear { provider } => {
             let account = provider_account(&provider)?;
@@ -1298,6 +1352,72 @@ async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
     }
 }
 
+/// Resolves the account a *typed key* is filed under, refusing one that an authorization fills.
+///
+/// A key stored under an account an authorization owns would be a credential nothing ever reads as
+/// one, so the refusal names the command that does fill it rather than accepting the value and
+/// leaving the reader to find out at the next turn.
+fn key_account(asked: &str) -> Result<&'static str, String> {
+    let account = provider_account(asked)?;
+    match plan_of_account(account) {
+        Some((provider, plan)) if provider.credential_is_oauth(Some(plan)) => Err(format!(
+            "{account} is filled by an authorization, not a key: run `nanus auth login {account}`"
+        )),
+        _ => Ok(account),
+    }
+}
+
+/// Resolves the plan an authorization is for, or refuses the name.
+///
+/// A name without a plan answers the provider's only authorizable plan, so `nanus auth login openai`
+/// is the same command as `nanus auth login openai:subscription`. A provider with several is asked
+/// for by plan, and one whose plans are all keyed is refused with the command that does store a key.
+fn authorization_target(asked: &str) -> Result<(Provider, &'static str), String> {
+    if let Some((provider, plan)) = asked.split_once(':') {
+        let provider = Provider::parse(provider).ok_or_else(|| unknown_provider(asked))?;
+        let plan = provider
+            .plan(plan)
+            .ok_or_else(|| unknown_plan(provider, plan))?;
+        if !provider.credential_is_oauth(Some(plan.name)) {
+            return Err(format!(
+                "{}'s {} plan is reached with a key, not an authorization: run `nanus auth set {asked}`",
+                provider, plan.name
+            ));
+        }
+        return Ok((provider, plan.name));
+    }
+    let provider = Provider::parse(asked).ok_or_else(|| unknown_provider(asked))?;
+    let authorizable: Vec<&'static str> = provider
+        .plans()
+        .iter()
+        .filter(|plan| provider.credential_is_oauth(Some(plan.name)))
+        .map(|plan| plan.name)
+        .collect();
+    match authorizable.as_slice() {
+        [plan] => Ok((provider, plan)),
+        [] => Err(format!(
+            "{provider} is reached with a key, not an authorization: run `nanus auth set {provider}`"
+        )),
+        several => Err(format!(
+            "{provider} authorizes {}; name one as `{provider}:<plan>`",
+            several.join(", ")
+        )),
+    }
+}
+
+/// Returns the provider and plan an account belongs to, when the table has one for it.
+fn plan_of_account(account: &str) -> Option<(Provider, &'static str)> {
+    Provider::ALL
+        .iter()
+        .flat_map(|provider| {
+            provider
+                .plans()
+                .iter()
+                .map(move |plan| (*provider, plan.name))
+        })
+        .find(|(provider, plan)| provider.credential_account(Some(plan)) == account)
+}
+
 /// Resolves the account a credential is filed under from the command line, or refuses the name.
 ///
 /// The name is a provider, or `provider:plan` for a plan with a credential of its own: a provider's
@@ -1309,18 +1429,23 @@ fn provider_account(asked: &str) -> Result<&'static str, String> {
         let Some(provider) = Provider::parse(provider) else {
             return Err(unknown_provider(provider));
         };
-        if provider.plan(plan).is_none() {
-            let offered: Vec<&str> = provider.plans().iter().map(|entry| entry.name).collect();
-            return Err(format!(
-                "unknown plan {plan:?} for {provider}: it offers {}",
-                offered.join(", ")
-            ));
-        }
-        return Ok(provider.credential_account(Some(plan)));
+        let Some(plan) = provider.plan(plan) else {
+            return Err(unknown_plan(provider, plan));
+        };
+        return Ok(provider.credential_account(Some(plan.name)));
     }
     Provider::parse(asked)
         .map(Provider::name)
         .ok_or_else(|| unknown_provider(asked))
+}
+
+/// The refusal for a plan name a provider does not offer.
+fn unknown_plan(provider: Provider, plan: &str) -> String {
+    let offered: Vec<&str> = provider.plans().iter().map(|entry| entry.name).collect();
+    format!(
+        "unknown plan {plan:?} for {provider}: it offers {}",
+        offered.join(", ")
+    )
 }
 
 /// The refusal for a provider name this build does not have.
@@ -2087,5 +2212,46 @@ mod tests {
         // A name this build does not have is refused by name.
         assert!(provider_account("gemini").is_err());
         assert!(provider_account("zai:enterprise").is_err());
+    }
+
+    /// A key is not filed under an account an authorization fills, and the refusal says where to go.
+    #[test]
+    fn a_key_is_refused_for_an_authorized_account() {
+        // z.ai's coding plan takes a key of its own, so a key is exactly what it wants.
+        assert_eq!(key_account("zai:coding").ok(), Some("zai:coding"));
+        assert_eq!(key_account("deepseek").ok(), Some("deepseek"));
+        // `openai:subscription` is filled by a token set: a typed key there would be a credential
+        // nothing reads as a key.
+        let refused =
+            key_account("openai:subscription").expect_err("an authorization is not keyed");
+        assert!(refused.contains("authorization"), "{refused}");
+        assert!(refused.contains("nanus auth login"), "{refused}");
+    }
+
+    /// An authorization names a plan that takes one, and a bare provider answers its only one.
+    #[test]
+    fn an_authorization_resolves_to_the_plan_that_takes_one() {
+        // `openai` offers one authorizable plan, so the plan may be left off.
+        let (provider, plan) =
+            authorization_target("openai").expect("openai authorizes a subscription");
+        assert_eq!(provider, Provider::OpenAi);
+        assert_eq!(plan, "subscription");
+        // And naming it resolves to the same account.
+        let (provider, plan) =
+            authorization_target("openai:subscription").expect("the plan is named");
+        assert_eq!(
+            provider.credential_account(Some(plan)),
+            "openai:subscription"
+        );
+
+        // A provider whose plans are keyed is refused with the command that does store one.
+        let refused = authorization_target("zai").expect_err("z.ai is keyed");
+        assert!(refused.contains("nanus auth set zai"), "{refused}");
+        // Naming a keyed plan says the same rather than starting a flow for it.
+        let refused = authorization_target("zai:coding").expect_err("the coding plan takes a key");
+        assert!(refused.contains("nanus auth set zai:coding"), "{refused}");
+        // A name this build does not have is refused by name, as `auth set` refuses it.
+        assert!(authorization_target("gemini").is_err());
+        assert!(authorization_target("openai:enterprise").is_err());
     }
 }

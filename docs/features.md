@@ -98,9 +98,15 @@ the account through the **Responses API** — the items-shaped wire that backend
 grant's access token as the bearer, the account named in its own header, and an expired access token
 renewed from the refresh token rather than sent and refused.
 
-- **A plan is an endpoint plus a default model.** z.ai's `coding` plan is the same
-  key and protocol at a different host; OpenAI's `coding` plan is a coding model on
-  the same host. `base_url` overrides either, for a proxy or a gateway.
+- **A plan is an endpoint, a default model, a wire, and a credential.** z.ai's `coding` plan is
+  the same protocol and a key of its own at a different host; OpenAI's `subscription` plan is a
+  `ChatGPT` account, authorized in a browser, that serves the Responses API rather than chat
+  completions. `base_url` moves where a request goes, not which of the two it is.
+- **OpenAI's `coding` plan is gone.** It was a default model — `gpt-5.3-codex` — on the API with
+  the API key, and the same model is one `model = "gpt-5.3-codex"` away on the `api` plan, so
+  `plan = "coding"` with `provider = "openai"` is refused by name rather than kept as a second
+  spelling of the API plan. z.ai's `coding` plan is unaffected: it is a different host and a
+  different key.
 - **Streaming responses** over SSE, with reasoning content and tool calls
   reassembled from their frames. DeepSeek and z.ai send `data:`-framed chunks ending
   in `[DONE]`; Anthropic sends event-typed frames ending in `message_stop`.
@@ -129,8 +135,10 @@ renewed from the refresh token rather than sent and refused.
 A provider key is a secret, so it is not in the configuration file and not a
 field of any type that reaches a log.
 
-- **`nanus auth set <provider>`** reads a key from standard input and stores it;
-  `nanus auth clear <provider>` removes it, and `nanus auth status` reports which
+- **`nanus auth set <provider>`** reads a key from standard input and stores it, and
+  **`nanus auth login <provider>`** runs the device flow a plan reached with OAuth needs: the page
+  and the code are printed, and the token set is filed when the service confirms.
+  `nanus auth clear <provider>` removes either, and `nanus auth status` reports which
   providers have one. The value is never printed, and never taken as an argument,
   so it does not appear in a process list.
 - **A chain of stores**, tried in order: the macOS keychain, a `0600` file under
@@ -230,9 +238,11 @@ Environment variables:
 | Variable | Effect |
 |---|---|
 | `DEEPSEEK_API_KEY` | DeepSeek credential. The last store in the chain; never stored, serialised, or rendered by the harness. |
-| `ZAI_API_KEY` | z.ai credential, for the API and coding plans alike. |
+| `ZAI_API_KEY` | z.ai credential, for the `api` plan. The `coding` plan has its own
+  (`ZAI_CODING_API_KEY`). |
 | `ANTHROPIC_API_KEY` | Anthropic credential. |
-| `OPENAI_API_KEY` | OpenAI credential, for the API and coding plans alike. |
+| `OPENAI_API_KEY` | OpenAI credential, for the `api` plan. The `subscription` plan is authorized,
+  not keyed: see `nanus auth login`. |
 | `NANUS_CONFIG` | Override the configuration file path. |
 | `NANUS_HOME` | Override the session-store home (and the default socket and log paths). |
 | `NANUS_TUI` | Override the path to the interface binary. |
@@ -257,9 +267,10 @@ which asks for progress on stderr.
 | `nanus service stop [--socket PATH]` | Ask a running service to stop. |
 | `nanus service status [--socket PATH]` | Report whether one is running, and which sessions it holds; non-zero when nothing answers. |
 | `nanus config` | Print the effective configuration and the provider, plan, model, and endpoint it resolves to; no key needed. |
-| `nanus auth set <PROVIDER>` | Store a credential, read from standard input. |
-| `nanus auth clear <PROVIDER>` | Remove a stored credential. |
-| `nanus auth status` | Report which providers have a credential, and where it is read from; no key needed. |
+| `nanus auth set <PROVIDER>[:<PLAN>]` | Store a key, read from standard input. |
+| `nanus auth login <PROVIDER>[:<PLAN>]` | Authorize a plan that is reached with a browser rather than a key; waits for the service. |
+| `nanus auth clear <PROVIDER>[:<PLAN>]` | Remove a stored credential, key or authorization. |
+| `nanus auth status` | Report which providers and plans have a credential, and where a key is read from; no key needed. |
 | `nanus sessions` | List recorded sessions, newest first; no key needed. |
 | `nanus sessions name <NAME> <SESSION>` | Record or change a session's name. |
 | `nanus sessions delete <NAME\|ID>` | Remove a session and release its name. |
@@ -446,9 +457,6 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **OpenAI's subscription is reached through a second wire.** The `subscription` plan authorizes with
-  OAuth and speaks the Responses API — items rather than messages, named events rather than `choices`
-  deltas — while the `api` plan keeps `chat/completions`. Which one a request uses is the plan's.
 - **Anthropic's extended thinking is not requested.** A tool-using turn requires
   the signed thinking blocks of the previous turn replayed, and the message model
   has no place for a signature, so `reasoning_effort` has no effect there.

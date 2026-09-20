@@ -12,15 +12,17 @@
 //!
 //! ## What a plan is
 //!
-//! A plan is what a provider calls a tier of service: z.ai's coding subscription is
-//! the same protocol and the same key at a different host, and `OpenAI`'s is a
-//! different default model on the same host. So a plan is an endpoint plus a default
-//! model, plus — where this build cannot honour it — a sentence saying why not.
+//! A plan is what a provider calls a tier of service: z.ai's coding subscription is the
+//! same protocol and a different key at a different host, and `OpenAI`'s subscription is
+//! a `ChatGPT` account authorized in a browser and reached through a second wire. So a
+//! plan is an endpoint plus a default model, the shape that endpoint serves, and the
+//! credential it takes, plus — where this build cannot honour it — a sentence saying why
+//! not.
 //!
 //! A plan this build cannot use is *listed and refused by name* rather than absent:
-//! "unknown plan" tells a reader nothing, while "the subscription plan needs an
-//! OAuth token and the Responses API, which this build does not encode" tells them
-//! what would have to change.
+//! "unknown plan" tells a reader nothing, while "the Responses API, which this build does
+//! not encode" tells them what would have to change. No shipped plan is refused today, and
+//! the mechanism stays for the next one that has to be.
 //!
 //! ## Absent means the provider's answer
 //!
@@ -34,7 +36,7 @@ use nanus_adapter_config::NanusConfig;
 use nanus_adapter_deepseek::{
     self as deepseek, DEFAULT_MAX_OUTPUT_TOKENS as DEEPSEEK_MAX_OUTPUT_TOKENS,
 };
-use nanus_adapter_openai::Vendor;
+use nanus_adapter_openai::{Protocol, Vendor};
 
 use crate::error::BundleError;
 
@@ -122,6 +124,14 @@ pub struct Plan {
     ///
     /// `None` means the provider's own account and variable — one key for every plan.
     pub credential: Option<PlanCredential>,
+    /// Which shape this endpoint serves, for the providers whose adapters speak both.
+    ///
+    /// A fact of the *endpoint*, recorded beside the endpoint rather than inferred from how the
+    /// credential was obtained: `OpenAI`'s `ChatGPT` backend serves the Responses API and every
+    /// other endpoint here serves chat completions, and a plan says which of the two it is even
+    /// when a `base_url` moves where the request goes. `None` for a provider whose adapter has one
+    /// shape of its own — Anthropic's Messages API — where the field would be a guess.
+    pub protocol: Option<Protocol>,
 }
 
 /// `DeepSeek`'s plans: one endpoint, no tiers.
@@ -131,6 +141,7 @@ static DEEPSEEK_PLANS: [Plan; 1] = [Plan {
     model: Some(deepseek::MODEL_FLASH),
     refusal: None,
     credential: None,
+    protocol: Some(Protocol::ChatCompletions),
 }];
 
 /// z.ai's plans: the API and the coding subscription, the same protocol at two hosts and two keys.
@@ -145,6 +156,7 @@ static ZAI_PLANS: [Plan; 2] = [
         model: Some("glm-5.3-flashx"),
         refusal: None,
         credential: None,
+        protocol: Some(Protocol::ChatCompletions),
     },
     Plan {
         name: "coding",
@@ -157,6 +169,7 @@ static ZAI_PLANS: [Plan; 2] = [
             account: "zai:coding",
             env: "ZAI_CODING_API_KEY",
         }),
+        protocol: Some(Protocol::ChatCompletions),
     },
 ];
 
@@ -167,14 +180,17 @@ static ANTHROPIC_PLANS: [Plan; 1] = [Plan {
     model: Some("claude-sonnet-5"),
     refusal: None,
     credential: None,
+    // The Messages API is not chat completions, and the adapter that speaks it has one shape: there
+    // is nothing here for a plan to choose between.
+    protocol: None,
 }];
 
 /// `OpenAI`'s plans: the API, and the `ChatGPT` subscription reached with an OAuth authorization.
 ///
 /// The subscription is not a different host for the same key: it is a `ChatGPT` account, authorized
-/// in a browser, whose token is filed under its own account. There is no third plan — the coding
-/// models are served by the API with the same key, so they are models of the `api` plan rather
-/// than a plan of their own.
+/// in a browser, whose token is filed under its own account, and it serves the Responses API rather
+/// than chat completions. There is no third plan — the coding models are served by the API with the
+/// same key, so they are models of the `api` plan rather than a plan of their own.
 static OPENAI_PLANS: [Plan; 2] = [
     Plan {
         name: DEFAULT_PLAN,
@@ -182,6 +198,7 @@ static OPENAI_PLANS: [Plan; 2] = [
         model: Some("gpt-6-astra"),
         refusal: None,
         credential: None,
+        protocol: Some(Protocol::ChatCompletions),
     },
     Plan {
         name: "subscription",
@@ -191,6 +208,7 @@ static OPENAI_PLANS: [Plan; 2] = [
         credential: Some(PlanCredential::Oauth {
             account: "openai:subscription",
         }),
+        protocol: Some(Protocol::Responses),
     },
 ];
 
@@ -489,6 +507,20 @@ impl Selection {
         &self.endpoint
     }
 
+    /// Returns the shape that endpoint serves, for the adapters that speak both.
+    ///
+    /// Read from the plan rather than from the credential: an authorization is not what makes an
+    /// endpoint speak the Responses API, which is why a subscription reached through a gateway is
+    /// still a subscription request. A plan that names no shape is served by an adapter with one of
+    /// its own, which is not consulted here, so the `OpenAI`-compatible default answers instead.
+    #[must_use]
+    pub const fn protocol(&self) -> Protocol {
+        match self.plan.protocol {
+            Some(protocol) => protocol,
+            None => Protocol::ChatCompletions,
+        }
+    }
+
     /// Returns the models a client may switch this run between.
     #[must_use]
     pub const fn models(&self) -> &'static [&'static str] {
@@ -674,6 +706,59 @@ mod tests {
         assert!(selection.credential_is_oauth());
         assert_eq!(selection.credential_account(), "openai:subscription");
         assert_eq!(selection.credential_env(), None);
+        // The wire is the plan's, in the same row as the endpoint it belongs to.
+        assert_eq!(selection.protocol(), Protocol::Responses);
+    }
+
+    /// Which wire a request takes is the plan's fact, not the credential's.
+    ///
+    /// The two travel together in the shipped table — the subscription is the endpoint that serves
+    /// the Responses API *and* the plan that authorizes — so the point of reading the wire from the
+    /// plan is that one cannot make the other's decision: an endpoint that serves one shape is
+    /// described as such even when a `base_url` moves where it goes, and a plan that takes a key is
+    /// not turned into a subscription by one.
+    #[test]
+    fn the_wire_comes_from_the_plan() {
+        for provider in Provider::ALL {
+            for plan in provider.plans() {
+                let selection = Selection::resolve(&NanusConfig {
+                    provider: Some(provider.name().to_owned()),
+                    plan: Some(plan.name.to_owned()),
+                    ..config()
+                })
+                .expect("every shipped plan resolves");
+                assert_eq!(selection.plan().name, plan.name);
+                assert_eq!(
+                    selection.protocol(),
+                    plan.protocol.unwrap_or(Protocol::ChatCompletions),
+                    "{} · {} resolves its own wire",
+                    provider,
+                    plan.name
+                );
+            }
+        }
+        let subscription = Selection::resolve(&NanusConfig {
+            provider: Some(String::from("openai")),
+            plan: Some(String::from("subscription")),
+            // Pointed somewhere else, the plan still says which shape the request is: what a
+            // `base_url` moves is where it goes, not what it is.
+            base_url: Some(String::from("https://gateway.internal/v1")),
+            ..config()
+        })
+        .expect("the subscription resolves through a gateway");
+        assert_eq!(subscription.protocol(), Protocol::Responses);
+        assert!(subscription.credential_is_oauth());
+
+        let api = Selection::resolve(&NanusConfig {
+            provider: Some(String::from("openai")),
+            ..config()
+        })
+        .expect("the api plan resolves");
+        assert_eq!(api.protocol(), Protocol::ChatCompletions);
+        assert!(!api.credential_is_oauth());
+        // A provider whose adapter has one shape of its own states none, rather than claiming the
+        // `OpenAI` vocabulary for Anthropic's Messages API.
+        assert_eq!(Provider::Anthropic.default_plan().protocol, None);
     }
 
     /// A relative endpoint would fail as a confusing transport error later, so it is

@@ -55,8 +55,9 @@ goes away with it.
 That gives you three things that are hard to get any other way:
 
 **Replace the model without touching the tools.** The adapter is a plugin behind an
-`LlmPort`. Four providers ship — DeepSeek, z.ai (API and coding plans), Anthropic, and
-OpenAI (API and coding plans) — and they are *selected*, not compiled in: one line in the
+`LlmPort`. Four providers ship — DeepSeek, z.ai (its API and a coding plan with a key
+of its own), Anthropic, and OpenAI (its API and a `ChatGPT` subscription authorized
+over OAuth) — and they are *selected*, not compiled in: one line in the
 configuration, and the seven tools never learn about it.
 
 **Replace the tools without touching the model.** Each tool is a plugin behind a

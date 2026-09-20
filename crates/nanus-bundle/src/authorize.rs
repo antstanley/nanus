@@ -73,10 +73,24 @@ impl PendingAuth {
     }
 }
 
+/// Starts an authorization for `provider`'s `plan`, against the provider's own service.
+///
+/// The issuer is not a parameter here, unlike in [`begin`]: a caller that has no reason to know
+/// which service a provider authorizes against — the command line, a service — names the provider
+/// and the plan and nothing else.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] when the plan is reached with a key rather than an
+/// authorization, or when the authorization service cannot be reached.
+pub async fn begin_for(provider: Provider, plan: Option<&str>) -> Result<PendingAuth, BundleError> {
+    begin(provider, plan, oauth::ISSUER).await
+}
+
 /// Starts an authorization for `provider`'s `plan`, against `issuer`.
 ///
 /// The issuer is a parameter rather than a constant so a test can point the flow at a local
-/// service; production passes [`oauth::ISSUER`].
+/// service; production passes [`oauth::ISSUER`], which [`begin_for`] is the way to ask for.
 ///
 /// # Errors
 ///

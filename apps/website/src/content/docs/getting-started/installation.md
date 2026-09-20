@@ -59,8 +59,13 @@ export DEEPSEEK_API_KEY=...
 | `openai` | `OPENAI_API_KEY` |
 
 `nanus auth set <provider>` and `nanus auth status` work for every provider and plan. The account
-is the provider's name, or `provider:plan` for a plan with a key of its own (`zai:coding`), so a
-key stored for one provider or plan can never be sent to another.
+is the provider's name, or `provider:plan` for a plan with a credential of its own (`zai:coding`), so
+a credential stored for one provider or plan can never be sent to another.
+
+One plan is not reached with a key at all: OpenAI's `subscription` is a `ChatGPT` account, so it is
+**authorized** rather than typed. `nanus auth login openai` prints a page and a code, waits while you
+authorize there, and files the token set under `openai:subscription`; the same flow runs when the
+plan is chosen in the interface.
 
 ## Verify the install
 
@@ -85,7 +90,7 @@ mermaid diagrams: true
 workspace root: <the current directory>
 service socket: /Users/you/.config/nanus/run/agent.sock
 service log: /Users/you/.config/nanus/nanus-service.log
-credential: set for deepseek (keychain)
+credential: set for deepseek (fallback DEEPSEEK_API_KEY)
 ```
 
 `nanus auth status` reports the same credential chain provider by provider, and

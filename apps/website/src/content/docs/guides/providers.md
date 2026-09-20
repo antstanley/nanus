@@ -32,9 +32,14 @@ plan = "coding"
 model = "glm-5.3-flashx"
 ```
 
-A **plan is an endpoint plus a default model.** z.ai's `coding` plan is the same key and
-protocol at a different host; OpenAI's `coding` plan is a coding model on the same host.
-`base_url` overrides either, for a proxy or a gateway.
+A **plan is an endpoint, a default model, a wire, and a credential.** z.ai's `coding` plan is
+the same protocol and a key of its own at a different host; OpenAI's `subscription` plan is a
+`ChatGPT` account, authorized in a browser, that serves the Responses API rather than chat
+completions. `base_url` moves where a request goes, not which of the two it is.
+
+OpenAI's `coding` plan was removed when the subscription took its place. It was a default model —
+`gpt-5.3-codex` — on the API with the API key, and that model is still offered, so what it did is
+now `model = "gpt-5.3-codex"` on the `api` plan.
 
 A model id belongs to the provider that offers it: naming a DeepSeek id with
 `provider = "openai"` is a request the provider refuses rather than a quiet substitution,

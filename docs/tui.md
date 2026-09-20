@@ -543,9 +543,9 @@ they were — so a conversation survives the switch and the next request goes to
 **A row is a provider and one of its plans.** A provider with a single plan is one row named for it;
 one with several is one row per plan, labelled `provider · plan`. Flattening them means one keypress
 chooses both, which matters because a plan is what a request actually goes to: z.ai's `api` and
-`coding` are two hosts, and `OpenAI`'s `subscription` is listed and **refused with its reason** —
-it needs an OAuth token and the Responses API — so a reader sees it exists and why it cannot be
-chosen rather than not seeing it at all.
+`coding` are two hosts, and `OpenAI`'s `subscription` is another host, another wire, and a
+credential of its own. A plan this build cannot honour would be a row that says why rather than a
+row that is missing.
 
 **A provider with no credential asks before it refuses.** Choosing one whose key is not configured
 answers with a question rather than an error: store a key now? `y` or `Enter` opens a masked field,
@@ -568,8 +568,12 @@ filed under.
 shows a page and a code, the reader authorizes on any machine, and the agent — which is the one
 polling — files the token set under `openai:subscription` and switches when the service confirms.
 `Esc` hides the note and leaves the flow running, because the authorization is the service's to
-confirm and may finish after the reader looks away. The grant is a token set with a refresh token,
-so an expiry is the agent's to renew rather than the reader's to re-enter.
+confirm and may finish after the reader looks away; the page and the code are kept, in the status
+line and in the transcript, so hiding the note is not the same as losing the code. The same flow runs
+from the shell as `nanus auth login openai:subscription`, which prints the page and the code and
+waits. The grant is a token set with a refresh token and the instant its access token expires, so an
+expiry is the agent's to renew — from the refresh token, before the token is sent — rather than the
+reader's to re-enter.
 
 **The switch is the agent's, and it reaches every client**, exactly as the model and the approval
 state do: one runner serves every session, so a client that switches tells every watcher. The
