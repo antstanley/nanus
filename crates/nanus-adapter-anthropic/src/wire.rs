@@ -42,7 +42,11 @@ pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
         "a chat request carries at least one message"
     );
     let mut body = Map::new();
-    body.insert("model".to_owned(), json!(config.model()));
+    // The request's id rather than the adapter's configured one: a runner switches models by naming
+    // a different id in the request, without rebuilding the adapter. The effort gate below reads the
+    // same id, because which models take `output_config.effort` is a fact about the model being
+    // asked, not about the one the adapter was built for.
+    body.insert("model".to_owned(), json!(request.model));
     // Anthropic requires a ceiling on every request; there is no server default.
     body.insert(
         "max_tokens".to_owned(),
@@ -67,7 +71,7 @@ pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
     // left out rather than sent as a value that only repeats the default. A model that takes no
     // effort parameter sends nothing whatever the caller chose.
     if let Some(effort) = request.reasoning_effort
-        && let Some(spelling) = crate::config::effort_spelling(config.model(), effort)
+        && let Some(spelling) = crate::config::effort_spelling(&request.model, effort)
     {
         body.insert("output_config".to_owned(), json!({ "effort": spelling }));
     }
@@ -553,6 +557,9 @@ mod tests {
     }
 
     /// Effort reaches the wire as `output_config.effort`, and only for a model that takes it.
+    ///
+    /// The model the *request* names is the one the gate reads, so each case builds its own request
+    /// rather than reusing one whose id would decide the answer instead of the configured model.
     #[test]
     fn effort_reaches_the_wire_only_where_the_model_takes_it() {
         let modern = AnthropicConfig::new("claude-sonnet-5", "test-key");
@@ -567,7 +574,8 @@ mod tests {
         ] {
             let body = build_request(
                 &modern,
-                &request(vec![Message::user("hi")]).with_reasoning_effort(effort),
+                &ChatRequest::new("claude-sonnet-5", vec![Message::user("hi")])
+                    .with_reasoning_effort(effort),
             );
             assert_eq!(
                 body["output_config"]["effort"],
@@ -580,12 +588,43 @@ mod tests {
         let legacy = AnthropicConfig::new("claude-haiku-4-5-20251001", "test-key");
         let body = build_request(
             &legacy,
-            &request(vec![Message::user("hi")]).with_reasoning_effort(ReasoningEffort::Max),
+            &ChatRequest::new("claude-haiku-4-5-20251001", vec![Message::user("hi")])
+                .with_reasoning_effort(ReasoningEffort::Max),
         );
         assert!(body.get("output_config").is_none(), "{body}");
 
         // And an unset effort is left out entirely, so the API's own default applies.
-        let body = build_request(&modern, &request(vec![Message::user("hi")]));
+        let body = build_request(
+            &modern,
+            &ChatRequest::new("claude-sonnet-5", vec![Message::user("hi")]),
+        );
+        assert!(body.get("output_config").is_none(), "{body}");
+    }
+
+    /// A switched model reaches the wire, and the effort gate follows the request's id rather than
+    /// the adapter's configured one: a runner switches models without rebuilding the adapter, so the
+    /// configured id must not decide which model is asked or whether it takes `output_config`.
+    #[test]
+    fn a_switched_model_decides_the_body_and_the_effort_gate() {
+        // Built for a legacy model, asked for a modern one: the modern id travels and takes effort.
+        let legacy = AnthropicConfig::new("claude-haiku-4-5-20251001", "test-key");
+        let body = build_request(
+            &legacy,
+            &ChatRequest::new("claude-sonnet-5", vec![Message::user("hi")])
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(body["model"], json!("claude-sonnet-5"), "{body}");
+        assert_eq!(body["output_config"]["effort"], json!("high"), "{body}");
+
+        // Built for a modern model, asked for a legacy one: the legacy id travels and takes nothing,
+        // even though the adapter was configured for a model that does.
+        let modern = AnthropicConfig::new("claude-sonnet-5", "test-key");
+        let body = build_request(
+            &modern,
+            &ChatRequest::new("claude-haiku-4-5-20251001", vec![Message::user("hi")])
+                .with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(body["model"], json!("claude-haiku-4-5-20251001"), "{body}");
         assert!(body.get("output_config").is_none(), "{body}");
     }
 

@@ -40,7 +40,11 @@ pub fn build_request(config: &DeepSeekConfig, request: &ChatRequest) -> Value {
         "a chat request carries at least one message"
     );
     let mut body = Map::new();
-    body.insert("model".to_owned(), json!(config.model()));
+    // The request's id rather than the adapter's configured one: a runner switches models by naming
+    // a different id in the request, without rebuilding the adapter, so sending the configured id
+    // would answer every switch with the model the composition started on. See the OpenAI-compatible
+    // adapter for the same fix and the case that exposed it.
+    body.insert("model".to_owned(), json!(request.model));
     body.insert("messages".to_owned(), encode_messages(&request.messages));
     body.insert("stream".to_owned(), json!(true));
     // Usage rides on the final content chunk; asking for it explicitly is what
@@ -448,6 +452,16 @@ mod tests {
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["stream_options"]["include_usage"], json!(true));
         assert_eq!(body["model"], json!(crate::MODEL_FLASH));
+    }
+
+    /// A switched model reaches the wire: the request's id wins over the adapter's configured one,
+    /// because a runner switches by naming a different model in the request rather than by
+    /// rebuilding the adapter.
+    #[test]
+    fn the_request_names_the_model_it_carries_not_the_configured_one() {
+        let switched = ChatRequest::new(crate::MODEL_PRO, vec![Message::user("hi")]);
+        let body = build_request(&config(), &switched);
+        assert_eq!(body["model"], json!(crate::MODEL_PRO), "{body}");
     }
 
     #[test]

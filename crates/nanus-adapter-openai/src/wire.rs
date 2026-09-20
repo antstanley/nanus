@@ -50,7 +50,13 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
         "a chat request carries at least one message"
     );
     let mut body = Map::new();
-    body.insert("model".to_owned(), json!(config.model()));
+    // The id the *request* names, not the one this adapter was built with: a runner may switch
+    // models without rebuilding the adapter, so the configured id is only what `LlmPort::model`
+    // reports — never what every request sends. Reading the configured id here sent every switch
+    // back to the model the provider was selected with, which for a provider whose default is
+    // `glm-5.3-flashx` meant a reader who chose `glm-5.3-flash` was still answered by
+    // `glm-5.3-flashx`.
+    body.insert("model".to_owned(), json!(request.model));
     body.insert("messages".to_owned(), encode_messages(&request.messages));
     body.insert("stream".to_owned(), json!(true));
     // Usage arrives only when it is asked for, and both vendors tolerate the field
@@ -486,6 +492,24 @@ mod tests {
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["stream_options"]["include_usage"], json!(true));
         assert_eq!(body["model"], json!("test-model"));
+    }
+
+    /// A switched model reaches the wire: the request's id wins over the adapter's configured one,
+    /// because a runner switches by naming a different model in the request rather than by rebuilding
+    /// the adapter. This is the z.ai case a reader hit — choosing `glm-5.3-flash` while the adapter
+    /// was built for the plan's `glm-5.3-flashx` default.
+    #[test]
+    fn the_request_names_the_model_it_carries_not_the_configured_one() {
+        let configured = OpenAiConfig::new(Vendor::Zai, "glm-5.3-flashx", "test-key");
+        let switched = ChatRequest::new("glm-5.3-flash", vec![Message::user("hi")]);
+        let body = build_request(&configured, &switched);
+        assert_eq!(body["model"], json!("glm-5.3-flash"), "{body}");
+
+        // The other direction: the configured id is still what an unswitched request sends, so the
+        // fix does not change the ordinary path.
+        let request = request(vec![Message::user("hi")]);
+        let body = build_request(&config(Vendor::Zai), &request);
+        assert_eq!(body["model"], json!("test-model"), "{body}");
     }
 
     #[test]

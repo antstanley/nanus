@@ -27,7 +27,10 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
         "a request carries at least one message"
     );
     let mut body = Map::new();
-    body.insert("model".to_owned(), json!(config.model()));
+    // The request's id rather than the adapter's configured one: a runner switches models by naming
+    // a different id in the request, without rebuilding the adapter. See the chat-completions path
+    // for why the configured id is `LlmPort::model`'s answer and not the id every request sends.
+    body.insert("model".to_owned(), json!(request.model));
     body.insert("stream".to_owned(), json!(true));
     // Nothing is kept server-side: the session log is the record, and a stored response would be a
     // second one that outlives the conversation it belongs to.
@@ -434,6 +437,16 @@ mod tests {
             out.push(event);
         }
         out
+    }
+
+    /// A switched model reaches the Responses wire too: the request's id wins over the adapter's
+    /// configured one, exactly as on the chat-completions path.
+    #[test]
+    fn the_request_names_the_model_it_carries_not_the_configured_one() {
+        let configured = OpenAiConfig::new(Vendor::OpenAi, "gpt-5.3-codex", "token");
+        let switched = ChatRequest::new("gpt-6-astra", vec![Message::user("hi")]);
+        let body = build_request(&configured, &switched);
+        assert_eq!(body["model"], json!("gpt-6-astra"), "{body}");
     }
 
     /// The prompt is lifted into `instructions` and the turns become flat input items.

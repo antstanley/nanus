@@ -556,3 +556,44 @@ async fn the_response_head_is_announced_before_the_body() {
         "and is announced once, because a second announcement would move the boundary"
     );
 }
+
+/// A model switched at runtime is the one the provider is asked for.
+///
+/// The end-to-end shape of the defect a provider change exposed: the runner switches by naming a
+/// different id in the *request*, without rebuilding the adapter, so an adapter that encoded its own
+/// configured model answered every switch with the id it was built for. A provider whose plan default
+/// is `glm-5.3-flashx` therefore answered `glm-5.3-flash` with `glm-5.3-flashx`. This drives the real
+/// runner and the real adapter over a socket, so it is the whole path from `set_model` to the body.
+#[tokio::test]
+async fn a_switched_model_is_the_one_the_provider_is_asked_for() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let (base_url, requests) = spawn_server(vec![Response {
+        body: answer_stream("hello"),
+    }]);
+    let (runner, _shell) = runner(&base_url, root);
+    // The runner was built for `MODEL_FLASH`; switch it without touching the adapter's configuration.
+    runner.set_model(nanus_adapter_deepseek::MODEL_PRO);
+
+    let mut session = Session::new(SessionId::new("switch"), 0, "/tmp");
+    runner
+        .run_turn(&mut session, "say hi", &mut nanus_bundle::Silent, None)
+        .await
+        .expect("the turn completes over a real socket");
+
+    let observed = {
+        let seen = requests.lock().expect("the request log is not poisoned");
+        seen.clone()
+    };
+    let request = observed.first().expect("the request arrived");
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("the request carries a body");
+    let payload: serde_json::Value = serde_json::from_str(body.trim()).expect("the body is JSON");
+    assert_eq!(
+        payload["model"],
+        serde_json::json!(nanus_adapter_deepseek::MODEL_PRO),
+        "the switched id reaches the provider rather than the one the adapter was built with: {body}"
+    );
+}
