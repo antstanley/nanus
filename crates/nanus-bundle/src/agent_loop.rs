@@ -416,13 +416,15 @@ impl AgentRunner {
     ///
     /// The chosen one when a caller has chosen, and otherwise what the adapter applies to a
     /// request that sets none — which is the only place that answer exists, because an adapter
-    /// is what fills an unset effort in. `None` means this adapter has no notion of effort,
-    /// which is not the same fact as any effort at all.
+    /// is what fills an unset effort in. The adapter is asked about the model in force rather
+    /// than the one it was configured with, because a switch does not rebuild it and a model
+    /// that takes no effort steps has none in force. `None` means no effort is in force, which
+    /// is not the same fact as any effort at all.
     #[must_use]
     pub fn effort(&self) -> Option<nanus_ports::ReasoningEffort> {
         self.effort
             .get()
-            .or_else(|| self.llm.borrow().reasoning_effort())
+            .or_else(|| self.llm.borrow().reasoning_effort(&self.model()))
     }
 
     /// Replaces the reasoning effort every later request will carry.
@@ -2032,6 +2034,55 @@ mod tests {
                 .get(1)
                 .and_then(|request| request.reasoning_effort),
             None
+        );
+    }
+
+    /// The adapter's applied effort follows the model in force, not the one it was configured with:
+    /// a runner that switches to a model taking no effort steps reports the absence, without
+    /// rebuilding the adapter. The adapter here reports `High` for its configured id alone, so a
+    /// runner still asking the configured model would report `High` for `plain` and fail.
+    #[test]
+    fn the_adapters_effort_follows_the_model_in_force() {
+        struct GatedLlm;
+
+        impl LlmPort for GatedLlm {
+            fn model(&self) -> &'static str {
+                "test-model"
+            }
+
+            fn reasoning_effort(&self, model: &str) -> Option<nanus_ports::ReasoningEffort> {
+                (model == "test-model").then_some(nanus_ports::ReasoningEffort::High)
+            }
+
+            fn effort_levels(&self, model: &str) -> &'static [nanus_ports::ReasoningEffort] {
+                if model == "test-model" {
+                    &[
+                        nanus_ports::ReasoningEffort::Low,
+                        nanus_ports::ReasoningEffort::High,
+                    ]
+                } else {
+                    &[]
+                }
+            }
+
+            fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let Some(runner) = runner(Rc::new(Box::new(GatedLlm)), registry_with_echo()) else {
+            return;
+        };
+        assert_eq!(
+            runner.effort(),
+            Some(nanus_ports::ReasoningEffort::High),
+            "the model in force takes an effort, so the adapter's default is in force"
+        );
+        runner.set_model("plain");
+        assert_eq!(
+            runner.effort(),
+            None,
+            "a model that takes no effort steps has none in force, whatever the adapter was built for"
         );
     }
 

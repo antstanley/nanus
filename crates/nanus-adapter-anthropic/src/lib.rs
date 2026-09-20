@@ -137,11 +137,13 @@ impl LlmPort for AnthropicLlm {
         self.config.model()
     }
 
-    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+    fn reasoning_effort(&self, model: &str) -> Option<ReasoningEffort> {
         // The API's own default is `high`, and only the models that take the parameter
         // report an effort at all: Haiku 4.5 and the previous generation answer with the
-        // absence, which is the truth rather than a default.
-        if effort_levels(self.config.model()).is_empty() {
+        // absence, which is the truth rather than a default. The id is the request's, not
+        // the configured one, because a runner may switch models without rebuilding the
+        // adapter — the same reason `effort_levels` takes it.
+        if effort_levels(model).is_empty() {
             return None;
         }
         Some(ReasoningEffort::High)
@@ -157,7 +159,7 @@ impl LlmPort for AnthropicLlm {
             return error_stream("could not encode the request as JSON");
         };
         tracing::debug!(
-            model = %self.config.model(),
+            model = %request.model,
             endpoint = %self.endpoint(),
             messages = request.messages.len(),
             tools = request.tools.len(),
@@ -334,21 +336,21 @@ mod tests {
         assert!(rendered.contains("claude-sonnet-4"), "{rendered}");
     }
 
-    /// A model that takes no effort parameter reports the absence; a 5-series model reports the
-    /// API default it applies.
+    /// Which models take an effort parameter is a fact about the id, not about the adapter's
+    /// configuration: a 5-series id reports the API default and a previous-generation id reports
+    /// the absence, whatever the adapter was built for.
     #[test]
     fn only_the_models_that_take_an_effort_report_one() {
-        let Some(llm) = adapter() else {
+        let Some(legacy) = adapter() else {
             return;
         };
-        // The test adapter is built for a previous-generation model.
-        assert_eq!(llm.reasoning_effort(), None);
-        let Some(modern) =
-            AnthropicLlm::new(AnthropicConfig::new("claude-sonnet-5", "test-key")).ok()
-        else {
-            return;
-        };
-        assert_eq!(modern.reasoning_effort(), Some(ReasoningEffort::High));
+        // The adapter is built for a previous-generation model, and still answers for the model it
+        // is asked about — which is what makes a switch truthful without a rebuild.
+        assert_eq!(legacy.reasoning_effort("claude-sonnet-4-20250514"), None);
+        assert_eq!(
+            legacy.reasoning_effort("claude-sonnet-5"),
+            Some(ReasoningEffort::High)
+        );
         assert_eq!(API_VERSION, "2023-06-01");
     }
 

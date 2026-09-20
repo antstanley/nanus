@@ -51,16 +51,21 @@ pub trait LlmPort {
     /// what is configured rather than what a particular request overrode.
     fn model(&self) -> &str;
 
-    /// Returns the reasoning effort this adapter applies to a request that sets none.
+    /// Returns the reasoning effort this adapter applies to a request naming `model` that sets none.
     ///
     /// The adapter is the component that fills an unset effort in, so it is the only one
     /// that can answer what a run actually asked for. A caller records this rather than
     /// assuming the configured default, because "which effort produced this session" is
     /// what makes two runs comparable and a guess would make them silently incomparable.
     ///
-    /// Defaults to `None`, meaning this adapter has no notion of effort. That is not the
-    /// same fact as "medium", and it is reported as the absence it is.
-    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+    /// `model` is passed rather than assumed for the same reason [`LlmPort::effort_levels`] takes
+    /// it: a runner may switch models without rebuilding the adapter, and whether a default is
+    /// applied at all is a fact about the model — one that takes no effort steps has none in force.
+    ///
+    /// Defaults to `None`, meaning this adapter has no notion of effort for `model`. That is not
+    /// the same fact as "medium", and it is reported as the absence it is.
+    fn reasoning_effort(&self, model: &str) -> Option<ReasoningEffort> {
+        let _ = model;
         None
     }
 
@@ -71,7 +76,7 @@ pub trait LlmPort {
     /// that predates effort takes none of them. A caller that offered the whole scale would offer
     /// steps the provider refuses, so the interface reads this before it draws the list. An empty
     /// slice means this adapter has no notion of effort at all — the same fact
-    /// [`LlmPort::reasoning_effort`] reports as `None` for the model it is configured with.
+    /// [`LlmPort::reasoning_effort`] reports as `None` for that model.
     ///
     /// `model` is passed rather than assumed because a runner may switch models without rebuilding
     /// the adapter, so the answer is a fact about the id and not about the instance.

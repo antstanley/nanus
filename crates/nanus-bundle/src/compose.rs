@@ -477,9 +477,10 @@ impl ProviderSwitch {
 /// Read from the same selection the runner and the prompt are built from, so the
 /// recorded facts are the ones in force rather than ones a caller restated. The effort is
 /// the runner's own answer — the chosen step when a caller chose one, and otherwise what the
-/// adapter applies to a request that sets none, which is the only place that answer exists.
-/// It is left absent when the adapter has no notion of an effort: a provider without an effort
-/// knob (Anthropic) is recorded as having none, which is an absence rather than a default.
+/// adapter applies to a request naming the model in force that sets none, which is the only
+/// place that answer exists. It is left absent when the model in force takes no step: an
+/// Anthropic model that predates the parameter is recorded as having no effort, which is an
+/// absence rather than a default.
 fn origin_of(
     config: &NanusConfig,
     selection: &Selection,

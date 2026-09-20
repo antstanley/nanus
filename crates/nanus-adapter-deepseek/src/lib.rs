@@ -178,7 +178,9 @@ impl LlmPort for DeepSeekLlm {
         self.config.model()
     }
 
-    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+    fn reasoning_effort(&self, _model: &str) -> Option<ReasoningEffort> {
+        // Both offered models are the same family with the same knob, so the id does not
+        // change the answer.
         Some(self.config.reasoning_effort())
     }
 
@@ -194,7 +196,7 @@ impl LlmPort for DeepSeekLlm {
             return error_stream("could not encode the request as JSON");
         };
         tracing::debug!(
-            model = %self.config.model(),
+            model = %request.model,
             endpoint = %self.endpoint(),
             messages = request.messages.len(),
             tools = request.tools.len(),

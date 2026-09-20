@@ -190,9 +190,10 @@ impl LlmPort for OpenAiLlm {
         self.config.model()
     }
 
-    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+    fn reasoning_effort(&self, _model: &str) -> Option<ReasoningEffort> {
         // Both vendors take the same scale on the wire now, so a chosen step is a fact
-        // worth recording for either.
+        // worth recording for either. Every model either vendor offers takes it, so the id
+        // does not change the answer.
         Some(self.config.reasoning_effort())
     }
 
@@ -207,7 +208,7 @@ impl LlmPort for OpenAiLlm {
         };
         tracing::debug!(
             vendor = %self.config.vendor(),
-            model = %self.config.model(),
+            model = %request.model,
             endpoint = %self.endpoint(),
             messages = request.messages.len(),
             tools = request.tools.len(),
@@ -413,17 +414,24 @@ mod tests {
         assert!(rendered.contains("gpt-5"), "{rendered}");
     }
 
-    /// Both vendors name an effort on the wire now, so both report the one they would send.
+    /// Both vendors name an effort on the wire now, and every model they offer takes it, so the
+    /// answer is the configured default whatever id a switch names.
     #[test]
     fn both_vendors_report_the_effort_they_send() {
         let Some(openai) = adapter(Vendor::OpenAi) else {
             return;
         };
-        assert_eq!(openai.reasoning_effort(), Some(ReasoningEffort::Medium));
+        assert_eq!(
+            openai.reasoning_effort("gpt-5.6-sol"),
+            Some(ReasoningEffort::Medium)
+        );
         let Some(zai) = adapter(Vendor::Zai) else {
             return;
         };
-        assert_eq!(zai.reasoning_effort(), Some(ReasoningEffort::Medium));
+        assert_eq!(
+            zai.reasoning_effort("glm-5.2"),
+            Some(ReasoningEffort::Medium)
+        );
     }
 
     #[test]

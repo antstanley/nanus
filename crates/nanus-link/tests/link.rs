@@ -866,7 +866,7 @@ impl LlmPort for EffortLlm {
         "one"
     }
 
-    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+    fn reasoning_effort(&self, _model: &str) -> Option<ReasoningEffort> {
         Some(ReasoningEffort::Medium)
     }
 
