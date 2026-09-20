@@ -25,8 +25,12 @@ pub enum Command {
     /// not about what is being typed: the panel is a view, and the session it views is
     /// untouched.
     Clear,
-    /// Switch the model: the next one offered when no id is given, and the named one when it
-    /// is.
+    /// Switch the model: open the selector when no id is given, and switch to the named one when
+    /// it is.
+    ///
+    /// The selector rather than a blind cycle, because the list is the agent's and a reader who
+    /// wants a particular model should be able to read the ids before choosing one. `Alt+P` is
+    /// still the cycle for a reader who would rather press a key than a dialog.
     Model,
     /// Put the newest answer on the clipboard.
     ///

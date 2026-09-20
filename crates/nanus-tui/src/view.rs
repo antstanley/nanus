@@ -467,6 +467,21 @@ pub struct ViewState {
     /// so a selection can never point past the end.
     pub permission_selection: usize,
 
+    /// Whether the model selector is open.
+    ///
+    /// While it is set the selector owns the keyboard, as the permission dialog and the key
+    /// list do: the reader is choosing between the models the agent offered, and a key that
+    /// reached the composer behind it would be typed into a prompt nobody can see. A session
+    /// that offers nothing to switch to never opens it — every recording is one — and says so
+    /// in the status line instead of drawing a list nobody would honour.
+    pub model_open: bool,
+
+    /// Which offered model the selector has selected.
+    ///
+    /// An index into [`ViewState::models`], kept in range by the methods rather than by the
+    /// callers, so a selection can never point past the end.
+    pub model_selection: usize,
+
     /// How many rows into the key list the overlay starts.
     ///
     /// The list is longer than a short terminal, so it is scrolled rather than cut: an
@@ -527,6 +542,8 @@ impl Default for ViewState {
             last_transcript: None,
             permission_open: false,
             permission_selection: 0,
+            model_open: false,
+            model_selection: 0,
             last_viewport: None,
             last_composer: None,
         }
@@ -1121,7 +1138,11 @@ impl ViewState {
     /// a word being typed, so the composer behind it is still live.
     #[must_use]
     pub(crate) fn modal_open(&self) -> bool {
-        self.queue_open || self.help_open || self.permission_open || self.pending_approval.is_some()
+        self.queue_open
+            || self.help_open
+            || self.permission_open
+            || self.model_open
+            || self.pending_approval.is_some()
     }
 
     /// Drops the selection.
@@ -1544,6 +1565,70 @@ impl ViewState {
             .map_or(ApprovalPolicy::PerCall, |(policy, _)| *policy)
     }
 
+    /// Opens the model selector, on the current model when it is one of them.
+    ///
+    /// Returns `false` when the agent offered no model to switch to, so the caller can say so
+    /// rather than draw an empty list: a dialogue with nothing in it would be worse than a
+    /// sentence, and that is every recorded session.
+    ///
+    /// The current model rather than the next one: `Alt+P` is still the cycle, so the selector
+    /// is where a reader reads the list and chooses, and opening on the model that is answering
+    /// means `Enter` is a no-op rather than a surprise move.
+    pub fn open_models(&mut self) -> bool {
+        if self.models.is_empty() {
+            return false;
+        }
+        self.model_open = true;
+        self.model_selection = self
+            .model
+            .as_deref()
+            .and_then(|current| self.models.iter().position(|model| model == current))
+            .unwrap_or(0);
+        true
+    }
+
+    /// Closes the model selector without changing anything.
+    pub fn close_models(&mut self) {
+        self.model_open = false;
+    }
+
+    /// Moves the selection toward the top of the list, wrapping round.
+    pub fn model_up(&mut self) {
+        self.model_selection = self
+            .model_selection
+            .checked_sub(1)
+            .unwrap_or_else(|| self.models.len().saturating_sub(1));
+    }
+
+    /// Moves the selection toward the bottom of the list, wrapping round.
+    pub fn model_down(&mut self) {
+        self.model_selection = if self.model_selection.saturating_add(1) >= self.models.len() {
+            0
+        } else {
+            self.model_selection.saturating_add(1)
+        };
+    }
+
+    /// Selects an offered model by its position in the selector.
+    ///
+    /// Returns `false` for a position that is not offered, so a caller can say nothing rather
+    /// than moving a selection that does not exist: the digits are the keyboard's shortcut, and
+    /// a key that is not one of them is not a command.
+    #[must_use]
+    pub fn model_select(&mut self, position: usize) -> bool {
+        if position >= self.models.len() {
+            return false;
+        }
+        self.model_selection = position;
+        true
+    }
+
+    /// Returns the model the selector has selected, if any.
+    #[must_use]
+    pub fn selected_model(&self) -> Option<String> {
+        self.models.get(self.model_selection).cloned()
+    }
+
     /// The rows of the key list that fit in `height`, and where they start.
     #[must_use]
     fn help_window(&self, height: u16) -> (usize, usize) {
@@ -1870,6 +1955,12 @@ impl ViewState {
         // transcript and under the two things the agent is waiting on.
         if self.help_open {
             self.render_help(frame, area);
+        }
+        // Over the transcript and the key list, under the approval question and the permission
+        // dialog: the selector is a deliberate choice a reader made, but the things whose keys
+        // are routed first have to be the things on top.
+        if self.model_open {
+            self.render_models(frame, area);
         }
         // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
         // be the thing a reader sees, not a dialogue behind the transcript.
@@ -2225,6 +2316,77 @@ impl ViewState {
             )))
             .title_bottom(Line::from(Span::styled(
                 " Enter applies, Esc cancels ",
+                Style::default().fg(Color::DarkGray),
+            )));
+        // Cleared first, so the transcript behind the dialog does not show through the gaps
+        // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .style(self.theme.notice),
+            dialog,
+        );
+    }
+
+    /// Draws the model selector.
+    ///
+    /// The models the agent offered, one per row, with the one answering marked: `/model` opens
+    /// this rather than cycling blind, so a reader can read the list and choose instead of
+    /// pressing a key until the title bar happens to name what they wanted. The list comes from
+    /// the agent's handshake, so nothing here can offer an id the agent would refuse.
+    fn render_models(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.models.is_empty() {
+            return;
+        }
+        let width = area.width.saturating_sub(4).clamp(24, 72);
+        let room = usize::from(width.saturating_sub(2));
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            "the models the agent offers",
+            Style::default().fg(Color::DarkGray),
+        ))];
+        for (index, model) in self.models.iter().enumerate() {
+            let selected = index == self.model_selection;
+            let style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "\u{25b6}" } else { " " };
+            // The model answering is marked in the row rather than left to the title bar
+            // behind the dialog: `Enter` on it changes nothing, and a reader should be able to
+            // see that before pressing it.
+            let current = if self.model.as_deref() == Some(model.as_str()) {
+                " · current"
+            } else {
+                ""
+            };
+            let text = format!("{marker} {} {model}{current}", index.saturating_add(1));
+            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
+        }
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(4).max(4));
+        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
+        // workspace treats integer division as a defect wherever it appears.
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.busy)
+            .title(Line::from(Span::styled(
+                " model ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .title_bottom(Line::from(Span::styled(
+                " Enter switches, Esc cancels ",
                 Style::default().fg(Color::DarkGray),
             )));
         // Cleared first, so the transcript behind the dialog does not show through the gaps
@@ -4222,6 +4384,53 @@ mod tests {
                 "no row is wider than the terminal: {row:?}"
             );
         }
+    }
+
+    /// The model selector lists the ids the agent offered, marks the selection, and marks the
+    /// model that is answering so a reader knows what `Enter` on it would change.
+    #[test]
+    fn the_model_selector_lists_the_models_the_agent_offered() {
+        let mut state = ViewState::new();
+        state.transcript.push(Entry::prose(
+            Role::User,
+            String::from("a prompt that must not show through"),
+        ));
+        state.models = vec![
+            String::from("glm-5.3-flashx"),
+            String::from("glm-5.3-flash"),
+            String::from("glm-5.2"),
+        ];
+        state.model = Some(String::from("glm-5.3-flash"));
+        assert!(state.open_models());
+        let text = rendered(&mut state, 90, 20);
+        assert!(text.contains(" model "), "{text}");
+        assert!(text.contains("the models the agent offers"), "{text}");
+        for model in &state.models {
+            assert!(text.contains(model.as_str()), "{model} is listed: {text}");
+        }
+        assert!(
+            text.contains("current"),
+            "the answering model is marked: {text}"
+        );
+        assert!(text.contains("Enter switches"), "{text}");
+
+        // It opens on the model that is answering, so Enter changes nothing by surprise.
+        let marked = text
+            .lines()
+            .find(|row| row.contains('\u{25b6}'))
+            .expect("the selection is marked");
+        assert!(marked.contains("glm-5.3-flash"), "{marked}");
+        assert_eq!(state.selected_model().as_deref(), Some("glm-5.3-flash"));
+    }
+
+    /// A session that offers nothing to switch to never draws a list: every recording is one,
+    /// and an empty dialog would be worse than the sentence the caller says instead.
+    #[test]
+    fn a_selector_with_nothing_to_offer_does_not_open() {
+        let mut state = ViewState::new();
+        assert!(!state.open_models(), "there is nothing to choose");
+        assert!(!state.model_open);
+        assert_eq!(state.selected_model(), None);
     }
 
     /// The key list is drawn over the transcript, with the bindings and a way out.

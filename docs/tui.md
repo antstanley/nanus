@@ -391,7 +391,7 @@ than sending it to the model.
 | `/stats` | write the session's model figures into the transcript |
 | `/help` | draw the key list, the same one `?` opens |
 | `/clear` | empty the transcript, leaving the draft and the toggles alone |
-| `/model [id]` | switch to the next model the agent offers, or to the one named |
+| `/model [id]` | open the model selector, or switch to the one named |
 | `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
@@ -401,8 +401,10 @@ tokens per second while waiting. It is a notice rather than prose — the model 
 the interface did — and it reports the session rather than the last request, so it is worth
 reading after a few turns and not before the first.
 
-`/model` is the command form of `Alt+P`, and the pair is deliberate: the key cycles and the
-argument names one. See [switching models](#switching-models).
+`/model` opens the model selector, and `/model <id>` switches to the id named directly. The
+selector is the command's plain form rather than the cycle `Alt+P` still is: a reader who wants
+a particular model should be able to read the ids the agent offers and choose one, and the
+argument is there for when the id is already known. See [switching models](#switching-models).
 
 `/help` and `/clear` are the screen's business rather than the session's, which is why they
 are answered in a recorded session too: neither needs an agent, and a reader browsing a
@@ -497,12 +499,21 @@ lie. `PermissionPreset` and its three names are in
 ### Switching models
 
 A model is chosen by configuration and can be changed without restarting: `Alt+P` moves to the
-next one the agent offers and `/model <id>` names one, and the title bar says which model is
-answering. The list comes from the agent's handshake rather than from the interface, because
-which models exist is a decision of the composition — an interface that cycled a list of its own
-would offer models the agent refuses — and the agent refuses an id it does not offer with a
-sentence naming the ones it does. A session that offers nothing to switch to, which is every
-recording, says so rather than drawing a list nobody would honour.
+next one the agent offers, `/model` opens a selector listing every id the agent offers, and
+`/model <id>` names one directly. The title bar says which model is answering. The list comes
+from the agent's handshake rather than from the interface, because which models exist is a
+decision of the composition — an interface that cycled a list of its own would offer models the
+agent refuses — and the agent refuses an id it does not offer with a sentence naming the ones it
+does. A session that offers nothing to switch to, which is every recording, says so rather than
+drawing a list nobody would honour.
+
+**The selector is where the ids are read.** `Alt+P` cycles blind — a reader presses it until the
+title bar happens to name what they wanted — so `/model` opens a dialog instead: one row per
+model the agent offers, the answering model marked `current`, and the selection starting on that
+model so `Enter` on it is a no-op rather than a surprise move. `Up`/`Down` (or `k`/`j`) move,
+`Tab` and `Shift+Tab` walk forward, the digits `1`–`9` select directly, `Enter` switches and
+`Esc` cancels. Every other key does nothing rather than typing into the composer behind the
+dialog, the same rule the permission dialog and the key list follow.
 
 **The switch is the agent's, and it reaches every client.** The model belongs to the agent's
 runner rather than to a session, exactly as the approval state does: one runner serves every

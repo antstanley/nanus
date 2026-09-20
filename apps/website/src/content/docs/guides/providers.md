@@ -12,9 +12,9 @@ configuration, not a rebuild.
 | Provider | Adapter | Models offered | Plans |
 | --- | --- | --- | --- |
 | `deepseek` (default) | `nanus-adapter-deepseek` | `deepseek-flash`, `deepseek-v4-pro` | `api` |
-| `zai` | `nanus-adapter-openai` | `glm-4.5`, `glm-4.5-air`, `glm-4.5-flash` | `api`, `coding` |
-| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
-| `openai` | `nanus-adapter-openai` | `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `coding`, `subscription`¹ |
+| `zai` | `nanus-adapter-openai` | `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2` | `api`, `coding` |
+| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
+| `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.3-codex`, `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `coding`, `subscription`¹ |
 
 ¹ OpenAI's `subscription` plan - the ChatGPT coding tier reached with an OAuth token - is
 listed and **refused with its reason** rather than silently absent. It needs an OAuth token
@@ -27,7 +27,7 @@ Set `provider` (and optionally `plan` and `model`) in the config file:
 ```toml
 provider = "zai"
 plan = "coding"
-model = "glm-4.5"
+model = "glm-5.3-flashx"
 ```
 
 A **plan is an endpoint plus a default model.** z.ai's `coding` plan is the same key and

@@ -43,10 +43,28 @@ pub const ZAI_API_KEY_ENV: &str = "ZAI_API_KEY";
 /// it: a plan whose default model the agent does not offer would put a client on a model
 /// it could cycle away from and never back to, and `SetModel` would refuse the id the
 /// session was already running.
-static OPENAI_MODELS: [&str; 3] = ["gpt-5", "gpt-5-mini", "gpt-5-codex"];
+///
+/// The current flagships come first, so the fallback default is one of them, and the
+/// previous generation stays behind them rather than being dropped: a session resumed
+/// against `gpt-5` can still cycle back to it, and removing an offered id would strand
+/// exactly the runs that predate the update.
+static OPENAI_MODELS: [&str; 8] = [
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.3-codex",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-codex",
+];
 
 /// The models offered for z.ai, in cycling order.
-static ZAI_MODELS: [&str; 3] = ["glm-4.5", "glm-4.5-air", "glm-4.5-flash"];
+///
+/// The default is the first, which is the same rule the composition's plan follows: z.ai's
+/// plans resolve to `glm-5.3-flashx`, and a plan whose default model the agent did not offer
+/// would put a client on a model it could cycle away from and never back to.
+static ZAI_MODELS: [&str; 4] = ["glm-5.3-flashx", "glm-5.3-flash", "glm-5.3", "glm-5.2"];
 
 /// One `OpenAI`-compatible vendor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -420,11 +438,20 @@ mod tests {
     fn the_offered_models_belong_to_their_vendor() {
         assert_eq!(
             Vendor::OpenAi.models(),
-            ["gpt-5", "gpt-5-mini", "gpt-5-codex"]
+            [
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.3-codex",
+                "gpt-5",
+                "gpt-5-mini",
+                "gpt-5-codex",
+            ]
         );
         assert_eq!(
             Vendor::Zai.models(),
-            ["glm-4.5", "glm-4.5-air", "glm-4.5-flash"]
+            ["glm-5.3-flashx", "glm-5.3-flash", "glm-5.3", "glm-5.2"]
         );
         for model in Vendor::OpenAi.models() {
             assert!(!model.contains("glm"), "{model}");
@@ -432,7 +459,10 @@ mod tests {
         // The default is the first, and it stays the general model rather than the
         // coding one: the coding model is reachable by the plan that names it, and by
         // a cycle, without becoming what a configuration that names nothing gets.
-        assert_eq!(Vendor::OpenAi.models().first().copied(), Some("gpt-5"));
+        assert_eq!(
+            Vendor::OpenAi.models().first().copied(),
+            Some("gpt-6-astra")
+        );
     }
 
     /// The budget sent is capped at the provider's documented ceiling, because a

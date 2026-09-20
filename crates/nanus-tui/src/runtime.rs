@@ -1235,6 +1235,12 @@ enum Routed {
     /// answer, carried in the handshake and held by the view, and a router that decided a
     /// switch was valid would be a second list of model ids to keep true.
     SetModel(Option<String>),
+    /// Open the model selector, where a model is chosen from the list the agent offered.
+    ///
+    /// Routed for the same reason as [`Routed::SetModel`]: the list and the selection are the
+    /// view's, and the router is a pure function of the line. A bare `/model` asks for this
+    /// rather than a blind cycle, so a reader reads the ids before choosing one.
+    Models,
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1250,9 +1256,12 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         Submission::Run(Command::Stats) => Routed::Stats,
         Submission::Run(Command::Help) => Routed::Help,
         Submission::Run(Command::Clear) => Routed::Clear,
-        // The argument is the rest of the line: `/model` cycles and `/model <id>` names one,
-        // which is the pair a command with a useful default and a useful argument offers.
-        Submission::Run(Command::Model) => Routed::SetModel(model_argument(&prompt)),
+        // The argument is the rest of the line: `/model <id>` names one, and a bare `/model`
+        // opens the selector rather than cycling blind, so the reader reads the ids the agent
+        // offers and then chooses.
+        Submission::Run(Command::Model) => {
+            model_argument(&prompt).map_or(Routed::Models, |named| Routed::SetModel(Some(named)))
+        }
         Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
             if command.trim().is_empty() {
@@ -1364,6 +1373,18 @@ fn switch_model(requested: Option<String>, source: &mut dyn SessionSource, view:
     source.set_model(&chosen);
 }
 
+/// Opens the model selector, or says in the status line that there is nothing to choose.
+///
+/// A session that offers no model — a recording — cannot draw a list, so it says so instead,
+/// which is the same sentence [`switch_model`] gives to a cycle with an empty list.
+fn open_model_selector(view: &mut ViewState) {
+    view.status = if view.open_models() {
+        String::from("model: Enter switches, Esc cancels")
+    } else {
+        String::from("this session offers no model to switch to")
+    };
+}
+
 /// Applies a submitted line, returning whether it asked to leave.
 ///
 /// A function rather than a match arm, because the arm is every command the interface has and the
@@ -1395,6 +1416,7 @@ async fn submitted(
         }
         Routed::Shell(command) => begin_shell(command, shells, view),
         Routed::SetModel(requested) => switch_model(requested, source, view),
+        Routed::Models => open_model_selector(view),
         Routed::Say(message) => {
             view.transcript.push(Entry::notice(message));
             view.scroll_to_bottom();
@@ -1712,6 +1734,12 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     if view.pending_approval.is_some() {
         return handle_approval_key(key, view);
     }
+    // The model selector owns the keyboard while it is up, as the permission dialog does: the
+    // reader is choosing from a list drawn over the composer, and a key that reached the text
+    // behind it would be typed into a prompt nobody can see.
+    if view.model_open {
+        return handle_model_key(key, view);
+    }
     // The key list is what the reader asked to look at, and it is drawn over the composer, so
     // it owns the keyboard while it is up — as the queue overlay does. A key that reached the
     // text behind it would be typed into a prompt nobody can see.
@@ -1862,6 +1890,39 @@ fn handle_permission_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         KeyCode::Char(digit @ '1'..='3') => {
             let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
             let _ = view.permission_select(position);
+        }
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Routes a key while the model selector is open.
+///
+/// A movement key or a decision, and nothing else: the reader is choosing from the list the
+/// agent offered, and every other key does nothing rather than reaching the composer behind the
+/// selector. The digits are the shortcut — a reader who knows which model they want should not
+/// have to walk to it — and both Tab directions move, so the key that opened the list walks it.
+fn handle_model_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => view.close_models(),
+        // `Ctrl+C` abandons what is in front of the reader everywhere else in this interface,
+        // and cancelling here changes nothing: the model in force is whatever it already was.
+        KeyCode::Char('c' | 'C') if control => view.close_models(),
+        KeyCode::Enter => {
+            // Closed before the switch leaves, so a reader cannot press Enter twice and have
+            // the second press land on a model they never looked at.
+            let chosen = view.selected_model();
+            view.close_models();
+            if let Some(chosen) = chosen {
+                return Outcome::SetModel(Some(chosen));
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => view.model_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => view.model_down(),
+        KeyCode::Char(digit @ '1'..='9') => {
+            let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
+            let _ = view.model_select(position);
         }
         _ => {}
     }
@@ -3280,6 +3341,98 @@ mod tests {
         assert_eq!(next_model(&[], Some("one")), None);
     }
 
+    /// A bare `/model` opens the selector rather than cycling, `Down` picks another, and `Enter`
+    /// asks the agent for it and closes the dialog.
+    #[test]
+    fn the_model_command_opens_a_selector_and_enter_switches() {
+        let mut view = ViewState::new();
+        view.models = vec![String::from("one"), String::from("two")];
+        view.model = Some(String::from("one"));
+
+        open_model_selector(&mut view);
+        assert!(view.model_open, "{}", view.status);
+        assert_eq!(view.status, "model: Enter switches, Esc cancels");
+        // It opens on the model answering, so Enter is not a surprise move.
+        assert_eq!(view.selected_model().as_deref(), Some("one"));
+
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_model().as_deref(), Some("two"));
+        let outcome = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(!view.model_open, "Enter closes the selector");
+
+        let mut source = Scripted::new(Vec::new());
+        let Outcome::SetModel(requested) = outcome else {
+            panic!("Enter asks for the selected model");
+        };
+        assert_eq!(requested.as_deref(), Some("two"));
+        switch_model(requested, &mut source, &mut view);
+        assert_eq!(view.model.as_deref(), Some("two"));
+        assert_eq!(view.status, "model: two");
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::SetModel {
+                model: String::from("two")
+            }]
+        );
+    }
+
+    /// A session with nothing to switch to — every recording — says so rather than drawing an
+    /// empty selector, and the sentence is the same one a cycle with an empty list gives.
+    #[test]
+    fn a_session_that_offers_no_model_says_so_instead_of_a_selector() {
+        let mut view = ViewState::new();
+        open_model_selector(&mut view);
+        assert!(!view.model_open, "there is nothing to choose");
+        assert!(
+            view.status.contains("no model to switch to"),
+            "{}",
+            view.status
+        );
+    }
+
+    /// The selector owns the keyboard: a key that is not its own does not reach the composer
+    /// behind it, and `Esc` cancels without changing the model in force.
+    #[test]
+    fn the_model_selector_owns_the_keyboard_and_escape_cancels() {
+        let mut view = ViewState::new();
+        view.models = vec![String::from("one"), String::from("two")];
+        view.model = Some(String::from("one"));
+        open_model_selector(&mut view);
+
+        let outcome = handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut view);
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(view.input.is_empty(), "the composer is not taking text");
+        assert!(view.model_open, "and the selector stays up");
+
+        let _ = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(!view.model_open, "Esc closes it");
+        assert_eq!(
+            view.model.as_deref(),
+            Some("one"),
+            "cancelling changes no model"
+        );
+    }
+
+    /// Wrapping in both directions, and a digit choosing directly: the list is a cycle a reader
+    /// can walk past either end, and a shortcut for the one they already know they want.
+    #[test]
+    fn the_model_selector_wraps_and_the_digits_choose() {
+        let mut view = ViewState::new();
+        view.models = vec![String::from("one"), String::from("two")];
+        view.model = Some(String::from("one"));
+        open_model_selector(&mut view);
+
+        let _ = handle_key(key(KeyCode::Up, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_model().as_deref(), Some("two"), "wraps up");
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_model().as_deref(), Some("one"), "wraps down");
+        let _ = handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_model().as_deref(), Some("two"));
+        // A digit past the end is not a command rather than a wrong selection.
+        let _ = handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE), &mut view);
+        assert_eq!(view.selected_model().as_deref(), Some("two"));
+    }
+
     /// Typing `@` opens a menu over the files that answer it, and `Tab` puts the file in the text.
     ///
     /// The whole word is replaced, not the part before the caret: a reader who arrowed back into the
@@ -4117,11 +4270,11 @@ mod tests {
 
         // `/model` is routed rather than decided here: which models exist is the agent's
         // answer, held by the view, and the router only says which of the two forms was asked
-        // for — a cycle, or a named id.
+        // for — the selector, or a named id.
         assert_eq!(
             route_submission(String::from("/model"), true),
-            Routed::SetModel(None),
-            "a bare /model asks for the next one"
+            Routed::Models,
+            "a bare /model opens the selector"
         );
         assert_eq!(
             route_submission(String::from("/model deepseek-v4-pro"), true),

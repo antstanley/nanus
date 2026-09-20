@@ -79,12 +79,12 @@ static DEEPSEEK_PLANS: [Plan; 1] = [Plan {
 }];
 
 /// z.ai's plans: the API and the coding subscription, the same key and protocol at
-/// two hosts.
+/// two hosts. Both default to `glm-5.3-flashx`, the first model the vendor offers.
 static ZAI_PLANS: [Plan; 2] = [
     Plan {
         name: DEFAULT_PLAN,
         endpoint: nanus_adapter_openai::ZAI_BASE_URL,
-        model: Some("glm-4.5"),
+        model: Some("glm-5.3-flashx"),
         refusal: None,
     },
     Plan {
@@ -92,7 +92,7 @@ static ZAI_PLANS: [Plan; 2] = [
         endpoint: nanus_adapter_openai::ZAI_CODING_BASE_URL,
         // The coding host serves the same models, so the plan changes where a
         // request goes and nothing else.
-        model: Some("glm-4.5"),
+        model: Some("glm-5.3-flashx"),
         refusal: None,
     },
 ];
@@ -101,7 +101,7 @@ static ZAI_PLANS: [Plan; 2] = [
 static ANTHROPIC_PLANS: [Plan; 1] = [Plan {
     name: DEFAULT_PLAN,
     endpoint: nanus_adapter_anthropic::DEFAULT_BASE_URL,
-    model: Some("claude-sonnet-4-20250514"),
+    model: Some("claude-sonnet-5"),
     refusal: None,
 }];
 
@@ -111,7 +111,7 @@ static OPENAI_PLANS: [Plan; 3] = [
     Plan {
         name: DEFAULT_PLAN,
         endpoint: nanus_adapter_openai::OPENAI_BASE_URL,
-        model: Some("gpt-5"),
+        model: Some("gpt-6-astra"),
         refusal: None,
     },
     Plan {
@@ -119,7 +119,7 @@ static OPENAI_PLANS: [Plan; 3] = [
         // The coding models are served by the same API with the same key, so the
         // plan is a default model rather than a host.
         endpoint: nanus_adapter_openai::OPENAI_BASE_URL,
-        model: Some("gpt-5-codex"),
+        model: Some("gpt-5.3-codex"),
         refusal: None,
     },
     Plan {
@@ -438,7 +438,7 @@ mod tests {
         let selection = Selection::resolve(&openai).expect("openai resolves");
         assert_eq!(selection.provider(), Provider::OpenAi);
         assert_eq!(selection.endpoint(), "https://api.openai.com/v1");
-        assert_eq!(selection.model(), "gpt-5");
+        assert_eq!(selection.model(), "gpt-6-astra");
         assert_eq!(selection.credential_env(), "OPENAI_API_KEY");
 
         let anthropic = NanusConfig {
@@ -446,7 +446,7 @@ mod tests {
             ..config()
         };
         let selection = Selection::resolve(&anthropic).expect("anthropic resolves");
-        assert_eq!(selection.model(), "claude-sonnet-4-20250514");
+        assert_eq!(selection.model(), "claude-sonnet-5");
         assert_eq!(selection.endpoint(), "https://api.anthropic.com/v1");
         // And a provider that does not use the effort knob says so.
         assert!(!selection.provider().effort_applies());
@@ -477,7 +477,7 @@ mod tests {
             ..config()
         };
         let selection = Selection::resolve(&openai_coding).expect("the coding plan resolves");
-        assert_eq!(selection.model(), "gpt-5-codex");
+        assert_eq!(selection.model(), "gpt-5.3-codex");
         assert_eq!(selection.endpoint(), "https://api.openai.com/v1");
     }
 

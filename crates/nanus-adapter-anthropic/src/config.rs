@@ -25,16 +25,30 @@ pub const API_VERSION: &str = "2023-06-01";
 
 /// The models offered, in cycling order.
 ///
-/// The full dated ids, because that is what the API accepts and what a session
-/// transcript should record: an alias that resolves to a different model next month
-/// would make two runs silently incomparable.
-static MODELS: [&str; 2] = ["claude-sonnet-4-20250514", "claude-opus-4-20250514"];
-
-/// The documented maximum output tokens for the offered models.
+/// Pinned snapshots rather than aliases, because an alias that resolves to a different
+/// model next month would make two runs silently incomparable: the 4.x ids are dated
+/// snapshots, and from the 4.6 generation on Anthropic's dateless ids are themselves
+/// pinned, so both forms name one immutable model.
 ///
-/// A request above it is refused rather than truncated, so the adapter sends the
-/// smaller of the configured budget and this. It is a provider fact and therefore
-/// lives here rather than in the ports crate.
+/// The current lineup comes first, so the fallback default is one of them, and the
+/// previous generation stays behind it rather than being dropped: a session resumed
+/// against a 4.x model can still cycle back to it.
+static MODELS: [&str; 6] = [
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-fable-5-1",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
+];
+
+/// The documented maximum output tokens the adapter will send.
+///
+/// A request above a model's ceiling is refused rather than truncated, so the adapter
+/// sends the smaller of the configured budget and this. It is the *smallest* ceiling of
+/// the offered models — Claude Haiku 4.5 caps at 64K while the 5-series caps at 128K —
+/// because one value has to hold for whichever model a configuration names. It is a
+/// provider fact and therefore lives here rather than in the ports crate.
 pub const MAX_OUTPUT_TOKENS: u32 = 64_000;
 
 /// The adapter's settings.
@@ -230,10 +244,17 @@ mod tests {
         assert_eq!(DEFAULT_BASE_URL, "https://api.anthropic.com/v1");
         assert_eq!(API_KEY_ENV, "ANTHROPIC_API_KEY");
         assert_eq!(API_VERSION, "2023-06-01");
-        // The full dated ids, which is what the API accepts.
+        // The offered ids are pinned snapshots, which is what the API accepts.
         assert_eq!(
             AnthropicConfig::models(),
-            ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]
+            [
+                "claude-sonnet-5",
+                "claude-opus-5",
+                "claude-fable-5-1",
+                "claude-haiku-4-5-20251001",
+                "claude-sonnet-4-20250514",
+                "claude-opus-4-20250514",
+            ]
         );
     }
 

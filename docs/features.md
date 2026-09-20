@@ -88,9 +88,9 @@ which one is in use.
 | Provider | Adapter | Models offered | Plans |
 |---|---|---|---|
 | `deepseek` (default) | `nanus-adapter-deepseek` | `deepseek-flash`, `deepseek-v4-pro` | `api` |
-| `zai` | `nanus-adapter-openai` | `glm-4.5`, `glm-4.5-air`, `glm-4.5-flash` | `api`, `coding` |
-| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
-| `openai` | `nanus-adapter-openai` | `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `coding`, `subscription`¹ |
+| `zai` | `nanus-adapter-openai` | `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2` | `api`, `coding` |
+| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
+| `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.3-codex`, `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `coding`, `subscription`¹ |
 
 ¹ The OpenAI `subscription` plan — the ChatGPT coding tier reached with an OAuth
 token — is listed and **refused with its reason** rather than silently absent: it
@@ -311,9 +311,9 @@ supports:
 - **The key list on screen** (`?`, or `/help`), scrolled from one table so a
   binding cannot be documented in one place and forgotten in another.
 - **The settings a key changes**: the approval state (`Shift+Tab`, in a dialog that
-  says what each state grants), the model (`Alt+P`, or `/model <id>`), and the
-  reasoning effort (`Alt+T`). Each is drawn where a reader can see which is in
-  force.
+  says what each state grants), the model (`Alt+P` cycles, `/model` opens a selector,
+  `/model <id>` names one), and the reasoning effort (`Alt+T`). Each is drawn where a
+  reader can see which is in force.
 - **`@` file mentions**, completed from the workspace by `Tab` and expanded to the
   path — the model reads the file with a tool rather than being handed its
   contents.
