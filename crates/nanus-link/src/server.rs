@@ -1730,8 +1730,19 @@ async fn set_model(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, model:
     // does: one runner serves every session the agent holds. Every viewer is told, not only the
     // connection that asked, so two views of one agent cannot disagree about which model is
     // answering.
+    let changed = registry.agent.model() != model;
     registry.agent.runner().set_model(&model);
+    if changed {
+        // The effort in force was chosen for the model being left, whose steps may differ, so it
+        // goes back to the adapter's default rather than naming a step the new model refuses. This
+        // is the same reconciliation a provider change makes.
+        registry.agent.runner().set_effort(None);
+    }
     registry.broadcast_model(&model).await;
+    if changed && let Some(effort) = registry.agent.effort() {
+        // The step the adapter now applies, so every client's effort agrees with the new model.
+        registry.broadcast_effort(effort).await;
+    }
 }
 
 /// Rebuilds the agent's model adapter for another provider, or says why it could not.
@@ -1786,9 +1797,17 @@ async fn set_provider(
             let provider = switch.provider();
             let plan = switch.plan();
             let model_efforts = registry.agent.model_efforts();
+            // The lists first, then the two facts that changed with them. A provider change replaces
+            // the model and the effort in force, so the frames that say so follow — otherwise a
+            // client would keep the old provider's model, and look the new models' steps up under
+            // the old id and find none.
             registry
                 .broadcast_provider(provider, plan, models, model_efforts)
                 .await;
+            registry.broadcast_model(&switch.model()).await;
+            if let Some(effort) = registry.agent.effort() {
+                registry.broadcast_effort(effort).await;
+            }
         }
         Err(error) => {
             send(

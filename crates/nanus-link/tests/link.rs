@@ -36,7 +36,8 @@ use nanus_link::{Client, LinkError};
 // `StorePort` is in scope for the concrete store the claim test writes through: `save` and
 // `name` live on the port, and `lock_file` on the adapter.
 use nanus_ports::{
-    ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, StoreHandle, StorePort as _,
+    ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, ReasoningEffort, StoreHandle,
+    StorePort as _,
 };
 
 /// A model that answers every request the same way, without a network.
@@ -658,6 +659,114 @@ fn an_effort_switch_reaches_the_agent_and_is_broadcast() {
         state,
         Some(EffortState::High),
         "the effort the client asked for is the one the agent says it is using"
+    );
+}
+
+/// A model whose adapter has a notion of effort, so a switch has a step to reconcile.
+struct EffortLlm;
+
+impl LlmPort for EffortLlm {
+    fn model(&self) -> &'static str {
+        "one"
+    }
+
+    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        Some(ReasoningEffort::Medium)
+    }
+
+    fn effort_levels(&self, _model: &str) -> &'static [ReasoningEffort] {
+        &[
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ]
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        Box::pin(futures::stream::empty())
+    }
+}
+
+/// A model switch reconciles the effort in force: the step chosen for the model being left is
+/// dropped to the adapter's default and every client is told, because a step the new model refuses
+/// must never reach the provider.
+#[test]
+fn a_model_switch_reconciles_the_effort() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(EffortLlm)), "one");
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (model, effort) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        assert_eq!(
+            client.info().effort,
+            Some(EffortState::Medium),
+            "the handshake reports the adapter's default"
+        );
+        client.start(None).await.expect("a session starts");
+        loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::ModelChanged { .. }) => break,
+                Some(_) => {}
+                None => panic!("the attach frames arrived"),
+            }
+        }
+
+        // A step chosen for the model in force.
+        client
+            .send(&Request::SetEffort {
+                state: EffortState::Max,
+            })
+            .await
+            .expect("the request is sent");
+        loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::EffortChanged {
+                    state: EffortState::Max,
+                }) => break,
+                Some(_) => {}
+                None => panic!("the effort frame arrived"),
+            }
+        }
+
+        // Switching model drops it to the adapter's default, and says so on the same wake-up.
+        client
+            .send(&Request::SetModel {
+                model: String::from("deepseek-v4-pro"),
+            })
+            .await
+            .expect("the switch is sent");
+        let mut model = String::new();
+        let mut effort = None;
+        for _ in 0..8 {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::ModelChanged { model: switched }) => model = switched,
+                Some(Frame::EffortChanged { state }) => {
+                    effort = Some(state);
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        (model, effort)
+    });
+
+    assert_eq!(model, "deepseek-v4-pro", "the switch is broadcast");
+    assert_eq!(
+        effort,
+        Some(EffortState::Medium),
+        "the chosen step is reconciled to the new model's default, not carried over"
     );
 }
 

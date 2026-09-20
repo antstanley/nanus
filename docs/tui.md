@@ -555,11 +555,12 @@ drawn, and never kept in the interface once it has been sent. `n` or `Esc` cance
 stays what it was.
 
 **The switch is the agent's, and it reaches every client**, exactly as the model and the approval
-state do: one runner serves every session, so a client that switches tells every watcher, and the
-model list and the models' effort steps travel with the answer because a provider change replaces
-both. It takes effect on the next request, including the next step of a turn already running, and
-the effort in force goes back to the new adapter's default rather than naming a step the new model
-may not accept.
+state do: one runner serves every session, so a client that switches tells every watcher. The
+provider and its model-and-step lists arrive first, then the model the new provider resolved and the
+effort its adapter applies — because a provider change replaces all of those, and a client that kept
+the old model would look the new models' steps up under it and find none. It takes effect on the
+next request, including the next step of a turn already running, and the effort in force goes back
+to the new adapter's default rather than naming a step the new model may not accept.
 
 ### Selecting and copying
 
@@ -715,9 +716,12 @@ while Haiku 4.5 and the previous generation take no effort parameter at all, and
 models cannot turn thinking off, so `none` is not offered for them.
 
 Like the model, the effort belongs to the agent's runner and reaches every watcher, and it takes
-effect on the next request rather than the next turn. An adapter with no notion of effort says so
-by the absence: nothing is drawn beside the model, `/effort` says the current model has no effort
-to choose, and a change is a request the adapter ignores rather than an error.
+effect on the next request rather than the next turn. **A model change reconciles it**: the agent
+drops the chosen step to the new model's default, because the steps a model takes differ and a step
+the new model refuses must never reach the provider — the same rule a provider change follows. An
+adapter with no notion of effort says so by the absence: nothing is drawn beside the model,
+`/effort` says the current model has no effort to choose, and a change is a request the adapter
+ignores rather than an error.
 
 ## Scrolling back
 

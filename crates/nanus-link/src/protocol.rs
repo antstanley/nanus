@@ -227,8 +227,9 @@ pub enum Request {
     ///
     /// The same shape as [`Request::SetModel`] and for the same reason: the effort travels with
     /// the request the agent issues, so a choice has to reach the loop rather than ride along
-    /// with the next prompt. Unlike the model there is no list to validate against — the scale is
-    /// the protocol's own — and a provider that has no notion of effort simply ignores it.
+    /// with the next prompt. The *link* does not validate it — the scale is the protocol's own —
+    /// and the steps a model actually takes cross in [`AgentInfo::model_efforts`], so it is the
+    /// interface that offers only those; a provider with no notion of effort ignores the choice.
     SetEffort {
         /// The effort to ask for from now on.
         state: EffortState,

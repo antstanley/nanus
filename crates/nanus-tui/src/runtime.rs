@@ -2943,15 +2943,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // carries.
             view.effort = Some(view_effort(state).as_str().to_owned());
         }
-        Frame::ModelChanged { model } => {
-            // The agent is the authority here too, and for a stronger reason: it is the model
-            // named in the next request. A client that switched it has already drawn the
-            // switch, and a client watching another conversation learns it from this frame.
-            view.model = Some(model);
-            // The steps a model takes differ between models, so the chooser and the cycle follow
-            // the switch rather than keeping the previous model's list.
-            view.refresh_effort_levels();
-        }
+        Frame::ModelChanged { model } => apply_model_changed(model, view),
         Frame::ProviderChanged {
             provider,
             plan,
@@ -3045,6 +3037,23 @@ fn apply_tool_done(name: String, error: bool, call_id: Option<String>, view: &mu
     view.transcript
         .push(call_entry(Entry::tool_result(name, error, ""), call_id));
     view.follow();
+}
+
+/// Applies a model change: the model, the steps it takes, and the effort reconciled with them.
+///
+/// The agent is the authority here, and for a stronger reason than elsewhere: it is the model named
+/// in the next request. A client that switched it has already drawn the switch, and a client
+/// watching another conversation learns it from this frame. The steps a model takes differ between
+/// models, so the chooser and the cycle follow the switch; and a model that takes no effort has
+/// none in force, which is an absence the agent cannot frame — it sends no `EffortChanged` for
+/// "none" — so the drawn step is cleared here. A model that does take effort is corrected by the
+/// `EffortChanged` the agent sends with the switch.
+fn apply_model_changed(model: String, view: &mut ViewState) {
+    view.model = Some(model);
+    view.refresh_effort_levels();
+    if view.effort_levels.is_empty() {
+        view.effort = None;
+    }
 }
 
 /// Applies a provider change: where requests go, and the models and their effort steps with it.
@@ -4801,15 +4810,20 @@ mod tests {
         assert!(!view.provider_open);
     }
 
-    /// `ProviderChanged` replaces where requests go, and the models and effort steps with it.
+    /// A provider change replaces where requests go and, with the frames the agent sends after it,
+    /// the model and the effort in force — and the effort steps follow the model.
     #[test]
-    fn a_provider_frame_replaces_the_provider_and_its_models() {
+    fn a_provider_change_replaces_the_provider_model_and_effort() {
         let mut view = ViewState::new();
         view.provider = Some(String::from("deepseek"));
         view.plan = Some(String::from("api"));
         view.models = vec![String::from("deepseek-flash")];
         view.model = Some(String::from("deepseek-flash"));
+        view.effort = Some(String::from("medium"));
         view.pending_switch = Some((String::from("zai"), String::from("coding")));
+
+        // The agent answers a switch with three frames: the provider and its lists, the model it
+        // resolved, and the effort the new adapter applies.
         apply(
             Frame::ProviderChanged {
                 provider: String::from("zai"),
@@ -4822,18 +4836,56 @@ mod tests {
             },
             &mut view,
         );
-        assert_eq!(view.provider.as_deref(), Some("zai"));
-        assert_eq!(view.plan.as_deref(), Some("coding"));
-        assert_eq!(view.models, vec!["glm-5.3-flashx", "glm-5.2"]);
-        assert!(view.pending_switch.is_none(), "the switch has landed");
-        // The effort steps follow the model, once a model frame names it.
         apply(
             Frame::ModelChanged {
                 model: String::from("glm-5.3-flashx"),
             },
             &mut view,
         );
-        assert_eq!(view.effort_levels, vec!["high", "max"]);
+        apply(
+            Frame::EffortChanged {
+                state: EffortState::High,
+            },
+            &mut view,
+        );
+
+        assert_eq!(view.provider.as_deref(), Some("zai"));
+        assert_eq!(view.plan.as_deref(), Some("coding"));
+        assert_eq!(
+            view.model.as_deref(),
+            Some("glm-5.3-flashx"),
+            "the model follows the provider"
+        );
+        assert_eq!(view.models, vec!["glm-5.3-flashx", "glm-5.2"]);
+        assert_eq!(view.effort.as_deref(), Some("high"));
+        assert_eq!(
+            view.effort_levels,
+            vec!["high", "max"],
+            "the steps follow the model, not the provider that was left"
+        );
+        assert!(view.pending_switch.is_none(), "the switch has landed");
+    }
+
+    /// A model that takes no effort has none in force, and the agent sends no `EffortChanged` for
+    /// an absence, so the drawn step is cleared when the new model offers none.
+    #[test]
+    fn a_model_that_takes_no_effort_clears_the_drawn_step() {
+        let mut view = ViewState::new();
+        view.model = Some(String::from("m"));
+        view.model_efforts
+            .insert(String::from("m"), vec![String::from("high")]);
+        view.refresh_effort_levels();
+        view.effort = Some(String::from("high"));
+
+        view.models = vec![String::from("plain")];
+        apply(
+            Frame::ModelChanged {
+                model: String::from("plain"),
+            },
+            &mut view,
+        );
+        assert!(view.effort.is_none(), "an absence clears the drawn step");
+        assert!(view.effort_levels.is_empty());
     }
 
     /// The agent is the authority on the effort its next request carries, and a recording has

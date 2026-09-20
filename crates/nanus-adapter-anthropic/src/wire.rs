@@ -479,6 +479,7 @@ fn truncate_for_message(payload: &str) -> String {
 mod tests {
     use super::*;
     use nanus_domain::ToolCall;
+    use nanus_ports::ReasoningEffort;
 
     fn config() -> AnthropicConfig {
         AnthropicConfig::new("claude-sonnet-4-20250514", "test-key")
@@ -545,9 +546,47 @@ mod tests {
             "stream_options",
             "reasoning_effort",
             "thinking",
+            "output_config",
         ] {
             assert!(body.get(field).is_none(), "{field} must not be sent");
         }
+    }
+
+    /// Effort reaches the wire as `output_config.effort`, and only for a model that takes it.
+    #[test]
+    fn effort_reaches_the_wire_only_where_the_model_takes_it() {
+        let modern = AnthropicConfig::new("claude-sonnet-5", "test-key");
+        for (effort, expected) in [
+            (ReasoningEffort::None, "low"),
+            (ReasoningEffort::Minimal, "low"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            let body = build_request(
+                &modern,
+                &request(vec![Message::user("hi")]).with_reasoning_effort(effort),
+            );
+            assert_eq!(
+                body["output_config"]["effort"],
+                json!(expected),
+                "the chosen step travels as its own name: {effort:?}"
+            );
+        }
+
+        // A model that predates the parameter is sent nothing, whatever the caller chose.
+        let legacy = AnthropicConfig::new("claude-haiku-4-5-20251001", "test-key");
+        let body = build_request(
+            &legacy,
+            &request(vec![Message::user("hi")]).with_reasoning_effort(ReasoningEffort::Max),
+        );
+        assert!(body.get("output_config").is_none(), "{body}");
+
+        // And an unset effort is left out entirely, so the API's own default applies.
+        let body = build_request(&modern, &request(vec![Message::user("hi")]));
+        assert!(body.get("output_config").is_none(), "{body}");
     }
 
     /// The budget sent is capped at the model's documented ceiling.
