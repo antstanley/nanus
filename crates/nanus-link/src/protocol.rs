@@ -257,7 +257,14 @@ pub enum Request {
     SetCredential {
         /// The provider's name.
         provider: String,
-        /// The secret to file under that provider's account.
+        /// The plan the credential is for, when one is named.
+        ///
+        /// A plan may take a credential of its own — z.ai's coding subscription does — so the key is
+        /// filed against the account the plan names, not the provider's. Absent means the provider's
+        /// default plan.
+        #[serde(default)]
+        plan: Option<String>,
+        /// The secret to file under that account.
         key: String,
     },
 
@@ -436,6 +443,9 @@ pub enum Frame {
     NoCredential {
         /// The provider whose credential is missing.
         provider: String,
+        /// The plan whose credential is missing, when the provider has more than one account.
+        #[serde(default)]
+        plan: Option<String>,
         /// The environment variable a credential would otherwise be read from, so the interface can
         /// say where a key is normally kept.
         env: String,
@@ -954,7 +964,13 @@ mod tests {
                 model_efforts: Vec::new(),
             },
             Frame::NoCredential {
+                provider: "zai".to_owned(),
+                plan: Some("coding".to_owned()),
+                env: "ZAI_CODING_API_KEY".to_owned(),
+            },
+            Frame::NoCredential {
                 provider: "openai".to_owned(),
+                plan: None,
                 env: "OPENAI_API_KEY".to_owned(),
             },
         ] {
@@ -1039,7 +1055,13 @@ mod tests {
                 plan: None,
             },
             Request::SetCredential {
+                provider: "zai".to_owned(),
+                plan: Some("coding".to_owned()),
+                key: "zai-coding-secret".to_owned(),
+            },
+            Request::SetCredential {
                 provider: "openai".to_owned(),
+                plan: None,
                 key: "sk-secret".to_owned(),
             },
             Request::Sessions,

@@ -137,7 +137,8 @@ field of any type that reaches a log.
   (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). The
   first store holding a value answers, and a store that cannot answer — a locked
   keychain on a detached service — does not hide a value another store holds.
-- **The account is the provider's name**, so a key stored for one provider can
+- **The account names what the key is for**: the provider's name, or the provider and plan joined
+  for a plan with a key of its own (`zai:coding`), so a key stored for one provider or plan can
   never be sent to another.
 - **The stores are a port.** `SecretPort` is the boundary and each store is a
   `SecretBackend`, so another platform store is an implementation rather than a

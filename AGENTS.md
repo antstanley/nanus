@@ -279,9 +279,11 @@ design docs too.
   exception; it is not the default and must not become one.
 - **Retired model ids do not resolve.** `deepseek-chat` and `deepseek-reasoner`
   are gone; the supported ids are `deepseek-flash` and `deepseek-v4-pro`.
-- **A credential is not configuration, and its account is the provider's name.**
+- **A credential is not configuration, and its account names what it is for.**
   A key lives in the secret store behind `SecretPort`, is wrapped in a type that
-  redacts its own `Debug`, and is read out only by name. A plan this build cannot
+  redacts its own `Debug`, and is read out only by name. The account is the provider's name — or
+  the provider and plan joined for a plan that takes a key of its own, `zai:coding` — so a key
+  stored for one provider or plan can never be sent to another. A plan this build cannot
   honour is listed and refused with its reason rather than silently absent.
 - **Temporal composability:** unloading a plugin reverts its effects in reverse
   order. `nanus-kernel/tests/composition.rs` asserts the revert order, not just

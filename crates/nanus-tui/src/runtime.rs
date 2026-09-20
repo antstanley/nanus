@@ -442,10 +442,10 @@ pub trait SessionSource {
     /// has no agent to tell, and the provider it shows is the one it was recorded with.
     fn set_provider(&mut self, _provider: &str, _plan: Option<&str>) {}
 
-    /// Tells the agent to file a credential for a provider.
+    /// Tells the agent to file a credential for a provider's plan.
     ///
     /// A default of doing nothing, for the same reason as [`SessionSource::set_provider`].
-    fn set_credential(&mut self, _provider: &str, _key: &str) {}
+    fn set_credential(&mut self, _provider: &str, _plan: Option<&str>, _key: &str) {}
 
     /// Releases whatever the source owns.
     ///
@@ -856,9 +856,10 @@ impl SessionSource for Remote {
         });
     }
 
-    fn set_credential(&mut self, provider: &str, key: &str) {
+    fn set_credential(&mut self, provider: &str, plan: Option<&str>, key: &str) {
         self.send(Request::SetCredential {
             provider: provider.to_owned(),
+            plan: plan.map(str::to_owned),
             key: key.to_owned(),
         });
     }
@@ -1250,8 +1251,12 @@ async fn event_loop(
                     Outcome::SetProvider { provider, plan } => {
                         request_switch(&provider, &plan, source, &mut view);
                     }
-                    Outcome::SetCredential { provider, key } => {
-                        store_credential(&provider, &key, source, &mut view);
+                    Outcome::SetCredential {
+                        provider,
+                        plan,
+                        key,
+                    } => {
+                        store_credential(&provider, plan.as_deref(), &key, source, &mut view);
                     }
                     Outcome::CycleEffort => cycle_effort(source, &mut view),
                     Outcome::SetApproval(policy) => set_approval(policy, source, &mut view),
@@ -1880,6 +1885,8 @@ enum Outcome {
     SetCredential {
         /// The provider the key is for.
         provider: String,
+        /// The plan the key is for, when the provider has more than one account.
+        plan: Option<String>,
         /// The key, which is never drawn or logged again.
         key: String,
     },
@@ -2240,6 +2247,7 @@ fn handle_key_entry_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         KeyCode::Enter => {
             let typed = view.take_key();
             let provider = view.credential_provider.clone();
+            let plan = view.credential_plan.clone();
             view.close_key_entry();
             if typed.trim().is_empty() {
                 view.pending_switch = None;
@@ -2247,6 +2255,7 @@ fn handle_key_entry_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             } else if let Some(provider) = provider {
                 return Outcome::SetCredential {
                     provider,
+                    plan,
                     key: typed,
                 };
             }
@@ -2350,12 +2359,16 @@ fn request_switch(
 /// filed against one provider and applied to another.
 fn store_credential(
     provider: &str,
+    plan: Option<&str>,
     key: &str,
     source: &mut dyn SessionSource,
     view: &mut ViewState,
 ) {
-    source.set_credential(provider, key);
-    view.status = format!("storing a key for {provider}");
+    source.set_credential(provider, plan, key);
+    view.status = plan.map_or_else(
+        || format!("storing a key for {provider}"),
+        |plan| format!("storing a key for {provider} · {plan}"),
+    );
     if let Some((provider, plan)) = view.pending_switch.clone() {
         source.set_provider(&provider, Some(&plan));
     }
@@ -2950,11 +2963,16 @@ fn apply(frame: Frame, view: &mut ViewState) {
             models,
             model_efforts,
         } => apply_provider_changed(&provider, &plan, &models, &model_efforts, view),
-        Frame::NoCredential { provider, env } => {
+        Frame::NoCredential {
+            provider,
+            plan,
+            env,
+        } => {
             // Asked rather than refused: storing a key is the one thing a reader can do about it,
-            // and what was asked for is still held so the key is filed against it.
-            view.open_credential(&provider, &env);
-            view.status = format!("no credential for {provider}: store one?");
+            // and what was asked for is still held so the key is filed against it. The plan is
+            // part of what was asked for — a coding subscription takes a key of its own.
+            view.open_credential(&provider, plan.as_deref(), &env);
+            view.status = format!("no credential for {}: store one?", view.credential_label());
         }
         Frame::Tool {
             call_id,
@@ -3259,9 +3277,10 @@ mod tests {
             });
         }
 
-        fn set_credential(&mut self, provider: &str, key: &str) {
+        fn set_credential(&mut self, provider: &str, plan: Option<&str>, key: &str) {
             self.requests.borrow_mut().push(Request::SetCredential {
                 provider: provider.to_owned(),
+                plan: plan.map(str::to_owned),
                 key: key.to_owned(),
             });
         }
@@ -4713,9 +4732,9 @@ mod tests {
         view.providers = vec![
             ProviderChoice {
                 provider: String::from("zai"),
-                plan: String::from("api"),
-                label: String::from("zai · api"),
-                env: String::from("ZAI_API_KEY"),
+                plan: String::from("coding"),
+                label: String::from("zai · coding"),
+                env: String::from("ZAI_CODING_API_KEY"),
                 refused: None,
             },
             ProviderChoice {
@@ -4747,15 +4766,18 @@ mod tests {
             Some("zai")
         );
 
-        // The agent answers that there is no key: the question opens.
+        // The agent answers that there is no key: the question opens, naming the plan whose key is
+        // wanted rather than the provider's own account.
         apply(
             Frame::NoCredential {
                 provider: String::from("zai"),
-                env: String::from("ZAI_API_KEY"),
+                plan: Some(String::from("coding")),
+                env: String::from("ZAI_CODING_API_KEY"),
             },
             &mut view,
         );
         assert!(view.credential_open);
+        assert_eq!(view.credential_label(), "zai · coding");
 
         // `y` opens the masked field, and typing then Enter yields the credential to store.
         let _ = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
@@ -4765,11 +4787,21 @@ mod tests {
         }
         assert_eq!(view.key_input, "sk-secret");
         let outcome = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
-        let Outcome::SetCredential { provider, key } = outcome else {
+        let Outcome::SetCredential {
+            provider,
+            plan,
+            key,
+        } = outcome
+        else {
             panic!("Enter stores the key");
         };
         assert_eq!(provider, "zai");
-        store_credential(&provider, &key, &mut source, &mut view);
+        assert_eq!(
+            plan.as_deref(),
+            Some("coding"),
+            "the plan is filed with the key"
+        );
+        store_credential(&provider, plan.as_deref(), &key, &mut source, &mut view);
 
         // Both requests left, in order: the store, then the switch that now sees the key. And the
         // key is not kept once it has been sent.
@@ -4779,6 +4811,7 @@ mod tests {
             requests[1],
             Request::SetCredential {
                 provider: String::from("zai"),
+                plan: Some(String::from("coding")),
                 key: String::from("sk-secret"),
             }
         );
@@ -4786,7 +4819,7 @@ mod tests {
             requests[2],
             Request::SetProvider {
                 provider: String::from("zai"),
-                plan: Some(String::from("api")),
+                plan: Some(String::from("coding")),
             }
         );
         assert!(view.key_input.is_empty(), "the key is not kept");

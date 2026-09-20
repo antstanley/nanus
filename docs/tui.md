@@ -554,6 +554,15 @@ to the agent, which owns the credential store, and is written there — it is ne
 drawn, and never kept in the interface once it has been sent. `n` or `Esc` cancels, and the provider
 stays what it was.
 
+**A plan may take a key of its own, and the question names it.** z.ai's coding subscription is a
+coding-plan key on a different host, not something a pay-as-you-go API key can replace, so its
+credential is filed under `zai:coding` (falling back to `ZAI_CODING_API_KEY`) rather than the API
+account `zai`. Choosing `zai · coding` with only the API key stored therefore asks for the coding
+key, and the two plans keep two keys. A plan that shares the provider's key — `OpenAI`'s `coding` is
+the same key on the same host — is filed under the provider's own account, so it never asks twice.
+The same names work from the shell: `nanus auth set zai:coding` stores one, and `nanus auth status`
+lists every account a provider may be filed under.
+
 **The switch is the agent's, and it reaches every client**, exactly as the model and the approval
 state do: one runner serves every session, so a client that switches tells every watcher. The
 provider and its model-and-step lists arrive first, then the model the new provider resolved and the

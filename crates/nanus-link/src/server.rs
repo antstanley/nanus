@@ -1653,8 +1653,12 @@ async fn serve_connection(
             Request::SetProvider { provider, plan } => {
                 set_provider(&registry, &frames, &provider, plan.as_deref()).await;
             }
-            Request::SetCredential { provider, key } => {
-                set_credential(&registry, &frames, &provider, &key).await;
+            Request::SetCredential {
+                provider,
+                plan,
+                key,
+            } => {
+                set_credential(&registry, &frames, &provider, plan.as_deref(), &key).await;
             }
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
@@ -1780,12 +1784,13 @@ async fn set_provider(
         .await;
         return;
     };
-    if !switch.has_credential(name).await {
+    if !switch.has_credential(name, plan).await {
         send(
             frames,
             Frame::NoCredential {
                 provider: name.name().to_owned(),
-                env: name.env_var().to_owned(),
+                plan: plan.map(str::to_owned),
+                env: name.credential_env(plan).to_owned(),
             },
         )
         .await;
@@ -1821,7 +1826,7 @@ async fn set_provider(
     }
 }
 
-/// Files a credential for a provider.
+/// Files a credential for a provider's plan.
 ///
 /// The key is written and never echoed: neither the acknowledgement nor any frame carries it back.
 /// A failure is a [`Frame::Failed`] naming the provider, and success is silent because the
@@ -1830,6 +1835,7 @@ async fn set_credential(
     registry: &Rc<Registry>,
     frames: &mpsc::Sender<Frame>,
     provider: &str,
+    plan: Option<&str>,
     key: &str,
 ) {
     let Some(name) = Provider::parse(provider) else {
@@ -1852,7 +1858,7 @@ async fn set_credential(
         .await;
         return;
     };
-    if let Err(error) = switch.set_credential(name, key).await {
+    if let Err(error) = switch.set_credential(name, plan, key).await {
         send(
             frames,
             Frame::Failed {

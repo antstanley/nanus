@@ -58,8 +58,9 @@ export DEEPSEEK_API_KEY=...
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openai` | `OPENAI_API_KEY` |
 
-`nanus auth set <provider>` and `nanus auth status` work for every provider. The account is
-the provider's name, so a key stored for one provider can never be sent to another.
+`nanus auth set <provider>` and `nanus auth status` work for every provider and plan. The account
+is the provider's name, or `provider:plan` for a plan with a key of its own (`zai:coding`), so a
+key stored for one provider or plan can never be sent to another.
 
 ## Verify the install
 

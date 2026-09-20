@@ -281,31 +281,39 @@ impl ProviderSwitch {
         models
     }
 
-    /// Returns whether a credential is configured for `provider`.
+    /// Returns whether a credential is configured for `provider`'s `plan`.
     ///
     /// Asked of the store rather than remembered, because a key set from another terminal between
-    /// two attempts has to be seen: the answer is what decides whether a switch can go ahead.
-    pub async fn has_credential(&self, provider: Provider) -> bool {
+    /// two attempts has to be seen: the answer is what decides whether a switch can go ahead. The
+    /// plan matters — z.ai's coding subscription has an account of its own, so an API key already
+    /// stored is not one for it.
+    pub async fn has_credential(&self, provider: Provider, plan: Option<&str>) -> bool {
         matches!(
-            self.secrets.get(provider.name()).await,
+            self.secrets.get(provider.credential_account(plan)).await,
             Ok(Some(ref secret)) if !secret.is_blank()
         )
     }
 
-    /// Files a credential for `provider`.
+    /// Files a credential for `provider`'s `plan`.
     ///
     /// # Errors
     ///
     /// Returns [`BundleError::Config`] when the store refuses the write, so a key that could not be
     /// saved is a sentence rather than a switch that silently cannot happen.
-    pub async fn set_credential(&self, provider: Provider, key: &str) -> Result<(), BundleError> {
+    pub async fn set_credential(
+        &self,
+        provider: Provider,
+        plan: Option<&str>,
+        key: &str,
+    ) -> Result<(), BundleError> {
         if key.trim().is_empty() {
             return Err(BundleError::config("a credential is not empty"));
         }
+        let account = provider.credential_account(plan);
         self.secrets
-            .set(provider.name(), key)
+            .set(account, key)
             .await
-            .map_err(|error| BundleError::config(format!("{}: {error}", provider.name())))
+            .map_err(|error| BundleError::config(format!("{account}: {error}")))
     }
 
     /// Rebuilds the model adapter for `provider` and `plan`, and points the runner at it.

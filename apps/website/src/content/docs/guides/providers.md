@@ -48,8 +48,9 @@ nanus auth set zai        # or: export ZAI_API_KEY=...
 nanus auth status         # which providers have a credential, and where it is read from
 ```
 
-The account a key is stored under is the provider's name, so a key stored for one provider
-can never be sent to another.
+The account a key is stored under names what it is for — the provider, or `provider:plan` for a
+plan with a key of its own (`zai:coding`) — so a key stored for one provider or plan can never be
+sent to another.
 
 ## What the adapters implement
 

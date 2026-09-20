@@ -255,7 +255,8 @@ pub enum AuthAction {
     /// nothing is echoed in the second case, which is the same trade the platform's
     /// own tools make.
     Set {
-        /// The provider the credential is for: one of the names `nanus config` lists.
+        /// The provider the credential is for, or `provider:plan` for a plan with a key of its
+        /// own (`zai:coding`): one of the names `nanus auth status` lists.
         provider: String,
     },
 
@@ -1255,10 +1256,15 @@ async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
             } else {
                 // The environment cannot be changed from here, so a reader whose key
                 // comes from a variable is told where to remove it rather than being
-                // left with a credential this command cannot see.
-                let provider = Provider::parse(account).map_or("", Provider::env_var);
+                // left with a credential this command cannot see. The variable is the
+                // one the account falls back to, which a plan's own account names.
+                let fallback = Provider::ALL
+                    .iter()
+                    .flat_map(|provider| provider.accounts())
+                    .find(|(name, _)| *name == account)
+                    .map_or("", |(_, env)| env);
                 println!(
-                    "nanus: no stored credential for {account}; if it comes from {provider}, unset it in the shell that sets it"
+                    "nanus: no stored credential for {account}; if it comes from {fallback}, unset it in the shell that sets it"
                 );
             }
             Ok(Ready::Done)
@@ -1266,34 +1272,56 @@ async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
         AuthAction::Status => {
             println!("credential stores: {}", secrets.backend());
             for provider in Provider::ALL {
-                let account = provider.name();
-                // The credential is never printed: this output is routinely pasted
-                // into an issue. A store that could not answer says so rather than
-                // reporting an absence it did not observe.
-                let state = match secrets.get(account).await {
-                    Ok(Some(credential)) if !credential.is_blank() => String::from("set"),
-                    Ok(_) => String::from("not set"),
-                    Err(error) => format!("not readable ({error})"),
-                };
-                println!("  {account}: {state}  (fallback {})", provider.env_var());
+                // Every account the provider may be filed under, so a plan with a key of its own is
+                // visible with the name it is asked for rather than hidden behind the provider's.
+                for (account, env) in provider.accounts() {
+                    // The credential is never printed: this output is routinely pasted
+                    // into an issue. A store that could not answer says so rather than
+                    // reporting an absence it did not observe.
+                    let state = match secrets.get(account).await {
+                        Ok(Some(credential)) if !credential.is_blank() => String::from("set"),
+                        Ok(_) => String::from("not set"),
+                        Err(error) => format!("not readable ({error})"),
+                    };
+                    println!("  {account}: {state}  (fallback {env})");
+                }
             }
             Ok(Ready::Done)
         }
     }
 }
 
-/// Resolves a provider name from the command line, or refuses it by name.
+/// Resolves the account a credential is filed under from the command line, or refuses the name.
 ///
-/// The account a credential is filed under is the provider's name, so the name is
-/// checked against the providers this build actually has: storing a key under a
-/// misspelling would be a credential nothing ever reads.
+/// The name is a provider, or `provider:plan` for a plan with a credential of its own: a provider's
+/// own account is its name, and z.ai's coding subscription is `zai:coding`. Naming the account so a
+/// build that reads it can find it is the point — storing a key under a misspelling would be a
+/// credential nothing ever reads.
 fn provider_account(asked: &str) -> Result<&'static str, String> {
-    Provider::parse(asked).map(Provider::name).ok_or_else(|| {
-        format!(
-            "unknown provider {asked:?}: this build offers {}",
-            Provider::names().join(", ")
-        )
-    })
+    if let Some((provider, plan)) = asked.split_once(':') {
+        let Some(provider) = Provider::parse(provider) else {
+            return Err(unknown_provider(provider));
+        };
+        if provider.plan(plan).is_none() {
+            let offered: Vec<&str> = provider.plans().iter().map(|entry| entry.name).collect();
+            return Err(format!(
+                "unknown plan {plan:?} for {provider}: it offers {}",
+                offered.join(", ")
+            ));
+        }
+        return Ok(provider.credential_account(Some(plan)));
+    }
+    Provider::parse(asked)
+        .map(Provider::name)
+        .ok_or_else(|| unknown_provider(asked))
+}
+
+/// The refusal for a provider name this build does not have.
+fn unknown_provider(asked: &str) -> String {
+    format!(
+        "unknown provider {asked:?}: this build offers {}",
+        Provider::names().join(", ")
+    )
 }
 
 /// Reads one credential from standard input.
@@ -2031,5 +2059,18 @@ mod tests {
         // And the refusal removed nothing: the session that *is* there is still there.
         let listed = kernel_block_on(store.list()).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(listed.len(), 1, "the store was not touched: {listed:?}");
+    }
+
+    /// A credential name is a provider, or `provider:plan` for a plan with a key of its own.
+    #[test]
+    fn a_credential_name_resolves_to_its_account() {
+        assert_eq!(provider_account("zai").ok(), Some("zai"));
+        // z.ai's coding subscription has an account of its own.
+        assert_eq!(provider_account("zai:coding").ok(), Some("zai:coding"));
+        // A plan that shares the provider's key resolves to the provider's own account.
+        assert_eq!(provider_account("openai:coding").ok(), Some("openai"));
+        // A name this build does not have is refused by name.
+        assert!(provider_account("gemini").is_err());
+        assert!(provider_account("zai:enterprise").is_err());
     }
 }

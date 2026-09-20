@@ -533,6 +533,11 @@ pub struct ViewState {
     pub credential_open: bool,
     /// The provider that question is about.
     pub credential_provider: Option<String>,
+    /// The plan that question is about, when the provider has more than one account.
+    ///
+    /// Carried because a key is filed against the plan as well as the provider: z.ai's coding
+    /// subscription takes a key of its own, so the question and the store both name it.
+    pub credential_plan: Option<String>,
     /// The environment variable that provider's key is normally read from.
     pub credential_env: String,
     /// Whether the masked key-entry field is open.
@@ -618,6 +623,7 @@ impl Default for ViewState {
             pending_switch: None,
             credential_open: false,
             credential_provider: None,
+            credential_plan: None,
             credential_env: String::new(),
             key_entry_open: false,
             key_input: String::new(),
@@ -1892,10 +1898,11 @@ impl ViewState {
             && self.plan.as_deref() == Some(choice.plan.as_str())
     }
 
-    /// Opens the "store a key?" question for a provider.
-    pub fn open_credential(&mut self, provider: &str, env: &str) {
+    /// Opens the "store a key?" question for a provider's plan.
+    pub fn open_credential(&mut self, provider: &str, plan: Option<&str>, env: &str) {
         self.credential_open = true;
         self.credential_provider = Some(provider.to_owned());
+        self.credential_plan = plan.map(str::to_owned);
         env.clone_into(&mut self.credential_env);
     }
 
@@ -1903,7 +1910,18 @@ impl ViewState {
     pub fn close_credential(&mut self) {
         self.credential_open = false;
         self.credential_provider = None;
+        self.credential_plan = None;
         self.credential_env.clear();
+    }
+
+    /// The provider-and-plan the credential question names, for its rows.
+    #[must_use]
+    pub fn credential_label(&self) -> String {
+        match (&self.credential_provider, &self.credential_plan) {
+            (Some(provider), Some(plan)) => format!("{provider} · {plan}"),
+            (Some(provider), None) => provider.clone(),
+            _ => String::from("this provider"),
+        }
     }
 
     /// Opens the masked key-entry field.
@@ -2839,10 +2857,7 @@ impl ViewState {
 
     /// Draws the "no credential — store one?" question.
     fn render_credential(&self, frame: &mut Frame<'_>, area: Rect) {
-        let provider = self
-            .credential_provider
-            .as_deref()
-            .unwrap_or("this provider");
+        let provider = self.credential_label();
         let width = area.width.saturating_sub(4).clamp(32, 80);
         let room = usize::from(width.saturating_sub(2));
         let dim = Style::default().fg(Color::DarkGray);
@@ -2887,10 +2902,7 @@ impl ViewState {
     /// The key is drawn as stars, and the count is cut so a long key cannot widen the dialog: what
     /// is on the screen is never the secret.
     fn render_key_entry(&self, frame: &mut Frame<'_>, area: Rect) {
-        let provider = self
-            .credential_provider
-            .as_deref()
-            .unwrap_or("the provider");
+        let provider = self.credential_label();
         let width = area.width.saturating_sub(4).clamp(30, 72);
         let masked = "*".repeat(self.key_input.chars().count().min(48));
         let dim = Style::default().fg(Color::DarkGray);
@@ -5039,17 +5051,18 @@ mod tests {
         assert!(marked.contains("deepseek"), "{marked}");
     }
 
-    /// The key field is drawn masked, and never shows the secret.
+    /// The key field names the plan whose key is wanted, and never draws the secret.
     #[test]
     fn the_key_field_draws_stars_not_the_key() {
         let mut state = ViewState::new();
-        state.open_credential("zai", "ZAI_API_KEY");
+        state.open_credential("zai", Some("coding"), "ZAI_CODING_API_KEY");
         state.open_key_entry();
         state.key_push('s');
         state.key_push('k');
         state.key_push('x');
         let text = rendered(&mut state, 90, 20);
         assert!(text.contains(" api key "), "{text}");
+        assert!(text.contains("zai · coding"), "the plan is named: {text}");
         assert!(text.contains("***"), "the key is masked: {text}");
         assert!(!text.contains("skx"), "the key is never drawn: {text}");
     }
