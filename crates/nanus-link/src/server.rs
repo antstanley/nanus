@@ -57,7 +57,7 @@ use tokio::task::JoinSet;
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
-    AgentInfo, ApprovalState, EffortState, Frame, Request, SessionInfo, TurnEnd,
+    AgentInfo, ApprovalState, EffortState, Frame, ModelEfforts, Request, SessionInfo, TurnEnd,
 };
 use crate::wire::{read_request, write_frame};
 
@@ -202,9 +202,31 @@ impl Agent {
             model: self.model(),
             models: self.models.clone(),
             effort: self.effort(),
+            model_efforts: self.model_efforts(),
             tools: self.tools,
             version: crate::protocol::PROTOCOL_VERSION,
         }
+    }
+
+    /// Returns the effort steps each offered model takes, read from the runner's adapter.
+    ///
+    /// The adapter owns the fact — which steps a provider refuses differs between its models —
+    /// and the runner is where the adapter is, so this asks it rather than keeping a second copy
+    /// that could drift from the one the request will obey.
+    fn model_efforts(&self) -> Vec<ModelEfforts> {
+        self.models
+            .iter()
+            .map(|model| ModelEfforts {
+                model: model.clone(),
+                efforts: self
+                    .runner
+                    .effort_levels(model)
+                    .iter()
+                    .copied()
+                    .map(wire_effort)
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Starts a session for a new conversation.
@@ -857,20 +879,26 @@ const fn wire_state(policy: ApprovalPolicy) -> ApprovalState {
 /// An exhaustive match, so a step the ports scale grows cannot quietly fail to cross.
 const fn wire_effort(effort: nanus_ports::ReasoningEffort) -> EffortState {
     match effort {
+        nanus_ports::ReasoningEffort::None => EffortState::None,
         nanus_ports::ReasoningEffort::Minimal => EffortState::Minimal,
         nanus_ports::ReasoningEffort::Low => EffortState::Low,
         nanus_ports::ReasoningEffort::Medium => EffortState::Medium,
         nanus_ports::ReasoningEffort::High => EffortState::High,
+        nanus_ports::ReasoningEffort::XHigh => EffortState::XHigh,
+        nanus_ports::ReasoningEffort::Max => EffortState::Max,
     }
 }
 
 /// Reads the link's effort into the ports vocabulary.
 const fn domain_effort(state: EffortState) -> nanus_ports::ReasoningEffort {
     match state {
+        EffortState::None => nanus_ports::ReasoningEffort::None,
         EffortState::Minimal => nanus_ports::ReasoningEffort::Minimal,
         EffortState::Low => nanus_ports::ReasoningEffort::Low,
         EffortState::Medium => nanus_ports::ReasoningEffort::Medium,
         EffortState::High => nanus_ports::ReasoningEffort::High,
+        EffortState::XHigh => nanus_ports::ReasoningEffort::XHigh,
+        EffortState::Max => nanus_ports::ReasoningEffort::Max,
     }
 }
 

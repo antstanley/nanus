@@ -392,6 +392,7 @@ than sending it to the model.
 | `/help` | draw the key list, the same one `?` opens |
 | `/clear` | empty the transcript, leaving the draft and the toggles alone |
 | `/model [id]` | open the model selector, or switch to the one named |
+| `/effort [step]` | open the effort chooser, or switch to the step named |
 | `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
@@ -667,18 +668,25 @@ other than to press it.
 
 ### How hard the model is asked to think
 
-`Alt+T` steps the reasoning effort, and the title bar names the step in force. The scale is the
-provider's own, four steps from `minimal` — which is how a provider says "do not think" — through
-`low` and `medium` to `high`, and the key cycles it rather than toggling it: only one of the four
-means "no thinking", so a toggle would have to invent what "on" means for a reader who had already
-chosen `low`. A session that has not said which effort it is using starts above the middle, since a
-reader pressing a key called extended thinking means more thinking rather than the setting they
-already had.
+`Alt+T` steps the reasoning effort, and the title bar names the step in force. The neutral scale is
+seven steps — `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — but **only the steps the
+current model takes are offered**: which steps a provider refuses differs between its models, so
+the key cycles the model's own list and `/effort` opens a chooser over it. `/effort <step>` names
+one directly, and a step the model does not take is refused in the status line rather than sent for
+the provider to refuse. The key cycles rather than toggles, because the bottom of the scale is how
+a provider says "do not think" and the rest are degrees of thinking, so a toggle would have to
+invent what "on" means for a reader who had already chosen `low`.
+
+The steps each model takes travel with the handshake, beside the models, because the adapter is
+what knows them: OpenAI's `gpt-5.6` family takes `none` through `max` while `gpt-5.3-codex` stops
+at `xhigh` and the previous generation at `high`, Anthropic's 5-series takes `low` through `max`
+while Haiku 4.5 and the previous generation take no effort parameter at all, and z.ai's GLM-5.3
+models cannot turn thinking off, so `none` is not offered for them.
 
 Like the model, the effort belongs to the agent's runner and reaches every watcher, and it takes
 effect on the next request rather than the next turn. An adapter with no notion of effort says so
-by the absence: nothing is drawn beside the model, and a change is a request the adapter ignores
-rather than an error.
+by the absence: nothing is drawn beside the model, `/effort` says the current model has no effort
+to choose, and a change is a request the adapter ignores rather than an error.
 
 ## Scrolling back
 

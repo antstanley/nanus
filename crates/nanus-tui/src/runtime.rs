@@ -340,6 +340,14 @@ pub trait SessionSource {
         &[]
     }
 
+    /// The effort steps each offered model takes, by model id, from the agent's handshake.
+    ///
+    /// Empty for a source with no agent, so the chooser offers the whole neutral scale no more
+    /// than it offers a model the agent would not accept.
+    fn model_efforts(&self) -> Vec<(String, Vec<String>)> {
+        Vec::new()
+    }
+
     /// Which model the conversation is being answered by, when one was said.
     ///
     /// `None` means nothing recorded one — a session from before the configuration was written
@@ -562,6 +570,8 @@ pub struct Remote {
     /// The model the agent reported, and the ones it offers to switch between.
     model: Option<String>,
     models: Vec<String>,
+    /// The effort steps each offered model takes, by model id, from the handshake.
+    model_efforts: Vec<(String, Vec<String>)>,
     /// The reasoning effort the agent reported, when it has one.
     effort: Option<ReasoningEffort>,
     /// Whether a turn was already running in the session when it was attached to.
@@ -629,6 +639,20 @@ impl Remote {
             approval,
             model: Some(agent.model.clone()),
             models: agent.models.clone(),
+            model_efforts: agent
+                .model_efforts
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.model.clone(),
+                        entry
+                            .efforts
+                            .iter()
+                            .map(|state| view_effort(*state).as_str().to_owned())
+                            .collect(),
+                    )
+                })
+                .collect(),
             effort: agent.effort.map(view_effort),
             busy,
             redundant_backlog,
@@ -698,6 +722,10 @@ impl SessionSource for Remote {
 
     fn models(&self) -> &[String] {
         &self.models
+    }
+
+    fn model_efforts(&self) -> Vec<(String, Vec<String>)> {
+        self.model_efforts.clone()
     }
 
     fn model(&self) -> Option<&str> {
@@ -791,20 +819,26 @@ const fn wire_state(policy: ApprovalPolicy) -> ApprovalState {
 /// value the wire cannot carry.
 const fn wire_effort(effort: ReasoningEffort) -> EffortState {
     match effort {
+        ReasoningEffort::None => EffortState::None,
         ReasoningEffort::Minimal => EffortState::Minimal,
         ReasoningEffort::Low => EffortState::Low,
         ReasoningEffort::Medium => EffortState::Medium,
         ReasoningEffort::High => EffortState::High,
+        ReasoningEffort::XHigh => EffortState::XHigh,
+        ReasoningEffort::Max => EffortState::Max,
     }
 }
 
 /// Reads the link's effort into the interface's vocabulary.
 const fn view_effort(state: EffortState) -> ReasoningEffort {
     match state {
+        EffortState::None => ReasoningEffort::None,
         EffortState::Minimal => ReasoningEffort::Minimal,
         EffortState::Low => ReasoningEffort::Low,
         EffortState::Medium => ReasoningEffort::Medium,
         EffortState::High => ReasoningEffort::High,
+        EffortState::XHigh => ReasoningEffort::XHigh,
+        EffortState::Max => ReasoningEffort::Max,
     }
 }
 
@@ -1015,6 +1049,8 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     view.label = source.label().map(str::to_owned);
     view.model = source.model().map(str::to_owned);
     view.models = source.models().to_vec();
+    view.model_efforts = source.model_efforts().into_iter().collect();
+    view.refresh_effort_levels();
     view.effort = source.effort().map(|effort| effort.as_str().to_owned());
     // Only when one was asked for: the default is already the fail-closed state, and a live
     // conversation overwrites this with the agent's own answer as soon as it is attached.
@@ -1099,8 +1135,7 @@ async fn event_loop(
                 }
                 let outcome = handle_key(key, &mut view);
                 // After every keystroke, because a mention is a property of the text: typing
-                // narrows it, deleting closes it, and moving the caret into a different word
-                // changes which one it is.
+                // narrows it, deleting closes it, and moving the caret changes which one it is.
                 refresh_mentions(&mut view, &mut files, source.workspace());
                 match outcome {
                     Outcome::Quit => break,
@@ -1145,15 +1180,9 @@ async fn event_loop(
                         view.status = String::from("permission: Enter applies, Esc cancels");
                     }
                     Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
+                    Outcome::SetEffort(step) => set_effort_word(&step, source, &mut view),
                     Outcome::CycleEffort => cycle_effort(source, &mut view),
-                    Outcome::SetApproval(policy) => {
-                        // Applied locally first, so the status line answers the keypress
-                        // immediately, and sent to the agent, which owns the gate: the state
-                        // has to reach the loop rather than the next prompt.
-                        view.approval = policy;
-                        view.status = format!("approval: {}", policy.label());
-                        source.set_approval(policy);
-                    }
+                    Outcome::SetApproval(policy) => set_approval(policy, source, &mut view),
                     Outcome::Submit(prompt) => {
                         if submitted(
                             prompt,
@@ -1241,6 +1270,11 @@ enum Routed {
     /// view's, and the router is a pure function of the line. A bare `/model` asks for this
     /// rather than a blind cycle, so a reader reads the ids before choosing one.
     Models,
+    /// Choose an effort: open the chooser when nothing is named, and set the named step when it is.
+    ///
+    /// Routed for the same reason as [`Routed::Models`]: the steps the current model takes are the
+    /// view's state, carried in the handshake, and the router cannot know them.
+    Efforts(Option<String>),
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1262,6 +1296,9 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         Submission::Run(Command::Model) => {
             model_argument(&prompt).map_or(Routed::Models, |named| Routed::SetModel(Some(named)))
         }
+        // The argument is the step's own word: `/effort` opens the chooser and `/effort <step>`
+        // names one, which the view checks against the model's own list before it is sent.
+        Submission::Run(Command::Effort) => Routed::Efforts(model_argument(&prompt)),
         Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
             if command.trim().is_empty() {
@@ -1417,6 +1454,10 @@ async fn submitted(
         Routed::Shell(command) => begin_shell(command, shells, view),
         Routed::SetModel(requested) => switch_model(requested, source, view),
         Routed::Models => open_model_selector(view),
+        Routed::Efforts(requested) => match requested {
+            Some(step) => set_effort_word(&step, source, view),
+            None => open_effort_chooser(view),
+        },
         Routed::Say(message) => {
             view.transcript.push(Entry::notice(message));
             view.scroll_to_bottom();
@@ -1581,15 +1622,56 @@ fn paste_image(read: &dyn Fn() -> Option<Vec<u8>>, workspace: Option<&str>, view
 /// read back through the scale itself rather than through a second list of steps kept here — and
 /// the two directions of that scale are one definition, in the ports crate, with a round trip
 /// test either side of them.
+/// Applies an approval state, locally and to the agent.
+///
+/// Applied locally first, so the status line answers the keypress immediately, and sent to the
+/// agent, which owns the gate: the state has to reach the loop rather than the next prompt.
+fn set_approval(policy: ApprovalPolicy, source: &mut dyn SessionSource, view: &mut ViewState) {
+    view.approval = policy;
+    view.status = format!("approval: {}", policy.label());
+    source.set_approval(policy);
+}
+
+/// Opens the effort chooser, or says the current model takes none.
+fn open_effort_chooser(view: &mut ViewState) {
+    view.status = if view.open_efforts() {
+        String::from("thinking: Enter applies, Esc cancels")
+    } else {
+        String::from("this model has no effort to choose")
+    };
+}
+
+/// Sets the effort to a named step, when the current model takes it.
+///
+/// Checked against the model's own list rather than the whole neutral scale, so `/effort max` on a
+/// model that stops at `high` is refused where the reader is looking rather than sent for the
+/// provider to refuse.
+fn set_effort_word(word: &str, source: &mut dyn SessionSource, view: &mut ViewState) {
+    let Some(step) = ReasoningEffort::parse(word) else {
+        view.status = format!("no such effort: {word}");
+        return;
+    };
+    if !view.effort_levels.iter().any(|level| level == word) {
+        view.status = format!("this model does not take: {word}");
+        return;
+    }
+    view.effort = Some(step.as_str().to_owned());
+    view.status = format!("thinking: {step}");
+    source.set_effort(step);
+}
+
+/// Moves to the next effort the current model takes, or says there is none.
 fn cycle_effort(source: &mut dyn SessionSource, view: &mut ViewState) {
-    let chosen = view
-        .effort
-        .as_deref()
-        .and_then(ReasoningEffort::parse)
-        .map_or_else(|| ReasoningEffort::Medium.next(), ReasoningEffort::next);
-    view.effort = Some(chosen.as_str().to_owned());
-    view.status = format!("thinking: {chosen}");
-    source.set_effort(chosen);
+    let Some(next) = view.next_effort() else {
+        view.status = String::from("this model has no effort to choose");
+        return;
+    };
+    let Some(step) = ReasoningEffort::parse(&next) else {
+        return;
+    };
+    view.effort = Some(next);
+    view.status = format!("thinking: {step}");
+    source.set_effort(step);
 }
 
 /// The model a cycle moves to, or `None` when there is nothing to move to.
@@ -1696,6 +1778,11 @@ enum Outcome {
     OpenPermissions,
     /// Switch to this model, or to the next one when nothing is named.
     SetModel(Option<String>),
+    /// Set the effort to this step, named as its wire word.
+    ///
+    /// An outcome rather than the key handling doing it, because it is sent to the agent: the keys
+    /// decide what the reader meant, and the loop is where the request leaves.
+    SetEffort(String),
     /// Read an image off the clipboard and put its path in the composer.
     PasteImage,
     /// Copy the selection to the clipboard.
@@ -1739,6 +1826,10 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     // behind it would be typed into a prompt nobody can see.
     if view.model_open {
         return handle_model_key(key, view);
+    }
+    // The effort chooser owns the keyboard while it is up, on the same rule.
+    if view.effort_open {
+        return handle_effort_key(key, view);
     }
     // The key list is what the reader asked to look at, and it is drawn over the composer, so
     // it owns the keyboard while it is up — as the queue overlay does. A key that reached the
@@ -1923,6 +2014,37 @@ fn handle_model_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         KeyCode::Char(digit @ '1'..='9') => {
             let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
             let _ = view.model_select(position);
+        }
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Routes a key while the effort chooser is open.
+///
+/// The same vocabulary as the model selector, over the steps the current model takes: move,
+/// choose, cancel, and nothing else reaching the composer behind it.
+fn handle_effort_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => view.close_efforts(),
+        // `Ctrl+C` abandons what is in front of the reader everywhere else in this interface,
+        // and cancelling here changes nothing: the effort in force is whatever it already was.
+        KeyCode::Char('c' | 'C') if control => view.close_efforts(),
+        KeyCode::Enter => {
+            // Closed before the choice leaves, so a reader cannot press Enter twice and have the
+            // second press land on a step they never looked at.
+            let chosen = view.selected_effort();
+            view.close_efforts();
+            if let Some(chosen) = chosen {
+                return Outcome::SetEffort(chosen);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => view.effort_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => view.effort_down(),
+        KeyCode::Char(digit @ '1'..='9') => {
+            let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
+            let _ = view.effort_select(position);
         }
         _ => {}
     }
@@ -2516,6 +2638,9 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // named in the next request. A client that switched it has already drawn the
             // switch, and a client watching another conversation learns it from this frame.
             view.model = Some(model);
+            // The steps a model takes differ between models, so the chooser and the cycle follow
+            // the switch rather than keeping the previous model's list.
+            view.refresh_effort_levels();
         }
         Frame::Tool {
             call_id,
@@ -4083,41 +4208,96 @@ mod tests {
     ///
     /// A cycle rather than a toggle, because only one of the four steps means "no thinking": a
     /// toggle would have to invent what "on" means for a reader who had already chosen `low`.
+    /// A cycle through the steps the current model takes, wrapping round, each move sent to the
+    /// agent. The steps are the model's own, so the key never lands on one the provider refuses.
     #[test]
-    fn the_thinking_key_cycles_the_effort_and_tells_the_agent() {
+    fn the_thinking_key_cycles_the_steps_the_model_takes() {
         let mut view = ViewState::new();
+        view.model = Some(String::from("m"));
+        view.model_efforts.insert(
+            String::from("m"),
+            vec![
+                String::from("low"),
+                String::from("high"),
+                String::from("max"),
+            ],
+        );
+        view.refresh_effort_levels();
         let mut source = Scripted::new(Vec::new());
         assert!(matches!(
             handle_key(key(KeyCode::Char('t'), KeyModifiers::ALT), &mut view),
             Outcome::CycleEffort
         ));
 
-        // Nothing said which effort is in use, so the cycle starts at the middle of the scale —
-        // where an unset request lands — and moves from there.
-        let _ = handle_key(key(KeyCode::Char('t'), KeyModifiers::ALT), &mut view);
+        // Nothing said which effort is in use, so the cycle starts at the model's first step.
         cycle_effort(&mut source, &mut view);
-        assert_eq!(view.effort.as_deref(), Some("high"));
-        assert_eq!(view.status, "thinking: high");
+        assert_eq!(view.effort.as_deref(), Some("low"));
+        assert_eq!(view.status, "thinking: low");
 
-        for expected in [
-            ReasoningEffort::Minimal,
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-        ] {
+        // Then the rest, wrapping round rather than stopping at the top.
+        for expected in ["high", "max", "low"] {
             cycle_effort(&mut source, &mut view);
             assert_eq!(
                 view.effort.as_deref(),
-                Some(expected.as_str()),
+                Some(expected),
                 "the cycle wraps round"
             );
         }
         assert_eq!(
             source.requests.borrow().last(),
             Some(&Request::SetEffort {
-                state: EffortState::High
+                state: EffortState::Low
             })
         );
+    }
+
+    /// A model with no effort to choose says so rather than moving a step it does not take.
+    #[test]
+    fn the_thinking_key_says_so_when_the_model_takes_no_effort() {
+        let mut view = ViewState::new();
+        let mut source = Scripted::new(Vec::new());
+        cycle_effort(&mut source, &mut view);
+        assert!(view.status.contains("no effort"), "{}", view.status);
+        assert!(source.requests.borrow().is_empty());
+    }
+
+    /// `/effort` opens a chooser over the current model's steps; a named step outside them is
+    /// refused where the reader is looking rather than sent for the provider to refuse.
+    #[test]
+    fn the_effort_command_offers_only_the_models_steps() {
+        let mut view = ViewState::new();
+        view.model = Some(String::from("m"));
+        view.model_efforts.insert(
+            String::from("m"),
+            vec![String::from("low"), String::from("high")],
+        );
+        view.refresh_effort_levels();
+        let mut source = Scripted::new(Vec::new());
+
+        open_effort_chooser(&mut view);
+        assert!(view.effort_open, "{}", view.status);
+        assert_eq!(view.selected_effort().as_deref(), Some("low"));
+
+        let _ = handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        let outcome = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(!view.effort_open, "Enter closes the chooser");
+        let Outcome::SetEffort(step) = outcome else {
+            panic!("Enter asks for a step");
+        };
+        set_effort_word(&step, &mut source, &mut view);
+        assert_eq!(view.effort.as_deref(), Some("high"));
+        assert_eq!(view.status, "thinking: high");
+
+        // A step the model does not take is refused here, and changes nothing.
+        set_effort_word("max", &mut source, &mut view);
+        assert!(view.status.contains("does not take"), "{}", view.status);
+        assert_eq!(view.effort.as_deref(), Some("high"));
+
+        // A model with no effort at all opens nothing and says so.
+        view.effort_levels.clear();
+        open_effort_chooser(&mut view);
+        assert!(!view.effort_open);
+        assert!(view.status.contains("no effort"), "{}", view.status);
     }
 
     /// The agent is the authority on the effort its next request carries, and a recording has
@@ -4279,6 +4459,18 @@ mod tests {
         assert_eq!(
             route_submission(String::from("/model deepseek-v4-pro"), true),
             Routed::SetModel(Some(String::from("deepseek-v4-pro")))
+        );
+
+        // `/effort` is the same pair: a bare one opens the chooser, an argument names a step the
+        // view checks against the current model's own list.
+        assert_eq!(
+            route_submission(String::from("/effort"), true),
+            Routed::Efforts(None),
+            "a bare /effort opens the chooser"
+        );
+        assert_eq!(
+            route_submission(String::from("/effort high"), true),
+            Routed::Efforts(Some(String::from("high")))
         );
 
         // Prose is prose, and a prompt in a recording is refused rather than dropped.
@@ -5131,6 +5323,7 @@ mod tests {
                 model: "m".to_owned(),
                 models: Vec::new(),
                 effort: None,
+                model_efforts: Vec::new(),
                 tools: 0,
                 version: nanus_link::protocol::PROTOCOL_VERSION,
             }),

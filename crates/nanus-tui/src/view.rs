@@ -8,6 +8,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use std::collections::BTreeMap;
 
 use nanus_domain::ApprovalPolicy;
 use unicode_width::UnicodeWidthChar as _;
@@ -482,6 +483,33 @@ pub struct ViewState {
     /// callers, so a selection can never point past the end.
     pub model_selection: usize,
 
+    /// Whether the effort chooser is open.
+    ///
+    /// While it is set the chooser owns the keyboard, as the model selector does: the reader is
+    /// choosing from the steps the current model takes, and a key that reached the composer
+    /// behind it would be typed into a prompt nobody can see. A model with no notion of effort —
+    /// an Anthropic model that predates the parameter — never opens it, and says so instead.
+    pub effort_open: bool,
+
+    /// Which offered effort the chooser has selected.
+    ///
+    /// An index into [`ViewState::effort_levels`], kept in range by the methods rather than by
+    /// the callers, so a selection can never point past the end.
+    pub effort_selection: usize,
+
+    /// The effort steps the current model takes, in increasing order, as their wire words.
+    ///
+    /// Empty means the model has no notion of effort, and the chooser says so rather than drawing
+    /// an empty list. Kept as the words rather than the ports enum because this half builds
+    /// without the runtime crates, exactly as [`ViewState::effort`] is.
+    pub effort_levels: Vec<String>,
+
+    /// The effort steps each offered model takes, by model id, from the agent's handshake.
+    ///
+    /// Kept so a model switch can swap [`ViewState::effort_levels`] without another round trip:
+    /// the handshake describes every model, and the current one is looked up from here.
+    pub model_efforts: BTreeMap<String, Vec<String>>,
+
     /// How many rows into the key list the overlay starts.
     ///
     /// The list is longer than a short terminal, so it is scrolled rather than cut: an
@@ -544,6 +572,10 @@ impl Default for ViewState {
             permission_selection: 0,
             model_open: false,
             model_selection: 0,
+            effort_open: false,
+            effort_selection: 0,
+            effort_levels: Vec::new(),
+            model_efforts: BTreeMap::new(),
             last_viewport: None,
             last_composer: None,
         }
@@ -1142,6 +1174,7 @@ impl ViewState {
             || self.help_open
             || self.permission_open
             || self.model_open
+            || self.effort_open
             || self.pending_approval.is_some()
     }
 
@@ -1629,6 +1662,103 @@ impl ViewState {
         self.models.get(self.model_selection).cloned()
     }
 
+    /// Refreshes the effort steps for whatever model is in force.
+    ///
+    /// Called when the handshake arrives and whenever the model changes, so the chooser and the
+    /// `Alt+T` cycle offer the steps that model takes rather than the whole neutral scale.
+    pub fn refresh_effort_levels(&mut self) {
+        self.effort_levels = self
+            .model
+            .as_ref()
+            .and_then(|model| self.model_efforts.get(model).cloned())
+            .unwrap_or_default();
+    }
+
+    /// Opens the effort chooser, on the effort in force when it is one of the offered steps.
+    ///
+    /// Returns `false` when the current model takes no effort, so the caller can say so rather
+    /// than draw an empty list.
+    pub fn open_efforts(&mut self) -> bool {
+        if self.effort_levels.is_empty() {
+            return false;
+        }
+        self.effort_open = true;
+        self.effort_selection = self
+            .effort
+            .as_ref()
+            .and_then(|current| self.effort_levels.iter().position(|step| step == current))
+            .unwrap_or(0);
+        true
+    }
+
+    /// Closes the effort chooser without changing anything.
+    pub fn close_efforts(&mut self) {
+        self.effort_open = false;
+    }
+
+    /// Moves the chooser's selection toward the least effort, wrapping round.
+    pub fn effort_up(&mut self) {
+        self.effort_selection = self
+            .effort_selection
+            .checked_sub(1)
+            .unwrap_or_else(|| self.effort_levels.len().saturating_sub(1));
+    }
+
+    /// Moves the chooser's selection toward the most effort, wrapping round.
+    pub fn effort_down(&mut self) {
+        self.effort_selection =
+            if self.effort_selection.saturating_add(1) >= self.effort_levels.len() {
+                0
+            } else {
+                self.effort_selection.saturating_add(1)
+            };
+    }
+
+    /// Selects an offered effort by its position in the chooser.
+    ///
+    /// Returns `false` for a position that is not offered, so a caller can say nothing rather
+    /// than moving a selection that does not exist.
+    #[must_use]
+    pub fn effort_select(&mut self, position: usize) -> bool {
+        if position >= self.effort_levels.len() {
+            return false;
+        }
+        self.effort_selection = position;
+        true
+    }
+
+    /// Returns the effort the chooser has selected, if any.
+    #[must_use]
+    pub fn selected_effort(&self) -> Option<String> {
+        self.effort_levels.get(self.effort_selection).cloned()
+    }
+
+    /// Returns the step `Alt+T` should move to from the effort in force.
+    ///
+    /// The offered steps are the model's own, so a cycle through them never lands on one the
+    /// provider refuses. An effort in force that is not one of them — a session resumed under a
+    /// model that changed — starts the cycle at the first step, which keeps the key useful.
+    #[must_use]
+    pub fn next_effort(&self) -> Option<String> {
+        let first = self.effort_levels.first()?;
+        let Some(current) = self.effort.as_ref() else {
+            // Nothing said which effort is in use, so the cycle starts at the model's default
+            // step: the first one the provider lists, which is what a request that names none
+            // lands on for the models that have one.
+            return Some(first.clone());
+        };
+        let position = self
+            .effort_levels
+            .iter()
+            .position(|step| step == current)
+            .unwrap_or_else(|| self.effort_levels.len().saturating_sub(1));
+        let next = self
+            .effort_levels
+            .get(position.saturating_add(1))
+            .unwrap_or(first);
+        Some(next.clone())
+    }
+
     /// The rows of the key list that fit in `height`, and where they start.
     #[must_use]
     fn help_window(&self, height: u16) -> (usize, usize) {
@@ -1961,6 +2091,9 @@ impl ViewState {
         // are routed first have to be the things on top.
         if self.model_open {
             self.render_models(frame, area);
+        }
+        if self.effort_open {
+            self.render_efforts(frame, area);
         }
         // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
         // be the thing a reader sees, not a dialogue behind the transcript.
@@ -2387,6 +2520,75 @@ impl ViewState {
             )))
             .title_bottom(Line::from(Span::styled(
                 " Enter switches, Esc cancels ",
+                Style::default().fg(Color::DarkGray),
+            )));
+        // Cleared first, so the transcript behind the dialog does not show through the gaps
+        // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .style(self.theme.notice),
+            dialog,
+        );
+    }
+
+    /// Draws the effort chooser.
+    ///
+    /// The steps the current model takes, one per row, with the one in force marked: `/effort`
+    /// opens this rather than cycling blind, and the list is the model's own so nothing here can
+    /// offer a step the provider refuses.
+    fn render_efforts(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.effort_levels.is_empty() {
+            return;
+        }
+        let width = area.width.saturating_sub(4).clamp(24, 60);
+        let room = usize::from(width.saturating_sub(2));
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            "how hard the model is asked to think",
+            Style::default().fg(Color::DarkGray),
+        ))];
+        for (index, step) in self.effort_levels.iter().enumerate() {
+            let selected = index == self.effort_selection;
+            let style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "\u{25b6}" } else { " " };
+            // The step in force is marked in the row rather than left to the title bar behind
+            // the dialog: `Enter` on it changes nothing, and a reader should see that first.
+            let current = if self.effort.as_deref() == Some(step.as_str()) {
+                " · current"
+            } else {
+                ""
+            };
+            let text = format!("{marker} {} {step}{current}", index.saturating_add(1));
+            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
+        }
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(4).max(4));
+        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
+        // workspace treats integer division as a defect wherever it appears.
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.busy)
+            .title(Line::from(Span::styled(
+                " thinking ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .title_bottom(Line::from(Span::styled(
+                " Enter applies, Esc cancels ",
                 Style::default().fg(Color::DarkGray),
             )));
         // Cleared first, so the transcript behind the dialog does not show through the gaps

@@ -47,7 +47,7 @@ mod wire;
 
 pub use config::{
     OPENAI_API_KEY_ENV, OPENAI_BASE_URL, OpenAiConfig, Vendor, ZAI_API_KEY_ENV, ZAI_BASE_URL,
-    ZAI_CODING_BASE_URL, wire_effort,
+    ZAI_CODING_BASE_URL, effort_spelling, openai_effort_levels, zai_effort_levels,
 };
 pub use error::OpenAiError;
 pub use nanus_ports::ReasoningEffort;
@@ -147,14 +147,13 @@ impl LlmPort for OpenAiLlm {
     }
 
     fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        // Reported only where the provider publishes a scale. z.ai has a switch, not
-        // a scale, so recording one of these steps for it would claim a granularity
-        // that never reached the wire — and a session that cannot be compared is
-        // better than one that lies about what produced it.
-        if self.config.vendor().has_effort_scale() {
-            return Some(self.config.reasoning_effort());
-        }
-        None
+        // Both vendors take the same scale on the wire now, so a chosen step is a fact
+        // worth recording for either.
+        Some(self.config.reasoning_effort())
+    }
+
+    fn effort_levels(&self, model: &str) -> &'static [ReasoningEffort] {
+        self.config.vendor().effort_levels(model)
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
@@ -351,10 +350,9 @@ mod tests {
         assert!(rendered.contains("gpt-5"), "{rendered}");
     }
 
-    /// A vendor with a switch reports no effort, because a step that never reached
-    /// the wire is not a fact about the run.
+    /// Both vendors name an effort on the wire now, so both report the one they would send.
     #[test]
-    fn the_reported_effort_is_absent_where_the_vendor_has_no_scale() {
+    fn both_vendors_report_the_effort_they_send() {
         let Some(openai) = adapter(Vendor::OpenAi) else {
             return;
         };
@@ -362,7 +360,7 @@ mod tests {
         let Some(zai) = adapter(Vendor::Zai) else {
             return;
         };
-        assert_eq!(zai.reasoning_effort(), None);
+        assert_eq!(zai.reasoning_effort(), Some(ReasoningEffort::Medium));
     }
 
     #[test]

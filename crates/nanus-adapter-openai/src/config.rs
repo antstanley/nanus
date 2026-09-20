@@ -141,14 +141,18 @@ impl Vendor {
         }
     }
 
-    /// Returns `true` when the vendor publishes a scale of efforts.
+    /// Returns the effort steps this vendor acts on for `model`, in increasing order.
     ///
-    /// `OpenAI` names four steps, so a chosen one is a fact worth recording. z.ai
-    /// publishes a switch, so a step recorded for it would name a value that never
-    /// reached the wire.
+    /// Which steps a model takes is the provider's fact and it differs between them: the
+    /// `gpt-5.6` family takes `none` through `max` while `gpt-5.3-codex` has no `none`, and
+    /// z.ai's GLM-5.3 models cannot turn thinking off at all. A chooser that offered the whole
+    /// scale would offer steps the provider refuses, so the interface draws this list.
     #[must_use]
-    pub const fn has_effort_scale(self) -> bool {
-        matches!(self, Self::OpenAi)
+    pub fn effort_levels(self, model: &str) -> &'static [ReasoningEffort] {
+        match self {
+            Self::OpenAi => openai_effort_levels(model),
+            Self::Zai => zai_effort_levels(model),
+        }
     }
 
     /// Returns the provider's documented maximum output tokens.
@@ -376,32 +380,87 @@ impl OpenAiConfig {
     }
 }
 
-/// Translates the harness's neutral effort into a vendor's wire vocabulary.
+/// The spelling of a neutral effort on the wire.
 ///
-/// | Port | `OpenAI` | z.ai |
-/// |---|---|---|
-/// | `Minimal` | `minimal` | thinking disabled |
-/// | `Low` | `low` | thinking enabled |
-/// | `Medium` | `medium` | thinking enabled |
-/// | `High` | `high` | thinking enabled |
-///
-/// `OpenAI` publishes the same four steps the port does, so that mapping is exact.
-/// z.ai expresses thinking as a *mode* rather than as a scale, so the neutral steps
-/// above `Minimal` all mean "think" and the adapter does not invent a granularity
-/// the provider does not document. `None` is the mode: thinking is turned off
-/// rather than asked for less of.
+/// Both vendors name reasoning depth with the same seven words — `none`, `minimal`, `low`,
+/// `medium`, `high`, `xhigh`, `max` — so the neutral step travels as written. They differ in how
+/// they express *thinking off*: `OpenAI` just sends `none`, while z.ai needs the thinking switch on
+/// as well, which [`crate::wire`] writes for it.
 #[must_use]
-pub const fn wire_effort(vendor: Vendor, effort: ReasoningEffort) -> Option<&'static str> {
-    match vendor {
-        Vendor::OpenAi => Some(effort.as_str()),
-        Vendor::Zai => match effort {
-            ReasoningEffort::Minimal => None,
-            ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High => {
-                Some("enabled")
-            }
-        },
+pub const fn effort_spelling(effort: ReasoningEffort) -> &'static str {
+    effort.as_str()
+}
+
+/// The effort steps `OpenAI`'s `gpt-5.6` family takes: `none` through `max`.
+const OPENAI_FULL: &[ReasoningEffort] = &[
+    ReasoningEffort::None,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+];
+
+/// The steps a model takes that has no `none`: `gpt-6-astra`.
+const OPENAI_NO_NONE: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+];
+
+/// The steps `gpt-5.3-codex` takes: no `none` and no `max`.
+const OPENAI_CODEX: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+];
+
+/// The steps the previous-generation models take: `minimal` through `high`.
+const OPENAI_LEGACY: &[ReasoningEffort] = &[
+    ReasoningEffort::Minimal,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+];
+
+/// The documented effort steps for one `OpenAI` model.
+///
+/// Read from each model's own page rather than guessed: the family splits between four and six
+/// steps, and a model the table does not know falls back to the previous generation's four, which
+/// every reasoning model accepts.
+#[must_use]
+pub fn openai_effort_levels(model: &str) -> &'static [ReasoningEffort] {
+    match model {
+        "gpt-6-astra" => OPENAI_NO_NONE,
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => OPENAI_FULL,
+        "gpt-5.3-codex" => OPENAI_CODEX,
+        _ => OPENAI_LEGACY,
     }
 }
+
+/// The documented effort steps for one z.ai model.
+///
+/// The GLM-5.3 family can no longer turn thinking off — sending a disabled switch is an error —
+/// so its list starts at `low`; GLM-5.2 keeps the whole scale, `none` included.
+#[must_use]
+pub fn zai_effort_levels(model: &str) -> &'static [ReasoningEffort] {
+    match model {
+        "glm-5.2" => OPENAI_FULL,
+        _ => ZAI_FORCED,
+    }
+}
+
+/// The steps a z.ai model that cannot disable thinking takes.
+const ZAI_FORCED: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+];
 
 #[cfg(test)]
 mod tests {
@@ -496,37 +555,60 @@ mod tests {
         assert_eq!(Vendor::Zai.output_token_field(), "max_tokens");
     }
 
-    /// Only a vendor with a scale reports one.
+    /// Every neutral step travels as its own name, for both vendors.
     #[test]
-    fn only_openai_publishes_an_effort_scale() {
-        assert!(Vendor::OpenAi.has_effort_scale());
-        assert!(!Vendor::Zai.has_effort_scale());
+    fn every_effort_travels_as_its_own_name() {
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(effort_spelling(effort), effort.as_str());
+        }
     }
 
-    /// Every step of the neutral scale has an answer, and the answer differs by
-    /// vendor where the providers differ.
+    /// The steps offered are the ones each model documents, which differ by model.
     #[test]
-    fn the_effort_scale_maps_per_vendor() {
-        // OpenAI publishes the same four steps the port does.
+    fn the_offered_levels_follow_the_model() {
+        // The `gpt-5.6` family takes `none` through `max`.
         assert_eq!(
-            wire_effort(Vendor::OpenAi, ReasoningEffort::Minimal),
-            Some("minimal")
+            Vendor::OpenAi.effort_levels("gpt-5.6-sol"),
+            [
+                ReasoningEffort::None,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+            ]
         );
-        assert_eq!(
-            wire_effort(Vendor::OpenAi, ReasoningEffort::High),
-            Some("high")
+        // The flagship has no `none` of its own.
+        assert!(
+            !Vendor::OpenAi
+                .effort_levels("gpt-6-astra")
+                .contains(&ReasoningEffort::None)
         );
-        // z.ai has a mode, not a scale: only "no thinking" is distinguishable.
-        assert_eq!(wire_effort(Vendor::Zai, ReasoningEffort::Minimal), None);
-        assert_eq!(
-            wire_effort(Vendor::Zai, ReasoningEffort::Medium),
-            Some("enabled")
+        // The previous generation stops at `high`.
+        assert!(
+            !Vendor::OpenAi
+                .effort_levels("gpt-5")
+                .contains(&ReasoningEffort::XHigh)
         );
-        // Every step above the bottom is the same mode, which is the honest answer
-        // when the provider publishes a switch rather than a scale.
-        assert_eq!(
-            wire_effort(Vendor::Zai, ReasoningEffort::Low),
-            wire_effort(Vendor::Zai, ReasoningEffort::High)
+
+        // z.ai's GLM-5.3 models cannot turn thinking off, so `none` is not offered; GLM-5.2 can.
+        assert!(
+            !Vendor::Zai
+                .effort_levels("glm-5.3-flashx")
+                .contains(&ReasoningEffort::None)
+        );
+        assert!(
+            Vendor::Zai
+                .effort_levels("glm-5.2")
+                .contains(&ReasoningEffort::None)
         );
     }
 

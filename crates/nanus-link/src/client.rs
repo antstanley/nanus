@@ -357,6 +357,7 @@ mod tests {
             model: "scripted".to_owned(),
             models: Vec::new(),
             effort: None,
+            model_efforts: Vec::new(),
             tools: 0,
             version: PROTOCOL_VERSION,
         }))
@@ -406,6 +407,7 @@ mod tests {
                 model: "scripted".to_owned(),
                 models: Vec::new(),
                 effort: None,
+                model_efforts: Vec::new(),
                 tools: 0,
                 version: PROTOCOL_VERSION,
             }),
@@ -451,6 +453,7 @@ mod tests {
                 model: "scripted".to_owned(),
                 models: Vec::new(),
                 effort: None,
+                model_efforts: Vec::new(),
                 tools: 0,
                 version: PROTOCOL_VERSION,
             }),
@@ -497,6 +500,7 @@ mod tests {
             model: "scripted".to_owned(),
             models: Vec::new(),
             effort: None,
+            model_efforts: Vec::new(),
             tools: 0,
             version: PROTOCOL_VERSION.saturating_add(1),
         }))
@@ -543,6 +547,7 @@ mod tests {
             model: "deepseek-flash".to_owned(),
             models: vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()],
             effort: Some(crate::protocol::EffortState::Medium),
+            model_efforts: Vec::new(),
             tools: 7,
             version: PROTOCOL_VERSION,
         };

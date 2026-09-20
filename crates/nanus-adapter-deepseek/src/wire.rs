@@ -477,19 +477,19 @@ mod tests {
     }
 
     #[test]
-    fn minimal_effort_disables_thinking_and_omits_the_effort_field() {
+    fn none_effort_disables_thinking_and_omits_the_effort_field() {
         let mut config = config();
-        config.set_reasoning_effort(ReasoningEffort::Minimal);
+        config.set_reasoning_effort(ReasoningEffort::None);
         let body = build_request(&config, &request(vec![Message::user("hi")]));
         assert_eq!(body["thinking"]["type"], json!("disabled"));
         // Sending both would be contradictory.
         assert!(body.get("reasoning_effort").is_none());
 
-        // Pair assertion: the non-minimal levels enable thinking and name an effort.
+        // Pair assertion: a thinking level enables thinking and names an effort.
         config.set_reasoning_effort(ReasoningEffort::High);
         let body = build_request(&config, &request(vec![Message::user("hi")]));
         assert_eq!(body["thinking"]["type"], json!("enabled"));
-        assert_eq!(body["reasoning_effort"], json!("max"));
+        assert_eq!(body["reasoning_effort"], json!("high"));
     }
 
     #[test]

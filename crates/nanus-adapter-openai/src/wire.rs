@@ -89,22 +89,19 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
 
 /// Writes the reasoning control the vendor understands.
 ///
-/// `OpenAI` takes a scale whose four steps are the port's own, so the effort travels
-/// as written. z.ai takes a mode — thinking on or off — so everything above
-/// `Minimal` means "on"; inventing an intermediate value the provider does not
-/// document would be sending a knob with no effect.
+/// Both vendors take the same seven-word scale on `reasoning_effort`, so the neutral step travels
+/// as written (see [`crate::effort_spelling`]). z.ai additionally needs the thinking switch named,
+/// and it must be *enabled*: its GLM-5.3 models refuse a disabled switch, so turning thinking off
+/// is asked for as the `none` effort that skips it rather than as the switch being turned off.
 fn insert_effort(body: &mut Map<String, Value>, vendor: Vendor, effort: ReasoningEffort) {
-    let wire = crate::wire_effort(vendor, effort);
+    let spelling = crate::effort_spelling(effort);
     match vendor {
         Vendor::OpenAi => {
-            // Every step of the port's scale is named by OpenAI, so this is always
-            // `Some`; the fallback keeps the function total without an unwrap.
-            let spelling = wire.unwrap_or("medium");
             body.insert("reasoning_effort".to_owned(), json!(spelling));
         }
         Vendor::Zai => {
-            let mode = wire.unwrap_or("disabled");
-            body.insert("thinking".to_owned(), json!({ "type": mode }));
+            body.insert("thinking".to_owned(), json!({ "type": "enabled" }));
+            body.insert("reasoning_effort".to_owned(), json!(spelling));
         }
     }
 }
@@ -505,15 +502,18 @@ mod tests {
         }
     }
 
-    /// `OpenAI` takes a scale, so the effort travels as the step's own name.
+    /// `OpenAI` takes the scale, so the effort travels as the step's own name.
     #[test]
     fn openai_sends_the_effort_scale() {
         let mut config = config(Vendor::OpenAi);
         for (effort, expected) in [
+            (ReasoningEffort::None, "none"),
             (ReasoningEffort::Minimal, "minimal"),
             (ReasoningEffort::Low, "low"),
             (ReasoningEffort::Medium, "medium"),
             (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
         ] {
             config.set_reasoning_effort(effort);
             let body = build_request(&config, &request(vec![Message::user("hi")]));
@@ -523,19 +523,21 @@ mod tests {
         }
     }
 
-    /// z.ai takes a mode, so the scale collapses to on or off and the effort field
-    /// is absent.
+    /// z.ai takes the same scale but also needs the thinking switch named, and never disabled —
+    /// its GLM-5.3 models refuse a disabled switch, so "off" is the `none` effort.
     #[test]
-    fn zai_sends_a_thinking_mode() {
+    fn zai_sends_a_thinking_switch_and_the_effort_scale() {
         let mut config = config(Vendor::Zai);
         config.set_reasoning_effort(ReasoningEffort::High);
         let body = build_request(&config, &request(vec![Message::user("hi")]));
         assert_eq!(body["thinking"]["type"], json!("enabled"));
-        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["reasoning_effort"], json!("high"));
 
-        config.set_reasoning_effort(ReasoningEffort::Minimal);
+        // The bottom of the scale is an effort rather than a disabled switch.
+        config.set_reasoning_effort(ReasoningEffort::None);
         let body = build_request(&config, &request(vec![Message::user("hi")]));
-        assert_eq!(body["thinking"]["type"], json!("disabled"));
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+        assert_eq!(body["reasoning_effort"], json!("none"));
     }
 
     /// The budget sent is the capped one, and the cap is the provider's own.

@@ -409,6 +409,16 @@ impl AgentRunner {
         self.effort.set(effort);
     }
 
+    /// Returns the effort steps the adapter takes for `model`, in increasing order.
+    ///
+    /// A fact about the model rather than about the runner, read from the adapter that will send
+    /// the request: which steps a provider refuses differs between its models, and the interface
+    /// reads this so it offers only the ones that act.
+    #[must_use]
+    pub fn effort_levels(&self, model: &str) -> &'static [nanus_ports::ReasoningEffort] {
+        self.llm.effort_levels(model)
+    }
+
     /// Returns the tool registry this runner dispatches from.
     ///
     /// The same handle the composition publishes as the `tools` service, so a caller may

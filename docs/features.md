@@ -306,13 +306,14 @@ supports:
   Read from the log and from the interface's own measurements respectively, so the
   session's totals cover turns that ran before this interface opened. See
   [the interface](tui.md#commands).
-- **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, `/model`, and `/copy`.
-  Anything else is named in the transcript rather than sent to the model.
+- **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, `/model`, `/effort`,
+  and `/copy`. Anything else is named in the transcript rather than sent to the model.
 - **The key list on screen** (`?`, or `/help`), scrolled from one table so a
   binding cannot be documented in one place and forgotten in another.
 - **The settings a key changes**: the approval state (`Shift+Tab`, in a dialog that
   says what each state grants), the model (`Alt+P` cycles, `/model` opens a selector,
-  `/model <id>` names one), and the reasoning effort (`Alt+T`). Each is drawn where a
+  `/model <id>` names one), and the reasoning effort (`Alt+T` cycles the current
+  model's own steps, `/effort` opens a chooser over them). Each is drawn where a
   reader can see which is in force.
 - **`@` file mentions**, completed from the workspace by `Tab` and expanded to the
   path — the model reads the file with a tool rather than being handed its

@@ -20,10 +20,13 @@
 //! replayed. A signature is not part of the message vocabulary `nanus-domain` owns,
 //! so asking for thinking would produce a conversation that cannot be continued —
 //! the second request of a tool loop would be refused. So no `thinking` field is
-//! ever sent, [`LlmPort::reasoning_effort`] reports nothing, and a session records
-//! the absence rather than a plausible value. `reasoning_effort` in the
-//! configuration therefore has no effect on this provider, which is stated where it
-//! is configured as well as here.
+//! ever sent.
+//!
+//! That is a separate knob from **effort**, which this adapter does send: the
+//! 5-series models take `output_config.effort` (a behavioral signal) rather than the
+//! thinking budget, and it needs no signed block to be replayed. A model that takes
+//! no effort parameter is sent nothing, and [`LlmPort::reasoning_effort`] reports the
+//! absence for it rather than a plausible value.
 //!
 //! ## What the adapter owns
 //!
@@ -43,6 +46,7 @@ mod wire;
 
 pub use config::{
     API_KEY_ENV, API_VERSION, AnthropicConfig, DEFAULT_BASE_URL, MAX_OUTPUT_TOKENS, PROVIDER,
+    effort_levels,
 };
 pub use error::AnthropicError;
 pub use nanus_ports::ReasoningEffort;
@@ -134,10 +138,17 @@ impl LlmPort for AnthropicLlm {
     }
 
     fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        // See the crate documentation: no thinking budget is ever sent, so there is
-        // no effort to report. `None` is "this adapter has no notion of effort",
-        // which is the truth rather than a default.
-        None
+        // The API's own default is `high`, and only the models that take the parameter
+        // report an effort at all: Haiku 4.5 and the previous generation answer with the
+        // absence, which is the truth rather than a default.
+        if effort_levels(self.config.model()).is_empty() {
+            return None;
+        }
+        Some(ReasoningEffort::High)
+    }
+
+    fn effort_levels(&self, model: &str) -> &'static [ReasoningEffort] {
+        effort_levels(model)
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
@@ -323,14 +334,21 @@ mod tests {
         assert!(rendered.contains("claude-sonnet-4"), "{rendered}");
     }
 
-    /// Thinking is never requested, so no effort is reported — an absence, not a
-    /// default.
+    /// A model that takes no effort parameter reports the absence; a 5-series model reports the
+    /// API default it applies.
     #[test]
-    fn no_effort_is_reported_because_none_is_requested() {
+    fn only_the_models_that_take_an_effort_report_one() {
         let Some(llm) = adapter() else {
             return;
         };
+        // The test adapter is built for a previous-generation model.
         assert_eq!(llm.reasoning_effort(), None);
+        let Some(modern) =
+            AnthropicLlm::new(AnthropicConfig::new("claude-sonnet-5", "test-key")).ok()
+        else {
+            return;
+        };
+        assert_eq!(modern.reasoning_effort(), Some(ReasoningEffort::High));
         assert_eq!(API_VERSION, "2023-06-01");
     }
 

@@ -6,6 +6,7 @@
 //! bearer token, and every request must name the API version it was written against.
 
 use crate::error::AnthropicError;
+use nanus_ports::ReasoningEffort;
 
 /// The provider name the harness knows this adapter by.
 pub const PROVIDER: &str = "anthropic";
@@ -15,6 +16,44 @@ pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 
 /// The environment variable the API key is read from.
 pub const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// The effort steps the models this build offers take, in increasing order.
+///
+/// Anthropic's `output_config.effort` parameter is only accepted by the 5-series models here;
+/// Haiku 4.5 and the previous generation do not take it, so they offer nothing and the adapter
+/// sends no `output_config` for them.
+#[must_use]
+pub fn effort_levels(model: &str) -> &'static [ReasoningEffort] {
+    match model {
+        "claude-sonnet-5" | "claude-opus-5" | "claude-fable-5-1" => &[
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ],
+        _ => &[],
+    }
+}
+
+/// The effort a model sends on the wire, or `None` when it takes no effort parameter.
+///
+/// The neutral scale is wider than Anthropic's five steps and starts lower: its lowest step is
+/// `low`, so `none` and `minimal` collapse onto it rather than being sent as values the API does
+/// not accept.
+#[must_use]
+pub fn effort_spelling(model: &str, effort: ReasoningEffort) -> Option<&'static str> {
+    match model {
+        "claude-sonnet-5" | "claude-opus-5" | "claude-fable-5-1" => Some(match effort {
+            ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
+        }),
+        _ => None,
+    }
+}
 
 /// The API version every request declares.
 ///

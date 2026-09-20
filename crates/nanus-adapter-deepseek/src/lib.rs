@@ -54,22 +54,39 @@ pub use nanus_ports::ReasoningEffort;
 ///
 /// | Port | `DeepSeek` | Effect |
 /// |---|---|---|
-/// | `Minimal` | `none` | thinking disabled entirely |
-/// | `Low` | `low` | |
-/// | `Medium` | `high` | `DeepSeek`'s documented default, so the neutral middle maps to it |
-/// | `High` | `max` | |
+/// | `None` | `none` | thinking disabled entirely |
+/// | `Minimal`, `Low` | `low` | |
+/// | `Medium`, `High`, `XHigh` | `high` | `DeepSeek`'s documented default, so the neutral middle maps to it |
+/// | `Max` | `max` | |
 ///
-/// `Minimal` is the one that is not a scale step: `DeepSeek` expresses "do not think"
+/// `None` is the one that is not a scale step: `DeepSeek` expresses "do not think"
 /// as a separate mode, so the adapter writes `thinking: {"type": "disabled"}` and
-/// omits `reasoning_effort` rather than sending a contradictory pair.
+/// omits `reasoning_effort` rather than sending a contradictory pair. The other steps
+/// collapse onto the three efforts `DeepSeek` documents, which is its own mapping made
+/// here rather than on the wire.
 #[must_use]
 pub const fn wire_effort(effort: ReasoningEffort) -> Option<&'static str> {
     match effort {
-        ReasoningEffort::Minimal => None,
-        ReasoningEffort::Low => Some("low"),
-        ReasoningEffort::Medium => Some("high"),
-        ReasoningEffort::High => Some("max"),
+        ReasoningEffort::None => None,
+        ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::XHigh => Some("high"),
+        ReasoningEffort::Max => Some("max"),
     }
+}
+
+/// The effort steps `DeepSeek` acts on, in increasing order.
+///
+/// The three efforts its API documents — `low`, `high`, and `max` — plus `none` to turn
+/// thinking off. The remaining neutral steps are not listed because they collapse onto
+/// these: offering `minimal` beside `low` would be two rows that do the same thing.
+#[must_use]
+pub const fn effort_levels() -> &'static [ReasoningEffort] {
+    &[
+        ReasoningEffort::None,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::Max,
+    ]
 }
 pub use error::DeepSeekError;
 
@@ -163,6 +180,12 @@ impl LlmPort for DeepSeekLlm {
 
     fn reasoning_effort(&self) -> Option<ReasoningEffort> {
         Some(self.config.reasoning_effort())
+    }
+
+    fn effort_levels(&self, _model: &str) -> &'static [ReasoningEffort] {
+        // Both offered models are the same family with the same knob, so the id does not
+        // change the answer.
+        effort_levels()
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {

@@ -64,6 +64,22 @@ pub trait LlmPort {
         None
     }
 
+    /// Returns the effort steps this adapter may send for `model`, in increasing order.
+    ///
+    /// The scale is provider-neutral, but which steps a *model* accepts is a provider fact: one
+    /// `OpenAI` model takes `none` through `max` while another has no `none`, and an Anthropic model
+    /// that predates effort takes none of them. A caller that offered the whole scale would offer
+    /// steps the provider refuses, so the interface reads this before it draws the list. An empty
+    /// slice means this adapter has no notion of effort at all — the same fact
+    /// [`LlmPort::reasoning_effort`] reports as `None` for the model it is configured with.
+    ///
+    /// `model` is passed rather than assumed because a runner may switch models without rebuilding
+    /// the adapter, so the answer is a fact about the id and not about the instance.
+    fn effort_levels(&self, model: &str) -> &'static [ReasoningEffort] {
+        let _ = model;
+        &[]
+    }
+
     /// Starts a chat completion and returns its event stream.
     ///
     /// Failure is delivered as [`LlmEvent::Error`]; a caller that has read the
@@ -72,16 +88,28 @@ pub trait LlmPort {
 }
 
 /// How much reasoning effort to ask the model to spend.
+///
+/// A provider-neutral scale in increasing order. Not every provider offers every step — and not
+/// every *model* does — so a caller asks which steps a model supports before offering them; see
+/// [`LlmPort::effort_levels`]. [`ReasoningEffort::None`] is the bottom of the scale: it asks the
+/// provider to spend nothing at all, which a provider that expresses thinking as a switch writes
+/// as that switch being off rather than as an effort of zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReasoningEffort {
-    /// Spend as little as possible.
+    /// Spend nothing: the provider's way of turning thinking off.
+    None,
+    /// Spend as little as possible while still thinking.
     Minimal,
     /// Spend a little.
     Low,
     /// Spend the default amount.
     Medium,
-    /// Spend as much as the provider allows.
+    /// Spend more than the default.
     High,
+    /// Spend still more, for long-horizon work.
+    XHigh,
+    /// Spend as much as the provider allows.
+    Max,
 }
 
 impl ReasoningEffort {
@@ -89,10 +117,13 @@ impl ReasoningEffort {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 
@@ -113,10 +144,13 @@ impl ReasoningEffort {
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
+            "none" => Some(Self::None),
             "minimal" => Some(Self::Minimal),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
             _ => None,
         }
     }
@@ -129,10 +163,13 @@ impl ReasoningEffort {
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
+            Self::None => Self::Minimal,
             Self::Minimal => Self::Low,
             Self::Low => Self::Medium,
             Self::Medium => Self::High,
-            Self::High => Self::Minimal,
+            Self::High => Self::XHigh,
+            Self::XHigh => Self::Max,
+            Self::Max => Self::None,
         }
     }
 }
@@ -571,13 +608,17 @@ mod tests {
     /// that ends at the top would be a key that stops working.
     #[test]
     fn the_effort_scale_steps_upward_and_wraps() {
+        assert_eq!(ReasoningEffort::None.next(), ReasoningEffort::Minimal);
         assert_eq!(ReasoningEffort::Minimal.next(), ReasoningEffort::Low);
         assert_eq!(ReasoningEffort::Low.next(), ReasoningEffort::Medium);
         assert_eq!(ReasoningEffort::Medium.next(), ReasoningEffort::High);
-        assert_eq!(ReasoningEffort::High.next(), ReasoningEffort::Minimal);
+        assert_eq!(ReasoningEffort::High.next(), ReasoningEffort::XHigh);
+        assert_eq!(ReasoningEffort::XHigh.next(), ReasoningEffort::Max);
+        assert_eq!(ReasoningEffort::Max.next(), ReasoningEffort::None);
         // The order agrees with `Ord`, so "more effort" means the same thing however it is
         // expressed.
         assert!(ReasoningEffort::High > ReasoningEffort::Minimal);
+        assert!(ReasoningEffort::Max > ReasoningEffort::None);
     }
 
     /// Every step survives the round trip through its own name, which is what lets a caller draw
@@ -586,10 +627,13 @@ mod tests {
     #[test]
     fn an_effort_is_read_back_from_its_own_name() {
         for effort in [
+            ReasoningEffort::None,
             ReasoningEffort::Minimal,
             ReasoningEffort::Low,
             ReasoningEffort::Medium,
             ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
         ] {
             assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
             assert_eq!(effort.to_string(), effort.as_str());

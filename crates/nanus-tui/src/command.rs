@@ -32,6 +32,13 @@ pub enum Command {
     /// wants a particular model should be able to read the ids before choosing one. `Alt+P` is
     /// still the cycle for a reader who would rather press a key than a dialog.
     Model,
+    /// Choose how hard the model is asked to think: open the chooser when no step is given, and
+    /// switch to the named one when it is.
+    ///
+    /// The chooser lists only the steps the current model takes, which is a provider fact that
+    /// differs between models, so a reader cannot pick one the provider would refuse. `Alt+T` is
+    /// still the cycle.
+    Effort,
     /// Put the newest answer on the clipboard.
     ///
     /// A command as well as a key, because the commonest thing a reader wants out of a transcript is
@@ -57,6 +64,7 @@ impl Command {
         (Self::Help, &["/help"]),
         (Self::Clear, &["/clear"]),
         (Self::Model, &["/model"]),
+        (Self::Effort, &["/effort"]),
         (Self::Copy, &["/copy"]),
     ];
 
@@ -239,6 +247,7 @@ mod tests {
             Command::Help,
             Command::Clear,
             Command::Model,
+            Command::Effort,
             Command::Copy,
         ];
         for command in every {
@@ -263,7 +272,7 @@ mod tests {
         assert_eq!(
             offered,
             vec![
-                "/exit", "/quit", "/stats", "/help", "/clear", "/model", "/copy"
+                "/exit", "/quit", "/stats", "/help", "/clear", "/model", "/effort", "/copy"
             ]
         );
         for name in offered {

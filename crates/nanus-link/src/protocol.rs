@@ -110,14 +110,20 @@ pub enum ApprovalState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffortState {
-    /// Spend as little as possible: the provider's way of turning thinking off.
+    /// Spend nothing: the provider's way of turning thinking off.
+    None,
+    /// Spend as little as possible while still thinking.
     Minimal,
     /// Spend a little.
     Low,
     /// Spend the provider's default amount.
     Medium,
-    /// Spend as much as the provider allows.
+    /// Spend more than the default.
     High,
+    /// Spend still more, for long-horizon work.
+    XHigh,
+    /// Spend as much as the provider allows.
+    Max,
 }
 
 /// What a client asks an agent to do.
@@ -571,7 +577,7 @@ impl Frame {
 /// The field is optional on the wire and defaults to zero, which is what a build that
 /// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
 /// rather than assuming compatibility.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -605,6 +611,15 @@ pub struct AgentInfo {
     /// reason `models` is.
     #[serde(default)]
     pub effort: Option<EffortState>,
+    /// The effort steps each offered model takes, one entry per model in [`AgentInfo::models`].
+    ///
+    /// Which steps a model accepts is a provider fact that differs between models — one family
+    /// takes `none` through `max`, another stops at `high` — so a client that offered the whole
+    /// scale would offer steps the provider refuses. Defaulted on the way in, so a handshake from
+    /// an agent that predates the field still decodes; a client then offers nothing and draws only
+    /// the effort in force.
+    #[serde(default)]
+    pub model_efforts: Vec<ModelEfforts>,
     /// How many tools the agent exposes.
     pub tools: usize,
     /// The link protocol version the agent speaks.
@@ -613,6 +628,19 @@ pub struct AgentInfo {
     /// decodes; the client then refuses it by name rather than misreading it.
     #[serde(default = "unversioned")]
     pub version: u32,
+}
+
+/// The effort steps one model takes.
+///
+/// Carried beside [`AgentInfo::models`] because which steps a model accepts is a provider fact
+/// that differs between models, and an interface that offered the whole scale would offer steps
+/// the provider refuses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ModelEfforts {
+    /// The model id.
+    pub model: String,
+    /// The effort steps it takes, in increasing order.
+    pub efforts: Vec<EffortState>,
 }
 
 /// What an agent says about one session.
@@ -674,6 +702,7 @@ mod tests {
             model: "deepseek-flash".to_owned(),
             models: vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()],
             effort: Some(EffortState::Medium),
+            model_efforts: Vec::new(),
             tools: 7,
             version: PROTOCOL_VERSION,
         }
@@ -906,6 +935,7 @@ mod tests {
                 model: "m".to_owned(),
                 models: Vec::new(),
                 effort: None,
+                model_efforts: Vec::new(),
                 tools: 7,
                 version: 0,
             }))

@@ -259,13 +259,14 @@ fn a_streamed_tool_call_becomes_events_over_a_real_socket() {
 /// The other vendor's control is on the wire instead, which is the one thing that differs
 /// between them at the request level — and the ceiling is the vendor's own.
 #[test]
-fn the_zai_vendor_sends_its_thinking_mode() {
+fn the_zai_vendor_sends_its_thinking_switch_and_effort() {
     let server = spawn_server(200, "data: [DONE]\n\n");
     let _ = collect(nanus_adapter_openai::Vendor::Zai, &server, "glm-4.5");
     let (head, body) = split_request(&only_request(&server));
     assert!(head.starts_with("POST /chat/completions"), "{head}");
+    // The switch is always on: GLM-5.3 refuses a disabled one, so "off" is the `none` effort.
     assert_eq!(body["thinking"]["type"], serde_json::json!("enabled"));
-    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["reasoning_effort"], serde_json::json!("medium"));
     assert_eq!(body["max_tokens"], serde_json::json!(98_304));
 }
 

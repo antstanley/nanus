@@ -237,13 +237,31 @@ mod tests {
 
     #[test]
     fn every_port_effort_translates_to_a_wire_value() {
-        // Positive space: each scale step has a DeepSeek equivalent.
+        // Positive space: each scale step lands on one of the three efforts DeepSeek
+        // documents, or on the mode that turns thinking off.
         assert_eq!(crate::wire_effort(ReasoningEffort::Low), Some("low"));
+        assert_eq!(crate::wire_effort(ReasoningEffort::Minimal), Some("low"));
         assert_eq!(crate::wire_effort(ReasoningEffort::Medium), Some("high"));
-        assert_eq!(crate::wire_effort(ReasoningEffort::High), Some("max"));
-        // `Minimal` is not a scale step: it disables thinking, which the adapter
+        assert_eq!(crate::wire_effort(ReasoningEffort::High), Some("high"));
+        assert_eq!(crate::wire_effort(ReasoningEffort::XHigh), Some("high"));
+        assert_eq!(crate::wire_effort(ReasoningEffort::Max), Some("max"));
+        // `None` is not a scale step: it disables thinking, which the adapter
         // expresses as a mode rather than as an effort.
-        assert_eq!(crate::wire_effort(ReasoningEffort::Minimal), None);
+        assert_eq!(crate::wire_effort(ReasoningEffort::None), None);
+    }
+
+    /// The steps offered to a chooser are the ones that act, not every neutral step.
+    #[test]
+    fn the_offered_levels_are_the_distinct_ones() {
+        assert_eq!(
+            crate::effort_levels(),
+            [
+                ReasoningEffort::None,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Max,
+            ]
+        );
     }
 
     #[test]

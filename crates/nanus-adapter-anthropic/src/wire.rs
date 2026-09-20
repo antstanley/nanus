@@ -63,6 +63,14 @@ pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
     if let Some(temperature) = request.temperature.or_else(|| config.temperature()) {
         body.insert("temperature".to_owned(), json!(temperature));
     }
+    // Only when a caller chose an effort: the API's own default is `high`, so an unset effort is
+    // left out rather than sent as a value that only repeats the default. A model that takes no
+    // effort parameter sends nothing whatever the caller chose.
+    if let Some(effort) = request.reasoning_effort
+        && let Some(spelling) = crate::config::effort_spelling(config.model(), effort)
+    {
+        body.insert("output_config".to_owned(), json!({ "effort": spelling }));
+    }
     if !request.tools.is_empty() {
         body.insert("tools".to_owned(), encode_tools(&request.tools));
     }
