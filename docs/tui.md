@@ -393,6 +393,7 @@ than sending it to the model.
 | `/clear` | empty the transcript, leaving the draft and the toggles alone |
 | `/model [id]` | open the model selector, or switch to the one named |
 | `/effort [step]` | open the effort chooser, or switch to the step named |
+| `/provider [name]` | open the provider chooser, or switch to the provider named |
 | `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
@@ -529,6 +530,36 @@ own name, and the alternative — rebuilding the prompt on every switch — woul
 conversation the model is being sent no longer matches the one recorded against it. The live
 value is the one in the title bar; the recorded one is what the session says produced it, and the
 two are the same thing until somebody switches.
+
+### Switching providers
+
+`/provider` opens a chooser over the providers (and plans) the agent offered in its handshake, and
+`/provider <name>` switches to the named one directly. A provider change is a *recomposition of one
+plugin*: the agent rebuilds its model adapter from the configuration, the credential store, and the
+provider table, and points the loop at the replacement and at the new provider's default model.
+Nothing else moves — the tools, the sessions, the system prompt, and the log are the same objects
+they were — so a conversation survives the switch and the next request goes to the new provider.
+
+**A row is a provider and one of its plans.** A provider with a single plan is one row named for it;
+one with several is one row per plan, labelled `provider · plan`. Flattening them means one keypress
+chooses both, which matters because a plan is what a request actually goes to: z.ai's `api` and
+`coding` are two hosts, and `OpenAI`'s `subscription` is listed and **refused with its reason** —
+it needs an OAuth token and the Responses API — so a reader sees it exists and why it cannot be
+chosen rather than not seeing it at all.
+
+**A provider with no credential asks before it refuses.** Choosing one whose key is not configured
+answers with a question rather than an error: store a key now? `y` or `Enter` opens a masked field,
+the key is typed and `Enter` stores it, and the switch is retried. The key travels the local socket
+to the agent, which owns the credential store, and is written there — it is never echoed back, never
+drawn, and never kept in the interface once it has been sent. `n` or `Esc` cancels, and the provider
+stays what it was.
+
+**The switch is the agent's, and it reaches every client**, exactly as the model and the approval
+state do: one runner serves every session, so a client that switches tells every watcher, and the
+model list and the models' effort steps travel with the answer because a provider change replaces
+both. It takes effect on the next request, including the next step of a turn already running, and
+the effort in force goes back to the new adapter's default rather than naming a step the new model
+may not accept.
 
 ### Selecting and copying
 

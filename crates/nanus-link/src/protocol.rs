@@ -234,6 +234,32 @@ pub enum Request {
         state: EffortState,
     },
 
+    /// Replace the provider (and plan) every later request goes to.
+    ///
+    /// A request rather than part of a prompt because the *agent* owns the adapter: a provider
+    /// change rebuilds it in place, and every client attached to the agent is told, so two views
+    /// cannot disagree about where the next request goes. An unknown provider, a refused plan, or
+    /// a provider with no credential is answered rather than applied.
+    SetProvider {
+        /// The provider's name, as the provider table spells it.
+        provider: String,
+        /// The plan to use, when one is named. Absent means the provider's default plan.
+        #[serde(default)]
+        plan: Option<String>,
+    },
+
+    /// File a credential for a provider.
+    ///
+    /// The interface's way to store a key it has just asked for: the agent owns the credential
+    /// store, so the key travels the local socket to the one process that can file it rather than
+    /// the interface reaching for a store it does not link. The key is never echoed back.
+    SetCredential {
+        /// The provider's name.
+        provider: String,
+        /// The secret to file under that provider's account.
+        key: String,
+    },
+
     /// Describe the agent without changing anything.
     Status,
 
@@ -381,6 +407,37 @@ pub enum Frame {
     EffortChanged {
         /// The effort the agent is asking for now.
         state: EffortState,
+    },
+
+    /// The provider (and plan) the agent is talking to now.
+    ///
+    /// Sent whenever a client changes it, so every viewer agrees about where the next request goes.
+    /// The model list and the models' effort steps travel with it because a provider change
+    /// replaces both, and a client that kept the old list would offer models the agent no longer
+    /// has.
+    ProviderChanged {
+        /// The provider's name.
+        provider: String,
+        /// The plan in force.
+        plan: String,
+        /// The model ids the new provider offers, the one in use first.
+        models: Vec<String>,
+        /// The effort steps each offered model takes.
+        #[serde(default)]
+        model_efforts: Vec<ModelEfforts>,
+    },
+
+    /// A provider switch could not go ahead because no credential is configured.
+    ///
+    /// A separate frame rather than a [`Frame::Failed`] because it is the prompt that leads to the
+    /// interface asking for a key: matching the text of a refusal to decide whether to offer that
+    /// would be guessing at a sentence.
+    NoCredential {
+        /// The provider whose credential is missing.
+        provider: String,
+        /// The environment variable a credential would otherwise be read from, so the interface can
+        /// say where a key is normally kept.
+        env: String,
     },
 
     /// The agent's approval state, for an interface to draw and cycle from.
@@ -577,7 +634,7 @@ impl Frame {
 /// The field is optional on the wire and defaults to zero, which is what a build that
 /// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
 /// rather than assuming compatibility.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -620,6 +677,22 @@ pub struct AgentInfo {
     /// the effort in force.
     #[serde(default)]
     pub model_efforts: Vec<ModelEfforts>,
+    /// The provider the agent is talking to.
+    ///
+    /// Defaulted on the way in so a handshake from an agent that predates providers decodes; a
+    /// client then draws nothing for it.
+    #[serde(default)]
+    pub provider: String,
+    /// The plan in force for that provider.
+    #[serde(default)]
+    pub plan: String,
+    /// The providers a client may switch this agent to, with the plans each offers.
+    ///
+    /// Carried for the same reason the models are: which providers exist, and which plans each has,
+    /// is a decision of the composition, and an interface that offered a list of its own would
+    /// offer a provider the agent refuses. Defaulted on the way in.
+    #[serde(default)]
+    pub providers: Vec<ProviderInfo>,
     /// How many tools the agent exposes.
     pub tools: usize,
     /// The link protocol version the agent speaks.
@@ -641,6 +714,31 @@ pub struct ModelEfforts {
     pub model: String,
     /// The effort steps it takes, in increasing order.
     pub efforts: Vec<EffortState>,
+}
+
+/// One provider a client may switch to, and the plans it offers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ProviderInfo {
+    /// The provider's name, as it is written in a configuration.
+    pub name: String,
+    /// The environment variable its credential is read from, for a prompt that names it.
+    pub credential_env: String,
+    /// The plans it offers, the default first.
+    pub plans: Vec<PlanInfo>,
+}
+
+/// One plan of a provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct PlanInfo {
+    /// The plan's name, as it is written in a configuration.
+    pub name: String,
+    /// The model the plan resolves to when the configuration names none.
+    pub model: Option<String>,
+    /// Why this build cannot use the plan, when it cannot.
+    ///
+    /// A plan that cannot be used is listed and refused by name rather than absent, so a reader is
+    /// told what would have to change rather than that nothing exists.
+    pub refused: Option<String>,
 }
 
 /// What an agent says about one session.
@@ -703,6 +801,17 @@ mod tests {
             models: vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()],
             effort: Some(EffortState::Medium),
             model_efforts: Vec::new(),
+            provider: "deepseek".to_owned(),
+            plan: "api".to_owned(),
+            providers: vec![ProviderInfo {
+                name: "deepseek".to_owned(),
+                credential_env: "DEEPSEEK_API_KEY".to_owned(),
+                plans: vec![PlanInfo {
+                    name: "api".to_owned(),
+                    model: Some("deepseek-flash".to_owned()),
+                    refused: None,
+                }],
+            }],
             tools: 7,
             version: PROTOCOL_VERSION,
         }
@@ -823,6 +932,39 @@ mod tests {
         }
     }
 
+    /// The provider frames carry a model list with per-model effort steps — the one nesting here
+    /// besides a backlog — so they get their own round trip.
+    #[test]
+    fn the_provider_frames_round_trip() {
+        for frame in [
+            Frame::ProviderChanged {
+                provider: "zai".to_owned(),
+                plan: "coding".to_owned(),
+                models: vec!["glm-5.3-flashx".to_owned()],
+                model_efforts: vec![ModelEfforts {
+                    model: "glm-5.3-flashx".to_owned(),
+                    efforts: vec![EffortState::High, EffortState::Max],
+                }],
+            },
+            Frame::ProviderChanged {
+                provider: "deepseek".to_owned(),
+                plan: "api".to_owned(),
+                models: Vec::new(),
+                model_efforts: Vec::new(),
+            },
+            Frame::NoCredential {
+                provider: "openai".to_owned(),
+                env: "OPENAI_API_KEY".to_owned(),
+            },
+        ] {
+            let encoded = encode(&frame);
+            assert!(encoded.is_ok(), "encodes: {encoded:?}");
+            let Ok(encoded) = encoded else { return };
+            let decoded = decode::<Frame>(&encoded);
+            assert_eq!(decoded.ok(), Some(frame.clone()), "round trip of {frame:?}");
+        }
+    }
+
     /// A backlog is the one recursive shape here — a frame that carries frames — so it gets
     /// its own round trip: empty, for an attachment to an idle session, and carrying a turn,
     /// which is what a late client is actually sent.
@@ -887,6 +1029,18 @@ mod tests {
             Request::SetEffort {
                 state: EffortState::Minimal,
             },
+            Request::SetProvider {
+                provider: "zai".to_owned(),
+                plan: Some("coding".to_owned()),
+            },
+            Request::SetProvider {
+                provider: "deepseek".to_owned(),
+                plan: None,
+            },
+            Request::SetCredential {
+                provider: "openai".to_owned(),
+                key: "sk-secret".to_owned(),
+            },
             Request::Sessions,
             Request::Status,
             Request::Shutdown,
@@ -936,6 +1090,9 @@ mod tests {
                 models: Vec::new(),
                 effort: None,
                 model_efforts: Vec::new(),
+                provider: String::new(),
+                plan: String::new(),
+                providers: Vec::new(),
                 tools: 7,
                 version: 0,
             }))

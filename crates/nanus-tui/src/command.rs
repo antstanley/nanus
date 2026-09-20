@@ -39,6 +39,13 @@ pub enum Command {
     /// differs between models, so a reader cannot pick one the provider would refuse. `Alt+T` is
     /// still the cycle.
     Effort,
+    /// Choose a provider (and plan) to send requests to: open the chooser when none is named, and
+    /// switch to the named one when it is.
+    ///
+    /// A provider change rebuilds the agent's adapter, and a provider with no credential is the one
+    /// refusal the interface can act on: it is answered, and the interface asks whether to store a
+    /// key before trying again.
+    Provider,
     /// Put the newest answer on the clipboard.
     ///
     /// A command as well as a key, because the commonest thing a reader wants out of a transcript is
@@ -65,6 +72,7 @@ impl Command {
         (Self::Clear, &["/clear"]),
         (Self::Model, &["/model"]),
         (Self::Effort, &["/effort"]),
+        (Self::Provider, &["/provider"]),
         (Self::Copy, &["/copy"]),
     ];
 
@@ -248,6 +256,7 @@ mod tests {
             Command::Clear,
             Command::Model,
             Command::Effort,
+            Command::Provider,
             Command::Copy,
         ];
         for command in every {
@@ -272,7 +281,15 @@ mod tests {
         assert_eq!(
             offered,
             vec![
-                "/exit", "/quit", "/stats", "/help", "/clear", "/model", "/effort", "/copy"
+                "/exit",
+                "/quit",
+                "/stats",
+                "/help",
+                "/clear",
+                "/model",
+                "/effort",
+                "/provider",
+                "/copy"
             ]
         );
         for name in offered {

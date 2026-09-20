@@ -62,7 +62,7 @@ pub mod provider;
 pub mod tools;
 
 pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
-pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, compose};
+pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, ProviderSwitch, compose};
 pub use error::BundleError;
 pub use provider::{Provider, Selection};
 

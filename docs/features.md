@@ -307,9 +307,14 @@ supports:
   session's totals cover turns that ran before this interface opened. See
   [the interface](tui.md#commands).
 - **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, `/model`, `/effort`,
-  and `/copy`. Anything else is named in the transcript rather than sent to the model.
+  `/provider`, and `/copy`. Anything else is named in the transcript rather than sent to the
+  model.
 - **The key list on screen** (`?`, or `/help`), scrolled from one table so a
   binding cannot be documented in one place and forgotten in another.
+- **Switching provider at runtime** (`/provider`): a chooser over the providers and plans the
+  agent offered, or a named one. A provider with no credential is answered with the question of
+  whether to store a key, and the key is filed by the agent, which owns the store. A change
+  rebuilds only the model adapter, so the conversation survives it.
 - **The settings a key changes**: the approval state (`Shift+Tab`, in a dialog that
   says what each state grants), the model (`Alt+P` cycles, `/model` opens a selector,
   `/model <id>` names one), and the reasoning effort (`Alt+T` cycles the current

@@ -307,6 +307,7 @@ fn agent_over(dir: &Path, llm: Rc<Box<dyn LlmPort>>, model: &str) -> (Agent, Sto
             .map(|id| (*id).to_owned())
             .collect(),
         tools: 0,
+        switch: None,
     });
     (agent, store)
 }
@@ -402,6 +403,7 @@ fn gated_agent(dir: &Path, approval: ApprovalPolicy) -> (Agent, StoreHandle) {
         workspace: dir.to_path_buf(),
         models: vec![String::from("calling")],
         tools: 1,
+        switch: None,
     });
     (agent, store)
 }

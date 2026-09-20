@@ -40,7 +40,7 @@ use nanus_domain::{
     Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId, ToolName,
     ToolResult, TurnEndReason, TurnMachine, Usage,
 };
-use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort};
+use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmHandle};
 
 use crate::guard;
 use crate::{BundleError, ToolRegistryHandle};
@@ -251,7 +251,7 @@ fn with_step_budget(prompt: &str, budget: u32) -> String {
 /// session. Everything mutable lives in the [`Session`], which is what makes the run
 /// observable and resumable.
 pub struct AgentRunner {
-    llm: Rc<Box<dyn LlmPort>>,
+    llm: Rc<core::cell::RefCell<LlmHandle>>,
     /// The tools the model is offered, shared rather than owned.
     ///
     /// The same handle the bundle publishes as the `tools` service, deliberately: the
@@ -305,7 +305,7 @@ impl AgentRunner {
     /// Returns [`BundleError::Config`] when the agent configuration is invalid, so an
     /// unusable runner cannot be constructed and then consulted.
     pub fn new(
-        llm: Rc<Box<dyn LlmPort>>,
+        llm: LlmHandle,
         tools: ToolRegistryHandle,
         system_prompt: impl Into<String>,
         config: AgentConfig,
@@ -325,7 +325,7 @@ impl AgentRunner {
         );
         let model = Rc::new(core::cell::RefCell::new(config.model.clone()));
         Ok(Self {
-            llm,
+            llm: Rc::new(core::cell::RefCell::new(llm)),
             tools,
             system_prompt,
             approval: Rc::new(core::cell::Cell::new(config.approval_policy)),
@@ -397,7 +397,9 @@ impl AgentRunner {
     /// which is not the same fact as any effort at all.
     #[must_use]
     pub fn effort(&self) -> Option<nanus_ports::ReasoningEffort> {
-        self.effort.get().or_else(|| self.llm.reasoning_effort())
+        self.effort
+            .get()
+            .or_else(|| self.llm.borrow().reasoning_effort())
     }
 
     /// Replaces the reasoning effort every later request will carry.
@@ -416,7 +418,17 @@ impl AgentRunner {
     /// reads this so it offers only the ones that act.
     #[must_use]
     pub fn effort_levels(&self, model: &str) -> &'static [nanus_ports::ReasoningEffort] {
-        self.llm.effort_levels(model)
+        self.llm.borrow().effort_levels(model)
+    }
+
+    /// Points every later request at another adapter.
+    ///
+    /// The switch a provider change is: the loop keeps running, the session keeps its log, and only
+    /// the thing that issues the request is replaced. It takes effect on the next request,
+    /// including the next step of a turn already running, exactly as [`AgentRunner::set_model`]
+    /// does — a reader switching providers mid-turn is saying what they want the next step to be.
+    pub fn set_llm(&self, llm: LlmHandle) {
+        *self.llm.borrow_mut() = llm;
     }
 
     /// Returns the tool registry this runner dispatches from.
@@ -558,7 +570,7 @@ impl AgentRunner {
         if let Some(elision) = &elision {
             progress.elided(elision);
         }
-        let mut stream = self.llm.stream_chat(request);
+        let mut stream = self.llm.borrow().stream_chat(request);
         let assembled = match self.consume_stream(&mut stream, progress).await {
             Ok(assembled) => assembled,
             Err(error) => {
@@ -1058,7 +1070,7 @@ pub use nanus_ports::FinishReason as ModelFinishReason;
 #[cfg(test)]
 mod tests {
     use nanus_domain::{ToolOutcome, ToolRegistry, ToolSchema};
-    use nanus_ports::{ChatRequest, LlmStream};
+    use nanus_ports::{ChatRequest, LlmPort, LlmStream};
     use serde_json::json;
 
     use super::*;

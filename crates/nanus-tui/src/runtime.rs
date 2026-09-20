@@ -73,7 +73,9 @@ use futures::future::LocalBoxFuture;
 use nanus_adapter_config::{NanusConfig, TuiDetail};
 use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
-use nanus_link::protocol::{ApprovalState, EffortState, Frame, Request, SessionInfo, TurnEnd};
+use nanus_link::protocol::{
+    ApprovalState, EffortState, Frame, ProviderInfo, Request, SessionInfo, TurnEnd,
+};
 use nanus_ports::{ReasoningEffort, StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -87,7 +89,7 @@ use crate::compact::Detail;
 use crate::notice::{self, Ending};
 use crate::stats::{Generation, Throughput};
 use crate::transcript::{Entry, Role};
-use crate::view::{PendingApproval, Theme, ViewState};
+use crate::view::{PendingApproval, ProviderChoice, Theme, ViewState};
 
 /// Rows scrolled per `PageUp` or `PageDown`.
 const PAGE_ROWS: i32 = 10;
@@ -348,6 +350,23 @@ pub trait SessionSource {
         Vec::new()
     }
 
+    /// The provider the conversation is being answered by, when one was said.
+    fn provider(&self) -> Option<&str> {
+        None
+    }
+
+    /// The plan in force for that provider, when one was said.
+    fn plan(&self) -> Option<&str> {
+        None
+    }
+
+    /// The provider-and-plan choices the agent offered, from its handshake.
+    ///
+    /// Empty for a source with no agent, so the chooser is never drawn for a recording.
+    fn providers(&self) -> Vec<ProviderChoice> {
+        Vec::new()
+    }
+
     /// Which model the conversation is being answered by, when one was said.
     ///
     /// `None` means nothing recorded one — a session from before the configuration was written
@@ -416,6 +435,17 @@ pub trait SessionSource {
     /// A default of doing nothing, for the same reason as [`SessionSource::set_model`]: a
     /// recording has no agent to tell.
     fn set_effort(&mut self, _effort: ReasoningEffort) {}
+
+    /// Tells the agent which provider and plan to send requests to from now on.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::set_model`]: a recording
+    /// has no agent to tell, and the provider it shows is the one it was recorded with.
+    fn set_provider(&mut self, _provider: &str, _plan: Option<&str>) {}
+
+    /// Tells the agent to file a credential for a provider.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::set_provider`].
+    fn set_credential(&mut self, _provider: &str, _key: &str) {}
 
     /// Releases whatever the source owns.
     ///
@@ -572,6 +602,10 @@ pub struct Remote {
     models: Vec<String>,
     /// The effort steps each offered model takes, by model id, from the handshake.
     model_efforts: Vec<(String, Vec<String>)>,
+    /// The provider the agent reported, the plan in force, and the choices it offered.
+    provider: Option<String>,
+    plan: Option<String>,
+    providers: Vec<ProviderChoice>,
     /// The reasoning effort the agent reported, when it has one.
     effort: Option<ReasoningEffort>,
     /// Whether a turn was already running in the session when it was attached to.
@@ -654,6 +688,9 @@ impl Remote {
                 })
                 .collect(),
             effort: agent.effort.map(view_effort),
+            provider: (!agent.provider.is_empty()).then(|| agent.provider.clone()),
+            plan: (!agent.plan.is_empty()).then(|| agent.plan.clone()),
+            providers: provider_choices(&agent.providers),
             busy,
             redundant_backlog,
         })
@@ -728,6 +765,18 @@ impl SessionSource for Remote {
         self.model_efforts.clone()
     }
 
+    fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    fn plan(&self) -> Option<&str> {
+        self.plan.as_deref()
+    }
+
+    fn providers(&self) -> Vec<ProviderChoice> {
+        self.providers.clone()
+    }
+
     fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
@@ -799,6 +848,20 @@ impl SessionSource for Remote {
             state: wire_effort(effort),
         });
     }
+
+    fn set_provider(&mut self, provider: &str, plan: Option<&str>) {
+        self.send(Request::SetProvider {
+            provider: provider.to_owned(),
+            plan: plan.map(str::to_owned),
+        });
+    }
+
+    fn set_credential(&mut self, provider: &str, key: &str) {
+        self.send(Request::SetCredential {
+            provider: provider.to_owned(),
+            key: key.to_owned(),
+        });
+    }
 }
 
 /// Renders the interface's approval state in the link's vocabulary.
@@ -842,7 +905,32 @@ const fn view_effort(state: EffortState) -> ReasoningEffort {
     }
 }
 
-/// Reads the link's approval state into the interface's vocabulary.
+/// Flattens the agent's provider list into chooser rows.
+///
+/// A provider with one plan is one row named for the provider; a provider with several is one row
+/// per plan, labelled `provider · plan`, because a plan is what a request actually goes to. A plan
+/// this build refuses is kept as a row that carries its reason, so a reader sees it exists and why
+/// it cannot be chosen rather than not seeing it at all.
+fn provider_choices(providers: &[ProviderInfo]) -> Vec<ProviderChoice> {
+    let mut choices = Vec::new();
+    for provider in providers {
+        let single = provider.plans.len() == 1;
+        for plan in &provider.plans {
+            choices.push(ProviderChoice {
+                provider: provider.name.clone(),
+                plan: plan.name.clone(),
+                label: if single {
+                    provider.name.clone()
+                } else {
+                    format!("{} · {}", provider.name, plan.name)
+                },
+                env: provider.credential_env.clone(),
+                refused: plan.refused.clone(),
+            });
+        }
+    }
+    choices
+}
 const fn view_policy(state: ApprovalState) -> ApprovalPolicy {
     match state {
         ApprovalState::PerCall => ApprovalPolicy::PerCall,
@@ -1051,6 +1139,9 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     view.models = source.models().to_vec();
     view.model_efforts = source.model_efforts().into_iter().collect();
     view.refresh_effort_levels();
+    view.provider = source.provider().map(str::to_owned);
+    view.plan = source.plan().map(str::to_owned);
+    view.providers = source.providers();
     view.effort = source.effort().map(|effort| effort.as_str().to_owned());
     // Only when one was asked for: the default is already the fail-closed state, and a live
     // conversation overwrites this with the agent's own answer as soon as it is attached.
@@ -1103,9 +1194,8 @@ async fn event_loop(
 
     loop {
         guard.terminal().draw(|frame| view.render(frame))?;
-        // Redrawn after every wake-up rather than on a timer: the interface has no
-        // animation, so every reason to redraw is either a keystroke or a frame from the
-        // agent, and both arrive here. A tick would only add idle wake-ups.
+        // Redrawn after every wake-up rather than on a timer: every reason to redraw is either a
+        // keystroke or a frame from the agent, and both arrive here.
         tokio::select! {
             event = events.next() => {
                 let Some(event) = event else {
@@ -1114,16 +1204,10 @@ async fn event_loop(
                     break;
                 };
                 let event = event?;
-                // Mouse events are routed before the keyboard, so the key handling
-                // below stays the one flat match it always was. The event is borrowed
-                // rather than moved so it is still there when it is not a mouse event.
+                // Mouse events are routed before the keyboard, so the key handling below stays
+                // the one flat match it always was. The event is borrowed rather than moved.
                 if let TerminalEvent::Mouse(mouse) = &event {
-                    handle_mouse(*mouse, &mut view);
-                    // A click moves the caret, and a mention is a property of the text: the
-                    // refresh is here for the pointer for the same reason it is below for the
-                    // keyboard — a menu raised for a word the caret has left is a menu that
-                    // answers for something nobody is pointing at any more.
-                    refresh_mentions(&mut view, &mut files, source.workspace());
+                    handle_pointer(*mouse, &mut view, &mut files, source.workspace());
                     continue;
                 }
                 let TerminalEvent::Key(key) = event else {
@@ -1134,8 +1218,7 @@ async fn event_loop(
                     continue;
                 }
                 let outcome = handle_key(key, &mut view);
-                // After every keystroke, because a mention is a property of the text: typing
-                // narrows it, deleting closes it, and moving the caret changes which one it is.
+                // After every keystroke, because a mention is a property of the text.
                 refresh_mentions(&mut view, &mut files, source.workspace());
                 match outcome {
                     Outcome::Quit => break,
@@ -1152,24 +1235,7 @@ async fn event_loop(
                         always,
                         stop,
                     } => {
-                        // Cleared before the answer is sent, so a reader cannot press `y`
-                        // twice and have the second press land on whatever question comes
-                        // next — answers are keyed by id, but the dialog is not.
-                        view.pending_approval = None;
-                        // The answer is sent first, because it is what the turn is waiting
-                        // for: the stop it may also be asking for is read at the turn's next
-                        // checkpoint, which it cannot reach until the question is settled.
-                        source.answer(&call_id, allow, always);
-                        if stop {
-                            view.status = String::from("denied; stopping the turn");
-                            source.interrupt();
-                        } else {
-                            view.status = match (allow, always) {
-                                (true, true) => String::from("always allowed; the turn is running"),
-                                (true, false) => String::from("allowed once; the turn is running"),
-                                (false, _) => String::from("denied; the model is told"),
-                            };
-                        }
+                        answer_and_report(&call_id, allow, always, stop, source, &mut view);
                     }
                     Outcome::Copy => copy_selection(&system_clipboard, &mut view).await,
                     Outcome::PasteImage => {
@@ -1181,6 +1247,12 @@ async fn event_loop(
                     }
                     Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
                     Outcome::SetEffort(step) => set_effort_word(&step, source, &mut view),
+                    Outcome::SetProvider { provider, plan } => {
+                        request_switch(&provider, &plan, source, &mut view);
+                    }
+                    Outcome::SetCredential { provider, key } => {
+                        store_credential(&provider, &key, source, &mut view);
+                    }
                     Outcome::CycleEffort => cycle_effort(source, &mut view),
                     Outcome::SetApproval(policy) => set_approval(policy, source, &mut view),
                     Outcome::Submit(prompt) => {
@@ -1275,6 +1347,13 @@ enum Routed {
     /// Routed for the same reason as [`Routed::Models`]: the steps the current model takes are the
     /// view's state, carried in the handshake, and the router cannot know them.
     Efforts(Option<String>),
+    /// Choose a provider: open the chooser when nothing is named, and switch to the named one when
+    /// it is.
+    ///
+    /// Routed for the same reason as [`Routed::Models`]: the providers and plans exist are the
+    /// agent's answer, held by the view, and a router that decided a name was valid would be a
+    /// second provider table to keep true.
+    Provider(Option<String>),
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1299,6 +1378,9 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         // The argument is the step's own word: `/effort` opens the chooser and `/effort <step>`
         // names one, which the view checks against the model's own list before it is sent.
         Submission::Run(Command::Effort) => Routed::Efforts(model_argument(&prompt)),
+        // The argument is a provider's name: `/provider` opens the chooser and `/provider <name>`
+        // names one, which the view matches against the choices the agent offered.
+        Submission::Run(Command::Provider) => Routed::Provider(model_argument(&prompt)),
         Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
             if command.trim().is_empty() {
@@ -1457,6 +1539,10 @@ async fn submitted(
         Routed::Efforts(requested) => match requested {
             Some(step) => set_effort_word(&step, source, view),
             None => open_effort_chooser(view),
+        },
+        Routed::Provider(requested) => match requested {
+            Some(name) => switch_provider_named(&name, source, view),
+            None => open_provider_chooser(view),
         },
         Routed::Say(message) => {
             view.transcript.push(Entry::notice(message));
@@ -1783,6 +1869,20 @@ enum Outcome {
     /// An outcome rather than the key handling doing it, because it is sent to the agent: the keys
     /// decide what the reader meant, and the loop is where the request leaves.
     SetEffort(String),
+    /// Switch provider and plan, named as the chooser labels them.
+    SetProvider {
+        /// The provider's name.
+        provider: String,
+        /// The plan's name.
+        plan: String,
+    },
+    /// Store a credential, then retry the switch it was asked for.
+    SetCredential {
+        /// The provider the key is for.
+        provider: String,
+        /// The key, which is never drawn or logged again.
+        key: String,
+    },
     /// Read an image off the clipboard and put its path in the composer.
     PasteImage,
     /// Copy the selection to the clipboard.
@@ -1803,6 +1903,17 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     // reason: what a reader is looking at has to be what their keys reach.
     if view.permission_open {
         return handle_permission_key(key, view);
+    }
+    // The provider flow's modals own the keyboard, innermost first: the key field takes text, the
+    // credential question takes a yes or a no, and the chooser takes a movement or a decision.
+    if view.key_entry_open {
+        return handle_key_entry_key(key, view);
+    }
+    if view.credential_open {
+        return handle_credential_key(key, view);
+    }
+    if view.provider_open {
+        return handle_provider_key(key, view);
     }
     // Shift+Tab opens the permission dialog wherever the focus is. It is a setting rather than an
     // edit, so it is routed before the approval question takes the keyboard: a reader who wants to
@@ -2049,6 +2160,205 @@ fn handle_effort_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         _ => {}
     }
     Outcome::Continue
+}
+
+/// Routes a key while the provider chooser is open.
+///
+/// The model selector's vocabulary over the provider-and-plan rows, with one difference: a refused
+/// row is a row that says why rather than one that switches, so `Enter` on it is a sentence rather
+/// than a request.
+fn handle_provider_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => view.close_providers(),
+        KeyCode::Char('c' | 'C') if control => view.close_providers(),
+        KeyCode::Enter => {
+            let choice = view.selected_choice();
+            view.close_providers();
+            if let Some(choice) = choice {
+                if let Some(refusal) = choice.refused {
+                    view.status = format!("{} is unavailable: {refusal}", choice.label);
+                } else {
+                    return Outcome::SetProvider {
+                        provider: choice.provider,
+                        plan: choice.plan,
+                    };
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => view.provider_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => {
+            view.provider_down();
+        }
+        KeyCode::Char(digit @ '1'..='9') => {
+            let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
+            let _ = view.provider_select(position);
+        }
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Routes a key while the "store a key?" question is open.
+///
+/// A yes and a no, and nothing else: a stray keypress must not open a secret field, so only `y` or
+/// `Enter` does, and everything else is a no or does nothing.
+fn handle_credential_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => view.open_key_entry(),
+        KeyCode::Char('c' | 'C') if control => {
+            view.close_credential();
+            view.pending_switch = None;
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            view.close_credential();
+            view.pending_switch = None;
+            view.status = String::from("the key was not stored");
+        }
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Routes a key while the masked key field is open.
+///
+/// Text plus the three keys that end it: `Enter` stores, `Esc` and `Ctrl+C` cancel and forget what
+/// was typed. Nothing here is echoed to the transcript.
+fn handle_key_entry_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            view.close_key_entry();
+            view.pending_switch = None;
+            view.status = String::from("the key was not stored");
+        }
+        KeyCode::Char('c' | 'C') if control => {
+            view.close_key_entry();
+            view.pending_switch = None;
+        }
+        KeyCode::Enter => {
+            let typed = view.take_key();
+            let provider = view.credential_provider.clone();
+            view.close_key_entry();
+            if typed.trim().is_empty() {
+                view.pending_switch = None;
+                view.status = String::from("no key was typed");
+            } else if let Some(provider) = provider {
+                return Outcome::SetCredential {
+                    provider,
+                    key: typed,
+                };
+            }
+        }
+        KeyCode::Backspace => view.key_pop(),
+        KeyCode::Char(character) if !control => view.key_push(character),
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Records the answer to an approval question, sends it, and says what it did.
+///
+/// The question is cleared before the answer leaves, so a reader cannot press `y` twice and have the
+/// second press land on whatever question comes next — answers are keyed by id, but the dialog is
+/// not. The answer is sent first, because it is what the turn is waiting for: the stop it may also
+/// ask for is read at the turn's next checkpoint, which it cannot reach until the question settles.
+fn answer_and_report(
+    call_id: &str,
+    allow: bool,
+    always: bool,
+    stop: bool,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    view.pending_approval = None;
+    source.answer(call_id, allow, always);
+    if stop {
+        view.status = String::from("denied; stopping the turn");
+        source.interrupt();
+    } else {
+        view.status = match (allow, always) {
+            (true, true) => String::from("always allowed; the turn is running"),
+            (true, false) => String::from("allowed once; the turn is running"),
+            (false, _) => String::from("denied; the model is told"),
+        };
+    }
+}
+
+/// Routes a mouse event, then refreshes the mention menu for the pointer's new place.
+///
+/// A click moves the caret, and a mention is a property of the text: the refresh is here for the
+/// pointer for the same reason it is for the keyboard — a menu raised for a word the caret has left
+/// is a menu that answers for something nobody is pointing at any more.
+fn handle_pointer(
+    mouse: MouseEvent,
+    view: &mut ViewState,
+    files: &mut Option<Vec<String>>,
+    workspace: Option<&str>,
+) {
+    handle_mouse(mouse, view);
+    refresh_mentions(view, files, workspace);
+}
+
+/// Opens the provider chooser, or says the agent offers none.
+fn open_provider_chooser(view: &mut ViewState) {
+    view.status = if view.open_providers() {
+        String::from("provider: Enter switches, Esc cancels")
+    } else {
+        String::from("this agent offers no provider to switch to")
+    };
+}
+
+/// Switches to the provider a named command asked for.
+///
+/// The name is matched against the choices the agent offered: a provider with several plans is
+/// named without one only when it has a single plan, and a refused choice is skipped rather than
+/// attempted, so `/provider openai` lands on the first usable plan.
+fn switch_provider_named(name: &str, source: &mut dyn SessionSource, view: &mut ViewState) {
+    let Some(choice) = view
+        .providers
+        .iter()
+        .find(|choice| choice.provider == name && choice.refused.is_none())
+        .cloned()
+    else {
+        view.status = format!("no such provider: {name}");
+        return;
+    };
+    request_switch(&choice.provider, &choice.plan, source, view);
+}
+
+/// Asks the agent to switch provider, remembering what was asked for.
+///
+/// Remembered because the answer may be "no credential", and the key that follows is filed against
+/// exactly this provider and plan.
+fn request_switch(
+    provider: &str,
+    plan: &str,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    view.status = format!("switching to {provider} · {plan}");
+    view.pending_switch = Some((provider.to_owned(), plan.to_owned()));
+    source.set_provider(provider, Some(plan));
+}
+
+/// Stores a key, then retries the switch it was asked for.
+///
+/// Both requests leave, in order: the store files the key and the switch that follows sees it. The
+/// provider and plan come from what was asked for rather than from the argument, so a key cannot be
+/// filed against one provider and applied to another.
+fn store_credential(
+    provider: &str,
+    key: &str,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    source.set_credential(provider, key);
+    view.status = format!("storing a key for {provider}");
+    if let Some((provider, plan)) = view.pending_switch.clone() {
+        source.set_provider(&provider, Some(&plan));
+    }
 }
 
 /// Applies one keystroke to an open approval question.
@@ -2642,34 +2952,28 @@ fn apply(frame: Frame, view: &mut ViewState) {
             // the switch rather than keeping the previous model's list.
             view.refresh_effort_levels();
         }
+        Frame::ProviderChanged {
+            provider,
+            plan,
+            models,
+            model_efforts,
+        } => apply_provider_changed(&provider, &plan, &models, &model_efforts, view),
+        Frame::NoCredential { provider, env } => {
+            // Asked rather than refused: storing a key is the one thing a reader can do about it,
+            // and what was asked for is still held so the key is filed against it.
+            view.open_credential(&provider, &env);
+            view.status = format!("no credential for {provider}: store one?");
+        }
         Frame::Tool {
             call_id,
             name,
             arguments,
-        } => {
-            // Followed like every other append: a tool line that arrives below the fold is a
-            // line the reader is not shown, and the transcript's own rule is that everything
-            // which appends follows.
-            view.transcript.push(call_entry(
-                Entry::tool_call(name, tool_arguments(arguments)),
-                call_id,
-            ));
-            view.follow();
-        }
+        } => apply_tool(name, arguments, call_id, view),
         Frame::ToolDone {
             call_id,
             name,
             error,
-        } => {
-            // No content, because the frame carries none: a tool's output is in the
-            // session log, and this frame says only that the call is over and how it went.
-            // A placeholder here used to put the word "done" under every tool call in a
-            // live transcript — a line of screen saying nothing — and with the outcome
-            // moved onto the call's own line it would have said it twice.
-            view.transcript
-                .push(call_entry(Entry::tool_result(name, error, ""), call_id));
-            view.follow();
-        }
+        } => apply_tool_done(name, error, call_id, view),
         Frame::Usage {
             tokens,
             completion_tokens,
@@ -2712,6 +3016,69 @@ fn apply(frame: Frame, view: &mut ViewState) {
         | Frame::Status(_)
         | Frame::Bye => {}
     }
+}
+
+/// Appends a tool call to the transcript and follows it.
+///
+/// Followed like every other append: a tool line that arrives below the fold is a line the reader is
+/// not shown, and the transcript's own rule is that everything which appends follows.
+fn apply_tool(
+    name: String,
+    arguments: serde_json::Value,
+    call_id: Option<String>,
+    view: &mut ViewState,
+) {
+    view.transcript.push(call_entry(
+        Entry::tool_call(name, tool_arguments(arguments)),
+        call_id,
+    ));
+    view.follow();
+}
+
+/// Appends a tool result to the transcript and follows it.
+///
+/// No content, because the frame carries none: a tool's output is in the session log, and this frame
+/// says only that the call is over and how it went. A placeholder here used to put the word "done"
+/// under every tool call in a live transcript — a line of screen saying nothing — and with the
+/// outcome moved onto the call's own line it would have said it twice.
+fn apply_tool_done(name: String, error: bool, call_id: Option<String>, view: &mut ViewState) {
+    view.transcript
+        .push(call_entry(Entry::tool_result(name, error, ""), call_id));
+    view.follow();
+}
+
+/// Applies a provider change: where requests go, and the models and their effort steps with it.
+///
+/// The agent is the authority on where requests go, as it is on the model: a client that switched
+/// has already drawn the switch, and a watcher learns it here. The models and their steps are
+/// replaced together because a provider change replaces both, and the requested switch is cleared
+/// because this frame is its answer.
+fn apply_provider_changed(
+    provider: &str,
+    plan: &str,
+    models: &[String],
+    model_efforts: &[nanus_link::protocol::ModelEfforts],
+    view: &mut ViewState,
+) {
+    view.provider = Some(provider.to_owned());
+    view.plan = Some(plan.to_owned());
+    view.models = models.to_vec();
+    view.model_efforts = model_efforts
+        .iter()
+        .map(|entry| {
+            (
+                entry.model.clone(),
+                entry
+                    .efforts
+                    .iter()
+                    .map(|state| view_effort(*state).as_str().to_owned())
+                    .collect(),
+            )
+        })
+        .collect();
+    view.refresh_effort_levels();
+    view.pending_switch = None;
+    view.status = format!("provider: {provider}");
 }
 
 /// Draws the notice that part of the conversation was left out of the prompt.
@@ -2873,6 +3240,20 @@ mod tests {
         fn set_effort(&mut self, effort: ReasoningEffort) {
             self.requests.borrow_mut().push(Request::SetEffort {
                 state: wire_effort(effort),
+            });
+        }
+
+        fn set_provider(&mut self, provider: &str, plan: Option<&str>) {
+            self.requests.borrow_mut().push(Request::SetProvider {
+                provider: provider.to_owned(),
+                plan: plan.map(str::to_owned),
+            });
+        }
+
+        fn set_credential(&mut self, provider: &str, key: &str) {
+            self.requests.borrow_mut().push(Request::SetCredential {
+                provider: provider.to_owned(),
+                key: key.to_owned(),
             });
         }
     }
@@ -4300,6 +4681,161 @@ mod tests {
         assert!(view.status.contains("no effort"), "{}", view.status);
     }
 
+    /// `/provider` routes to the chooser and `/provider <name>` to a named switch.
+    #[test]
+    fn the_provider_command_opens_a_chooser_or_names_one() {
+        assert_eq!(
+            route_submission(String::from("/provider"), true),
+            Routed::Provider(None)
+        );
+        assert_eq!(
+            route_submission(String::from("/provider zai"), true),
+            Routed::Provider(Some(String::from("zai")))
+        );
+    }
+
+    /// Choosing a provider sends the switch; a "no credential" answer opens the question that
+    /// stores a key and retries the switch it was asked for.
+    #[test]
+    fn choosing_a_provider_switches_or_offers_to_store_a_key() {
+        let mut view = ViewState::new();
+        view.provider = Some(String::from("deepseek"));
+        view.plan = Some(String::from("api"));
+        view.providers = vec![
+            ProviderChoice {
+                provider: String::from("zai"),
+                plan: String::from("api"),
+                label: String::from("zai · api"),
+                env: String::from("ZAI_API_KEY"),
+                refused: None,
+            },
+            ProviderChoice {
+                provider: String::from("openai"),
+                plan: String::from("subscription"),
+                label: String::from("openai · subscription"),
+                env: String::from("OPENAI_API_KEY"),
+                refused: Some(String::from("needs an OAuth token")),
+            },
+        ];
+        let mut source = Scripted::new(Vec::new());
+
+        open_provider_chooser(&mut view);
+        assert!(view.provider_open, "{}", view.status);
+        assert_eq!(
+            view.selected_choice().map(|choice| choice.provider),
+            Some(String::from("zai"))
+        );
+
+        // Enter on a usable row asks for the switch and remembers it.
+        let outcome = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(!view.provider_open);
+        let Outcome::SetProvider { provider, plan } = outcome else {
+            panic!("Enter switches provider");
+        };
+        request_switch(&provider, &plan, &mut source, &mut view);
+        assert_eq!(
+            view.pending_switch.as_ref().map(|(p, _)| p.as_str()),
+            Some("zai")
+        );
+
+        // The agent answers that there is no key: the question opens.
+        apply(
+            Frame::NoCredential {
+                provider: String::from("zai"),
+                env: String::from("ZAI_API_KEY"),
+            },
+            &mut view,
+        );
+        assert!(view.credential_open);
+
+        // `y` opens the masked field, and typing then Enter yields the credential to store.
+        let _ = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        assert!(view.key_entry_open);
+        for character in "sk-secret".chars() {
+            let _ = handle_key(key(KeyCode::Char(character), KeyModifiers::NONE), &mut view);
+        }
+        assert_eq!(view.key_input, "sk-secret");
+        let outcome = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        let Outcome::SetCredential { provider, key } = outcome else {
+            panic!("Enter stores the key");
+        };
+        assert_eq!(provider, "zai");
+        store_credential(&provider, &key, &mut source, &mut view);
+
+        // Both requests left, in order: the store, then the switch that now sees the key. And the
+        // key is not kept once it has been sent.
+        let requests = source.requests.borrow();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(
+            requests[1],
+            Request::SetCredential {
+                provider: String::from("zai"),
+                key: String::from("sk-secret"),
+            }
+        );
+        assert_eq!(
+            requests[2],
+            Request::SetProvider {
+                provider: String::from("zai"),
+                plan: Some(String::from("api")),
+            }
+        );
+        assert!(view.key_input.is_empty(), "the key is not kept");
+    }
+
+    /// A refused plan is a row that says why rather than a switch.
+    #[test]
+    fn a_refused_plan_is_not_switched() {
+        let mut view = ViewState::new();
+        view.providers = vec![ProviderChoice {
+            provider: String::from("openai"),
+            plan: String::from("subscription"),
+            label: String::from("openai · subscription"),
+            env: String::from("OPENAI_API_KEY"),
+            refused: Some(String::from("needs an OAuth token")),
+        }];
+        open_provider_chooser(&mut view);
+        let outcome = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(view.status.contains("unavailable"), "{}", view.status);
+        assert!(!view.provider_open);
+    }
+
+    /// `ProviderChanged` replaces where requests go, and the models and effort steps with it.
+    #[test]
+    fn a_provider_frame_replaces_the_provider_and_its_models() {
+        let mut view = ViewState::new();
+        view.provider = Some(String::from("deepseek"));
+        view.plan = Some(String::from("api"));
+        view.models = vec![String::from("deepseek-flash")];
+        view.model = Some(String::from("deepseek-flash"));
+        view.pending_switch = Some((String::from("zai"), String::from("coding")));
+        apply(
+            Frame::ProviderChanged {
+                provider: String::from("zai"),
+                plan: String::from("coding"),
+                models: vec![String::from("glm-5.3-flashx"), String::from("glm-5.2")],
+                model_efforts: vec![nanus_link::protocol::ModelEfforts {
+                    model: String::from("glm-5.3-flashx"),
+                    efforts: vec![EffortState::High, EffortState::Max],
+                }],
+            },
+            &mut view,
+        );
+        assert_eq!(view.provider.as_deref(), Some("zai"));
+        assert_eq!(view.plan.as_deref(), Some("coding"));
+        assert_eq!(view.models, vec!["glm-5.3-flashx", "glm-5.2"]);
+        assert!(view.pending_switch.is_none(), "the switch has landed");
+        // The effort steps follow the model, once a model frame names it.
+        apply(
+            Frame::ModelChanged {
+                model: String::from("glm-5.3-flashx"),
+            },
+            &mut view,
+        );
+        assert_eq!(view.effort_levels, vec!["high", "max"]);
+    }
+
     /// The agent is the authority on the effort its next request carries, and a recording has
     /// nothing to ask.
     #[test]
@@ -5324,6 +5860,9 @@ mod tests {
                 models: Vec::new(),
                 effort: None,
                 model_efforts: Vec::new(),
+                provider: String::new(),
+                plan: String::new(),
+                providers: Vec::new(),
                 tools: 0,
                 version: nanus_link::protocol::PROTOCOL_VERSION,
             }),

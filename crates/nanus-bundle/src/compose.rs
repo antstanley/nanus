@@ -62,15 +62,11 @@ pub struct Harness {
     pub store: StoreHandle,
     /// The clock.
     pub clock: ClockHandle,
-    /// The model adapter, for its model id.
-    pub llm: LlmHandle,
-    /// The model ids a client may switch this harness between, in cycling order.
+    /// What provider the harness is talking to, and how to change it.
     ///
-    /// Taken from the resolved [`Selection`] rather than from the adapter, because
-    /// which ids are offered is a decision about this deployment and not about the
-    /// provider: the adapter accepts what it is told, and the list is what the
-    /// interface may name.
-    models: Vec<String>,
+    /// Replaces a bare adapter handle: the switch owns the model adapter the runner issues requests
+    /// through, so a provider change reaches the loop rather than being a fact kept beside it.
+    pub switch: Rc<ProviderSwitch>,
     /// What a session created here is being run under.
     ///
     /// Kept on the harness rather than passed to [`Harness::new_session`], so a session is
@@ -82,7 +78,7 @@ pub struct Harness {
 impl core::fmt::Debug for Harness {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Harness")
-            .field("model", &self.llm.model())
+            .field("model", &self.switch.model())
             .field("steps", &self.context.stats())
             .finish_non_exhaustive()
     }
@@ -99,8 +95,8 @@ impl Harness {
 
     /// Returns the model ids a client may switch this harness between.
     #[must_use]
-    pub fn models(&self) -> &[String] {
-        &self.models
+    pub fn models(&self) -> Vec<String> {
+        self.switch.models()
     }
 
     /// Starts a new session.
@@ -215,20 +211,137 @@ impl Pending {
                 .map_err(|error| BundleError::Kernel(error.to_string()))?
                 .0
         ));
+        let runner = Rc::new(runner);
+        let switch = Rc::new(ProviderSwitch {
+            config: self.config.clone(),
+            secrets: self.secrets.clone(),
+            runner: Rc::clone(&runner),
+            selection: core::cell::RefCell::new(self.selection),
+        });
         Ok(Harness {
             context,
-            runner: Rc::new(runner),
+            runner,
             store: self.store,
             clock: self.clock,
-            llm: self.llm,
-            models: self
-                .selection
-                .models()
-                .iter()
-                .map(|id| (*id).to_owned())
-                .collect(),
+            switch,
             origin,
         })
+    }
+}
+
+/// The provider a harness is talking to, and how to change it.
+///
+/// A provider change is a *recomposition* of one plugin: the model adapter is rebuilt from the
+/// configuration, the credential store, and the provider table, and the runner is pointed at the
+/// replacement. Nothing else moves — the tools, the store, the sessions, and the system prompt are
+/// the same objects they were — which is what lets a conversation survive a switch.
+///
+/// The configuration is kept rather than only its resolution: a switch names a provider and a plan,
+/// and everything else (the workspace, the ceilings, the sandbox) has to be resolved again from the
+/// same file the startup used.
+pub struct ProviderSwitch {
+    config: NanusConfig,
+    secrets: SecretHandle,
+    runner: Rc<AgentRunner>,
+    selection: core::cell::RefCell<Selection>,
+}
+
+impl ProviderSwitch {
+    /// Returns the name of the provider in force.
+    #[must_use]
+    pub fn provider(&self) -> String {
+        self.selection.borrow().provider().name().to_owned()
+    }
+
+    /// Returns the plan in force.
+    #[must_use]
+    pub fn plan(&self) -> String {
+        self.selection.borrow().plan().name.to_owned()
+    }
+
+    /// Returns the model the current provider will name in its next request.
+    #[must_use]
+    pub fn model(&self) -> String {
+        self.selection.borrow().model().to_owned()
+    }
+
+    /// Returns the model ids the provider in force offers, the one in use first.
+    #[must_use]
+    pub fn models(&self) -> Vec<String> {
+        let selection = self.selection.borrow();
+        let current = selection.model().to_owned();
+        let mut models: Vec<String> = selection
+            .models()
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        if !models.contains(&current) {
+            models.insert(0, current);
+        }
+        models
+    }
+
+    /// Returns whether a credential is configured for `provider`.
+    ///
+    /// Asked of the store rather than remembered, because a key set from another terminal between
+    /// two attempts has to be seen: the answer is what decides whether a switch can go ahead.
+    pub async fn has_credential(&self, provider: Provider) -> bool {
+        matches!(
+            self.secrets.get(provider.name()).await,
+            Ok(Some(ref secret)) if !secret.is_blank()
+        )
+    }
+
+    /// Files a credential for `provider`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Config`] when the store refuses the write, so a key that could not be
+    /// saved is a sentence rather than a switch that silently cannot happen.
+    pub async fn set_credential(&self, provider: Provider, key: &str) -> Result<(), BundleError> {
+        if key.trim().is_empty() {
+            return Err(BundleError::config("a credential is not empty"));
+        }
+        self.secrets
+            .set(provider.name(), key)
+            .await
+            .map_err(|error| BundleError::config(format!("{}: {error}", provider.name())))
+    }
+
+    /// Rebuilds the model adapter for `provider` and `plan`, and points the runner at it.
+    ///
+    /// Returns the model ids the new provider offers. The startup configuration's other fields are
+    /// carried over, and its provider, plan, model, and endpoint are overwritten: a switch names a
+    /// provider, not a whole configuration, so everything else has to stay what the file said.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Config`] when the provider or plan is unknown, the plan is one this
+    /// build refuses, or no credential is configured — the same resolutions composition performs, so
+    /// a switch cannot land on a provider a fresh run would refuse.
+    pub async fn switch(
+        &self,
+        provider: Provider,
+        plan: Option<&str>,
+    ) -> Result<Vec<String>, BundleError> {
+        let mut config = self.config.clone();
+        config.provider = Some(provider.name().to_owned());
+        config.plan = plan.map(str::to_owned);
+        // The model and the endpoint belong to the provider being left, so they are dropped and
+        // resolved afresh: a DeepSeek id sent to OpenAI is a refused request, not a substitution.
+        config.model = None;
+        config.base_url = None;
+        let selection = Selection::resolve(&config)?;
+        let credential = resolve_credential(&self.secrets, &selection).await?;
+        let llm = build_llm(&config, &selection, &credential)?;
+        self.runner.set_llm(llm);
+        self.runner.set_model(selection.model());
+        // The effort in force was chosen for the model being left, and the steps a model takes
+        // differ, so it goes back to the adapter's own default rather than naming a step the new
+        // model may not accept.
+        self.runner.set_effort(None);
+        *self.selection.borrow_mut() = selection;
+        Ok(self.models())
     }
 }
 

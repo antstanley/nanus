@@ -43,7 +43,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use nanus_bundle::compose::new_session;
-use nanus_bundle::{AgentRunner, Approver, Harness, Progress};
+use nanus_bundle::{AgentRunner, Approver, Harness, Progress, Provider, ProviderSwitch};
 use nanus_domain::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Session, SessionId, ToolCallId, ToolName,
     TurnEndReason, Usage,
@@ -57,7 +57,8 @@ use tokio::task::JoinSet;
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
-    AgentInfo, ApprovalState, EffortState, Frame, ModelEfforts, Request, SessionInfo, TurnEnd,
+    AgentInfo, ApprovalState, EffortState, Frame, ModelEfforts, PlanInfo, ProviderInfo, Request,
+    SessionInfo, TurnEnd,
 };
 use crate::wire::{read_request, write_frame};
 
@@ -89,8 +90,14 @@ pub struct Agent {
     store: StoreHandle,
     clock: ClockHandle,
     workspace: PathBuf,
-    models: Vec<String>,
+    /// The model ids a client may switch between, replaced when the provider changes.
+    models: RefCell<Vec<String>>,
     tools: usize,
+    /// How to change provider, when this agent was composed from a harness.
+    ///
+    /// `None` for an agent built from parts with no composition behind it — a scripted test — which
+    /// cannot change provider and says so rather than pretending.
+    switch: Option<Rc<ProviderSwitch>>,
 }
 
 /// The parts an [`Agent`] is built from.
@@ -116,6 +123,11 @@ pub struct Parts {
     pub models: Vec<String>,
     /// How many tools the runner exposes.
     pub tools: usize,
+    /// How to change provider, when this agent has a composition behind it.
+    ///
+    /// Optional so a scripted test can build an agent with no adapters: an agent that cannot
+    /// change provider refuses the request rather than pretending it worked.
+    pub switch: Option<Rc<ProviderSwitch>>,
 }
 
 impl Agent {
@@ -127,8 +139,9 @@ impl Agent {
             store: harness.store.clone(),
             clock: harness.clock.clone(),
             workspace: workspace.into(),
-            models: harness.models().to_vec(),
+            models: harness.models(),
             tools: harness.tool_count(),
+            switch: Some(Rc::clone(&harness.switch)),
         })
     }
 
@@ -152,8 +165,9 @@ impl Agent {
             store: parts.store,
             clock: parts.clock,
             workspace: parts.workspace,
-            models,
+            models: RefCell::new(models),
             tools: parts.tools,
+            switch: parts.switch,
         }
     }
 
@@ -181,8 +195,19 @@ impl Agent {
 
     /// Returns the model ids a client may switch to, the one in use first.
     #[must_use]
-    pub fn models(&self) -> &[String] {
-        &self.models
+    pub fn models(&self) -> Vec<String> {
+        self.models.borrow().clone()
+    }
+
+    /// Returns how to change provider, when this agent has a composition behind it.
+    #[must_use]
+    pub fn switch(&self) -> Option<Rc<ProviderSwitch>> {
+        self.switch.clone()
+    }
+
+    /// Replaces the model list, after a provider change replaced every id in it.
+    pub fn set_models(&self, models: Vec<String>) {
+        *self.models.borrow_mut() = models;
     }
 
     /// Returns the reasoning effort the agent's next request will carry.
@@ -200,9 +225,18 @@ impl Agent {
         AgentInfo {
             workspace: self.workspace.display().to_string(),
             model: self.model(),
-            models: self.models.clone(),
+            models: self.models(),
             effort: self.effort(),
             model_efforts: self.model_efforts(),
+            provider: self
+                .switch
+                .as_ref()
+                .map_or_else(String::new, |switch| switch.provider()),
+            plan: self
+                .switch
+                .as_ref()
+                .map_or_else(String::new, |switch| switch.plan()),
+            providers: provider_catalogue(),
             tools: self.tools,
             version: crate::protocol::PROTOCOL_VERSION,
         }
@@ -214,7 +248,7 @@ impl Agent {
     /// and the runner is where the adapter is, so this asks it rather than keeping a second copy
     /// that could drift from the one the request will obey.
     fn model_efforts(&self) -> Vec<ModelEfforts> {
-        self.models
+        self.models()
             .iter()
             .map(|model| ModelEfforts {
                 model: model.clone(),
@@ -808,6 +842,34 @@ impl Registry {
         }
     }
 
+    /// Tells every attached client which provider the agent is talking to now.
+    ///
+    /// Sent for the same reason the model is: the provider is the agent's, and the model list and
+    /// the models' effort steps change with it, so a client that kept the old ones would offer
+    /// models and steps the agent no longer has.
+    async fn broadcast_provider(
+        &self,
+        provider: String,
+        plan: String,
+        models: Vec<String>,
+        model_efforts: Vec<ModelEfforts>,
+    ) {
+        let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
+        for entry in held {
+            broadcast_awaited(
+                &entry,
+                Frame::ProviderChanged {
+                    provider: provider.clone(),
+                    plan: plan.clone(),
+                    models: models.clone(),
+                    model_efforts: model_efforts.clone(),
+                },
+                None,
+            )
+            .await;
+        }
+    }
+
     /// Lets idle sessions go until the agent is holding no more than it should.
     ///
     /// `incoming` is how many sessions the caller is about to add. Counting them before
@@ -900,6 +962,30 @@ const fn domain_effort(state: EffortState) -> nanus_ports::ReasoningEffort {
         EffortState::XHigh => nanus_ports::ReasoningEffort::XHigh,
         EffortState::Max => nanus_ports::ReasoningEffort::Max,
     }
+}
+
+/// The providers this build offers, with the plans each has.
+///
+/// Read from the composition's provider table so the interface offers exactly what the agent would
+/// accept: a provider named in the modal is one a switch can resolve, and a plan marked refused is
+/// one this build would not honour.
+fn provider_catalogue() -> Vec<ProviderInfo> {
+    Provider::ALL
+        .iter()
+        .map(|provider| ProviderInfo {
+            name: provider.name().to_owned(),
+            credential_env: provider.env_var().to_owned(),
+            plans: provider
+                .plans()
+                .iter()
+                .map(|plan| PlanInfo {
+                    name: plan.name.to_owned(),
+                    model: plan.model.map(str::to_owned),
+                    refused: plan.refusal.map(str::to_owned),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// Reads the link's approval state into the domain's vocabulary.
@@ -1490,6 +1576,9 @@ async fn refuse_if_detached(
 /// # Errors
 ///
 /// Returns an error when the connection cannot be read or its frames cannot be written.
+// One flat match over the protocol's requests is the whole vocabulary in one place, and splitting
+// it into a helper per arm would hide that; the complexity is the protocol's, not the logic's.
+#[allow(clippy::cognitive_complexity)]
 async fn serve_connection(
     stream: UnixStream,
     registry: Rc<Registry>,
@@ -1560,6 +1649,12 @@ async fn serve_connection(
                     .runner()
                     .set_effort(Some(domain_effort(state)));
                 registry.broadcast_effort(state).await;
+            }
+            Request::SetProvider { provider, plan } => {
+                set_provider(&registry, &frames, &provider, plan.as_deref()).await;
+            }
+            Request::SetCredential { provider, key } => {
+                set_credential(&registry, &frames, &provider, &key).await;
             }
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
@@ -1637,6 +1732,116 @@ async fn set_model(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, model:
     // answering.
     registry.agent.runner().set_model(&model);
     registry.broadcast_model(&model).await;
+}
+
+/// Rebuilds the agent's model adapter for another provider, or says why it could not.
+///
+/// Three refusals, each named: a provider this build does not offer, an agent with no composition
+/// behind it, and a provider with no credential. The last is [`Frame::NoCredential`] rather than a
+/// [`Frame::Failed`] because it is the one refusal a reader can act on, and the interface turns it
+/// into the question of whether to store a key.
+async fn set_provider(
+    registry: &Rc<Registry>,
+    frames: &mpsc::Sender<Frame>,
+    provider: &str,
+    plan: Option<&str>,
+) {
+    let Some(name) = Provider::parse(provider) else {
+        send(
+            frames,
+            Frame::Failed {
+                message: format!(
+                    "unknown provider: {provider} — this build offers {}",
+                    Provider::names().join(", ")
+                ),
+            },
+        )
+        .await;
+        return;
+    };
+    let Some(switch) = registry.agent.switch() else {
+        send(
+            frames,
+            Frame::Failed {
+                message: String::from("this agent cannot change provider"),
+            },
+        )
+        .await;
+        return;
+    };
+    if !switch.has_credential(name).await {
+        send(
+            frames,
+            Frame::NoCredential {
+                provider: name.name().to_owned(),
+                env: name.env_var().to_owned(),
+            },
+        )
+        .await;
+        return;
+    }
+    match switch.switch(name, plan).await {
+        Ok(models) => {
+            registry.agent.set_models(models.clone());
+            let provider = switch.provider();
+            let plan = switch.plan();
+            let model_efforts = registry.agent.model_efforts();
+            registry
+                .broadcast_provider(provider, plan, models, model_efforts)
+                .await;
+        }
+        Err(error) => {
+            send(
+                frames,
+                Frame::Failed {
+                    message: error.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Files a credential for a provider.
+///
+/// The key is written and never echoed: neither the acknowledgement nor any frame carries it back.
+/// A failure is a [`Frame::Failed`] naming the provider, and success is silent because the
+/// interface's next move is to try the switch again, whose own answer is the one that matters.
+async fn set_credential(
+    registry: &Rc<Registry>,
+    frames: &mpsc::Sender<Frame>,
+    provider: &str,
+    key: &str,
+) {
+    let Some(name) = Provider::parse(provider) else {
+        send(
+            frames,
+            Frame::Failed {
+                message: format!("unknown provider: {provider}"),
+            },
+        )
+        .await;
+        return;
+    };
+    let Some(switch) = registry.agent.switch() else {
+        send(
+            frames,
+            Frame::Failed {
+                message: String::from("this agent cannot store a credential"),
+            },
+        )
+        .await;
+        return;
+    };
+    if let Err(error) = switch.set_credential(name, key).await {
+        send(
+            frames,
+            Frame::Failed {
+                message: error.to_string(),
+            },
+        )
+        .await;
+    }
 }
 
 /// Detaches a connection from the session it was watching.
@@ -1882,6 +2087,42 @@ mod tests {
         }
     }
 
+    /// The provider catalogue is the composition's table: every provider this build offers, each
+    /// with its plans, and a plan it refuses carrying its reason.
+    #[test]
+    fn the_provider_catalogue_lists_every_provider_and_plan() {
+        let catalogue = provider_catalogue();
+        let names: Vec<&str> = catalogue
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["deepseek", "zai", "anthropic", "openai"]);
+        for provider in &catalogue {
+            assert!(!provider.credential_env.is_empty(), "{}", provider.name);
+            assert!(!provider.plans.is_empty(), "{}", provider.name);
+        }
+        // z.ai offers two hosts; OpenAI's subscription is listed and refused with its reason.
+        let zai = catalogue
+            .iter()
+            .find(|provider| provider.name == "zai")
+            .expect("zai is offered");
+        let plans: Vec<&str> = zai.plans.iter().map(|plan| plan.name.as_str()).collect();
+        assert_eq!(plans, vec!["api", "coding"]);
+        let openai = catalogue
+            .iter()
+            .find(|provider| provider.name == "openai")
+            .expect("openai is offered");
+        let subscription = openai
+            .plans
+            .iter()
+            .find(|plan| plan.name == "subscription")
+            .expect("the subscription plan is listed");
+        assert!(
+            subscription.refused.is_some(),
+            "and refused with its reason rather than absent"
+        );
+    }
+
     /// A held session with nobody attached.
     ///
     /// Built here rather than through `Registry::hold` because none of these tests needs a
@@ -1929,6 +2170,7 @@ mod tests {
                 workspace: dir.to_path_buf(),
                 models: vec![String::from("silent")],
                 tools: 0,
+                switch: None,
             })),
             String::from("a test agent"),
         ))

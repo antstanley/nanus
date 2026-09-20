@@ -118,7 +118,7 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     // what turns an absent `model` into the provider's own default, so the two are
     // asserted together: the adapter talks to what the configuration resolved to.
     let selection = Selection::resolve(&settings).expect("the configuration resolves");
-    assert_eq!(harness.llm.model(), selection.model());
+    assert_eq!(harness.switch.model(), selection.model());
 
     // The prompt the model is sent describes this deployment: the workspace the tools are
     // rooted in, and the two permission knobs the gate enforces. The domain renders this

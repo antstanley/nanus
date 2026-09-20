@@ -510,6 +510,40 @@ pub struct ViewState {
     /// the handshake describes every model, and the current one is looked up from here.
     pub model_efforts: BTreeMap<String, Vec<String>>,
 
+    /// The provider the conversation is being answered by, when one was said.
+    pub provider: Option<String>,
+    /// The plan in force for that provider, when one was said.
+    pub plan: Option<String>,
+    /// The choices the provider chooser offers, from the agent's handshake.
+    pub providers: Vec<ProviderChoice>,
+    /// Whether the provider chooser is open.
+    ///
+    /// While it is set it owns the keyboard, as the model selector does: the reader is choosing
+    /// where requests go, and a key that reached the composer would be typed into a prompt nobody
+    /// can see.
+    pub provider_open: bool,
+    /// Which choice the provider chooser has selected.
+    pub provider_selection: usize,
+    /// The provider and plan a switch has asked for, while the answer is in flight.
+    ///
+    /// Held so a "no credential" answer can name what was asked for: storing a key is only useful
+    /// with the thing the key is for, and that thing is what is being waited on.
+    pub pending_switch: Option<(String, String)>,
+    /// Whether the "no credential — store one?" question is open.
+    pub credential_open: bool,
+    /// The provider that question is about.
+    pub credential_provider: Option<String>,
+    /// The environment variable that provider's key is normally read from.
+    pub credential_env: String,
+    /// Whether the masked key-entry field is open.
+    ///
+    /// A field of its own rather than the composer: a key typed into the composer would be drawn
+    /// in full and could be submitted as a prompt. This one is drawn masked and goes nowhere but
+    /// the credential store.
+    pub key_entry_open: bool,
+    /// The key as typed, cleared whenever the entry closes.
+    pub key_input: String,
+
     /// How many rows into the key list the overlay starts.
     ///
     /// The list is longer than a short terminal, so it is scrolled rather than cut: an
@@ -576,6 +610,17 @@ impl Default for ViewState {
             effort_selection: 0,
             effort_levels: Vec::new(),
             model_efforts: BTreeMap::new(),
+            provider: None,
+            plan: None,
+            providers: Vec::new(),
+            provider_open: false,
+            provider_selection: 0,
+            pending_switch: None,
+            credential_open: false,
+            credential_provider: None,
+            credential_env: String::new(),
+            key_entry_open: false,
+            key_input: String::new(),
             last_viewport: None,
             last_composer: None,
         }
@@ -595,6 +640,26 @@ impl std::fmt::Debug for ViewState {
             .field("queued", &self.queue.len())
             .finish_non_exhaustive()
     }
+}
+
+/// One switchable choice the provider chooser offers: a provider and one of its plans.
+///
+/// A tuple rather than a provider with a submenu, because a plan is what a request actually goes to:
+/// z.ai's `api` and `coding` are two hosts, and `OpenAI`'s `subscription` is a plan this build
+/// refuses. Flattening them means one keypress chooses both, and a refused plan is a row that says
+/// why rather than a submenu that cannot be entered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderChoice {
+    /// The provider's name, as a configuration and the link spell it.
+    pub provider: String,
+    /// The plan's name.
+    pub plan: String,
+    /// The label the row is drawn with.
+    pub label: String,
+    /// The environment variable this provider's credential is read from.
+    pub env: String,
+    /// Why this choice cannot be used, when it cannot.
+    pub refused: Option<String>,
 }
 
 /// The approval states the permission dialog offers, and what each one means.
@@ -1175,6 +1240,9 @@ impl ViewState {
             || self.permission_open
             || self.model_open
             || self.effort_open
+            || self.provider_open
+            || self.credential_open
+            || self.key_entry_open
             || self.pending_approval.is_some()
     }
 
@@ -1759,6 +1827,117 @@ impl ViewState {
         Some(next.clone())
     }
 
+    /// Opens the provider chooser, selecting the choice in force.
+    ///
+    /// Returns `false` when the agent offered no provider to switch to, so the caller can say so
+    /// rather than draw an empty list.
+    pub fn open_providers(&mut self) -> bool {
+        if self.providers.is_empty() {
+            return false;
+        }
+        self.provider_open = true;
+        self.provider_selection = self
+            .providers
+            .iter()
+            .position(|choice| self.is_current(choice))
+            .unwrap_or(0);
+        true
+    }
+
+    /// Closes the provider chooser without changing anything.
+    pub fn close_providers(&mut self) {
+        self.provider_open = false;
+    }
+
+    /// Moves the chooser's selection toward the top of the list, wrapping round.
+    pub fn provider_up(&mut self) {
+        self.provider_selection = self
+            .provider_selection
+            .checked_sub(1)
+            .unwrap_or_else(|| self.providers.len().saturating_sub(1));
+    }
+
+    /// Moves the chooser's selection toward the bottom of the list, wrapping round.
+    pub fn provider_down(&mut self) {
+        self.provider_selection =
+            if self.provider_selection.saturating_add(1) >= self.providers.len() {
+                0
+            } else {
+                self.provider_selection.saturating_add(1)
+            };
+    }
+
+    /// Selects a choice by its position in the chooser.
+    ///
+    /// Returns `false` for a position that is not offered.
+    #[must_use]
+    pub fn provider_select(&mut self, position: usize) -> bool {
+        if position >= self.providers.len() {
+            return false;
+        }
+        self.provider_selection = position;
+        true
+    }
+
+    /// Returns the choice the chooser has selected, if any.
+    #[must_use]
+    pub fn selected_choice(&self) -> Option<ProviderChoice> {
+        self.providers.get(self.provider_selection).cloned()
+    }
+
+    /// Whether a choice is the provider and plan already in force.
+    #[must_use]
+    pub fn is_current(&self, choice: &ProviderChoice) -> bool {
+        self.provider.as_deref() == Some(choice.provider.as_str())
+            && self.plan.as_deref() == Some(choice.plan.as_str())
+    }
+
+    /// Opens the "store a key?" question for a provider.
+    pub fn open_credential(&mut self, provider: &str, env: &str) {
+        self.credential_open = true;
+        self.credential_provider = Some(provider.to_owned());
+        env.clone_into(&mut self.credential_env);
+    }
+
+    /// Closes the question without storing anything.
+    pub fn close_credential(&mut self) {
+        self.credential_open = false;
+        self.credential_provider = None;
+        self.credential_env.clear();
+    }
+
+    /// Opens the masked key-entry field.
+    pub fn open_key_entry(&mut self) {
+        self.credential_open = false;
+        self.key_entry_open = true;
+        self.key_input.clear();
+    }
+
+    /// Closes the key-entry field and forgets what was typed.
+    ///
+    /// The key is cleared rather than kept: a secret left in a field is a secret that could be
+    /// drawn again, and the only place it belongs is the store.
+    pub fn close_key_entry(&mut self) {
+        self.key_entry_open = false;
+        self.key_input.clear();
+    }
+
+    /// Appends a character to the key being typed.
+    pub fn key_push(&mut self, character: char) {
+        self.key_input.push(character);
+    }
+
+    /// Removes the last character of the key being typed.
+    pub fn key_pop(&mut self) {
+        self.key_input.pop();
+    }
+
+    /// Takes the typed key, leaving the field empty.
+    #[must_use]
+    pub fn take_key(&mut self) -> String {
+        core::mem::take(&mut self.key_input)
+    }
+
     /// The rows of the key list that fit in `height`, and where they start.
     #[must_use]
     fn help_window(&self, height: u16) -> (usize, usize) {
@@ -2094,6 +2273,15 @@ impl ViewState {
         }
         if self.effort_open {
             self.render_efforts(frame, area);
+        }
+        if self.provider_open {
+            self.render_providers(frame, area);
+        }
+        if self.credential_open {
+            self.render_credential(frame, area);
+        }
+        if self.key_entry_open {
+            self.render_key_entry(frame, area);
         }
         // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
         // be the thing a reader sees, not a dialogue behind the transcript.
@@ -2589,6 +2777,181 @@ impl ViewState {
             )))
             .title_bottom(Line::from(Span::styled(
                 " Enter applies, Esc cancels ",
+                Style::default().fg(Color::DarkGray),
+            )));
+        // Cleared first, so the transcript behind the dialog does not show through the gaps
+        // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .style(self.theme.notice),
+            dialog,
+        );
+    }
+
+    /// Draws the provider chooser.
+    ///
+    /// One row per provider-and-plan the agent offers, with the one in force marked: `/provider`
+    /// opens this rather than switching blind, and a plan this build refuses is a row that says why.
+    fn render_providers(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.providers.is_empty() {
+            return;
+        }
+        let width = area.width.saturating_sub(4).clamp(30, 76);
+        let room = usize::from(width.saturating_sub(2));
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines: Vec<Line<'static>> =
+            vec![Line::from(Span::styled("where requests go", dim))];
+        for (index, choice) in self.providers.iter().enumerate() {
+            let selected = index == self.provider_selection;
+            let style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            };
+            let marker = if selected { "\u{25b6}" } else { " " };
+            let note = choice.refused.as_deref().map_or_else(
+                || {
+                    if self.is_current(choice) {
+                        String::from(" · current")
+                    } else {
+                        String::new()
+                    }
+                },
+                |refusal| format!(" — {refusal}"),
+            );
+            let text = format!(
+                "{marker} {} {}{note}",
+                index.saturating_add(1),
+                choice.label
+            );
+            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
+        }
+        self.render_dialog(
+            frame,
+            area,
+            width,
+            lines,
+            (" provider ", " Enter switches, Esc cancels "),
+        );
+    }
+
+    /// Draws the "no credential — store one?" question.
+    fn render_credential(&self, frame: &mut Frame<'_>, area: Rect) {
+        let provider = self
+            .credential_provider
+            .as_deref()
+            .unwrap_or("this provider");
+        let width = area.width.saturating_sub(4).clamp(32, 80);
+        let room = usize::from(width.saturating_sub(2));
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            clip_row(&format!("no credential is configured for {provider}"), room),
+            Style::default(),
+        ))];
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            clip_row(
+                &format!("it would otherwise be read from {}", self.credential_env),
+                room,
+            ),
+            dim,
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" store a key    "),
+            Span::styled(
+                "n",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel"),
+        ]));
+        self.render_dialog(
+            frame,
+            area,
+            width,
+            lines,
+            (" credential ", " Enter stores, Esc cancels "),
+        );
+    }
+
+    /// Draws the masked key-entry field.
+    ///
+    /// The key is drawn as stars, and the count is cut so a long key cannot widen the dialog: what
+    /// is on the screen is never the secret.
+    fn render_key_entry(&self, frame: &mut Frame<'_>, area: Rect) {
+        let provider = self
+            .credential_provider
+            .as_deref()
+            .unwrap_or("the provider");
+        let width = area.width.saturating_sub(4).clamp(30, 72);
+        let masked = "*".repeat(self.key_input.chars().count().min(48));
+        let dim = Style::default().fg(Color::DarkGray);
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(Span::styled(
+                format!("key for {provider}, typed and stored by the agent"),
+                dim,
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("> "),
+                Span::styled(masked, Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("it is never echoed back", dim)),
+        ];
+        self.render_dialog(
+            frame,
+            area,
+            width,
+            lines,
+            (" api key ", " Enter stores, Esc cancels "),
+        );
+    }
+
+    /// Draws a centred, bounded dialog around `lines`.
+    ///
+    /// Shared by the provider flow's three dialogs, which differ only in their rows and their
+    /// titles; the frame, the border, the clearing, and the height clamp are the same for all.
+    fn render_dialog(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        width: u16,
+        lines: Vec<Line<'static>>,
+        chrome: (&str, &str),
+    ) {
+        let (title, footer) = chrome;
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(4).max(4));
+        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
+        // workspace treats integer division as a defect wherever it appears.
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.busy)
+            .title(Line::from(Span::styled(
+                title.to_owned(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+            .title_bottom(Line::from(Span::styled(
+                footer.to_owned(),
                 Style::default().fg(Color::DarkGray),
             )));
         // Cleared first, so the transcript behind the dialog does not show through the gaps
@@ -4633,6 +4996,62 @@ mod tests {
         assert!(!state.open_models(), "there is nothing to choose");
         assert!(!state.model_open);
         assert_eq!(state.selected_model(), None);
+    }
+
+    /// The provider chooser lists one row per provider-and-plan, marks the one in force, and says
+    /// why a refused plan cannot be chosen.
+    #[test]
+    fn the_provider_chooser_lists_rows_and_refusals() {
+        let mut state = ViewState::new();
+        state.provider = Some(String::from("deepseek"));
+        state.plan = Some(String::from("api"));
+        state.providers = vec![
+            ProviderChoice {
+                provider: String::from("deepseek"),
+                plan: String::from("api"),
+                label: String::from("deepseek"),
+                env: String::from("DEEPSEEK_API_KEY"),
+                refused: None,
+            },
+            ProviderChoice {
+                provider: String::from("openai"),
+                plan: String::from("subscription"),
+                label: String::from("openai · subscription"),
+                env: String::from("OPENAI_API_KEY"),
+                refused: Some(String::from("needs an OAuth token")),
+            },
+        ];
+        assert!(state.open_providers());
+        let text = rendered(&mut state, 90, 20);
+        assert!(text.contains(" provider "), "{text}");
+        assert!(text.contains("where requests go"), "{text}");
+        assert!(text.contains("deepseek"), "{text}");
+        assert!(text.contains("openai · subscription"), "{text}");
+        assert!(
+            text.contains("needs an OAuth token"),
+            "the reason is shown: {text}"
+        );
+        // The row in force is marked.
+        let marked = text
+            .lines()
+            .find(|row| row.contains('\u{25b6}'))
+            .expect("the selection is marked");
+        assert!(marked.contains("deepseek"), "{marked}");
+    }
+
+    /// The key field is drawn masked, and never shows the secret.
+    #[test]
+    fn the_key_field_draws_stars_not_the_key() {
+        let mut state = ViewState::new();
+        state.open_credential("zai", "ZAI_API_KEY");
+        state.open_key_entry();
+        state.key_push('s');
+        state.key_push('k');
+        state.key_push('x');
+        let text = rendered(&mut state, 90, 20);
+        assert!(text.contains(" api key "), "{text}");
+        assert!(text.contains("***"), "the key is masked: {text}");
+        assert!(!text.contains("skx"), "the key is never drawn: {text}");
     }
 
     /// The key list is drawn over the transcript, with the bindings and a way out.
