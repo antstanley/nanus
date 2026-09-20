@@ -79,6 +79,37 @@ pub struct Tokens {
 }
 
 impl Tokens {
+    /// Returns the access token's expiry as a Unix instant in milliseconds, when it is known.
+    #[must_use]
+    pub fn expires_at(&self) -> Option<u64> {
+        let seconds = self.expires_in?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u64::try_from(since.as_millis()).ok())?;
+        // Saturating rather than wrapping: an expiry a very long way out must not read as one in
+        // the past.
+        Some(now.saturating_add(seconds.saturating_mul(1_000)))
+    }
+
+    /// Returns `true` when the access token is expired or within `margin` of it.
+    ///
+    /// A token with no stated lifetime is treated as expired, so it is renewed rather than sent and
+    /// refused: the flow that produced it knows the lifetime, and its absence means the token was
+    /// written by something that did not.
+    #[must_use]
+    pub fn is_expired(&self, margin: Duration) -> bool {
+        let Some(expires_at) = self.expires_at() else {
+            return true;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u64::try_from(since.as_millis()).ok())
+            .unwrap_or(u64::MAX);
+        now.saturating_add(margin.as_millis().try_into().unwrap_or(u64::MAX)) >= expires_at
+    }
+
     /// Renders the token set as the single string the credential store holds.
     ///
     /// # Errors
@@ -124,6 +155,8 @@ struct AuthorizationCode {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// A refresh response may omit it, in which case the old one still stands.
+    #[serde(default)]
     refresh_token: String,
     #[serde(default)]
     id_token: String,
@@ -280,6 +313,51 @@ fn percent_encode(value: &str, out: &mut String) {
             out.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
+}
+
+/// Mints a new access token from a stored refresh token.
+///
+/// # Errors
+///
+/// Returns [`OAuthError`] when the service cannot be reached or refuses the grant, which means the
+/// authorization is gone and the user must complete the flow again.
+pub async fn refresh(issuer: &str, tokens: &Tokens) -> Result<Tokens, OAuthError> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+    let response = client
+        .post(format!("{issuer}/oauth/token"))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &tokens.refresh_token),
+            ("client_id", CLIENT_ID),
+        ]))
+        .send()
+        .await
+        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(OAuthError::Status(response.status().as_u16()));
+    }
+    let refreshed: TokenResponse = response
+        .json()
+        .await
+        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+    Ok(Tokens {
+        account_id: account_id(&refreshed).or_else(|| tokens.account_id.clone()),
+        access_token: refreshed.access_token,
+        // A response that rotates nothing keeps the token that was used.
+        refresh_token: if refreshed.refresh_token.is_empty() {
+            tokens.refresh_token.clone()
+        } else {
+            refreshed.refresh_token
+        },
+        id_token: refreshed.id_token,
+        expires_in: refreshed.expires_in,
+    })
 }
 
 /// Reads the `ChatGPT` account id out of a token set's claims.

@@ -14,12 +14,13 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use nanus_adapter_anthropic::{AnthropicConfig, AnthropicLlm};
 use nanus_adapter_config::{DEFAULT_MAX_TOKENS, NanusConfig};
 use nanus_adapter_deepseek::{DEFAULT_MAX_OUTPUT_TOKENS, DeepSeekConfig, DeepSeekLlm};
 use nanus_adapter_local::{LocalFs, LocalShell, SystemClock};
-use nanus_adapter_openai::{OpenAiConfig, OpenAiLlm, Vendor};
+use nanus_adapter_openai::{OpenAiConfig, OpenAiLlm, Protocol, Vendor, oauth};
 use nanus_adapter_secret::Secrets;
 use nanus_adapter_store::JsonlStore;
 use nanus_domain::{AgentConfig, Origin, Session};
@@ -327,7 +328,7 @@ impl ProviderSwitch {
         provider: Provider,
         plan: Option<&str>,
     ) -> Result<crate::authorize::PendingAuth, BundleError> {
-        crate::authorize::begin(provider, plan, nanus_adapter_openai::oauth::ISSUER).await
+        crate::authorize::begin(provider, plan, oauth::ISSUER).await
     }
 
     /// Polls an authorization once, filing the token set when the user has finished.
@@ -478,7 +479,15 @@ async fn resolve_credential(
         |env| format!("run `nanus auth set {account}`, or set {env}"),
     );
     match secrets.get(account).await {
-        Ok(Some(secret)) if !secret.is_blank() => Ok(secret),
+        Ok(Some(secret)) if !secret.is_blank() => {
+            // An authorization is a grant rather than a key, so an expired one is renewed here
+            // rather than sent and refused.
+            if selection.credential_is_oauth() {
+                renew(secrets, selection, secret).await
+            } else {
+                Ok(secret)
+            }
+        }
         Ok(_) => Err(BundleError::config(format!(
             "no credential for {account}: {hint}"
         ))),
@@ -489,6 +498,43 @@ async fn resolve_credential(
             "no credential for {account}: {error}; {hint}"
         ))),
     }
+}
+
+/// How long before an access token's expiry it is renewed.
+///
+/// A request that leaves just before the expiry would arrive just after it, so the renewal happens
+/// early rather than exactly on time.
+const REFRESH_MARGIN: Duration = Duration::from_mins(5);
+
+/// Renews an authorization whose access token is at or past expiry, storing the new set.
+///
+/// A grant is a long-lived refresh token and a short-lived access token, so an authorization older
+/// than its access token is renewed here rather than sent and refused. The renewed set is written
+/// back, so the next request does not renew again.
+async fn renew(
+    secrets: &SecretHandle,
+    selection: &Selection,
+    stored: Secret,
+) -> Result<Secret, BundleError> {
+    let account = selection.credential_account();
+    let tokens = oauth::Tokens::decode(stored.expose())
+        .map_err(|error| BundleError::config(format!("{account}: {error}")))?;
+    if !tokens.is_expired(REFRESH_MARGIN) {
+        return Ok(stored);
+    }
+    let renewed = oauth::refresh(oauth::ISSUER, &tokens).await.map_err(|error| {
+        BundleError::config(format!(
+            "{account} could not be renewed: {error}; authorize it again from the provider chooser"
+        ))
+    })?;
+    let encoded = renewed
+        .encode()
+        .map_err(|error| BundleError::config(format!("{account}: {error}")))?;
+    secrets
+        .set(account, &encoded)
+        .await
+        .map_err(|error| BundleError::config(format!("{account}: {error}")))?;
+    Ok(Secret::new(encoded))
 }
 
 /// Opens the credential stores without composing a harness.
@@ -595,21 +641,49 @@ fn build_llm(
     let port: Box<dyn LlmPort> = match selection.provider() {
         Provider::DeepSeek => Box::new(build_deepseek(config, selection, key)?),
         Provider::Zai => Box::new(build_compatible(Vendor::Zai, config, selection, key)?),
-        // `OpenAI`'s subscription speaks the Responses API, which this build does not encode yet.
-        // The refusal is here rather than in the plan table so the plan can be *chosen* — its
-        // authorization can be filed — while a turn against it is refused with this sentence rather
-        // than sent as a chat completion the ChatGPT backend does not serve.
+        // A `ChatGPT` subscription is reached through the Responses API, with the grant's access
+        // token as the bearer and the account named in its own header.
         Provider::OpenAi if selection.credential_is_oauth() => {
-            return Err(BundleError::config(format!(
-                "the {} plan speaks the Responses API, which this build does not encode yet: its \
-                 authorization is stored, but a turn against it is not possible until that lands",
-                selection.plan().name
-            )));
+            Box::new(build_responses(config, selection, key)?)
         }
         Provider::OpenAi => Box::new(build_compatible(Vendor::OpenAi, config, selection, key)?),
         Provider::Anthropic => Box::new(build_anthropic(config, selection, key)?),
     };
     Ok(Rc::new(port))
+}
+
+/// Builds the Responses adapter a `ChatGPT` subscription is reached through.
+///
+/// The credential is the stored token set rather than a key, so the access token becomes the bearer
+/// and the `ChatGPT` account the token names is sent in its own header: those two are what the
+/// subscription backend authorizes a request with.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] when the stored credential is not a token set — which is a
+/// credential filed by something else, not a subscription — or when the adapter cannot be built.
+fn build_responses(
+    config: &NanusConfig,
+    selection: &Selection,
+    key: &Secret,
+) -> Result<OpenAiLlm, BundleError> {
+    let tokens = oauth::Tokens::decode(key.expose())
+        .map_err(|error| BundleError::config(error.to_string()))?;
+    let mut adapter = OpenAiConfig::with_base_url(
+        Vendor::OpenAi,
+        selection.model(),
+        tokens.access_token,
+        selection.endpoint(),
+    );
+    adapter.set_protocol(Protocol::Responses);
+    if let Some(account_id) = tokens.account_id {
+        adapter.set_account_id(account_id);
+    }
+    adapter
+        .set_max_tokens(config.max_tokens)
+        .map_err(|error| BundleError::config(error.to_string()))?;
+    adapter.set_reasoning_effort(config.reasoning_effort.to_port());
+    OpenAiLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
 }
 
 /// Builds the `DeepSeek` adapter.

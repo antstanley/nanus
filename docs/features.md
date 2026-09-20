@@ -93,9 +93,10 @@ which one is in use.
 | `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.3-codex`, `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `subscription`¹ |
 
 ¹ The OpenAI `subscription` plan is a ChatGPT account **authorized with OAuth** rather than a typed
-key: choosing it runs the device flow and files the token set under `openai:subscription`. A *turn*
-against it needs the ChatGPT backend's Responses API, which this build does not encode yet, so the
-authorization can be set up while a run is refused with that reason.
+key: choosing it runs the device flow, files the token set under `openai:subscription`, and reaches
+the account through the **Responses API** — the items-shaped wire that backend speaks, with the
+grant's access token as the bearer, the account named in its own header, and an expired access token
+renewed from the refresh token rather than sent and refused.
 
 - **A plan is an endpoint plus a default model.** z.ai's `coding` plan is the same
   key and protocol at a different host; OpenAI's `coding` plan is a coding model on
@@ -445,10 +446,9 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **An OpenAI subscription can be authorized but not yet used.** Choosing the `subscription` plan
-  runs the OAuth device flow and files the token set, and the plan is offered; a *turn* against it is
-  refused because the ChatGPT backend speaks the Responses API, which this build does not encode
-  yet.
+- **OpenAI's subscription is reached through a second wire.** The `subscription` plan authorizes with
+  OAuth and speaks the Responses API — items rather than messages, named events rather than `choices`
+  deltas — while the `api` plan keeps `chat/completions`. Which one a request uses is the plan's.
 - **Anthropic's extended thinking is not requested.** A tool-using turn requires
   the signed thinking blocks of the previous turn replayed, and the message model
   has no place for a signature, so `reasoning_effort` has no effect there.

@@ -17,9 +17,10 @@ configuration, not a rebuild.
 | `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.3-codex`, `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `subscription`¹ |
 
 ¹ OpenAI's `subscription` plan is a ChatGPT account **authorized with OAuth** rather than a typed
-key: choosing it runs the device flow and files the token set under `openai:subscription`. A *turn*
-against it needs the ChatGPT backend's Responses API, which this build does not encode yet, so the
-authorization can be set up while a run is refused with that reason.
+key: choosing it runs the device flow, files the token set under `openai:subscription`, and reaches
+the account through the **Responses API** — the items-shaped wire that backend speaks, with the
+grant's access token as the bearer, the account named in its own header, and an expired access token
+renewed from the refresh token rather than sent and refused.
 
 ## Choosing a provider
 

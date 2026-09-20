@@ -177,6 +177,31 @@ impl core::fmt::Display for Vendor {
     }
 }
 
+/// Which request shape a vendor's endpoint speaks.
+///
+/// The two are different APIs rather than options of one: the conversation is messages with
+/// `choices` deltas in one, and items with named events in the other. Which one is a fact of the
+/// endpoint — a `ChatGPT` subscription is reached through `responses`, the API through
+/// `chat/completions` — so it travels with the configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    /// `chat/completions`: the conversation as messages, streamed as `choices` deltas.
+    ChatCompletions,
+    /// `responses`: the conversation as items, streamed as named events.
+    Responses,
+}
+
+impl Protocol {
+    /// Returns the path appended to a base URL for this protocol.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/chat/completions",
+            Self::Responses => "/responses",
+        }
+    }
+}
+
 /// The adapter's settings.
 ///
 /// `Debug` is implemented by hand so the API key cannot leak into a log line; this
@@ -190,6 +215,12 @@ pub struct OpenAiConfig {
     max_tokens: u32,
     reasoning_effort: ReasoningEffort,
     temperature: Option<f32>,
+    protocol: Protocol,
+    /// The `ChatGPT` account a subscription request names in its own header.
+    ///
+    /// `None` for the API, which names the account by its key alone. The id is not a secret: it is
+    /// an opaque account name the backend wants on every subscription request.
+    account_id: Option<String>,
 }
 
 impl core::fmt::Debug for OpenAiConfig {
@@ -202,6 +233,8 @@ impl core::fmt::Debug for OpenAiConfig {
             .field("max_tokens", &self.max_tokens)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("temperature", &self.temperature)
+            .field("protocol", &self.protocol)
+            .field("account_id", &self.account_id)
             .finish()
     }
 }
@@ -218,7 +251,31 @@ impl OpenAiConfig {
             max_tokens: vendor.max_output_tokens(),
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
+            protocol: Protocol::ChatCompletions,
+            account_id: None,
         }
+    }
+
+    /// Returns the request shape this configuration speaks.
+    #[must_use]
+    pub const fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    /// Sets the request shape, for an endpoint that speaks the other one.
+    pub fn set_protocol(&mut self, protocol: Protocol) {
+        self.protocol = protocol;
+    }
+
+    /// Returns the `ChatGPT` account a subscription request names, when there is one.
+    #[must_use]
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
+    }
+
+    /// Records the `ChatGPT` account a subscription request names.
+    pub fn set_account_id(&mut self, account_id: impl Into<String>) {
+        self.account_id = Some(account_id.into());
     }
 
     /// Builds a configuration pointing at a different endpoint.

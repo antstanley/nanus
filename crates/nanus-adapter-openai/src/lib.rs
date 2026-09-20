@@ -44,11 +44,12 @@
 mod config;
 mod error;
 pub mod oauth;
+pub mod responses;
 mod wire;
 
 pub use config::{
-    OPENAI_API_KEY_ENV, OPENAI_BASE_URL, OpenAiConfig, Vendor, ZAI_API_KEY_ENV, ZAI_BASE_URL,
-    ZAI_CODING_BASE_URL, effort_spelling, openai_effort_levels, zai_effort_levels,
+    OPENAI_API_KEY_ENV, OPENAI_BASE_URL, OpenAiConfig, Protocol, Vendor, ZAI_API_KEY_ENV,
+    ZAI_BASE_URL, ZAI_CODING_BASE_URL, effort_spelling, openai_effort_levels, zai_effort_levels,
 };
 pub use error::OpenAiError;
 pub use nanus_ports::ReasoningEffort;
@@ -57,14 +58,53 @@ use core::pin::Pin;
 use futures::StreamExt as _;
 use nanus_ports::{ChatRequest, LlmEvent, LlmPort, LlmStream};
 
-/// The path appended to a configured base URL for a chat completion.
-const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
-
 /// Maximum length of an error body echoed back to the caller.
 const BODY_SNIPPET_MAX: usize = 2_000;
 
 /// A stream of model events.
 type EventStream = Pin<Box<dyn futures::Stream<Item = LlmEvent> + 'static>>;
+
+/// The per-protocol half of decoding: how a body's events become model events.
+///
+/// An enum rather than a trait object, because the decode loop is monomorphic and the two arms are
+/// known: each protocol's accumulator owns the part that differs, and the loop only moves bytes and
+/// flushes.
+enum Decoder {
+    /// `chat/completions`: `choices` deltas.
+    Chat(Box<wire::StreamAccumulator>),
+    /// `responses`: named events.
+    Responses(Box<responses::StreamAccumulator>),
+}
+
+impl Decoder {
+    fn take_ready(&mut self) -> Option<LlmEvent> {
+        match self {
+            Self::Chat(accumulator) => accumulator.take_ready(),
+            Self::Responses(accumulator) => accumulator.take_ready(),
+        }
+    }
+
+    fn fail(&mut self, message: String) {
+        match self {
+            Self::Chat(accumulator) => accumulator.fail(message),
+            Self::Responses(accumulator) => accumulator.fail(message),
+        }
+    }
+
+    fn observe_line(&mut self, payload: &str) {
+        match self {
+            Self::Chat(accumulator) => accumulator.observe_line(payload),
+            Self::Responses(accumulator) => accumulator.observe_line(payload),
+        }
+    }
+
+    fn close(&mut self) {
+        match self {
+            Self::Chat(accumulator) => accumulator.close(),
+            Self::Responses(accumulator) => accumulator.close(),
+        }
+    }
+}
 
 /// A chat-completions client for one `OpenAI`-compatible vendor.
 ///
@@ -129,7 +169,7 @@ impl OpenAiLlm {
         // Postcondition: a usable base URL is absolute, so a misconfigured one fails
         // here rather than as a confusing transport error later.
         assert!(base.starts_with("http"), "a base URL is absolute");
-        format!("{base}{CHAT_COMPLETIONS_PATH}")
+        format!("{base}{}", self.config.protocol().path())
     }
 
     /// Encodes a request as the JSON body the vendor expects.
@@ -138,7 +178,10 @@ impl OpenAiLlm {
     /// performing a request.
     #[must_use]
     pub fn encode(&self, request: &ChatRequest) -> serde_json::Value {
-        wire::build_request(&self.config, request)
+        match self.config.protocol() {
+            Protocol::ChatCompletions => wire::build_request(&self.config, request),
+            Protocol::Responses => responses::build_request(&self.config, request),
+        }
     }
 }
 
@@ -175,21 +218,24 @@ impl LlmPort for OpenAiLlm {
         let endpoint = self.endpoint();
         let api_key = self.config.api_key().to_owned();
         let vendor = self.config.vendor();
+        let protocol = self.config.protocol();
+        // A subscription names the account in its own header; the API does not.
+        let account_id = self.config.account_id().map(str::to_owned);
         // The host survives as an owned value inside the stream: the transport
         // failure is reported after `&self` has gone out of scope.
         let host = self.config.base_url().to_owned();
         let stream_host = host.clone();
 
         let response = async move {
-            let sent = client
+            let mut sent = client
                 .post(&endpoint)
                 .header("accept", "text/event-stream")
                 .header("content-type", "application/json")
-                .bearer_auth(api_key)
-                .body(body)
-                .send()
-                .await;
-            match sent {
+                .bearer_auth(api_key);
+            if let Some(account_id) = account_id {
+                sent = sent.header("chatgpt-account-id", account_id);
+            }
+            match sent.body(body).send().await {
                 Ok(response) => Ok(response),
                 Err(source) => Err(OpenAiError::transport(&source, &host).to_string()),
             }
@@ -204,8 +250,20 @@ impl LlmPort for OpenAiLlm {
                 // from here is its body. Reported before the body is read, because
                 // this is the earliest moment the fact is true.
                 let head = futures::stream::iter([LlmEvent::ResponseHead]);
-                let announced: EventStream =
-                    Box::pin(head.chain(decode(response, stream_host.clone(), vendor)));
+                let announced: EventStream = match protocol {
+                    Protocol::ChatCompletions => Box::pin(head.chain(decode(
+                        response,
+                        stream_host.clone(),
+                        vendor,
+                        Decoder::Chat(Box::default()),
+                    ))),
+                    Protocol::Responses => Box::pin(head.chain(decode(
+                        response,
+                        stream_host.clone(),
+                        vendor,
+                        Decoder::Responses(Box::default()),
+                    ))),
+                };
                 announced
             }
             Err(message) => error_stream_owned(message),
@@ -228,7 +286,12 @@ fn error_stream_owned(message: String) -> LlmStream {
 ///
 /// `host` is the base URL the request was sent to, carried so that a failure part
 /// way through the body names the same endpoint the request did.
-fn decode(response: reqwest::Response, host: String, vendor: Vendor) -> EventStream {
+fn decode(
+    response: reqwest::Response,
+    host: String,
+    vendor: Vendor,
+    mut accumulator: Decoder,
+) -> EventStream {
     let status = response.status();
     if !status.is_success() {
         // The body carries the vendor's own message, which is the only useful thing
@@ -249,7 +312,6 @@ fn decode(response: reqwest::Response, host: String, vendor: Vendor) -> EventStr
 
     let mut bytes = response.bytes_stream();
     let mut decoder = wire::SseDecoder::new();
-    let mut accumulator = wire::StreamAccumulator::default();
     let mut done = false;
 
     let stream = futures::stream::poll_fn(move |cx| {

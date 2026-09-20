@@ -298,3 +298,85 @@ fn a_provider_error_is_reported_with_its_message() {
         "{events:?}"
     );
 }
+
+/// The subscription path: a Responses request over a real socket, streaming named events rather
+/// than `choices`, with the `ChatGPT` account named in its own header.
+///
+/// The gap this closes is the same one the chat tests close: that the adapter really sends the
+/// Responses body to `/responses` with the account header, and that a real `text/event-stream` of
+/// named events decodes into the events the loop expects — text, an assembled tool call, usage, and
+/// an ending.
+#[test]
+fn the_subscription_speaks_the_responses_api() {
+    let events = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"i1\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"i1\",\"delta\":\"{\\\"file_path\\\":\\\"a.rs\\\"}\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":3}}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = spawn_server(200, events);
+
+    let mut config = nanus_adapter_openai::OpenAiConfig::with_base_url(
+        nanus_adapter_openai::Vendor::OpenAi,
+        "gpt-5.3-codex",
+        "access-token",
+        &server.base_url,
+    );
+    config.set_protocol(nanus_adapter_openai::Protocol::Responses);
+    config.set_account_id("acct-1");
+    let llm = nanus_adapter_openai::OpenAiLlm::new(config).expect("the adapter builds");
+    let request = ChatRequest::new(
+        "gpt-5.3-codex",
+        vec![Message::system("be terse"), Message::user("hi")],
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let collected = runtime.block_on(async {
+        let mut events = Vec::new();
+        let mut stream = llm.stream_chat(request);
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    });
+
+    let (head, body) = split_request(&only_request(&server));
+    assert!(head.starts_with("POST /responses"), "{head}");
+    assert!(
+        head.to_lowercase().contains("chatgpt-account-id: acct-1"),
+        "the account travels in its own header: {head}"
+    );
+    assert!(body.get("messages").is_none(), "not the chat shape: {body}");
+    assert!(body.get("input").is_some(), "the items shape: {body}");
+    assert!(body.get("instructions").is_some(), "the prompt is lifted");
+
+    assert!(
+        collected
+            .iter()
+            .any(|event| matches!(event, LlmEvent::TextDelta(text) if text == "hello")),
+        "{collected:?}"
+    );
+    assert!(
+        collected
+            .iter()
+            .any(|event| matches!(event, LlmEvent::ToolCallDelta { .. })),
+        "the call is assembled: {collected:?}"
+    );
+    assert!(
+        collected
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Usage(_))),
+        "usage is decoded: {collected:?}"
+    );
+    assert!(
+        matches!(collected.last(), Some(LlmEvent::Finished { .. })),
+        "the stream ends with a reason: {collected:?}"
+    );
+}

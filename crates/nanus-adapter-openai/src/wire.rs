@@ -448,7 +448,10 @@ fn decode_finish_reason(raw: &str) -> FinishReason {
 }
 
 /// Shortens a frame for an error message.
-fn truncate_for_message(payload: &str) -> String {
+/// Cuts a payload to a length worth putting in a message.
+///
+/// Shared with the Responses decoder, which says the same thing about a payload that is not JSON.
+pub fn truncate_for_message(payload: &str) -> String {
     const MAX: usize = 200;
     if payload.len() <= MAX {
         return payload.to_owned();
