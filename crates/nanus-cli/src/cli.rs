@@ -1262,7 +1262,8 @@ async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
                     .iter()
                     .flat_map(|provider| provider.accounts())
                     .find(|(name, _)| *name == account)
-                    .map_or("", |(_, env)| env);
+                    .and_then(|(_, env)| env)
+                    .unwrap_or("");
                 println!(
                     "nanus: no stored credential for {account}; if it comes from {fallback}, unset it in the shell that sets it"
                 );
@@ -1283,7 +1284,13 @@ async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
                         Ok(_) => String::from("not set"),
                         Err(error) => format!("not readable ({error})"),
                     };
-                    println!("  {account}: {state}  (fallback {env})");
+                    // An authorization has no variable: it is completed in a browser, so saying
+                    // "fallback" for it would name something that does not exist.
+                    let source = env.map_or_else(
+                        || String::from("authorized, not keyed"),
+                        |env| format!("fallback {env}"),
+                    );
+                    println!("  {account}: {state}  ({source})");
                 }
             }
             Ok(Ready::Done)
@@ -1401,10 +1408,13 @@ async fn show_config(args: &Options) -> Result<(), String> {
         "service log: {}",
         resolved(&crate::service::log_path(&config, None))
     );
+    let source = selection.credential_env().map_or_else(
+        || String::from("authorized, not keyed"),
+        |env| format!("fallback {env}"),
+    );
     println!(
-        "credential: {credential} for {} (fallback {})",
-        selection.credential_account(),
-        selection.credential_env()
+        "credential: {credential} for {} ({source})",
+        selection.credential_account()
     );
     Ok(())
 }
@@ -2068,7 +2078,12 @@ mod tests {
         // z.ai's coding subscription has an account of its own.
         assert_eq!(provider_account("zai:coding").ok(), Some("zai:coding"));
         // A plan that shares the provider's key resolves to the provider's own account.
-        assert_eq!(provider_account("openai:coding").ok(), Some("openai"));
+        assert_eq!(provider_account("openai:api").ok(), Some("openai"));
+        // And a plan with a credential of its own names its account.
+        assert_eq!(
+            provider_account("openai:subscription").ok(),
+            Some("openai:subscription")
+        );
         // A name this build does not have is refused by name.
         assert!(provider_account("gemini").is_err());
         assert!(provider_account("zai:enterprise").is_err());

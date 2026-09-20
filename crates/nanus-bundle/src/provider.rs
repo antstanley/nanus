@@ -57,18 +57,54 @@ pub enum Provider {
     OpenAi,
 }
 
-/// The account and variable a plan's credential is filed under, when the plan does not share the
-/// provider's own.
+/// The credential a plan takes, when it does not share the provider's own.
 ///
-/// A plan with a credential of its own names it explicitly rather than deriving it, so the spelling
-/// is a fact in the table a reader can see: z.ai's coding subscription is `zai:coding` and falls
-/// back to `ZAI_CODING_API_KEY`.
+/// Two kinds, because they are obtained in different ways: a *key* is typed by the user and filed
+/// under an account, and an *authorization* is completed in a browser and the resulting token set
+/// is filed instead. z.ai's coding subscription is the first kind; `OpenAI`'s `ChatGPT` subscription
+/// is the second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlanCredential {
-    /// The account the credential is filed under.
-    pub account: &'static str,
-    /// The environment variable it falls back to.
-    pub env: &'static str,
+pub enum PlanCredential {
+    /// A key the user types, filed under `account` and falling back to `env`.
+    Key {
+        /// The account the credential is filed under.
+        account: &'static str,
+        /// The environment variable it falls back to.
+        env: &'static str,
+    },
+    /// An OAuth authorization the user completes elsewhere, stored as a token set.
+    Oauth {
+        /// The account the token set is filed under.
+        account: &'static str,
+    },
+}
+
+impl PlanCredential {
+    /// Returns the account this credential is filed under.
+    #[must_use]
+    pub const fn account(self) -> &'static str {
+        match self {
+            Self::Key { account, .. } | Self::Oauth { account } => account,
+        }
+    }
+
+    /// Returns the environment variable it falls back to, when it has one.
+    ///
+    /// An authorization has none: a token set is not a key that can be exported into a shell, and
+    /// advertising a variable for it would suggest one could.
+    #[must_use]
+    pub const fn env(self) -> Option<&'static str> {
+        match self {
+            Self::Key { env, .. } => Some(env),
+            Self::Oauth { .. } => None,
+        }
+    }
+
+    /// Returns `true` when this credential is an authorization rather than a typed key.
+    #[must_use]
+    pub const fn is_oauth(self) -> bool {
+        matches!(self, Self::Oauth { .. })
+    }
 }
 
 /// One tier of a provider's service.
@@ -84,10 +120,7 @@ pub struct Plan {
     pub refusal: Option<&'static str>,
     /// The credential this plan takes, when it does not share the provider's own.
     ///
-    /// `None` means the provider's own account and variable — one key for every plan, which is what
-    /// `OpenAI`'s `api` and `coding` plans are: the same key on the same host. z.ai's coding
-    /// subscription is not: it takes a coding-plan key that a pay-as-you-go key cannot replace, so
-    /// it carries an account of its own and is asked for separately.
+    /// `None` means the provider's own account and variable — one key for every plan.
     pub credential: Option<PlanCredential>,
 }
 
@@ -120,7 +153,7 @@ static ZAI_PLANS: [Plan; 2] = [
         // request goes and which key it carries, and nothing else.
         model: Some("glm-5.3-flashx"),
         refusal: None,
-        credential: Some(PlanCredential {
+        credential: Some(PlanCredential::Key {
             account: "zai:coding",
             env: "ZAI_CODING_API_KEY",
         }),
@@ -136,9 +169,13 @@ static ANTHROPIC_PLANS: [Plan; 1] = [Plan {
     credential: None,
 }];
 
-/// `OpenAI`'s plans: the API, the coding models on the same API, and the `ChatGPT`
-/// subscription, which this build cannot use.
-static OPENAI_PLANS: [Plan; 3] = [
+/// `OpenAI`'s plans: the API, and the `ChatGPT` subscription reached with an OAuth authorization.
+///
+/// The subscription is not a different host for the same key: it is a `ChatGPT` account, authorized
+/// in a browser, whose token is filed under its own account. There is no third plan — the coding
+/// models are served by the API with the same key, so they are models of the `api` plan rather
+/// than a plan of their own.
+static OPENAI_PLANS: [Plan; 2] = [
     Plan {
         name: DEFAULT_PLAN,
         endpoint: nanus_adapter_openai::OPENAI_BASE_URL,
@@ -147,24 +184,13 @@ static OPENAI_PLANS: [Plan; 3] = [
         credential: None,
     },
     Plan {
-        name: "coding",
-        // The coding models are served by the same API with the same key, so the
-        // plan is a default model rather than a host or a credential.
-        endpoint: nanus_adapter_openai::OPENAI_BASE_URL,
-        model: Some("gpt-5.3-codex"),
-        refusal: None,
-        credential: None,
-    },
-    Plan {
         name: "subscription",
         endpoint: "https://chatgpt.com/backend-api/codex",
-        model: None,
-        refusal: Some(
-            "the ChatGPT subscription is reached with an OAuth token and speaks the \
-             Responses API; this build does neither, so an API key cannot be used here. \
-             Use the `api` or `coding` plan, or set `base_url` for an endpoint you run.",
-        ),
-        credential: None,
+        model: Some("gpt-5.3-codex"),
+        refusal: None,
+        credential: Some(PlanCredential::Oauth {
+            account: "openai:subscription",
+        }),
     },
 ];
 
@@ -253,33 +279,43 @@ impl Provider {
     /// refusal there names the plans that do exist.
     #[must_use]
     pub fn credential_account(self, plan: Option<&str>) -> &'static str {
-        let name = plan.unwrap_or(DEFAULT_PLAN);
-        self.plan(name)
-            .and_then(|plan| plan.credential)
-            .map_or_else(|| self.name(), |credential| credential.account)
+        self.credential(plan)
+            .map_or_else(|| self.name(), PlanCredential::account)
     }
 
     /// Returns the environment variable a credential for `plan` falls back to.
+    ///
+    /// `None` for an authorization, which is completed in a browser and has no variable to export.
     #[must_use]
-    pub fn credential_env(self, plan: Option<&str>) -> &'static str {
-        let name = plan.unwrap_or(DEFAULT_PLAN);
-        self.plan(name)
+    pub fn credential_env(self, plan: Option<&str>) -> Option<&'static str> {
+        self.credential(plan)
+            .map_or_else(|| Some(self.env_var()), PlanCredential::env)
+    }
+
+    /// Returns `true` when `plan` is reached with an authorization rather than a typed key.
+    #[must_use]
+    pub fn credential_is_oauth(self, plan: Option<&str>) -> bool {
+        self.credential(plan).is_some_and(PlanCredential::is_oauth)
+    }
+
+    /// Returns the credential `plan` takes of its own, when it takes one.
+    fn credential(self, plan: Option<&str>) -> Option<PlanCredential> {
+        self.plan(plan.unwrap_or(DEFAULT_PLAN))
             .and_then(|plan| plan.credential)
-            .map_or_else(|| self.env_var(), |credential| credential.env)
     }
 
     /// Returns every account a credential for this provider may be filed under, with the variable
-    /// each falls back to.
+    /// each falls back to (none, for an authorization).
     ///
     /// The provider's own account first, then each plan that takes a credential of its own: what
-    /// `nanus auth status` lists, so a reader sees the account a coding plan is asked for rather
-    /// than having to guess its name.
+    /// `nanus auth status` lists, so a reader sees the account a coding plan or a subscription is
+    /// asked for rather than having to guess its name.
     #[must_use]
-    pub fn accounts(self) -> Vec<(&'static str, &'static str)> {
-        let mut accounts = vec![(self.name(), self.env_var())];
+    pub fn accounts(self) -> Vec<(&'static str, Option<&'static str>)> {
+        let mut accounts = vec![(self.name(), Some(self.env_var()))];
         for plan in self.plans() {
             if let Some(credential) = plan.credential {
-                accounts.push((credential.account, credential.env));
+                accounts.push((credential.account(), credential.env()));
             }
         }
         accounts
@@ -467,15 +503,24 @@ impl Selection {
     pub fn credential_account(&self) -> &'static str {
         self.plan
             .credential
-            .map_or_else(|| self.provider.name(), |credential| credential.account)
+            .map_or_else(|| self.provider.name(), |credential| credential.account())
     }
 
-    /// Returns the environment variable a credential falls back to.
+    /// Returns the environment variable a credential falls back to, when it has one.
+    ///
+    /// `None` for an authorization: a token set is completed in a browser rather than read from the
+    /// environment.
     #[must_use]
-    pub fn credential_env(&self) -> &'static str {
+    pub fn credential_env(&self) -> Option<&'static str> {
         self.plan
             .credential
-            .map_or_else(|| self.provider.env_var(), |credential| credential.env)
+            .map_or_else(|| Some(self.provider.env_var()), PlanCredential::env)
+    }
+
+    /// Returns `true` when this plan is reached with an authorization rather than a typed key.
+    #[must_use]
+    pub fn credential_is_oauth(&self) -> bool {
+        self.plan.credential.is_some_and(PlanCredential::is_oauth)
     }
 
     /// Returns the provider's documented maximum output tokens.
@@ -520,7 +565,7 @@ mod tests {
         assert_eq!(selection.provider(), Provider::OpenAi);
         assert_eq!(selection.endpoint(), "https://api.openai.com/v1");
         assert_eq!(selection.model(), "gpt-6-astra");
-        assert_eq!(selection.credential_env(), "OPENAI_API_KEY");
+        assert_eq!(selection.credential_env(), Some("OPENAI_API_KEY"));
 
         let anthropic = NanusConfig {
             provider: Some(String::from("anthropic")),
@@ -533,8 +578,8 @@ mod tests {
         assert!(!selection.provider().effort_applies());
     }
 
-    /// A plan changes the endpoint (z.ai's coding plan) or the default model
-    /// (`OpenAI`'s), because that is what a plan is.
+    /// A plan changes the endpoint (z.ai's coding plan, `OpenAI`'s subscription) or the default
+    /// model (`OpenAI`'s coding models), because that is what a plan is.
     #[test]
     fn a_plan_changes_the_endpoint_or_the_model() {
         let zai_coding = NanusConfig {
@@ -552,14 +597,22 @@ mod tests {
         let selection = Selection::resolve(&zai_api).expect("the api plan resolves");
         assert_eq!(selection.endpoint(), "https://api.z.ai/api/paas/v4");
 
-        let openai_coding = NanusConfig {
+        // The subscription is a different host *and* a different credential.
+        let openai_subscription = NanusConfig {
             provider: Some(String::from("openai")),
-            plan: Some(String::from("coding")),
+            plan: Some(String::from("subscription")),
             ..config()
         };
-        let selection = Selection::resolve(&openai_coding).expect("the coding plan resolves");
-        assert_eq!(selection.model(), "gpt-5.3-codex");
-        assert_eq!(selection.endpoint(), "https://api.openai.com/v1");
+        let selection =
+            Selection::resolve(&openai_subscription).expect("the subscription plan resolves");
+        assert_eq!(
+            selection.endpoint(),
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert!(
+            selection.credential_is_oauth(),
+            "reached with an authorization"
+        );
     }
 
     /// An explicit model or endpoint wins over the plan's, because the more specific
@@ -603,26 +656,24 @@ mod tests {
         assert!(rendered.contains("api"), "{rendered}");
     }
 
-    /// A plan this build cannot honour is refused with the reason, rather than
-    /// silently absent or half-implemented.
+    /// The subscription is a usable plan now, and what it takes is an authorization
+    /// rather than a key.
     #[test]
-    fn a_plan_this_build_cannot_use_is_refused_with_its_reason() {
+    fn the_subscription_resolves_and_authorizes() {
         let config = NanusConfig {
             provider: Some(String::from("openai")),
             plan: Some(String::from("subscription")),
             ..config()
         };
-        let error = Selection::resolve(&config).expect_err("the plan is refused");
-        let rendered = error.to_string();
-        assert!(rendered.contains("subscription"), "{rendered}");
-        assert!(rendered.contains("OAuth"), "{rendered}");
-        // The refusal is listed rather than hidden, so a reader can see it exists.
-        assert!(
-            Provider::OpenAi
-                .plans()
-                .iter()
-                .any(|plan| plan.name == "subscription")
+        let selection = Selection::resolve(&config).expect("the subscription plan resolves");
+        assert_eq!(selection.plan().name, "subscription");
+        assert_eq!(
+            selection.endpoint(),
+            "https://chatgpt.com/backend-api/codex"
         );
+        assert!(selection.credential_is_oauth());
+        assert_eq!(selection.credential_account(), "openai:subscription");
+        assert_eq!(selection.credential_env(), None);
     }
 
     /// A relative endpoint would fail as a confusing transport error later, so it is
@@ -692,54 +743,68 @@ mod tests {
         }
     }
 
-    /// A plan may carry a credential of its own, and one that does not shares the provider's.
-    ///
-    /// z.ai's coding subscription is a different key on a different host, so a stored API key is
-    /// not one for it; `OpenAI`'s coding plan is the same key on the same host, so it is.
+    /// A plan may carry a credential of its own — a key or an authorization — and one that does not
+    /// shares the provider's.
     #[test]
     fn a_plan_may_carry_its_own_credential() {
+        // z.ai's coding subscription is a different key on a different host.
         assert_eq!(
             Provider::Zai.credential_account(Some("coding")),
             "zai:coding"
         );
         assert_eq!(
             Provider::Zai.credential_env(Some("coding")),
-            "ZAI_CODING_API_KEY"
+            Some("ZAI_CODING_API_KEY")
         );
+        assert!(!Provider::Zai.credential_is_oauth(Some("coding")));
         // The API plan is the provider's own account, and so is an unset plan.
         assert_eq!(Provider::Zai.credential_account(Some("api")), "zai");
         assert_eq!(Provider::Zai.credential_account(None), "zai");
-        assert_eq!(Provider::Zai.credential_env(None), "ZAI_API_KEY");
-        // OpenAI's coding plan shares the provider's key.
-        assert_eq!(
-            Provider::OpenAi.credential_account(Some("coding")),
-            "openai"
-        );
+        assert_eq!(Provider::Zai.credential_env(None), Some("ZAI_API_KEY"));
 
-        // The account a selection resolves to follows the plan, so composition reads the coding
-        // key for the coding host rather than the API key.
-        let coding = Selection::resolve(&NanusConfig {
-            provider: Some(String::from("zai")),
-            plan: Some(String::from("coding")),
+        // OpenAI's subscription is an authorization: an account of its own, and no variable to name
+        // because it is completed in a browser. The API plan shares the provider's key.
+        assert_eq!(
+            Provider::OpenAi.credential_account(Some("subscription")),
+            "openai:subscription"
+        );
+        assert!(Provider::OpenAi.credential_is_oauth(Some("subscription")));
+        assert_eq!(Provider::OpenAi.credential_env(Some("subscription")), None);
+        assert_eq!(Provider::OpenAi.credential_account(Some("api")), "openai");
+        assert!(!Provider::OpenAi.credential_is_oauth(Some("api")));
+
+        // The account a selection resolves to follows the plan, so composition reads the right one.
+        let subscription = Selection::resolve(&NanusConfig {
+            provider: Some(String::from("openai")),
+            plan: Some(String::from("subscription")),
             ..NanusConfig::default()
         })
-        .expect("the coding plan resolves");
-        assert_eq!(coding.credential_account(), "zai:coding");
-        assert_eq!(coding.credential_env(), "ZAI_CODING_API_KEY");
+        .expect("the subscription plan resolves");
+        assert_eq!(subscription.credential_account(), "openai:subscription");
+        assert_eq!(subscription.credential_env(), None);
+        assert!(subscription.credential_is_oauth());
 
-        // The name has to be one the credential store accepts, or the key could never be filed.
-        for (account, _) in Provider::Zai.accounts() {
-            assert!(
-                nanus_adapter_secret::valid_account(account),
-                "{account} is a usable account name"
-            );
+        // Every account a provider may be filed under is one the credential store accepts.
+        for provider in Provider::ALL {
+            for (account, _) in provider.accounts() {
+                assert!(
+                    nanus_adapter_secret::valid_account(account),
+                    "{account} is a usable account name"
+                );
+            }
         }
-        // And a listing shows both accounts, so the name a coding plan is asked for is visible.
-        let accounts: Vec<&str> = Provider::Zai
+        // And a listing shows them, so the name a plan is asked for is visible.
+        let zai: Vec<&str> = Provider::Zai
             .accounts()
             .iter()
             .map(|(account, _)| *account)
             .collect();
-        assert_eq!(accounts, vec!["zai", "zai:coding"]);
+        assert_eq!(zai, vec!["zai", "zai:coding"]);
+        let openai: Vec<&str> = Provider::OpenAi
+            .accounts()
+            .iter()
+            .map(|(account, _)| *account)
+            .collect();
+        assert_eq!(openai, vec!["openai", "openai:subscription"]);
     }
 }

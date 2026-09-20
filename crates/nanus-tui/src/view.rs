@@ -549,6 +549,21 @@ pub struct ViewState {
     /// The key as typed, cleared whenever the entry closes.
     pub key_input: String,
 
+    /// Whether the authorization prompt is open.
+    ///
+    /// Shown while a plan is being authorized in a browser: the page and the code, and a note that
+    /// the agent is waiting. It owns the keyboard as the other modals do — there is nothing to type
+    /// here — and closing it only hides the note, because the agent keeps polling either way.
+    pub auth_open: bool,
+    /// The provider being authorized.
+    pub auth_provider: Option<String>,
+    /// The plan being authorized.
+    pub auth_plan: Option<String>,
+    /// The page the user visits.
+    pub auth_url: String,
+    /// The code they enter there.
+    pub auth_code: String,
+
     /// How many rows into the key list the overlay starts.
     ///
     /// The list is longer than a short terminal, so it is scrolled rather than cut: an
@@ -627,6 +642,11 @@ impl Default for ViewState {
             credential_env: String::new(),
             key_entry_open: false,
             key_input: String::new(),
+            auth_open: false,
+            auth_provider: None,
+            auth_plan: None,
+            auth_url: String::new(),
+            auth_code: String::new(),
             last_viewport: None,
             last_composer: None,
         }
@@ -1249,6 +1269,7 @@ impl ViewState {
             || self.provider_open
             || self.credential_open
             || self.key_entry_open
+            || self.auth_open
             || self.pending_approval.is_some()
     }
 
@@ -1924,6 +1945,37 @@ impl ViewState {
         }
     }
 
+    /// Opens the authorization prompt for a plan.
+    pub fn open_auth(&mut self, provider: &str, plan: Option<&str>, url: &str, code: &str) {
+        self.auth_open = true;
+        self.auth_provider = Some(provider.to_owned());
+        self.auth_plan = plan.map(str::to_owned);
+        url.clone_into(&mut self.auth_url);
+        code.clone_into(&mut self.auth_code);
+    }
+
+    /// Hides the authorization prompt without stopping the flow.
+    ///
+    /// The agent keeps polling: closing this only stops the note being drawn, because the
+    /// authorization is the service's to confirm and may complete after the reader looks away.
+    pub fn close_auth(&mut self) {
+        self.auth_open = false;
+        self.auth_provider = None;
+        self.auth_plan = None;
+        self.auth_url.clear();
+        self.auth_code.clear();
+    }
+
+    /// The provider-and-plan the authorization prompt names.
+    #[must_use]
+    pub fn auth_label(&self) -> String {
+        match (&self.auth_provider, &self.auth_plan) {
+            (Some(provider), Some(plan)) => format!("{provider} · {plan}"),
+            (Some(provider), None) => provider.clone(),
+            _ => String::from("this provider"),
+        }
+    }
+
     /// Opens the masked key-entry field.
     pub fn open_key_entry(&mut self) {
         self.credential_open = false;
@@ -2300,6 +2352,9 @@ impl ViewState {
         }
         if self.key_entry_open {
             self.render_key_entry(frame, area);
+        }
+        if self.auth_open {
+            self.render_auth(frame, area);
         }
         // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
         // be the thing a reader sees, not a dialogue behind the transcript.
@@ -2925,6 +2980,44 @@ impl ViewState {
             width,
             lines,
             (" api key ", " Enter stores, Esc cancels "),
+        );
+    }
+
+    /// Draws the authorization prompt.
+    ///
+    /// The page and the code are the whole of it: there is nothing to type here, and the agent is
+    /// the one polling, so the prompt says that and leaves the reader to their browser.
+    fn render_auth(&self, frame: &mut Frame<'_>, area: Rect) {
+        let width = area.width.saturating_sub(4).clamp(34, 84);
+        let room = usize::from(width.saturating_sub(2));
+        let dim = Style::default().fg(Color::DarkGray);
+        let strong = Style::default().add_modifier(Modifier::BOLD);
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(Span::styled(
+                clip_row(&format!("authorize {}", self.auth_label()), room),
+                Style::default(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                clip_row(&format!("visit {}", self.auth_url), room),
+                strong,
+            )),
+            Line::from(Span::styled(
+                clip_row(&format!("and enter code {}", self.auth_code), room),
+                strong,
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                clip_row("waiting for authorization…", room),
+                dim,
+            )),
+        ];
+        self.render_dialog(
+            frame,
+            area,
+            width,
+            lines,
+            (" authorize ", " Esc hides this "),
         );
     }
 
@@ -5049,6 +5142,27 @@ mod tests {
             .find(|row| row.contains('\u{25b6}'))
             .expect("the selection is marked");
         assert!(marked.contains("deepseek"), "{marked}");
+    }
+
+    /// The authorization prompt shows the page and the code, and closes without a secret.
+    #[test]
+    fn the_authorization_prompt_shows_the_page_and_code() {
+        let mut state = ViewState::new();
+        state.open_auth(
+            "openai",
+            Some("subscription"),
+            "https://auth.openai.com/codex/device",
+            "ABCD-EFGH",
+        );
+        let text = rendered(&mut state, 100, 24);
+        assert!(text.contains("authorize"), "{text}");
+        assert!(text.contains("openai · subscription"), "{text}");
+        assert!(text.contains("auth.openai.com/codex/device"), "{text}");
+        assert!(text.contains("ABCD-EFGH"), "{text}");
+        assert!(text.contains("waiting for authorization"), "{text}");
+        state.close_auth();
+        assert!(!state.auth_open);
+        assert!(state.auth_code.is_empty(), "the code is not kept");
     }
 
     /// The key field names the plan whose key is wanted, and never draws the secret.

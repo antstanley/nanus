@@ -55,6 +55,7 @@
 
 pub mod agent_loop;
 pub mod args;
+pub mod authorize;
 pub mod compose;
 pub mod error;
 pub mod guard;
@@ -62,6 +63,7 @@ pub mod provider;
 pub mod tools;
 
 pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
+pub use authorize::PendingAuth;
 pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, ProviderSwitch, compose};
 pub use error::BundleError;
 pub use provider::{Provider, Selection};

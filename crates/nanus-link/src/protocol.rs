@@ -451,6 +451,24 @@ pub enum Frame {
         env: String,
     },
 
+    /// The user must authorize a plan in a browser, and here is where.
+    ///
+    /// Sent when a plan is reached with an OAuth authorization and none is stored: the interface
+    /// shows the page and the code, and the agent polls the service until the user finishes. A
+    /// [`Frame::ProviderChanged`] follows on success, a [`Frame::Failed`] on failure — there is no
+    /// reply the client sends, because the authorization is the service's to confirm.
+    AuthPrompt {
+        /// The provider being authorized.
+        provider: String,
+        /// The plan being authorized.
+        #[serde(default)]
+        plan: Option<String>,
+        /// The page the user visits.
+        url: String,
+        /// The code they enter there.
+        code: String,
+    },
+
     /// The agent's approval state, for an interface to draw and cycle from.
     ///
     /// Sent once when a client attaches, so the interface knows the state before it draws
@@ -645,7 +663,7 @@ impl Frame {
 /// The field is optional on the wire and defaults to zero, which is what a build that
 /// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
 /// rather than assuming compatibility.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -972,6 +990,12 @@ mod tests {
                 provider: "openai".to_owned(),
                 plan: None,
                 env: "OPENAI_API_KEY".to_owned(),
+            },
+            Frame::AuthPrompt {
+                provider: "openai".to_owned(),
+                plan: Some("subscription".to_owned()),
+                url: "https://auth.openai.com/codex/device".to_owned(),
+                code: "ABCD-EFGH".to_owned(),
             },
         ] {
             let encoded = encode(&frame);

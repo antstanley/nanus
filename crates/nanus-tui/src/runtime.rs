@@ -1922,6 +1922,11 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     if view.provider_open {
         return handle_provider_key(key, view);
     }
+    // The authorization prompt owns the keyboard too, though there is nothing to type: closing it is
+    // the only thing a key does, and a key that reached the composer would be typed behind a modal.
+    if view.auth_open {
+        return handle_auth_key(key, view);
+    }
     // Shift+Tab opens the permission dialog wherever the focus is. It is a setting rather than an
     // edit, so it is routed before the approval question takes the keyboard: a reader who wants to
     // stop being asked must not have to answer a question first. The dialog is what makes that
@@ -2308,6 +2313,25 @@ fn handle_pointer(
 ) {
     handle_mouse(mouse, view);
     refresh_mentions(view, files, workspace);
+}
+
+/// Routes a key while the authorization prompt is open.
+///
+/// There is nothing to type and nothing to send — the agent is polling the authorization service —
+/// so the only key that does anything closes the note. The flow itself keeps running, and the agent
+/// switches and broadcasts when the service confirms.
+fn handle_auth_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'Q') => {
+            view.close_auth();
+            view.status =
+                String::from("the authorization continues; the agent will switch when it lands");
+        }
+        KeyCode::Char('c' | 'C') if control => view.close_auth(),
+        _ => {}
+    }
+    Outcome::Continue
 }
 
 /// Opens the provider chooser, or says the agent offers none.
@@ -2933,17 +2957,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
             call_id,
             tool,
             reason,
-        } => {
-            // The question is drawn as a dialog rather than appended to the transcript: it
-            // is a thing the reader must answer, not a thing the model said. The status line
-            // says what is being waited for, so a reader who scrolled away still knows.
-            view.status = format!("waiting for your decision on the {tool} call");
-            view.pending_approval = Some(PendingApproval {
-                call_id,
-                tool,
-                reason,
-            });
-        }
+        } => apply_approval(call_id, tool, reason, view),
         Frame::ApprovalChanged { state } => {
             // The agent is the authority on the state, so this is applied even to the client
             // that just changed it: two views of one session agree, and a state chosen at
@@ -2967,13 +2981,13 @@ fn apply(frame: Frame, view: &mut ViewState) {
             provider,
             plan,
             env,
-        } => {
-            // Asked rather than refused: storing a key is the one thing a reader can do about it,
-            // and what was asked for is still held so the key is filed against it. The plan is
-            // part of what was asked for — a coding subscription takes a key of its own.
-            view.open_credential(&provider, plan.as_deref(), &env);
-            view.status = format!("no credential for {}: store one?", view.credential_label());
-        }
+        } => apply_no_credential(&provider, plan.as_deref(), &env, view),
+        Frame::AuthPrompt {
+            provider,
+            plan,
+            url,
+            code,
+        } => apply_auth_prompt(&provider, plan.as_deref(), &url, &code, view),
         Frame::Tool {
             call_id,
             name,
@@ -3013,6 +3027,9 @@ fn apply(frame: Frame, view: &mut ViewState) {
         }
         Frame::Done { answer, reason } => apply_done(&answer, &reason, view),
         Frame::Failed { message } => {
+            // A failure ends whatever was in front of the reader, including an authorization prompt:
+            // its refusal is the answer the prompt was waiting for.
+            view.close_auth();
             view.transcript.push(Entry::notice(message));
             closed(view);
         }
@@ -3055,6 +3072,45 @@ fn apply_tool_done(name: String, error: bool, call_id: Option<String>, view: &mu
     view.transcript
         .push(call_entry(Entry::tool_result(name, error, ""), call_id));
     view.follow();
+}
+
+/// Applies an approval question: opens the dialog the reader must answer.
+///
+/// Drawn as a dialog rather than appended to the transcript: it is a thing the reader must answer,
+/// not a thing the model said. The status line says what is being waited for, so a reader who
+/// scrolled away still knows.
+fn apply_approval(call_id: String, tool: String, reason: Option<String>, view: &mut ViewState) {
+    view.status = format!("waiting for your decision on the {tool} call");
+    view.pending_approval = Some(PendingApproval {
+        call_id,
+        tool,
+        reason,
+    });
+}
+
+/// Applies a "no credential" answer: opens the question that stores a key.
+///
+/// Asked rather than refused, because storing a key is the one thing a reader can do about it, and
+/// what was asked for is still held so the key is filed against it. The plan is part of what was
+/// asked for — a coding subscription takes a key of its own.
+fn apply_no_credential(provider: &str, plan: Option<&str>, env: &str, view: &mut ViewState) {
+    view.open_credential(provider, plan, env);
+    view.status = format!("no credential for {}: store one?", view.credential_label());
+}
+
+/// Applies an authorization prompt: shows the page and the code the user acts on.
+///
+/// The agent has started the flow and is polling, so this is only what the reader needs to act on
+/// it. Closing the prompt does not stop the flow, so the frame carries no reply.
+fn apply_auth_prompt(
+    provider: &str,
+    plan: Option<&str>,
+    url: &str,
+    code: &str,
+    view: &mut ViewState,
+) {
+    view.open_auth(provider, plan, url, code);
+    view.status = format!("authorizing {}…", view.auth_label());
 }
 
 /// Applies a model change: the model, the steps it takes, and the effort reconciled with them.
@@ -3105,6 +3161,7 @@ fn apply_provider_changed(
         .collect();
     view.refresh_effort_levels();
     view.pending_switch = None;
+    view.close_auth();
     view.status = format!("provider: {provider}");
 }
 
@@ -4823,6 +4880,47 @@ mod tests {
             }
         );
         assert!(view.key_input.is_empty(), "the key is not kept");
+    }
+
+    /// An authorization prompt names the page and the code, and hiding it leaves the flow running.
+    #[test]
+    fn an_authorization_prompt_names_the_page_and_the_code() {
+        let mut view = ViewState::new();
+        apply(
+            Frame::AuthPrompt {
+                provider: String::from("openai"),
+                plan: Some(String::from("subscription")),
+                url: String::from("https://auth.openai.com/codex/device"),
+                code: String::from("ABCD-EFGH"),
+            },
+            &mut view,
+        );
+        assert!(view.auth_open);
+        assert_eq!(view.auth_label(), "openai · subscription");
+        assert_eq!(view.auth_code, "ABCD-EFGH");
+
+        // Esc hides the note; the agent keeps polling.
+        let _ = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(!view.auth_open);
+        assert!(view.status.contains("continues"), "{}", view.status);
+
+        // A failure closes it too, because its refusal is the answer the prompt waited for.
+        apply(
+            Frame::AuthPrompt {
+                provider: String::from("openai"),
+                plan: Some(String::from("subscription")),
+                url: String::from("https://auth.openai.com/codex/device"),
+                code: String::from("WXYZ-1234"),
+            },
+            &mut view,
+        );
+        apply(
+            Frame::Failed {
+                message: String::from("the authorization was not completed in time"),
+            },
+            &mut view,
+        );
+        assert!(!view.auth_open);
     }
 
     /// A refused plan is a row that says why rather than a switch.

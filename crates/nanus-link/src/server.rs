@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{AgentRunner, Approver, Harness, Progress, Provider, ProviderSwitch};
 use nanus_domain::{
@@ -54,6 +55,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
@@ -1752,9 +1754,10 @@ async fn set_model(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, model:
 /// Rebuilds the agent's model adapter for another provider, or says why it could not.
 ///
 /// Three refusals, each named: a provider this build does not offer, an agent with no composition
-/// behind it, and a provider with no credential. The last is [`Frame::NoCredential`] rather than a
-/// [`Frame::Failed`] because it is the one refusal a reader can act on, and the interface turns it
-/// into the question of whether to store a key.
+/// behind it, and a provider with no credential. A missing *key* is [`Frame::NoCredential`] rather
+/// than a [`Frame::Failed`] because it is the one refusal a reader can act on, and the interface
+/// turns it into the question of whether to store a key; a missing *authorization* starts the flow
+/// instead, since there is nothing for the reader to type until the service hands back a token.
 async fn set_provider(
     registry: &Rc<Registry>,
     frames: &mpsc::Sender<Frame>,
@@ -1785,16 +1788,26 @@ async fn set_provider(
         return;
     };
     if !switch.has_credential(name, plan).await {
-        send(
-            frames,
-            Frame::NoCredential {
-                provider: name.name().to_owned(),
-                plan: plan.map(str::to_owned),
-                env: name.credential_env(plan).to_owned(),
-            },
-        )
-        .await;
-        return;
+        // A plan reached with an authorization is not asked for a key: the flow is started here, the
+        // user authorizes elsewhere, and the token set is filed before the switch is retried. A plan
+        // reached with a key gets the question the interface turns into a masked field.
+        if name.credential_is_oauth(plan) {
+            if let Err(message) = authorize(&switch, frames, name, plan).await {
+                send(frames, Frame::Failed { message }).await;
+                return;
+            }
+        } else {
+            send(
+                frames,
+                Frame::NoCredential {
+                    provider: name.name().to_owned(),
+                    plan: plan.map(str::to_owned),
+                    env: name.credential_env(plan).unwrap_or_default().to_owned(),
+                },
+            )
+            .await;
+            return;
+        }
     }
     match switch.switch(name, plan).await {
         Ok(models) => {
@@ -1866,6 +1879,58 @@ async fn set_credential(
             },
         )
         .await;
+    }
+}
+
+/// Runs the authorization a plan needs: shows the user the page and the code, and files the token
+/// set when they finish.
+///
+/// Returns the sentence to show when the flow cannot start, cannot finish, or is not completed
+/// within [`AUTHORIZATION_TIMEOUT`], so the caller sends one refusal rather than knowing the flow's
+/// shape. It blocks this connection's request loop for the wait — which is what a modal wants: the
+/// reader is completing the authorization, not sending prompts, and every other connection is
+/// unaffected.
+async fn authorize(
+    switch: &Rc<ProviderSwitch>,
+    frames: &mpsc::Sender<Frame>,
+    provider: Provider,
+    plan: Option<&str>,
+) -> Result<(), String> {
+    let pending = switch
+        .begin_authorization(provider, plan)
+        .await
+        .map_err(|error| error.to_string())?;
+    send(
+        frames,
+        Frame::AuthPrompt {
+            provider: provider.name().to_owned(),
+            plan: plan.map(str::to_owned),
+            url: pending.url().to_owned(),
+            code: pending.code().to_owned(),
+        },
+    )
+    .await;
+    // A moment past the service's own interval, so a poll that arrives a touch early is not counted
+    // as the user having not authorized.
+    let wait = pending.interval().saturating_add(POLL_MARGIN);
+    let deadline = Instant::now()
+        .checked_add(AUTHORIZATION_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    loop {
+        sleep(wait).await;
+        if switch
+            .poll_authorization(&pending)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the authorization for {} was not completed in time",
+                provider.name()
+            ));
+        }
     }
 }
 
@@ -2126,7 +2191,7 @@ mod tests {
             assert!(!provider.credential_env.is_empty(), "{}", provider.name);
             assert!(!provider.plans.is_empty(), "{}", provider.name);
         }
-        // z.ai offers two hosts; OpenAI's subscription is listed and refused with its reason.
+        // z.ai offers two hosts; OpenAI offers the API and the subscription, and neither is refused.
         let zai = catalogue
             .iter()
             .find(|provider| provider.name == "zai")
@@ -2137,15 +2202,11 @@ mod tests {
             .iter()
             .find(|provider| provider.name == "openai")
             .expect("openai is offered");
-        let subscription = openai
-            .plans
-            .iter()
-            .find(|plan| plan.name == "subscription")
-            .expect("the subscription plan is listed");
-        assert!(
-            subscription.refused.is_some(),
-            "and refused with its reason rather than absent"
-        );
+        let plans: Vec<&str> = openai.plans.iter().map(|plan| plan.name.as_str()).collect();
+        assert_eq!(plans, vec!["api", "subscription"]);
+        for plan in &openai.plans {
+            assert!(plan.refused.is_none(), "{} is offered", plan.name);
+        }
     }
 
     /// A held session with nobody attached.

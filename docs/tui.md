@@ -558,10 +558,18 @@ stays what it was.
 coding-plan key on a different host, not something a pay-as-you-go API key can replace, so its
 credential is filed under `zai:coding` (falling back to `ZAI_CODING_API_KEY`) rather than the API
 account `zai`. Choosing `zai · coding` with only the API key stored therefore asks for the coding
-key, and the two plans keep two keys. A plan that shares the provider's key — `OpenAI`'s `coding` is
-the same key on the same host — is filed under the provider's own account, so it never asks twice.
-The same names work from the shell: `nanus auth set zai:coding` stores one, and `nanus auth status`
-lists every account a provider may be filed under.
+key, and the two plans keep two keys. A plan that shares the provider's key is filed under the
+provider's own account, so it never asks twice. The same names work from the shell:
+`nanus auth set zai:coding` stores one, and `nanus auth status` lists every account a provider may be
+filed under.
+
+**A plan reached with OAuth is authorized instead of keyed.** `OpenAI`'s `subscription` is a
+`ChatGPT` account rather than an API key, so choosing it starts OpenAI's device flow: the interface
+shows a page and a code, the reader authorizes on any machine, and the agent — which is the one
+polling — files the token set under `openai:subscription` and switches when the service confirms.
+`Esc` hides the note and leaves the flow running, because the authorization is the service's to
+confirm and may finish after the reader looks away. The grant is a token set with a refresh token,
+so an expiry is the agent's to renew rather than the reader's to re-enter.
 
 **The switch is the agent's, and it reaches every client**, exactly as the model and the approval
 state do: one runner serves every session, so a client that switches tells every watcher. The

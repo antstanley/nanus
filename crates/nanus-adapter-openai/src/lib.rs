@@ -43,6 +43,7 @@
 
 mod config;
 mod error;
+pub mod oauth;
 mod wire;
 
 pub use config::{

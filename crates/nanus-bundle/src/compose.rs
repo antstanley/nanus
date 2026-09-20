@@ -316,6 +316,36 @@ impl ProviderSwitch {
             .map_err(|error| BundleError::config(format!("{account}: {error}")))
     }
 
+    /// Starts an authorization for `provider`'s `plan`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Config`] when the plan is reached with a key rather than an
+    /// authorization, or when the authorization service cannot be reached.
+    pub async fn begin_authorization(
+        &self,
+        provider: Provider,
+        plan: Option<&str>,
+    ) -> Result<crate::authorize::PendingAuth, BundleError> {
+        crate::authorize::begin(provider, plan, nanus_adapter_openai::oauth::ISSUER).await
+    }
+
+    /// Polls an authorization once, filing the token set when the user has finished.
+    ///
+    /// `false` means still waiting. The caller decides how long to keep asking; the service's own
+    /// code expires on its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Config`] when the service cannot be reached or refuses the poll, and
+    /// when the store refuses the write.
+    pub async fn poll_authorization(
+        &self,
+        pending: &crate::authorize::PendingAuth,
+    ) -> Result<bool, BundleError> {
+        crate::authorize::poll(&self.secrets, pending).await
+    }
+
     /// Rebuilds the model adapter for `provider` and `plan`, and points the runner at it.
     ///
     /// Returns the model ids the new provider offers. The startup configuration's other fields are
@@ -441,17 +471,22 @@ async fn resolve_credential(
     selection: &Selection,
 ) -> Result<Secret, BundleError> {
     let account = selection.credential_account();
-    let env = selection.credential_env();
+    // A plan reached with an authorization has no variable to name: it is completed in a browser,
+    // so the sentence points at the flow rather than at a shell.
+    let hint = selection.credential_env().map_or_else(
+        || String::from("authorize it from the provider chooser"),
+        |env| format!("run `nanus auth set {account}`, or set {env}"),
+    );
     match secrets.get(account).await {
         Ok(Some(secret)) if !secret.is_blank() => Ok(secret),
         Ok(_) => Err(BundleError::config(format!(
-            "no credential for {account}: run `nanus auth set {account}`, or set {env}"
+            "no credential for {account}: {hint}"
         ))),
         // The store failed rather than answering, so its own sentence is kept: a
         // locked keychain is a different problem from an unset key, and the fix is
         // different too.
         Err(error) => Err(BundleError::config(format!(
-            "no credential for {account}: {error}; run `nanus auth set {account}`, or set {env}"
+            "no credential for {account}: {error}; {hint}"
         ))),
     }
 }
@@ -560,6 +595,17 @@ fn build_llm(
     let port: Box<dyn LlmPort> = match selection.provider() {
         Provider::DeepSeek => Box::new(build_deepseek(config, selection, key)?),
         Provider::Zai => Box::new(build_compatible(Vendor::Zai, config, selection, key)?),
+        // `OpenAI`'s subscription speaks the Responses API, which this build does not encode yet.
+        // The refusal is here rather than in the plan table so the plan can be *chosen* — its
+        // authorization can be filed — while a turn against it is refused with this sentence rather
+        // than sent as a chat completion the ChatGPT backend does not serve.
+        Provider::OpenAi if selection.credential_is_oauth() => {
+            return Err(BundleError::config(format!(
+                "the {} plan speaks the Responses API, which this build does not encode yet: its \
+                 authorization is stored, but a turn against it is not possible until that lands",
+                selection.plan().name
+            )));
+        }
         Provider::OpenAi => Box::new(build_compatible(Vendor::OpenAi, config, selection, key)?),
         Provider::Anthropic => Box::new(build_anthropic(config, selection, key)?),
     };
