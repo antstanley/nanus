@@ -234,6 +234,66 @@ impl Selection {
     }
 }
 
+/// One cell of the terminal, for a selection that is not over the transcript.
+///
+/// Screen coordinates rather than a line of the transcript, because everything a dialogue draws —
+/// the key list, a model list, the title, the composer — is laid out by deciding cells, and only
+/// the *buffer* knows all of it at once. Ordering is by row and then by column, which is the order
+/// a reader reads and therefore the order the two ends of a range are put into.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct Cell {
+    /// Which row of the screen, counted from the top.
+    pub(crate) row: u16,
+    /// Which column of that row.
+    pub(crate) column: u16,
+}
+
+/// A range of screen cells the reader has selected, and the frame it was drawn against.
+///
+/// The counterpart of [`Selection`] for everything that is not the transcript. The two are separate
+/// because they answer to different things: a transcript selection is a range of *rendered lines*,
+/// which keeps its meaning while an answer streams and the view scrolls, whereas a dialogue does not
+/// stream — its text is rebuilt on every keystroke — so the only thing a selection over it can name
+/// is the cells it was drawn on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ScreenSelection {
+    /// Where the selection began: the end that stays put while the other moves.
+    anchor: Cell,
+    /// The end that moves.
+    head: Cell,
+    /// The size of the frame the selection was made against.
+    ///
+    /// A screen selection names cells, and a terminal that has changed size is drawing something
+    /// else at those cells. The size is what lets the view notice and drop it, exactly as the width
+    /// does for a transcript selection.
+    viewport: (u16, u16),
+    /// Whether a dialogue was up when it was made.
+    ///
+    /// A highlight drawn over a dialogue's rows is about that dialogue, so it goes when the
+    /// dialogue does — and a highlight drawn before one opened is covered by it, which is a change
+    /// to what those cells mean. Either way the selection is dropped rather than left holding
+    /// something the reader never chose.
+    over_dialogue: bool,
+}
+
+impl ScreenSelection {
+    /// The two ends in order, whichever way round the reader dragged.
+    #[must_use]
+    fn range(self) -> (Cell, Cell) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Whether both ends are the same cell, which is a click rather than a selection.
+    #[must_use]
+    fn is_point(self) -> bool {
+        self.anchor == self.head
+    }
+}
+
 /// The style the selected characters are drawn with.
 ///
 /// A modifier rather than a background colour, for the reason the caret is one: the backend sets a
@@ -433,6 +493,21 @@ pub struct ViewState {
     /// with it.
     pub(crate) selection: Option<Selection>,
 
+    /// The range of the *screen* the reader has selected, if any, for everything that is not the
+    /// transcript: a dialogue's rows, the composer, the title line.
+    ///
+    /// At most one of this and [`ViewState::selection`] is set, because a drag is one gesture: the
+    /// press decides which surface it landed on and the whole drag stays on it.
+    screen_selection: Option<ScreenSelection>,
+
+    /// The text the last drawn frame held, one string per row, and the size it was drawn at.
+    ///
+    /// A screen selection names cells, and what is drawn in a cell is only known to the buffer that
+    /// was painted: a dialogue is assembled row by row inside its own drawing function, so nothing
+    /// else holds the whole screen's text. Recorded after every frame for that reason.
+    screen: Vec<String>,
+    screen_size: (u16, u16),
+
     /// The transcript area as it was last drawn, for turning a click into a position.
     ///
     /// Recorded for the same reason the composer's rectangle is: a click arrives as a cell, and which
@@ -621,6 +696,9 @@ impl Default for ViewState {
             mentions: Vec::new(),
             mention_selection: 0,
             selection: None,
+            screen_selection: None,
+            screen: Vec::new(),
+            screen_size: (0, 0),
             last_transcript: None,
             permission_open: false,
             permission_selection: 0,
@@ -796,6 +874,24 @@ fn column_in_line(line: &Line<'static>, x: usize, rows: usize, within: usize) ->
     offset
 }
 
+/// The index of the character drawn at a screen column, in a row of the frame that was drawn.
+///
+/// Cell columns and character offsets are not the same number, and a wide character is where they
+/// part company: it covers two cells and is one character, so a drag that starts on either of them
+/// means the character. A column past the end of the row is the end of the row, which is what a
+/// drag that ran off the right edge of a line means.
+fn character_at(characters: &[char], column: usize) -> usize {
+    let mut used = 0_usize;
+    for (index, character) in characters.iter().enumerate() {
+        let width = character.width().unwrap_or(0);
+        if used.saturating_add(width) > column {
+            return index;
+        }
+        used = used.saturating_add(width);
+    }
+    characters.len()
+}
+
 /// The text of one rendered line.
 fn line_text(line: &Line<'static>) -> String {
     line.spans
@@ -849,6 +945,47 @@ fn marked_line(line: &Line<'static>, from: usize, to: usize) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+/// Reverses every cell a screen selection covers, on the frame that was just finished.
+///
+/// Painted onto the finished frame rather than into whatever widget drew each cell, because a
+/// selection may cover several at once: a dialogue's border, the row of text inside it, and the
+/// transcript visible beside it are all drawn by different calls. The modifier rather than a
+/// colour is the choice the transcript highlight makes, for the reason given there.
+fn paint_screen_selection(frame: &mut Frame<'_>, selection: ScreenSelection) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let right = area.width.saturating_sub(1);
+    let bottom = area.height.saturating_sub(1);
+    let (start, end) = selection.range();
+    let first = start.row.min(bottom);
+    let last = end.row.min(bottom);
+    let buffer = frame.buffer_mut();
+    for row in first..=last {
+        // The anchor's row begins at its column and the head's ends at its own; every row between
+        // is taken whole, which is the shape a box drawn with a mouse has.
+        let from = if row == start.row {
+            start.column.min(right)
+        } else {
+            0
+        };
+        let to = if row == end.row {
+            end.column.min(right)
+        } else {
+            right
+        };
+        if from > to {
+            continue;
+        }
+        for column in from..=to {
+            if let Some(cell) = buffer.cell_mut((column, row)) {
+                cell.modifier.insert(SELECTION_STYLE);
+            }
+        }
+    }
 }
 
 /// The first line of a prompt, with a mark when there is more.
@@ -1247,10 +1384,10 @@ impl ViewState {
         self.help_scroll = u16::try_from(moved).unwrap_or(u16::MAX);
     }
 
-    /// Whether anything is selected.
+    /// Whether anything is selected, on the transcript or anywhere else on the screen.
     #[must_use]
     pub(crate) fn has_selection(&self) -> bool {
-        self.selection.is_some()
+        self.selection.is_some() || self.screen_selection.is_some()
     }
 
     /// Whether a dialogue that owns the keyboard is up.
@@ -1273,9 +1410,10 @@ impl ViewState {
             || self.pending_approval.is_some()
     }
 
-    /// Drops the selection.
+    /// Drops the selection, whichever surface it was over.
     pub(crate) fn clear_selection(&mut self) {
         self.selection = None;
+        self.screen_selection = None;
     }
 
     /// The width the transcript is being drawn at.
@@ -1296,6 +1434,7 @@ impl ViewState {
         let Some(position) = self.position_at(column, row) else {
             return false;
         };
+        self.screen_selection = None;
         self.selection = Some(Selection {
             anchor: position,
             head: position,
@@ -1304,12 +1443,80 @@ impl ViewState {
         true
     }
 
+    /// Whether a cell is inside the composer, where a press means the caret.
+    ///
+    /// The whole box rather than the rows that carry text: a click on the blank row a full caret
+    /// wraps onto is the end of the prompt, and a click on the padding around the rules is a
+    /// reader reaching for the prompt rather than for the text near it. Either way it is not the
+    /// start of a selection.
+    #[must_use]
+    pub(crate) fn over_composer(&self, column: u16, row: u16) -> bool {
+        self.last_composer
+            .is_some_and(|area| area.contains(Position::new(column, row)))
+    }
+
+    /// Starts a selection on the screen itself, at a cell, replacing any there was.
+    ///
+    /// `false` when the row is outside the frame that was last drawn, so the caller can leave things
+    /// alone rather than starting a selection over cells that have never held anything.
+    #[must_use]
+    pub(crate) fn begin_screen_selection(&mut self, column: u16, row: u16) -> bool {
+        if usize::from(row) >= self.screen.len() {
+            return false;
+        }
+        self.selection = None;
+        let cell = self.clamped_cell(column, row);
+        self.screen_selection = Some(ScreenSelection {
+            anchor: cell,
+            head: cell,
+            viewport: self.screen_size,
+            over_dialogue: self.modal_open(),
+        });
+        true
+    }
+
+    /// Moves a screen selection's head to a cell.
+    ///
+    /// A drag with no screen selection starts one at the dragged-to cell, on the same rule a
+    /// transcript drag does: the movement means what the pointer is over, even when the press was
+    /// reported somewhere else or not at all.
+    pub(crate) fn drag_screen_selection(&mut self, column: u16, row: u16) {
+        if self.screen.is_empty() {
+            return;
+        }
+        let cell = self.clamped_cell(column, row);
+        if let Some(selection) = self.screen_selection.as_mut() {
+            selection.head = cell;
+            return;
+        }
+        let _ = self.begin_screen_selection(column, row);
+        if let Some(selection) = self.screen_selection.as_mut() {
+            selection.head = cell;
+        }
+    }
+
+    /// A cell held inside the frame that was drawn, so a selection can never point off the screen.
+    fn clamped_cell(&self, column: u16, row: u16) -> Cell {
+        let (width, height) = self.screen_size;
+        Cell {
+            row: row.min(height.saturating_sub(1)),
+            column: column.min(width.saturating_sub(1)),
+        }
+    }
+
     /// Moves the selection's head to a point on the screen.
     ///
     /// A drag with no selection is a selection of nothing, so it starts one at the dragged-to point
     /// rather than being ignored: a terminal that reports the press somewhere else, or a drag that
     /// arrived without one, should still select what the pointer is over.
     pub(crate) fn drag_selection(&mut self, column: u16, row: u16) {
+        // Whichever surface the press chose is the surface the whole drag is on: a drag that
+        // crossed from a dialogue to the transcript must not become a different selection
+        // half-way through.
+        if self.screen_selection.is_some() {
+            self.drag_screen_selection(column, row);
+            return;
+        }
         let Some(position) = self.position_at(column, row) else {
             return;
         };
@@ -1334,6 +1541,9 @@ impl ViewState {
         {
             self.selection = None;
         }
+        if self.screen_selection.is_some_and(ScreenSelection::is_point) {
+            self.screen_selection = None;
+        }
     }
 
     /// Extends the selection by rendered lines, starting one if there is none.
@@ -1343,6 +1553,7 @@ impl ViewState {
     /// means the text they are looking at rather than a point somewhere off screen.
     pub(crate) fn extend_selection(&mut self, rows: i32) {
         let width = self.drawn_width();
+        self.screen_selection = None;
         let last = self.transcript_lines(width).len().saturating_sub(1);
         let Some(mut selection) = self.selection.filter(|it| it.width == width) else {
             // The first press takes the line the reader is looking at, and stops there: a highlight
@@ -1369,6 +1580,7 @@ impl ViewState {
     /// Moves the selection's head to the start or the end of the line it is on.
     pub(crate) fn select_line_edge(&mut self, to_end: bool) {
         let width = self.drawn_width();
+        self.screen_selection = None;
         let last = self.transcript_lines(width).len().saturating_sub(1);
         let mut selection = self
             .selection
@@ -1395,6 +1607,7 @@ impl ViewState {
 
     /// Selects a range outright, which is what a command that copies something does.
     pub(crate) fn select_range(&mut self, anchor: Place, head: Place, width: u16) {
+        self.screen_selection = None;
         self.selection = Some(Selection {
             anchor,
             head,
@@ -1485,7 +1698,19 @@ impl ViewState {
     /// pressed the key over a blank row meant to copy something else.
     #[must_use]
     pub(crate) fn selected_text(&self) -> Option<String> {
-        let selection = self.selection?;
+        if let Some(selection) = self.selection {
+            return self.transcript_text(selection);
+        }
+        self.screen_selection
+            .and_then(|selection| self.screen_text(selection))
+    }
+
+    /// The text a transcript selection covers, drawn as it is on screen.
+    ///
+    /// `None` when what is selected is only whitespace: a reader who selected a blank row meant to
+    /// copy something else.
+    #[must_use]
+    fn transcript_text(&self, selection: Selection) -> Option<String> {
         let lines = self.transcript_lines(selection.width);
         let (start, end) = selection.range();
         let mut rows: Vec<String> = Vec::new();
@@ -1516,7 +1741,52 @@ impl ViewState {
         (!text.trim().is_empty()).then_some(text)
     }
 
-    /// The lines the newest answer occupies, for a copy that does not need a mouse.
+    /// The text a screen selection covers, read out of the frame that was last drawn.
+    ///
+    /// The rows are the ones the highlight is drawn over, so what a reader sees reversed is what
+    /// goes to the clipboard. Trailing blanks are taken off every row and off the end, because the
+    /// cells of a row run to the edge of the terminal and the padding to the right of a dialogue's
+    /// text is not part of what was selected.
+    ///
+    /// `None` when nothing has been drawn, and when what is selected is only whitespace.
+    #[must_use]
+    fn screen_text(&self, selection: ScreenSelection) -> Option<String> {
+        let (start, end) = selection.range();
+        let last = usize::from(end.row).min(self.screen.len().saturating_sub(1));
+        let mut rows: Vec<String> = Vec::new();
+        for row in usize::from(start.row)..=last {
+            let Some(drawn) = self.screen.get(row) else {
+                break;
+            };
+            let characters: Vec<char> = drawn.chars().collect();
+            let from = if row == usize::from(start.row) {
+                character_at(&characters, usize::from(start.column))
+            } else {
+                0
+            };
+            // Inclusive, and one past the head's cell on the head's own row: a column is a cell
+            // rather than a character, so this is where a wide character is taken as a whole.
+            let to = if row == usize::from(end.row) {
+                character_at(&characters, usize::from(end.column).saturating_add(1))
+            } else {
+                usize::MAX
+            };
+            let from = from.min(characters.len());
+            let to = to.min(characters.len());
+            rows.push(
+                characters
+                    .get(from..to)
+                    .map_or_else(String::new, |run| run.iter().collect::<String>())
+                    .trim_end()
+                    .to_owned(),
+            );
+        }
+        while rows.last().is_some_and(|row| row.trim().is_empty()) {
+            rows.pop();
+        }
+        let text = rows.join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
     ///
     /// The answer is the last entry the *model* wrote, and the range is that entry's own lines and
     /// nothing else: a reader asking for it by command means the prose, not a tool line that happened
@@ -2251,6 +2521,7 @@ impl ViewState {
     /// transcript.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        self.drop_stale_selection(area);
         // The composer grows with the prompt, so a multi-line one is visible rather
         // than clipped to a single row. The transcript keeps a floor of rows so that a
         // tall composer cannot squeeze the conversation out entirely.
@@ -2383,6 +2654,48 @@ impl ViewState {
         if self.permission_open {
             self.render_permissions(frame, area);
         }
+        // The frame is finished, so this is the screen the reader is looking at. Recorded, then
+        // highlighted: the snapshot is taken before the paint because the highlight adds a modifier
+        // and no text, and the paint comes last because a selection may be over a dialogue, which
+        // is only drawn now.
+        self.capture_screen(frame);
+        if let Some(selection) = self.screen_selection {
+            paint_screen_selection(frame, selection);
+        }
+    }
+
+    /// Drops a screen selection the frame it was made against no longer matches.
+    ///
+    /// A screen selection names cells, so a terminal that has changed size is drawing something else
+    /// at them, and a dialogue that has opened or closed has changed what is at every cell it
+    /// covers. Dropped rather than clamped, for the reason a transcript selection is.
+    fn drop_stale_selection(&mut self, area: Rect) {
+        let dialogue = self.modal_open();
+        if self.screen_selection.is_some_and(|it| {
+            it.viewport != (area.width, area.height) || it.over_dialogue != dialogue
+        }) {
+            self.screen_selection = None;
+        }
+    }
+
+    /// Records the text of the frame that was just drawn, one string per row.
+    ///
+    /// The row of a cell is its row on the terminal: every widget here is drawn into a full-screen
+    /// area, so row zero is the top of the screen and the two agree.
+    fn capture_screen(&mut self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        let buffer = frame.buffer_mut();
+        self.screen.clear();
+        self.screen_size = (area.width, area.height);
+        for row in 0..area.height {
+            let mut line = String::new();
+            for column in 0..area.width {
+                if let Some(cell) = buffer.cell((column, row)) {
+                    line.push_str(cell.symbol());
+                }
+            }
+            self.screen.push(line);
+        }
     }
 
     /// How many rows the inline queue draws, and therefore how many it needs.
@@ -2469,7 +2782,7 @@ impl ViewState {
         let total = self.queue.len();
         let mut lines = vec![Line::from(vec![
             Span::styled("── queued", self.theme.notice),
-            Span::styled(format!(" · {total} · Ctrl+Q to edit"), dim),
+            Span::styled(format!(" · {total} · Ctrl+P to edit"), dim),
         ])];
         for (index, prompt) in self
             .queue
@@ -3821,7 +4134,7 @@ impl ViewState {
         // they know there is something to open.
         let queued = if self.has_queued() {
             Span::styled(
-                format!("  ·  {} queued (Ctrl+Q)", self.queue.len()),
+                format!("  ·  {} queued (Ctrl+P)", self.queue.len()),
                 Style::default().fg(Color::Yellow),
             )
         } else {
@@ -4670,7 +4983,7 @@ mod tests {
         assert!(text.contains("run the tests"), "{text}");
         assert!(text.contains("then fix the docs"), "{text}");
         assert!(
-            text.contains("2 queued (Ctrl+Q)"),
+            text.contains("2 queued (Ctrl+P)"),
             "the status counts them: {text}"
         );
         let rows: Vec<&str> = text.lines().collect();
@@ -4903,6 +5216,191 @@ mod tests {
         assert!(state.has_selection());
         rendered(&mut state, 60, 12);
         assert!(!state.has_selection(), "the width changed under it");
+    }
+
+    /// A drag anywhere that is not the transcript selects the cells it crossed: a dialogue, the
+    /// composer, the title. This is the "anywhere in the interface" half of the copy key, and the
+    /// text is the one *drawn* there rather than anything hidden beneath it.
+    #[test]
+    fn a_screen_selection_copies_what_is_drawn_where_the_pointer_went() {
+        let mut state = ViewState::new();
+        state.open_help();
+        let text = rendered(&mut state, 60, 16);
+        let row = text
+            .lines()
+            .position(|line| line.contains("submit"))
+            .expect("the key list is drawn");
+        let row = u16::try_from(row).expect("a row within a terminal");
+
+        // A press and a drag across the row: the text between the two columns is the selection.
+        assert!(state.begin_screen_selection(0, row), "the row was drawn");
+        state.drag_screen_selection(56, row);
+        let copied = state.selected_text().expect("the dialogue's own text");
+        assert!(copied.contains("submit"), "{copied:?}");
+        assert!(
+            !copied.ends_with(' '),
+            "the padding to the right is not copied: {copied:?}"
+        );
+
+        // And it is painted over the finished frame: every cell of the range is reversed.
+        let reversed = reversed_cells(&mut state, 60, 16);
+        let painted = reversed.iter().filter(|(_, drawn)| *drawn == row).count();
+        assert!(
+            painted >= 20,
+            "the highlight covers the row: {painted} cells of {reversed:?}"
+        );
+    }
+
+    /// A screen selection is a box, not a run: every row between the two ends comes whole, and each
+    /// end stops at its own column. That is what makes a copied dialogue read as the text a reader
+    /// drew a box around rather than as one long line.
+    #[test]
+    fn a_screen_selection_takes_every_row_between_its_ends() {
+        let mut state = ViewState::new();
+        state.open_help();
+        let text = rendered(&mut state, 60, 16);
+        let rows: Vec<u16> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("submit") || line.contains("newline:"))
+            .map(|(index, _)| u16::try_from(index).expect("a row"))
+            .collect();
+        let (first, last) = (
+            *rows.first().expect("the first binding is drawn"),
+            *rows.last().expect("the last binding is drawn"),
+        );
+        assert!(last > first, "the two rows are different rows");
+
+        let _ = state.begin_screen_selection(0, first);
+        state.drag_screen_selection(30, last);
+        let copied = state.selected_text().expect("a box of dialogue");
+        assert!(
+            copied.lines().count() > 1,
+            "the rows between come with it: {copied:?}"
+        );
+
+        // The same range upwards is the same text: a selection is a range, not a direction.
+        let _ = state.begin_screen_selection(30, last);
+        state.drag_screen_selection(0, first);
+        assert_eq!(state.selected_text().as_deref(), Some(copied.as_str()));
+    }
+
+    /// A press and a release on one cell is a click, not a selection: a one-cell highlight left
+    /// behind by a click would look like something a reader meant, and they did not.
+    #[test]
+    fn a_screen_click_that_did_not_drag_selects_nothing() {
+        let mut state = ViewState::new();
+        state.open_help();
+        rendered(&mut state, 60, 16);
+        assert!(state.begin_screen_selection(3, 1));
+        state.finish_selection();
+        assert!(!state.has_selection(), "a click is not a selection");
+        assert!(state.selected_text().is_none());
+    }
+
+    /// A screen selection names cells of the frame it was made on, so a terminal that has changed
+    /// size is drawing something else at them: it is dropped rather than left where it was.
+    #[test]
+    fn a_resize_drops_a_screen_selection() {
+        let mut state = ViewState::new();
+        state.open_help();
+        rendered(&mut state, 60, 16);
+        let _ = state.begin_screen_selection(1, 1);
+        state.drag_screen_selection(20, 2);
+        assert!(state.has_selection());
+
+        // Drawn at the same size again: still standing, because the cells still mean the same.
+        rendered(&mut state, 60, 16);
+        assert!(state.has_selection(), "an identical frame changes nothing");
+
+        rendered(&mut state, 60, 14);
+        assert!(!state.has_selection(), "the rows moved under it");
+    }
+
+    /// A highlight drawn over a dialogue is about that dialogue: it goes when the dialogue does,
+    /// rather than being left covering whatever was hidden behind it.
+    #[test]
+    fn closing_a_dialogue_drops_a_selection_over_it() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "behind the list"));
+        state.open_help();
+        rendered(&mut state, 60, 16);
+        let _ = state.begin_screen_selection(1, 1);
+        state.drag_screen_selection(20, 2);
+        assert!(state.has_selection());
+
+        state.close_help();
+        rendered(&mut state, 60, 16);
+        assert!(
+            !state.has_selection(),
+            "the dialogue's highlight went with it"
+        );
+    }
+
+    /// A screen selection and a transcript selection are one at a time: the press that names the
+    /// surface the whole drag is on is the press that decides, and whichever selection was there
+    /// before goes.
+    #[test]
+    fn a_screen_selection_replaces_a_transcript_one_and_the_reverse() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .push(Entry::prose(Role::Assistant, "some text"));
+        let text = rendered(&mut state, 60, 16);
+        let answer = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("some text"))
+                .expect("the transcript is drawn"),
+        )
+        .expect("a row within a terminal");
+        assert!(state.begin_selection(0, answer), "the transcript is there");
+        state.drag_selection(9, answer);
+        assert!(state.selected_text().is_some_and(|it| it.contains("some")));
+
+        // A dialogue is drawn over the transcript, so a press on it names the screen: the
+        // transcript selection goes, and what is copied is the dialogue's own row.
+        state.open_help();
+        let covered = rendered(&mut state, 60, 16);
+        let listed = u16::try_from(
+            covered
+                .lines()
+                .position(|line| line.contains("submit"))
+                .expect("the key list is drawn"),
+        )
+        .expect("a row within a terminal");
+        let _ = state.begin_screen_selection(0, listed);
+        state.drag_screen_selection(56, listed);
+        let copied = state.selected_text().expect("the dialogue's own text");
+        assert!(copied.contains("submit"), "{copied:?}");
+        assert!(!copied.contains("some text"), "{copied:?}");
+
+        // And the other way round: a transcript drag takes the screen selection off.
+        state.close_help();
+        rendered(&mut state, 60, 16);
+        assert!(state.begin_selection(0, answer));
+        state.drag_selection(9, answer);
+        let back = state.selected_text().expect("the transcript again");
+        assert!(back.contains("some"), "{back:?}");
+        assert!(!back.contains("submit"), "{back:?}");
+    }
+
+    /// Cell columns and character offsets are different numbers wherever a wide character is, so
+    /// the mapping between them is stated rather than assumed: a drag that lands on either cell of
+    /// a full-width character means that character.
+    #[test]
+    fn a_column_is_resolved_to_the_character_covering_it() {
+        let characters: Vec<char> = "a日b".chars().collect();
+        assert_eq!(character_at(&characters, 0), 0);
+        assert_eq!(
+            character_at(&characters, 1),
+            1,
+            "the wide char's first cell"
+        );
+        assert_eq!(character_at(&characters, 2), 1, "and its second cell");
+        assert_eq!(character_at(&characters, 3), 2);
+        assert_eq!(character_at(&characters, 99), 3, "past the end is the end");
     }
 
     /// `/copy` needs the newest *answer*, which is the last thing the model wrote — not a tool line
@@ -5252,7 +5750,7 @@ mod tests {
         let last = rendered(&mut open, 60, 12);
         assert!(last.contains("while an approval dialog is up"), "{last}");
         assert!(
-            last.contains("deny it and stop"),
+            last.contains("deny it"),
             "the last row is reachable: {last}"
         );
     }

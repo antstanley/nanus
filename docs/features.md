@@ -42,8 +42,9 @@ that runs a turn.
   there is no tokenizer here, the provider reports the real count with every
   response, and the default sits well below every provider's window. See
   [context fitting](../crates/nanus-domain/src/context.rs).
-- **Interruptible turns.** `Ctrl+C` / `Esc` in the interface and `SIGINT` on a
-  headless run ask the turn to stop at the next safe point.
+- **Interruptible turns.** `Esc` in the interface and `SIGINT` on a
+  headless run ask the turn to stop at the next safe point. (`Ctrl+C` is the copy
+  key and never stops anything.)
 - **A step's tool calls run together, bounded.** `max_parallel_tools` (default 4)
   caps how many are in flight at once. The concurrency is cooperative — the kernel
   is single-threaded and its futures are `!Send` — and the log still records every
@@ -345,9 +346,11 @@ supports:
 - **Pasting an image** (`Ctrl+V`): the clipboard is read by the platform's own
   tool, the bytes are checked by their magic number, and the file is written inside
   the workspace so `read_image` can reach it.
-- **Selecting and copying**: drag with the mouse or extend with `Shift` and a
-  movement key, then `Ctrl+C` — or `/copy` for the newest answer. The clipboard is
-  the platform's own tool, falling back to the terminal's `OSC 52`. See
+- **Selecting and copying**: drag with the mouse, anywhere in the interface —
+  over a dialogue or the composer as readily as over an answer — or extend the
+  transcript with `Shift` and a movement key, then `Ctrl+C`. `/copy` takes the
+  newest answer without pointing at it. The clipboard is the platform's own tool,
+  falling back to the terminal's `OSC 52`. See
   [the interface](tui.md#selecting-and-copying).
 - **`!` for your own commands**: a line that opens with `!` is a shell command the
   interface runs itself, echoed into the transcript. It is not the model's, is not

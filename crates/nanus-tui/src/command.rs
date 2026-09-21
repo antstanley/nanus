@@ -84,6 +84,35 @@ impl Command {
             .flat_map(|(_, names)| names.iter().copied())
             .collect()
     }
+
+    /// The same names as a sentence, which is how a refusal says them.
+    #[must_use]
+    pub fn names_sentence() -> String {
+        sentence(&Self::names())
+    }
+}
+
+/// Joins names into a sentence: commas between them and one `and` before the last.
+///
+/// The refusal used to put `and` between every pair, so nine commands read as nine clauses and a
+/// reader scanning for the one they meant had no shape to scan. Commas are that shape; the single
+/// `and` at the end is what keeps it a sentence rather than a table. Nothing else is special-cased,
+/// because there is nothing else: a lone name is a name, and a pair needs no comma between two.
+///
+/// An empty list is an empty string, which no caller can reach — [`Command::TABLE`] is never empty,
+/// and a test below holds that down.
+#[must_use]
+fn sentence(names: &[&str]) -> String {
+    let Some((last, rest)) = names.split_last() else {
+        return String::new();
+    };
+    if rest.is_empty() {
+        return (*last).to_owned();
+    }
+    let mut joined = rest.join(", ");
+    joined.push_str(" and ");
+    joined.push_str(last);
+    joined
 }
 
 /// What the interface makes of a line the reader submitted.
@@ -320,5 +349,25 @@ mod tests {
         for name in offered {
             assert!(matches!(submission_of(name), Submission::Run(_)), "{name}");
         }
+    }
+
+    /// The names a refusal offers are a sentence rather than a chain of `and`s: commas between
+    /// them and one `and` before the last, whatever the length.
+    #[test]
+    fn a_list_of_names_reads_as_a_sentence() {
+        assert_eq!(sentence(&[]), "");
+        assert_eq!(sentence(&["/exit"]), "/exit");
+        assert_eq!(sentence(&["/exit", "/quit"]), "/exit and /quit");
+        assert_eq!(
+            sentence(&["/exit", "/quit", "/stats"]),
+            "/exit, /quit and /stats"
+        );
+
+        // And the real list, in the order the table offers them: the property above is about the
+        // joining, and this is about what a reader who mistypes a command actually sees.
+        assert_eq!(
+            Command::names_sentence(),
+            "/exit, /quit, /stats, /help, /clear, /model, /effort, /provider and /copy"
+        );
     }
 }

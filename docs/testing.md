@@ -219,7 +219,8 @@ calls both.
 
 Three smaller ones, recorded because they are the same kind of thing: `Ctrl+C` at an approval
 prompt did nothing (the turn is asleep on the answer, so the stop flag never reached its
-checkpoint — the key now denies the call *and* asks for the stop), `--scroll` without
+checkpoint; the key then denied the call *and* asked for the stop, and has since been made
+copy-only everywhere, so `n` denies and `Esc` stops), `--scroll` without
 `--session` was accepted and ignored, and a capped search reported `truncated` whenever the
 cap was *reached* rather than when a match was dropped, which is a confident falsehood a
 model cannot check.

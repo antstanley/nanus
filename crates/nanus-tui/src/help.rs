@@ -36,15 +36,19 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "scroll back and forward through the conversation",
     ),
     ("Shift+arrows", "select text in the transcript"),
-    ("Ctrl+C", "copy the selection, when there is one"),
     (
-        "Ctrl+C / Esc",
-        "stop the running turn; then cancel the prompt; then quit",
+        "Ctrl+C",
+        "copy what is highlighted, on the transcript or anywhere else",
     ),
+    (
+        "Esc",
+        "clear the selection; then stop the running turn; then cancel the prompt; then quit",
+    ),
+    ("Ctrl+Q", "quit"),
     ("Ctrl+D", "quit"),
     ("Ctrl+R", "reverse-search submitted prompts"),
     (
-        "Ctrl+Q",
+        "Ctrl+P",
         "open the queue of prompts waiting for the turn to end",
     ),
     (
@@ -71,7 +75,6 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("y", "allow the call once"),
     ("a", "allow it, and record the tool for the session"),
     ("n / Esc", "deny it"),
-    ("Ctrl+C", "deny it and stop the turn"),
 ];
 
 /// What the overlay is titled.
@@ -206,7 +209,7 @@ mod tests {
         assert_eq!(all.len(), KEYS.len());
         let last = rows(height(), 4, 60);
         assert_eq!(last.len(), 4);
-        assert!(matches!(last.last(), Some(Row::Keys { key, .. }) if key.trim() == "Ctrl+C"));
+        assert!(matches!(last.last(), Some(Row::Keys { key, .. }) if key.trim() == "n / Esc"));
     }
 
     /// A row that names no keys is a group heading rather than a binding.

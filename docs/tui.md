@@ -220,17 +220,17 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `y` | while an approval dialog is up: allow the call once |
 | `a` | while an approval dialog is up: allow the call and record the tool for the session |
 | `n` (or `Esc`) | while an approval dialog is up: deny it |
-| `Ctrl+C` | while an approval dialog is up: deny it *and* stop the turn |
 | `Shift+Tab` | choose the approval state, from anywhere |
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
 | `Shift` + arrows, `Home` / `End` | select text in the transcript |
-| `Ctrl+C` | copy the selection; or stop the running turn, then cancel the prompt, then quit |
+| `Ctrl+C` | copy what is highlighted, wherever it is — transcript, dialogue, composer, title |
 | `Esc` | clear the selection; then stop the running turn, then cancel the prompt, then quit |
+| `Ctrl+Q` | quit |
 | `Ctrl+D` | quit |
 | `Ctrl+R` | reverse-search submitted prompts |
-| `Ctrl+Q` | open the queue of prompts waiting for the turn to end (and close it) |
+| `Ctrl+P` | open the queue of prompts waiting for the turn to end (and close it) |
 | `Ctrl+O` | switch between the one-line form and the whole of a tool call |
 | `Ctrl+T` | summarise runs of tool calls |
 | `Ctrl+E` | summarise runs of reasoning |
@@ -255,21 +255,23 @@ know a binding exists has no way to find it, and documentation they are not look
 not a list. The gate is the composer: `?` opens the list only when there is nothing being
 typed, because a prompt needs `?` to be a `?` — `why?` is a question, not a command. Nothing
 being typed means nothing but whitespace, so a prompt holding only spaces still gives the
-key to the list. The overlay owns the keyboard while it is up — `Esc`, `Enter`, `Ctrl+C`,
-`q`, or `?` again closes it, `Up` and `Down` scroll it, and every other key does nothing
-rather than typing into the composer behind it — and the list scrolls rather than being cut,
-because a binding that fell off the bottom of a short terminal would be exactly the one a
-reader opened the list to find.
+key to the list. The overlay owns the keyboard while it is up — `Esc`, `Enter`, `q`, or `?`
+again closes it, `Up` and `Down` scroll it, and every other key does nothing rather than
+typing into the composer behind it — and the list scrolls rather than being cut, because a
+binding that fell off the bottom of a short terminal would be exactly the one a reader
+opened the list to find. The one key it does not own is `Ctrl+C`, which is the copy key
+wherever the reader is: the text of the list is exactly the kind of thing somebody wants to
+take out of this interface, and the highlight can be drawn over it while it is up.
 
-**While an approval dialog is up, four answers are possible and every other key is
+**While an approval dialog is up, three answers are possible and every other key is
 swallowed.** The dialog is drawn over the interface, names the tool and the harness's reason,
 and names every option with the key that selects it. `y` allows that one call, `a` allows it
-and records the tool for the rest of the session so the question is not asked again, `n` or
-`Esc` denies it, and `Ctrl+C` denies it *and* asks the turn to stop — because the turn is
-asleep on this answer, so the key that means "stop everything" everywhere else would
-otherwise do nothing at all here. A stray keypress cannot approve a command. The status line
-says what is being waited for, and the dialog closes when the turn ends — an answer cannot
-outlive the question.
+and records the tool for the rest of the session so the question is not asked again, and `n`
+or `Esc` denies it. A stray keypress cannot approve a command. The status line says what is
+being waited for, and the dialog closes when the turn ends — an answer cannot outlive the
+question. `Ctrl+C` is not an answer here either: it copies, as it does everywhere else, and
+leaves the question open. Denying *and* stopping the turn in one press went with it; `n`
+denies, and the turn is stopped afterwards with the key that stops it.
 
 **`Ctrl+R` searches the history** rather than toggling anything, because that is what it is
 in every interface that has one — including the one these bindings are modelled on, where
@@ -278,17 +280,18 @@ search takes over the composer and the status line: what you type narrows the qu
 than editing the prompt, the composer shows the match, and the status line says
 `(reverse-i-search)\`query'`. `Ctrl+R` again walks to older matches and stops at the oldest
 one rather than emptying the screen; `Tab` or `Esc` takes the match and leaves it to be
-edited; `Enter` takes it and sends it; `Ctrl+C` abandons the search and gives back whatever
-was being typed. Matching ignores case, because a prompt is prose and a search that could
-not see `Refactor` when asked for `refactor` reads as broken rather than strict.
+edited; `Enter` takes it and sends it; `Backspace` past the start of the query abandons the
+search and gives back whatever was being typed. Matching ignores case, because a prompt is
+prose and a search that could not see `Refactor` when asked for `refactor` reads as broken
+rather than strict. `Ctrl+C` copies here as it does everywhere else, and does not abandon the
+search — it is the copy key, and a mode does not get to claim it.
 
-**`Ctrl+C` and `Esc` stop what is happening, in the order a reader means it.** A turn in
-flight is stopped first, because that is the thing happening now and the thing a reader
-pressing "stop" is looking at. With nothing running the key reaches the prompt, and only an
-empty prompt leaves — a key that means "stop" should not be able to lose a prompt somebody
-is halfway through writing. `Esc` and `Ctrl+C` are the same key here for the same reason:
-what a reader wants stopped is whatever is happening, and the key should not need reading
-the screen first.
+**`Esc` stops what is happening, in the order a reader means it.** A turn in flight is
+stopped first, because that is the thing happening now and the thing a reader pressing "stop"
+is looking at. With nothing running the key reaches the prompt, and only an empty prompt
+leaves — a key that means "stop" should not be able to lose a prompt somebody is halfway
+through writing. It is `Esc` alone that does this: `Ctrl+C` is the copy key, so the key a
+terminal user reaches for to copy an answer is not also the key that throws the turn away.
 
 Stopping a turn is a *request*, not a keystroke. The turn belongs to the session rather
 than to the terminal: it runs in a task the agent owns, so that closing a window does not
@@ -329,7 +332,7 @@ when the turn before it ends. The queue is the interface's and not the session's
 deliberately not written into the log: it dies with the terminal that typed it rather than
 being replayed to the next client that attaches.
 
-`Ctrl+Q` opens the overlay, which is where a queue is read and changed, and it owns the
+`Ctrl+P` opens the overlay, which is where a queue is read and changed, and it owns the
 keyboard while it is up:
 
 | Key | Effect |
@@ -337,22 +340,25 @@ keyboard while it is up:
 | `Up` / `Down` (or `k` / `j`) | move the selection |
 | `Enter` (or `e`) | pull the selected prompt into the composer to edit it |
 | `d` / `Delete` | remove the selected prompt |
-| `Esc` (or `q`, `Ctrl+Q` again, `Ctrl+C`) | close the overlay |
+| `Esc` (or `q`) | close the overlay |
 
 **Editing takes the prompt out of the queue and into the composer**, so a turn that ends
 mid-edit cannot send the half-read text. `Enter` saves it back at the position it came
-from; `Esc` or `Ctrl+C` cancels and gives back both the original prompt and whatever draft
+from; `Esc` cancels and gives back both the original prompt and whatever draft
 was in the composer before the edit began. Deleting every character and saving removes the
 entry, because an empty prompt is not one worth sending. The one place this differs from
 every other mode is `Enter`: everywhere else it sends, and here it keeps the edit — which
 is what the status line says while the composer is holding a queued prompt.
+
+`Ctrl+Q` is not the overlay's key and does not close it: it leaves the interface, as it does
+from anywhere else. `Ctrl+C` copies, as it does everywhere.
 
 ### Mouse
 
 The mouse navigates as well as the keyboard. The wheel scrolls the conversation three rows
 a notch, in the same direction and with the same follow rule as `PageUp`/`PageDown`, and a
 left click in the composer puts the caret on the character it landed on, so a long prompt
-can be corrected without arrow keys. Everywhere else in the transcript, a *drag* selects —
+can be corrected without arrow keys. A *drag* anywhere else selects what is drawn there —
 see [selecting and copying](#selecting-and-copying) — and a click that does not drag takes
 the selection off.
 
@@ -592,21 +598,37 @@ wants when they paste an answer into an editor, an issue, or a message.
 letting go leaves it standing; a click that never moved is not a selection, and it takes any
 selection off, so the pointer is never left holding a highlight nobody meant.
 
-**With the keyboard**, `Shift` with any movement key — while no overlay is up, since an overlay
-owns the keys it uses, exactly as it does everywhere else: `Shift+Up` and `Shift+Down` take a row at
-a time, `Shift+PageUp`/`Shift+PageDown` the same jump `PageUp`/`PageDown` make, and
-`Shift+Home`/`Shift+End` to the end of the row the selection is on. The first press selects the line
-the reader is looking at — the newest text, not the blank row after it — and each press after that
-takes one more row in the direction being pressed. The transcript has no cursor of its own, so a
-selection is what those keys move; without `Shift` they are the composer's keys, exactly as before.
+**With the keyboard**, `Shift` with any movement key selects the transcript — while no overlay
+is up, since an overlay owns the keys it uses, exactly as it does everywhere else: `Shift+Up`
+and `Shift+Down` take a row at a time, `Shift+PageUp`/`Shift+PageDown` the same jump
+`PageUp`/`PageDown` make, and `Shift+Home`/`Shift+End` to the end of the row the selection is
+on. The first press selects the line the reader is looking at — the newest text, not the blank
+row after it — and each press after that takes one more row in the direction being pressed.
+The transcript has no cursor of its own, so a selection is what those keys move; without
+`Shift` they are the composer's keys, exactly as before. The keyboard selects the transcript
+rather than the screen: a dialogue is read with the pointer, and its own arrow keys already
+mean something else.
 
-**`Ctrl+C` copies what is selected**, and with nothing selected it is the key it always was:
-it stops the running turn, then cancels the prompt, then leaves. A copy that worked takes the
-selection off, so the next press is the stop rather than a second copy; a copy that failed —
-no clipboard tool and a terminal that did not take the write — leaves the selection standing
-so the reader can try again. `Esc` takes the selection off before it stops anything, which is
-what makes it safe to press when a highlight is in the way. The status line says what
-happened: how many lines went, or which failure it was.
+**A drag is not confined to the transcript.** Over the transcript it selects the rendered
+rows, which keep their meaning while an answer streams; anywhere else — a dialogue, the
+composer, the title, the status line — it selects the *cells* the pointer crossed, and what
+is copied is what is drawn there. That is what makes the key list, a model list, an
+authorization code, or the prompt being written all copyable: the highlight is painted on
+the finished frame, so it covers whatever is on top rather than whatever is hidden beneath
+it. A screen selection is dropped when the terminal changes size or when a dialogue opens or
+closes, because the cells it named are then showing something else; and a press in the composer
+is still a caret rather than a selection, because that is what a click there has always meant.
+
+**`Ctrl+C` copies whatever is highlighted, and nothing else.** It does not stop a turn, does
+not cancel a prompt, does not close a dialogue, and never quits — a reader who has drawn a
+box around something is asking for that text, and a copy key that did something else would be
+the one place they could not get it. With nothing highlighted it says so on the status line
+and the state is left exactly as it was. A copy that worked takes the selection off; a copy
+that failed — no clipboard tool and a terminal that did not take the write — leaves the
+selection standing so the reader can try again. The status line says what happened: how many
+lines went, or which failure it was. `Esc` is the key that leaves a mode, and it takes the
+selection off before it stops anything, which is what makes it safe to press when a highlight
+is in the way.
 
 **`/copy` is the same thing for the commonest case**: the newest answer, selected and copied
 without having to point at it. It takes the last thing the *model* wrote rather than whatever
@@ -614,18 +636,25 @@ came last, because a tool line after an answer is not what a reader means by it 
 answer's own lines and no more, so the `──` line the view draws above it, which is a label rather
 than something the model wrote, is not in the copy either.
 
-A selection is a range of *rendered* rows, which has a consequence worth knowing: anything *you* do
-that re-renders the transcript drops it, rather than leaving a highlight over text nobody chose. A
-resize re-wraps every paragraph; `Ctrl+L` or `/clear` takes the lines away altogether; and the two
-summary toggles (`Ctrl+T`, `Ctrl+E`) and `Ctrl+O` change what the lines *are*. Making a selection
-after the toggle rather than before is the whole cost, and it is cheaper than a highlight that says
-one thing and copies another. Text still streaming is the one thing that moves the rows under a
-highlight rather than dropping it — the answer grows and re-wraps as it arrives — and there the
-highlight is what a copy follows, so what a reader sees selected is what they get. And a line the
-*drawer* has to wrap — one wider than the terminal that the renderer did not wrap itself — is
-selected whole, because which character a wrapped row begins with is the drawing library's business
-and it does not report it. Every line a model's answer is made of is wrapped by the renderer, so
-this is rare, and it errs towards copying too much rather than too little.
+A transcript selection is a range of *rendered* rows, which has a consequence worth knowing:
+anything *you* do that re-renders the transcript drops it, rather than leaving a highlight over
+text nobody chose. A resize re-wraps every paragraph; `Ctrl+L` or `/clear` takes the lines away
+altogether; and the two summary toggles (`Ctrl+T`, `Ctrl+E`) and `Ctrl+O` change what the lines
+*are*. Making a selection after the toggle rather than before is the whole cost, and it is
+cheaper than a highlight that says one thing and copies another. Text still streaming is the one
+thing that moves the rows under a highlight rather than dropping it — the answer grows and
+re-wraps as it arrives — and there the highlight is what a copy follows, so what a reader sees
+selected is what they get. And a line the *drawer* has to wrap — one wider than the terminal
+that the renderer did not wrap itself — is selected whole, because which character a wrapped row
+begins with is the drawing library's business and it does not report it. Every line a model's
+answer is made of is wrapped by the renderer, so this is rare, and it errs towards copying too
+much rather than too little.
+
+A *screen* selection is the other way round, and deliberately so: it names cells, so a dialogue
+whose rows move under it copies what is drawn in those cells now. That is the honest answer for
+a surface this interface rebuilds on every keystroke — what a reader sees reversed is what goes
+to the clipboard — and the two checks that drop it are what stop it surviving a change the cells
+cannot follow: a resize, and a dialogue opening or closing over them.
 
 **The clipboard is the platform's own tool, or the terminal's.** `pbcopy` on macOS, `wl-copy`
 or `xclip` elsewhere; when none of those exists — a server reached over ssh, a session with no

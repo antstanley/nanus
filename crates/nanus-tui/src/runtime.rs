@@ -32,7 +32,9 @@
 //! | `Enter` | submit the composer |
 //! | `\` + `Enter` | insert a newline, which no terminal can misreport |
 //! | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | insert a newline |
-//! | `Ctrl+C` / `Esc` | stop the running turn; then cancel the composer; then quit |
+//! | `Ctrl+C` | copy what is highlighted, anywhere on the screen |
+//! | `Esc` | clear the selection; then stop the running turn; then cancel the composer; then quit |
+//! | `Ctrl+Q` | quit |
 //! | `Ctrl+D` | quit |
 //! | `Ctrl+R` | reverse-search the submitted prompts |
 //! | `Ctrl+O` | switch between the one-line and full forms |
@@ -43,7 +45,7 @@
 //! | `Alt+T` | ask for the next step of reasoning effort |
 //! | `Ctrl+V` | paste an image from the clipboard, as a path |
 //! | `Shift` + arrows | select text in the transcript |
-//! | `Ctrl+C` | copy the selection, or stop what is happening |
+//! | `Ctrl+P` | open the queue of prompts waiting for the turn to end |
 //! | `Ctrl+L` | clear the transcript |
 //! | `Backspace` / `Delete` | delete a character |
 //! | `Up` / `Down` | move between lines, then browse submitted prompts |
@@ -53,8 +55,10 @@
 //! | `@path` | name a file; `Tab` completes it |
 //! | `!command` | run a shell command here, without the model |
 //!
-//! The mouse navigates too: the wheel scrolls the conversation, and a left click in the
-//! composer puts the caret where it landed.
+//! The mouse navigates too: the wheel scrolls the conversation, a left click in the composer
+//! puts the caret where it landed, and a drag anywhere else selects the text drawn there —
+//! the transcript when the pointer is over it, and the whole screen otherwise, so a dialogue
+//! or the composer can be copied out as well.
 //!
 //! A line whose first word opens with `/` is a command the interface answers itself:
 //! `/exit` and `/quit` leave, and anything else is named as unrecognised rather than sent
@@ -1234,9 +1238,8 @@ async fn event_loop(
                         call_id,
                         allow,
                         always,
-                        stop,
                     } => {
-                        answer_and_report(&call_id, allow, always, stop, source, &mut view);
+                        answer_and_report(&call_id, allow, always, source, &mut view);
                     }
                     Outcome::Copy => copy_selection(&system_clipboard, &mut view).await,
                     Outcome::PasteImage => {
@@ -1398,7 +1401,7 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         }
         Submission::Unknown(name) => Routed::Say(format!(
             "no such command: {name} — this interface knows {}",
-            Command::names().join(" and ")
+            Command::names_sentence()
         )),
         Submission::Prompt => {
             if accepts_prompts {
@@ -1622,9 +1625,10 @@ fn system_clipboard(text: &str) -> LocalBoxFuture<'_, Result<crate::copy::Copied
 
 /// Puts the selection on the clipboard, or says why it could not.
 ///
-/// A copy that worked drops the selection, so the next `Ctrl+C` is the key that stops a turn rather
-/// than a second copy of the same text. A copy that did not is left standing, because the reader's
-/// next move is to try again or to copy by hand.
+/// A copy that worked drops the selection, so the highlight does not sit there as if the reader
+/// had only just drawn it — and so the next `Ctrl+C`, which is copy and nothing else, starts a new
+/// one rather than sending the same text twice. A copy that did not is left standing, because the
+/// reader's next move is to try again or to copy by hand.
 async fn copy_selection(copier: &Copier, view: &mut ViewState) {
     let Some(text) = view.selected_text() else {
         view.clear_selection();
@@ -1790,7 +1794,7 @@ fn model_argument(line: &str) -> Option<String> {
 
 /// The status line while prompts are waiting.
 fn queued_status(waiting: usize) -> String {
-    format!("queued · {waiting} waiting · Ctrl+Q to edit")
+    format!("queued · {waiting} waiting · Ctrl+P to edit")
 }
 
 /// Restores what the status line should say once an edit has ended.
@@ -1851,13 +1855,6 @@ enum Outcome {
         allow: bool,
         /// Whether the answer is a standing permission for the session.
         always: bool,
-        /// Whether the reader also asked for the turn to stop.
-        ///
-        /// True for `Ctrl-C` alone. The key a reader reaches for when they want everything to
-        /// stop must not be the one key that does nothing here: the turn is parked inside the
-        /// question, so without asking for the stop as well, answering would be the only way
-        /// out and the reader would have to press the key again afterwards.
-        stop: bool,
     },
     /// Tell the agent to use this approval state from now on.
     SetApproval(ApprovalPolicy),
@@ -1906,6 +1903,15 @@ enum Outcome {
 
 /// Applies one keystroke to the view.
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    // `Ctrl+C` is copy wherever the reader is, and nothing else. It is routed before every
+    // dialogue for that reason: a key that closed an overlay, denied a tool, or stopped a turn
+    // would be a place a highlight could not be taken out of, and copying is the one thing a
+    // reader who has highlighted something is asking for. With nothing highlighted it says so
+    // on the status line and nothing else happens — a copy key that also quit would be a
+    // copy key nobody could press by accident.
+    if copy_key(key) {
+        return Outcome::Copy;
+    }
     // The permission dialog owns the keyboard while it is up, and it is checked first for that
     // reason: what a reader is looking at has to be what their keys reach.
     if view.permission_open {
@@ -2075,6 +2081,15 @@ fn shift_tab(key: KeyEvent) -> bool {
         || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+/// Whether a key is `Ctrl+C`, however the terminal spells it.
+///
+/// Both cases, because a terminal that reports modifiers reports the *character* its modifier state
+/// produces: with Caps Lock on, `Ctrl+C` arrives as `Char('C')` with CONTROL. Matching only the
+/// lowercase form is how this interface once became impossible to leave.
+fn copy_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+}
+
 /// Routes a key while the permission dialog is open.
 ///
 /// A movement key or a decision, and nothing else: this is a dialogue about one setting, and every
@@ -2082,12 +2097,8 @@ fn shift_tab(key: KeyEvent) -> bool {
 /// shortcut — a reader who knows which of the three they want should not have to walk to it — and
 /// both Tab directions move, so the key that opened the dialog walks it.
 fn handle_permission_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => view.close_permissions(),
-        // `Ctrl+C` abandons what is in front of the reader everywhere else in this interface, and
-        // cancelling here changes nothing: the state in force is whatever it already was.
-        KeyCode::Char('c' | 'C') if control => view.close_permissions(),
         KeyCode::Enter => {
             // Closed before the answer leaves, so a reader cannot press Enter twice and have the
             // second press land on a state they never looked at.
@@ -2117,12 +2128,8 @@ fn handle_permission_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 /// selector. The digits are the shortcut — a reader who knows which model they want should not
 /// have to walk to it — and both Tab directions move, so the key that opened the list walks it.
 fn handle_model_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => view.close_models(),
-        // `Ctrl+C` abandons what is in front of the reader everywhere else in this interface,
-        // and cancelling here changes nothing: the model in force is whatever it already was.
-        KeyCode::Char('c' | 'C') if control => view.close_models(),
         KeyCode::Enter => {
             // Closed before the switch leaves, so a reader cannot press Enter twice and have
             // the second press land on a model they never looked at.
@@ -2148,12 +2155,8 @@ fn handle_model_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 /// The same vocabulary as the model selector, over the steps the current model takes: move,
 /// choose, cancel, and nothing else reaching the composer behind it.
 fn handle_effort_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => view.close_efforts(),
-        // `Ctrl+C` abandons what is in front of the reader everywhere else in this interface,
-        // and cancelling here changes nothing: the effort in force is whatever it already was.
-        KeyCode::Char('c' | 'C') if control => view.close_efforts(),
         KeyCode::Enter => {
             // Closed before the choice leaves, so a reader cannot press Enter twice and have the
             // second press land on a step they never looked at.
@@ -2180,10 +2183,8 @@ fn handle_effort_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 /// row is a row that says why rather than one that switches, so `Enter` on it is a sentence rather
 /// than a request.
 fn handle_provider_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => view.close_providers(),
-        KeyCode::Char('c' | 'C') if control => view.close_providers(),
         KeyCode::Enter => {
             let choice = view.selected_choice();
             view.close_providers();
@@ -2216,13 +2217,8 @@ fn handle_provider_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 /// A yes and a no, and nothing else: a stray keypress must not open a secret field, so only `y` or
 /// `Enter` does, and everything else is a no or does nothing.
 fn handle_credential_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => view.open_key_entry(),
-        KeyCode::Char('c' | 'C') if control => {
-            view.close_credential();
-            view.pending_switch = None;
-        }
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             view.close_credential();
             view.pending_switch = None;
@@ -2235,8 +2231,8 @@ fn handle_credential_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 
 /// Routes a key while the masked key field is open.
 ///
-/// Text plus the three keys that end it: `Enter` stores, `Esc` and `Ctrl+C` cancel and forget what
-/// was typed. Nothing here is echoed to the transcript.
+/// Text plus the two keys that end it: `Enter` stores, `Esc` cancels and forgets what was typed.
+/// Nothing here is echoed to the transcript.
 fn handle_key_entry_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -2244,10 +2240,6 @@ fn handle_key_entry_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.close_key_entry();
             view.pending_switch = None;
             view.status = String::from("the key was not stored");
-        }
-        KeyCode::Char('c' | 'C') if control => {
-            view.close_key_entry();
-            view.pending_switch = None;
         }
         KeyCode::Enter => {
             let typed = view.take_key();
@@ -2276,28 +2268,21 @@ fn handle_key_entry_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
 ///
 /// The question is cleared before the answer leaves, so a reader cannot press `y` twice and have the
 /// second press land on whatever question comes next — answers are keyed by id, but the dialog is
-/// not. The answer is sent first, because it is what the turn is waiting for: the stop it may also
-/// ask for is read at the turn's next checkpoint, which it cannot reach until the question settles.
+/// not.
 fn answer_and_report(
     call_id: &str,
     allow: bool,
     always: bool,
-    stop: bool,
     source: &mut dyn SessionSource,
     view: &mut ViewState,
 ) {
     view.pending_approval = None;
     source.answer(call_id, allow, always);
-    if stop {
-        view.status = String::from("denied; stopping the turn");
-        source.interrupt();
-    } else {
-        view.status = match (allow, always) {
-            (true, true) => String::from("always allowed; the turn is running"),
-            (true, false) => String::from("allowed once; the turn is running"),
-            (false, _) => String::from("denied; the model is told"),
-        };
-    }
+    view.status = match (allow, always) {
+        (true, true) => String::from("always allowed; the turn is running"),
+        (true, false) => String::from("allowed once; the turn is running"),
+        (false, _) => String::from("denied; the model is told"),
+    };
 }
 
 /// Routes a mouse event, then refreshes the mention menu for the pointer's new place.
@@ -2323,10 +2308,8 @@ fn handle_pointer(
 /// read the conversation has not finished authorizing, and the flow may still be waiting on the code
 /// they have just stopped looking at.
 fn handle_auth_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'Q') => hide_auth(view),
-        KeyCode::Char('c' | 'C') if control => hide_auth(view),
         _ => {}
     }
     Outcome::Continue
@@ -2411,26 +2394,23 @@ fn store_credential(
 
 /// Applies one keystroke to an open approval question.
 ///
-/// `y` allows the call once, and `n` or `Esc` denies it. Nothing else does anything: a
-/// stray keypress must not approve a command, and it must not close the question either,
-/// so the one key a reader has to get right is `y`.
+/// `y` allows the call once, `a` allows it for the rest of the session, and `n` or `Esc` denies it.
+/// Nothing else does anything: a stray keypress must not approve a command, and it must not close
+/// the question either, so the one key a reader has to get right is `y`.
 ///
-/// The exception is `Ctrl-C`, which means "stop everything" everywhere else in this
-/// interface and means it here too: it denies the call *and* asks the turn to stop. The turn
-/// is waiting on this answer, so a key that only set a flag would appear to do nothing —
-/// which is exactly what it used to do.
+/// `Ctrl+C` is the copy key here as it is everywhere else, and is routed before this. Denying *and*
+/// stopping the turn in one keypress went with it: `n` denies, `Esc` denies and closes, and the turn
+/// can be stopped with the key that stops it everywhere else afterwards.
 fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
     let Some(approval) = view.pending_approval.as_ref() else {
         return Outcome::Continue;
     };
     let call_id = approval.call_id.clone();
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char('y' | 'Y') => Outcome::Answer {
             call_id,
             allow: true,
             always: false,
-            stop: false,
         },
         // "Always allow": the tool is granted for the rest of the session, so the same
         // question is not put to the reader again. It is a separate key from `y` because it
@@ -2439,53 +2419,31 @@ fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
             call_id,
             allow: true,
             always: true,
-            stop: false,
-        },
-        KeyCode::Char('c' | 'C') if control => Outcome::Answer {
-            call_id,
-            allow: false,
-            always: false,
-            stop: true,
         },
         KeyCode::Char('n' | 'N') | KeyCode::Esc => Outcome::Answer {
             call_id,
             allow: false,
             always: false,
-            stop: false,
         },
         _ => Outcome::Continue,
     }
 }
 
-/// What `Ctrl+C` means with a selection up: copy it, and leave the stopping to the next press.
-///
-/// The order is the point. `Ctrl+C` stops what is happening everywhere else in this interface, and it
-/// still does — but a reader who has just drawn a box around an answer is asking for the answer, and a
-/// key that stopped the turn instead would be the one place they could not get it out.
-fn copy_or_stop(view: &mut ViewState) -> Outcome {
-    if view.has_selection() {
-        return Outcome::Copy;
-    }
-    stop_or_cancel_or_quit(view)
-}
-
 /// Routes a key while the key list is open.
 ///
 /// Three things and nothing else: close it, scroll it, or ignore the key. Closing takes the
-/// keys that mean "leave what is in front of me" everywhere else in this interface — `Esc`,
-/// `Ctrl+C` — and the key that opened it, so a reader who pressed `?` to look closes it the
-/// same way. Ignoring everything else is what stops a stray `d` from typing into a prompt
-/// behind the overlay.
+/// keys that mean "leave what is in front of me" everywhere else in this interface — `Esc` —
+/// and the key that opened it, so a reader who pressed `?` to look closes it the same way.
+/// Ignoring everything else is what stops a stray `d` from typing into a prompt behind the
+/// overlay, and `Ctrl+C` never reaches here: it is the copy key from anywhere.
 fn handle_help_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        // `Esc` and `Ctrl+C` are how a dialogue is left everywhere else in this interface,
-        // `Enter` is how one is accepted, and `?` is the key that opened this one. `q` and `Q`
-        // are here because the queue overlay closes on them and a reader should not have to
-        // remember which overlay they are looking at: `Q` matches because a terminal that
-        // reports modifiers may send a capital with Shift held.
+        // `Esc` is how a dialogue is left everywhere else in this interface, `Enter` is how one
+        // is accepted, and `?` is the key that opened this one. `q` and `Q` are here because the
+        // queue overlay closes on them and a reader should not have to remember which overlay
+        // they are looking at: `Q` matches because a terminal that reports modifiers may send a
+        // capital with Shift held.
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q' | 'Q') => view.close_help(),
-        KeyCode::Char('c' | 'C') if control => view.close_help(),
         KeyCode::Up => view.scroll_help(-1),
         KeyCode::Down => view.scroll_help(1),
         KeyCode::PageUp => view.scroll_help(-PAGE_ROWS),
@@ -2505,11 +2463,9 @@ fn handle_queue_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let plain = !control && !key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        // `q` closes whether or not Control is held, so the key that opened the overlay
-        // also closes it; `Ctrl+C` closes it too, because that is what it means in the
-        // history search — abandon what you are looking at.
+        // `q` closes, so the key that opened the overlay also closes it — and `Ctrl+Q` is
+        // routed before this and leaves the interface, as it does everywhere else.
         KeyCode::Esc | KeyCode::Char('q' | 'Q') => view.close_queue(),
-        KeyCode::Char('c' | 'C') if control => view.close_queue(),
         KeyCode::Up => view.queue_up(),
         KeyCode::Down => view.queue_down(),
         KeyCode::Char('k') if plain => view.queue_up(),
@@ -2541,7 +2497,6 @@ fn begin_queue_edit(view: &mut ViewState) {
 /// editor. Only the two keys that end the edit are intercepted, and Enter is one of them:
 /// in every other mode it sends, and here it saves.
 fn handle_queue_edit_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome> {
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
@@ -2554,21 +2509,14 @@ fn handle_queue_edit_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome>
             Some(Outcome::Continue)
         }
         // Cancelling gives back the draft that was being typed, so looking at a queued
-        // prompt costs nothing. `Ctrl+C` means the same thing here, as it does in the
-        // history search: the key that abandons what you are looking at.
+        // prompt costs nothing. `Esc` is the key that leaves a dialogue everywhere else in
+        // this interface, and `Ctrl+C` deliberately is not one here: it is the copy key
+        // whether the composer is editing a queued prompt or anything else.
         KeyCode::Esc => {
             view.cancel_queue_edit();
             queue_edit_finished(view);
             Some(Outcome::Continue)
         }
-        KeyCode::Char('c' | 'C') if control => {
-            view.cancel_queue_edit();
-            queue_edit_finished(view);
-            Some(Outcome::Continue)
-        }
-        // The overlay's key does nothing mid-edit rather than opening a second list over a
-        // composer that is already showing one of its entries.
-        KeyCode::Char('q' | 'Q') if control => Some(Outcome::Continue),
         _ => None,
     }
 }
@@ -2580,16 +2528,15 @@ fn handle_queue_edit_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome>
 /// with no fallthrough into text editing, which is what keeps the ordinary handler readable.
 fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     // These match either case, and that is not tidiness. A terminal that reports modifiers
-    // reports the *character* its modifier state produces, so with Caps Lock on `Ctrl+C`
-    // arrives as `Char('C')` with CONTROL. Matching only the lowercase form left the
+    // reports the *character* its modifier state produces, so with Caps Lock on `Ctrl+Q`
+    // arrives as `Char('Q')` with CONTROL. Matching only the lowercase form left the
     // interface impossible to quit and the toggles dead — the same mistake as reading a key
     // without asking what the modifiers did to it.
+    //
+    // `Ctrl+C` is not here at all: it is [`copy_key`]'s, routed before this, and it copies
+    // wherever the reader is.
     match key.code {
-        // With something selected, the key means copy it: a reader who has highlighted a passage and
-        // pressed `Ctrl+C` is asking for the passage, and stopping the turn would throw the answer
-        // away. Copying drops the selection, so the next press is the key it always was.
-        KeyCode::Char('c' | 'C') => copy_or_stop(view),
-        KeyCode::Char('d' | 'D') => Outcome::Quit,
+        KeyCode::Char('q' | 'Q' | 'd' | 'D') => Outcome::Quit,
         KeyCode::Char('l' | 'L') => {
             view.transcript.clear();
             // The selection was a range of lines the transcript no longer has.
@@ -2654,7 +2601,7 @@ fn handle_control_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         // The queue: prompts typed while a turn was running. Opening it when there is
         // nothing queued would draw an empty dialogue, so that case answers on the status
         // line instead — a key should always say what it did.
-        KeyCode::Char('q' | 'Q') => {
+        KeyCode::Char('p' | 'P') => {
             if !view.open_queue() {
                 view.status = String::from("nothing is queued");
             }
@@ -2816,34 +2763,37 @@ fn handle_selection_key(key: KeyEvent, view: &mut ViewState) -> Option<Outcome> 
 /// The wheel is the whole of scrolling with the mouse, and it is not confined to the
 /// transcript band: it is the one gesture for "move through the conversation", and
 /// requiring the pointer to be over a particular area would make it fail exactly when a
-/// reader reached for it without looking. A left click belongs to the composer, and only
-/// there: the transcript is read, not pointed at, so a click that misses the prompt is
-/// not a command.
+/// reader reached for it without looking. A left click belongs to the composer and, failing
+/// that, starts a selection — the transcript's own if the pointer is over the transcript, and
+/// otherwise the screen's, so a dialogue or the composer can be copied from too.
 fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
-    // The overlay owns the keyboard, so it owns the pointer too: a click behind a modal dialogue
-    // should not move a caret — or start a selection — that the reader cannot see. A drag is guarded
-    // as well as a press, because a drag with no selection starts one, and a press that was ignored
-    // must not be turned into a selection by the movement after it.
+    // A dialogue owns the caret: a click behind one must not move a caret the reader cannot
+    // see. It does not own the highlight, though — the text of a dialogue is exactly the kind
+    // of thing a reader wants out of this interface, so a press while one is up starts a
+    // *screen* selection, which names the cells they can see rather than the transcript
+    // underneath.
     let behind_a_dialogue = view.modal_open();
     match mouse.kind {
         MouseEventKind::ScrollUp => view.scroll(-MOUSE_SCROLL_ROWS),
         MouseEventKind::ScrollDown => view.scroll(MOUSE_SCROLL_ROWS),
-        MouseEventKind::Down(MouseButton::Left) if !behind_a_dialogue => {
-            // The composer and the transcript are the two places a click means something: a caret in
-            // the one, the start of a selection in the other. A click in the composer is not a
-            // selection, so it takes any selection off.
-            if view.place_caret(mouse.column, mouse.row) {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if behind_a_dialogue {
+                let _ = view.begin_screen_selection(mouse.column, mouse.row);
+            } else if view.place_caret(mouse.column, mouse.row) {
+                // A click in the composer is a caret, and it takes any selection off.
                 view.clear_selection();
-            } else {
-                let _ = view.begin_selection(mouse.column, mouse.row);
+            } else if !view.over_composer(mouse.column, mouse.row)
+                && !view.begin_selection(mouse.column, mouse.row)
+            {
+                // Not over the transcript or the composer: the title, the queue above the
+                // composer, the status line. The press still means the text it landed on.
+                let _ = view.begin_screen_selection(mouse.column, mouse.row);
             }
         }
         // A drag extends the selection it started, and finishes it when the button comes up. Both are
         // reported as their own events because a terminal does not send a release for every pixel: the
         // drags are what draw the box, and the release is what says the reader has stopped.
-        MouseEventKind::Drag(MouseButton::Left) if !behind_a_dialogue => {
-            view.drag_selection(mouse.column, mouse.row);
-        }
+        MouseEventKind::Drag(MouseButton::Left) => view.drag_selection(mouse.column, mouse.row),
         MouseEventKind::Up(MouseButton::Left) => view.finish_selection(),
         // Scrolling sideways and every other button are not things this interface has
         // anywhere to put. Ignoring them is deliberate rather than an oversight.
@@ -2905,12 +2855,10 @@ fn handle_search_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.input.search_older();
             Outcome::Continue
         }
-        // `Ctrl+C` abandons the search and gives back what was being typed: the cancel
-        // that means "forget this", as opposed to the accept that means "use it".
-        KeyCode::Char('c' | 'C') if control => {
-            view.input.search_cancel();
-            Outcome::Continue
-        }
+        // `Ctrl+C` used to abandon the search here. It cannot: it is the copy key wherever the
+        // reader is, and a search is no exception. Abandoning and getting the draft back is
+        // what `Backspace` past the start of the query already does, and `Esc` or `Tab` takes
+        // the match into the composer instead.
         KeyCode::Char(character) if !control && !alt => {
             view.input.search_push(character);
             Outcome::Continue
@@ -3355,17 +3303,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_and_ctrl_d_quit() {
+    fn ctrl_q_and_ctrl_d_quit_and_ctrl_c_does_not() {
         let mut view = ViewState::new();
         assert!(matches!(
-            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view),
             Outcome::Quit
         ));
         assert!(matches!(
             handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut view),
             Outcome::Quit
         ));
-        // `c` alone is a character, not a command.
+        // `Ctrl+C` is the copy key: it never leaves, and a bare `c` is a character.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Copy
+        ));
         assert!(matches!(
             handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE), &mut view),
             Outcome::Continue
@@ -3468,20 +3420,22 @@ mod tests {
         assert_eq!(source.requests.borrow().len(), 2);
     }
 
-    /// `Ctrl+Q` is the queue's key, and it answers on the status line when there is
+    /// `Ctrl+P` is the queue's key, and it answers on the status line when there is
     /// nothing to open rather than drawing an empty dialogue.
     #[test]
-    fn ctrl_q_opens_the_queue_and_says_when_there_is_none() {
+    fn ctrl_p_opens_the_queue_and_says_when_there_is_none() {
         let mut view = ViewState::new();
-        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
+        let _ = handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut view);
         assert!(!view.queue_open);
         assert!(view.status.contains("nothing is queued"), "{}", view.status);
 
         view.enqueue(String::from("held"));
-        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
+        let _ = handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut view);
         assert!(view.queue_open, "the key opens the overlay");
-        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
-        assert!(!view.queue_open, "and the same key closes it");
+        // The overlay closes on plain `q`, which is the key it always closed on; `Ctrl+Q`
+        // leaves the interface before the overlay ever sees it.
+        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE), &mut view);
+        assert!(!view.queue_open, "and plain `q` closes it");
     }
 
     /// The overlay is modal: a key that is not one of its own does not reach the composer
@@ -3490,17 +3444,20 @@ mod tests {
     fn the_queue_overlay_swallows_keys_that_are_not_its_own() {
         let mut view = ViewState::new();
         view.enqueue(String::from("held"));
-        let _ = handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view);
+        let _ = handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut view);
         assert!(view.queue_open);
         let outcome = handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut view);
         assert!(matches!(outcome, Outcome::Continue));
         assert!(view.input.is_empty(), "the composer behind it is untouched");
         assert!(view.queue_open, "and the overlay stays up");
 
-        // `Ctrl+C` is the one control key it does honour: the same "abandon this" it means
-        // in the history search.
-        let _ = handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view);
-        assert!(!view.queue_open, "Ctrl+C closes the overlay");
+        // `Ctrl+C` copies rather than closing: it is routed before the overlay, and the text
+        // of the list is exactly what a reader might want out of it.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Copy
+        ));
+        assert!(view.queue_open, "Ctrl+C copies and leaves the overlay up");
     }
 
     /// Editing takes the prompt out of the schedule and puts it in the composer, and
@@ -3654,13 +3611,10 @@ mod tests {
     #[test]
     fn a_control_binding_works_whatever_case_the_terminal_reports() {
         // Reported by injecting what Caps Lock produces once the keyboard protocol is on:
-        // the terminal reports the character its modifier state makes, so `Ctrl+C` arrives
-        // as `Char('C')` with CONTROL. Matching only lowercase left the interface
+        // the terminal reports the character its modifier state makes, so `Ctrl+Q` arrives
+        // as `Char('Q')` with CONTROL. Matching only lowercase left the interface
         // impossible to quit.
-        // `Ctrl+D` leaves outright; `Ctrl+C` cancels first, so an empty composer is the
-        // state in which it quits — which is what makes the two keys different rather
-        // than two spellings of one.
-        for character in ['d', 'D'] {
+        for character in ['q', 'Q', 'd', 'D'] {
             let mut view = ViewState::new();
             assert!(
                 matches!(
@@ -3681,9 +3635,9 @@ mod tests {
                         key(KeyCode::Char(character), KeyModifiers::CONTROL),
                         &mut view
                     ),
-                    Outcome::Quit
+                    Outcome::Copy
                 ),
-                "Ctrl+{character} quits when there is nothing to cancel"
+                "Ctrl+{character} copies"
             );
         }
 
@@ -3862,8 +3816,13 @@ mod tests {
         }
         let mut view = ViewState::new();
         view.open_help();
-        let _ = handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view);
-        assert!(!view.help_open, "Ctrl-C closes it, as it closes the queue");
+        // `Ctrl+C` is the copy key and is routed before the overlay, so it copies without
+        // closing: a highlight may well be over the list itself.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Copy
+        ));
+        assert!(view.help_open, "Ctrl-C copies and leaves the list up");
 
         // And a reader who closes it does not leave with it: the prompt is still there.
         let mut view = ViewState::new();
@@ -4216,33 +4175,41 @@ mod tests {
         assert!(!unmatched.mention_open());
     }
 
-    /// With something selected, `Ctrl+C` copies it; with nothing selected it is the key it always
-    /// was. That precedence is the whole design: the key that stops a turn is the key a terminal user
-    /// reaches for to copy, and a reader who has drawn a box around an answer means the answer.
+    /// `Ctrl+C` copies, and does nothing else, whatever is going on.
+    ///
+    /// That is the whole design of the key now: it is the key a terminal user reaches for to copy,
+    /// and a reader who has highlighted something — an answer, a dialogue, a line of the prompt —
+    /// means that text. A turn that is running is not stopped by it, an empty composer is not
+    /// cancelled by it, and the interface does not leave because of it; with nothing highlighted it
+    /// says so on the status line and the state is exactly as it was.
     #[test]
-    fn ctrl_c_copies_a_selection_and_otherwise_stops() {
+    fn ctrl_c_always_copies_and_never_stops_or_quits() {
+        // Nothing selected and nothing running: no quit, and a status line that says why.
         let mut view = ViewState::new();
-        // Nothing selected and nothing running: the two-step exit, as before.
         assert!(matches!(
             handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
-            Outcome::Quit
+            Outcome::Copy
         ));
-        // A turn running: it is asked to stop.
+        // A turn running: not asked to stop.
         let mut busy = ViewState::new();
         busy.begin_turn(1);
         assert!(matches!(
             handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut busy),
-            Outcome::Interrupt
+            Outcome::Copy
         ));
-        // Something selected: neither, and the selection is what the key is for.
-        let mut selected = ViewState::new();
-        selected.begin_turn(1);
-        selected.select_range(crate::view::Place::start(0), crate::view::Place::end(0), 40);
+        assert!(busy.busy, "the turn is left alone");
+        // A prompt being written: not cancelled, and no `c` typed into it.
+        let mut typing = ViewState::new();
+        typing.input.insert_str("a draft");
         assert!(matches!(
-            handle_key(
-                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                &mut selected
-            ),
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut typing),
+            Outcome::Copy
+        ));
+        assert_eq!(typing.input.text(), "a draft", "the draft is untouched");
+        // And the uppercase spelling, which is what Caps Lock reports.
+        let mut shifted = ViewState::new();
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('C'), KeyModifiers::CONTROL), &mut shifted),
             Outcome::Copy
         ));
     }
@@ -4352,8 +4319,8 @@ mod tests {
         (copied, take)
     }
 
-    /// Copying says what it did, and a copy that worked takes the selection away so the next `Ctrl+C`
-    /// stops a turn rather than copying the same text twice.
+    /// Copying says what it did, and a copy that worked takes the selection away so a reader is not
+    /// left looking at a highlight that has already been taken.
     #[test]
     fn copying_reports_where_the_text_went() {
         // Nothing is drawn, so there are no lines to copy: the interface says so rather than copying
@@ -4390,7 +4357,7 @@ mod tests {
         assert!(status.contains("copied"), "{status}");
         assert!(
             !view.has_selection(),
-            "the highlight goes, so the next Ctrl+C stops a turn"
+            "the highlight goes once it has been copied"
         );
 
         // A clipboard that refused says so, and leaves the selection standing so the reader can try
@@ -4453,6 +4420,43 @@ mod tests {
         assert!(empty.status.contains("no answer"), "{}", empty.status);
     }
 
+    /// `Ctrl+C` takes the highlighted text out of a dialogue as readily as out of the transcript:
+    /// that is the whole of "anywhere in the interface", and it is the path a reader takes when
+    /// the thing they want is a line of the key list or a model row rather than an answer.
+    #[test]
+    fn ctrl_c_copies_the_highlighted_text_of_a_dialogue() {
+        let mut view = ViewState::new();
+        view.open_help();
+        let text = drawn(&mut view, 60, 16);
+        let row = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("submit"))
+                .expect("the key list is drawn"),
+        )
+        .expect("a row within a terminal");
+        assert!(view.begin_screen_selection(0, row));
+        view.drag_screen_selection(56, row);
+
+        // The key is the whole entry point: it asks for a copy, and the loop does it.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Copy
+        ));
+        assert!(view.help_open, "and the dialogue is left up");
+
+        let (copied, send) = recording_copier(false);
+        nanus_kernel::runtime::block_on_local(async {
+            copy_selection(&send, &mut view).await;
+        });
+        let copied = copied.borrow().clone();
+        assert!(copied.contains("submit"), "{copied:?}");
+        assert!(
+            !copied.contains("nanus"),
+            "the title is not in it: {copied:?}"
+        );
+        assert!(view.status.contains("copied"), "{}", view.status);
+    }
+
     /// A key that re-renders the transcript drops the selection, because the lines it named are not
     /// the lines it named any more.
     #[test]
@@ -4502,20 +4506,31 @@ mod tests {
         assert!(view.has_selection(), "the drag selected the answer");
         assert_eq!(view.selected_text().as_deref(), Some("copy me"));
 
-        // The composer is not the transcript: a drag there is a caret, and it takes the selection off.
+        // The composer is not the transcript: a press on its own row is a caret, and a drag
+        // from there takes any selection off rather than starting one.
         let mut typing = ViewState::new();
-        drawn(&mut typing, 60, 16);
+        typing
+            .transcript
+            .push(Entry::prose(Role::Assistant, "copy me"));
+        let layout = drawn(&mut typing, 60, 16);
+        let composer = u16::try_from(
+            layout
+                .lines()
+                .position(|line| line.contains('›'))
+                .expect("the composer is drawn"),
+        )
+        .expect("a row within a terminal");
         handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 4, 13),
+            mouse(MouseEventKind::Down(MouseButton::Left), 4, composer),
             &mut typing,
         );
         handle_mouse(
-            mouse(MouseEventKind::Drag(MouseButton::Left), 8, 13),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 8, composer),
             &mut typing,
         );
         assert!(
             !typing.has_selection(),
-            "the composer is not the transcript"
+            "the composer is a caret, not a selection"
         );
     }
 
@@ -4553,10 +4568,12 @@ mod tests {
         );
     }
 
-    /// What owns the keyboard owns the pointer: a click behind a dialogue the reader is answering must
-    /// not move a caret, or start a selection, that they cannot see.
+    /// A press behind a dialogue does not move the caret — that would be a caret the reader cannot
+    /// see — but it does start a *screen* selection, so the text of the dialogue itself can be
+    /// copied out. That is the difference from the transcript selection: the highlight covers the
+    /// cells that are on top, not whatever is hidden beneath them.
     #[test]
-    fn a_click_behind_a_dialogue_is_ignored() {
+    fn a_press_behind_a_dialogue_selects_the_text_on_top() {
         let mut view = ViewState::new();
         view.transcript
             .push(Entry::prose(Role::Assistant, "some text"));
@@ -4568,8 +4585,7 @@ mod tests {
         )
         .expect("a row within a terminal");
 
-        // The same click with nothing in the way is a selection, which is what makes the guard below
-        // mean something rather than passing on a click that never did anything.
+        // The same drag with nothing in the way selects the transcript line itself.
         handle_mouse(
             mouse(MouseEventKind::Down(MouseButton::Left), 0, row),
             &mut view,
@@ -4582,19 +4598,41 @@ mod tests {
             view.has_selection(),
             "the transcript is not behind anything"
         );
+        assert!(
+            view.selected_text()
+                .is_some_and(|text| text.contains("some")),
+            "the transcript line under the pointer"
+        );
 
+        // With the key list up, the same drag selects what is drawn there, which is the list.
         view.clear_selection();
         view.open_help();
         assert!(view.modal_open(), "the key list is up");
+        let covered = drawn(&mut view, 60, 16);
+        let listed = u16::try_from(
+            covered
+                .lines()
+                .position(|line| line.contains("submit"))
+                .expect("the key list is drawn"),
+        )
+        .expect("a row within a terminal");
         handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 0, row),
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, listed),
             &mut view,
         );
         handle_mouse(
-            mouse(MouseEventKind::Drag(MouseButton::Left), 5, row),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 20, listed),
             &mut view,
         );
-        assert!(!view.has_selection(), "the dialogue owns the pointer");
+        let copied = view.selected_text().expect("the dialogue is selectable");
+        assert!(
+            copied.contains("Enter"),
+            "the list's own text is what is highlighted: {copied:?}"
+        );
+        assert!(
+            !copied.contains("some text"),
+            "not the transcript underneath it: {copied:?}"
+        );
     }
 
     /// `Ctrl+V` writes the clipboard's image into the workspace and puts its path in the prompt.
@@ -5109,7 +5147,7 @@ mod tests {
 
     /// The stop key means the thing that is happening now: with a turn running it asks the
     /// agent to stop, and only with nothing running does it reach the prompt and the
-    /// session.
+    /// session. `Esc` is the only stop key now — `Ctrl+C` copies wherever it is pressed.
     #[test]
     fn the_stop_key_stops_a_running_turn_before_it_touches_the_prompt() {
         let mut view = ViewState::new();
@@ -5127,8 +5165,9 @@ mod tests {
         );
         assert!(matches!(
             handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
-            Outcome::Interrupt
+            Outcome::Copy
         ));
+        assert!(view.busy, "Ctrl+C copies and leaves the turn running");
 
         // With the turn over the same key falls back, in the same order as before.
         view.end_turn();
@@ -5170,6 +5209,17 @@ mod tests {
                 && message.contains("/help")
                 && message.contains("/clear"),
             "and the commands that exist: {message}"
+        );
+        // As a sentence rather than a chain of `and`s: commas between the names, and the only
+        // `and` is the one before the last of them.
+        assert_eq!(
+            message.matches(" and ").count(),
+            1,
+            "one `and`, at the end: {message}"
+        );
+        assert!(
+            message.contains("/model, /effort") && message.contains("/provider and /copy"),
+            "commas between the names and `and` before the last: {message}"
         );
 
         // `/stats` is the interface's to answer, and it is answered in a recording too: what it
@@ -5234,26 +5284,44 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_cancels_the_input_before_it_quits() {
+    fn ctrl_q_and_ctrl_d_quit_without_touching_the_prompt() {
+        // `Ctrl+Q` leaves outright, which is what a reader wants from a quit key: a draft in
+        // the composer is not a reason to stay, because `Esc` is the key that cancels and it
+        // is a different key.
         let mut view = ViewState::new();
         view.input.insert_str("half a thought");
         assert!(
             matches!(
-                handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
-                Outcome::Continue
-            ),
-            "the first press cancels"
-        );
-        assert!(
-            view.input.is_empty(),
-            "and the prompt is gone, not the session"
-        );
-        assert!(
-            matches!(
-                handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+                handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), &mut view),
                 Outcome::Quit
             ),
-            "the second one, with nothing left to cancel, leaves"
+            "Ctrl+Q quits"
+        );
+        assert_eq!(
+            view.input.text(),
+            "half a thought",
+            "the draft is left alone"
+        );
+
+        let mut view = ViewState::new();
+        for character in ['q', 'Q'] {
+            assert!(
+                matches!(
+                    handle_key(
+                        key(KeyCode::Char(character), KeyModifiers::CONTROL),
+                        &mut view
+                    ),
+                    Outcome::Quit
+                ),
+                "Ctrl+{character} quits, whatever case the terminal reports"
+            );
+        }
+        assert!(
+            matches!(
+                handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut view),
+                Outcome::Quit
+            ),
+            "Ctrl+D leaves too"
         );
     }
 
@@ -5339,17 +5407,31 @@ mod tests {
         assert!(!view.input.is_searching());
     }
 
-    /// `Ctrl+C` during a search abandons it rather than clearing the prompt or quitting:
-    /// "forget this search" is what the key means while one is running.
+    /// `Ctrl+C` during a search copies rather than abandoning it, and the search is left by the
+    /// keys that were always the way out: `Esc` or `Tab` takes the match, and `Backspace` past the
+    /// start of the query abandons it and gives the draft back.
     #[test]
-    fn ctrl_c_cancels_a_search_rather_than_quitting() {
+    fn ctrl_c_copies_during_a_search_and_backspace_abandons_it() {
         let mut view = ViewState::new();
         view.input.insert_str("an earlier prompt");
         assert!(view.input.submit().is_some());
         view.input.insert_str("in progress");
         let _ = handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut view);
+
         assert!(matches!(
             handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
+            Outcome::Copy
+        ));
+        assert!(view.input.is_searching(), "the search is still running");
+        assert_eq!(
+            view.input.text(),
+            "an earlier prompt",
+            "and is still showing its match"
+        );
+
+        // Backspace past the start of the query is the way out that gives the draft back.
+        assert!(matches!(
+            handle_key(key(KeyCode::Backspace, KeyModifiers::NONE), &mut view),
             Outcome::Continue
         ));
         assert!(!view.input.is_searching());
@@ -6159,7 +6241,6 @@ mod tests {
                 call_id,
                 allow: true,
                 always: false,
-                stop: false
             } if call_id == "a1"
         ));
 
@@ -6176,7 +6257,6 @@ mod tests {
                 call_id,
                 allow: true,
                 always: true,
-                stop: false
             } if call_id == "a1"
         ));
 
@@ -6193,7 +6273,6 @@ mod tests {
                 call_id,
                 allow: false,
                 always: false,
-                stop: false
             } if call_id == "a2"
         ));
         assert!(matches!(
@@ -6202,24 +6281,21 @@ mod tests {
                 call_id,
                 allow: false,
                 always: false,
-                stop: false
             } if call_id == "a2"
         ));
 
-        // And `Ctrl-C`: the whole of stopping, from a question. It denies the call *and*
-        // asks for the turn to stop, because the turn is asleep on this answer and a stop
-        // flag alone would not reach it.
+        // `Ctrl+C` is not an answer here, and that is the point: it is the copy key wherever
+        // the reader is, so a question does not get in the way of taking the text in front of
+        // them out. It copies — saying there is nothing selected — and leaves the question
+        // open, while a bare `c` approves nothing and stops nothing either.
         assert!(matches!(
             handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut view),
-            Outcome::Answer {
-                call_id,
-                allow: false,
-                always: false,
-                stop: true
-            } if call_id == "a2"
+            Outcome::Copy
         ));
-        // The other direction: a bare `c` is not a Ctrl-C, so it approves nothing and stops
-        // nothing — the question stays open for a real answer.
+        assert!(
+            view.pending_approval.is_some(),
+            "the question is still open for a real answer"
+        );
         assert!(matches!(
             handle_key(key(KeyCode::Char('c'), KeyModifiers::NONE), &mut view),
             Outcome::Continue
