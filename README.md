@@ -64,6 +64,12 @@ configuration, and the seven tools never learn about it.
 `ToolExecutor`. Add one and its schema joins the prompt automatically. Remove one and it
 stops existing, with no dead description left in every request.
 
+That cut is a real saving, because every tool is paid for on every request. The seven
+schemas plus the default system prompt come to roughly **1,400 estimated tokens before the
+first human word** — and the schemas ride outside the `context_budget` accounting
+altogether. See
+[what a request costs](docs/features.md#what-a-request-costs-before-the-conversation).
+
 **Unload a component and get your system back.** Every registration is recorded *with its
 inverse*. Unloading a plugin reverts its effects in reverse order: services withdraw,
 listeners unregister, consumers deactivate. No stale registrations, no restart to get

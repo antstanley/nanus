@@ -48,8 +48,9 @@ Not one of them is a convenience wrapper around something `sh` already does.
 
 There is deliberately no `list_directory`, no `move_file`, no `make_directory`, and no
 per-language tool. Every tool costs a description in every request and a schema the
-model must choose between. A tool earns its place by being irreplaceable, not by being
-convenient.
+model must choose between — the shipped seven are about 1,200 estimated tokens on the
+wire, on every request ([measured](features.md#what-a-request-costs-before-the-conversation)).
+A tool earns its place by being irreplaceable, not by being convenient.
 
 ### Only three fields of a tool can reach the model
 

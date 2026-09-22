@@ -80,6 +80,47 @@ Only a tool's `name`, `description`, and `parameters` may reach the model; the
 executable half is not serialisable, so the allowlist is carried by the types.
 See [the toolset](../crates/nanus-bundle/src/tools/mod.rs).
 
+### What a request costs before the conversation
+
+The system prompt and all seven schemas are sent on **every** request — once per step of
+every turn — so there is a fixed floor before the first human word. Measured from the
+shipped defaults (`deepseek-flash`, `per_call`, `read_only`, 512 steps/turn) by
+serialising the schemas through the DeepSeek encoder:
+
+| Piece | Characters | Estimated tokens |
+|---|---|---|
+| `DEFAULT_SYSTEM_PROMPT` | 433 | ~108 |
+| `## Runtime` section (cwd, model, policy, sandbox) | 133 | ~33 |
+| Step-budget sentence | 274 | ~69 |
+| **System message, as the harness sizes it** | **844** | **215** |
+| The seven tool schemas, on the wire | 4,755 | ~1,188 |
+| **Total, every request** | **~5,599** | **~1,403** |
+
+| Tool | Estimated tokens |
+|---|---|
+| `edit` | ~207 |
+| `grep` | ~206 |
+| `glob` | ~185 |
+| `write` | ~183 |
+| `bash` | ~166 |
+| `read` | ~151 |
+| `read_image` | ~90 |
+
+"Estimated" is the same approximation `context_budget` uses — characters over four, plus
+four tokens per message. Each row is rounded on its own, so they need not sum exactly: the
+harness sizes the assembled system message at 844 characters and charges 215 estimated
+tokens for it, the message framing included. A real tokenizer counts *more* on JSON, which
+is punctuation-heavy, so the provider's reported prompt tokens are the number to check a
+budget against. The `cwd` in the runtime section is the one piece that moves with where
+you run; the system prompt can be overridden with `system_prompt`, and the runtime section
+and budget sentence are appended to whatever replaces it.
+
+Two things follow, and both are recorded rather than hidden. The tool schemas are **not**
+charged to `context_budget`: the estimator folds messages, and the schemas ride in the
+request outside it, so the real prompt is larger than the budget accounts for. And the
+seven-tool limit is a cost decision as well as a design one — an eighth tool is roughly
+100–200 more estimated tokens in every request of every turn.
+
 ## Model providers
 
 Four providers, selected with `provider` in the configuration. Each is an adapter

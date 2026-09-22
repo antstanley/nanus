@@ -61,7 +61,11 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   message — because there is no tokenizer in the harness and the provider's real count
   arrives only with the response. It is not a summarising policy: the oldest *turns* are
   dropped with a notice the model reads, and nothing rewrites what they said. A single turn
-  larger than the whole budget is refused rather than sent or silently shortened.
+  larger than the whole budget is refused rather than sent or silently shortened. The
+  estimate also covers **messages only**: the system prompt is a message and is counted,
+  but the seven tool schemas are sent on every request outside that accounting, so the real
+  prompt carries roughly 1,200 estimated tokens more than `context_budget` knows about. See
+  [what a request costs](features.md#what-a-request-costs-before-the-conversation).
 - **A session is claimed, not locked.** A writer claims the session it holds — a `nanus run`
   for its run, an agent for as long as it holds the session — and a second writer is refused
   with a sentence naming the holder, so `nanus run --resume x` against a service serving `x`
