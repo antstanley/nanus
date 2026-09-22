@@ -444,8 +444,10 @@ It is two tables because the figures have two scopes. The first is the session's
 and the permission state it ran under, the turns, steps and requests, the prompt split into
 cached and read, the generated tokens and how many of them were thinking, a row per model
 when a session used more than one, and why the last turn ended. All of it is read from the
-log, so it covers the whole conversation — a session that was resumed includes the turns that
-ran before this interface existed.
+log — a live session is re-read from the store as the interface leaves, because the copy a
+client holds is the one it attached with and the store is where the turns it watched were
+written — so it covers the whole conversation, and a session that was resumed includes the
+turns that ran before this interface existed.
 
 The second is the run's: the same rates and waits the row under the composer reports, as
 `last` and `average` side by side. Only the process that watched the responses arrive can know
@@ -588,6 +590,23 @@ effort its adapter applies — because a provider change replaces all of those, 
 the old model would look the new models' steps up under it and find none. It takes effect on the
 next request, including the next step of a turn already running, and the effort in force goes back
 to the new adapter's default rather than naming a step the new model may not accept.
+
+### What the next start begins from
+
+A change is remembered. `Alt+P`, `/model`, `Alt+T`, `/effort`, and `/provider` all end by writing
+the provider, plan, model, and effort in force to `<nanus home>/selection.toml` — through the agent,
+which owns them — so the next start of any mode begins where the reader left off rather than at the
+configuration's default. That is the interface's way of changing the default: there is no second
+command to set one, because the switch *is* the setting.
+
+Nothing is written unless something is **changed**. Opening the interface and quitting leaves the
+configuration exactly as it was, which is what keeps a file edited later from being overridden by a
+run that asked for nothing different. Deleting `selection.toml` makes the configuration the whole
+answer again.
+
+The stored effort is the step in force rather than the configuration's own field, so a step the
+configuration cannot name — `none`, `max` — is remembered as itself rather than rounded to a
+neighbour.
 
 ### Selecting and copying
 

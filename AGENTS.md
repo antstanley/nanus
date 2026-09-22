@@ -175,6 +175,11 @@ Contract to preserve:
   `NanusConfig`, serialised, or rendered by `Debug`.
 - `NANUS_HOME` — override the session-store home. Sessions live under
   `$NANUS_HOME/sessions/` (default: the platform config dir).
+- `<nanus home>/selection.toml` — the provider, plan, model, and effort an interface last
+  *changed*, written by the agent when a client switches and applied as the default at the
+  next start. It is never written on a start, so editing the configuration is not overridden
+  by merely opening the interface; deleting it returns the configuration to being the whole
+  answer. See `docs/features.md`.
 - `NO_COLOR` — when set to anything non-empty, the interface renders with no colour at all
   (keeping bold and italic) rather than letting the backend drop the colours: the command
   that would have carried a colour to a cell collapses into a reset when colour is

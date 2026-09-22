@@ -178,6 +178,24 @@ renewed from the refresh token rather than sent and refused.
   owns the table of providers, and adding one is an adapter crate plus a row —
   nothing in the tools or the domain changes.
 
+### What the next start begins from
+
+The interface can change the provider, the model, and the effort of a running agent
+(`/provider`, `/model`, `/effort`, `Alt+P`, `Alt+T`). The moment it does, the agent writes the
+whole selection to `<nanus home>/selection.toml`, and the next start — a run, a service, or an
+interface — begins from it rather than from the file's provider, model, and effort. So choosing a
+model in the interface and quitting is how the default is changed.
+
+The record is written on a **change** and never on a start: merely opening the interface does not
+pin the configuration, so a file edited afterwards is still what an untouched run uses. Deleting
+`selection.toml` makes the configuration the whole answer again, and `nanus config` reports the
+selection a run would actually use, record included.
+
+Two details are deliberate. The record stores the plan with the provider and a model with either,
+because a provider without them would send the previous provider's model to the new host. And it
+stores the effort in the port's own vocabulary rather than the configuration's four-value field,
+because a model's scale has steps — `none`, `max` — that the field cannot name.
+
 ## Credentials
 
 A provider key is a secret, so it is not in the configuration file and not a

@@ -32,6 +32,9 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The remembered selection is a small TOML file the configuration's own crate already uses
+# this for; a JSON file would be a second format for the same kind of state.
+toml = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

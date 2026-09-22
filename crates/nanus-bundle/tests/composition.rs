@@ -186,6 +186,57 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
 }
 
+/// A remembered selection is the default the next start begins from.
+///
+/// The interface changes the provider, model, and effort of a running agent, and without a
+/// record of that the next start forgets it. The record is written on a change by the link
+/// server (asserted where a change can be made) and read here, which is the half that makes a
+/// fresh process begin where the last one left off rather than where the file was written.
+#[test]
+fn a_remembered_selection_is_the_default_it_starts_from() {
+    in_child_process("a_remembered_selection_is_the_default_it_starts_from");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let settings = config(dir.path());
+    // Nothing in the settings names a model, so a change here can only have come from the
+    // record. `max` is a step the configuration's four-value field cannot even spell.
+    let home = nanus_bundle::compose::store_home().expect("the child has a home");
+    nanus_bundle::LastSelection {
+        provider: Some(String::from("deepseek")),
+        plan: Some(String::from("api")),
+        model: Some(String::from("deepseek-v4-pro")),
+        effort: Some(String::from("max")),
+    }
+    .save(&home)
+    .expect("the record is written");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let pending = runtime.block_on(compose(&settings)).expect("composes");
+    let harness = pending.start().expect("mounts");
+
+    assert_eq!(
+        harness.switch.model(),
+        "deepseek-v4-pro",
+        "the model the record names is the default"
+    );
+    assert_eq!(
+        harness.runner.effort(),
+        Some(nanus_ports::ReasoningEffort::Max),
+        "the effort the record names is on the runner, which the configuration cannot spell"
+    );
+    let session = harness.new_session(dir.path());
+    assert_eq!(
+        session.origin().and_then(|origin| origin.effort.as_deref()),
+        Some("max"),
+        "and it is what the session records as in force"
+    );
+
+    let shutdown = harness.shutdown();
+    assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
+}
+
 /// A tool registered through one door is visible through the other.
 ///
 /// The runner used to be built over its own `ToolRegistry` while the plugin published a

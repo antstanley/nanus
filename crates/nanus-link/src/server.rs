@@ -44,7 +44,9 @@ use std::time::{Duration, Instant};
 
 use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::new_session;
-use nanus_bundle::{AgentRunner, Approver, Harness, Progress, Provider, ProviderSwitch};
+use nanus_bundle::{
+    AgentRunner, Approver, Harness, LastSelection, Progress, Provider, ProviderSwitch,
+};
 use nanus_domain::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Session, SessionId, ToolCallId, ToolName,
     TurnEndReason, Usage,
@@ -1651,6 +1653,7 @@ async fn serve_connection(
                     .runner()
                     .set_effort(Some(domain_effort(state)));
                 registry.broadcast_effort(state).await;
+                remember_selection(&registry).await;
             }
             Request::SetProvider { provider, plan } => {
                 set_provider(&registry, &frames, &provider, plan.as_deref()).await;
@@ -1749,6 +1752,57 @@ async fn set_model(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, model:
         // The step the adapter now applies, so every client's effort agrees with the new model.
         registry.broadcast_effort(effort).await;
     }
+    remember_selection(registry).await;
+}
+
+/// Writes a selection to the memory file in `home`.
+///
+/// Split from [`remember_selection`] so what a remembered default *says* can be asserted
+/// without a composed agent behind it; the caller below is the part that reads the agent.
+fn write_selection(
+    home: &Path,
+    provider: &str,
+    plan: Option<&str>,
+    model: &str,
+    effort: Option<nanus_ports::ReasoningEffort>,
+) -> std::io::Result<PathBuf> {
+    LastSelection {
+        provider: Some(provider.to_owned()),
+        plan: plan.map(str::to_owned),
+        model: Some(model.to_owned()),
+        effort: effort.map(|effort| effort.as_str().to_owned()),
+    }
+    .save(home)
+}
+
+/// Remembers the agent's selection, so the next start begins where this one left off.
+///
+/// Written when a client *changes* the model, the effort, or the provider — the moments the
+/// default changes — and never on startup, so a configuration is not overridden by a run that
+/// asked for nothing different. The file is described by [`LastSelection`].
+///
+/// A failure to write is logged rather than reported: the change is already in force, and a
+/// preference that could not be saved is not a reason to refuse the change that was made.
+async fn remember_selection(registry: &Rc<Registry>) {
+    let Some(switch) = registry.agent.switch() else {
+        // An agent with no composition behind it — a scripted test — has no provider to record.
+        return;
+    };
+    let Ok(home) = registry.agent.store.home().await else {
+        tracing::warn!("the nanus home could not be resolved; the selection is not remembered");
+        return;
+    };
+    let effort = registry.agent.runner().effort();
+    let written = write_selection(
+        &home,
+        &switch.provider(),
+        Some(&switch.plan()),
+        &switch.model(),
+        effort,
+    );
+    if let Err(error) = written {
+        tracing::warn!(%error, "the remembered selection could not be written");
+    }
 }
 
 /// Rebuilds the agent's model adapter for another provider, or says why it could not.
@@ -1826,6 +1880,7 @@ async fn set_provider(
             if let Some(effort) = registry.agent.effort() {
                 registry.broadcast_effort(effort).await;
             }
+            remember_selection(registry).await;
         }
         Err(error) => {
             send(
@@ -2207,6 +2262,32 @@ mod tests {
         for plan in &openai.plans {
             assert!(plan.refused.is_none(), "{} is offered", plan.name);
         }
+    }
+
+    /// What a client changes is what the next start remembers.
+    ///
+    /// The write half of the remembered default: a change to the model, the effort, or the
+    /// provider is what the file records, and it records the agent's whole selection — not only
+    /// the field that moved — because a model without the provider it belongs to is not a
+    /// default anything could resolve.
+    #[test]
+    fn a_remembered_selection_names_the_whole_choice_it_was_left_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let written = write_selection(
+            dir.path(),
+            "openai",
+            Some("subscription"),
+            "gpt-5.3-codex",
+            Some(nanus_ports::ReasoningEffort::XHigh),
+        );
+        assert!(written.is_ok(), "the record is written: {written:?}");
+
+        let read = LastSelection::load(dir.path()).expect("the record reads back");
+        assert_eq!(read.provider.as_deref(), Some("openai"));
+        assert_eq!(read.plan.as_deref(), Some("subscription"));
+        assert_eq!(read.model.as_deref(), Some("gpt-5.3-codex"));
+        // In the port's spelling, because `xhigh` is a step the configuration cannot name.
+        assert_eq!(read.effort.as_deref(), Some("xhigh"));
     }
 
     /// A held session with nobody attached.

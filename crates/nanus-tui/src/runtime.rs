@@ -451,6 +451,17 @@ pub trait SessionSource {
     /// A default of doing nothing, for the same reason as [`SessionSource::set_provider`].
     fn set_credential(&mut self, _provider: &str, _plan: Option<&str>, _key: &str) {}
 
+    /// Re-reads the session from wherever it is authoritative, before the summary is drawn.
+    ///
+    /// A live session's copy here is a snapshot taken when this interface attached, and the
+    /// agent writes what happens to the store as turns end — so by the time the reader leaves,
+    /// the store can hold turns this copy has never seen. The summary printed on the way out
+    /// claims to be the session's, so it is taken from the store rather than from the snapshot.
+    ///
+    /// A source with nothing behind it — a recording — does nothing, and a source whose
+    /// session cannot be re-read keeps the copy it has rather than failing the exit.
+    fn refresh(&mut self) {}
+
     /// Releases whatever the source owns.
     ///
     /// # Errors
@@ -594,6 +605,13 @@ pub enum Target {
 pub struct Remote {
     session: Session,
     label: String,
+    /// The store the conversation is written to by the agent, kept so the session can be
+    /// re-read when the interface leaves.
+    ///
+    /// The copy above is a snapshot taken when this client attached: the agent owns the
+    /// conversation, so everything that happened while the interface was open is in the
+    /// store and not necessarily in the copy.
+    store: StoreHandle,
     client: Option<Client>,
     requests: mpsc::UnboundedSender<Request>,
     pending: Option<mpsc::UnboundedReceiver<Request>>,
@@ -671,6 +689,7 @@ impl Remote {
             session,
             workspace,
             label,
+            store: std::rc::Rc::clone(store),
             client: Some(client),
             requests,
             pending: Some(pending),
@@ -866,6 +885,33 @@ impl SessionSource for Remote {
             plan: plan.map(str::to_owned),
             key: key.to_owned(),
         });
+    }
+
+    fn refresh(&mut self) {
+        let id = self.session.id().clone();
+        if let Some(session) = reloaded(&self.store, &id) {
+            self.session = session;
+        }
+    }
+}
+
+/// Re-reads a session from the store, or `None` when it cannot be read.
+///
+/// The reason this is a function rather than a method: it is the part of the interface's exit
+/// that has an answer worth testing, and it takes only a store and a key. A session the store
+/// has never been given — one that opened and closed without a completed turn — is not a
+/// failure, so an unreadable one leaves the caller's copy in place.
+fn reloaded(store: &StoreHandle, id: &SessionId) -> Option<Session> {
+    let store = std::rc::Rc::clone(store);
+    let id = id.clone();
+    // Blocking is right here: this runs after the loop has returned and outside its task set,
+    // on the way to printing a table to a terminal that is already the reader's again.
+    match nanus_kernel::runtime::block_on(store.load(&id)) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            tracing::debug!(%error, "the session could not be re-read for the summary");
+            None
+        }
     }
 }
 
@@ -1091,6 +1137,11 @@ pub fn run_source(source: &mut dyn SessionSource) -> io::Result<()> {
     // Only on a clean exit. A loop that failed is reported as the failure it is, and a table
     // of figures in front of that error would bury the one line that says what went wrong.
     if let Ok(stats) = &outcome {
+        // Re-read before the table is built, so the session's own rows describe what happened
+        // rather than the snapshot this client attached with. A live agent writes turns to the
+        // store as they end, and that store, not the copy held here, is what the summary is a
+        // claim about — the copy predates every turn this interface watched.
+        source.refresh();
         let summary = crate::summary::session_summary(source.session(), source.label(), stats);
         // Written rather than printed: a library does not own the process's stdout — the
         // workspace forbids the `print!` that would assume it does — and a write that fails
@@ -6691,6 +6742,38 @@ mod tests {
             broken.id().as_str(),
             "damaged",
             "and it is still the session the client attached to"
+        );
+    }
+
+    #[test]
+    fn a_reload_takes_the_sessions_latest_form_and_leaves_a_missing_one_alone() {
+        // The summary printed on the way out is a claim about the session, and the copy a live
+        // client holds was taken when it attached. Re-reading is what makes the claim true for
+        // the turns this interface watched; a session the store has never been given is not a
+        // failure but an absence, and the caller keeps what it had.
+        let home = std::env::temp_dir().join(format!("nanus-tui-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let store = block_on(JsonlStore::new(&home)).expect("a store in the temporary directory");
+
+        let id = SessionId::new("live");
+        let mut saved = Session::new(id.clone(), 1_700_000_000_000, "/work");
+        saved.append(nanus_domain::SessionEvent::UserMessage {
+            text: "read the file".to_owned(),
+        });
+        block_on(store.save(&saved)).expect("save");
+        let store = store.handle();
+
+        let reread = reloaded(&store, &id).expect("a stored session comes back");
+        assert_eq!(
+            reread.event_count(),
+            1,
+            "the store's form is what is returned"
+        );
+        assert_eq!(reread.cwd(), "/work");
+
+        assert!(
+            reloaded(&store, &SessionId::new("never-saved")).is_none(),
+            "nothing stored is an absence, not an empty session"
         );
     }
 

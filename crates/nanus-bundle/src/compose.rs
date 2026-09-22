@@ -26,14 +26,15 @@ use nanus_adapter_store::JsonlStore;
 use nanus_domain::{AgentConfig, Origin, Session};
 use nanus_kernel::{Context, Kernel, MountContext, Plugin, PluginId};
 use nanus_ports::{
-    ClockHandle, FsHandle, LlmEvent, LlmHandle, LlmPort, LlmStream, SandboxPolicy, Secret,
-    SecretHandle, SecretPort, ShellHandle, StoreHandle,
+    ClockHandle, FsHandle, LlmEvent, LlmHandle, LlmPort, LlmStream, ReasoningEffort, SandboxPolicy,
+    Secret, SecretHandle, SecretPort, ShellHandle, StoreHandle,
 };
 
 use crate::ToolRegistryHandle;
 use crate::agent_loop::AgentRunner;
 use crate::error::BundleError;
 use crate::provider::{Provider, Selection};
+use crate::selection::LastSelection;
 
 /// The default system prompt.
 ///
@@ -210,6 +211,13 @@ pub struct Pending {
     clock: ClockHandle,
     store: StoreHandle,
     llm: LlmHandle,
+    /// The effort a remembered selection asked for, if any.
+    ///
+    /// Carried rather than folded into the configuration because the configuration's field has
+    /// four steps and a model's scale can have seven: an effort of `none` or `max` is a step the
+    /// interface can choose and the configuration cannot name. Applied in [`Pending::start`],
+    /// where the runner it belongs to exists.
+    remembered_effort: Option<ReasoningEffort>,
     /// The one tool registry this composition has: the runner's and the published service's.
     tools: ToolRegistryHandle,
 }
@@ -264,10 +272,17 @@ impl Pending {
             &self.selection,
             &self.workspace,
         )?;
+        // The effort a remembered selection asked for is put on the runner rather than into the
+        // configuration, because it can name a step the configuration's field cannot. It goes on
+        // before the origin is built, so the record says what the requests will carry rather
+        // than what the configuration happened to say.
+        if let Some(effort) = self.remembered_effort {
+            runner.set_effort(Some(effort));
+        }
         // Built before the adapters are moved into the harness, and from the same
         // selection the runner was built from, so the record cannot disagree with what
         // the run will do.
-        let origin = origin_of(&self.config, &self.selection, &self.llm);
+        let origin = origin_of(&self.config, &self.selection, runner.effort());
         // Postconditions: the request model is the resolved one, and the registry the
         // runner dispatches from is the one the context published. The second is the
         // property this whole construction exists to hold — a runner over a *copy* of the
@@ -457,20 +472,40 @@ impl ProviderSwitch {
 ///
 /// Read from the same selection the runner and the prompt are built from, so the
 /// recorded facts are the ones in force rather than ones a caller restated. The effort is
-/// asked of the adapter instead, because an adapter fills in an unset effort from its own
-/// configuration — which is the only place the answer exists — and it is left absent when
-/// the adapter has no notion of one. A provider without an effort knob (Anthropic) is
-/// therefore recorded as having no effort, which is an absence rather than a default.
-fn origin_of(config: &NanusConfig, selection: &Selection, llm: &LlmHandle) -> Origin {
+/// the runner's own answer — the chosen step when a caller chose one, and otherwise what the
+/// adapter applies to a request that sets none, which is the only place that answer exists.
+/// It is left absent when the adapter has no notion of an effort: a provider without an effort
+/// knob (Anthropic) is recorded as having none, which is an absence rather than a default.
+fn origin_of(
+    config: &NanusConfig,
+    selection: &Selection,
+    effort: Option<ReasoningEffort>,
+) -> Origin {
     Origin {
         model: Some(selection.model().to_owned()),
-        effort: llm
-            .reasoning_effort()
-            .map(|effort| effort.as_str().to_owned()),
+        effort: effort.map(|effort| effort.as_str().to_owned()),
         sandbox: Some(config.sandbox_mode.as_str().to_owned()),
         approval: Some(config.approval_policy.as_str().to_owned()),
         harness: Some(format!("nanus/{}", env!("CARGO_PKG_VERSION"))),
     }
+}
+
+/// Overlays the selection a previous change left behind onto a configuration.
+///
+/// The record is written when an interface changes the provider, model, or effort of a running
+/// agent (see [`LastSelection`]); this is the read that makes the next start begin there. A
+/// configuration is complete without it, so an absent or unreadable record changes nothing.
+///
+/// Returns the remembered effort, which is *not* folded into the configuration: the
+/// configuration's field has four steps and a model's scale can have seven, so `none` and `max`
+/// have nowhere to go. The caller puts it on the runner instead.
+pub fn apply_remembered(
+    config: &mut NanusConfig,
+    home: &std::path::Path,
+) -> Option<ReasoningEffort> {
+    let remembered = LastSelection::load(home).unwrap_or_default();
+    remembered.apply(config);
+    remembered.effort()
 }
 
 /// Builds the adapters a harness needs, leaving the kernel unmounted.
@@ -483,19 +518,25 @@ fn origin_of(config: &NanusConfig, selection: &Selection, llm: &LlmHandle) -> Or
 /// Returns [`BundleError::Config`] when the configuration or the API key is unusable,
 /// and [`BundleError::Session`] when the session store cannot be opened.
 pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
-    let workspace = workspace_root(config)?;
+    let home = store_home()?;
+    // The default this start begins from is the selection the last *change* left behind, when
+    // there is one: the configuration resolves everything else, and resolves all of it when
+    // nothing was recorded. Read before the selection is resolved because that is the one place
+    // a provider, plan, or model is decided.
+    let mut config = config.clone();
+    let remembered_effort = apply_remembered(&mut config, &home);
+    let workspace = workspace_root(&config)?;
     // Which provider, plan, model, and endpoint this run uses is decided before
     // anything is built, because a configuration that cannot resolve is a sentence
     // rather than a partly assembled harness.
-    let selection = Selection::resolve(config)?;
-    let home = store_home()?;
+    let selection = Selection::resolve(&config)?;
     // The secret stores are consulted by *account*, which is the provider's name, so
     // a key stored for one provider can never be sent to another.
     let secrets = Secrets::new(&home).handle();
     // A missing credential is the one failure an agent may start *through*: the interface opens
     // so the reader can supply one with `/provider`, and the placeholder reports it on the first
     // request. Every other failure still refuses to compose.
-    let (llm, configured) = match build_adapter(config, &selection, &secrets).await {
+    let (llm, configured) = match build_adapter(&config, &selection, &secrets).await {
         Ok(llm) => (llm, true),
         Err(BundleError::Credential(reason)) => {
             let placeholder: LlmHandle = Rc::new(Box::new(UnconfiguredLlm {
@@ -524,7 +565,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
     let tools = build_tools(&fs, &shell)?;
 
     Ok(Pending {
-        config: config.clone(),
+        config,
         workspace,
         selection,
         configured,
@@ -534,6 +575,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         clock,
         store,
         llm,
+        remembered_effort,
         tools,
     })
 }

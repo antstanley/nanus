@@ -58,7 +58,10 @@ That gives you three things that are hard to get any other way:
 `LlmPort`. Four providers ship — DeepSeek, z.ai (its API and a coding plan with a key
 of its own), Anthropic, and OpenAI (its API and a `ChatGPT` subscription authorized
 over OAuth) — and they are *selected*, not compiled in: one line in the
-configuration, and the seven tools never learn about it.
+configuration, and the seven tools never learn about it. Switch provider, model, or
+reasoning effort while the interface is open and that becomes the default the next start
+begins from — see
+[what the next start begins from](docs/features.md#what-the-next-start-begins-from).
 
 **Replace the tools without touching the model.** Each tool is a plugin behind a
 `ToolExecutor`. Add one and its schema joins the prompt automatically. Remove one and it

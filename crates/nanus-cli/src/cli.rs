@@ -1482,7 +1482,20 @@ async fn read_credential() -> Result<String, String> {
 
 /// Prints the effective configuration.
 async fn show_config(args: &Options) -> Result<(), String> {
-    let config = load(args)?;
+    let mut config = load(args)?;
+    // A selection a live change left behind is what a run begins from, so it is applied here
+    // as well: this command claims to print the *effective* configuration, and the file alone
+    // would name the default the reader has already moved away from. The returned effort is the
+    // one exception to the overlay, because a model's scale has steps the configuration cannot
+    // spell — `none` and `max` among them — and is printed from the record when it has one. A
+    // home that cannot be resolved is not fatal here: there is then no record to read, and the
+    // configuration is the whole answer, exactly as it was before there was ever a record.
+    let remembered_effort =
+        compose::store_home().map_or(None, |home| compose::apply_remembered(&mut config, &home));
+    let effort = remembered_effort.map_or_else(
+        || format!("{:?}", config.reasoning_effort),
+        |effort| effort.as_str().to_owned(),
+    );
     // Resolved rather than echoed: the file may name none of the provider, plan, or
     // model, and what a run will actually use is the useful answer. A configuration
     // that cannot resolve is refused here, with the same sentence a run would give.
@@ -1502,12 +1515,11 @@ async fn show_config(args: &Options) -> Result<(), String> {
     println!("endpoint: {}", selection.endpoint());
     println!("max tokens: {}", max_tokens_display(&config, &selection));
     if selection.provider().effort_applies() {
-        println!("reasoning effort: {:?}", config.reasoning_effort);
+        println!("reasoning effort: {effort}");
     } else {
         // An inert knob is named as inert rather than printed as though it were sent.
         println!(
-            "reasoning effort: {:?} (not sent to {})",
-            config.reasoning_effort,
+            "reasoning effort: {effort} (not sent to {})",
             selection.provider()
         );
     }
