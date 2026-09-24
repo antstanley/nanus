@@ -90,7 +90,7 @@ pub use approval::{
 };
 pub use context::{Elision, FitError, Fitted, estimate, fit};
 pub use error::{DomainError, DomainResult};
-pub use goal::{GOAL_OBJECTIVE_MAX_CHARS, Goal, GoalPhase};
+pub use goal::{GOAL_NOTE_MAX_CHARS, GOAL_OBJECTIVE_MAX_CHARS, Goal, GoalPhase};
 pub use message::{Message, Role, ToolCallId, Usage};
 pub use prompt::{PromptBuilder, PromptError, PromptSection, runtime_context};
 pub use session::{

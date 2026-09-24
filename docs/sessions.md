@@ -122,6 +122,14 @@ format version did not move: the version decides how the *body* is read, an olde
 ignores a header field it does not know, and treating a new header as an unreadable version
 would have made every existing transcript unopenable.
 
+A goal is the one addition to the *body*: a `goal/change` record, written wherever a goal is
+set or moved. The version stayed put for it too, and deliberately. A newer build reads every
+older log unchanged, because an older log simply has no such record; an older build meeting a
+log with one refuses it as a malformed event rather than guessing, which is the answer the
+version would have given anyway — and moving the version would have made the newer build's
+own reader refuse every log written before the goal existed, since it checks for an exact
+match.
+
 ## Reporting on a run
 
 ```sh
@@ -243,6 +251,7 @@ A session is the agent's; a client's view of it is a handful of frames.
 | `Approval` | A call outside the sandbox needs a decision; the client answers with an `approve` request. |
 | `Goal` | The session's durable objective, or its absence: sent on attaching to a session that has one, on every change, and in answer to a `goal` request. |
 | `Done`, `Failed` | How it ended. |
+| `Refused` | A request that is not a prompt — a model, provider, credential, or goal change — was not carried out. It ends no turn, which is why it is not `Failed`. |
 
 Deliberately not a session log. A client that wants the conversation reads it from the
 store, where it is already durable, rather than receiving a second copy over a socket that

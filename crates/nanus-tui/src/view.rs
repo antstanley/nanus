@@ -372,6 +372,16 @@ pub struct ViewState {
     pub following: bool,
     /// `true` while a turn is open.
     pub busy: bool,
+    /// The goal line the transcript last showed, or `None` before it has shown one.
+    ///
+    /// A goal reaches the interface from more than one place — the replayed log, the frame an
+    /// attachment sends, the frame a change sends — and the first two describe the same goal:
+    /// attaching to a session that had one drew it twice. A goal frame nobody asked for that
+    /// would draw this same line again is therefore not drawn.
+    pub goal_shown: Option<String>,
+    /// Whether a `/goal` is waiting for its answer, which is drawn even when it repeats the
+    /// line above: the reader asked, and silence would read as the request being lost.
+    pub goal_asked: bool,
     /// The current step within the open turn.
     pub step: u32,
     /// Total tokens the session has used.
@@ -670,6 +680,8 @@ impl Default for ViewState {
             scroll_offset: 0,
             following: true,
             busy: false,
+            goal_shown: None,
+            goal_asked: false,
             step: 0,
             tokens_used: 0,
             stats: Throughput::default(),

@@ -873,7 +873,8 @@ async fn a_goal_tool_call_reaches_the_session_log() {
     );
 }
 
-/// A goal tool that refuses is a tool result, not a harness error, and the turn goes on.
+/// A goal tool that refuses is a tool result, not a harness error, and the turn goes on —
+/// and a refused call, having changed nothing, leaves no `goal/change` behind.
 #[tokio::test]
 async fn a_refused_goal_tool_call_is_a_result_the_model_reads() {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
@@ -884,11 +885,250 @@ async fn a_refused_goal_tool_call_is_a_result_the_model_reads() {
         call("call_1", "pause_goal", "{}"),
         answer("there was nothing to pause"),
     ]);
-    let outcome = run(as_port(&model), tools, "pause the goal").await;
+    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", config(), clock())
+        .unwrap_or_else(|error| panic!("the runner builds: {error}"));
+    let mut session = Session::new(SessionId::new("refused"), 0, "/tmp");
+    let outcome = runner
+        .run_turn(&mut session, "pause the goal", &mut Silent, None)
+        .await
+        .unwrap_or_else(|error| panic!("the turn completes: {error}"));
     assert_eq!(outcome.answer, "there was nothing to pause");
     assert!(
         outcome.is_success(),
         "a refused tool call does not fail the turn: {outcome:?}"
+    );
+    let refused = session.log().events().iter().find_map(|event| match event {
+        SessionEvent::ToolResult {
+            call_id, is_error, ..
+        } if call_id.as_str() == "call_1" => Some(*is_error),
+        _ => None,
+    });
+    assert_eq!(
+        refused,
+        Some(true),
+        "the model reads the refusal as an error"
+    );
+    assert!(
+        !session
+            .log()
+            .events()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::GoalChange { .. })),
+        "a refused call records no goal change"
+    );
+}
+
+/// Builds one step that makes several tool calls at once.
+fn calls(script: &[(&str, &str, &str)]) -> Vec<LlmEvent> {
+    let mut events: Vec<LlmEvent> = script
+        .iter()
+        .zip(0_u32..)
+        .map(|((id, name, arguments), index)| LlmEvent::ToolCallDelta {
+            index,
+            id: Some(ToolCallId::new(*id)),
+            name: Some(
+                ToolName::new(*name).unwrap_or_else(|error| panic!("test tool {name}: {error}")),
+            ),
+            arguments_delta: (*arguments).to_owned(),
+        })
+        .collect();
+    events.push(LlmEvent::Finished {
+        reason: FinishReason::ToolCalls,
+    });
+    events
+}
+
+/// What a listener heard, in order, so the place a goal change is reported is assertable.
+#[derive(Default)]
+struct Heard(Vec<String>);
+
+impl Progress for Heard {
+    fn tool_started(&mut self, call_id: &ToolCallId, _: &ToolName, _: &serde_json::Value) {
+        self.0.push(format!("start {call_id}"));
+    }
+
+    fn tool_finished(&mut self, call_id: &ToolCallId, _: &ToolName, _: bool) {
+        self.0.push(format!("done {call_id}"));
+    }
+
+    fn goal_changed(&mut self, goal: Option<&nanus_domain::Goal>) {
+        let phase = goal.map_or_else(|| String::from("none"), |goal| goal.phase().to_string());
+        self.0.push(format!("goal {phase}"));
+    }
+}
+
+/// A step that mixes goal calls with a registered tool keeps every pairing: each goal call
+/// lands in the log in the order it was made, every result answers its call in call order, the
+/// registered tool still runs, and a listener hears each change between the call that made it
+/// and that call's result — which is where a replay of the log draws it.
+#[tokio::test]
+async fn goal_calls_mixed_with_a_registered_tool_in_one_step_keep_their_order() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    std::fs::write(dir.path().join("notes.md"), "the notes\n")
+        .unwrap_or_else(|error| panic!("the fixture is written: {error}"));
+    let (tools, _shell) = workspace_tools(dir.path());
+
+    let model = ScriptedModel::new(vec![
+        calls(&[
+            ("call_1", "read", r#"{"file_path":"notes.md"}"#),
+            ("call_2", "create_goal", r#"{"objective":"ship the notes"}"#),
+            ("call_3", "pause_goal", r#"{"reason":"waiting for review"}"#),
+        ]),
+        answer("done"),
+    ]);
+    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", config(), clock())
+        .unwrap_or_else(|error| panic!("the runner builds: {error}"));
+    let mut session = Session::new(SessionId::new("mixed"), 0, "/tmp");
+    let mut heard = Heard::default();
+    runner
+        .run_turn(
+            &mut session,
+            "read, then set and pause a goal",
+            &mut heard,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the turn completes: {error}"));
+
+    let shape: Vec<String> = session
+        .log()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolCall { call_id, .. } => Some(format!("call {call_id}")),
+            SessionEvent::GoalChange { goal } => Some(format!(
+                "goal {}",
+                goal.as_ref().map_or("none", |goal| goal.phase().as_str())
+            )),
+            SessionEvent::ToolResult { call_id, .. } => Some(format!("result {call_id}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "call call_1",
+            "call call_2",
+            "call call_3",
+            "goal active",
+            "goal paused",
+            "result call_1",
+            "result call_2",
+            "result call_3",
+        ],
+        "the goal changes sit between the calls and the results, in the order they were made"
+    );
+    assert_eq!(
+        session.goal().map(|goal| goal.note().map(str::to_owned)),
+        Some(Some(String::from("waiting for review")))
+    );
+    assert!(
+        tool_result(&session, "call_1").contains("the notes"),
+        "the registered tool ran beside the goal calls"
+    );
+    assert_eq!(
+        heard.0,
+        [
+            "start call_1",
+            "start call_2",
+            "start call_3",
+            "goal active",
+            "done call_2",
+            "goal paused",
+            "done call_3",
+            "done call_1",
+        ],
+        "each change is heard between its call starting and finishing"
+    );
+}
+
+/// The goal tools change session state rather than the workspace, so the approval gate — which
+/// guards what a tool can do to the files and the machine — does not ask about them: a goal
+/// call runs under a read-only sandbox with nobody to answer, where a write is refused.
+#[tokio::test]
+async fn goal_calls_are_not_put_to_the_approval_gate() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let (tools, _shell) = workspace_tools(dir.path());
+    let model = ScriptedModel::new(vec![
+        calls(&[
+            ("call_1", "create_goal", r#"{"objective":"ship the notes"}"#),
+            ("call_2", "write", r#"{"file_path":"x.md","content":"x"}"#),
+        ]),
+        answer("done"),
+    ]);
+    let config = config()
+        .with_sandbox(nanus_domain::SandboxMode::ReadOnly)
+        .with_approval(nanus_domain::ApprovalPolicy::PerCall);
+    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", config, clock())
+        .unwrap_or_else(|error| panic!("the runner builds: {error}"));
+    let mut session = Session::new(SessionId::new("gated"), 0, "/tmp");
+    runner
+        .run_turn(&mut session, "set a goal and write", &mut Silent, None)
+        .await
+        .unwrap_or_else(|error| panic!("the turn completes: {error}"));
+
+    assert!(session.goal().is_some(), "the goal call ran without asking");
+    assert!(
+        !dir.path().join("x.md").exists(),
+        "and the write beside it was refused, so the gate was in force"
+    );
+}
+
+/// A tool registered under a goal tool's name is not offered: the loop runs a call by that name
+/// itself, so the registered one could never run, and offering both would send the model two
+/// schemas with one name. The count the agent advertises follows what is offered.
+#[tokio::test]
+async fn a_registered_tool_with_a_goal_tools_name_is_not_offered() {
+    struct Impostor;
+    impl nanus_domain::ToolExecutor for Impostor {
+        fn execute(&self, call: nanus_domain::ToolCall) -> nanus_domain::ToolFuture {
+            Box::pin(async move {
+                nanus_domain::ToolResult::success(call.id, serde_json::json!("the impostor ran"))
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let (tools, _shell) = workspace_tools(dir.path());
+    let schema = nanus_domain::ToolSchema {
+        name: ToolName::new("get_goal").unwrap_or_else(|error| panic!("{error}")),
+        description: "a plugin's own get_goal".to_owned(),
+        parameters: serde_json::json!({ "type": "object" }),
+    };
+    let registered = tools
+        .borrow_mut()
+        .register(nanus_domain::ToolDefinition::new(schema, Impostor));
+    assert!(registered.is_ok(), "the registry itself accepts the name");
+
+    let model = ScriptedModel::new(vec![call("call_1", "get_goal", "{}"), answer("done")]);
+    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", config(), clock())
+        .unwrap_or_else(|error| panic!("the runner builds: {error}"));
+    assert_eq!(
+        runner.tool_count(),
+        12,
+        "seven registered and five goal tools, once each"
+    );
+    let mut session = Session::new(SessionId::new("impostor"), 0, "/tmp");
+    runner
+        .run_turn(&mut session, "read the goal", &mut Silent, None)
+        .await
+        .unwrap_or_else(|error| panic!("the turn completes: {error}"));
+
+    let requests = model.requests();
+    let offered = requests
+        .first()
+        .map(|request| {
+            request
+                .tools
+                .iter()
+                .filter(|schema| schema.name.as_str() == "get_goal")
+                .count()
+        })
+        .unwrap_or_default();
+    assert_eq!(offered, 1, "one schema for the name");
+    assert!(
+        tool_result(&session, "call_1").contains("no goal is set"),
+        "the loop's get_goal answered, not the registered one"
     );
 }
 

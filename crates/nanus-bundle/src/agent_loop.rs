@@ -149,6 +149,14 @@ pub trait Progress {
     /// cannot tell the difference.
     fn elided(&mut self, _elision: &nanus_domain::Elision) {}
 
+    /// The model changed the session's goal, and the change is now in the log.
+    ///
+    /// Reported at the point it happens — after the call that made it started and before that
+    /// call finished — which is where a replay of the log puts it too, so a turn watched live
+    /// and the same turn read back show the same notices in the same places. `None` is a goal
+    /// cleared, which no goal tool does today, but the log can hold one.
+    fn goal_changed(&mut self, _goal: Option<&nanus_domain::Goal>) {}
+
     /// Whether the turn should stop.
     ///
     /// Asked between steps and between the tokens of a model response, so a driver that
@@ -473,13 +481,35 @@ impl AgentRunner {
     /// The registered set plus the goal tools — [`crate::goal_tools`] — because the loop offers
     /// both and dispatches both. This is the one place the two lists meet, so the count an agent
     /// advertises in its handshake is the number of schemas a request carries; asking the
-    /// registry alone would understate what the model can see.
+    /// registry alone would understate what the model can see. A registered tool that takes a
+    /// goal tool's name is not counted, because it is not offered — see [`Self::offered_schemas`].
     #[must_use]
     pub fn tool_count(&self) -> usize {
-        self.tools
-            .borrow()
-            .len()
-            .saturating_add(crate::goal_tools::COUNT)
+        self.offered_schemas().len()
+    }
+
+    /// Returns every schema a request offers the model: the registered tools, then the goal tools.
+    ///
+    /// A tool registered through the published handle under a goal tool's name is left out. The
+    /// loop runs a call by that name itself, before the registry is consulted, so the registered
+    /// tool could never run — and offering both would send the model two schemas with one name,
+    /// which a provider rejects or resolves arbitrarily. It is left out loudly: the name is a
+    /// plugin's mistake, and a tool that silently never appears is a harder one to find.
+    fn offered_schemas(&self) -> Vec<nanus_domain::ToolSchema> {
+        let registry = self.tools.borrow();
+        let mut schemas: Vec<nanus_domain::ToolSchema> = Vec::new();
+        for schema in registry.schemas() {
+            if crate::goal_tools::is_goal_tool(&schema.name) {
+                tracing::warn!(
+                    tool = %schema.name,
+                    "a registered tool takes a goal tool's name and is not offered"
+                );
+            } else {
+                schemas.push(schema.clone());
+            }
+        }
+        schemas.extend(crate::goal_tools::schemas());
+        schemas
     }
 
     /// Returns the assembled system prompt every request carries.
@@ -681,17 +711,9 @@ impl AgentRunner {
         messages.extend(session.derive_messages());
         let fitted = nanus_domain::fit(messages, self.config.context_budget)
             .map_err(|error| BundleError::context(error.to_string()))?;
-        // The borrow ends with the statement, which is what keeps a tool registered through
-        // the published handle visible on the very next request rather than only after a
-        // rebuild. The goal tools are appended here rather than registered, because the loop
-        // dispatches them itself: this is the one place the offered set is assembled.
-        let tools: Vec<nanus_domain::ToolSchema> = {
-            let registry = self.tools.borrow();
-            let mut schemas: Vec<nanus_domain::ToolSchema> =
-                registry.schemas().into_iter().cloned().collect();
-            schemas.extend(crate::goal_tools::schemas());
-            schemas
-        };
+        // Read on every request, which is what keeps a tool registered through the published
+        // handle visible on the very next request rather than only after a rebuild.
+        let tools = self.offered_schemas();
         let mut request = ChatRequest::new(self.model(), fitted.messages);
         request.tools = tools;
         // Set only when a caller chose one: an unset effort is the adapter filling in its own
@@ -821,7 +843,7 @@ impl AgentRunner {
             .copied()
             .partition(|index| crate::goal_tools::is_goal_tool(&calls[*index].name));
         for index in goal_indexes {
-            let result = self.run_goal_tool(session, &calls[index]);
+            let result = self.run_goal_tool(session, &calls[index], progress);
             let is_error = !result.outcome.is_success();
             progress.tool_finished(&calls[index].id, &calls[index].name, is_error);
             results[index] = Some(result);
@@ -883,10 +905,18 @@ impl AgentRunner {
     /// order they were made. Nothing is appended for a read, for a call the domain refuses, or
     /// for a transition that left the goal as it was (pausing a goal already paused):
     /// a `goal/change` record *is* a change, and a call that changed nothing must not leave one.
-    fn run_goal_tool(&self, session: &mut Session, call: &ToolCall) -> ToolResult {
+    fn run_goal_tool(
+        &self,
+        session: &mut Session,
+        call: &ToolCall,
+        progress: &mut dyn Progress,
+    ) -> ToolResult {
         let applied = crate::goal_tools::run(session.goal().as_ref(), call, self.clock.now_ms());
         if let Some(goal) = applied.record {
-            session.append(SessionEvent::GoalChange { goal: Some(goal) });
+            session.append(SessionEvent::GoalChange {
+                goal: Some(goal.clone()),
+            });
+            progress.goal_changed(Some(&goal));
         }
         ToolResult::new(call.id.clone(), applied.outcome)
     }

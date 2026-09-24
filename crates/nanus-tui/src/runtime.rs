@@ -1199,6 +1199,12 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
         crate::replay::transcript_of(source.session())
     };
     view.tokens_used = u64::from(source.session().usage_totals().total_tokens());
+    // The goal the replay ended on, so the frame an attachment sends about the same goal is not
+    // drawn a second time.
+    view.goal_shown = source
+        .session()
+        .goal()
+        .map(|goal| crate::replay::goal_line(Some(&goal)));
     // Opening at the end, or part way back from it: the offset is applied on the first
     // render, when the viewport it is measured against is known.
     view.pending_scroll_back = Some(source.initial_scroll());
@@ -1940,13 +1946,12 @@ fn request_goal(action: GoalAction, source: &mut dyn SessionSource, view: &mut V
         view.scroll_to_bottom();
         return;
     }
-    // A change during a turn is refused here rather than by the agent. The agent would refuse it
-    // too — the turn owns the session — but its refusal is a `Failed`, and a `Failed` is how the
-    // interface learns a turn ended: sent, it would dismiss an open approval the turn is still
-    // waiting on and send the next queued prompt into a session that is still busy. A *read* is
-    // sent, because the agent answers one from its cache without refusing.
+    // A change during a turn is refused here, where the reader is looking, rather than sent for
+    // the agent to refuse: the turn owns the session, so the answer is known without a round
+    // trip. A *read* is sent, because the agent answers one from its cache without refusing.
     if view.busy {
         if action == GoalAction::Status {
+            view.goal_asked = true;
             source.set_goal(action);
         } else {
             view.transcript.push(Entry::notice(String::from(
@@ -1965,6 +1970,7 @@ fn request_goal(action: GoalAction, source: &mut dyn SessionSource, view: &mut V
         GoalAction::Abandon { .. } => String::from("abandoning the goal"),
         GoalAction::Clear => String::from("clearing the goal"),
     };
+    view.goal_asked = true;
     source.set_goal(action);
 }
 
@@ -3174,6 +3180,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
             view.transcript.push(Entry::notice(message));
             closed(view);
         }
+        Frame::Refused { message } => apply_refused(message, view),
         // Frames that describe the connection rather than the conversation: the handshake,
         // the attachment, a listing, a status, and the goodbye. The interface learned what it
         // needed from the first two before it drew anything, and a `Bye` is the transport's
@@ -3254,24 +3261,36 @@ fn apply_auth_prompt(
     view.status = format!("authorizing {}…", view.auth_label());
 }
 
-/// Applies a model change: the model, the steps it takes, and the effort reconciled with them.
+/// Shows a request the agent would not carry out.
 ///
-/// The agent is the authority here, and for a stronger reason than elsewhere: it is the model named
-/// in the next request. A client that switched it has already drawn the switch, and a client
-/// watching another conversation learns it from this frame. The steps a model takes differ between
-/// models, so the chooser and the cycle follow the switch; and a model that takes no effort has
-/// none in force, which is an absence the agent cannot frame — it sends no `EffortChanged` for
-/// "none" — so the drawn step is cleared here. A model that does take effort is corrected by the
-/// `EffortChanged` the agent sends with the switch.
+/// It ends nothing — a turn that is running keeps its approval and its queue, which is the whole
+/// difference from a `Failed`. An authorization prompt is the exception, because the refusal is
+/// the answer it was waiting for.
+fn apply_refused(message: String, view: &mut ViewState) {
+    view.close_auth();
+    view.transcript.push(Entry::notice(message));
+    view.follow();
+    if !view.busy {
+        view.status = resting_status(view);
+    }
+}
+
 /// Writes the session's goal into the transcript as the interface's own notice.
 ///
 /// A notice rather than prose: the model did not say this, the interface did, and the colour is
-/// how a reader tells them apart. Answered on every change, on every attachment to a session that
-/// has a goal, and on every `/goal`, so a reader who typed the command and one watching the same
-/// session both see the same line.
+/// how a reader tells them apart. Sent on every change, on every attachment to a session that has
+/// a goal, and on every `/goal`, so a reader who typed the command and one watching the same
+/// session both see the same line — and drawn unless it repeats the goal line the transcript
+/// already shows without anyone having asked, which is what an attachment's frame does after the
+/// replayed log has drawn the same goal.
 fn apply_goal(goal: Option<GoalInfo>, view: &mut ViewState) {
-    view.transcript.push(Entry::notice(goal_notice(goal)));
-    view.follow();
+    let line = goal_notice(goal);
+    let asked = std::mem::take(&mut view.goal_asked);
+    if asked || view.goal_shown.as_deref() != Some(line.as_str()) {
+        view.transcript.push(Entry::notice(line.clone()));
+        view.follow();
+    }
+    view.goal_shown = Some(line);
     // The answer is what "setting the goal" was waiting for. During a turn the status line is the
     // turn's, and a goal frame does not end one.
     if !view.busy {
@@ -3298,6 +3317,15 @@ fn goal_notice(goal: Option<GoalInfo>) -> String {
     line
 }
 
+/// Applies a model change: the model, the steps it takes, and the effort reconciled with them.
+///
+/// The agent is the authority here, and for a stronger reason than elsewhere: it is the model named
+/// in the next request. A client that switched it has already drawn the switch, and a client
+/// watching another conversation learns it from this frame. The steps a model takes differ between
+/// models, so the chooser and the cycle follow the switch; and a model that takes no effort has
+/// none in force, which is an absence the agent cannot frame — it sends no `EffortChanged` for
+/// "none" — so the drawn step is cleared here. A model that does take effort is corrected by the
+/// `EffortChanged` the agent sends with the switch.
 fn apply_model_changed(model: String, view: &mut ViewState) {
     view.model = Some(model);
     view.refresh_effort_levels();
@@ -5180,6 +5208,141 @@ mod tests {
         assert!(view.busy, "the answer to a read does not end the turn");
         assert!(view.pending_approval.is_some());
         assert_eq!(view.status, status, "the status line is still the turn's");
+    }
+
+    /// A refused request ends nothing, where a failure ends the turn in front of the reader.
+    ///
+    /// A model switch the agent refuses mid-turn used to arrive as a `Failed`, which dismissed
+    /// the turn's open approval and released the queue into a busy session. The other direction
+    /// is pinned too: a `Failed` still ends the turn.
+    #[test]
+    fn a_refused_request_leaves_a_running_turn_alone() {
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        view.enqueue(String::from("the next prompt"));
+        apply(
+            Frame::Approval {
+                call_id: "a1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: None,
+            },
+            &mut view,
+        );
+        apply(
+            Frame::Refused {
+                message: "no such model: x".to_owned(),
+            },
+            &mut view,
+        );
+        assert!(view.busy, "the turn is still running");
+        assert!(view.pending_approval.is_some(), "and still asking");
+        assert!(view.has_queued(), "and the queue waits for it");
+        assert_eq!(
+            view.transcript.entries().last().map(Entry::text),
+            Some("no such model: x"),
+            "the refusal is shown"
+        );
+
+        apply(
+            Frame::Failed {
+                message: "the turn failed".to_owned(),
+            },
+            &mut view,
+        );
+        assert!(!view.busy, "a failure does end it");
+        assert!(view.pending_approval.is_none());
+    }
+
+    /// A goal frame that repeats what the transcript already shows is not drawn again unless
+    /// the reader asked: attaching to a session with a goal replayed it from the log and then
+    /// drew the attachment's frame about the same goal beneath it.
+    #[test]
+    fn a_goal_the_transcript_already_shows_is_not_drawn_twice() {
+        let goal = nanus_domain::Goal::new("ship the notes", 1_000)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let wire = GoalInfo {
+            objective: String::from("ship the notes"),
+            state: GoalState::Active,
+            revision: goal.revision(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            note: None,
+        };
+        let mut view = ViewState::new();
+        // What opening a session whose log ends on this goal leaves behind.
+        view.goal_shown = Some(crate::replay::goal_line(Some(&goal)));
+
+        apply(
+            Frame::Goal {
+                goal: Some(wire.clone()),
+            },
+            &mut view,
+        );
+        assert!(
+            view.transcript.is_empty(),
+            "the attachment's frame repeats the log"
+        );
+
+        // The reader asked: the answer is drawn even though it is the same goal.
+        let mut source = Scripted::new(Vec::new());
+        request_goal(GoalAction::Status, &mut source, &mut view);
+        apply(
+            Frame::Goal {
+                goal: Some(wire.clone()),
+            },
+            &mut view,
+        );
+        assert_eq!(view.transcript.len(), 1, "a status read is always answered");
+
+        // A different goal nobody here asked about — another viewer's change — is drawn.
+        let paused = GoalInfo {
+            state: GoalState::Paused,
+            revision: wire.revision.saturating_add(1),
+            ..wire
+        };
+        apply(Frame::Goal { goal: Some(paused) }, &mut view);
+        assert_eq!(view.transcript.len(), 2, "a change is drawn");
+    }
+
+    /// The live notice and the replayed one are the same line for the same goal, in every phase
+    /// and with a note, so a turn watched live and the same turn re-read agree — and so a view
+    /// can tell that a frame repeats what the log already drew.
+    #[test]
+    fn the_live_and_replayed_goal_lines_agree() {
+        let base = nanus_domain::Goal::new("ship the notes", 1_000)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let note = Some(String::from("the benchmark is green"));
+        let goals = [
+            base.clone(),
+            base.paused(note.clone(), 2_000)
+                .unwrap_or_else(|error| panic!("{error}")),
+            base.completed(note.clone(), 2_000)
+                .unwrap_or_else(|error| panic!("{error}")),
+            base.abandoned(note, 2_000)
+                .unwrap_or_else(|error| panic!("{error}")),
+        ];
+        for goal in goals {
+            let state = match goal.phase() {
+                nanus_domain::GoalPhase::Active => GoalState::Active,
+                nanus_domain::GoalPhase::Paused => GoalState::Paused,
+                nanus_domain::GoalPhase::Complete => GoalState::Complete,
+                nanus_domain::GoalPhase::Abandoned => GoalState::Abandoned,
+            };
+            let wire = GoalInfo {
+                objective: goal.objective().to_owned(),
+                state,
+                revision: goal.revision(),
+                created_at_ms: goal.created_at_ms(),
+                updated_at_ms: goal.updated_at_ms(),
+                note: goal.note().map(str::to_owned),
+            };
+            assert_eq!(
+                goal_notice(Some(wire)),
+                crate::replay::goal_line(Some(&goal)),
+                "{goal:?}"
+            );
+        }
+        assert_eq!(goal_notice(None), crate::replay::goal_line(None));
     }
 
     /// Once the agent answers a goal change, the status line stops saying it is waiting.

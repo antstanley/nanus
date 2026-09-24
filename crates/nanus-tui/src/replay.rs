@@ -185,8 +185,10 @@ fn apply(
 /// Renders a goal change as the interface's own notice.
 ///
 /// Formatted here from the domain goal rather than from a wire type, because a recording is read
-/// without an agent: the log is all there is.
-fn goal_line(goal: Option<&nanus_domain::Goal>) -> String {
+/// without an agent: the log is all there is. The live notice renders the wire's goal to the same
+/// line, which is what lets a view tell that a goal frame repeats what the log already showed.
+#[must_use]
+pub fn goal_line(goal: Option<&nanus_domain::Goal>) -> String {
     let Some(goal) = goal else {
         return String::from("no goal is set");
     };

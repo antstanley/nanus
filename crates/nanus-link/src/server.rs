@@ -1170,19 +1170,12 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
     };
 
     // Settled before the ending goes out, so a client that sees the ending and then asks
-    // what is running is told the truth. The goal is read across the refresh for the same
-    // reason the turn's frames are recorded: a goal the *model* changed during the turn has no
-    // one to broadcast it — the loop writes the log and cannot reach a client — so the change is
-    // noticed here, where the log is compared against what was last shown, and sent as the same
-    // notice a `/goal` change sends.
-    let goal_before = held.goal.borrow().clone();
+    // what is running is told the truth. A goal the model changed is not announced here: it
+    // went out as it happened, through the progress bridge, between the call that made it and
+    // that call's result.
     held.refresh(&session);
-    let goal_after = held.goal.borrow().clone();
     drop(session);
     held.busy.set(false);
-    if goal_after != goal_before {
-        broadcast_awaited(held, Frame::Goal { goal: goal_after }, None).await;
-    }
     broadcast_end(held, ending).await;
 }
 
@@ -1343,6 +1336,19 @@ impl Progress for Broadcast<'_> {
 
     fn cancelled(&self) -> bool {
         self.held.stop.get()
+    }
+
+    /// Tells every viewer the model changed the goal, where in the turn it did.
+    ///
+    /// Pushed like the tool frames it sits between, and recorded in the backlog with them, so a
+    /// client that attaches later in the turn reads it in the same place a replay of the log
+    /// puts it. The cache is moved too: it is what an attachment and a status read are answered
+    /// from, and a cache that waited for the turn to end would answer both with the goal the
+    /// backlog it came with had already replaced.
+    fn goal_changed(&mut self, goal: Option<&Goal>) {
+        let goal = goal.map(wire_goal);
+        self.held.goal.borrow_mut().clone_from(&goal);
+        self.push(&Frame::Goal { goal });
     }
 
     /// Reports that this step's prompt had part of the conversation dropped.
@@ -1785,7 +1791,7 @@ async fn set_model(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, model:
             "no such model: {model} — this agent offers {}",
             registry.agent.models().join(", ")
         );
-        send(frames, Frame::Failed { message }).await;
+        send(frames, Frame::Refused { message }).await;
         return;
     }
     // The model belongs to the agent rather than to the session, exactly as the approval state
@@ -1874,8 +1880,8 @@ async fn apply_goal(
     // running turn needs to refuse. Refusing it did worse than inconvenience — an interface reads
     // a `Failed` as the end of the turn in front of it, so a status read typed during the
     // reader's own turn dismissed an open approval and sent the next queued prompt into a busy
-    // session. What the cache holds is the goal as of the last turn or change: a change the model
-    // makes mid-turn is broadcast when that turn ends.
+    // session. The cache moves with every change, the model's mid-turn ones included, so a read
+    // answered from it is the goal as the log has it.
     if action == GoalAction::Status {
         let goal = held.goal.borrow().clone();
         send(frames, Frame::Goal { goal }).await;
@@ -1893,7 +1899,7 @@ async fn apply_goal(
     if held.busy.replace(true) {
         send(
             frames,
-            Frame::Failed {
+            Frame::Refused {
                 message: String::from(
                     "a turn is running in this session; the goal can be changed when it is idle",
                 ),
@@ -1912,7 +1918,7 @@ async fn apply_goal(
         // approval state already follow, here at the granularity of a session.
         GoalAnswer::Changed(goal) => broadcast_awaited(held, Frame::Goal { goal }, None).await,
         GoalAnswer::Unchanged(goal) => send(frames, Frame::Goal { goal }).await,
-        GoalAnswer::Refused(message) => send(frames, Frame::Failed { message }).await,
+        GoalAnswer::Refused(message) => send(frames, Frame::Refused { message }).await,
     }
 }
 
@@ -2028,7 +2034,7 @@ fn transition(outcome: Result<Goal, nanus_domain::DomainError>) -> Result<Option
 ///
 /// Three refusals, each named: a provider this build does not offer, an agent with no composition
 /// behind it, and a provider with no credential. A missing *key* is [`Frame::NoCredential`] rather
-/// than a [`Frame::Failed`] because it is the one refusal a reader can act on, and the interface
+/// than a [`Frame::Refused`] because it is the one refusal a reader can act on, and the interface
 /// turns it into the question of whether to store a key; a missing *authorization* starts the flow
 /// instead, since there is nothing for the reader to type until the service hands back a token.
 async fn set_provider(
@@ -2040,7 +2046,7 @@ async fn set_provider(
     let Some(name) = Provider::parse(provider) else {
         send(
             frames,
-            Frame::Failed {
+            Frame::Refused {
                 message: format!(
                     "unknown provider: {provider} — this build offers {}",
                     Provider::names().join(", ")
@@ -2053,7 +2059,7 @@ async fn set_provider(
     let Some(switch) = registry.agent.switch() else {
         send(
             frames,
-            Frame::Failed {
+            Frame::Refused {
                 message: String::from("this agent cannot change provider"),
             },
         )
@@ -2066,7 +2072,7 @@ async fn set_provider(
         // reached with a key gets the question the interface turns into a masked field.
         if name.credential_is_oauth(plan) {
             if let Err(message) = authorize(&switch, frames, name, plan).await {
-                send(frames, Frame::Failed { message }).await;
+                send(frames, Frame::Refused { message }).await;
                 return;
             }
         } else {
@@ -2104,7 +2110,7 @@ async fn set_provider(
         Err(error) => {
             send(
                 frames,
-                Frame::Failed {
+                Frame::Refused {
                     message: error.to_string(),
                 },
             )
@@ -2116,7 +2122,7 @@ async fn set_provider(
 /// Files a credential for a provider's plan.
 ///
 /// The key is written and never echoed: neither the acknowledgement nor any frame carries it back.
-/// A failure is a [`Frame::Failed`] naming the provider, and success is silent because the
+/// A failure is a [`Frame::Refused`] naming the provider, and success is silent because the
 /// interface's next move is to try the switch again, whose own answer is the one that matters.
 async fn set_credential(
     registry: &Rc<Registry>,
@@ -2128,7 +2134,7 @@ async fn set_credential(
     let Some(name) = Provider::parse(provider) else {
         send(
             frames,
-            Frame::Failed {
+            Frame::Refused {
                 message: format!("unknown provider: {provider}"),
             },
         )
@@ -2138,7 +2144,7 @@ async fn set_credential(
     let Some(switch) = registry.agent.switch() else {
         send(
             frames,
-            Frame::Failed {
+            Frame::Refused {
                 message: String::from("this agent cannot store a credential"),
             },
         )
@@ -2148,7 +2154,7 @@ async fn set_credential(
     if let Err(error) = switch.set_credential(name, plan, key).await {
         send(
             frames,
-            Frame::Failed {
+            Frame::Refused {
                 message: error.to_string(),
             },
         )
@@ -2498,6 +2504,51 @@ mod tests {
     /// provider is what the file records, and it records the agent's whole selection — not only
     /// the field that moved — because a model without the provider it belongs to is not a
     /// default anything could resolve.
+    /// Every goal action that needs a goal is refused without one, and every transition the
+    /// domain refuses is refused here with its sentence — never applied, never a panic. The other
+    /// direction: the same actions on a goal that can take them are applied.
+    #[test]
+    fn a_goal_action_is_refused_by_name_when_it_cannot_apply() {
+        for (action, expected) in [
+            (GoalAction::Pause, "no goal to pause"),
+            (GoalAction::Resume, "no goal to resume"),
+            (GoalAction::Complete { note: None }, "no goal to complete"),
+            (GoalAction::Abandon { note: None }, "no goal to abandon"),
+        ] {
+            let refused = next_goal(None, action, 2_000).expect_err("nothing to act on");
+            assert!(refused.contains(expected), "{refused}");
+        }
+        let blank = GoalAction::Set {
+            objective: String::from("   "),
+        };
+        assert!(next_goal(None, blank, 2_000).is_err(), "a blank objective");
+        let oversized = GoalAction::Set {
+            objective: "x".repeat(nanus_domain::GOAL_OBJECTIVE_MAX_CHARS.saturating_add(1)),
+        };
+        assert!(
+            next_goal(None, oversized, 2_000).is_err(),
+            "an oversized one"
+        );
+
+        let active = Goal::new("ship the notes", 1_000).expect("a goal");
+        let done = active.completed(None, 1_500).expect("completes");
+        assert!(
+            next_goal(Some(&done), GoalAction::Pause, 2_000).is_err(),
+            "a completed goal cannot be paused"
+        );
+
+        let paused = next_goal(Some(&active), GoalAction::Pause, 2_000)
+            .expect("an active goal pauses")
+            .expect("and is still a goal");
+        assert_eq!(paused.phase(), GoalPhase::Paused);
+        assert_eq!(
+            next_goal(Some(&paused), GoalAction::Pause, 3_000),
+            Ok(Some(paused.clone())),
+            "pausing a paused goal is the same goal, which the caller does not record"
+        );
+        assert_eq!(next_goal(Some(&paused), GoalAction::Clear, 3_000), Ok(None));
+    }
+
     #[test]
     fn a_remembered_selection_names_the_whole_choice_it_was_left_in() {
         let dir = tempfile::tempdir().expect("temp dir");

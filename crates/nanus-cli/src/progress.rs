@@ -128,6 +128,25 @@ impl Progress for StderrProgress {
         }
     }
 
+    fn goal_changed(&mut self, goal: Option<&nanus_domain::Goal>) {
+        // With the tool lines, because it is what a goal tool call did: a reader following the
+        // calls sees the objective move where the call that moved it ran.
+        if self.tools {
+            let line = goal.map_or_else(
+                || String::from("no goal is set"),
+                |goal| {
+                    format!(
+                        "{} (rev {}): {}",
+                        goal.phase(),
+                        goal.revision(),
+                        goal.objective()
+                    )
+                },
+            );
+            Self::note(&format!("nanus: goal {line}"));
+        }
+    }
+
     fn usage(&mut self, usage: &Usage) {
         if self.tools {
             Self::note(&format!(

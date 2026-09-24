@@ -101,6 +101,13 @@ is on the mechanism side.
 
 Clearing a goal — removing the objective outright — is deliberately **not** among them.
 It is the person's decision, and it lives in the interface's `/goal clear`.
+
+They are also **not put to the approval gate**, under any sandbox or approval state. The gate
+guards what a tool can do to the workspace and the machine, and a goal call does neither: it
+changes a record in the session the agent already holds. A person who wants to overrule the
+model's goal does it with `/goal`, and every change the model makes is drawn as a notice. A
+tool registered through the published registry under one of these five names is not offered
+— the loop would run the goal tool for a call by that name anyway — and a warning names it.
 See [the toolset](../crates/nanus-bundle/src/tools/mod.rs).
 
 ### What a request costs before the conversation

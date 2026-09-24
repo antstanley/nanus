@@ -15,8 +15,9 @@
 //!
 //! ## The lifecycle
 //!
-//! [`GoalPhase::Active`] is a goal being pursued, [`GoalPhase::Paused`] one a
-//! person has suspended, [`GoalPhase::Complete`] one whose objective is achieved,
+//! [`GoalPhase::Active`] is a goal being pursued, [`GoalPhase::Paused`] one that has
+//! been suspended — by a person with `/goal pause`, or by the model when the work cannot
+//! go on for now — [`GoalPhase::Complete`] one whose objective is achieved,
 //! and [`GoalPhase::Abandoned`] one given up on without achieving it. Every change
 //! bumps the [`Goal::revision`], which is what lets two clients that edited the
 //! same goal be told apart without a lock: the log is append-only, so a change is
@@ -40,10 +41,18 @@ use crate::error::DomainError;
 
 /// The largest number of characters an objective may hold.
 ///
-/// The objective is replayed into future prompts, so it is bounded the way every
-/// other model-visible string is: an unbounded one is a way to spend a context
-/// window on a single instruction.
+/// The objective is not put into the prompt, but it is handed back to the model on every
+/// `get_goal` and every goal tool result, and drawn on every goal notice, so it is bounded
+/// the way every other model-visible string is: an unbounded one is a way to spend a
+/// context window on a single instruction.
 pub const GOAL_OBJECTIVE_MAX_CHARS: usize = 4_000;
+
+/// The largest number of characters a note — a reason, or evidence of completion — may hold.
+///
+/// Bounded for the same reason and to the same size as the objective: a note travels
+/// everywhere the objective does, and the evidence a model offers for completion is the
+/// string most tempted to grow into a pasted log.
+pub const GOAL_NOTE_MAX_CHARS: usize = GOAL_OBJECTIVE_MAX_CHARS;
 
 /// Where a goal is in its lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,7 +60,7 @@ pub const GOAL_OBJECTIVE_MAX_CHARS: usize = 4_000;
 pub enum GoalPhase {
     /// Being pursued.
     Active,
-    /// Suspended by a person; not continued.
+    /// Suspended, by a person or by the model; not continued until it is resumed.
     Paused,
     /// The objective is achieved.
     Complete,
@@ -73,7 +82,7 @@ impl GoalPhase {
 
     /// Returns `true` when a goal in this phase may still be worked on.
     ///
-    /// Only [`GoalPhase::Active`] is open: a paused goal waits for a person, and a
+    /// Only [`GoalPhase::Active`] is open: a paused goal waits to be resumed, and a
     /// terminal one is answered.
     #[must_use]
     pub const fn is_open(self) -> bool {
@@ -206,7 +215,7 @@ impl Goal {
         })
     }
 
-    /// Returns a copy suspended, waiting for a person to resume it.
+    /// Returns a copy suspended, waiting to be resumed.
     ///
     /// `note` is why, when a reason was given. Resuming clears it, because a reason for
     /// stopping is not a fact about a goal that is running again.
@@ -214,7 +223,8 @@ impl Goal {
     /// # Errors
     ///
     /// Returns [`DomainError::Validation`] when the goal is terminal, because a
-    /// goal that has been achieved or given up on is not something to pause.
+    /// goal that has been achieved or given up on is not something to pause, or when
+    /// the note is longer than [`GOAL_NOTE_MAX_CHARS`].
     pub fn paused(&self, note: Option<String>, now_ms: u64) -> Result<Self, DomainError> {
         self.transitioned(GoalPhase::Paused, now_ms, note)
     }
@@ -233,7 +243,8 @@ impl Goal {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::Validation`] when the goal is already terminal.
+    /// Returns [`DomainError::Validation`] when the goal is already terminal, or when
+    /// the note is longer than [`GOAL_NOTE_MAX_CHARS`].
     pub fn completed(&self, note: Option<String>, now_ms: u64) -> Result<Self, DomainError> {
         self.transitioned(GoalPhase::Complete, now_ms, note)
     }
@@ -246,7 +257,8 @@ impl Goal {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::Validation`] when the goal is already terminal.
+    /// Returns [`DomainError::Validation`] when the goal is already terminal, or when
+    /// the note is longer than [`GOAL_NOTE_MAX_CHARS`].
     pub fn abandoned(&self, note: Option<String>, now_ms: u64) -> Result<Self, DomainError> {
         self.transitioned(GoalPhase::Abandoned, now_ms, note)
     }
@@ -271,6 +283,9 @@ impl Goal {
                 ),
             ));
         }
+        if let Some(note) = &note {
+            validate_note(note)?;
+        }
         if self.phase == phase {
             return Ok(self.clone());
         }
@@ -289,6 +304,22 @@ impl fmt::Display for Goal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.objective, self.phase)
     }
+}
+
+/// Checks that a note fits within [`GOAL_NOTE_MAX_CHARS`].
+///
+/// # Errors
+///
+/// Returns [`DomainError::Validation`] naming the length when it does not.
+fn validate_note(note: &str) -> Result<(), DomainError> {
+    let length = note.chars().count();
+    if length > GOAL_NOTE_MAX_CHARS {
+        return Err(DomainError::validation(
+            "goal",
+            format!("a note holds at most {GOAL_NOTE_MAX_CHARS} characters, not {length}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Trims and checks an objective, returning the text to store.
@@ -325,6 +356,27 @@ mod tests {
     fn goal() -> Goal {
         Goal::new("ship the release notes", 1_000)
             .unwrap_or_else(|error| panic!("test goal: {error}"))
+    }
+
+    /// A note is bounded like the objective, because it travels everywhere the objective does:
+    /// evidence of completion is the string most tempted to become a pasted log.
+    #[test]
+    fn a_note_longer_than_the_bound_is_refused_and_one_at_it_is_kept() {
+        let at_bound = "n".repeat(GOAL_NOTE_MAX_CHARS);
+        let kept = goal()
+            .completed(Some(at_bound.clone()), 2_000)
+            .unwrap_or_else(|error| panic!("a note at the bound is kept: {error}"));
+        assert_eq!(kept.note(), Some(at_bound.as_str()));
+
+        let over = "n".repeat(GOAL_NOTE_MAX_CHARS.saturating_add(1));
+        for refused in [
+            goal().paused(Some(over.clone()), 2_000),
+            goal().completed(Some(over.clone()), 2_000),
+            goal().abandoned(Some(over), 2_000),
+        ] {
+            let message = refused.map(|_| ()).unwrap_err().to_string();
+            assert!(message.contains("at most"), "{message}");
+        }
     }
 
     #[test]

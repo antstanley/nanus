@@ -290,6 +290,8 @@ struct GatedStore {
     entered: Arc<tokio::sync::Semaphore>,
     /// Awaited by an armed save before it writes.
     release: Arc<tokio::sync::Semaphore>,
+    /// Whether every save fails, as a full disk would, for as long as it is set.
+    refusing: Rc<std::cell::Cell<bool>>,
 }
 
 impl StorePort for GatedStore {
@@ -301,6 +303,12 @@ impl StorePort for GatedStore {
             if self.armed.replace(false) {
                 self.entered.add_permits(1);
                 let _permit = self.release.acquire().await;
+            }
+            if self.refusing.get() {
+                return Err(nanus_ports::StoreError::Io {
+                    path: std::path::PathBuf::from("sessions"),
+                    message: String::from("no space left on device"),
+                });
             }
             self.inner.save(session).await
         })
@@ -378,6 +386,8 @@ struct Gate {
     entered: Arc<tokio::sync::Semaphore>,
     /// Given to let the held save write.
     release: Arc<tokio::sync::Semaphore>,
+    /// Set to make every save fail until it is cleared.
+    refusing: Rc<std::cell::Cell<bool>>,
 }
 
 /// Builds a scripted agent that records through a [`GatedStore`], and the gate that holds it.
@@ -386,6 +396,7 @@ fn save_gated_agent(dir: &Path) -> (Agent, StoreHandle, Gate) {
         armed: Rc::new(std::cell::Cell::new(false)),
         entered: Arc::new(tokio::sync::Semaphore::new(0)),
         release: Arc::new(tokio::sync::Semaphore::new(0)),
+        refusing: Rc::new(std::cell::Cell::new(false)),
     };
     let inner = nanus_kernel::runtime::block_on(async {
         JsonlStore::new(dir.to_path_buf())
@@ -398,6 +409,7 @@ fn save_gated_agent(dir: &Path) -> (Agent, StoreHandle, Gate) {
         armed: Rc::clone(&gate.armed),
         entered: Arc::clone(&gate.entered),
         release: Arc::clone(&gate.release),
+        refusing: Rc::clone(&gate.refusing),
     }));
     let (agent, store) = agent_with_store(dir, Rc::new(Box::new(ScriptedLlm)), "scripted", store);
     (agent, store, gate)
@@ -760,7 +772,11 @@ fn a_model_switch_reaches_the_agent_and_is_answered() {
             .expect("the request is sent");
         let refused = loop {
             match client.next().await.expect("frames are readable") {
-                Some(Frame::Failed { message }) => break message,
+                // A refusal of a request that is not a prompt ends no turn, so it is not `Failed`.
+                Some(Frame::Refused { message }) => break message,
+                Some(Frame::Failed { message }) => {
+                    panic!("a refusal is not a turn ending: {message}")
+                }
                 Some(_) => {}
                 None => break String::new(),
             }
@@ -3010,7 +3026,7 @@ fn a_goal_change_is_refused_during_a_turn_and_a_read_is_answered() {
             .expect("the goal request is sent");
         let refused = loop {
             match client.next().await.expect("frames are readable") {
-                Some(Frame::Failed { message }) => break message,
+                Some(Frame::Refused { message }) => break message,
                 Some(frame) if frame.is_end_of_turn() => break String::new(),
                 Some(_) => {}
                 None => break String::new(),
@@ -3026,7 +3042,7 @@ fn a_goal_change_is_refused_during_a_turn_and_a_read_is_answered() {
         let read = loop {
             match client.next().await.expect("frames are readable") {
                 Some(Frame::Goal { goal }) => break Ok(goal),
-                Some(frame @ Frame::Failed { .. }) => break Err(frame),
+                Some(frame @ Frame::Refused { .. }) => break Err(frame),
                 Some(frame) if frame.is_end_of_turn() => break Err(frame),
                 Some(_) => {}
                 None => break Err(Frame::Bye),
@@ -3159,6 +3175,77 @@ fn a_goal_change_holds_the_session_against_another_viewers_prompt() {
         stored.goal().map(|goal| goal.objective().to_owned()),
         objective,
         "the turn that ran afterwards kept the goal in the log"
+    );
+}
+
+/// A goal change the store refuses is not applied: the agent saves before it swaps the held
+/// session, so a failed write leaves the goal as it was — in memory and on disk — and says why.
+/// The other direction: once the store writes again, the same change goes through.
+#[test]
+fn a_goal_change_the_store_refuses_leaves_the_goal_unchanged() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store, gate) = save_gated_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let outcome = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let session = client.start(None).await.expect("a session starts");
+        let set = |objective: &str| GoalAction::Set {
+            objective: objective.to_owned(),
+        };
+        let _ = ask_goal(&mut client, set("the first objective")).await;
+
+        gate.refusing.set(true);
+        client
+            .send(&Request::Goal {
+                action: set("the second objective"),
+            })
+            .await
+            .expect("the goal request is sent");
+        let refused = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::Refused { message }) => break message,
+                Some(Frame::Goal { goal }) => panic!("a refused write was announced: {goal:?}"),
+                Some(_) => {}
+                None => break String::new(),
+            }
+        };
+        let kept = ask_goal(&mut client, GoalAction::Status).await;
+        gate.refusing.set(false);
+        let retried = ask_goal(&mut client, set("the second objective")).await;
+
+        let stored = store
+            .load(&SessionId::new(session.session))
+            .await
+            .expect("the session was recorded");
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        (refused, kept, retried, stored)
+    });
+    let (refused, kept, retried, stored) = outcome;
+
+    assert!(refused.contains("could not be recorded"), "{refused}");
+    assert_eq!(
+        kept.map(|goal| goal.objective),
+        Some(String::from("the first objective")),
+        "the refused change was not applied in memory"
+    );
+    assert_eq!(
+        retried.map(|goal| goal.objective),
+        Some(String::from("the second objective")),
+        "and the session was not left reserved"
+    );
+    assert_eq!(
+        stored.goal().map(|goal| goal.objective().to_owned()),
+        Some(String::from("the second objective"))
     );
 }
 

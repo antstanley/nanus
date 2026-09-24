@@ -203,6 +203,7 @@ pub enum GoalAction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
+    /// Start a session and attach this connection to it.
     ///
     /// Replaces whatever the connection was attached to. Naming it is optional, and a
     /// name that is already taken is refused rather than moved: an alias silently
@@ -522,7 +523,7 @@ pub enum Frame {
 
     /// A provider switch could not go ahead because no credential is configured.
     ///
-    /// A separate frame rather than a [`Frame::Failed`] because it is the prompt that leads to the
+    /// A separate frame rather than a [`Frame::Refused`] because it is the prompt that leads to the
     /// interface asking for a key: matching the text of a refusal to decide whether to offer that
     /// would be guessing at a sentence.
     NoCredential {
@@ -540,7 +541,7 @@ pub enum Frame {
     ///
     /// Sent when a plan is reached with an OAuth authorization and none is stored: the interface
     /// shows the page and the code, and the agent polls the service until the user finishes. A
-    /// [`Frame::ProviderChanged`] follows on success, a [`Frame::Failed`] on failure — there is no
+    /// [`Frame::ProviderChanged`] follows on success, a [`Frame::Refused`] on failure — there is no
     /// reply the client sends, because the authorization is the service's to confirm.
     AuthPrompt {
         /// The provider being authorized.
@@ -689,8 +690,21 @@ pub enum Frame {
         reason: TurnEnd,
     },
 
-    /// The turn failed.
+    /// The turn failed — or the turn a client asked for never started, or the connection stopped
+    /// following the session. Either way, whatever turn the client was showing is over.
     Failed {
+        /// The rendered reason, already user-facing.
+        message: String,
+    },
+
+    /// A request was refused, and nothing about any turn changed.
+    ///
+    /// The answer to a request that is not a prompt — a model, provider, credential, or goal
+    /// change the agent will not make. Separate from [`Frame::Failed`] because a client reads
+    /// `Failed` as the end of the turn in front of it: a refused model switch sent while a turn
+    /// ran used to dismiss the turn's open approval and send the next queued prompt into a
+    /// session that was still busy. A `Refused` is only a sentence to show.
+    Refused {
         /// The rendered reason, already user-facing.
         message: String,
     },
@@ -766,7 +780,11 @@ impl Frame {
 /// [`GoalAction`], and [`GoalState`] — so a client or agent from before that cannot
 /// read the other's goal frames: an older peer meets an unknown variant as a decode
 /// error naming a field, which is exactly the misread this moves for.
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// Version 9 added [`Frame::Refused`], and moved the refusals of non-prompt requests onto it:
+/// an older client would read it as a decode error, and an older agent sends those refusals as
+/// [`Frame::Failed`], which a newer client would read as a turn ending.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -1449,6 +1467,18 @@ mod tests {
         }
     }
 
+    /// A refusal survives the wire as a refusal, so a client cannot read it as a turn ending.
+    #[test]
+    fn a_refusal_round_trips_as_itself() {
+        let frame = Frame::Refused {
+            message: "no such model: x".to_owned(),
+        };
+        let encoded = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
+        let decoded = decode::<Frame>(&encoded).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(decoded, frame);
+        assert!(!decoded.is_end_of_turn());
+    }
+
     #[test]
     fn only_done_and_failed_end_a_turn() {
         assert!(
@@ -1466,5 +1496,12 @@ mod tests {
         );
         assert!(!Frame::Bye.is_end_of_turn());
         assert!(!Frame::Step { step: 1 }.is_end_of_turn());
+        assert!(
+            !Frame::Refused {
+                message: String::new()
+            }
+            .is_end_of_turn(),
+            "a refused request ends no turn"
+        );
     }
 }

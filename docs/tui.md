@@ -118,6 +118,14 @@ sentence naming both, and a build too old to send a version reads as version zer
 rather than assumed compatible. `nanus service status` prints the version the running agent
 reported.
 
+**A refusal is not an ending.** `failed` ends the turn a client is showing — the turn failed,
+the prompt it sent was refused, or the connection stopped following the session — and the
+interface closes its view of the turn on it, taking an open approval with it and letting the
+queue go. A request that is *not* a prompt — a model, provider, credential, or goal change the
+agent will not make — is answered with `refused` instead, which is a sentence and nothing else.
+Before protocol version 9 both were `failed`, so a model switch refused mid-turn dismissed the
+turn's approval dialog and sent the next queued prompt into a session that was still busy.
+
 **A tool call outside the sandbox is decided by whoever is watching.** When the loop
 reaches a call the sandbox does not already permit and the state does not grant it — `per
 call` grants nothing, and `permitted calls` grants the non-destructive ones — the agent
@@ -439,9 +447,11 @@ agent. A status read is answered during a turn, with the goal as of the last cha
 person types: it is data the session remembers, not an instruction the model is given.
 
 The *model* can read and move the same goal, through five tools the loop runs itself:
-`get_goal`, `create_goal`, `update_goal`, `pause_goal`, and `abandon_goal`. So a change a
-reader makes with `/goal` is visible to the model on its next step, and a change the model
-makes appears in the transcript as the same notice. Two things the model may not do: clear
+`get_goal`, `create_goal`, `update_goal`, `pause_goal`, and `abandon_goal`. The goal is not
+put into the prompt, so a change a reader makes with `/goal` reaches the model the next time
+it reads the goal; a change the model makes appears in the transcript as the same notice, at
+the point in the turn it was made — between the call that made it and that call's result,
+which is where a replay of the log draws it too. Two things the model may not do: clear
 the goal (that is `/goal clear`), and complete one without saying what it checked — the
 `evidence` argument is required. See [the toolset](features.md#the-goal-tools).
 
