@@ -270,10 +270,19 @@ than advice.
 These are load-bearing; changing them means changing the tests and usually the
 design docs too.
 
-- **Exactly seven tools:** `read`, `write`, `edit`, `read_image`, `glob`, `grep`,
-  `bash`. There are assertions on this count and on the name list in
+- **Exactly seven registered tools:** `read`, `write`, `edit`, `read_image`, `glob`,
+  `grep`, `bash`. There are assertions on this count and on the name list in
   `nanus-bundle`. The count is a design decision (see `docs/design.md`), not an
   accident.
+- **Exactly five goal tools, offered beside them and *not* registered:**
+  `get_goal`, `create_goal`, `update_goal`, `pause_goal`, `abandon_goal`. Their
+  effect is a `goal/change` record in the session log, which a `'static` tool
+  executor cannot reach, so `nanus-bundle/src/agent_loop.rs` runs them itself and
+  `nanus-bundle/src/goal_tools.rs` holds the pure half. They are offered with the
+  registered set and counted with it; the one place the two lists meet is
+  `AgentRunner`, which sends the schemas and advertises the count. A test asserts
+  no name is in both lists, and another that a goal tool call reaches the session
+  log.
 - **Wire allowlist:** only a tool's `name`, `description`, and `parameters` may be
   serialised to the model. The executable half of a `ToolDefinition` is not
   `Serialize`, so this is a type-level guarantee; a test asserts the serialised

@@ -400,6 +400,7 @@ than sending it to the model.
 | `/model [id]` | open the model selector, or switch to the one named |
 | `/effort [step]` | open the effort chooser, or switch to the step named |
 | `/provider [name]` | open the provider chooser, or switch to the provider named |
+| `/goal [objective\|status\|pause\|resume\|complete\|clear]` | read, set, or move the session's goal |
 | `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
@@ -420,6 +421,25 @@ transcript still has a keyboard. `/help` opens the same overlay `?` does rather 
 list that says almost the same thing. `/clear` empties the transcript and nothing else — the
 draft in the composer and the two summary toggles are about what the reader is doing now, and
 `Ctrl+L` already means exactly this.
+
+`/goal` is the one command that has to reach the agent rather than being answered on the
+screen. A goal is *session state* — a durable objective the conversation carries — and a
+session belongs to the agent, so the interface cannot change it: the command sends a
+`goal` request and the agent answers with a `goal` frame, which the interface writes into the
+transcript as its own notice. A bare `/goal` (or `/goal status`) reads the current objective,
+`/goal pause`, `/goal resume`, `/goal complete [reason]`, and `/goal clear` move its lifecycle,
+and anything else is an objective to set — `/goal reduce p95 latency below 120 ms`. The words
+are reserved, so an objective that is exactly one of them has to be phrased as a sentence. A
+goal change is refused while a turn is running, because the turn owns the session, and refused
+in a recording, which has no agent. The objective is trusted no further than any other text a
+person types: it is data the session remembers, not an instruction the model is given.
+
+The *model* can read and move the same goal, through five tools the loop runs itself:
+`get_goal`, `create_goal`, `update_goal`, `pause_goal`, and `abandon_goal`. So a change a
+reader makes with `/goal` is visible to the model on its next step, and a change the model
+makes appears in the transcript as the same notice. Two things the model may not do: clear
+the goal (that is `/goal clear`), and complete one without saying what it checked — the
+`evidence` argument is required. See [the toolset](features.md#the-goal-tools).
 
 Nothing else is a command yet, and an unrecognised one is not sent to the model: it is
 named in the transcript along with the commands that do exist, because a typo should say so

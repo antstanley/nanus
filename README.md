@@ -4,7 +4,8 @@
 
 **A coding agent you can take apart.**
 
-Eleven crates of safe Rust. A seven-tool toolset. Everything the agent runs on — the
+Eleven crates of safe Rust. A seven-tool toolset, plus five goal tools the loop runs
+itself. Everything the agent runs on — the
 filesystem, the shell, the session log, the model adapter, and the tool registry — is a
 plugin you can remove, replace, or write yourself, and the loop over them is built from
 the handles they publish.
@@ -58,7 +59,7 @@ That gives you three things that are hard to get any other way:
 `LlmPort`. Four providers ship — DeepSeek, z.ai (its API and a coding plan with a key
 of its own), Anthropic, and OpenAI (its API and a `ChatGPT` subscription authorized
 over OAuth) — and they are *selected*, not compiled in: one line in the
-configuration, and the seven tools never learn about it. Switch provider, model, or
+configuration, and the tools never learn about it. Switch provider, model, or
 reasoning effort while the interface is open and that becomes the default the next start
 begins from — see
 [what the next start begins from](docs/features.md#what-the-next-start-begins-from).
@@ -67,8 +68,9 @@ begins from — see
 `ToolExecutor`. Add one and its schema joins the prompt automatically. Remove one and it
 stops existing, with no dead description left in every request.
 
-That cut is a real saving, because every tool is paid for on every request. The seven
-schemas plus the default system prompt come to roughly **1,400 estimated tokens before the
+That cut is a real saving, because every tool is paid for on every request. The twelve
+schemas — seven registered and five goal tools — plus the default system prompt come to
+roughly **2,000 estimated tokens before the
 first human word** — and the schemas ride outside the `context_budget` accounting
 altogether. See
 [what a request costs](docs/features.md#what-a-request-costs-before-the-conversation).
@@ -251,7 +253,8 @@ $ cargo test --workspace --doc
 
 `unsafe` appears nowhere — every crate forbids it *and* the workspace denies it, because
 the manifest lint alone does not cover doctests. For what that buys you, why the toolset is
-exactly seven tools, how the crates fit together, and the two bugs verification caught that
+exactly seven registered tools, how the crates fit together, and the two bugs verification
+caught that
 reasoning did not, see [**the documentation**](docs/).
 
 ## Acknowledgements

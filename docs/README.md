@@ -5,7 +5,7 @@ run it. Everything below is the detail behind that pitch.
 
 ## [Features](features.md)
 
-A map of what the harness supports today — the three modes, the seven tools, the four
+A map of what the harness supports today — the three modes, the twelve tools, the four
 providers and their plans, the credential stores, the request controls, sessions,
 configuration, the command line, the interface, the service, the link, the kernel, and
 what is deliberately not covered — each with a link to the page that explains it.

@@ -52,6 +52,17 @@ model must choose between — the shipped seven are about 1,200 estimated tokens
 wire, on every request ([measured](features.md#what-a-request-costs-before-the-conversation)).
 A tool earns its place by being irreplaceable, not by being convenient.
 
+Beside them are five more the model is offered: `get_goal` · `create_goal` · `update_goal`
+· `pause_goal` · `abandon_goal`. The rule above is not relaxed for them — no shell command
+can mutate a session's durable objective, so each is a mechanism in the same sense. They
+are *not registered*, and the split is structural rather than stylistic: their effect is a
+record in the session log, and a tool executor is `'static`, so it cannot borrow the session
+a turn holds. The agent loop runs them itself. The count that is the design is the count of
+tools the registry dispatches; the goal tools are the loop's own and are offered with them,
+and the two lists meet in exactly one place — the runner, which sends the schemas and
+advertises the count. What they may *not* do is clear a goal: removing the objective is the
+person's decision, and `/goal clear` is where it lives.
+
 ### Only three fields of a tool can reach the model
 
 A tool's `name`, `description`, and `parameters` may be serialised into a request. Its

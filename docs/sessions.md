@@ -13,10 +13,10 @@ nanus sessions name project-x 01a09a98…         # or rename it later
 
 ## What a session is
 
-An append-only log of events — turns, messages, tool calls and their results — plus the
-identity of the conversation: a store key, a creation time, the directory it ran in, and the
-harness configuration it ran under. It is the only copy. Everything a client shows is derived
-from it, which is why the agent records before it answers and why a transcript is
+An append-only log of events — turns, messages, tool calls and their results, and the session's
+goal — plus the identity of the conversation: a store key, a creation time, the directory it ran
+in, and the harness configuration it ran under. It is the only copy. Everything a client shows
+is derived from it, which is why the agent records before it answers and why a transcript is
 reproducible rather than reconstructed.
 
 ```text
@@ -241,6 +241,7 @@ A session is the agent's; a client's view of it is a handful of frames.
 | `User` | Somebody asked something, sent to every view but the one that asked. |
 | `Text`, `Reasoning`, `Step`, `Tool`, `ToolDone`, `Usage` | The turn, as it happens. |
 | `Approval` | A call outside the sandbox needs a decision; the client answers with an `approve` request. |
+| `Goal` | The session's durable objective, or its absence: sent on attaching to a session that has one, on every change, and in answer to a `goal` request. |
 | `Done`, `Failed` | How it ended. |
 
 Deliberately not a session log. A client that wants the conversation reads it from the

@@ -62,7 +62,7 @@ that runs a turn.
 
 ## The toolset
 
-Exactly seven tools, and the count is the design: each is a mechanism a shell
+Seven *registered* tools, and the count is the design: each is a mechanism a shell
 cannot provide as well, not a convenience wrapper. See
 [design decisions](design.md#seven-tools-and-the-count-is-the-design).
 
@@ -78,12 +78,36 @@ cannot provide as well, not a convenience wrapper. See
 
 Only a tool's `name`, `description`, and `parameters` may reach the model; the
 executable half is not serialisable, so the allowlist is carried by the types.
+
+### The goal tools
+
+Five more, offered with the seven and dispatched by the loop rather than the registry:
+
+| Tool | What it does |
+|---|---|
+| `get_goal` | Reads the session's durable objective — its text, whether it is active, paused, complete, or abandoned, and any note on it. |
+| `create_goal` | Creates a goal for work that will not fit in one turn, from an objective stated as an outcome. Refused while an open goal exists, so a second create cannot silently drop the first. |
+| `update_goal` | Gives the goal a new objective, resumes it (`status: "active"`), or marks it complete (`status: "complete"`) — the last requiring `evidence` of what was checked. |
+| `pause_goal` | Suspends a goal that cannot be worked on now, with an optional reason. |
+| `abandon_goal` | Gives up on a goal that cannot be achieved, with a required reason. Terminal, and not completion: the objective was not met. |
+
+They are the one set that is **not registered**, because their effect is a `goal/change`
+record appended to the session log: a tool executor is `'static` and cannot borrow the
+session a turn holds, so the agent loop runs them itself — see
+[the goal](roadmap.md#shipped-the-goal). They are not a convenience wrapper
+either: no shell command can mutate a session's durable objective. The distinction the
+seven-tool rule defends is *irreplaceable mechanism versus convenience*, and a goal tool
+is on the mechanism side.
+
+Clearing a goal — removing the objective outright — is deliberately **not** among them.
+It is the person's decision, and it lives in the interface's `/goal clear`.
 See [the toolset](../crates/nanus-bundle/src/tools/mod.rs).
 
 ### What a request costs before the conversation
 
-The system prompt and all seven schemas are sent on **every** request — once per step of
-every turn — so there is a fixed floor before the first human word. Measured from the
+The system prompt and all twelve schemas — the seven registered tools and the five goal
+tools — are sent on **every** request, once per step of every turn, so there is a fixed
+floor before the first human word. Measured from the
 shipped defaults (`deepseek-flash`, `per_call`, `read_only`, 512 steps/turn) by
 serialising the schemas through the DeepSeek encoder:
 
@@ -93,8 +117,9 @@ serialising the schemas through the DeepSeek encoder:
 | `## Runtime` section (cwd, model, policy, sandbox) | 133 | ~33 |
 | Step-budget sentence | 274 | ~69 |
 | **System message, as the harness sizes it** | **844** | **215** |
-| The seven tool schemas, on the wire | 4,755 | ~1,188 |
-| **Total, every request** | **~5,599** | **~1,403** |
+| The seven registered tool schemas, on the wire | 4,755 | ~1,188 |
+| The five goal tool schemas, on the wire | 2,418 | ~605 |
+| **Total, every request** | **~8,017** | **~2,008** |
 
 | Tool | Estimated tokens |
 |---|---|
@@ -105,6 +130,11 @@ serialising the schemas through the DeepSeek encoder:
 | `bash` | ~166 |
 | `read` | ~151 |
 | `read_image` | ~90 |
+| `update_goal` | ~179 |
+| `abandon_goal` | ~121 |
+| `create_goal` | ~117 |
+| `pause_goal` | ~106 |
+| `get_goal` | ~81 |
 
 "Estimated" is the same approximation `context_budget` uses — characters over four, plus
 four tokens per message. Each row is rounded on its own, so they need not sum exactly: the
@@ -118,8 +148,9 @@ and budget sentence are appended to whatever replaces it.
 Two things follow, and both are recorded rather than hidden. The tool schemas are **not**
 charged to `context_budget`: the estimator folds messages, and the schemas ride in the
 request outside it, so the real prompt is larger than the budget accounts for. And the
-seven-tool limit is a cost decision as well as a design one — an eighth tool is roughly
-100–200 more estimated tokens in every request of every turn.
+seven-tool limit is a cost decision as well as a design one — an eighth *registered* tool
+is roughly 100–200 more estimated tokens in every request of every turn, which is part of
+why the goal tools are five and not fifteen.
 
 ## Model providers
 
@@ -386,8 +417,15 @@ supports:
   session's totals cover turns that ran before this interface opened. See
   [the interface](tui.md#commands).
 - **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, `/model`, `/effort`,
-  `/provider`, and `/copy`. Anything else is named in the transcript rather than sent to the
-  model.
+  `/provider`, `/goal`, and `/copy`. Anything else is named in the transcript rather than sent to
+  the model.
+- **A durable goal** (`/goal`): one objective per session, persisted in the session log, with a
+  lifecycle a person drives — `/goal <objective>` sets one, a bare `/goal` reads it, and
+  `pause`, `resume`, `complete`, `abandon`, and `clear` move it. It survives a resume, it is
+  shown to every client attached to the session, and the model can read and move it too; see
+  [the goal tools](#the-goal-tools). `/goal` is the one command that reaches the agent rather
+  than being answered on screen, because a session belongs to the agent. See
+  [the interface](tui.md#commands).
 - **The key list on screen** (`?`, or `/help`), scrolled from one table so a
   binding cannot be documented in one place and forgotten in another.
 - **Switching provider at runtime** (`/provider`): a chooser over the providers and plans the
