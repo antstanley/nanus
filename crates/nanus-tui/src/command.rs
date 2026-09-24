@@ -51,7 +51,8 @@ pub enum Command {
     /// A goal is a durable objective the session carries, so this is the one command that has to
     /// reach the agent rather than being answered on screen: the interface sends it and the agent
     /// answers. A bare `/goal` reads the current one, a lifecycle word (`pause`, `resume`,
-    /// `complete`, `done`, `abandon`, `clear`) moves it, and anything else is an objective to set.
+    /// `complete`, `done`, `abandon`, `clear`) on its own — or before a colon and a reason — moves
+    /// it, and anything else is an objective to set.
     Goal,
     /// Put the newest answer on the clipboard.
     ///

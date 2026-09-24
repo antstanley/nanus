@@ -880,7 +880,8 @@ impl AgentRunner {
     /// Runs one goal tool call, writing the change into the session log.
     ///
     /// The clock is read once per call, so two goal changes in one step are stamped in the
-    /// order they were made. Nothing is appended for a read, or for a call the domain refuses:
+    /// order they were made. Nothing is appended for a read, for a call the domain refuses, or
+    /// for a transition that left the goal as it was (pausing a goal already paused):
     /// a `goal/change` record *is* a change, and a call that changed nothing must not leave one.
     fn run_goal_tool(&self, session: &mut Session, call: &ToolCall) -> ToolResult {
         let applied = crate::goal_tools::run(session.goal().as_ref(), call, self.clock.now_ms());

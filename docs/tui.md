@@ -400,7 +400,7 @@ than sending it to the model.
 | `/model [id]` | open the model selector, or switch to the one named |
 | `/effort [step]` | open the effort chooser, or switch to the step named |
 | `/provider [name]` | open the provider chooser, or switch to the provider named |
-| `/goal [objective\|status\|pause\|resume\|complete\|clear]` | read, set, or move the session's goal |
+| `/goal [objective\|status\|pause\|resume\|done[: reason]\|abandon[: reason]\|clear]` | read, set, or move the session's goal |
 | `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
@@ -427,11 +427,15 @@ screen. A goal is *session state* — a durable objective the conversation carri
 session belongs to the agent, so the interface cannot change it: the command sends a
 `goal` request and the agent answers with a `goal` frame, which the interface writes into the
 transcript as its own notice. A bare `/goal` (or `/goal status`) reads the current objective,
-`/goal pause`, `/goal resume`, `/goal complete [reason]`, and `/goal clear` move its lifecycle,
-and anything else is an objective to set — `/goal reduce p95 latency below 120 ms`. The words
-are reserved, so an objective that is exactly one of them has to be phrased as a sentence. A
-goal change is refused while a turn is running, because the turn owns the session, and refused
-in a recording, which has no agent. The objective is trusted no further than any other text a
+`/goal pause`, `/goal resume`, `/goal done` (or `complete`), `/goal abandon`, and `/goal clear`
+move its lifecycle, and anything else is an objective to set — `/goal reduce p95 latency below
+120 ms`. A reason for finishing or giving up follows a colon: `/goal done: the benchmark is
+green`, `/goal abandon: the fixture cannot be fixed`. A lifecycle word acts only when it is the
+whole argument or the colon follows it, so `/goal clear out the flaky tests` sets that objective
+rather than clearing the goal; only an objective that is exactly one of the words has to be
+phrased as a sentence. A goal change is refused while a turn is running — by the interface
+itself, so the refusal cannot be mistaken for the turn ending — and in a recording, which has no
+agent. A status read is answered during a turn, with the goal as of the last change or turn. The objective is trusted no further than any other text a
 person types: it is data the session remembers, not an instruction the model is given.
 
 The *model* can read and move the same goal, through five tools the loop runs itself:

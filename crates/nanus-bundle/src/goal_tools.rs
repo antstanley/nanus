@@ -217,6 +217,15 @@ impl Applied {
         }
     }
 
+    /// A transition that left the goal as it was: nothing to record, and a result that says so.
+    fn unchanged(goal: &Goal) -> Self {
+        let text = format!("the goal is unchanged; it is already {}", describe(goal));
+        Self {
+            record: None,
+            outcome: success(Some(goal), &text),
+        }
+    }
+
     /// A failure the model can act on.
     fn failed(message: impl Into<String>) -> Self {
         Self {
@@ -254,8 +263,8 @@ fn create(current: Option<&Goal>, args: &Arguments<'_>, now_ms: u64) -> Applied 
             existing.phase(),
             existing.objective()
         )),
-        Some(existing) => transitioned(existing.with_objective(objective, now_ms)),
-        None => transitioned(Goal::new(objective, now_ms)),
+        Some(existing) => transitioned(current, existing.with_objective(objective, now_ms)),
+        None => transitioned(current, Goal::new(objective, now_ms)),
     }
 }
 
@@ -296,11 +305,11 @@ fn update(current: Option<&Goal>, args: &Arguments<'_>, now_ms: u64) -> Applied 
                      before calling it done.",
                 );
             }
-            transitioned(existing.completed(evidence, now_ms))
+            transitioned(current, existing.completed(evidence, now_ms))
         }
         Some("active") => objective.map_or_else(
-            || transitioned(existing.resumed(now_ms)),
-            |objective| transitioned(existing.with_objective(objective, now_ms)),
+            || transitioned(current, existing.resumed(now_ms)),
+            |objective| transitioned(current, existing.with_objective(objective, now_ms)),
         ),
         Some(other) => Applied::failed(format!(
             "update_goal's status is \"active\" or \"complete\", not {other:?}"
@@ -312,7 +321,7 @@ fn update(current: Option<&Goal>, args: &Arguments<'_>, now_ms: u64) -> Applied 
                      \"complete\"",
                 )
             },
-            |objective| transitioned(existing.with_objective(objective, now_ms)),
+            |objective| transitioned(current, existing.with_objective(objective, now_ms)),
         ),
     }
 }
@@ -329,7 +338,7 @@ fn pause(current: Option<&Goal>, args: &Arguments<'_>, now_ms: u64) -> Applied {
         ));
     }
     match args.optional_str(REASON) {
-        Ok(reason) => transitioned(existing.paused(reason, now_ms)),
+        Ok(reason) => transitioned(current, existing.paused(reason, now_ms)),
         Err(outcome) => Applied::from_outcome(outcome),
     }
 }
@@ -355,12 +364,24 @@ fn abandon(current: Option<&Goal>, args: &Arguments<'_>, now_ms: u64) -> Applied
              can be achieved later, pause_goal instead.",
         );
     }
-    transitioned(existing.abandoned(Some(reason), now_ms))
+    transitioned(current, existing.abandoned(Some(reason), now_ms))
 }
 
 /// Lifts a transition's result into what the model reads.
-fn transitioned(outcome: Result<Goal, nanus_domain::DomainError>) -> Applied {
-    outcome.map_or_else(|error| Applied::failed(error.to_string()), Applied::changed)
+///
+/// A transition the domain answered with the goal it was given — pausing a goal already
+/// paused, resuming one already active — changed nothing, so it is answered as a read and
+/// leaves no record: a `goal/change` that is not a change would replay as a second notice of
+/// the same goal, and would tell the model a new reason was kept when the old one was.
+fn transitioned(
+    current: Option<&Goal>,
+    outcome: Result<Goal, nanus_domain::DomainError>,
+) -> Applied {
+    match outcome {
+        Ok(goal) if current == Some(&goal) => Applied::unchanged(&goal),
+        Ok(goal) => Applied::changed(goal),
+        Err(error) => Applied::failed(error.to_string()),
+    }
 }
 
 /// Renders a goal as one line for the model, with its note beneath when there is one.
@@ -684,6 +705,54 @@ mod tests {
         let recorded = applied.record.as_ref().expect("a pause records a goal");
         assert_eq!(recorded.phase(), GoalPhase::Paused);
         assert_eq!(recorded.note(), Some("the fixture is broken"));
+    }
+
+    /// A transition to the phase the goal is already in changes nothing, so it records nothing:
+    /// a second `pause_goal`, or `update_goal` asking an active goal to be active, would
+    /// otherwise append a `goal/change` that replays as a second notice of the same goal — and
+    /// the result says the goal is unchanged rather than claiming a new reason was kept.
+    #[test]
+    fn a_transition_to_the_phase_the_goal_is_in_records_nothing() {
+        let paused = active()
+            .paused(Some(String::from("waiting for CI")), 2_000)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let again = run(
+            Some(&paused),
+            &call(PAUSE_GOAL, json!({ "reason": "a different reason" })),
+            3_000,
+        );
+        assert!(
+            again.record.is_none(),
+            "pausing a paused goal is not a change"
+        );
+        assert!(again.outcome.is_success(), "and it is not a failure either");
+        let message = text(&again);
+        assert!(message.contains("unchanged"), "{message}");
+        assert!(
+            message.contains("waiting for CI"),
+            "the kept note is the one shown: {message}"
+        );
+        assert!(!message.contains("a different reason"), "{message}");
+
+        let resumed = run(
+            Some(&active()),
+            &call(UPDATE_GOAL, json!({ "status": "active" })),
+            3_000,
+        );
+        assert!(
+            resumed.record.is_none(),
+            "resuming an active goal is not a change"
+        );
+        assert!(text(&resumed).contains("unchanged"));
+
+        // The other direction: a transition that does move the goal still records it.
+        let moved = run(Some(&active()), &call(PAUSE_GOAL, json!({})), 3_000);
+        let recorded = moved
+            .record
+            .as_ref()
+            .expect("pausing an active goal records");
+        assert_eq!(recorded.phase(), GoalPhase::Paused);
+        assert!(text(&moved).contains("now"));
     }
 
     #[test]

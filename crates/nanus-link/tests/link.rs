@@ -40,7 +40,7 @@ use nanus_link::{Client, LinkError};
 // `name` live on the port, and `lock_file` on the adapter.
 use nanus_ports::{
     ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, ReasoningEffort, StoreHandle,
-    StorePort as _,
+    StorePort,
 };
 
 /// A model that answers every request the same way, without a network.
@@ -276,6 +276,133 @@ impl LlmPort for SlowRelentlessLlm {
     }
 }
 
+/// A store that can hold one save open until the test lets it finish.
+///
+/// Armed, the next save announces itself on `entered` and waits on `release`, and disarms as it
+/// does, so every later save goes straight through. That is how a test puts a request in the
+/// middle of a write: the one await a goal change makes is the store's.
+struct GatedStore {
+    /// The store that does the writing.
+    inner: StoreHandle,
+    /// Whether the next save waits, shared with the test that arms it.
+    armed: Rc<std::cell::Cell<bool>>,
+    /// Given when an armed save has begun.
+    entered: Arc<tokio::sync::Semaphore>,
+    /// Awaited by an armed save before it writes.
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl StorePort for GatedStore {
+    fn save<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        Box::pin(async move {
+            if self.armed.replace(false) {
+                self.entered.add_permits(1);
+                let _permit = self.release.acquire().await;
+            }
+            self.inner.save(session).await
+        })
+    }
+
+    fn load<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Session>> {
+        self.inner.load(id)
+    }
+
+    fn list(
+        &self,
+    ) -> futures::future::LocalBoxFuture<
+        '_,
+        nanus_ports::StoreResult<Vec<nanus_ports::SessionSummary>>,
+    > {
+        self.inner.list()
+    }
+
+    fn delete<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.delete(id)
+    }
+
+    fn name<'a>(
+        &'a self,
+        id: &'a SessionId,
+        name: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.name(id, name)
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Option<SessionId>>> {
+        self.inner.resolve(name)
+    }
+
+    fn name_of<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Option<String>>> {
+        self.inner.name_of(id)
+    }
+
+    fn home(
+        &self,
+    ) -> futures::future::LocalBoxFuture<'_, nanus_ports::StoreResult<std::path::PathBuf>> {
+        self.inner.home()
+    }
+
+    fn lock<'a>(
+        &'a self,
+        id: &'a SessionId,
+        owner: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.lock(id, owner)
+    }
+
+    fn release_lock(&self, id: &SessionId) {
+        self.inner.release_lock(id);
+    }
+}
+
+/// The handles a test uses to hold a [`GatedStore`]'s next save open and let it go.
+struct Gate {
+    /// Set to make the next save wait.
+    armed: Rc<std::cell::Cell<bool>>,
+    /// Given when the held save has begun.
+    entered: Arc<tokio::sync::Semaphore>,
+    /// Given to let the held save write.
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+/// Builds a scripted agent that records through a [`GatedStore`], and the gate that holds it.
+fn save_gated_agent(dir: &Path) -> (Agent, StoreHandle, Gate) {
+    let gate = Gate {
+        armed: Rc::new(std::cell::Cell::new(false)),
+        entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+    };
+    let inner = nanus_kernel::runtime::block_on(async {
+        JsonlStore::new(dir.to_path_buf())
+            .await
+            .expect("the store opens")
+            .handle()
+    });
+    let store: StoreHandle = Rc::new(Box::new(GatedStore {
+        inner,
+        armed: Rc::clone(&gate.armed),
+        entered: Arc::clone(&gate.entered),
+        release: Arc::clone(&gate.release),
+    }));
+    let (agent, store) = agent_with_store(dir, Rc::new(Box::new(ScriptedLlm)), "scripted", store);
+    (agent, store, gate)
+}
+
 /// Builds an agent over a store in `dir`, and returns the store alongside it.
 fn scripted_agent(dir: &Path) -> (Agent, StoreHandle) {
     agent_over(dir, Rc::new(Box::new(ScriptedLlm)), "scripted")
@@ -289,6 +416,16 @@ fn agent_over(dir: &Path, llm: Rc<Box<dyn LlmPort>>, model: &str) -> (Agent, Sto
             .expect("the store opens")
             .handle()
     });
+    agent_with_store(dir, llm, model, store)
+}
+
+/// Builds an agent whose model is `llm` and whose sessions are recorded through `store`.
+fn agent_with_store(
+    dir: &Path,
+    llm: Rc<Box<dyn LlmPort>>,
+    model: &str,
+    store: StoreHandle,
+) -> (Agent, StoreHandle) {
     let config = AgentConfig::new(4, 1, model, 4096).expect("a valid agent config");
     let runner = AgentRunner::new(
         llm,
@@ -2817,9 +2954,14 @@ fn an_attachment_shows_the_session_goal() {
     );
 }
 
-/// A goal cannot be changed while a turn is running, because the turn owns the session.
+/// A goal cannot be changed while a turn is running, because the turn owns the session — but it
+/// can be *read*, because a read needs nothing the turn holds.
+///
+/// Both halves matter to the interface: it reads a `Failed` as the end of the turn in front of it,
+/// so a status read that was refused like a change dismissed an open approval and sent the next
+/// queued prompt into a session that was still busy.
 #[test]
-fn a_goal_is_refused_while_a_turn_is_running() {
+fn a_goal_change_is_refused_during_a_turn_and_a_read_is_answered() {
     let dir = tempfile::tempdir().expect("temp dir");
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2834,7 +2976,7 @@ fn a_goal_is_refused_while_a_turn_is_running() {
     let socket = dir.path().join("agent.sock");
     let socket_for_client = socket.clone();
 
-    let refused = nanus_kernel::runtime::block_on_local(async move {
+    let (refused, read) = nanus_kernel::runtime::block_on_local(async move {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let listener = nanus_link::bind(&socket).await.expect("the socket binds");
         let serving = serve(listener, agent, async move {
@@ -2844,6 +2986,10 @@ fn a_goal_is_refused_while_a_turn_is_running() {
             .await
             .expect("the agent answers");
         client.start(None).await.expect("a session starts");
+        let set = GoalAction::Set {
+            objective: "set before the turn".to_owned(),
+        };
+        let _ = ask_goal(&mut client, set).await;
 
         client
             .send(&Request::Prompt {
@@ -2870,18 +3016,149 @@ fn a_goal_is_refused_while_a_turn_is_running() {
                 None => break String::new(),
             }
         };
+        // The same session, still mid-turn, answers a read with the goal rather than a refusal.
+        client
+            .send(&Request::Goal {
+                action: GoalAction::Status,
+            })
+            .await
+            .expect("the status request is sent");
+        let read = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::Goal { goal }) => break Ok(goal),
+                Some(frame @ Frame::Failed { .. }) => break Err(frame),
+                Some(frame) if frame.is_end_of_turn() => break Err(frame),
+                Some(_) => {}
+                None => break Err(Frame::Bye),
+            }
+        };
 
         // Let the turn finish so the task joins cleanly rather than being aborted mid-stream.
         release.add_permits(1);
         let _ = turn_frames(&mut client).await;
         let _ = stop_tx.send(());
         let _ = serving.await;
-        refused
+        (refused, read)
     });
 
     assert!(
         refused.contains("idle"),
         "the refusal says the session is busy and when a goal can be set: {refused}"
+    );
+    let read = read.unwrap_or_else(|frame| panic!("a read during a turn is answered: {frame:?}"));
+    assert_eq!(
+        read.map(|goal| goal.objective),
+        Some(String::from("set before the turn")),
+        "the read reports the goal the refused change left in place"
+    );
+}
+
+/// A goal change holds the session for the whole of its write, so a prompt from another viewer
+/// that arrives mid-write is refused rather than starting a turn over it.
+///
+/// The change's write is an await, and the session was only *checked* idle before it: a prompt
+/// landing in that await started a turn, and the change's write-back met the turn's borrow — a
+/// panic, which the release profile makes the whole agent aborting. After the write the session
+/// is free again, which is the other direction: the reservation does not outlive the change.
+#[test]
+fn a_goal_change_holds_the_session_against_another_viewers_prompt() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store, gate) = save_gated_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let outcome = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut first = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let session = first.start(None).await.expect("a session starts");
+        let mut second = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        second
+            .attach(&session.session)
+            .await
+            .expect("the second viewer attaches");
+
+        // The first viewer's change is now inside its write.
+        gate.armed.set(true);
+        first
+            .send(&Request::Goal {
+                action: GoalAction::Set {
+                    objective: "written while a prompt arrives".to_owned(),
+                },
+            })
+            .await
+            .expect("the goal request is sent");
+        let _permit = gate
+            .entered
+            .acquire()
+            .await
+            .expect("the change reached the store");
+
+        second
+            .send(&Request::Prompt {
+                text: "sent mid-write".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mid_write = loop {
+            match second.next().await.expect("frames are readable") {
+                Some(frame @ (Frame::Failed { .. } | Frame::Done { .. })) => break frame,
+                Some(_) => {}
+                None => break Frame::Bye,
+            }
+        };
+
+        gate.release.add_permits(1);
+        let told_first = goal_of(&mut first).await;
+        let told_second = goal_of(&mut second).await;
+
+        // Released: the same viewer's prompt now runs a turn.
+        second
+            .send(&Request::Prompt {
+                text: "sent after the write".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let after = turn_frames(&mut second).await;
+
+        let stored = store
+            .load(&SessionId::new(session.session))
+            .await
+            .expect("the session was recorded");
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        (mid_write, told_first, told_second, after, stored)
+    });
+    let (mid_write, told_first, told_second, after, stored) = outcome;
+
+    assert!(
+        matches!(&mid_write, Frame::Failed { message } if message.contains("already running")),
+        "a prompt during the change's write is refused, not run: {mid_write:?}"
+    );
+    let objective = Some(String::from("written while a prompt arrives"));
+    assert_eq!(told_first.map(|goal| goal.objective), objective);
+    assert_eq!(
+        told_second.map(|goal| goal.objective),
+        objective,
+        "the change reaches the other viewer too"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|frame| matches!(frame, Frame::Done { .. })),
+        "the session is free once the change is written: {after:?}"
+    );
+    assert_eq!(
+        stored.goal().map(|goal| goal.objective().to_owned()),
+        objective,
+        "the turn that ran afterwards kept the goal in the log"
     );
 }
 

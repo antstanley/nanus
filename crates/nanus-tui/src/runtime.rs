@@ -1459,7 +1459,9 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         Submission::Run(Command::Provider) => Routed::Provider(model_argument(&prompt)),
         // The goal's argument is the rest of the line, not one word: an objective is a sentence.
         // The reader's words choose the action — a bare `/goal`, a lifecycle word, or an objective.
-        Submission::Run(Command::Goal) => Routed::Goal(goal_action(&prompt)),
+        Submission::Run(Command::Goal) => {
+            goal_action(&prompt).map_or_else(Routed::Say, Routed::Goal)
+        }
         Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
             if command.trim().is_empty() {
@@ -1874,33 +1876,55 @@ fn goal_argument(line: &str) -> String {
         .map_or_else(String::new, |(_, rest)| rest.trim().to_owned())
 }
 
-/// Reads a `/goal` line into the action it names.
+/// Reads a `/goal` line into the action it names, or the sentence saying why it names none.
 ///
 /// A bare `/goal` (or `/goal status`) reads the current goal; `pause`, `resume`, `complete`/
-/// `done`, and `clear` are the lifecycle words; anything else is an objective, so a sentence
-/// sets one. The cost is that an objective which is exactly one of those words cannot be set in
-/// one line — the trade every command with subcommands makes, stepped around by phrasing the
-/// objective as a sentence.
-fn goal_action(line: &str) -> GoalAction {
+/// `done`, `abandon`, and `clear` are the lifecycle words; anything else is an objective, so a
+/// sentence sets one. A lifecycle word acts only when it is the *whole* argument, or when a colon
+/// follows it to carry a reason — `/goal done: the benchmark is green`. Matching the first word
+/// alone read `/goal clear out the flaky tests` as a clear and `/goal done with the migration…` as
+/// a completion, which is a person's objective destroyed by its own phrasing; with the colon, the
+/// only objective that cannot be set in one line is one that is exactly a lifecycle word.
+///
+/// # Errors
+///
+/// Returns the sentence to show when a colon gives a reason to a word that takes none: the agent
+/// has nowhere to keep it, and dropping it silently is what this used to do.
+fn goal_action(line: &str) -> Result<GoalAction, String> {
     let argument = goal_argument(line);
-    let mut words = argument.splitn(2, char::is_whitespace);
-    let word = words.next().unwrap_or_default();
-    let rest = words.next().map(str::trim).filter(|text| !text.is_empty());
+    let (word, note) = match argument.split_once(':') {
+        Some((head, rest)) if is_goal_word(head.trim()) => {
+            let rest = rest.trim();
+            (head.trim(), (!rest.is_empty()).then(|| rest.to_owned()))
+        }
+        _ => (argument.as_str(), None),
+    };
+    let bare = |action: GoalAction| {
+        note.as_ref().map_or(Ok(action), |_| {
+            Err(format!(
+                "`/goal {word}` takes no reason; a reason goes with `done:` or `abandon:`"
+            ))
+        })
+    };
     match word {
-        "" | "status" => GoalAction::Status,
-        "pause" => GoalAction::Pause,
-        "resume" => GoalAction::Resume,
-        "clear" => GoalAction::Clear,
-        "abandon" | "abandoned" => GoalAction::Abandon {
-            note: rest.map(str::to_owned),
-        },
-        "complete" | "done" => GoalAction::Complete {
-            note: rest.map(str::to_owned),
-        },
-        _ => GoalAction::Set {
+        "" | "status" => bare(GoalAction::Status),
+        "pause" => bare(GoalAction::Pause),
+        "resume" => bare(GoalAction::Resume),
+        "clear" => bare(GoalAction::Clear),
+        "abandon" | "abandoned" => Ok(GoalAction::Abandon { note }),
+        "complete" | "done" => Ok(GoalAction::Complete { note }),
+        _ => Ok(GoalAction::Set {
             objective: argument,
-        },
+        }),
     }
+}
+
+/// Whether `word` is one of `/goal`'s lifecycle words rather than the start of an objective.
+fn is_goal_word(word: &str) -> bool {
+    matches!(
+        word,
+        "status" | "pause" | "resume" | "clear" | "abandon" | "abandoned" | "complete" | "done"
+    )
 }
 
 /// Sends a goal action to the agent, or says why the interface cannot.
@@ -1914,6 +1938,22 @@ fn request_goal(action: GoalAction, source: &mut dyn SessionSource, view: &mut V
             "this is a recording: its goal cannot be changed",
         )));
         view.scroll_to_bottom();
+        return;
+    }
+    // A change during a turn is refused here rather than by the agent. The agent would refuse it
+    // too — the turn owns the session — but its refusal is a `Failed`, and a `Failed` is how the
+    // interface learns a turn ended: sent, it would dismiss an open approval the turn is still
+    // waiting on and send the next queued prompt into a session that is still busy. A *read* is
+    // sent, because the agent answers one from its cache without refusing.
+    if view.busy {
+        if action == GoalAction::Status {
+            source.set_goal(action);
+        } else {
+            view.transcript.push(Entry::notice(String::from(
+                "a turn is running; the goal can be changed when it is idle",
+            )));
+            view.follow();
+        }
         return;
     }
     view.status = match &action {
@@ -1938,13 +1978,18 @@ fn queued_status(waiting: usize) -> String {
 /// The line said what the composer was for, and the composer is back to being an ordinary
 /// one; leaving the old sentence up would describe a mode the reader has already left.
 fn queue_edit_finished(view: &mut ViewState) {
-    view.status = if view.busy {
+    view.status = resting_status(view);
+}
+
+/// What the status line says when nothing the reader asked for is pending.
+fn resting_status(view: &ViewState) -> String {
+    if view.busy {
         String::from("thinking")
     } else if view.has_queued() {
         queued_status(view.queue.len())
     } else {
         String::from("ready")
-    };
+    }
 }
 
 /// Ends the interface's view of a turn and points the reader at what ended it.
@@ -3227,6 +3272,11 @@ fn apply_auth_prompt(
 fn apply_goal(goal: Option<GoalInfo>, view: &mut ViewState) {
     view.transcript.push(Entry::notice(goal_notice(goal)));
     view.follow();
+    // The answer is what "setting the goal" was waiting for. During a turn the status line is the
+    // turn's, and a goal frame does not end one.
+    if !view.busy {
+        view.status = resting_status(view);
+    }
 }
 
 /// Renders a goal, or its absence, as one line.
@@ -5014,35 +5064,40 @@ mod tests {
     #[test]
     fn the_goal_command_reads_sets_and_moves_the_goal() {
         // The line chooses the action: a bare read, a lifecycle word, or an objective.
-        assert_eq!(goal_action("/goal"), GoalAction::Status);
-        assert_eq!(goal_action("/goal status"), GoalAction::Status);
-        assert_eq!(goal_action("/goal pause"), GoalAction::Pause);
-        assert_eq!(goal_action("/goal resume"), GoalAction::Resume);
-        assert_eq!(goal_action("/goal clear"), GoalAction::Clear);
+        assert_eq!(goal_action("/goal"), Ok(GoalAction::Status));
+        assert_eq!(goal_action("/goal status"), Ok(GoalAction::Status));
+        assert_eq!(goal_action("/goal pause"), Ok(GoalAction::Pause));
+        assert_eq!(goal_action("/goal resume"), Ok(GoalAction::Resume));
+        assert_eq!(goal_action("/goal clear"), Ok(GoalAction::Clear));
         assert_eq!(
-            goal_action("/goal abandon the benchmark is flaky"),
-            GoalAction::Abandon {
-                note: Some(String::from("the benchmark is flaky"))
-            }
+            goal_action("/goal done"),
+            Ok(GoalAction::Complete { note: None })
         );
         assert_eq!(
-            goal_action("/goal complete the benchmark is green"),
-            GoalAction::Complete {
+            goal_action("/goal abandon: the benchmark is flaky"),
+            Ok(GoalAction::Abandon {
+                note: Some(String::from("the benchmark is flaky"))
+            })
+        );
+        assert_eq!(
+            goal_action("/goal complete : the benchmark is green"),
+            Ok(GoalAction::Complete {
                 note: Some(String::from("the benchmark is green"))
-            }
+            })
         );
         assert_eq!(
             goal_action("/goal reduce p95 latency below 120 ms"),
-            GoalAction::Set {
+            Ok(GoalAction::Set {
                 objective: String::from("reduce p95 latency below 120 ms")
-            },
+            }),
             "everything after the command word is the objective"
         );
 
         // And the action is sent to the agent, which owns the session the goal belongs to.
         let mut source = Scripted::new(Vec::new());
         let mut view = ViewState::new();
-        request_goal(goal_action("/goal ship the notes"), &mut source, &mut view);
+        let action = goal_action("/goal ship the notes").unwrap_or_else(|error| panic!("{error}"));
+        request_goal(action, &mut source, &mut view);
         assert_eq!(
             source.requests.borrow().clone(),
             vec![Request::Goal {
@@ -5051,6 +5106,91 @@ mod tests {
                 }
             }]
         );
+    }
+
+    /// An objective that merely *begins* with a lifecycle word is an objective: matching the first
+    /// word read these as a clear, a completion, and a pause that dropped the rest of the line.
+    /// A reason given to a word that keeps none is refused rather than silently dropped.
+    #[test]
+    fn an_objective_that_begins_with_a_lifecycle_word_is_still_an_objective() {
+        for line in [
+            "clear out the flaky tests",
+            "done with the migration and then the docs",
+            "pause waiting for CI",
+            "resume the docs work",
+            "complete the benchmark is green",
+            "abandon the old parser",
+        ] {
+            assert_eq!(
+                goal_action(&format!("/goal {line}")),
+                Ok(GoalAction::Set {
+                    objective: line.to_owned()
+                }),
+                "{line:?} is an objective"
+            );
+        }
+        for line in ["/goal pause: waiting for CI", "/goal clear: all of it"] {
+            let refused = goal_action(line).expect_err("a reason the agent cannot keep");
+            assert!(refused.contains("takes no reason"), "{line}: {refused}");
+        }
+        // Routed as a sentence, not sent.
+        assert!(matches!(
+            route_submission(String::from("/goal pause: waiting"), true),
+            Routed::Say(_)
+        ));
+    }
+
+    /// `/goal` typed during the reader's own turn does not end it.
+    ///
+    /// The agent refuses a change while a turn runs, and a refusal is a `Failed` — which is how
+    /// the interface learns a turn ended. Sent, the change dismissed an open approval the turn
+    /// was still waiting on and flushed the next queued prompt into a busy session. So a change
+    /// is refused here and never sent, and a read is sent, because the agent answers it.
+    #[test]
+    fn a_goal_command_during_a_turn_leaves_the_turn_alone() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        view.begin_turn(1);
+        view.enqueue(String::from("the next prompt"));
+        apply(
+            Frame::Approval {
+                call_id: "a1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: None,
+            },
+            &mut view,
+        );
+        let status = view.status.clone();
+
+        request_goal(GoalAction::Clear, &mut source, &mut view);
+        assert!(source.requests.borrow().is_empty(), "a change is not sent");
+        assert!(view.busy, "the turn is still running");
+        assert!(view.pending_approval.is_some(), "and still asking");
+        assert!(view.has_queued(), "and the queue waits for it");
+
+        request_goal(GoalAction::Status, &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().clone(),
+            vec![Request::Goal {
+                action: GoalAction::Status
+            }],
+            "a read is sent"
+        );
+        apply(Frame::Goal { goal: None }, &mut view);
+        assert!(view.busy, "the answer to a read does not end the turn");
+        assert!(view.pending_approval.is_some());
+        assert_eq!(view.status, status, "the status line is still the turn's");
+    }
+
+    /// Once the agent answers a goal change, the status line stops saying it is waiting.
+    #[test]
+    fn the_status_line_settles_when_the_goal_answer_arrives() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        request_goal(GoalAction::Clear, &mut source, &mut view);
+        assert_eq!(view.status, "clearing the goal");
+        apply(Frame::Goal { goal: None }, &mut view);
+        assert_eq!(view.status, "ready");
     }
 
     /// A goal frame becomes the interface's own notice, and a session with no goal says so.

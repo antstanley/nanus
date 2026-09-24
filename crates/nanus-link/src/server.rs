@@ -384,7 +384,8 @@ struct Held {
     goal: RefCell<Option<GoalInfo>>,
     /// One queue per attached client, with the id that connection unsubscribes by.
     viewers: RefCell<Vec<(u64, mpsc::Sender<Frame>)>>,
-    /// Whether a turn is running. One at a time, because a turn owns the session.
+    /// Whether a turn is running, or a goal change is being written. One at a time, because
+    /// each of them borrows the session across an await — see [`apply_goal`].
     busy: Cell<bool>,
     /// Whether the running turn has been asked to stop.
     ///
@@ -1868,11 +1869,28 @@ async fn apply_goal(
     held: &Rc<Held>,
     action: GoalAction,
 ) {
-    // A goal change is written into the session log, and a turn holds the session for its whole
+    // A read is answered from the cache, which is what the cache is for: a turn borrows the
+    // session for its whole duration, and a reader asking what the goal is has asked nothing a
+    // running turn needs to refuse. Refusing it did worse than inconvenience — an interface reads
+    // a `Failed` as the end of the turn in front of it, so a status read typed during the
+    // reader's own turn dismissed an open approval and sent the next queued prompt into a busy
+    // session. What the cache holds is the goal as of the last turn or change: a change the model
+    // makes mid-turn is broadcast when that turn ends.
+    if action == GoalAction::Status {
+        let goal = held.goal.borrow().clone();
+        send(frames, Frame::Goal { goal }).await;
+        return;
+    }
+    // A change is written into the session log, and a turn holds the session for its whole
     // duration — so a change waits for an idle session rather than fighting the borrow. The
-    // refusal is a sentence rather than a queue, the same answer a prompt to a busy session gets:
-    // a session runs one turn at a time, and the goal is read against the log.
-    if held.busy.get() {
+    // refusal is a sentence rather than a queue, the same answer a prompt to a busy session gets.
+    //
+    // The session is *reserved*, not merely checked: the record below is an await, and a prompt
+    // from another viewer that arrived during it used to find the session idle, start a turn that
+    // borrowed it, and meet this change's write-back as a second mutable borrow — a panic, which
+    // the release profile turns into the agent aborting. Two changes at once were the same race
+    // resolved silently, both built on one goal and the last write winning.
+    if held.busy.replace(true) {
         send(
             frames,
             Frame::Failed {
@@ -1884,27 +1902,60 @@ async fn apply_goal(
         .await;
         return;
     }
+    let answer = {
+        let _reserved = Reserved(&held.busy);
+        change_goal(registry, held, action).await
+    };
+    match answer {
+        // The change reaches every client watching the session, not only the one that asked, so
+        // two views of one conversation agree about its objective — the rule the model and the
+        // approval state already follow, here at the granularity of a session.
+        GoalAnswer::Changed(goal) => broadcast_awaited(held, Frame::Goal { goal }, None).await,
+        GoalAnswer::Unchanged(goal) => send(frames, Frame::Goal { goal }).await,
+        GoalAnswer::Refused(message) => send(frames, Frame::Failed { message }).await,
+    }
+}
+
+/// Releases a session reserved for a goal change, however the change ended.
+///
+/// A guard rather than a closing assignment, so a change whose future is dropped part-way — the
+/// connection that asked going away mid-write — cannot leave the session reserved for ever and
+/// every later prompt refused as though a turn were running.
+struct Reserved<'a>(&'a Cell<bool>);
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// What a goal change came to, for [`apply_goal`] to tell the right clients.
+enum GoalAnswer {
+    /// The change is on disk and in the held session; every viewer is told.
+    Changed(Option<GoalInfo>),
+    /// The action left the goal as it was — pausing a goal already paused — so there is nothing
+    /// to record and nothing for another viewer to learn; the client that asked is answered.
+    Unchanged(Option<GoalInfo>),
+    /// The sentence saying why the action could not be applied.
+    Refused(String),
+}
+
+/// Computes, records, and applies a goal change in a session reserved for it.
+///
+/// The caller holds the reservation, so no turn can be borrowing the session while this reads it
+/// or writes it back.
+async fn change_goal(registry: &Rc<Registry>, held: &Rc<Held>, action: GoalAction) -> GoalAnswer {
+    assert!(held.busy.get(), "a goal change runs in a reserved session");
     let current = held.session.borrow().goal();
     let now = registry.agent.clock.now_ms();
     let next = match next_goal(current.as_ref(), action, now) {
         Ok(next) => next,
-        Err(message) => {
-            send(frames, Frame::Failed { message }).await;
-            return;
-        }
+        Err(message) => return GoalAnswer::Refused(message),
     };
-    // A status read, or an action that changes nothing — pausing a goal already paused — is
-    // answered without writing a record: the revision did not move, so there is nothing to
-    // record and nothing to broadcast to a watcher.
+    // An action that changes nothing is answered without writing a record: the revision did not
+    // move, so there is nothing to record and nothing to broadcast to a watcher.
     if next == current {
-        send(
-            frames,
-            Frame::Goal {
-                goal: next.as_ref().map(wire_goal),
-            },
-        )
-        .await;
-        return;
+        return GoalAnswer::Unchanged(next.as_ref().map(wire_goal));
     }
     // The updated session is built and saved *before* the held copy is replaced: a store that
     // refused the write leaves the in-memory session as it was, so the change is either durable
@@ -1916,28 +1967,11 @@ async fn apply_goal(
         updated
     };
     if let Err(error) = registry.agent.record(&updated).await {
-        send(
-            frames,
-            Frame::Failed {
-                message: format!("the goal could not be recorded: {error}"),
-            },
-        )
-        .await;
-        return;
+        return GoalAnswer::Refused(format!("the goal could not be recorded: {error}"));
     }
-    *held.session.borrow_mut() = updated.clone();
     held.refresh(&updated);
-    // The change reaches every client watching the session, not only the one that asked, so two
-    // views of one conversation agree about its objective — the rule the model and the approval
-    // state already follow, here at the granularity of a session rather than an agent.
-    broadcast_awaited(
-        held,
-        Frame::Goal {
-            goal: next.as_ref().map(wire_goal),
-        },
-        None,
-    )
-    .await;
+    *held.session.borrow_mut() = updated;
+    GoalAnswer::Changed(next.as_ref().map(wire_goal))
 }
 
 /// Computes the goal an action leaves behind, or the sentence saying why it cannot.
