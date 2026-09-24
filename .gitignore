@@ -35,6 +35,17 @@ node_modules/
 dist/
 .astro/
 
+# The code-graph index.
+#
+# `.graph-search/` is the index a `graph-search` build writes into a workspace: a few
+# megabytes of machine-generated JSON and binary, derived entirely from the sources it
+# indexes and rebuilt by re-running the tool. Nothing in the harness reads it, and it is
+# large enough that `jj` refuses to snapshot parts of it. It is ignored rather than merely
+# absent, so a future index cannot be committed by accident — the same reason `.research/`
+# is listed above, and the role `.codegraph/.gitignore` plays for the other index beside it.
+# The pattern has no leading slash, so it matches at any depth.
+.graph-search/
+
 # Jujutsu's working state is not tracked; `.jj/` is written by `jj git init` itself and
 # is already listed in its own ignore file, so it is named here only for clarity.
 /.jj/
