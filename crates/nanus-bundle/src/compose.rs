@@ -124,11 +124,14 @@ impl core::fmt::Debug for Harness {
 
 impl Harness {
     /// Returns the number of tools the harness exposes to the model.
+    ///
+    /// Read from the runner, which is what assembles the schemas a request carries: the
+    /// registered toolset plus the goal tools the loop dispatches itself. Asking the published
+    /// registry would count only its half, and the count an agent advertises in its handshake
+    /// would then disagree with what the model is offered.
     #[must_use]
     pub fn tool_count(&self) -> usize {
-        self.context
-            .try_get(crate::tools_key())
-            .map_or(0, |handle| handle.borrow().len())
+        self.runner.tool_count()
     }
 
     /// Returns the model ids a client may switch this harness between.
@@ -271,6 +274,7 @@ impl Pending {
             &self.config,
             &self.selection,
             &self.workspace,
+            &self.clock,
         )?;
         // The effort a remembered selection asked for is put on the runner rather than into the
         // configuration, because it can name a step the configuration's field cannot. It goes on
@@ -930,6 +934,7 @@ fn build_runner(
     config: &NanusConfig,
     selection: &Selection,
     workspace: &std::path::Path,
+    clock: &ClockHandle,
 ) -> Result<AgentRunner, BundleError> {
     let prompt = config
         .system_prompt
@@ -959,6 +964,7 @@ fn build_runner(
         tools.clone(),
         format!("{prompt}\n\n{runtime}"),
         agent,
+        clock.clone(),
     )
 }
 

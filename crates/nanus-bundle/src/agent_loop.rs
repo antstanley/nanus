@@ -40,7 +40,7 @@ use nanus_domain::{
     Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId, ToolName,
     ToolResult, TurnEndReason, TurnMachine, Usage,
 };
-use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmHandle};
+use nanus_ports::{ChatRequest, ClockHandle, FinishReason, LlmEvent, LlmHandle};
 
 use crate::guard;
 use crate::{BundleError, ToolRegistryHandle};
@@ -291,6 +291,13 @@ pub struct AgentRunner {
     /// default is. `Some` is an interface that has chosen one, exactly as
     /// [`AgentRunner::approval`] is an interface that has chosen a state.
     effort: Rc<core::cell::Cell<Option<nanus_ports::ReasoningEffort>>>,
+    /// The clock a goal change is stamped from.
+    ///
+    /// The goal tools are the loop's own and run here, so the loop is what needs the time a
+    /// goal change records. It is a port rather than a system call for the reason every other
+    /// clock read is one: a test that cannot pin the clock cannot assert on a goal's revision
+    /// timestamps, and a recorded session has to mean the same thing when it is read back.
+    clock: ClockHandle,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -315,6 +322,7 @@ impl AgentRunner {
         tools: ToolRegistryHandle,
         system_prompt: impl Into<String>,
         config: AgentConfig,
+        clock: ClockHandle,
     ) -> Result<Self, BundleError> {
         config
             .validate()
@@ -337,6 +345,7 @@ impl AgentRunner {
             approval: Rc::new(core::cell::Cell::new(config.approval_policy)),
             model,
             effort: Rc::new(core::cell::Cell::new(None)),
+            clock,
             config,
         })
     }
@@ -457,6 +466,20 @@ impl AgentRunner {
     #[must_use]
     pub const fn tools(&self) -> &ToolRegistryHandle {
         &self.tools
+    }
+
+    /// Returns how many tools the model is offered.
+    ///
+    /// The registered set plus the goal tools — [`crate::goal_tools`] — because the loop offers
+    /// both and dispatches both. This is the one place the two lists meet, so the count an agent
+    /// advertises in its handshake is the number of schemas a request carries; asking the
+    /// registry alone would understate what the model can see.
+    #[must_use]
+    pub fn tool_count(&self) -> usize {
+        self.tools
+            .borrow()
+            .len()
+            .saturating_add(crate::goal_tools::COUNT)
     }
 
     /// Returns the assembled system prompt every request carries.
@@ -660,10 +683,14 @@ impl AgentRunner {
             .map_err(|error| BundleError::context(error.to_string()))?;
         // The borrow ends with the statement, which is what keeps a tool registered through
         // the published handle visible on the very next request rather than only after a
-        // rebuild.
+        // rebuild. The goal tools are appended here rather than registered, because the loop
+        // dispatches them itself: this is the one place the offered set is assembled.
         let tools: Vec<nanus_domain::ToolSchema> = {
             let registry = self.tools.borrow();
-            registry.schemas().into_iter().cloned().collect()
+            let mut schemas: Vec<nanus_domain::ToolSchema> =
+                registry.schemas().into_iter().cloned().collect();
+            schemas.extend(crate::goal_tools::schemas());
+            schemas
         };
         let mut request = ChatRequest::new(self.model(), fitted.messages);
         request.tools = tools;
@@ -783,7 +810,24 @@ impl AgentRunner {
         let permitted: Vec<usize> = (0..calls.len())
             .filter(|index| results[*index].is_none())
             .collect();
-        for batch in permitted.chunks(self.parallel_limit()) {
+        // The loop's own tools are run here, before the registry's. A goal change is a record
+        // in the session log, and this function is the one place that holds the session while a
+        // turn runs, so the goal tools are dispatched with it rather than through the registry —
+        // which does not hold them. Running them first means a step that both changes the goal
+        // and reads a file leaves the goal in the log before any result is recorded, so a
+        // resumed session cannot see the second without the first.
+        let (goal_indexes, registry_indexes): (Vec<usize>, Vec<usize>) = permitted
+            .iter()
+            .copied()
+            .partition(|index| crate::goal_tools::is_goal_tool(&calls[*index].name));
+        for index in goal_indexes {
+            let result = self.run_goal_tool(session, &calls[index]);
+            let is_error = !result.outcome.is_success();
+            progress.tool_finished(&calls[index].id, &calls[index].name, is_error);
+            results[index] = Some(result);
+        }
+
+        for batch in registry_indexes.chunks(self.parallel_limit()) {
             // `join_all` polls the batch together on this thread, so a call that awaits
             // leaves the others room to run: cooperative concurrency rather than
             // parallelism, because the kernel and its futures are deliberately `!Send`.
@@ -831,6 +875,19 @@ impl AgentRunner {
                 is_error,
             });
         }
+    }
+
+    /// Runs one goal tool call, writing the change into the session log.
+    ///
+    /// The clock is read once per call, so two goal changes in one step are stamped in the
+    /// order they were made. Nothing is appended for a read, or for a call the domain refuses:
+    /// a `goal/change` record *is* a change, and a call that changed nothing must not leave one.
+    fn run_goal_tool(&self, session: &mut Session, call: &ToolCall) -> ToolResult {
+        let applied = crate::goal_tools::run(session.goal().as_ref(), call, self.clock.now_ms());
+        if let Some(goal) = applied.record {
+            session.append(SessionEvent::GoalChange { goal: Some(goal) });
+        }
+        ToolResult::new(call.id.clone(), applied.outcome)
     }
 
     /// How many tool calls may be in flight at once.
@@ -1189,8 +1246,22 @@ mod tests {
         Session::new(SessionId::new("s-1"), 0, "/tmp")
     }
 
+    /// A clock that never moves, so a goal change's timestamps are assertable.
+    struct FixedClock;
+
+    impl nanus_ports::ClockPort for FixedClock {
+        fn now_ms(&self) -> u64 {
+            1_700_000_000_000
+        }
+    }
+
+    /// The clock every test runner is built with.
+    fn clock() -> ClockHandle {
+        Rc::new(Box::new(FixedClock))
+    }
+
     fn runner(llm: Rc<Box<dyn LlmPort>>, tools: ToolRegistryHandle) -> Option<AgentRunner> {
-        AgentRunner::new(llm, tools, "you are a test", config()).ok()
+        AgentRunner::new(llm, tools, "you are a test", config(), clock()).ok()
     }
 
     /// The budget is enforced by the turn machine and was, until it bit, invisible to the
@@ -1231,6 +1302,7 @@ mod tests {
                 ToolRegistryHandle::new(ToolRegistry::new()),
                 fits.clone(),
                 config(),
+                clock(),
             )
             .is_ok(),
             "a prompt that fits with the sentence is accepted"
@@ -1242,6 +1314,7 @@ mod tests {
             ToolRegistryHandle::new(ToolRegistry::new()),
             format!("{fits}x"),
             config(),
+            clock(),
         );
     }
 
@@ -2079,7 +2152,13 @@ mod tests {
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
         };
-        let outcome = AgentRunner::new(llm, ToolRegistryHandle::new(ToolRegistry::new()), "p", bad);
+        let outcome = AgentRunner::new(
+            llm,
+            ToolRegistryHandle::new(ToolRegistry::new()),
+            "p",
+            bad,
+            clock(),
+        );
         assert!(outcome.is_err());
     }
 
@@ -2214,7 +2293,7 @@ mod tests {
             .ok()?
             .with_sandbox(sandbox)
             .with_approval(approval);
-        AgentRunner::new(llm, tools, "you are a test", config).ok()
+        AgentRunner::new(llm, tools, "you are a test", config, clock()).ok()
     }
 
     /// The sandbox is the standing permission, so a call it permits is never put to a
@@ -2621,7 +2700,7 @@ mod tests {
         let config = AgentConfig::new(8, parallel, "test-model", 4096)
             .ok()?
             .with_sandbox(SandboxMode::ReadOnly);
-        AgentRunner::new(llm, tools, "you are a test", config).ok()
+        AgentRunner::new(llm, tools, "you are a test", config, clock()).ok()
     }
 
     /// The `(call id, content)` pairs the log recorded, in the order it recorded them.

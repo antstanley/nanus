@@ -120,7 +120,11 @@ fn the_pending_split_mounts_and_runs_a_turn() {
         "clock, fs, shell, store, llm, secrets and tools are active"
     );
     assert_eq!(stats.failed, 0, "nothing failed to mount");
-    assert_eq!(harness.tool_count(), 7, "the shipped toolset is published");
+    assert_eq!(
+        harness.tool_count(),
+        12,
+        "the seven registered tools and the five goal tools are offered"
+    );
 
     // The model id is the resolved one, and the loop is constructed. Resolution is
     // what turns an absent `model` into the provider's own default, so the two are
@@ -257,7 +261,11 @@ fn the_runners_registry_is_the_one_the_context_publishes() {
         .expect("runtime");
     let pending = runtime.block_on(compose(&settings)).expect("composes");
     let harness = pending.start().expect("mounts");
-    assert_eq!(harness.tool_count(), 7, "the shipped toolset");
+    assert_eq!(
+        harness.tool_count(),
+        12,
+        "the registered tools and the goal tools"
+    );
 
     // Register through the *runner's* handle, then look through the published service.
     let schema = nanus_domain::ToolSchema {
@@ -276,8 +284,9 @@ fn the_runners_registry_is_the_one_the_context_publishes() {
     // The published count follows, which it can only do if the two are one object.
     assert_eq!(
         harness.tool_count(),
-        8,
-        "the service the context publishes is the registry the runner dispatches from"
+        13,
+        "the service the context publishes is the registry the runner dispatches from, and the \
+         goal tools are counted with it"
     );
     // And the reverse door: what was registered through the service is what the runner
     // will send.

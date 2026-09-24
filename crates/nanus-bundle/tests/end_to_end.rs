@@ -21,6 +21,20 @@ use nanus_domain::{
 };
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, LlmPort, LlmStream, SandboxPolicy};
 
+/// A clock that never moves, so a goal change's timestamps are assertable.
+struct FixedClock;
+
+impl nanus_ports::ClockPort for FixedClock {
+    fn now_ms(&self) -> u64 {
+        1_700_000_000_000
+    }
+}
+
+/// The clock the runners here are built with.
+fn clock() -> nanus_ports::ClockHandle {
+    Rc::new(Box::new(FixedClock))
+}
+
 /// A model that replays a script of event batches, one per request.
 struct ScriptedModel {
     batches: RefCell<Vec<Vec<LlmEvent>>>,
@@ -151,7 +165,7 @@ async fn run(
     tools: nanus_bundle::ToolRegistryHandle,
     prompt: &str,
 ) -> nanus_bundle::RunOutcome {
-    let runner = AgentRunner::new(model, tools, "you are a test", config())
+    let runner = AgentRunner::new(model, tools, "you are a test", config(), clock())
         .unwrap_or_else(|error| panic!("the runner builds: {error}"));
     let mut session = Session::new(SessionId::new("e2e"), 0, "/tmp");
     runner
@@ -174,7 +188,7 @@ async fn a_conversation_longer_than_the_budget_is_trimmed_with_a_notice() {
     let settings = config()
         .with_context_budget(budget)
         .unwrap_or_else(|error| panic!("a small budget is valid: {error}"));
-    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", settings)
+    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", settings, clock())
         .unwrap_or_else(|error| panic!("the runner builds: {error}"));
 
     // Five completed turns, each far too large for the budget to hold.
@@ -603,15 +617,16 @@ async fn the_request_carries_the_prompt_and_the_tool_schemas() {
     let requests = model.requests();
     assert_eq!(requests.len(), 1, "one step means one request");
     let request = &requests[0];
-    // The prompt is the first message, and the seven schemas ride along.
+    // The prompt is the first message, and every schema rides along: the seven registered
+    // tools and the five the loop dispatches itself.
     assert_eq!(
         request.messages.first().map(nanus_domain::Message::role),
         Some(nanus_domain::Role::System)
     );
     assert_eq!(
         request.tools.len(),
-        7,
-        "the shipped toolset reaches the model"
+        12,
+        "the offered toolset reaches the model, goal tools included"
     );
     let mut names: Vec<String> = request
         .tools
@@ -622,12 +637,17 @@ async fn the_request_carries_the_prompt_and_the_tool_schemas() {
     assert_eq!(
         names,
         vec![
+            "abandon_goal",
             "bash",
+            "create_goal",
             "edit",
+            "get_goal",
             "glob",
             "grep",
+            "pause_goal",
             "read",
             "read_image",
+            "update_goal",
             "write"
         ]
     );
@@ -681,7 +701,7 @@ async fn progress_reports_every_step_and_tool() {
         ),
         answer("finished"),
     ]);
-    let runner = AgentRunner::new(as_port(&model), tools, "prompt", config())
+    let runner = AgentRunner::new(as_port(&model), tools, "prompt", config(), clock())
         .unwrap_or_else(|error| panic!("the runner builds: {error}"));
     let mut session = Session::new(SessionId::new("progress"), 0, "/tmp");
     let mut recorder = Recorder::default();
@@ -773,4 +793,118 @@ async fn the_glob_tool_anchors_a_bare_pattern_to_the_workspace_root() {
         text.contains("lib.rs"),
         "and reaches the nested file: {text}"
     );
+}
+
+/// A goal tool call is dispatched by the loop with the session, and its effect is durable.
+///
+/// This is the test for the interception: the goal tools are not in the registry, so if the
+/// loop did not run them itself the call would come back "not registered" and no `goal/change`
+/// record would exist. A create, then a read that must see it, then an answer.
+#[tokio::test]
+async fn a_goal_tool_call_reaches_the_session_log() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let (tools, _shell) = workspace_tools(dir.path());
+
+    let model = ScriptedModel::new(vec![
+        call(
+            "call_1",
+            "create_goal",
+            r#"{"objective":"reduce p95 latency below 120 ms"}"#,
+        ),
+        call("call_2", "get_goal", "{}"),
+        answer("the objective is recorded"),
+    ]);
+    let runner = AgentRunner::new(as_port(&model), tools, "you are a test", config(), clock())
+        .unwrap_or_else(|error| panic!("the runner builds: {error}"));
+    let mut session = Session::new(SessionId::new("goals"), 0, "/tmp");
+    runner
+        .run_turn(&mut session, "set a lasting objective", &mut Silent, None)
+        .await
+        .unwrap_or_else(|error| panic!("the turn completes: {error}"));
+
+    // The goal is durable state, and the log is where it lives.
+    let goal = session
+        .goal()
+        .unwrap_or_else(|| panic!("the goal was recorded in the log"));
+    assert_eq!(goal.objective(), "reduce p95 latency below 120 ms");
+    assert_eq!(goal.phase(), nanus_domain::GoalPhase::Active);
+    assert_eq!(
+        session
+            .log()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::GoalChange { .. }))
+            .count(),
+        1,
+        "the change is recorded once, and a read records nothing"
+    );
+
+    // The result the model read for the create is the loop's, and it names the goal.
+    let create_result = tool_result(&session, "call_1");
+    assert!(
+        create_result.contains("reduce p95 latency below 120 ms"),
+        "{create_result}"
+    );
+    assert!(
+        !create_result.contains("not registered"),
+        "the loop dispatched it: {create_result}"
+    );
+
+    // And the read saw what the create wrote, which it can only do if both ran against the
+    // same session.
+    let read_result = tool_result(&session, "call_2");
+    assert!(
+        read_result.contains("reduce p95 latency below 120 ms"),
+        "the read sees the goal the create wrote: {read_result}"
+    );
+    assert!(
+        !read_result.contains("no goal is set"),
+        "and not the empty answer: {read_result}"
+    );
+
+    // The offered schemas reach the model, goal tools included.
+    let requests = model.requests();
+    assert!(
+        requests.first().is_some_and(|request| request
+            .tools
+            .iter()
+            .any(|schema| schema.name.as_str() == "create_goal")),
+        "the goal tools are offered to the model"
+    );
+}
+
+/// A goal tool that refuses is a tool result, not a harness error, and the turn goes on.
+#[tokio::test]
+async fn a_refused_goal_tool_call_is_a_result_the_model_reads() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let (tools, _shell) = workspace_tools(dir.path());
+
+    let model = ScriptedModel::new(vec![
+        // Pausing nothing: there is no goal yet.
+        call("call_1", "pause_goal", "{}"),
+        answer("there was nothing to pause"),
+    ]);
+    let outcome = run(as_port(&model), tools, "pause the goal").await;
+    assert_eq!(outcome.answer, "there was nothing to pause");
+    assert!(
+        outcome.is_success(),
+        "a refused tool call does not fail the turn: {outcome:?}"
+    );
+}
+
+/// The result text a call left in the log.
+fn tool_result(session: &Session, call_id: &str) -> String {
+    session
+        .log()
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::ToolResult {
+                call_id: id,
+                content,
+                ..
+            } if id.as_str() == call_id => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{call_id} has a result"))
 }

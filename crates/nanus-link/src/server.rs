@@ -1169,10 +1169,19 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
     };
 
     // Settled before the ending goes out, so a client that sees the ending and then asks
-    // what is running is told the truth.
+    // what is running is told the truth. The goal is read across the refresh for the same
+    // reason the turn's frames are recorded: a goal the *model* changed during the turn has no
+    // one to broadcast it — the loop writes the log and cannot reach a client — so the change is
+    // noticed here, where the log is compared against what was last shown, and sent as the same
+    // notice a `/goal` change sends.
+    let goal_before = held.goal.borrow().clone();
     held.refresh(&session);
+    let goal_after = held.goal.borrow().clone();
     drop(session);
     held.busy.set(false);
+    if goal_after != goal_before {
+        broadcast_awaited(held, Frame::Goal { goal: goal_after }, None).await;
+    }
     broadcast_end(held, ending).await;
 }
 
@@ -2513,6 +2522,7 @@ mod tests {
             nanus_bundle::ToolRegistryHandle::new(ToolRegistry::new()),
             "a test",
             config,
+            SystemClock::new().handle(),
         )
         .expect("a valid runner");
         Rc::new(Registry::new(

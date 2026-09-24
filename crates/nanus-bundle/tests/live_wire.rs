@@ -26,6 +26,20 @@ use nanus_domain::{AgentConfig, Session, SessionId};
 // trait in scope rather than only the type.
 use nanus_ports::{LlmPort as _, SandboxPolicy};
 
+/// A clock that never moves, so a goal change's timestamps are assertable.
+struct FixedClock;
+
+impl nanus_ports::ClockPort for FixedClock {
+    fn now_ms(&self) -> u64 {
+        1_700_000_000_000
+    }
+}
+
+/// The clock the runners here are built with.
+fn clock() -> nanus_ports::ClockHandle {
+    Rc::new(Box::new(FixedClock))
+}
+
 /// One scripted HTTP response, as the server should write it.
 #[derive(Clone)]
 struct Response {
@@ -231,6 +245,7 @@ fn runner(
         nanus_bundle::ToolRegistryHandle::new(registry),
         "you are a test",
         config,
+        clock(),
     )
     .expect("the runner builds");
     (runner, shell)

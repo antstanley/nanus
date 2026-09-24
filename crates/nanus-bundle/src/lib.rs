@@ -12,18 +12,25 @@
 //!
 //! ## The toolset is deliberately small
 //!
-//! Seven tools: `read`, `write`, `edit`, `read_image`, `glob`, `grep`, and `bash`.
-//! Each is a mechanism the shell cannot provide as well — a bounded read window, an
-//! exactly-once edit, a diff, a capped search — rather than a convenience wrapper
-//! around something the shell already does. Adding a tool costs a description in
-//! every request and a schema the model must choose between, so a tool has to earn
-//! its place.
+//! Seven *registered* tools — `read`, `write`, `edit`, `read_image`, `glob`, `grep`, and
+//! `bash` — each a mechanism the shell cannot provide as well (a bounded read window, an
+//! exactly-once edit, a diff, a capped search) rather than a convenience wrapper. Adding a
+//! registered tool costs a description in every request and a schema the model must choose
+//! between, so one has to earn its place.
+//!
+//! Beside them are the five **goal tools** ([`goal_tools`]), the one set that is not
+//! registered: their effect is a record in the session log, which a `'static` executor
+//! cannot reach, so the loop runs them itself. They are offered with the registered set
+//! and counted with it — [`AgentRunner`] is the one place the two lists meet.
 //!
 //! ## Services this bundle publishes
 //!
 //! | Key | Type | Provided by |
 //! |---|---|---|
 //! | `tools` | [`ToolRegistryHandle`] | [`tools_plugin`] |
+//!
+//! The published registry is the *registered* toolset. The goal tools travel beside it and
+//! are not found by key: nothing outside the loop dispatches them.
 //!
 //! ## How a harness is assembled
 //!
@@ -58,6 +65,7 @@ pub mod args;
 pub mod authorize;
 pub mod compose;
 pub mod error;
+pub mod goal_tools;
 pub mod guard;
 pub mod provider;
 pub mod selection;
@@ -127,7 +135,10 @@ pub fn tools_key() -> ServiceKey<ToolRegistryHandle> {
     ServiceKey::of("tools")
 }
 
-/// Builds the seven model-facing tools over the filesystem and shell ports.
+/// Builds the seven registered model-facing tools over the filesystem and shell ports.
+///
+/// The goal tools are deliberately not here: they are the loop's own, because their effect is a
+/// record in the session log and a registered executor cannot reach it. See [`goal_tools`].
 ///
 /// # Errors
 ///
@@ -150,9 +161,9 @@ pub fn build_toolset(
     for definition in definitions {
         registry.register(definition)?;
     }
-    // Postcondition: the shipped set is exactly seven distinct tools, which is the
-    // scope the design committed to.
-    assert_eq!(registry.len(), 7, "the shipped toolset has seven tools");
+    // Postcondition: the registered set is exactly seven distinct tools, which is the
+    // scope the design committed to for tools the registry dispatches.
+    assert_eq!(registry.len(), 7, "the registered toolset has seven tools");
     Ok(registry)
 }
 
@@ -258,6 +269,48 @@ mod tests {
                 "grep",
                 "read",
                 "read_image",
+                "write"
+            ]
+        );
+    }
+
+    /// What the model is offered is the registered set *and* the goal tools, and they are
+    /// distinct: a name in both would be a tool the loop intercepts before the registry ever
+    /// sees it, which would make one of the two unreachable.
+    #[test]
+    fn the_offered_toolset_is_the_registered_tools_and_the_goal_tools() {
+        let Ok(registry) = build_toolset(&fs_handle(), &shell_handle()) else {
+            return;
+        };
+        let mut offered: Vec<String> = registry
+            .names()
+            .into_iter()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        for schema in goal_tools::schemas() {
+            let name = schema.name.as_str().to_owned();
+            assert!(
+                !offered.contains(&name),
+                "{name} is offered twice: once registered, once by the loop"
+            );
+            offered.push(name);
+        }
+        offered.sort();
+        assert_eq!(offered.len(), 7_usize.saturating_add(goal_tools::COUNT));
+        assert_eq!(
+            offered,
+            vec![
+                "abandon_goal",
+                "bash",
+                "create_goal",
+                "edit",
+                "get_goal",
+                "glob",
+                "grep",
+                "pause_goal",
+                "read",
+                "read_image",
+                "update_goal",
                 "write"
             ]
         );

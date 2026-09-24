@@ -295,6 +295,7 @@ fn agent_over(dir: &Path, llm: Rc<Box<dyn LlmPort>>, model: &str) -> (Agent, Sto
         nanus_bundle::ToolRegistryHandle::new(ToolRegistry::new()),
         "you are a test",
         config,
+        SystemClock::new().handle(),
     )
     .expect("a valid runner");
     let agent = Agent::from_parts(Parts {
@@ -354,6 +355,44 @@ impl LlmPort for CallingLlm {
     }
 }
 
+/// A model that calls `create_goal` once and then answers.
+///
+/// What makes a goal the *model* set observable over the link: the change is written by the
+/// loop, which has no way to reach a client, so the server has to notice it.
+struct GoalLlm {
+    step: std::cell::Cell<u32>,
+}
+
+impl LlmPort for GoalLlm {
+    fn model(&self) -> &'static str {
+        "goal"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        let step = self.step.get();
+        self.step.set(step.saturating_add(1));
+        if step > 0 {
+            return Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta("the objective is recorded".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ]));
+        }
+        Box::pin(futures::stream::iter(vec![
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("call_1")),
+                name: Some(ToolName::new("create_goal").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: r#"{"objective":"watch the nightly benchmark"}"#.to_owned(),
+            },
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]))
+    }
+}
+
 /// A tool that succeeds without touching anything, declared as running a program.
 ///
 /// `Execute` is the access no confined sandbox permits, which is what makes every call to it
@@ -398,6 +437,7 @@ fn gated_agent(dir: &Path, approval: ApprovalPolicy) -> (Agent, StoreHandle) {
         nanus_bundle::ToolRegistryHandle::new(registry),
         "you are a test",
         config,
+        SystemClock::new().handle(),
     )
     .expect("a valid runner");
     let agent = Agent::from_parts(Parts {
@@ -2842,5 +2882,68 @@ fn a_goal_is_refused_while_a_turn_is_running() {
     assert!(
         refused.contains("idle"),
         "the refusal says the session is busy and when a goal can be set: {refused}"
+    );
+}
+
+/// A goal the *model* changes during a turn reaches the clients watching it.
+///
+/// The loop writes the change into the log and cannot reach a client, so this is the server
+/// noticing it and sending the same notice a `/goal` change sends. Without it a watching
+/// interface would not learn the objective until it attached again.
+#[test]
+fn a_goal_the_model_sets_reaches_the_client() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(GoalLlm {
+            step: std::cell::Cell::new(0),
+        })),
+        "goal",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let outcome = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let session = client.start(None).await.expect("a session starts");
+
+        client
+            .send(&Request::Prompt {
+                text: "start the nightly objective".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let seen = frames.iter().find_map(|frame| match frame {
+            Frame::Goal { goal: Some(goal) } => Some(goal.objective.clone()),
+            _ => None,
+        });
+
+        let stored = store
+            .load(&SessionId::new(session.session))
+            .await
+            .expect("the session was recorded");
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        (seen, stored.goal().map(|goal| goal.objective().to_owned()))
+    });
+    let (seen, stored) = outcome;
+
+    assert_eq!(
+        seen.as_deref(),
+        Some("watch the nightly benchmark"),
+        "the goal the model set is broadcast as the turn ends"
+    );
+    assert_eq!(
+        stored.as_deref(),
+        Some("watch the nightly benchmark"),
+        "and it is durable, not only broadcast"
     );
 }
