@@ -59,6 +59,6 @@ pub mod wire;
 
 pub use client::Client;
 pub use error::{LinkError, LinkResult};
-pub use protocol::{AgentInfo, Frame, Request, decode, encode};
+pub use protocol::{AgentInfo, Frame, GoalAction, GoalInfo, GoalState, Request, decode, encode};
 #[cfg(feature = "server")]
 pub use server::{Agent, Parts, bind, serve};

@@ -126,11 +126,83 @@ pub enum EffortState {
     Max,
 }
 
+/// Where a goal is in its lifecycle, in the link's own vocabulary.
+///
+/// This crate's own rather than the domain's, for the same reason [`TurnEnd`] and
+/// [`ApprovalState`] are: a client that only draws links the protocol and not the
+/// domain. The server translates, and the translation is an exhaustive match, so a
+/// phase the domain grows cannot quietly fail to cross.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalState {
+    /// Being pursued.
+    Active,
+    /// Suspended by a person.
+    Paused,
+    /// The objective is achieved.
+    Complete,
+    /// Given up on without achieving the objective.
+    Abandoned,
+}
+
+/// A durable objective, as an interface draws it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalInfo {
+    /// What is to be done.
+    pub objective: String,
+    /// Where it is in its lifecycle.
+    pub state: GoalState,
+    /// How many changes the goal has had, starting at one.
+    pub revision: u64,
+    /// When it was created, in milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+    /// When it was last changed, in milliseconds since the Unix epoch.
+    pub updated_at_ms: u64,
+    /// Why it is in its current phase, when a reason was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// What a client asks to do to a session's goal.
+///
+/// One request with an action rather than a variant per transition, because the
+/// actions are one lifecycle: a client that speaks one has to speak the status read
+/// that tells it what the others mean, and a single shape keeps them together. The
+/// variant names are the words a person types after `/goal`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum GoalAction {
+    /// Report the goal without changing it.
+    Status,
+    /// Create a goal, or replace the objective of the one that exists.
+    Set {
+        /// The new objective.
+        objective: String,
+    },
+    /// Suspend a goal so it is not worked on.
+    Pause,
+    /// Resume a suspended goal.
+    Resume,
+    /// Mark the objective achieved, with the reason it was given.
+    Complete {
+        /// Why it is complete, when a reason was given.
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Give up on the objective without achieving it, with the reason it was given.
+    Abandon {
+        /// Why the pursuit stopped, when a reason was given.
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Remove the goal.
+    Clear,
+}
+
 /// What a client asks an agent to do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
-    /// Start a session and attach this connection to it.
     ///
     /// Replaces whatever the connection was attached to. Naming it is optional, and a
     /// name that is already taken is refused rather than moved: an alias silently
@@ -266,6 +338,19 @@ pub enum Request {
         plan: Option<String>,
         /// The secret to file under that account.
         key: String,
+    },
+
+    /// Change or report the session's goal.
+    ///
+    /// The interface's command for a durable objective, and a *request* rather than
+    /// something a client does for itself because a goal is session state and the session
+    /// belongs to the agent: a client cannot mutate a conversation it does not own, and two
+    /// clients editing one goal have to meet somewhere the log does. The agent answers with
+    /// [`Frame::Goal`], and the command's own output is not a prompt — it never reaches the
+    /// model, exactly as the goal record it writes does not.
+    Goal {
+        /// What to do to the goal.
+        action: GoalAction,
     },
 
     /// Describe the agent without changing anything.
@@ -568,6 +653,19 @@ pub enum Frame {
         decode_ms: u64,
     },
 
+    /// The session's goal, or its absence.
+    ///
+    /// Sent in answer to [`Request::Goal`], when a client attaches — only when a goal exists,
+    /// so attaching to a session with none does not announce the absence of something nobody
+    /// asked about — and to every client attached to the session whenever the goal changes, so
+    /// two views of one conversation agree about its objective. Unlike the model and the
+    /// approval state this is *session* state rather than the agent's, so only the session's
+    /// own viewers are told.
+    Goal {
+        /// The goal, when there is one.
+        goal: Option<GoalInfo>,
+    },
+
     /// The turn ended, whatever the outcome.
     ///
     /// One frame rather than a success variant and a failure variant, because "the model
@@ -663,7 +761,12 @@ impl Frame {
 /// The field is optional on the wire and defaults to zero, which is what a build that
 /// predates versioning sends. Zero is therefore "too old to say", and a client refuses it
 /// rather than assuming compatibility.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// Version 8 added the goal surface — [`Request::Goal`], [`Frame::Goal`],
+/// [`GoalAction`], and [`GoalState`] — so a client or agent from before that cannot
+/// read the other's goal frames: an older peer meets an unknown variant as a decode
+/// error naming a field, which is exactly the misread this moves for.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -857,6 +960,17 @@ mod tests {
         }
     }
 
+    fn goal_info() -> GoalInfo {
+        GoalInfo {
+            objective: "reduce p95 latency below 120 ms".to_owned(),
+            state: GoalState::Active,
+            revision: 1,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            note: None,
+        }
+    }
+
     #[test]
     fn a_round_trip_preserves_every_frame() {
         let frames = [
@@ -953,6 +1067,54 @@ mod tests {
             Frame::Bye,
         ];
         for frame in frames {
+            let encoded = encode(&frame);
+            assert!(encoded.is_ok(), "encodes: {encoded:?}");
+            let Ok(encoded) = encoded else { return };
+            let decoded = decode::<Frame>(&encoded);
+            assert_eq!(decoded.ok(), Some(frame.clone()), "round trip of {frame:?}");
+        }
+    }
+
+    /// The goal frame carries an optional goal and an optional note — the two shapes a session
+    /// with a goal and one that cleared it produce — so each gets a round trip.
+    #[test]
+    fn the_goal_frames_round_trip() {
+        for frame in [
+            Frame::Goal {
+                goal: Some(goal_info()),
+            },
+            Frame::Goal {
+                goal: Some(GoalInfo {
+                    objective: "a paused objective".to_owned(),
+                    state: GoalState::Paused,
+                    revision: 4,
+                    created_at_ms: 1,
+                    updated_at_ms: 9,
+                    note: Some("waiting on the release window".to_owned()),
+                }),
+            },
+            Frame::Goal {
+                goal: Some(GoalInfo {
+                    objective: "an achieved objective".to_owned(),
+                    state: GoalState::Complete,
+                    revision: 7,
+                    created_at_ms: 1,
+                    updated_at_ms: 20,
+                    note: None,
+                }),
+            },
+            Frame::Goal {
+                goal: Some(GoalInfo {
+                    objective: "a given-up-on objective".to_owned(),
+                    state: GoalState::Abandoned,
+                    revision: 2,
+                    created_at_ms: 1,
+                    updated_at_ms: 30,
+                    note: Some("this cannot be made deterministic".to_owned()),
+                }),
+            },
+            Frame::Goal { goal: None },
+        ] {
             let encoded = encode(&frame);
             assert!(encoded.is_ok(), "encodes: {encoded:?}");
             let Ok(encoded) = encoded else { return };
@@ -1102,6 +1264,38 @@ mod tests {
                 Some(request.clone()),
                 "round trip of {request:?}"
             );
+        }
+    }
+
+    /// Every goal request, one per action, because the actions are what `/goal` and the model
+    /// tools speak and each has to survive the wire unchanged.
+    #[test]
+    fn the_goal_requests_round_trip() {
+        for action in [
+            GoalAction::Status,
+            GoalAction::Set {
+                objective: "reduce p95 latency below 120 ms".to_owned(),
+            },
+            GoalAction::Pause,
+            GoalAction::Resume,
+            GoalAction::Complete {
+                note: Some("the benchmark run is green".to_owned()),
+            },
+            GoalAction::Complete { note: None },
+            GoalAction::Abandon {
+                note: Some("the benchmark cannot be made deterministic".to_owned()),
+            },
+            GoalAction::Abandon { note: None },
+            GoalAction::Clear,
+        ] {
+            let request = Request::Goal {
+                action: action.clone(),
+            };
+            let encoded = encode(&request);
+            assert!(encoded.is_ok(), "encodes: {encoded:?}");
+            let Ok(encoded) = encoded else { return };
+            let decoded = decode::<Request>(&encoded);
+            assert_eq!(decoded.ok(), Some(request), "round trip of {action:?}");
         }
     }
 

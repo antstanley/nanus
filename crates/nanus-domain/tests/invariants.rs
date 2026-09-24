@@ -8,7 +8,7 @@
 use std::future::Future;
 
 use nanus_domain::{
-    AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Message, PermissionPreset,
+    AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Goal, Message, PermissionPreset,
     PromptBuilder, PromptError, Role, SandboxMode, Session, SessionError, SessionEvent, SessionId,
     StepOutcome, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
     ToolOutcome, ToolRegistry, ToolResult, ToolSchema, TurnEndReason, TurnMachine, TurnOutcome,
@@ -593,6 +593,33 @@ fn usage() -> impl Strategy<Value = Usage> {
         })
 }
 
+/// A strategy for a goal, active or completed with a reason.
+///
+/// Built through the public transitions rather than by naming fields, because the
+/// type does not expose a constructor that could produce an unvalidated objective
+/// or an impossible phase.
+// The strategy states its fixtures with a panic, which is the test's assertion
+// mechanism: a generated value the type would refuse is a defect in the strategy.
+#[allow(clippy::panic)]
+fn goal() -> impl Strategy<Value = Goal> {
+    (
+        "[!-~]{1,120}",
+        any::<u64>(),
+        any::<u64>(),
+        prop::option::of("[ -~]{0,40}"),
+    )
+        .prop_map(|(objective, created, updated, note)| {
+            let goal = Goal::new(objective, created)
+                .unwrap_or_else(|error| panic!("a strategy builds a valid goal: {error}"));
+            match note {
+                Some(reason) => goal
+                    .completed(Some(reason), updated)
+                    .unwrap_or_else(|error| panic!("a fresh goal can complete: {error}")),
+                None => goal,
+            }
+        })
+}
+
 /// A strategy for one session event.
 fn event() -> impl Strategy<Value = SessionEvent> {
     prop_oneof![
@@ -657,6 +684,9 @@ fn event() -> impl Strategy<Value = SessionEvent> {
                 is_error,
             }
         }),
+        // A goal change, with and without a goal: the two shapes a log can hold,
+        // the second being the clear tombstone.
+        prop::option::of(goal()).prop_map(|goal| SessionEvent::GoalChange { goal }),
     ]
 }
 

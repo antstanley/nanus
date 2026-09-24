@@ -15,6 +15,8 @@
 //!   request, enforced by giving the executable half no `Serialize`.
 //! - [`session`] — the append-only event log, the only source of model history,
 //!   with a JSONL framing that detects truncation and sequence holes.
+//! - [`goal`] — a durable objective, persisted in the session log and read back
+//!   by a fold, with a lifecycle a person controls.
 //! - [`prompt`] — ordered, named prompt sections with explicit variables, where
 //!   an unresolved reference is an error rather than a silent empty string.
 //! - [`approval`] — the two orthogonal permission knobs, fail-closed.
@@ -72,6 +74,7 @@ pub mod agent;
 pub mod approval;
 pub mod context;
 pub mod error;
+pub mod goal;
 pub mod message;
 pub mod prompt;
 pub mod session;
@@ -87,6 +90,7 @@ pub use approval::{
 };
 pub use context::{Elision, FitError, Fitted, estimate, fit};
 pub use error::{DomainError, DomainResult};
+pub use goal::{GOAL_OBJECTIVE_MAX_CHARS, Goal, GoalPhase};
 pub use message::{Message, Role, ToolCallId, Usage};
 pub use prompt::{PromptBuilder, PromptError, PromptSection, runtime_context};
 pub use session::{

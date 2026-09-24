@@ -17,8 +17,8 @@
 //!   skipped: it carries no model-visible content, and replaying it would spend
 //!   tokens on nothing.
 //! - [`SessionEvent::ToolResult`] becomes a tool message, verbatim.
-//! - Everything else — turn and step boundaries, and the tool-call audit record —
-//!   is harness bookkeeping and never reaches a model.
+//! - Everything else — turn and step boundaries, the tool-call audit record, and
+//!   the goal change — is harness bookkeeping and never reaches a model.
 //!
 //! ## JSONL framing
 //!
@@ -48,6 +48,7 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::goal::Goal;
 use crate::message::{Message, ToolCallId, Usage};
 use crate::tool::{ToolCall, ToolName};
 
@@ -284,6 +285,20 @@ pub enum SessionEvent {
         /// Whether the tool failed.
         is_error: bool,
     },
+    /// The session's goal changed.
+    ///
+    /// A goal is durable *state* rather than a message: this record is the whole
+    /// goal after a change, or its absence after a clear, and the current goal is
+    /// the last such record — see [`SessionLog::goal`]. Recording the whole goal
+    /// rather than a diff is what makes the fold independent of every other
+    /// event, so a resumed session knows its objective without replaying anything
+    /// in order. Like a turn boundary and unlike a message, it is harness
+    /// bookkeeping and never reaches a model.
+    GoalChange {
+        /// The goal after the change, absent when it was cleared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<Goal>,
+    },
 }
 
 /// An append-only sequence of [`SessionEvent`]s.
@@ -429,7 +444,8 @@ impl SessionLog {
                 | SessionEvent::TurnEnd { .. }
                 | SessionEvent::StepStart { .. }
                 | SessionEvent::StepEnd { .. }
-                | SessionEvent::ToolCall { .. } => {}
+                | SessionEvent::ToolCall { .. }
+                | SessionEvent::GoalChange { .. } => {}
             }
         }
         // Postcondition: the fold only removes events, never invents messages.
@@ -565,6 +581,24 @@ impl SessionLog {
             SessionEvent::TurnEnd { reason, .. } => Some(reason),
             _ => None,
         })
+    }
+
+    /// Returns the session's current goal, if it has one.
+    ///
+    /// The log is the authority: a goal is the last `goal/change` record, and a
+    /// clear is a record with no goal after it. Scanning from the end rather than
+    /// folding forward means this costs the same whether the log holds one goal
+    /// change or a hundred.
+    #[must_use]
+    pub fn goal(&self) -> Option<Goal> {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                SessionEvent::GoalChange { goal } => Some(goal.clone()),
+                _ => None,
+            })
+            .flatten()
     }
 }
 
@@ -857,6 +891,16 @@ impl Session {
     #[must_use]
     pub fn request_count(&self) -> u32 {
         self.log.request_count()
+    }
+
+    /// Returns the session's current goal, if it has one.
+    ///
+    /// Delegated to the log, which is the only place a goal lives: a goal is
+    /// durable session state, not a field a caller could set behind the log's
+    /// back.
+    #[must_use]
+    pub fn goal(&self) -> Option<Goal> {
+        self.log.goal()
     }
 
     /// Derives a short title from the first human turn.
@@ -1337,6 +1381,58 @@ mod tests {
         let open = session.log().open_tool_calls();
         assert_eq!(open.len(), 1);
         assert_eq!(open.first().map(ToolCallId::as_str), Some("c-2"));
+    }
+
+    /// A goal change is state rather than a message, so it never reaches a model.
+    #[test]
+    fn a_goal_change_is_not_model_visible() {
+        let mut session = session();
+        session.append(SessionEvent::GoalChange {
+            goal: Some(Goal::new("ship it", 10).unwrap_or_else(|error| panic!("{error}"))),
+        });
+        assert!(
+            session.derive_messages().is_empty(),
+            "a goal is bookkeeping, not a message"
+        );
+        assert_eq!(
+            session.goal().map(|goal| goal.objective().to_owned()),
+            Some(String::from("ship it"))
+        );
+    }
+
+    /// The fold is over the *last* change, and a clear is a change with no goal.
+    #[test]
+    fn the_current_goal_is_the_last_change_and_a_clear_removes_it() {
+        let mut session = session();
+        assert_eq!(session.goal(), None, "no goal has been set");
+        let first = Goal::new("the first objective", 1).unwrap_or_else(|error| panic!("{error}"));
+        let second = first
+            .with_objective("the second objective", 2)
+            .unwrap_or_else(|error| panic!("{error}"));
+        session.append(SessionEvent::GoalChange { goal: Some(first) });
+        session.append(SessionEvent::GoalChange {
+            goal: Some(second.clone()),
+        });
+        assert_eq!(session.goal(), Some(second), "the newest change wins");
+        // A clear is a record with no goal after it, so the goal is gone — not
+        // reborn from the change before it.
+        session.append(SessionEvent::GoalChange { goal: None });
+        assert_eq!(session.goal(), None);
+    }
+
+    /// A goal is durable state, so it survives the file format round trip.
+    #[test]
+    fn a_goal_survives_the_jsonl_round_trip() {
+        let mut original = session();
+        let goal = Goal::new("reduce p95 latency below 120 ms", 42)
+            .unwrap_or_else(|error| panic!("{error}"));
+        original.append(SessionEvent::GoalChange {
+            goal: Some(goal.clone()),
+        });
+        let decoded = Session::from_jsonl(&original.to_jsonl());
+        assert!(decoded.is_ok(), "a session holding a goal round-trips");
+        let Ok(decoded) = decoded else { return };
+        assert_eq!(decoded.goal(), Some(goal));
     }
 
     #[test]

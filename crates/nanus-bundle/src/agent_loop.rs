@@ -2035,6 +2035,7 @@ mod tests {
             SessionEvent::AssistantMessage { .. } => "assistant_message",
             SessionEvent::ToolCall { .. } => "tool_call",
             SessionEvent::ToolResult { .. } => "tool_result",
+            SessionEvent::GoalChange { .. } => "goal_change",
         }
     }
 

@@ -48,8 +48,8 @@ use nanus_bundle::{
     AgentRunner, Approver, Harness, LastSelection, Progress, Provider, ProviderSwitch,
 };
 use nanus_domain::{
-    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Session, SessionId, ToolCallId, ToolName,
-    TurnEndReason, Usage,
+    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Goal, GoalPhase, Session, SessionEvent,
+    SessionId, ToolCallId, ToolName, TurnEndReason, Usage,
 };
 use nanus_ports::{ClockHandle, StoreHandle};
 use tokio::io::BufReader;
@@ -61,8 +61,8 @@ use tokio::time::sleep;
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
-    AgentInfo, ApprovalState, EffortState, Frame, ModelEfforts, PlanInfo, ProviderInfo, Request,
-    SessionInfo, TurnEnd,
+    AgentInfo, ApprovalState, EffortState, Frame, GoalAction, GoalInfo, GoalState, ModelEfforts,
+    PlanInfo, ProviderInfo, Request, SessionInfo, TurnEnd,
 };
 use crate::wire::{read_request, write_frame};
 
@@ -374,6 +374,14 @@ struct Held {
     name: RefCell<Option<String>>,
     /// What a listing shows about it.
     headline: RefCell<Headline>,
+    /// The session's current goal, cached like the headline.
+    ///
+    /// Cached rather than read from the session on demand for the same reason the headline
+    /// is: a turn borrows the session for its whole duration, and an attachment may happen
+    /// while one is running, so the goal a client is shown on attaching has to be readable
+    /// without touching the session. Refreshed wherever the session is, which is after a
+    /// turn and after a goal change.
+    goal: RefCell<Option<GoalInfo>>,
     /// One queue per attached client, with the id that connection unsubscribes by.
     viewers: RefCell<Vec<(u64, mpsc::Sender<Frame>)>>,
     /// Whether a turn is running. One at a time, because a turn owns the session.
@@ -461,12 +469,13 @@ impl Held {
         }
     }
 
-    /// Refreshes the cached headline from the session.
+    /// Refreshes the cached headline and goal from the session.
     fn refresh(&self, session: &Session) {
         *self.headline.borrow_mut() = Headline {
             title: session.title(),
             events: u64::try_from(session.event_count()).unwrap_or(u64::MAX),
         };
+        *self.goal.borrow_mut() = session.goal().as_ref().map(wire_goal);
     }
 
     /// Records one frame of the turn in progress.
@@ -660,6 +669,7 @@ impl Registry {
                 armed: Cell::new(true),
             }),
             headline: RefCell::new(Headline::default()),
+            goal: RefCell::new(None),
             session: RefCell::new(session),
             name: RefCell::new(name),
             turn: RefCell::new(Vec::new()),
@@ -952,6 +962,35 @@ const fn wire_effort(effort: nanus_ports::ReasoningEffort) -> EffortState {
         nanus_ports::ReasoningEffort::High => EffortState::High,
         nanus_ports::ReasoningEffort::XHigh => EffortState::XHigh,
         nanus_ports::ReasoningEffort::Max => EffortState::Max,
+    }
+}
+
+/// Renders a goal phase in the link's vocabulary.
+///
+/// An exhaustive match, so a phase the domain grows is a compile error here rather than a
+/// phase the interface silently never shows — the rule [`wire_state`] and [`wire_effort`]
+/// already follow.
+const fn wire_phase(phase: GoalPhase) -> GoalState {
+    match phase {
+        GoalPhase::Active => GoalState::Active,
+        GoalPhase::Paused => GoalState::Paused,
+        GoalPhase::Complete => GoalState::Complete,
+        GoalPhase::Abandoned => GoalState::Abandoned,
+    }
+}
+
+/// Renders a domain goal in the link's vocabulary.
+///
+/// Only the goal itself crosses, never anything the session holds around it: an interface
+/// draws an objective, its phase, and when it changed.
+fn wire_goal(goal: &Goal) -> GoalInfo {
+    GoalInfo {
+        objective: goal.objective().to_owned(),
+        state: wire_phase(goal.phase()),
+        revision: goal.revision(),
+        created_at_ms: goal.created_at_ms(),
+        updated_at_ms: goal.updated_at_ms(),
+        note: goal.note().map(str::to_owned),
     }
 }
 
@@ -1665,6 +1704,10 @@ async fn serve_connection(
             } => {
                 set_credential(&registry, &frames, &provider, plan.as_deref(), &key).await;
             }
+            Request::Goal { action } => match &watching {
+                Some((_, held)) => apply_goal(&registry, &frames, held, action).await,
+                None => refuse_unattached(&frames).await,
+            },
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
                 shutdown.notify_one();
@@ -1803,6 +1846,139 @@ async fn remember_selection(registry: &Rc<Registry>) {
     if let Err(error) = written {
         tracing::warn!(%error, "the remembered selection could not be written");
     }
+}
+
+/// Applies a goal action to the session this connection is watching, or says why it could not.
+///
+/// The goal is durable session state, so a change is a `goal/change` record written into the
+/// session log through the same store every turn is recorded through. The action's own output is
+/// not a prompt and never reaches the model, exactly as the record it writes does not.
+async fn apply_goal(
+    registry: &Rc<Registry>,
+    frames: &mpsc::Sender<Frame>,
+    held: &Rc<Held>,
+    action: GoalAction,
+) {
+    // A goal change is written into the session log, and a turn holds the session for its whole
+    // duration — so a change waits for an idle session rather than fighting the borrow. The
+    // refusal is a sentence rather than a queue, the same answer a prompt to a busy session gets:
+    // a session runs one turn at a time, and the goal is read against the log.
+    if held.busy.get() {
+        send(
+            frames,
+            Frame::Failed {
+                message: String::from(
+                    "a turn is running in this session; the goal can be changed when it is idle",
+                ),
+            },
+        )
+        .await;
+        return;
+    }
+    let current = held.session.borrow().goal();
+    let now = registry.agent.clock.now_ms();
+    let next = match next_goal(current.as_ref(), action, now) {
+        Ok(next) => next,
+        Err(message) => {
+            send(frames, Frame::Failed { message }).await;
+            return;
+        }
+    };
+    // A status read, or an action that changes nothing — pausing a goal already paused — is
+    // answered without writing a record: the revision did not move, so there is nothing to
+    // record and nothing to broadcast to a watcher.
+    if next == current {
+        send(
+            frames,
+            Frame::Goal {
+                goal: next.as_ref().map(wire_goal),
+            },
+        )
+        .await;
+        return;
+    }
+    // The updated session is built and saved *before* the held copy is replaced: a store that
+    // refused the write leaves the in-memory session as it was, so the change is either durable
+    // or absent, never applied in memory and lost.
+    let updated = {
+        let session = held.session.borrow();
+        let mut updated = session.clone();
+        updated.append(SessionEvent::GoalChange { goal: next.clone() });
+        updated
+    };
+    if let Err(error) = registry.agent.record(&updated).await {
+        send(
+            frames,
+            Frame::Failed {
+                message: format!("the goal could not be recorded: {error}"),
+            },
+        )
+        .await;
+        return;
+    }
+    *held.session.borrow_mut() = updated.clone();
+    held.refresh(&updated);
+    // The change reaches every client watching the session, not only the one that asked, so two
+    // views of one conversation agree about its objective — the rule the model and the approval
+    // state already follow, here at the granularity of a session rather than an agent.
+    broadcast_awaited(
+        held,
+        Frame::Goal {
+            goal: next.as_ref().map(wire_goal),
+        },
+        None,
+    )
+    .await;
+}
+
+/// Computes the goal an action leaves behind, or the sentence saying why it cannot.
+///
+/// Pure and separate from the session, so the lifecycle is testable without a store or a borrow:
+/// the caller writes the result into the log. `current` is the session's goal, `None` before one
+/// is set and after one is cleared.
+///
+/// # Errors
+///
+/// Returns the sentence to show when an action needs a goal and none exists, or when the domain
+/// refuses the transition — pausing a completed goal, or a blank or oversized objective.
+fn next_goal(
+    current: Option<&Goal>,
+    action: GoalAction,
+    now_ms: u64,
+) -> Result<Option<Goal>, String> {
+    match action {
+        GoalAction::Status => Ok(current.cloned()),
+        GoalAction::Set { objective } => {
+            let goal = match current {
+                Some(existing) => existing.with_objective(objective, now_ms),
+                None => Goal::new(objective, now_ms),
+            };
+            transition(goal)
+        }
+        GoalAction::Pause => {
+            transition(require(current, "there is no goal to pause")?.paused(None, now_ms))
+        }
+        GoalAction::Resume => {
+            transition(require(current, "there is no goal to resume")?.resumed(now_ms))
+        }
+        GoalAction::Complete { note } => {
+            transition(require(current, "there is no goal to complete")?.completed(note, now_ms))
+        }
+        GoalAction::Abandon { note } => {
+            transition(require(current, "there is no goal to abandon")?.abandoned(note, now_ms))
+        }
+        GoalAction::Clear => Ok(None),
+    }
+}
+
+/// Returns the goal an action needs, or the sentence saying there is none.
+fn require<'a>(current: Option<&'a Goal>, absent: &str) -> Result<&'a Goal, String> {
+    current.ok_or_else(|| String::from(absent))
+}
+
+/// Lifts a goal transition into the shape [`next_goal`] returns.
+fn transition(outcome: Result<Goal, nanus_domain::DomainError>) -> Result<Option<Goal>, String> {
+    outcome.map(Some).map_err(|error| error.to_string())
 }
 
 /// Rebuilds the agent's model adapter for another provider, or says why it could not.
@@ -2080,6 +2256,15 @@ async fn attach(
     if let Some(state) = registry.agent.effort() {
         send(frames, Frame::EffortChanged { state }).await;
     }
+    // The goal follows, and only when the session has one: it is the conversation's own durable
+    // objective, so a reader attaching mid-conversation knows what is being worked on. A frame
+    // announcing the absence of a goal nobody asked about would be noise on every attachment, so
+    // an idle session with no goal says nothing here. Read out of the cache first, because the
+    // queue send below awaits and the cache is a `RefCell`.
+    let goal = held.goal.borrow().clone();
+    if let Some(goal) = goal {
+        send(frames, Frame::Goal { goal: Some(goal) }).await;
+    }
     Ok((viewer, Rc::clone(held)))
 }
 
@@ -2304,6 +2489,7 @@ mod tests {
             session: RefCell::new(session),
             name: RefCell::new(None),
             headline: RefCell::new(Headline::default()),
+            goal: RefCell::new(None),
             turn: RefCell::new(Vec::new()),
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),

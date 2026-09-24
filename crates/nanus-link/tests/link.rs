@@ -30,7 +30,10 @@ use nanus_domain::{
     ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolRegistry,
     ToolResult, ToolSchema, Usage,
 };
-use nanus_link::protocol::{ApprovalState, EffortState, Frame, Request, SessionInfo, TurnEnd};
+use nanus_link::protocol::{
+    ApprovalState, EffortState, Frame, GoalAction, GoalInfo, GoalState, Request, SessionInfo,
+    TurnEnd,
+};
 use nanus_link::server::{Agent, Parts};
 use nanus_link::{Client, LinkError};
 // `StorePort` is in scope for the concrete store the claim test writes through: `save` and
@@ -2577,5 +2580,267 @@ fn setting_the_approval_state_changes_how_the_next_call_is_decided() {
             .iter()
             .any(|frame| matches!(frame, Frame::ToolDone { error: false, .. })),
         "the call ran: {frames:?}"
+    );
+}
+
+/// Reads frames until the goal frame, which is what every goal request answers with.
+async fn goal_of(client: &mut Client) -> Option<GoalInfo> {
+    while let Some(frame) = client.next().await.expect("frames are readable") {
+        if let Frame::Goal { goal } = frame {
+            return goal;
+        }
+    }
+    None
+}
+
+/// Sends one goal action and returns the goal the agent answers with.
+async fn ask_goal(client: &mut Client, action: GoalAction) -> Option<GoalInfo> {
+    client
+        .send(&Request::Goal { action })
+        .await
+        .expect("the goal request is sent");
+    goal_of(client).await
+}
+
+/// A goal set over the link is reported back and written into the session's log.
+///
+/// The durability is the point: the goal is session state, so it is read not from the agent's
+/// memory but from the store the session was recorded into.
+#[test]
+fn a_goal_is_set_reported_and_written_into_the_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let outcome = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let session = client.start(None).await.expect("a session starts");
+
+        let set = ask_goal(
+            &mut client,
+            GoalAction::Set {
+                objective: "reduce p95 latency below 120 ms".to_owned(),
+            },
+        )
+        .await;
+        // A status read reports the same goal, revision and all, and does not change it.
+        let read = ask_goal(&mut client, GoalAction::Status).await;
+
+        let stored = store
+            .load(&SessionId::new(session.session))
+            .await
+            .expect("the session was recorded");
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        (set, read, stored.goal())
+    });
+    let (set, read, stored) = outcome;
+
+    let set = set.expect("setting a goal reports it");
+    assert_eq!(set.objective, "reduce p95 latency below 120 ms");
+    assert_eq!(set.state, GoalState::Active);
+    assert_eq!(set.revision, 1, "a fresh goal is the first revision");
+    assert_eq!(
+        read.as_ref(),
+        Some(&set),
+        "the status read agrees the change"
+    );
+    assert_eq!(
+        stored.map(|goal| goal.objective().to_owned()),
+        Some(String::from("reduce p95 latency below 120 ms")),
+        "the goal survives the store, not just the agent's memory"
+    );
+}
+
+/// The lifecycle a person drives: pause, resume, complete, clear, each a revision on the last.
+#[test]
+fn a_goal_lifecycle_pauses_resumes_completes_and_clears() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let outcome = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+
+        let set = ask_goal(
+            &mut client,
+            GoalAction::Set {
+                objective: "watch the nightly benchmark".to_owned(),
+            },
+        )
+        .await;
+        let paused = ask_goal(&mut client, GoalAction::Pause).await;
+        let resumed = ask_goal(&mut client, GoalAction::Resume).await;
+        let done = ask_goal(
+            &mut client,
+            GoalAction::Complete {
+                note: Some("the benchmark run is green".to_owned()),
+            },
+        )
+        .await;
+        let cleared = ask_goal(&mut client, GoalAction::Clear).await;
+        let after = ask_goal(&mut client, GoalAction::Status).await;
+
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        (set, paused, resumed, done, cleared, after)
+    });
+    let (set, paused, resumed, done, cleared, after) = outcome;
+
+    assert_eq!(
+        set.map(|goal| (goal.state, goal.revision)),
+        Some((GoalState::Active, 1))
+    );
+    assert_eq!(
+        paused.map(|goal| (goal.state, goal.revision)),
+        Some((GoalState::Paused, 2))
+    );
+    assert_eq!(
+        resumed.map(|goal| (goal.state, goal.revision)),
+        Some((GoalState::Active, 3))
+    );
+    assert_eq!(
+        done.map(|goal| (goal.state, goal.revision, goal.note)),
+        Some((
+            GoalState::Complete,
+            4,
+            Some(String::from("the benchmark run is green"))
+        ))
+    );
+    assert_eq!(cleared, None, "a clear answers with no goal");
+    assert_eq!(after, None, "and the goal is gone afterwards");
+}
+
+/// A second client attaching to a session is shown the objective it is carrying.
+#[test]
+fn an_attachment_shows_the_session_goal() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let seen = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let session = client.start(None).await.expect("a session starts");
+        ask_goal(
+            &mut client,
+            GoalAction::Set {
+                objective: "read the roadmap".to_owned(),
+            },
+        )
+        .await;
+
+        // A fresh connection attaching to the same session is told the goal as part of attaching,
+        // so a reader who joins a conversation mid-flight knows what is being worked on.
+        let mut other = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers a second client");
+        other
+            .attach(&session.session)
+            .await
+            .expect("the session attaches");
+        let seen = goal_of(&mut other).await;
+
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        seen
+    });
+
+    assert_eq!(
+        seen.map(|goal| goal.objective),
+        Some(String::from("read the roadmap")),
+        "an attachment carries the objective"
+    );
+}
+
+/// A goal cannot be changed while a turn is running, because the turn owns the session.
+#[test]
+fn a_goal_is_refused_while_a_turn_is_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (agent, _store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(WaitingLlm {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })),
+        "waiting",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let refused = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client.start(None).await.expect("a session starts");
+
+        client
+            .send(&Request::Prompt {
+                text: "start something long".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        // The turn is in flight: it is inside the model's response and holds the session.
+        let _permit = entered.acquire().await.expect("the turn reached the model");
+
+        client
+            .send(&Request::Goal {
+                action: GoalAction::Set {
+                    objective: "cannot be set now".to_owned(),
+                },
+            })
+            .await
+            .expect("the goal request is sent");
+        let refused = loop {
+            match client.next().await.expect("frames are readable") {
+                Some(Frame::Failed { message }) => break message,
+                Some(frame) if frame.is_end_of_turn() => break String::new(),
+                Some(_) => {}
+                None => break String::new(),
+            }
+        };
+
+        // Let the turn finish so the task joins cleanly rather than being aborted mid-stream.
+        release.add_permits(1);
+        let _ = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        refused
+    });
+
+    assert!(
+        refused.contains("idle"),
+        "the refusal says the session is busy and when a goal can be set: {refused}"
     );
 }

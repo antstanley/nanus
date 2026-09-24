@@ -78,7 +78,8 @@ use nanus_adapter_config::{NanusConfig, TuiDetail};
 use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
 use nanus_link::protocol::{
-    ApprovalState, EffortState, Frame, ProviderInfo, Request, SessionInfo, TurnEnd,
+    ApprovalState, EffortState, Frame, GoalAction, GoalInfo, GoalState, ProviderInfo, Request,
+    SessionInfo, TurnEnd,
 };
 use nanus_ports::{ReasoningEffort, StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
@@ -450,6 +451,13 @@ pub trait SessionSource {
     ///
     /// A default of doing nothing, for the same reason as [`SessionSource::set_provider`].
     fn set_credential(&mut self, _provider: &str, _plan: Option<&str>, _key: &str) {}
+
+    /// Tells the agent to change or report the session's goal.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::set_approval`]: a
+    /// recording has no agent to tell, and the interface refuses `/goal` on one rather than
+    /// sending a request nowhere.
+    fn set_goal(&mut self, _action: GoalAction) {}
 
     /// Re-reads the session from wherever it is authoritative, before the summary is drawn.
     ///
@@ -885,6 +893,10 @@ impl SessionSource for Remote {
             plan: plan.map(str::to_owned),
             key: key.to_owned(),
         });
+    }
+
+    fn set_goal(&mut self, action: GoalAction) {
+        self.send(Request::Goal { action });
     }
 
     fn refresh(&mut self) {
@@ -1413,6 +1425,11 @@ enum Routed {
     /// agent's answer, held by the view, and a router that decided a name was valid would be a
     /// second provider table to keep true.
     Provider(Option<String>),
+    /// Change or read the session's goal, as `/goal` asked.
+    ///
+    /// Routed for the same reason as [`Routed::SetModel`]: the goal is the agent's session state,
+    /// the interface is only a view of it, and the router is a pure function of the line.
+    Goal(GoalAction),
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1440,6 +1457,9 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         // The argument is a provider's name: `/provider` opens the chooser and `/provider <name>`
         // names one, which the view matches against the choices the agent offered.
         Submission::Run(Command::Provider) => Routed::Provider(model_argument(&prompt)),
+        // The goal's argument is the rest of the line, not one word: an objective is a sentence.
+        // The reader's words choose the action — a bare `/goal`, a lifecycle word, or an objective.
+        Submission::Run(Command::Goal) => Routed::Goal(goal_action(&prompt)),
         Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
             if command.trim().is_empty() {
@@ -1603,6 +1623,7 @@ async fn submitted(
             Some(name) => switch_provider_named(&name, source, view),
             None => open_provider_chooser(view),
         },
+        Routed::Goal(action) => request_goal(action, source, view),
         Routed::Say(message) => {
             view.transcript.push(Entry::notice(message));
             view.scroll_to_bottom();
@@ -1841,6 +1862,70 @@ fn next_model(models: &[String], current: Option<&str>) -> Option<String> {
 /// The model named after a command, if one was.
 fn model_argument(line: &str) -> Option<String> {
     line.split_whitespace().nth(1).map(str::to_owned)
+}
+
+/// The text after a command's own word, trimmed, or empty when there is none.
+///
+/// Unlike [`model_argument`] this keeps the *rest* of the line rather than one word, because a
+/// goal's argument is a sentence: `/goal reduce p95 latency below 120 ms` sets that objective.
+fn goal_argument(line: &str) -> String {
+    line.trim_start()
+        .split_once(char::is_whitespace)
+        .map_or_else(String::new, |(_, rest)| rest.trim().to_owned())
+}
+
+/// Reads a `/goal` line into the action it names.
+///
+/// A bare `/goal` (or `/goal status`) reads the current goal; `pause`, `resume`, `complete`/
+/// `done`, and `clear` are the lifecycle words; anything else is an objective, so a sentence
+/// sets one. The cost is that an objective which is exactly one of those words cannot be set in
+/// one line — the trade every command with subcommands makes, stepped around by phrasing the
+/// objective as a sentence.
+fn goal_action(line: &str) -> GoalAction {
+    let argument = goal_argument(line);
+    let mut words = argument.splitn(2, char::is_whitespace);
+    let word = words.next().unwrap_or_default();
+    let rest = words.next().map(str::trim).filter(|text| !text.is_empty());
+    match word {
+        "" | "status" => GoalAction::Status,
+        "pause" => GoalAction::Pause,
+        "resume" => GoalAction::Resume,
+        "clear" => GoalAction::Clear,
+        "abandon" | "abandoned" => GoalAction::Abandon {
+            note: rest.map(str::to_owned),
+        },
+        "complete" | "done" => GoalAction::Complete {
+            note: rest.map(str::to_owned),
+        },
+        _ => GoalAction::Set {
+            objective: argument,
+        },
+    }
+}
+
+/// Sends a goal action to the agent, or says why the interface cannot.
+///
+/// The agent is the authority — the goal is its session's state — so the interface sends the
+/// action and the answer comes back as a [`Frame::Goal`] notice. A recording has no agent, so the
+/// command says so rather than sending a request nowhere.
+fn request_goal(action: GoalAction, source: &mut dyn SessionSource, view: &mut ViewState) {
+    if !source.accepts_prompts() {
+        view.transcript.push(Entry::notice(String::from(
+            "this is a recording: its goal cannot be changed",
+        )));
+        view.scroll_to_bottom();
+        return;
+    }
+    view.status = match &action {
+        GoalAction::Status => String::from("reading the goal"),
+        GoalAction::Set { .. } => String::from("setting the goal"),
+        GoalAction::Pause => String::from("pausing the goal"),
+        GoalAction::Resume => String::from("resuming the goal"),
+        GoalAction::Complete { .. } => String::from("completing the goal"),
+        GoalAction::Abandon { .. } => String::from("abandoning the goal"),
+        GoalAction::Clear => String::from("clearing the goal"),
+    };
+    source.set_goal(action);
 }
 
 /// The status line while prompts are waiting.
@@ -2963,6 +3048,7 @@ fn apply(frame: Frame, view: &mut ViewState) {
             dropped_messages,
             dropped_turns,
         } => apply_elided(dropped_messages, dropped_turns, view),
+        Frame::Goal { goal } => apply_goal(goal, view),
         Frame::Approval {
             call_id,
             tool,
@@ -3132,6 +3218,36 @@ fn apply_auth_prompt(
 /// none in force, which is an absence the agent cannot frame — it sends no `EffortChanged` for
 /// "none" — so the drawn step is cleared here. A model that does take effort is corrected by the
 /// `EffortChanged` the agent sends with the switch.
+/// Writes the session's goal into the transcript as the interface's own notice.
+///
+/// A notice rather than prose: the model did not say this, the interface did, and the colour is
+/// how a reader tells them apart. Answered on every change, on every attachment to a session that
+/// has a goal, and on every `/goal`, so a reader who typed the command and one watching the same
+/// session both see the same line.
+fn apply_goal(goal: Option<GoalInfo>, view: &mut ViewState) {
+    view.transcript.push(Entry::notice(goal_notice(goal)));
+    view.follow();
+}
+
+/// Renders a goal, or its absence, as one line.
+fn goal_notice(goal: Option<GoalInfo>) -> String {
+    let Some(goal) = goal else {
+        return String::from("no goal is set");
+    };
+    let phase = match goal.state {
+        GoalState::Active => "active",
+        GoalState::Paused => "paused",
+        GoalState::Complete => "complete",
+        GoalState::Abandoned => "abandoned",
+    };
+    let mut line = format!("goal ({phase}, rev {}): {}", goal.revision, goal.objective);
+    if let Some(note) = goal.note {
+        line.push_str(" — ");
+        line.push_str(&note);
+    }
+    line
+}
+
 fn apply_model_changed(model: String, view: &mut ViewState) {
     view.model = Some(model);
     view.refresh_effort_levels();
@@ -3290,6 +3406,7 @@ mod tests {
         session: Session,
         requests: std::rc::Rc<std::cell::RefCell<Vec<Request>>>,
         script: Vec<Frame>,
+        accepts: bool,
     }
 
     impl Scripted {
@@ -3298,6 +3415,15 @@ mod tests {
                 session: session(),
                 requests: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
                 script,
+                accepts: true,
+            }
+        }
+
+        /// The same source but one that cannot take a prompt, standing in for a recording.
+        fn recording(script: Vec<Frame>) -> Self {
+            Self {
+                accepts: false,
+                ..Self::new(script)
             }
         }
     }
@@ -3308,7 +3434,7 @@ mod tests {
         }
 
         fn accepts_prompts(&self) -> bool {
-            true
+            self.accepts
         }
 
         fn attach(&mut self, frames: &mpsc::Sender<Frame>) {
@@ -3350,6 +3476,10 @@ mod tests {
                 plan: plan.map(str::to_owned),
                 key: key.to_owned(),
             });
+        }
+
+        fn set_goal(&mut self, action: GoalAction) {
+            self.requests.borrow_mut().push(Request::Goal { action });
         }
     }
 
@@ -4879,6 +5009,107 @@ mod tests {
         );
     }
 
+    /// `/goal` reads the goal, sets an objective, or moves the lifecycle, and the action is what
+    /// reaches the agent — the interface cannot change a session it does not own.
+    #[test]
+    fn the_goal_command_reads_sets_and_moves_the_goal() {
+        // The line chooses the action: a bare read, a lifecycle word, or an objective.
+        assert_eq!(goal_action("/goal"), GoalAction::Status);
+        assert_eq!(goal_action("/goal status"), GoalAction::Status);
+        assert_eq!(goal_action("/goal pause"), GoalAction::Pause);
+        assert_eq!(goal_action("/goal resume"), GoalAction::Resume);
+        assert_eq!(goal_action("/goal clear"), GoalAction::Clear);
+        assert_eq!(
+            goal_action("/goal abandon the benchmark is flaky"),
+            GoalAction::Abandon {
+                note: Some(String::from("the benchmark is flaky"))
+            }
+        );
+        assert_eq!(
+            goal_action("/goal complete the benchmark is green"),
+            GoalAction::Complete {
+                note: Some(String::from("the benchmark is green"))
+            }
+        );
+        assert_eq!(
+            goal_action("/goal reduce p95 latency below 120 ms"),
+            GoalAction::Set {
+                objective: String::from("reduce p95 latency below 120 ms")
+            },
+            "everything after the command word is the objective"
+        );
+
+        // And the action is sent to the agent, which owns the session the goal belongs to.
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        request_goal(goal_action("/goal ship the notes"), &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().clone(),
+            vec![Request::Goal {
+                action: GoalAction::Set {
+                    objective: String::from("ship the notes")
+                }
+            }]
+        );
+    }
+
+    /// A goal frame becomes the interface's own notice, and a session with no goal says so.
+    #[test]
+    fn a_goal_frame_is_written_as_a_notice() {
+        let mut view = ViewState::new();
+        apply(
+            Frame::Goal {
+                goal: Some(GoalInfo {
+                    objective: String::from("reduce p95 latency"),
+                    state: GoalState::Paused,
+                    revision: 3,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    note: Some(String::from("waiting on the release window")),
+                }),
+            },
+            &mut view,
+        );
+        let line = view
+            .transcript
+            .entries()
+            .last()
+            .map(Entry::text)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(line.contains("paused"), "{line}");
+        assert!(line.contains("rev 3"), "{line}");
+        assert!(line.contains("reduce p95 latency"), "{line}");
+        assert!(line.contains("waiting on the release window"), "{line}");
+
+        // A goal frame with no goal is how a clear and a status read on nothing both read.
+        apply(Frame::Goal { goal: None }, &mut view);
+        let cleared = view
+            .transcript
+            .entries()
+            .last()
+            .map(Entry::text)
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(cleared, "no goal is set");
+    }
+
+    /// A recording has no agent, so `/goal` says so rather than sending a request nowhere.
+    #[test]
+    fn the_goal_command_is_refused_on_a_recording() {
+        let mut source = Scripted::recording(Vec::new());
+        let mut view = ViewState::new();
+        request_goal(GoalAction::Status, &mut source, &mut view);
+        let line = view
+            .transcript
+            .entries()
+            .last()
+            .map(Entry::text)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(line.contains("recording"), "{line}");
+    }
+
     /// Choosing a provider sends the switch; a "no credential" answer opens the question that
     /// stores a key and retries the switch it was asked for.
     #[test]
@@ -5269,7 +5500,7 @@ mod tests {
             "one `and`, at the end: {message}"
         );
         assert!(
-            message.contains("/model, /effort") && message.contains("/provider and /copy"),
+            message.contains("/model, /effort") && message.contains("/provider, /goal and /copy"),
             "commas between the names and `and` before the last: {message}"
         );
 

@@ -46,6 +46,13 @@ pub enum Command {
     /// refusal the interface can act on: it is answered, and the interface asks whether to store a
     /// key before trying again.
     Provider,
+    /// Set, read, or move the session's goal.
+    ///
+    /// A goal is a durable objective the session carries, so this is the one command that has to
+    /// reach the agent rather than being answered on screen: the interface sends it and the agent
+    /// answers. A bare `/goal` reads the current one, a lifecycle word (`pause`, `resume`,
+    /// `complete`, `done`, `abandon`, `clear`) moves it, and anything else is an objective to set.
+    Goal,
     /// Put the newest answer on the clipboard.
     ///
     /// A command as well as a key, because the commonest thing a reader wants out of a transcript is
@@ -73,6 +80,7 @@ impl Command {
         (Self::Model, &["/model"]),
         (Self::Effort, &["/effort"]),
         (Self::Provider, &["/provider"]),
+        (Self::Goal, &["/goal"]),
         (Self::Copy, &["/copy"]),
     ];
 
@@ -263,6 +271,20 @@ mod tests {
         assert_eq!(submission_of("wow! /exit"), Submission::Prompt);
     }
 
+    /// The goal has a default and an argument, like the model: `/goal` reads the current one and
+    /// `/goal <objective>` sets one, with the lifecycle words between them.
+    #[test]
+    fn goal_is_a_command() {
+        assert_eq!(submission_of("/goal"), Submission::Run(Command::Goal));
+        assert_eq!(submission_of("  /goal  "), Submission::Run(Command::Goal));
+        assert_eq!(submission_of("/goal pause"), Submission::Run(Command::Goal));
+        assert_eq!(
+            submission_of("/goal reduce p95 latency below 120 ms"),
+            Submission::Run(Command::Goal),
+            "the whole line is the command's argument, not the first word after it"
+        );
+    }
+
     #[test]
     fn copy_is_a_command() {
         assert_eq!(submission_of("/copy"), Submission::Run(Command::Copy));
@@ -311,6 +333,7 @@ mod tests {
             Command::Model,
             Command::Effort,
             Command::Provider,
+            Command::Goal,
             Command::Copy,
         ];
         for command in every {
@@ -343,6 +366,7 @@ mod tests {
                 "/model",
                 "/effort",
                 "/provider",
+                "/goal",
                 "/copy"
             ]
         );
@@ -367,7 +391,7 @@ mod tests {
         // joining, and this is about what a reader who mistypes a command actually sees.
         assert_eq!(
             Command::names_sentence(),
-            "/exit, /quit, /stats, /help, /clear, /model, /effort, /provider and /copy"
+            "/exit, /quit, /stats, /help, /clear, /model, /effort, /provider, /goal and /copy"
         );
     }
 }

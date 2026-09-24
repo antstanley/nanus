@@ -172,7 +172,35 @@ fn apply(
             }
         }
         SessionEvent::StepEnd { .. } => {}
+        // A goal change is state rather than a message, but a reader browsing a recording should
+        // still see it: this is the same line the live interface writes when the change arrives,
+        // so the transcript reads the same whether it was watched or re-read. A clear is a record
+        // with no goal, which is the absence the line names.
+        SessionEvent::GoalChange { goal } => {
+            transcript.push(Entry::notice(goal_line(goal.as_ref())));
+        }
     }
+}
+
+/// Renders a goal change as the interface's own notice.
+///
+/// Formatted here from the domain goal rather than from a wire type, because a recording is read
+/// without an agent: the log is all there is.
+fn goal_line(goal: Option<&nanus_domain::Goal>) -> String {
+    let Some(goal) = goal else {
+        return String::from("no goal is set");
+    };
+    let mut line = format!(
+        "goal ({}, rev {}): {}",
+        goal.phase(),
+        goal.revision(),
+        goal.objective()
+    );
+    if let Some(note) = goal.note() {
+        line.push_str(" — ");
+        line.push_str(note);
+    }
+    line
 }
 
 /// Renders tool arguments as compact JSON.
