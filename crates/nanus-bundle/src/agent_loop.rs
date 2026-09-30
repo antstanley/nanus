@@ -42,6 +42,9 @@ use nanus_domain::{
 };
 use nanus_ports::{ChatRequest, ClockHandle, FinishReason, LlmEvent, LlmHandle};
 
+use nanus_ports::control::until_cancelled;
+use nanus_ports::{ToolPolicy, ToolPolicyDecision, TurnControl};
+
 use crate::guard;
 use crate::{BundleError, ToolRegistryHandle};
 
@@ -306,6 +309,10 @@ pub struct AgentRunner {
     /// clock read is one: a test that cannot pin the clock cannot assert on a goal's revision
     /// timestamps, and a recorded session has to mean the same thing when it is read back.
     clock: ClockHandle,
+    /// Optional host policy; absence preserves the ordinary approval gate.
+    policy: Option<Rc<dyn ToolPolicy>>,
+    /// Explicit combined request reservation; unset preserves stock text behavior.
+    request_reservation: Option<(u32, u32)>,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -355,7 +362,26 @@ impl AgentRunner {
             effort: Rc::new(core::cell::Cell::new(None)),
             clock,
             config,
+            policy: None,
+            request_reservation: None,
         })
+    }
+
+    /// Adds an exact-call host policy without changing the default approval state.
+    #[must_use]
+    pub fn with_tool_policy(mut self, policy: Rc<dyn ToolPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Sets the actual output ceiling and separately bounded reasoning reservation.
+    ///
+    /// Reasoning included by the endpoint in output uses zero separately. Image requests
+    /// require this explicit setting; the caller's context budget includes both reservations.
+    #[must_use]
+    pub const fn with_request_budget(mut self, output: u32, separate_reasoning: u32) -> Self {
+        self.request_reservation = Some((output, separate_reasoning));
+        self
     }
 
     /// Returns the configuration in use.
@@ -544,6 +570,38 @@ impl AgentRunner {
         progress: &mut dyn Progress,
         approver: Option<&dyn Approver>,
     ) -> Result<RunOutcome, BundleError> {
+        self.run_controlled(session, message, progress, approver, None)
+            .await
+    }
+
+    /// Runs a turn with wakeable cancellation, also observing `Progress::cancelled`.
+    ///
+    /// The host owns teardown of detached work; interrupted calls are settled as failures
+    /// and never automatically replayed. A cancelled control must stay cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration, context and model errors as [`Self::run_turn`].
+    pub async fn run_turn_with_control(
+        &self,
+        session: &mut Session,
+        message: &str,
+        progress: &mut dyn Progress,
+        approver: Option<&dyn Approver>,
+        control: &dyn TurnControl,
+    ) -> Result<RunOutcome, BundleError> {
+        self.run_controlled(session, message, progress, approver, Some(control))
+            .await
+    }
+
+    async fn run_controlled(
+        &self,
+        session: &mut Session,
+        message: &str,
+        progress: &mut dyn Progress,
+        approver: Option<&dyn Approver>,
+        control: Option<&dyn TurnControl>,
+    ) -> Result<RunOutcome, BundleError> {
         let machine = TurnMachine::new(self.config.clone())
             .map_err(|error| BundleError::Config(error.to_string()))?;
         let turn = session.log().current_turn().saturating_add(1);
@@ -559,13 +617,16 @@ impl AgentRunner {
             // issued. The machine owns the mapping from a step outcome to a recorded
             // reason, so this goes through it rather than writing the reason into the log
             // directly — one vocabulary for why a turn ended, wherever that happens.
-            let step_outcome = if progress.cancelled() {
+            let step_outcome = if is_cancelled(progress, control) {
                 StepOutcome::Interrupted
             } else {
                 let step = steps.saturating_add(1);
                 steps = step;
                 progress.step_started(step);
-                match self.run_step(session, turn, step, progress, approver).await {
+                match self
+                    .run_step(session, (turn, step), progress, approver, control)
+                    .await
+                {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         // A step that failed still has to close its turn. Returning here
@@ -631,18 +692,32 @@ impl AgentRunner {
     async fn run_step(
         &self,
         session: &mut Session,
-        turn: u32,
-        step: u32,
+        position: (u32, u32),
         progress: &mut dyn Progress,
         approver: Option<&dyn Approver>,
+        control: Option<&dyn TurnControl>,
     ) -> Result<StepOutcome, BundleError> {
+        let (turn, step) = position;
         session.append(SessionEvent::StepStart { turn, step });
-        let (request, elision) = self.build_request(session)?;
+        let (request, elision) = match self.build_request(session) {
+            Ok(built) => built,
+            Err(error) => {
+                session.append(SessionEvent::StepEnd { turn, step });
+                return Err(error);
+            }
+        };
         if let Some(elision) = &elision {
             progress.elided(elision);
         }
+        if let Err(error) = nanus_ports::capabilities::validate_image_input(
+            self.llm.borrow().capabilities(&request.model),
+            &request,
+        ) {
+            session.append(SessionEvent::StepEnd { turn, step });
+            return Err(BundleError::Model(error.to_string()));
+        }
         let mut stream = self.llm.borrow().stream_chat(request);
-        let assembled = match self.consume_stream(&mut stream, progress).await {
+        let assembled = match self.consume_stream(&mut stream, progress, control).await {
             Ok(assembled) => assembled,
             Err(error) => {
                 // The step ends before the turn does: a log with a step that never finished
@@ -657,6 +732,7 @@ impl AgentRunner {
         // the two leaves a record of what was asked for rather than a silently
         // dropped step.
         session.append(SessionEvent::AssistantMessage {
+            replay: assembled.replay.clone(),
             // An empty string is recorded as `None`, which is what the wire shape
             // needs: the adapter sends `""` rather than null, and a transcript that
             // said "some text" for an empty turn would misdescribe it.
@@ -685,10 +761,15 @@ impl AgentRunner {
                 StepOutcome::FinalAnswer
             }
         } else {
-            self.run_tools(session, &assembled.calls, progress, approver)
-                .await;
-            StepOutcome::ToolCalls {
-                count: u32::try_from(assembled.calls.len()).unwrap_or(u32::MAX),
+            if self
+                .run_tools(session, &assembled.calls, progress, approver, control)
+                .await
+            {
+                StepOutcome::Interrupted
+            } else {
+                StepOutcome::ToolCalls {
+                    count: u32::try_from(assembled.calls.len()).unwrap_or(u32::MAX),
+                }
             }
         };
         session.append(SessionEvent::StepEnd { turn, step });
@@ -711,18 +792,48 @@ impl AgentRunner {
     ) -> Result<(ChatRequest, Option<nanus_domain::Elision>), BundleError> {
         let mut messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
         messages.extend(session.derive_messages());
+        let mut request = ChatRequest::new(self.model(), Vec::new());
+        request.tools = self.offered_schemas();
+        request.reasoning_effort = self.effort.get();
+        let images = nanus_ports::capabilities::has_images(&messages);
+        if let Some((output, reasoning)) = self.request_reservation {
+            request.max_tokens = Some(output);
+            request.separate_reasoning_tokens = reasoning;
+        }
+        if images || self.request_reservation.is_some() {
+            request.context_budget = Some(self.config.context_budget);
+            // Validate every retained image against the newly selected model, before elision.
+            let model = self.llm.borrow().clone();
+            let caps = model.capabilities(&request.model);
+            let mut probe = request.clone();
+            probe.messages.clone_from(&messages);
+            model
+                .estimate_request(&probe)
+                .map_err(|error| BundleError::context(error.to_string()))?;
+            let mut failure = None;
+            let fitted = nanus_domain::context::fit_with(
+                messages,
+                self.config.context_budget.min(u32::MAX.saturating_sub(1)),
+                |candidate| {
+                    let mut probe = request.clone();
+                    probe.messages = candidate.to_vec();
+                    match model.estimate_request(&probe) {
+                        Ok(estimate) if estimate.fits(caps, &probe) => estimate.input_tokens,
+                        Ok(_) => u32::MAX,
+                        Err(error) => {
+                            failure = Some(error.to_string());
+                            u32::MAX
+                        }
+                    }
+                },
+            )
+            .map_err(|error| BundleError::context(failure.unwrap_or_else(|| error.to_string())))?;
+            request.messages = fitted.messages;
+            return Ok((request, fitted.elision));
+        }
         let fitted = nanus_domain::fit(messages, self.config.context_budget)
             .map_err(|error| BundleError::context(error.to_string()))?;
-        // Read on every request, which is what keeps a tool registered through the published
-        // handle visible on the very next request rather than only after a rebuild.
-        let tools = self.offered_schemas();
-        let mut request = ChatRequest::new(self.model(), fitted.messages);
-        request.tools = tools;
-        // Set only when a caller chose one: an unset effort is the adapter filling in its own
-        // default, which is what a request that says nothing has always meant.
-        if let Some(effort) = self.effort.get() {
-            request = request.with_reasoning_effort(effort);
-        }
+        request.messages = fitted.messages;
         Ok((request, fitted.elision))
     }
 
@@ -731,11 +842,18 @@ impl AgentRunner {
         &self,
         stream: &mut nanus_ports::LlmStream,
         progress: &mut dyn Progress,
+        control: Option<&dyn TurnControl>,
     ) -> Result<Assembled, BundleError> {
         use futures::StreamExt as _;
 
         let mut assembled = Assembled::default();
-        while let Some(event) = stream.next().await {
+        loop {
+            let next = until_cancelled(control, stream.next()).await;
+            let Some(next) = next else {
+                assembled.interrupt();
+                break;
+            };
+            let Some(event) = next else { break };
             // A stop asked for while the model is streaming is taken at the next token
             // rather than at the end of the response: waiting out a long answer to a
             // question nobody wants answered any more is the whole thing the reader is
@@ -745,7 +863,7 @@ impl AgentRunner {
             // through naming are *dropped*: a call in the log with no result to answer it
             // would be replayed as one that ran, and the next request would be refused for
             // a call nothing ever answered.
-            if progress.cancelled() {
+            if is_cancelled(progress, control) {
                 assembled.interrupt();
                 break;
             }
@@ -767,6 +885,12 @@ impl AgentRunner {
                     progress.tool_call(&arguments_delta);
                     assembled.absorb(id, name, &arguments_delta);
                 }
+                LlmEvent::AssistantReplay(replay) => {
+                    replay
+                        .validate()
+                        .map_err(|error| BundleError::Model(error.to_string()))?;
+                    assembled.replay = Some(replay);
+                }
                 LlmEvent::ResponseHead => progress.response_head(),
                 LlmEvent::Usage(usage) => {
                     progress.usage(&usage);
@@ -785,10 +909,15 @@ impl AgentRunner {
         // response body, after the last event — is not seen by the check inside the loop,
         // because there is no next event to see it at, and running a command the reader has
         // just asked to stop is the one thing stopping is for.
-        if progress.cancelled() {
+        if is_cancelled(progress, control) {
             assembled.interrupt();
         }
         assembled.settle();
+        if let Some(replay) = &assembled.replay {
+            replay
+                .validate_response(Some(&assembled.text), &assembled.calls)
+                .map_err(|error| BundleError::Model(error.to_string()))?;
+        }
         Ok(assembled)
     }
 
@@ -813,7 +942,8 @@ impl AgentRunner {
         calls: &[ToolCall],
         progress: &mut dyn Progress,
         approver: Option<&dyn Approver>,
-    ) {
+        control: Option<&dyn TurnControl>,
+    ) -> bool {
         for call in calls {
             session.append(SessionEvent::ToolCall {
                 call_id: call.id.clone(),
@@ -825,9 +955,13 @@ impl AgentRunner {
 
         let mut results: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
         for (index, call) in calls.iter().enumerate() {
-            if let Some(denied) = self.gate(call, approver).await {
-                progress.tool_finished(&call.id, &call.name, true);
-                results[index] = Some(denied);
+            let denial = if is_cancelled(progress, control) {
+                Some(interrupted_result(call))
+            } else {
+                self.gate(call, approver, control).await
+            };
+            if let Some(denied) = denial {
+                results[index] = Some(self.finish_result(call, denied, progress));
             }
         }
 
@@ -845,10 +979,12 @@ impl AgentRunner {
             .copied()
             .partition(|index| crate::goal_tools::is_goal_tool(&calls[*index].name));
         for index in goal_indexes {
-            let result = self.run_goal_tool(session, &calls[index], progress);
-            let is_error = !result.outcome.is_success();
-            progress.tool_finished(&calls[index].id, &calls[index].name, is_error);
-            results[index] = Some(result);
+            let result = if is_cancelled(progress, control) {
+                interrupted_result(&calls[index])
+            } else {
+                self.run_goal_tool(session, &calls[index], progress)
+            };
+            results[index] = Some(self.finish_result(&calls[index], result, progress));
         }
 
         for batch in registry_indexes.chunks(self.parallel_limit()) {
@@ -860,18 +996,26 @@ impl AgentRunner {
             // follows: a `ToolFuture` is `'static` and owns whatever it needs, so holding a
             // borrow across the batch would only risk meeting the borrow a registration
             // takes.
-            let running: Vec<nanus_domain::ToolFuture> = {
-                let registry = self.tools.borrow();
+            let running = batch.iter().map(|index| async {
+                let call = &calls[*index];
+                if control.is_some_and(TurnControl::is_cancelled) {
+                    return interrupted_result(call);
+                }
+                let work = self.tools.borrow().execute(call.clone());
+                until_cancelled(control, work)
+                    .await
+                    .unwrap_or_else(|| interrupted_result(call))
+            });
+            let finished = if is_cancelled(progress, control) {
                 batch
                     .iter()
-                    .map(|index| registry.execute(calls[*index].clone()))
+                    .map(|index| interrupted_result(&calls[*index]))
                     .collect()
+            } else {
+                futures::future::join_all(running).await
             };
-            let finished = futures::future::join_all(running).await;
             for (index, result) in batch.iter().zip(finished) {
-                let is_error = !result.outcome.is_success();
-                progress.tool_finished(&calls[*index].id, &calls[*index].name, is_error);
-                results[*index] = Some(result);
+                results[*index] = Some(self.finish_result(&calls[*index], result, progress));
             }
         }
 
@@ -894,11 +1038,53 @@ impl AgentRunner {
                 "a result answers the call it names"
             );
             session.append(SessionEvent::ToolResult {
+                content_blocks: Some(result.outcome.content().to_vec()),
                 call_id: result.call_id,
                 content,
                 is_error,
             });
         }
+        is_cancelled(progress, control)
+    }
+
+    /// Reports only validated outcomes, as each work phase completes.
+    fn finish_result(
+        &self,
+        call: &ToolCall,
+        result: ToolResult,
+        progress: &mut dyn Progress,
+    ) -> ToolResult {
+        let result = self.validate_result_images(bounded_result(result));
+        progress.tool_finished(&call.id, &call.name, !result.outcome.is_success());
+        result
+    }
+
+    /// Rechecks pixels from custom executors before retaining their result.
+    fn validate_result_images(&self, result: ToolResult) -> ToolResult {
+        for block in result.outcome.content() {
+            if let ContentBlock::Image {
+                media_type,
+                data_base64,
+            } = block
+            {
+                let validation = self
+                    .llm
+                    .borrow()
+                    .capabilities(&self.model())
+                    .require_image_profile(&self.model())
+                    .and_then(|profile| {
+                        nanus_domain::content::validate_image(media_type, data_base64)
+                            .and_then(|dimensions| profile.reserved_tokens(dimensions))
+                            .map_err(|error| nanus_ports::LlmError::Unsupported {
+                                feature: error.to_string(),
+                            })
+                    });
+                if let Err(error) = validation {
+                    return ToolResult::failure(result.call_id, error.to_string());
+                }
+            }
+        }
+        result
     }
 
     /// Runs one goal tool call, writing the change into the session log.
@@ -947,14 +1133,54 @@ impl AgentRunner {
     ///   containment.
     ///
     /// With no answerer the outcome is `Unavailable`, which denies — fail closed either way.
-    async fn gate(&self, call: &ToolCall, approver: Option<&dyn Approver>) -> Option<ToolResult> {
+    async fn gate(
+        &self,
+        call: &ToolCall,
+        approver: Option<&dyn Approver>,
+        control: Option<&dyn TurnControl>,
+    ) -> Option<ToolResult> {
+        if control.is_some_and(TurnControl::is_cancelled) {
+            return Some(interrupted_result(call));
+        }
+        if crate::goal_tools::is_goal_tool(&call.name) {
+            return None;
+        }
         // The access is copied out and the borrow released before anything is awaited: the
         // decision below can take as long as a person takes, and a registry borrow held that
         // long would refuse the registration that answers it.
         let access = {
             let registry = self.tools.borrow();
-            registry.get(&call.name)?.access()
+            match registry.validate(call) {
+                Ok(definition) => definition.access(),
+                Err(error) => return Some(ToolResult::failure(call.id.clone(), error.to_string())),
+            }
         };
+        let mut host_granted = false;
+        if let Some(policy) = &self.policy {
+            match until_cancelled(control, policy.decide(call, access)).await {
+                Some(Ok(ToolPolicyDecision::UseDefault)) => {}
+                Some(Ok(ToolPolicyDecision::AllowOnce)) => host_granted = true,
+                Some(Ok(ToolPolicyDecision::Deny { reason })) => {
+                    return Some(ToolResult::failure(call.id.clone(), reason));
+                }
+                Some(Err(error)) => {
+                    return Some(ToolResult::failure(call.id.clone(), error.to_string()));
+                }
+                None => return Some(interrupted_result(call)),
+            }
+        }
+        if call.name.as_str() == "read_image"
+            && let Err(error) = self
+                .llm
+                .borrow()
+                .capabilities(&self.model())
+                .require_image_profile(&self.model())
+        {
+            return Some(ToolResult::failure(call.id.clone(), error.to_string()));
+        }
+        if host_granted {
+            return None;
+        }
         let sandbox = self.config.sandbox_mode;
         if sandbox.permits(access) {
             return None;
@@ -969,7 +1195,10 @@ impl AgentRunner {
                 let request = ApprovalRequest::new(call.name.clone())
                     .with_call_id(call.id.clone())
                     .with_reason(reason.clone());
-                approver.decide(request).await
+                match until_cancelled(control, approver.decide(request)).await {
+                    Some(outcome) => outcome,
+                    None => return Some(interrupted_result(call)),
+                }
             }
             None => ApprovalOutcome::Unavailable,
         };
@@ -978,6 +1207,73 @@ impl AgentRunner {
         }
         Some(denied_result(call, &reason, outcome))
     }
+}
+
+/// Bounds the record before retaining model content; a limit failure is model-visible.
+fn bounded_result(result: ToolResult) -> ToolResult {
+    let blocks = result.outcome.content();
+    if blocks.is_empty() {
+        let payload = match &result.outcome {
+            nanus_domain::ToolOutcome::Success { value, .. } => value,
+            nanus_domain::ToolOutcome::Failure { message, .. } => {
+                if message.len() > nanus_domain::content::RECORD_BYTES_MAX {
+                    return ToolResult::failure(
+                        result.call_id,
+                        "tool failure text exceeds record limit",
+                    );
+                }
+                &serde_json::Value::Null
+            }
+        };
+        if let Err(error) =
+            nanus_domain::content::serialized_size(payload, nanus_domain::content::RECORD_BYTES_MAX)
+        {
+            return ToolResult::failure(result.call_id, error.to_string());
+        }
+    } else if let Err(error) = nanus_domain::content::validate_blocks(blocks) {
+        return ToolResult::failure(result.call_id, error.to_string());
+    }
+    let blocks = if blocks.is_empty() {
+        vec![ContentBlock::Text(result.render_text())]
+    } else {
+        blocks.to_vec()
+    };
+    let event = SessionEvent::ToolResult {
+        call_id: result.call_id.clone(),
+        content: render_content(&blocks),
+        content_blocks: Some(blocks.clone()),
+        is_error: !result.is_success(),
+    };
+    let validation = nanus_domain::content::validate_blocks(&blocks).and_then(|()| {
+        // Sequence/envelope overhead is bounded here; the store checks the exact line too.
+        nanus_domain::content::serialized_size(
+            &event,
+            nanus_domain::content::RECORD_BYTES_MAX.saturating_sub(128),
+        )
+        .map(|_| ())
+    });
+    if let Err(error) = validation {
+        return ToolResult::failure(result.call_id, error.to_string());
+    }
+    let outcome = if result.is_success() {
+        nanus_domain::ToolOutcome::success_with(serde_json::Value::Null, blocks)
+    } else {
+        nanus_domain::ToolOutcome::failure_with(result.render_text(), blocks)
+    };
+    ToolResult::new(result.call_id, outcome)
+}
+
+/// Checks both cancellation sources at an effect boundary.
+fn is_cancelled(progress: &dyn Progress, control: Option<&dyn TurnControl>) -> bool {
+    progress.cancelled() || control.is_some_and(TurnControl::is_cancelled)
+}
+
+/// Answers an unfinished call so the next request has no orphaned invocation.
+fn interrupted_result(call: &ToolCall) -> ToolResult {
+    ToolResult::failure(
+        call.id.clone(),
+        "tool call interrupted; effects may be incomplete",
+    )
 }
 
 /// Returns whether an approval state grants a call the sandbox refused, without asking.
@@ -1062,6 +1358,7 @@ fn last_assistant_text(session: &Session) -> String {
 /// leaving the model wondering why its tool never ran.
 #[derive(Debug)]
 struct Assembled {
+    replay: Option<nanus_domain::message::AssistantReplay>,
     text: String,
     reasoning: String,
     calls: Vec<ToolCall>,
@@ -1088,6 +1385,7 @@ impl Assembled {
     /// that ran.
     fn interrupt(&mut self) {
         self.interrupted = true;
+        self.replay = None;
         self.calls.clear();
         self.partial.clear();
     }
@@ -1096,6 +1394,7 @@ impl Assembled {
 impl Default for Assembled {
     fn default() -> Self {
         Self {
+            replay: None,
             text: String::new(),
             reasoning: String::new(),
             calls: Vec::new(),
@@ -1158,11 +1457,16 @@ impl Assembled {
             };
             let id = call.id.unwrap_or_else(|| ToolCallId::new(""));
             // An empty fragment is a legitimate "no arguments"; anything that does
-            // not parse becomes an empty object, and the registry's validation turns
+            // not parse remains a non-object string, and the registry's validation turns
             // that into a message rather than a silent no-op.
-            let arguments = serde_json::from_str(&call.arguments).unwrap_or_else(|error| {
+            let raw = if call.arguments.is_empty() {
+                "{}"
+            } else {
+                &call.arguments
+            };
+            let arguments = serde_json::from_str(raw).unwrap_or_else(|error| {
                 tracing::warn!(%error, tool = %name, "tool arguments did not parse as JSON");
-                serde_json::Value::Object(serde_json::Map::new())
+                serde_json::Value::String(call.arguments.clone())
             });
             self.calls.push(ToolCall::new(id, name, arguments));
         }
@@ -2168,15 +2472,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_argument_fragment_becomes_an_empty_object() {
+    fn an_unparseable_argument_fragment_cannot_be_granted_as_a_no_argument_call() {
         let mut assembled = Assembled::default();
         let name = ToolName::new("echo").unwrap_or_else(|_| unreachable!("valid"));
         assembled.absorb(Some(ToolCallId::new("c")), Some(name), "{not json");
         assembled.settle();
-        // The call survives with empty arguments so the registry can report the
-        // problem, rather than the call vanishing.
+        // The call survives as invalid input, so the registry refuses it even if a
+        // host grants zero-argument tools. Null would be normalized to an empty object.
         assert_eq!(assembled.calls.len(), 1);
-        assert!(assembled.calls[0].arguments.is_object());
+        assert!(assembled.calls[0].arguments_object().is_err());
     }
 
     /// Names an event kind, for assertions about the log's shape.

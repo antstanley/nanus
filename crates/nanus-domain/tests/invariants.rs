@@ -163,6 +163,7 @@ fn reasoning_is_replayed_when_a_turn_carries_tool_calls() {
     // the fold must not drop it from a tool-using turn.
     let mut session = Session::new(SessionId::new("s"), 0, "/work");
     session.append(SessionEvent::AssistantMessage {
+        replay: None,
         text: None,
         reasoning: Some("I need to read the file".to_owned()),
         tool_calls: vec![ToolCall::new(
@@ -179,6 +180,7 @@ fn reasoning_is_replayed_when_a_turn_carries_tool_calls() {
     // cannot travel, and the reasoning of a turn whose calls are all dropped is dropped with
     // them, because a message with neither text nor a call is one no encoder can send.
     session.append(SessionEvent::ToolResult {
+        content_blocks: None,
         call_id: ToolCallId::new("c"),
         content: String::from("the file"),
         is_error: false,
@@ -217,6 +219,7 @@ fn the_fold_skips_empty_assistant_turns_and_keeps_tool_results() {
     });
     // Nothing a model can read: skipped.
     session.append(SessionEvent::AssistantMessage {
+        replay: None,
         text: None,
         reasoning: None,
         tool_calls: Vec::new(),
@@ -226,6 +229,7 @@ fn the_fold_skips_empty_assistant_turns_and_keeps_tool_results() {
         effort: None,
     });
     session.append(SessionEvent::AssistantMessage {
+        replay: None,
         text: Some("calling a tool".to_owned()),
         reasoning: None,
         tool_calls: vec![ToolCall::new(ToolCallId::new("c"), name("read"), json!({}))],
@@ -235,6 +239,7 @@ fn the_fold_skips_empty_assistant_turns_and_keeps_tool_results() {
         effort: None,
     });
     session.append(SessionEvent::ToolResult {
+        content_blocks: None,
         call_id: ToolCallId::new("c"),
         content: "contents".to_owned(),
         is_error: false,
@@ -270,6 +275,7 @@ fn populated_session() -> Session {
         text: "line one\nline \"two\"\ttabbed".to_owned(),
     });
     session.append(SessionEvent::AssistantMessage {
+        replay: None,
         text: Some("answer".to_owned()),
         reasoning: Some("because".to_owned()),
         tool_calls: vec![ToolCall::new(
@@ -288,6 +294,7 @@ fn populated_session() -> Session {
         arguments: json!({ "path": "src/lib.rs" }),
     });
     session.append(SessionEvent::ToolResult {
+        content_blocks: None,
         call_id: ToolCallId::new("c-1"),
         content: "fn main() {}".to_owned(),
         is_error: true,
@@ -325,12 +332,12 @@ fn a_foreign_format_is_rejected() {
 
 #[test]
 fn an_unsupported_version_is_rejected() {
-    let raw = r#"{"format":"nanus.session","version":2,"id":"s","created_at_ms":0,"cwd":"/w"}"#;
+    let raw = r#"{"format":"nanus.session","version":99,"id":"s","created_at_ms":0,"cwd":"/w"}"#;
     assert!(matches!(
         Session::from_jsonl(raw),
         Err(SessionError::UnsupportedVersion {
-            found: 2,
-            expected: 1
+            found: 99,
+            expected: 2
         })
     ));
 }
@@ -400,6 +407,7 @@ fn a_turn_closes_only_when_nothing_is_owed() {
     assert_eq!(open, TurnOutcome::Continue { step: 1 });
 
     session.append(SessionEvent::ToolResult {
+        content_blocks: None,
         call_id: ToolCallId::new("c-1"),
         content: "done".to_owned(),
         is_error: false,
@@ -660,6 +668,7 @@ fn event() -> impl Strategy<Value = SessionEvent> {
                         })
                         .collect();
                     SessionEvent::AssistantMessage {
+                        replay: None,
                         text,
                         reasoning,
                         tool_calls,
@@ -679,6 +688,7 @@ fn event() -> impl Strategy<Value = SessionEvent> {
         }),
         (text(), text(), any::<bool>()).prop_map(|(call_id, content, is_error)| {
             SessionEvent::ToolResult {
+                content_blocks: None,
                 call_id: ToolCallId::new(call_id),
                 content,
                 is_error,

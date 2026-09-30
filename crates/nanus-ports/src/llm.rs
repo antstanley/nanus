@@ -85,6 +85,24 @@ pub trait LlmPort {
         &[]
     }
 
+    /// Returns local capability metadata for this exact model and configured protocol.
+    ///
+    /// Defaults to unknown metadata; never reads credentials or performs network I/O.
+    fn capabilities(&self, model: &str) -> crate::ModelCapabilities {
+        let _ = model;
+        crate::ModelCapabilities::default()
+    }
+
+    /// Estimates the fully translated request without network access.
+    ///
+    /// Concrete providers override this with their actual encoder. The default serves fake
+    /// adapters and counts the neutral representation conservatively.
+    fn estimate_request(&self, request: &ChatRequest) -> LlmResult<crate::RequestEstimate> {
+        let payload = serde_json::json!({ "model": request.model, "messages": request.messages,
+            "tools": request.tools, "max_tokens": request.max_tokens });
+        crate::capabilities::estimate_payload(self.capabilities(&request.model), request, &payload)
+    }
+
     /// Starts a chat completion and returns its event stream.
     ///
     /// Failure is delivered as [`LlmEvent::Error`]; a caller that has read the
@@ -202,6 +220,10 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSchema>,
     /// The response token ceiling, when the caller wants one.
     pub max_tokens: Option<u32>,
+    /// Separately bounded reasoning tokens, outside the output ceiling (zero when included).
+    pub separate_reasoning_tokens: u32,
+    /// Caller context ceiling, when preflight is explicitly requested.
+    pub context_budget: Option<u32>,
     /// How much reasoning to request.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The sampling temperature.
@@ -217,6 +239,8 @@ impl ChatRequest {
             messages,
             tools: Vec::new(),
             max_tokens: None,
+            separate_reasoning_tokens: 0,
+            context_budget: None,
             reasoning_effort: None,
             temperature: None,
         }
@@ -330,6 +354,8 @@ pub enum LlmEvent {
         /// A fragment of the arguments JSON string.
         arguments_delta: String,
     },
+    /// Ordered signed assistant blocks for persistence and protocol-specific replay.
+    AssistantReplay(nanus_domain::message::AssistantReplay),
     /// The server began answering: its response head arrived, before any of the body.
     ///
     /// A fact about the transport rather than about the model, and the only one this vocabulary

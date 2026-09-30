@@ -96,3 +96,10 @@ The Tiger Style rules, which of them are enforced by a tool rather than by revie
 assertions and tests are written.
 
 Start here if you are sending a patch.
+
+## Change specifications
+
+Requested proposals are indexed in [`.specs/README.md`](../.specs/README.md). They track deltas and pending acceptance evidence; the pages above continue to document the current branch.
+
+The [vision and embedding evidence](vision-evidence.md) separates captured request proofs
+from exact-model live verification and native platform checks.

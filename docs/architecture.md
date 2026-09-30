@@ -67,6 +67,14 @@ is the only vocabulary the two share.
 | [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary: `run`, `service`, `config`, `sessions`, `auth`, and the shell-scoped agent behind `tui`. It does not depend on `nanus-tui`. |
 | [`nanus-tui`](../crates/nanus-tui) | The interface: the view, the input buffer, replay, and the terminal event loop. Its own binary (`nanus-tui`), a library for the parts that are testable without a terminal, and no dependency on the agent loop, a toolset, or a provider adapter — it links only the session store it reads recordings from and the configuration adapter it reads its own display preferences from. |
 
+`nanus-bundle` defaults to `stock-compose`, which owns concrete adapters, provider selection,
+authorization and remembered selection. A dependency with `default-features = false` exposes
+only the runner/tools and their domain/kernel/port dependencies. The host supplies its own
+handles and executors; it can depend directly on chosen provider adapters. No link, TUI,
+stock shell or secret fallback is pulled into that minimal library. Direct runner construction
+needs no kernel mount. Kernel composition still uses async preparation then synchronous mounting.
+The [downstream fixture](../examples/embedded) demonstrates the boundary on a local executor.
+
 ## Why the interface is a separate program
 
 An earlier revision had one binary that served both. It read well — one configuration

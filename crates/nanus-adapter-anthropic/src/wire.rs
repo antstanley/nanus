@@ -23,6 +23,9 @@
 //! than on a sentinel. Deltas name what they are: `text_delta`, `thinking_delta`,
 //! and `input_json_delta`, the last carrying the fragment of a tool call's arguments.
 
+use core::fmt::Write as _;
+use sha2::{Digest as _, Sha256};
+
 use nanus_domain::{Message, ToolCallId, ToolName, ToolSchema, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent};
 use serde_json::{Map, Value, json};
@@ -50,13 +53,30 @@ pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
     // Anthropic requires a ceiling on every request; there is no server default.
     body.insert(
         "max_tokens".to_owned(),
-        json!(config.effective_max_tokens()),
+        json!(
+            request
+                .max_tokens
+                .unwrap_or_else(|| config.max_tokens())
+                .min(crate::config::model_max_output_tokens(&request.model))
+        ),
     );
     body.insert("stream".to_owned(), json!(true));
+    if matches!(
+        request.model.as_str(),
+        "claude-opus-5-5" | "claude-sonnet-5-5"
+    ) {
+        body.insert("thinking".to_owned(), json!({ "type": "adaptive" }));
+    }
     if let Some(system) = system_text(&request.messages) {
         body.insert("system".to_owned(), json!(system));
     }
-    let messages = encode_messages(&request.messages);
+    let tools = if request.tools.is_empty() {
+        Value::Null
+    } else {
+        encode_tools(&request.tools)
+    };
+    let system = body.get("system").cloned().unwrap_or(Value::Null);
+    let messages = encode_messages_with_prefix(&request.messages, &system, &tools);
     // Postcondition: a conversation is required. A request carrying only a system
     // prompt has nothing to answer, and the API refuses it.
     assert!(
@@ -102,9 +122,38 @@ pub fn system_text(messages: &[Message]) -> Option<String> {
     Some(parts.join("\n\n"))
 }
 
-/// Encodes the conversation in the Messages shape.
-#[must_use]
-pub fn encode_messages(messages: &[Message]) -> Value {
+/// Fingerprints only the fields Anthropic binds signed thinking to.
+pub fn request_prefix(payload: &Value) -> String {
+    let messages = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    prefix_fingerprint(&payload["system"], &payload["tools"], &messages)
+}
+
+fn prefix_fingerprint(system: &Value, tools: &Value, messages: &[Value]) -> String {
+    let prefix = json!({ "system": system, "tools": tools, "messages": messages });
+    let raw = prefix.to_string();
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// Preserves typed result order inside the matching tool-result block.
+fn encode_content(blocks: &[nanus_domain::ContentBlock]) -> Value {
+    Value::Array(blocks.iter().map(|block| match block {
+        nanus_domain::ContentBlock::Text(text) => json!({ "type": "text", "text": text }),
+        nanus_domain::ContentBlock::Image { media_type, data_base64 } => json!({
+            "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data_base64 },
+        }),
+    }).collect())
+}
+
+fn encode_messages_with_prefix(messages: &[Message], system: &Value, tools: &Value) -> Value {
     let mut turns: Vec<Value> = Vec::new();
     // Tool results are gathered so that a step's several results become one user
     // turn rather than several; the API pairs them with the assistant turn that
@@ -115,6 +164,7 @@ pub fn encode_messages(messages: &[Message]) -> Value {
             // Lifted to the top level by `system_text`.
             Message::System { .. } => {}
             Message::Tool {
+                content_blocks,
                 call_id,
                 content,
                 is_error,
@@ -122,7 +172,11 @@ pub fn encode_messages(messages: &[Message]) -> Value {
                 results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": call_id.as_str(),
-                    "content": content,
+                    "content": content_blocks.as_ref().map_or_else(|| json!(content), |blocks| {
+                        if blocks.iter().any(|block| matches!(block, nanus_domain::ContentBlock::Image { .. })) {
+                            encode_content(blocks)
+                        } else { json!(message.tool_text()) }
+                    }),
                     // Passed through rather than flattened into the text: the model
                     // is told a call failed, which is what lets it try something
                     // else rather than trusting a failure's wording.
@@ -137,9 +191,22 @@ pub fn encode_messages(messages: &[Message]) -> Value {
                 }));
             }
             Message::Assistant {
-                text, tool_calls, ..
+                text,
+                tool_calls,
+                replay,
+                ..
             } => {
                 flush_results(&mut turns, &mut results);
+                if let Some(replay) = replay
+                    && replay
+                        .validate_response(text.as_deref(), tool_calls)
+                        .is_ok()
+                    && replay.protocol == "anthropic.messages"
+                    && replay.prefix_digest == prefix_fingerprint(system, tools, &turns)
+                {
+                    turns.push(json!({ "role": "assistant", "content": replay.blocks }));
+                    continue;
+                }
                 let mut blocks: Vec<Value> = Vec::new();
                 if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
                     blocks.push(json!({ "type": "text", "text": text }));
@@ -211,9 +278,21 @@ pub struct StreamAccumulator {
     output_tokens: u32,
     finish: Option<FinishReason>,
     closed: bool,
+    prefix_digest: String,
+    replay_blocks: std::collections::BTreeMap<u32, Value>,
+    replay_arguments: std::collections::BTreeMap<u32, String>,
+    replay_bytes: usize,
 }
 
 impl StreamAccumulator {
+    /// Starts a stream whose signed content is bound to this exact request prefix.
+    pub fn with_prefix(prefix_digest: String) -> Self {
+        Self {
+            prefix_digest,
+            ..Self::default()
+        }
+    }
+
     /// Takes the next ready event, if any.
     pub fn take_ready(&mut self) -> Option<LlmEvent> {
         if self.ready.is_empty() {
@@ -253,6 +332,10 @@ impl StreamAccumulator {
     /// date and adds event kinds, and a client that refused an unknown one would
     /// break on a release note.
     pub fn observe_frame(&mut self, frame: &Value) {
+        self.observe_replay(frame);
+        if self.closed {
+            return;
+        }
         match frame.get("type").and_then(Value::as_str) {
             Some("message_start") => self.observe_message_start(frame),
             Some("content_block_start") => self.observe_block_start(frame),
@@ -270,6 +353,89 @@ impl StreamAccumulator {
             // `ping` keep-alives, `content_block_stop`, and anything a later version
             // adds: nothing the harness acts on.
             _ => {}
+        }
+    }
+
+    /// Reassembles original blocks, including signatures that carry no visible text.
+    fn observe_replay(&mut self, frame: &Value) {
+        let index = block_index(frame);
+        match frame.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                if let Some(block) = frame.get("content_block") {
+                    if self.replay_blocks.len() >= 256 {
+                        self.fail("more than 256 assistant blocks".into());
+                        return;
+                    }
+                    let Ok(bytes) = nanus_domain::content::serialized_size(
+                        block,
+                        nanus_domain::content::RECORD_BYTES_MAX,
+                    ) else {
+                        self.fail("assistant block exceeds record byte limit".into());
+                        return;
+                    };
+                    self.replay_bytes = self.replay_bytes.saturating_add(bytes);
+                    if self.replay_bytes > nanus_domain::content::RECORD_BYTES_MAX {
+                        self.fail("assistant replay exceeds record byte limit".into());
+                        return;
+                    }
+                    self.replay_blocks.insert(index, block.clone());
+                }
+            }
+            Some("content_block_delta") => {
+                if let Some(delta) = frame.get("delta") {
+                    self.absorb_replay_delta(index, delta);
+                }
+            }
+            Some("content_block_stop") => {
+                if let Some(raw) = self.replay_arguments.remove(&index) {
+                    match serde_json::from_str::<Value>(&raw) {
+                        Ok(input) => {
+                            if let Some(block) = self.replay_blocks.get_mut(&index) {
+                                block["input"] = input;
+                            }
+                        }
+                        Err(error) => {
+                            self.fail(format!("invalid streamed tool arguments: {error}"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if self.replay_bytes > nanus_domain::content::RECORD_BYTES_MAX {
+            self.fail("assistant replay exceeds record byte limit".into());
+        }
+    }
+
+    fn absorb_replay_delta(&mut self, index: u32, delta: &Value) {
+        let field = match delta.get("type").and_then(Value::as_str) {
+            Some("text_delta") => "text",
+            Some("thinking_delta") => "thinking",
+            Some("signature_delta") => "signature",
+            Some("input_json_delta") => "partial_json",
+            _ => return,
+        };
+        let Some(fragment) = delta.get(field).and_then(Value::as_str) else {
+            return;
+        };
+        self.replay_bytes = self.replay_bytes.saturating_add(fragment.len());
+        if self.replay_bytes > nanus_domain::content::RECORD_BYTES_MAX {
+            self.fail("assistant replay exceeds record byte limit".into());
+            return;
+        }
+        if field == "partial_json" {
+            self.replay_arguments
+                .entry(index)
+                .or_default()
+                .push_str(fragment);
+        } else if let Some(block) = self.replay_blocks.get_mut(&index) {
+            let mut text = block
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            text.push_str(fragment);
+            block[field] = Value::String(text);
         }
     }
 
@@ -396,11 +562,36 @@ impl StreamAccumulator {
             return;
         }
         self.closed = true;
+        let blocks: Vec<_> = core::mem::take(&mut self.replay_blocks)
+            .into_values()
+            .collect();
+        if blocks.iter().any(|block| {
+            matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        }) {
+            if blocks.iter().any(|block| {
+                block["type"] == "thinking" && block["signature"].as_str().is_none_or(str::is_empty)
+            }) {
+                self.ready.push(LlmEvent::Error(
+                    "thinking block has no completed signature".into(),
+                ));
+                return;
+            }
+            self.ready.push(LlmEvent::AssistantReplay(
+                nanus_domain::message::AssistantReplay {
+                    protocol: "anthropic.messages".into(),
+                    prefix_digest: self.prefix_digest.clone(),
+                    blocks,
+                },
+            ));
+        }
         let usage = Usage::new(
             self.prompt_tokens(),
             self.output_tokens,
             // Anthropic does not break its output down into thinking and answering,
-            // and thinking is never requested here, so there is no share to report.
+            // so there is no separately reported share to record.
             0,
             self.cache_read_tokens,
             // A miss is everything the cache did not serve: the uncached input *and*
@@ -884,6 +1075,89 @@ mod tests {
                 })
             ),
             "{event:?}"
+        );
+    }
+    #[test]
+    fn signed_empty_thinking_survives_streaming_reload_and_unchanged_prefix_replay() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            let config = AnthropicConfig::new(model, "fixture-key");
+            let initial = ChatRequest::new(model, vec![Message::user("Inspect")]);
+            let payload = build_request(&config, &initial);
+            assert_eq!(payload["thinking"], json!({ "type": "adaptive" }));
+            let mut accumulator = StreamAccumulator::with_prefix(request_prefix(&payload));
+            for frame in [
+                json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "", "signature": "" } }),
+                json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "opaque-" } }),
+                json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "signature" } }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+                json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "call-1", "name": "inspect", "input": {} } }),
+                json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"fixture.png\"}" } }),
+                json!({ "type": "content_block_stop", "index": 1 }),
+                json!({ "type": "message_stop" }),
+            ] {
+                accumulator.observe_frame(&frame);
+            }
+            let mut replay = None;
+            while let Some(event) = accumulator.take_ready() {
+                if let LlmEvent::AssistantReplay(blocks) = event {
+                    replay = Some(blocks);
+                }
+            }
+            let replay = replay.expect("signed blocks retained");
+            assert_eq!(
+                replay.blocks[0],
+                json!({ "type": "thinking", "thinking": "", "signature": "opaque-signature" })
+            );
+            assert_eq!(replay.blocks[1]["input"], json!({ "path": "fixture.png" }));
+            let mut session =
+                nanus_domain::Session::new(nanus_domain::SessionId::new("signed"), 123, "/caller");
+            session.append(nanus_domain::SessionEvent::UserMessage {
+                text: "Inspect".into(),
+            });
+            let call = ToolCall::new(
+                ToolCallId::new("call-1"),
+                ToolName::new("inspect").unwrap(),
+                json!({ "path": "fixture.png" }),
+            );
+            session.append(nanus_domain::SessionEvent::AssistantMessage {
+                replay: Some(replay.clone()),
+                text: None,
+                reasoning: None,
+                tool_calls: vec![call],
+                usage: None,
+                interrupted: false,
+                model: Some(model.into()),
+                effort: None,
+            });
+            session.append(nanus_domain::SessionEvent::ToolResult {
+                call_id: ToolCallId::new("call-1"),
+                content: "inspected".into(),
+                content_blocks: None,
+                is_error: false,
+            });
+            let loaded =
+                nanus_domain::Session::from_jsonl(&session.try_to_jsonl().unwrap()).unwrap();
+            let request = ChatRequest::new(model, loaded.derive_messages());
+            let next = build_request(&config, &request);
+            assert_eq!(next["messages"][1]["content"], json!(replay.blocks));
+            let mut edited = request;
+            edited
+                .messages
+                .insert(0, Message::system("A changed instruction"));
+            let changed = build_request(&config, &edited);
+            assert_eq!(changed["messages"][1]["content"][0]["type"], "tool_use");
+            assert!(!changed.to_string().contains("opaque-signature"));
+        }
+    }
+
+    #[test]
+    fn incomplete_thinking_is_refused_and_does_not_become_replay() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.observe_frame(&json!({ "type": "content_block_start", "index": 0,
+            "content_block": { "type": "thinking", "thinking": "", "signature": "" } }));
+        accumulator.close();
+        assert!(
+            matches!(accumulator.take_ready(), Some(LlmEvent::Error(message)) if message.contains("signature"))
         );
     }
 }

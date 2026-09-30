@@ -1811,6 +1811,7 @@ mod tests {
             text: "read the file".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some(String::from("done")),
             reasoning: None,
             tool_calls: Vec::new(),

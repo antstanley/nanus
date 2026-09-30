@@ -64,7 +64,9 @@
     clippy::manual_unwrap_or_default
 )]
 
+pub mod capabilities;
 pub mod clock;
+pub mod control;
 pub mod error;
 pub mod fs;
 pub mod llm;
@@ -78,7 +80,9 @@ use core::pin::Pin;
 
 use nanus_kernel::ServiceKey;
 
+pub use capabilities::{ImageInputSupport, ImageProfile, ModelCapabilities, RequestEstimate};
 pub use clock::{ClockHandle, ClockPort};
+pub use control::{PolicyError, ToolPolicy, ToolPolicyDecision, TurnControl};
 pub use error::{PortError, PortResult};
 pub use fs::{
     DirEntry, EditOutcome, FileMeta, FileRead, FsError, FsHandle, FsPort, FsResult, SearchKind,

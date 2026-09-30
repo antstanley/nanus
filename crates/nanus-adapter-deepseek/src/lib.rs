@@ -190,8 +190,40 @@ impl LlmPort for DeepSeekLlm {
         effort_levels()
     }
 
+    fn estimate_request(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        nanus_ports::capabilities::estimate_payload(
+            self.capabilities(&request.model),
+            request,
+            &self.encode(request),
+        )
+    }
+
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        if let Err(error) = nanus_ports::capabilities::validate_image_input(
+            self.capabilities(&request.model),
+            &request,
+        ) {
+            return error_stream(&error.to_string());
+        }
+        if request.context_budget.is_some()
+            || nanus_ports::capabilities::has_images(&request.messages)
+        {
+            let checked = self.estimate_request(&request).and_then(|estimate| {
+                nanus_ports::capabilities::validate_estimate(
+                    self.capabilities(&request.model),
+                    &request,
+                    estimate,
+                )
+            });
+            if let Err(error) = checked {
+                return error_stream(&error.to_string());
+            }
+        }
         let payload = self.encode(&request);
+
         let Ok(body) = serde_json::to_string(&payload) else {
             return error_stream("could not encode the request as JSON");
         };

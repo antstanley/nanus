@@ -40,6 +40,19 @@ separate file beside the log, and that is deliberate:
 - **A name is content, never a path.** It lives inside the session's own directory under a
   fixed file name, so no name can climb out of the store.
 
+Writers now emit body version 2. Readers accept versions 1 and 2; old text logs keep their
+sequence, usage and optional provenance without inferred pixels. Version 1 cannot introduce
+typed content or signed replay via extra fields. Version 2 stores ordered image blocks inline
+beside display summaries, so resuming does not need the original image file. Signed Messages
+assistant blocks are retained for unchanged-prefix replay. Older binaries cannot read v2
+bodies; there is no destructive bulk migration or automatic downgrade.
+
+`try_to_jsonl` validates content and 4 MiB records/64 MiB total logs. The store uses it before
+atomic replacement and bounds reads before parsing, leaving the existing log intact on failed
+save. The legacy infallible `to_jsonl` remains for trusted in-memory compatibility; hosts should
+use the fallible writer. CLI/link projections show summaries, never duplicate image blobs.
+The runner mutates memory; hosts own saving before success/Done acknowledgment.
+
 ## Naming
 
 A name is how a session is found again, so it is taken for good: starting a second session

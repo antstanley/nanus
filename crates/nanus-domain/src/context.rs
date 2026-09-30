@@ -105,6 +105,7 @@ pub fn estimate_message(message: &Message) -> u32 {
             chars = chars.saturating_add(text.chars().count());
         }
         Message::Assistant {
+            replay: _,
             text,
             reasoning,
             tool_calls,
@@ -135,13 +136,27 @@ pub fn estimate_message(message: &Message) -> u32 {
 ///
 /// Returns [`FitError::TooLarge`] when the prompt that cannot be shortened further does not fit.
 pub fn fit(messages: Vec<Message>, budget: u32) -> Result<Fitted, FitError> {
+    fit_with(messages, budget, estimate)
+}
+
+/// Fits whole original turns using the caller's provider-aware cost function.
+///
+/// The estimator must include schemas, translated framing and output reservation.
+/// It returns an upward-bounded cost; `u32::MAX` means the candidate cannot fit.
+/// # Errors
+/// Returns [`FitError::TooLarge`] if the newest turn cannot fit.
+pub fn fit_with(
+    messages: Vec<Message>,
+    budget: u32,
+    mut cost: impl FnMut(&[Message]) -> u32,
+) -> Result<Fitted, FitError> {
     let head = leading_prompt(&messages);
     let tail = &messages[head..];
     let turns = split_turns(tail);
     if turns.is_empty() {
         // No human turn at all: there is nothing to drop and nothing to answer, so the only
         // question is whether the prompt itself fits.
-        let estimated = estimate(&messages);
+        let estimated = cost(&messages);
         if estimated > budget {
             return Err(FitError::TooLarge { estimated, budget });
         }
@@ -163,7 +178,7 @@ pub fn fit(messages: Vec<Message>, budget: u32) -> Result<Fitted, FitError> {
             candidate.push(notice.clone());
         }
         candidate.extend_from_slice(kept);
-        let kept_tokens = estimate(&candidate);
+        let kept_tokens = cost(&candidate);
         if kept_tokens <= budget {
             let elision = notice.map(|_| Elision {
                 dropped_messages,

@@ -241,9 +241,139 @@ impl From<Usage> for UsageWire {
     }
 }
 
-// `serde_json::Value` is only `PartialEq`, so `Eq` cannot be derived even
-// though equality here is structurally total.
-#[allow(clippy::derive_partial_eq_without_eq)]
+/// Opaque, ordered assistant content required to replay a signed provider response.
+///
+/// It travels only on the named protocol and unchanged prefix. Display continues to use
+/// ordinary text/reasoning, and other encoders ignore this content. No URLs are fetched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AssistantReplay {
+    /// The protocol that produced these blocks.
+    pub protocol: String,
+    /// SHA-256 of that request's system, tools and preceding encoded messages.
+    pub prefix_digest: String,
+    /// Original ordered provider blocks, including signed empty thinking.
+    pub blocks: Vec<Value>,
+}
+
+impl AssistantReplay {
+    /// Checks that replayed text and executable calls are exactly the neutral response.
+    pub fn validate_response(
+        &self,
+        text: Option<&str>,
+        calls: &[ToolCall],
+    ) -> Result<(), crate::content::ContentError> {
+        self.validate()?;
+        let original_text: String = self
+            .blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        let uses: Vec<_> = self
+            .blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        if original_text != text.unwrap_or_default()
+            || uses.len() != calls.len()
+            || uses.iter().zip(calls).any(|(block, call)| {
+                block["id"] != call.id.as_str()
+                    || block["name"] != call.name.as_str()
+                    || block["input"] != call.arguments
+            })
+        {
+            return Err(crate::content::ContentError::new(
+                "assistant replay differs from response",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates the limited signed Messages replay contract. Images belong only in typed results.
+    pub fn validate(&self) -> Result<(), crate::content::ContentError> {
+        use crate::content::{ContentError, RECORD_BYTES_MAX, serialized_size};
+        if self.protocol != "anthropic.messages"
+            || self.prefix_digest.len() != 64
+            || !self
+                .prefix_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.blocks.is_empty()
+            || self.blocks.len() > 256
+        {
+            return Err(ContentError::new("invalid assistant replay envelope"));
+        }
+        for block in &self.blocks {
+            validate_replay_block(block)?;
+        }
+        serialized_size(self, RECORD_BYTES_MAX)?;
+        Ok(())
+    }
+}
+
+fn validate_replay_block(block: &Value) -> Result<(), crate::content::ContentError> {
+    use crate::content::ContentError;
+    let Some(object) = block.as_object() else {
+        return Err(ContentError::new("assistant replay block is not an object"));
+    };
+    let fields: &[&str] = match block["type"].as_str() {
+        Some("text") if block["text"].is_string() => &["type", "text"],
+        Some("thinking")
+            if block["thinking"].is_string()
+                && block["signature"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()) =>
+        {
+            &["type", "thinking", "signature"]
+        }
+        Some("redacted_thinking")
+            if block["data"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()) =>
+        {
+            &["type", "data"]
+        }
+        Some("tool_use")
+            if block["id"].as_str().is_some_and(|id| !id.is_empty())
+                && block["name"]
+                    .as_str()
+                    .is_some_and(|name| ToolName::new(name).is_ok())
+                && block["input"].is_object() =>
+        {
+            &["type", "id", "name", "input"]
+        }
+        _ => {
+            return Err(ContentError::new(
+                "unsupported or malformed assistant replay block",
+            ));
+        }
+    };
+    if object.len() != fields.len() || !object.keys().all(|key| fields.contains(&key.as_str())) {
+        return Err(ContentError::new("unknown assistant replay fields"));
+    }
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for AssistantReplay {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            protocol: String,
+            prefix_digest: String,
+            blocks: Vec<Value>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let replay = Self {
+            protocol: wire.protocol,
+            prefix_digest: wire.prefix_digest,
+            blocks: wire.blocks,
+        };
+        replay.validate().map_err(de::Error::custom)?;
+        Ok(replay)
+    }
+}
+
 /// One entry in the conversation a model is asked to continue.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
@@ -264,6 +394,8 @@ pub enum Message {
         /// The model's reasoning trace, which `DeepSeek` requires back when tools
         /// are present.
         reasoning: Option<String>,
+        /// Opaque provider content, when required for signed reasoning replay.
+        replay: Option<AssistantReplay>,
         /// The tool calls the model asked for, in the order it asked.
         tool_calls: Vec<ToolCall>,
     },
@@ -273,6 +405,8 @@ pub enum Message {
         call_id: ToolCallId,
         /// The rendered result the model sees.
         content: String,
+        /// Ordered model content; absence means legacy text, never inferred images.
+        content_blocks: Option<Vec<crate::ContentBlock>>,
         /// Whether the tool failed. Not part of the wire shape: the harness
         /// renders failures into `content` so the model can react to them.
         is_error: bool,
@@ -303,6 +437,7 @@ impl Message {
             text,
             reasoning,
             tool_calls,
+            replay: None,
         }
     }
 
@@ -312,7 +447,39 @@ impl Message {
         Self::Tool {
             call_id,
             content: content.into(),
+            content_blocks: None,
             is_error,
+        }
+    }
+
+    /// Returns the original text blocks for a tool result, or its legacy text.
+    ///
+    /// Image blocks are omitted here only by text encoders whose request boundary refuses
+    /// images. Multimodal encoders must preserve them through their own translation.
+    #[must_use]
+    pub fn tool_text(&self) -> Option<String> {
+        match self {
+            Self::Tool {
+                content_blocks: Some(blocks),
+                ..
+            } => Some(
+                blocks
+                    .iter()
+                    .filter_map(|block| {
+                        if let crate::ContentBlock::Text(text) = block {
+                            Some(if text.ends_with('\n') {
+                                text.clone()
+                            } else {
+                                format!("{text}\n")
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            ),
+            Self::Tool { content, .. } => Some(content.clone()),
+            _ => None,
         }
     }
 
@@ -482,6 +649,7 @@ impl Serialize for Message {
                 text,
                 reasoning,
                 tool_calls,
+                replay,
             } => {
                 let mut map = serializer.serialize_map(None)?;
                 map.serialize_entry("role", Role::Assistant.as_str())?;
@@ -497,17 +665,29 @@ impl Serialize for Message {
                 if !tool_calls.is_empty() {
                     map.serialize_entry("tool_calls", tool_calls)?;
                 }
+                if let Some(replay) = replay {
+                    replay
+                        .validate_response(text.as_deref(), tool_calls)
+                        .map_err(serde::ser::Error::custom)?;
+                    map.serialize_entry("assistant_replay", replay)?;
+                }
                 map.end()
             }
             Self::Tool {
                 call_id,
                 content,
-                is_error: _,
+                content_blocks,
+                is_error,
             } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("role", Role::Tool.as_str())?;
                 map.serialize_entry("tool_call_id", call_id.as_str())?;
                 map.serialize_entry("content", content)?;
+                if let Some(blocks) = content_blocks {
+                    crate::content::validate_blocks(blocks).map_err(serde::ser::Error::custom)?;
+                    map.serialize_entry("content_blocks", blocks)?;
+                    map.serialize_entry("is_error", is_error)?;
+                }
                 map.end()
             }
         }
@@ -523,6 +703,8 @@ struct MessageFields {
     reasoning: Option<String>,
     call_id: Option<String>,
     is_error: bool,
+    content_blocks: Option<Vec<crate::ContentBlock>>,
+    replay: Option<AssistantReplay>,
 }
 
 impl MessageFields {
@@ -536,20 +718,34 @@ impl MessageFields {
             "system" => Ok(Message::system(text.unwrap_or_default())),
             "user" => Ok(Message::user(text.unwrap_or_default())),
             "assistant" => {
+                if let Some(replay) = &self.replay {
+                    replay
+                        .validate_response(text.as_deref(), &self.tool_calls)
+                        .map_err(|error| error.to_string())?;
+                }
                 // An empty string and an absent field both mean "no text"; they
                 // are normalised so the surface fold has one case to handle.
                 let text = text.filter(|value| !value.is_empty());
-                Ok(Message::assistant(text, self.reasoning, self.tool_calls))
+                Ok(Message::Assistant {
+                    text,
+                    reasoning: self.reasoning,
+                    tool_calls: self.tool_calls,
+                    replay: self.replay,
+                })
             }
             "tool" => {
                 let call_id = self
                     .call_id
                     .ok_or_else(|| String::from("a tool message has no tool_call_id"))?;
-                Ok(Message::tool(
-                    ToolCallId::new(call_id),
-                    text.unwrap_or_default(),
-                    self.is_error,
-                ))
+                if let Some(blocks) = &self.content_blocks {
+                    crate::content::validate_blocks(blocks).map_err(|error| error.to_string())?;
+                }
+                Ok(Message::Tool {
+                    call_id: ToolCallId::new(call_id),
+                    content: text.unwrap_or_default(),
+                    is_error: self.is_error,
+                    content_blocks: self.content_blocks,
+                })
             }
             other => Err(format!("unknown message role {other:?}")),
         }
@@ -606,6 +802,8 @@ impl<'de> Visitor<'de> for MessageVisitor {
                 "reasoning_content" | "reasoning" => fields.reasoning = map.next_value()?,
                 "tool_call_id" => fields.call_id = map.next_value()?,
                 "is_error" => fields.is_error = map.next_value()?,
+                "content_blocks" => fields.content_blocks = map.next_value()?,
+                "assistant_replay" => fields.replay = map.next_value()?,
                 _ => {
                     map.next_value::<de::IgnoredAny>()?;
                 }

@@ -31,7 +31,22 @@ it is checked separately: a view-layer module that reached for a runtime-only cr
 in the run above and fail here, which is exactly how `notice.rs` and `view.rs` were found naming
 the link and the ports in a build that has neither.
 
+The minimal bundle must also pass `cargo clippy -p nanus-bundle --no-default-features --all-targets`,
+`cargo nextest run -p nanus-bundle --no-default-features` and its no-default doctests.
+The standalone `examples/embedded` manifest is tested/run with and without `--features providers`;
+its own lockfile and native Windows/macOS CI matrix prevent workspace feature unification from
+hiding adapter imports. Native Windows and live-provider results must be reported separately.
+
 ## The tests that matter most
+
+**Caller policy and wakeable cancellation.** `nanus-bundle/tests/embedding.rs` drives never-ready
+model/policy/approval/tool futures without sleeps. It checks exact grants/denials, terminal call
+pairing and host teardown. The downstream fixture reuses those cases without stock adapters.
+
+**Multimodal persistence and assembled requests.** Domain/store tests bound media and logs;
+Anthropic/OpenAI fixtures decode captured PNG/JPEG bytes before/after store reload and verify
+call pairing, block order, errors and absent summaries. Native dimension and output/reasoning
+bounds are checked separately. Wire success does not promote a profile without live follow-ups.
 
 **End to end, over the real tools.**
 [`crates/nanus-bundle/tests/end_to_end.rs`](../crates/nanus-bundle/tests/end_to_end.rs)

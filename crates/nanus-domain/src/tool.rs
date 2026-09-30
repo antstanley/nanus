@@ -303,7 +303,7 @@ impl ContentBlock {
 /// A separate type rather than a `serde` attribute, because an internally tagged
 /// enum cannot carry a newtype variant containing a string.
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ContentBlockWire {
     Text {
         text: String,

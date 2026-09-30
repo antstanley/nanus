@@ -11,20 +11,33 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["stock-compose"]
+stock-compose = [
+    "dep:nanus-adapter-config",
+    "dep:nanus-adapter-deepseek",
+    "dep:nanus-adapter-openai",
+    "dep:nanus-adapter-anthropic",
+    "dep:nanus-adapter-secret",
+    "dep:nanus-adapter-local",
+    "dep:nanus-adapter-store",
+    "dep:toml",
+]
+
 [dependencies]
 nanus-kernel = { workspace = true }
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }
-nanus-adapter-config = { workspace = true }
-nanus-adapter-deepseek = { workspace = true }
+nanus-adapter-config = { workspace = true, optional = true }
+nanus-adapter-deepseek = { workspace = true, optional = true }
 # The other providers. This crate is the only one that names a concrete adapter, so
 # adding a provider means an entry in the table in `provider.rs` and a dependency
 # here, and nothing below changes.
-nanus-adapter-openai = { workspace = true }
-nanus-adapter-anthropic = { workspace = true }
-nanus-adapter-secret = { workspace = true }
-nanus-adapter-local = { workspace = true }
-nanus-adapter-store = { workspace = true }
+nanus-adapter-openai = { workspace = true, optional = true }
+nanus-adapter-anthropic = { workspace = true, optional = true }
+nanus-adapter-secret = { workspace = true, optional = true }
+nanus-adapter-local = { workspace = true, optional = true }
+nanus-adapter-store = { workspace = true, optional = true }
 futures = { workspace = true }
 serde = { workspace = true }
 globset = { workspace = true }
@@ -34,9 +47,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # The remembered selection is a small TOML file the configuration's own crate already uses
 # this for; a JSON file would be a second format for the same kind of state.
-toml = { workspace = true }
+toml = { workspace = true, optional = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }

@@ -71,7 +71,11 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
     // `max_tokens` and require `max_completion_tokens`.
     body.insert(
         config.vendor().output_token_field().to_owned(),
-        json!(config.effective_max_tokens()),
+        json!(
+            request
+                .max_tokens
+                .unwrap_or_else(|| config.effective_max_tokens())
+        ),
     );
 
     let effort = request
@@ -115,7 +119,40 @@ fn insert_effort(body: &mut Map<String, Value>, vendor: Vendor, effort: Reasonin
 /// Encodes the conversation in the vendor's message shape.
 #[must_use]
 pub fn encode_messages(messages: &[Message]) -> Value {
-    Value::Array(messages.iter().map(encode_message).collect())
+    let mut turns = Vec::new();
+    let mut attachments = Vec::new();
+    for message in messages {
+        if !matches!(message, Message::Tool { .. }) {
+            turns.append(&mut attachments);
+        }
+        if let Message::Tool {
+            call_id,
+            content_blocks: Some(blocks),
+            is_error,
+            ..
+        } = message
+            && blocks
+                .iter()
+                .any(|block| matches!(block, nanus_domain::ContentBlock::Image { .. }))
+        {
+            let label = nanus_ports::capabilities::attachment_label(call_id, *is_error);
+            turns.push(
+                json!({ "role": "tool", "tool_call_id": call_id.as_str(), "content": label }),
+            );
+            let mut content = vec![json!({ "type": "text", "text": label })];
+            content.extend(blocks.iter().map(|block| match block {
+                nanus_domain::ContentBlock::Text(text) => json!({ "type": "text", "text": text }),
+                nanus_domain::ContentBlock::Image { media_type, data_base64 } => json!({
+                    "type": "image_url", "image_url": { "url": format!("data:{media_type};base64,{data_base64}"), "detail": "high" },
+                }),
+            }));
+            attachments.push(json!({ "role": "user", "content": content }));
+        } else {
+            turns.push(encode_message(message));
+        }
+    }
+    turns.append(&mut attachments);
+    Value::Array(turns)
 }
 
 /// Encodes one message.
@@ -142,12 +179,10 @@ fn encode_message(message: &Message) -> Value {
             }
             Value::Object(object)
         }
-        Message::Tool {
-            call_id, content, ..
-        } => json!({
+        Message::Tool { call_id, .. } => json!({
             "role": "tool",
             "tool_call_id": call_id.as_str(),
-            "content": content,
+            "content": message.tool_text().unwrap_or_default(),
         }),
     }
 }
@@ -588,6 +623,7 @@ mod tests {
     #[test]
     fn an_empty_assistant_turn_sends_an_empty_string_not_null() {
         let message = Message::Assistant {
+            replay: None,
             text: None,
             reasoning: Some(String::from("because")),
             tool_calls: vec![ToolCall {
@@ -608,6 +644,7 @@ mod tests {
     #[test]
     fn tool_arguments_are_encoded_as_a_json_string() {
         let message = Message::Assistant {
+            replay: None,
             text: None,
             reasoning: None,
             tool_calls: vec![ToolCall {

@@ -145,6 +145,7 @@ fn apply(
             );
         }
         SessionEvent::ToolResult {
+            content_blocks: _,
             call_id,
             content,
             is_error,
@@ -295,6 +296,7 @@ mod tests {
     #[test]
     fn reasoning_is_shown_before_the_answer() {
         let session = session_with(vec![SessionEvent::AssistantMessage {
+            replay: None,
             text: Some("the answer".to_owned()),
             reasoning: Some("the thinking".to_owned()),
             tool_calls: Vec::new(),
@@ -312,6 +314,7 @@ mod tests {
     #[test]
     fn an_empty_reasoning_or_text_field_produces_no_entry() {
         let session = session_with(vec![SessionEvent::AssistantMessage {
+            replay: None,
             text: None,
             reasoning: Some(String::new()),
             tool_calls: Vec::new(),
@@ -334,6 +337,7 @@ mod tests {
                 arguments: json!({ "pattern": "**/*.rs" }),
             },
             SessionEvent::ToolResult {
+                content_blocks: None,
                 call_id: ToolCallId::new("c1"),
                 content: "a.rs\nb.rs".to_owned(),
                 is_error: false,
@@ -375,11 +379,13 @@ mod tests {
                 arguments: json!({ "pattern": "fn" }),
             },
             SessionEvent::ToolResult {
+                content_blocks: None,
                 call_id: ToolCallId::new("c-read"),
                 content: "the read output".to_owned(),
                 is_error: false,
             },
             SessionEvent::ToolResult {
+                content_blocks: None,
                 call_id: ToolCallId::new("c-grep"),
                 content: "the grep output".to_owned(),
                 is_error: false,
@@ -422,11 +428,13 @@ mod tests {
                 arguments: json!({ "file_path": "a.rs" }),
             },
             SessionEvent::ToolResult {
+                content_blocks: None,
                 call_id: ToolCallId::new("c-second"),
                 content: "read first".to_owned(),
                 is_error: false,
             },
             SessionEvent::ToolResult {
+                content_blocks: None,
                 call_id: ToolCallId::new("c-first"),
                 content: "glob second".to_owned(),
                 is_error: false,
@@ -457,6 +465,7 @@ mod tests {
                 arguments: json!({ "file_path": "missing.txt" }),
             },
             SessionEvent::ToolResult {
+                content_blocks: None,
                 call_id: ToolCallId::new("c1"),
                 content: "read: missing.txt does not exist".to_owned(),
                 is_error: true,
@@ -474,6 +483,7 @@ mod tests {
         // A log truncated to start mid-call is malformed but must not panic: the result
         // is rendered under a generic name.
         let session = session_with(vec![SessionEvent::ToolResult {
+            content_blocks: None,
             call_id: ToolCallId::new("orphan"),
             content: "dangling".to_owned(),
             is_error: false,
@@ -507,6 +517,7 @@ mod tests {
     #[test]
     fn an_interrupted_step_in_a_truncated_log_says_so_itself() {
         let session = session_with(vec![SessionEvent::AssistantMessage {
+            replay: None,
             text: None,
             reasoning: None,
             tool_calls: Vec::new(),
@@ -545,6 +556,7 @@ mod tests {
                 SessionEvent::TurnStart { turn: 1 },
                 SessionEvent::StepStart { turn: 1, step: 1 },
                 SessionEvent::AssistantMessage {
+                    replay: None,
                     text: Some(String::from("half an answer")),
                     reasoning: None,
                     tool_calls: Vec::new(),
@@ -577,6 +589,7 @@ mod tests {
             SessionEvent::TurnStart { turn: 1 },
             SessionEvent::StepStart { turn: 1, step: 1 },
             SessionEvent::AssistantMessage {
+                replay: None,
                 text: Some(String::from("the answer")),
                 reasoning: None,
                 tool_calls: Vec::new(),
@@ -638,6 +651,7 @@ mod tests {
     #[test]
     fn a_replayed_transcript_has_no_streaming_tail() {
         let session = session_with(vec![SessionEvent::AssistantMessage {
+            replay: None,
             text: Some("done".to_owned()),
             reasoning: None,
             tool_calls: Vec::new(),

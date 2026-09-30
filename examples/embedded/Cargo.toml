@@ -1,0 +1,23 @@
+[package]
+name = "nanus-embedded-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately downstream: inherited workspace features cannot mask this boundary.
+[workspace]
+
+[features]
+providers = ["dep:nanus-adapter-anthropic", "dep:nanus-adapter-openai", "dep:nanus-adapter-deepseek"]
+
+[dependencies]
+nanus-bundle = { path = "../../crates/nanus-bundle", default-features = false }
+nanus-domain = { path = "../../crates/nanus-domain" }
+nanus-ports = { path = "../../crates/nanus-ports" }
+nanus-adapter-anthropic = { path = "../../crates/nanus-adapter-anthropic", optional = true }
+nanus-adapter-openai = { path = "../../crates/nanus-adapter-openai", optional = true }
+nanus-adapter-deepseek = { path = "../../crates/nanus-adapter-deepseek", optional = true }
+base64 = "0.22"
+futures = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync"] }

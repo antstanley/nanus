@@ -25,7 +25,8 @@ pub const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 #[must_use]
 pub fn effort_levels(model: &str) -> &'static [ReasoningEffort] {
     match model {
-        "claude-sonnet-5" | "claude-opus-5" | "claude-fable-5-1" => &[
+        "claude-sonnet-5" | "claude-opus-5" | "claude-sonnet-5-5" | "claude-opus-5-5"
+        | "claude-fable-5-1" => &[
             ReasoningEffort::Low,
             ReasoningEffort::Medium,
             ReasoningEffort::High,
@@ -44,7 +45,8 @@ pub fn effort_levels(model: &str) -> &'static [ReasoningEffort] {
 #[must_use]
 pub fn effort_spelling(model: &str, effort: ReasoningEffort) -> Option<&'static str> {
     match model {
-        "claude-sonnet-5" | "claude-opus-5" | "claude-fable-5-1" => Some(match effort {
+        "claude-sonnet-5" | "claude-opus-5" | "claude-sonnet-5-5" | "claude-opus-5-5"
+        | "claude-fable-5-1" => Some(match effort {
             ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
@@ -72,9 +74,11 @@ pub const API_VERSION: &str = "2023-06-01";
 /// The current lineup comes first, so the fallback default is one of them, and the
 /// previous generation stays behind it rather than being dropped: a session resumed
 /// against a 4.x model can still cycle back to it.
-static MODELS: [&str; 6] = [
+static MODELS: [&str; 8] = [
     "claude-sonnet-5",
     "claude-opus-5",
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
     "claude-fable-5-1",
     "claude-haiku-4-5-20251001",
     "claude-sonnet-4-20250514",
@@ -89,6 +93,15 @@ static MODELS: [&str; 6] = [
 /// because one value has to hold for whichever model a configuration names. It is a
 /// provider fact and therefore lives here rather than in the ports crate.
 pub const MAX_OUTPUT_TOKENS: u32 = 64_000;
+
+/// Exact standard-output ceilings; legacy selections retain their existing clamp.
+#[must_use]
+pub fn model_max_output_tokens(model: &str) -> u32 {
+    match model {
+        "claude-opus-5-5" | "claude-sonnet-5-5" => 128_000,
+        _ => MAX_OUTPUT_TOKENS,
+    }
+}
 
 /// The adapter's settings.
 ///
@@ -207,12 +220,8 @@ impl AnthropicConfig {
 
     /// Returns the maximum output tokens a request may actually ask for.
     #[must_use]
-    pub const fn effective_max_tokens(&self) -> u32 {
-        if self.max_tokens < MAX_OUTPUT_TOKENS {
-            self.max_tokens
-        } else {
-            MAX_OUTPUT_TOKENS
-        }
+    pub fn effective_max_tokens(&self) -> u32 {
+        self.max_tokens.min(model_max_output_tokens(&self.model))
     }
 
     /// Returns the configured sampling temperature, if any.
@@ -289,6 +298,8 @@ mod tests {
             [
                 "claude-sonnet-5",
                 "claude-opus-5",
+                "claude-sonnet-5-5",
+                "claude-opus-5-5",
                 "claude-fable-5-1",
                 "claude-haiku-4-5-20251001",
                 "claude-sonnet-4-20250514",
@@ -346,5 +357,16 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("sk-ant-secret"), "{rendered}");
         assert!(rendered.contains("claude-sonnet-4"), "{rendered}");
+    }
+    #[test]
+    fn each_five_point_five_model_has_its_own_standard_output_ceiling() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            let mut config = AnthropicConfig::new(model, "fixture-key");
+            config.set_max_tokens(128_000).unwrap();
+            assert_eq!(config.effective_max_tokens(), 128_000);
+            assert_eq!(model_max_output_tokens(model), 128_000);
+            assert!(effort_levels(model).contains(&ReasoningEffort::Max));
+        }
+        assert_eq!(model_max_output_tokens("claude-haiku-4-5-20251001"), 64_000);
     }
 }

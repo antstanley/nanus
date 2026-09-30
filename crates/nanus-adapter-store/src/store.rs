@@ -331,7 +331,9 @@ impl JsonlStore {
             .await
             .map_err(|source| io_error(&dir, &source))?;
         let path = dir.join(SESSION_FILE);
-        let body = session.to_jsonl();
+        let body = session
+            .try_to_jsonl()
+            .map_err(|error| corrupt(session.id(), &error))?;
         assert!(!body.is_empty(), "an encoded session is never empty");
         write_atomic(&path, &body).await
     }
@@ -339,7 +341,7 @@ impl JsonlStore {
     /// Reads one session, rejecting a damaged file.
     async fn load_blocking(&self, id: &SessionId) -> StoreResult<Session> {
         let path = self.session_file(id)?;
-        let raw = match fs::read_to_string(&path).await {
+        let raw = match read_bounded_log(&path).await {
             Ok(raw) => raw,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Err(not_found(id));
@@ -565,6 +567,21 @@ impl StorePort for JsonlStore {
     fn release_lock(&self, id: &SessionId) {
         self.release_lock_blocking(id);
     }
+}
+
+/// Reads at most the session limit plus one byte, including files growing during a read.
+async fn read_bounded_log(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+    let file = fs::File::open(path).await?;
+    let cap = u64::try_from(nanus_domain::content::SESSION_BYTES_MAX)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut raw = String::new();
+    file.take(cap).read_to_string(&mut raw).await?;
+    if raw.len() > nanus_domain::content::SESSION_BYTES_MAX {
+        return Err(std::io::Error::other("session exceeds 64 MiB"));
+    }
+    Ok(raw)
 }
 
 /// Takes the claim on `path`, or reports that another writer already holds it.

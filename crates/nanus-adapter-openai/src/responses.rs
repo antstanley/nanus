@@ -43,7 +43,11 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
     // truncated, so sending it would fail every step.
     body.insert(
         "max_output_tokens".to_owned(),
-        json!(config.effective_max_tokens()),
+        json!(
+            request
+                .max_tokens
+                .unwrap_or_else(|| config.effective_max_tokens())
+        ),
     );
     let effort = request
         .reasoning_effort
@@ -119,12 +123,10 @@ pub fn encode_input(messages: &[Message]) -> Value {
                     }));
                 }
             }
-            Message::Tool {
-                call_id, content, ..
-            } => items.push(json!({
+            Message::Tool { call_id, .. } => items.push(json!({
                 "type": "function_call_output",
                 "call_id": call_id.as_str(),
-                "output": content,
+                "output": message.tool_text().unwrap_or_default(),
             })),
         }
     }
@@ -492,11 +494,13 @@ mod tests {
             &request(vec![
                 Message::user("read it"),
                 Message::Assistant {
+                    replay: None,
                     text: None,
                     reasoning: None,
                     tool_calls: vec![call],
                 },
                 Message::Tool {
+                    content_blocks: None,
                     call_id: ToolCallId::new("call-1"),
                     content: String::from("contents"),
                     is_error: false,

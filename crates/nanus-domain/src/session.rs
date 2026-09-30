@@ -56,7 +56,7 @@ use crate::tool::{ToolCall, ToolName};
 pub const SESSION_FORMAT_TAG: &str = "nanus.session";
 
 /// The session file format version this crate writes and accepts.
-pub const SESSION_FORMAT_VERSION: u32 = 1;
+pub const SESSION_FORMAT_VERSION: u32 = 2;
 
 /// Maximum number of characters in a derived session title.
 const TITLE_MAX_CHARS: usize = 72;
@@ -241,6 +241,9 @@ pub enum SessionEvent {
         /// present.
         #[serde(default)]
         reasoning: Option<String>,
+        /// Opaque signed content; absence means this provider supplied no replay blocks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<crate::message::AssistantReplay>,
         /// The tool calls the model asked for.
         #[serde(default)]
         tool_calls: Vec<ToolCall>,
@@ -282,6 +285,13 @@ pub enum SessionEvent {
         call_id: ToolCallId,
         /// The rendered result.
         content: String,
+        /// Ordered model content. Absence means legacy text only; an empty list is invalid.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::content::deserialize_blocks"
+        )]
+        content_blocks: Option<Vec<crate::ContentBlock>>,
         /// Whether the tool failed.
         is_error: bool,
     },
@@ -406,6 +416,7 @@ impl SessionLog {
                     text,
                     reasoning,
                     tool_calls,
+                    replay,
                     ..
                 } => {
                     let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
@@ -430,15 +441,31 @@ impl SessionLog {
                         .cloned()
                         .collect();
                     if has_text || !calls.is_empty() {
-                        messages.push(Message::assistant(text.clone(), reasoning.clone(), calls));
+                        let replay = if calls.len() == tool_calls.len() {
+                            replay.clone()
+                        } else {
+                            None
+                        };
+                        messages.push(Message::Assistant {
+                            text: text.clone(),
+                            reasoning: reasoning.clone(),
+                            tool_calls: calls,
+                            replay,
+                        });
                     }
                 }
                 SessionEvent::ToolResult {
+                    content_blocks,
                     call_id,
                     content,
                     is_error,
                 } => {
-                    messages.push(Message::tool(call_id.clone(), content.clone(), *is_error));
+                    messages.push(Message::Tool {
+                        call_id: call_id.clone(),
+                        content: content.clone(),
+                        content_blocks: content_blocks.clone(),
+                        is_error: *is_error,
+                    });
                 }
                 SessionEvent::TurnStart { .. }
                 | SessionEvent::TurnEnd { .. }
@@ -954,6 +981,84 @@ impl Session {
         out
     }
 
+    /// Encodes a bounded version-2 session, validating content before any store write.
+    ///
+    /// # Errors
+    ///
+    /// Refuses malformed media, oversized records and sessions exceeding 64 MiB.
+    pub fn try_to_jsonl(&self) -> Result<String, SessionError> {
+        let mut total = 0_usize;
+        for (index, event) in self.log.events().iter().enumerate() {
+            if let SessionEvent::ToolResult {
+                content_blocks: Some(blocks),
+                ..
+            } = event
+            {
+                crate::content::validate_blocks(blocks).map_err(|error| {
+                    SessionError::MalformedEvent {
+                        line: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
+                        detail: error.to_string(),
+                    }
+                })?;
+            }
+            if let SessionEvent::AssistantMessage {
+                replay: Some(replay),
+                text,
+                tool_calls,
+                ..
+            } = event
+            {
+                replay
+                    .validate_response(text.as_deref(), tool_calls)
+                    .map_err(|error| SessionError::MalformedEvent {
+                        line: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
+                        detail: error.to_string(),
+                    })?;
+            }
+            let seq = SessionSeq::new(u64::try_from(index).unwrap_or(u64::MAX));
+            let size = crate::content::serialized_size(
+                &SessionLineRef { seq, event },
+                crate::content::RECORD_BYTES_MAX,
+            )
+            .map_err(|error| SessionError::MalformedEvent {
+                line: seq.value().saturating_add(2),
+                detail: error.to_string(),
+            })?;
+            total = total
+                .checked_add(size)
+                .and_then(|bytes| bytes.checked_add(1))
+                .filter(|bytes| *bytes <= crate::content::SESSION_BYTES_MAX)
+                .ok_or_else(|| SessionError::BadHeader {
+                    line: 1,
+                    reason: "session exceeds 64 MiB".into(),
+                })?;
+        }
+        // The header contains caller-owned strings as well, so bound the whole serialized
+        // session before allocating it; this also counts the header's newline.
+        let header = SessionHeader {
+            format: SESSION_FORMAT_TAG.to_owned(),
+            version: SESSION_FORMAT_VERSION,
+            id: self.id.as_str().to_owned(),
+            created_at_ms: self.created_at_ms,
+            cwd: self.cwd.clone(),
+            origin: self.origin.clone(),
+        };
+        let size = crate::content::serialized_size(&header, crate::content::RECORD_BYTES_MAX)
+            .map_err(|error| SessionError::BadHeader {
+                line: 1,
+                reason: error.to_string(),
+            })?;
+        total
+            .checked_add(size)
+            .and_then(|bytes| bytes.checked_add(1))
+            .filter(|bytes| *bytes <= crate::content::SESSION_BYTES_MAX)
+            .ok_or_else(|| SessionError::BadHeader {
+                line: 1,
+                reason: "session exceeds 64 MiB".into(),
+            })?;
+        Ok(self.to_jsonl())
+    }
+
     /// Decodes a session from JSONL.
     ///
     /// # Errors
@@ -966,12 +1071,24 @@ impl Session {
     /// [`SessionError::NonContiguousSequence`] for a hole in the numbering.
     /// Blank lines are ignored so a trailing newline is not an error.
     pub fn from_jsonl(raw: &str) -> Result<Self, SessionError> {
+        if raw.len() > crate::content::SESSION_BYTES_MAX {
+            return Err(SessionError::BadHeader {
+                line: 1,
+                reason: "session exceeds 64 MiB".into(),
+            });
+        }
         let mut number: u64 = 0;
         let mut header: Option<SessionHeader> = None;
         let mut log = SessionLog::new();
         let mut expected: u64 = 0;
         for line in raw.lines() {
             number = number.saturating_add(1);
+            if line.len() > crate::content::RECORD_BYTES_MAX {
+                return Err(SessionError::MalformedEvent {
+                    line: number,
+                    detail: "record exceeds 4 MiB".into(),
+                });
+            }
             if line.trim().is_empty() {
                 continue;
             }
@@ -979,11 +1096,40 @@ impl Session {
                 header = Some(parse_header(line, number)?);
                 continue;
             }
+            if header.as_ref().is_some_and(|header| header.version == 1) {
+                let value: Value =
+                    serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
+                        line: number,
+                        detail: error.to_string(),
+                    })?;
+                if value.get("event").is_some_and(|event| {
+                    event.get("content_blocks").is_some() || event.get("replay").is_some()
+                }) {
+                    return Err(SessionError::MalformedEvent {
+                        line: number,
+                        detail: "version-1 records cannot contain typed content".into(),
+                    });
+                }
+            }
             let parsed: SessionLine =
                 serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
                     line: number,
                     detail: error.to_string(),
                 })?;
+            if let SessionEvent::AssistantMessage {
+                replay: Some(replay),
+                text,
+                tool_calls,
+                ..
+            } = &parsed.event
+            {
+                replay
+                    .validate_response(text.as_deref(), tool_calls)
+                    .map_err(|error| SessionError::MalformedEvent {
+                        line: number,
+                        detail: error.to_string(),
+                    })?;
+            }
             if parsed.seq.value() != expected {
                 return Err(SessionError::NonContiguousSequence {
                     line: number,
@@ -1028,7 +1174,7 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
             ),
         });
     }
-    if header.version != SESSION_FORMAT_VERSION {
+    if !matches!(header.version, 1 | SESSION_FORMAT_VERSION) {
         return Err(SessionError::UnsupportedVersion {
             found: header.version,
             expected: SESSION_FORMAT_VERSION,
@@ -1073,6 +1219,7 @@ mod tests {
             text: "read the file".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: None,
             reasoning: Some("I should read it".to_owned()),
             tool_calls: vec![ToolCall::new(
@@ -1091,6 +1238,7 @@ mod tests {
             arguments: json!({ "path": "src/lib.rs" }),
         });
         session.append(SessionEvent::ToolResult {
+            content_blocks: None,
             call_id: ToolCallId::new("c-1"),
             content: "fn main() {}".to_owned(),
             is_error: false,
@@ -1170,6 +1318,7 @@ mod tests {
     fn an_assistant_turn_with_nothing_to_say_is_skipped() {
         let mut session = session();
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some(String::new()),
             reasoning: Some("thinking".to_owned()),
             tool_calls: Vec::new(),
@@ -1179,6 +1328,7 @@ mod tests {
             effort: None,
         });
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: None,
             reasoning: None,
             tool_calls: Vec::new(),
@@ -1197,12 +1347,14 @@ mod tests {
     fn a_tool_result_keeps_its_call_id_and_error_flag() {
         let mut session = session();
         session.append(SessionEvent::ToolResult {
+            content_blocks: None,
             call_id: ToolCallId::new("c-7"),
             content: "no such file".to_owned(),
             is_error: true,
         });
         let messages = session.derive_messages();
         let Some(Message::Tool {
+            content_blocks: _,
             call_id,
             content,
             is_error,
@@ -1238,6 +1390,7 @@ mod tests {
             text: String::from("hi"),
         });
         log.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some(String::from("looking")),
             reasoning: Some(String::from("I should read it")),
             tool_calls: vec![unanswered, answered.clone()],
@@ -1247,6 +1400,7 @@ mod tests {
             effort: None,
         });
         log.append(SessionEvent::ToolResult {
+            content_blocks: None,
             call_id: answered.id.clone(),
             content: String::from("done"),
             is_error: false,
@@ -1274,6 +1428,7 @@ mod tests {
     fn an_assistant_turn_that_only_thought_is_still_skipped() {
         let mut log = SessionLog::new();
         log.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: None,
             reasoning: Some(String::from("thinking")),
             tool_calls: Vec::new(),
@@ -1302,6 +1457,7 @@ mod tests {
             text: String::from("hi"),
         });
         log.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: None,
             reasoning: Some(String::from("I should read it")),
             tool_calls: vec![ToolCall::new(
@@ -1336,6 +1492,7 @@ mod tests {
     fn usage_totals_sum_every_assistant_record() {
         let mut session = session();
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some("a".to_owned()),
             reasoning: None,
             tool_calls: Vec::new(),
@@ -1345,6 +1502,7 @@ mod tests {
             effort: None,
         });
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some("b".to_owned()),
             reasoning: None,
             tool_calls: Vec::new(),
@@ -1374,6 +1532,7 @@ mod tests {
         });
         assert_eq!(session.log().open_tool_calls().len(), 2);
         session.append(SessionEvent::ToolResult {
+            content_blocks: None,
             call_id: ToolCallId::new("c-1"),
             content: "ok".to_owned(),
             is_error: false,
@@ -1534,8 +1693,8 @@ mod tests {
             "nothing recorded is reported as nothing, not as a default"
         );
         assert_eq!(
-            SESSION_FORMAT_VERSION, 1,
-            "adding a header field is not a body change, so the version stays where it was"
+            SESSION_FORMAT_VERSION, 2,
+            "typed content requires body version 2; old headers still load"
         );
     }
 
@@ -1562,6 +1721,7 @@ mod tests {
             (None, Usage::new(7, 1, 0, 0, 7)),
         ] {
             session.append(SessionEvent::AssistantMessage {
+                replay: None,
                 text: Some(String::from("a")),
                 reasoning: None,
                 tool_calls: Vec::new(),
@@ -1646,7 +1806,7 @@ mod tests {
             decoded,
             Err(SessionError::UnsupportedVersion {
                 found: 99,
-                expected: 1
+                expected: SESSION_FORMAT_VERSION
             })
         );
     }

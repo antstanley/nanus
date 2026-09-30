@@ -106,8 +106,6 @@ pub fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
     match extension.as_str() {
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        "gif" => Some("image/gif"),
         _ => None,
     }
 }
@@ -123,8 +121,8 @@ mod tests {
         assert_eq!(image_media_type(Path::new("a.png")), Some("image/png"));
         assert_eq!(image_media_type(Path::new("a.jpg")), Some("image/jpeg"));
         assert_eq!(image_media_type(Path::new("a.jpeg")), Some("image/jpeg"));
-        assert_eq!(image_media_type(Path::new("a.webp")), Some("image/webp"));
-        assert_eq!(image_media_type(Path::new("a.gif")), Some("image/gif"));
+        assert_eq!(image_media_type(Path::new("a.webp")), None);
+        assert_eq!(image_media_type(Path::new("a.gif")), None);
         // The extension is matched case-insensitively, because a screenshot tool
         // commonly writes `.PNG`.
         assert_eq!(image_media_type(Path::new("a.PNG")), Some("image/png"));

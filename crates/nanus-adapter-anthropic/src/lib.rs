@@ -13,20 +13,13 @@
 //! translates, and they belong beside each other rather than inside an
 //! `OpenAI`-compatible encoder that would need a branch per line.
 //!
-//! ## What is deliberately not requested
+//! ## Adaptive thinking and signed replay
 //!
-//! **Extended thinking.** Anthropic expresses it as a token budget, and a
-//! tool-using turn requires the *signed* thinking blocks of the previous turn to be
-//! replayed. A signature is not part of the message vocabulary `nanus-domain` owns,
-//! so asking for thinking would produce a conversation that cannot be continued —
-//! the second request of a tool loop would be refused. So no `thinking` field is
-//! ever sent.
-//!
-//! That is a separate knob from **effort**, which this adapter does send: the
-//! 5-series models take `output_config.effort` (a behavioral signal) rather than the
-//! thinking budget, and it needs no signed block to be replayed. A model that takes
-//! no effort parameter is sent nothing, and [`LlmPort::reasoning_effort`] reports the
-//! absence for it rather than a plausible value.
+//! Opus/Sonnet 5.5 request adaptive thinking. Original ordered signed blocks, including
+//! empty thinking, are retained beside the neutral assistant response and replayed only
+//! with the unchanged system/tools/history prefix. A changed prefix strips old thinking
+//! from the derived request; the durable log remains unchanged. Other encoders use the
+//! neutral text/tool calls. Earlier model behavior is preserved.
 //!
 //! ## What the adapter owns
 //!
@@ -46,7 +39,7 @@ mod wire;
 
 pub use config::{
     API_KEY_ENV, API_VERSION, AnthropicConfig, DEFAULT_BASE_URL, MAX_OUTPUT_TOKENS, PROVIDER,
-    effort_levels,
+    effort_levels, model_max_output_tokens,
 };
 pub use error::AnthropicError;
 pub use nanus_ports::ReasoningEffort;
@@ -146,15 +139,66 @@ impl LlmPort for AnthropicLlm {
         if effort_levels(model).is_empty() {
             return None;
         }
-        Some(ReasoningEffort::High)
+        Some(if model == "claude-opus-5-5" {
+            ReasoningEffort::Medium
+        } else {
+            ReasoningEffort::High
+        })
     }
 
     fn effort_levels(&self, model: &str) -> &'static [ReasoningEffort] {
         effort_levels(model)
     }
 
+    fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        match model {
+            "claude-opus-5-5" | "claude-sonnet-5-5" => nanus_ports::ModelCapabilities {
+                // Pixel acceptance requires checked-in live evidence for each profile.
+                image_input: nanus_ports::ImageInputSupport::Unknown,
+                image_profile: None,
+                context_window_tokens: Some(1_000_000),
+                max_input_tokens: Some(1_000_000),
+                max_output_tokens: Some(128_000),
+            },
+            _ => nanus_ports::ModelCapabilities::default(),
+        }
+    }
+
+    fn estimate_request(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        nanus_ports::capabilities::estimate_payload(
+            self.capabilities(&request.model),
+            request,
+            &self.encode(request),
+        )
+    }
+
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        if let Err(error) = nanus_ports::capabilities::validate_image_input(
+            self.capabilities(&request.model),
+            &request,
+        ) {
+            return error_stream(&error.to_string());
+        }
+        if request.context_budget.is_some()
+            || nanus_ports::capabilities::has_images(&request.messages)
+        {
+            let checked = self.estimate_request(&request).and_then(|estimate| {
+                nanus_ports::capabilities::validate_estimate(
+                    self.capabilities(&request.model),
+                    &request,
+                    estimate,
+                )
+            });
+            if let Err(error) = checked {
+                return error_stream(&error.to_string());
+            }
+        }
         let payload = self.encode(&request);
+
+        let prefix_digest = wire::request_prefix(&payload);
         let Ok(body) = serde_json::to_string(&payload) else {
             return error_stream("could not encode the request as JSON");
         };
@@ -196,8 +240,11 @@ impl LlmPort for AnthropicLlm {
         let stream = futures::stream::once(response).flat_map(move |outcome| match outcome {
             Ok(response) => {
                 let head = futures::stream::iter([LlmEvent::ResponseHead]);
-                let announced: EventStream =
-                    Box::pin(head.chain(decode(response, stream_host.clone())));
+                let announced: EventStream = Box::pin(head.chain(decode(
+                    response,
+                    stream_host.clone(),
+                    prefix_digest.clone(),
+                )));
                 announced
             }
             Err(message) => error_stream_owned(message),
@@ -220,7 +267,7 @@ fn error_stream_owned(message: String) -> LlmStream {
 ///
 /// `host` is the base URL the request was sent to, carried so that a failure part
 /// way through the body names the same endpoint the request did.
-fn decode(response: reqwest::Response, host: String) -> EventStream {
+fn decode(response: reqwest::Response, host: String, prefix_digest: String) -> EventStream {
     let status = response.status();
     if !status.is_success() {
         // The body carries Anthropic's own message, which is the only useful thing
@@ -241,7 +288,7 @@ fn decode(response: reqwest::Response, host: String) -> EventStream {
 
     let mut bytes = response.bytes_stream();
     let mut decoder = wire::SseDecoder::new();
-    let mut accumulator = wire::StreamAccumulator::default();
+    let mut accumulator = wire::StreamAccumulator::with_prefix(prefix_digest);
     let mut done = false;
 
     let stream = futures::stream::poll_fn(move |cx| {

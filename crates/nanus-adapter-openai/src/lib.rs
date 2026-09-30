@@ -201,8 +201,58 @@ impl LlmPort for OpenAiLlm {
         self.config.vendor().effort_levels(model)
     }
 
+    fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        if self.config.vendor() == Vendor::OpenAi && model == "gpt-6-astra" {
+            nanus_ports::ModelCapabilities {
+                context_window_tokens: Some(1_050_000),
+                max_input_tokens: Some(1_050_000),
+                max_output_tokens: Some(128_000),
+                ..nanus_ports::ModelCapabilities::default()
+            }
+        } else {
+            nanus_ports::ModelCapabilities::default()
+        }
+    }
+
+    fn estimate_request(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        nanus_ports::capabilities::estimate_payload(
+            self.capabilities(&request.model),
+            request,
+            &self.encode(request),
+        )
+    }
+
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        if self.config.protocol() == Protocol::Responses
+            && nanus_ports::capabilities::has_images(&request.messages)
+        {
+            return error_stream("unsupported-image-protocol: OpenAI Responses");
+        }
+        if let Err(error) = nanus_ports::capabilities::validate_image_input(
+            self.capabilities(&request.model),
+            &request,
+        ) {
+            return error_stream(&error.to_string());
+        }
+        if request.context_budget.is_some()
+            || nanus_ports::capabilities::has_images(&request.messages)
+        {
+            let checked = self.estimate_request(&request).and_then(|estimate| {
+                nanus_ports::capabilities::validate_estimate(
+                    self.capabilities(&request.model),
+                    &request,
+                    estimate,
+                )
+            });
+            if let Err(error) = checked {
+                return error_stream(&error.to_string());
+            }
+        }
         let payload = self.encode(&request);
+
         let Ok(body) = serde_json::to_string(&payload) else {
             return error_stream("could not encode the request as JSON");
         };

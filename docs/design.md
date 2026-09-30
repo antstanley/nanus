@@ -100,6 +100,13 @@ session, so the same question is not asked again for the rest of that conversati
 record is per session and in memory, so nothing about it is written to the log or outlives
 the agent.
 
+An embedding host may install `ToolPolicy` on `AgentRunner`. It sees every registered call,
+including reads, with exact ID/arguments and its declared access before the default gate.
+`Deny` and policy errors refuse; `UseDefault` delegates; `AllowOnce` grants that call only.
+Registry validation precedes the callback, and no registry borrow survives its await.
+The five internal goal tools retain their separate session authority. With no policy,
+the ordinary approval behavior is unchanged.
+
 ### A budget, because unattended loops are a cost hazard
 
 The reference harness has **no** step budget: a tool loop continues until the model

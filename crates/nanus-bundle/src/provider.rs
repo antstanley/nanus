@@ -557,8 +557,12 @@ impl Selection {
 
     /// Returns the provider's documented maximum output tokens.
     #[must_use]
-    pub const fn max_output_tokens(&self) -> u32 {
-        self.provider.max_output_tokens()
+    pub fn max_output_tokens(&self) -> u32 {
+        if self.provider == Provider::Anthropic {
+            nanus_adapter_anthropic::model_max_output_tokens(&self.model)
+        } else {
+            self.provider.max_output_tokens()
+        }
     }
 }
 

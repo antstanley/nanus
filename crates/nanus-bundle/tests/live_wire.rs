@@ -14,6 +14,7 @@
 //! than an assumption.
 
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+#![cfg(feature = "stock-compose")]
 
 use std::io::Write as _;
 use std::net::TcpListener;

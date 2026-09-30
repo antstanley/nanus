@@ -108,6 +108,13 @@ cargo test --workspace --doc
 cargo clippy -p nanus-tui --no-default-features --all-targets
 cargo test -p nanus-tui --no-default-features
 
+# Minimal runner/tool library and standalone downstream host (also native Windows CI).
+cargo clippy -p nanus-bundle --no-default-features --all-targets
+cargo nextest run -p nanus-bundle --no-default-features
+cargo test -p nanus-bundle --no-default-features --doc
+cargo test --manifest-path examples/embedded/Cargo.toml --locked
+cargo test --manifest-path examples/embedded/Cargo.toml --locked --features providers
+
 # Build both binaries: the core (`nanus`) and the interface (`nanus-tui`).
 # `--workspace` is required: `default-members` is the kernel alone, so a bare
 # `cargo build --release` produces neither program.
@@ -322,6 +329,13 @@ design docs too.
 - **A name is an alias for a store key, and one session has one name.** Naming is
   refused rather than moved when the name is held, and the alias lives in the
   session's own directory (`name`), so it cannot be lost with a shared table.
+- **Bodies are version 2; readers accept 1 and 2.** Typed tool blocks and signed Messages
+  replay are bounded. Version 1 cannot smuggle these fields. Store saves use `try_to_jsonl`;
+  failed saves must leave the original intact. Image capability defaults Unknown until exact
+  profile wire/reload and live-follow-up evidence pass. Do not guess support from a model label.
+- **Embedding excludes stock adapters by default-feature opt-out.** `stock-compose` gates
+  concrete composition/provider/auth/selection together. Keep downstream/minimal gates clean;
+  native Windows applies to this subset, not the Unix shell/link/service.
 - **A session records what produced it, and "absent" is not "default".** The header
   carries the configuration and each model turn carries the model and effort that
   produced it, both optional: a session recorded before a field existed reports the

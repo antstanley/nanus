@@ -48,6 +48,42 @@
 //! and `session`. Nothing lists those in order, because the kernel activates each
 //! plugin when its requirements appear.
 
+//! ## Embedding without stock composition
+//!
+//! Depend on `nanus-bundle` with `default-features = false` for the runner and tools;
+//! provide model/clock handles and register caller executors. Plain trusted prompt text is
+//! the skill contract. No loader or kernel mounting is needed for a direct runner.
+//!
+//! ```
+//! use std::rc::Rc;
+//! use nanus_bundle::{AgentRunner, Silent, ToolRegistryHandle};
+//! use nanus_domain::{AgentConfig, Session, SessionId, ToolRegistry};
+//! use nanus_ports::{ChatRequest, ClockPort, LlmEvent, LlmPort, LlmStream};
+//! struct Clock;
+//! impl ClockPort for Clock { fn now_ms(&self) -> u64 { 0 } }
+//! struct Model;
+//! impl LlmPort for Model {
+//!     fn model(&self) -> &str { "host" }
+//!     fn stream_chat(&self, _: ChatRequest) -> LlmStream {
+//!         Box::pin(futures::stream::iter([LlmEvent::TextDelta("hello".into())]))
+//!     }
+//! }
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let runner = AgentRunner::new(Rc::new(Box::new(Model)),
+//!     ToolRegistryHandle::new(ToolRegistry::new()), "Trusted host instructions",
+//!     AgentConfig::new(4, 1, "host", 4096)?, Rc::new(Box::new(Clock)))?;
+//! let mut session = Session::new(SessionId::new("host-session"), 0, "host workspace");
+//! let result = futures::executor::block_on(
+//!     runner.run_turn(&mut session, "Hello", &mut Silent, None))?;
+//! let durable_payload = session.try_to_jsonl()?;
+//! // Save this payload through the host's store before acknowledging result.answer.
+//! assert!(!durable_payload.is_empty());
+//! assert_eq!(result.answer, "hello");
+//! # Ok(()) }
+//! ```
+//! The downstream fixture in `examples/embedded` exercises cancellation/policy with
+//! caller ports and explicitly chosen provider dependencies on native library targets.
+
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 // A `pub` item inside a private module is reachable only through this crate's own
@@ -62,20 +98,28 @@
 
 pub mod agent_loop;
 pub mod args;
+#[cfg(feature = "stock-compose")]
 pub mod authorize;
+#[cfg(feature = "stock-compose")]
 pub mod compose;
 pub mod error;
 pub mod goal_tools;
 pub mod guard;
+#[cfg(feature = "stock-compose")]
 pub mod provider;
+#[cfg(feature = "stock-compose")]
 pub mod selection;
 pub mod tools;
 
 pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
+#[cfg(feature = "stock-compose")]
 pub use authorize::PendingAuth;
+#[cfg(feature = "stock-compose")]
 pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, ProviderSwitch, compose};
 pub use error::BundleError;
+#[cfg(feature = "stock-compose")]
 pub use provider::{Provider, Selection};
+#[cfg(feature = "stock-compose")]
 pub use selection::LastSelection;
 
 #[cfg(test)]

@@ -1540,6 +1540,7 @@ fn an_attachment_reports_the_log_position_the_backlog_continues_from() {
             text: "an earlier question".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some("an earlier answer".to_owned()),
             reasoning: None,
             tool_calls: Vec::new(),

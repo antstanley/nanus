@@ -69,7 +69,7 @@ pub fn read_image_tool(fs: FsHandle) -> ToolDefinition {
         name: ToolName::new("read_image")
             .unwrap_or_else(|_| unreachable!("read_image is a valid tool name")),
         description: "Attach an image file to the conversation so you can see it. Supports \
-                      PNG, JPEG, WebP, and GIF."
+                      bounded inline PNG and JPEG."
             .to_owned(),
         parameters: json!({
             "type": "object",
@@ -244,14 +244,14 @@ async fn read_image_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         return ToolResult::new(
             id,
             ToolOutcome::failure(format!(
-                "read_image: {path} is not a supported image; use PNG, JPEG, WebP, or GIF"
+                "read_image: {path} is not a supported image; use PNG or JPEG"
             )),
         );
     };
 
-    // Size first, as `read` does, so a huge image never enters memory. The ceiling is the
-    // same one: both tools put a file's contents into the model's context, and base64 makes
-    // an image a third larger again than the bytes it came from.
+    // Size before reading, and check the bytes again afterwards in case the file grew.
+    // Images have a stricter file bound than text; encoded size and media are checked
+    // before the result can be retained or sent to a model.
     let metadata = fs.metadata(std::path::Path::new(&path)).await;
     let Ok(meta) = metadata else {
         let Err(error) = metadata else {
@@ -259,13 +259,11 @@ async fn read_image_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         };
         return port_error_result(id, "read_image", &error);
     };
-    if meta.byte_len > MAX_READ_BYTES {
-        return ToolResult::new(
+    let ceiling = u64::try_from(nanus_domain::content::IMAGE_BYTES_MAX).unwrap_or(u64::MAX);
+    if meta.byte_len > ceiling {
+        return ToolResult::failure(
             id,
-            ToolOutcome::failure(format!(
-                "read_image: {path} is {} bytes, above the {MAX_READ_BYTES}-byte ceiling",
-                meta.byte_len
-            )),
+            format!("read_image: {path} exceeds the {ceiling}-byte ceiling"),
         );
     }
 
@@ -277,13 +275,13 @@ async fn read_image_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         Ok(bytes) => bytes,
         Err(error) => return port_error_result(id, "read_image", &error),
     };
-    if bytes.is_empty() {
-        return ToolResult::new(
-            id,
-            ToolOutcome::failure(format!("read_image: {path} is empty")),
-        );
+    if bytes.is_empty() || bytes.len() > nanus_domain::content::IMAGE_BYTES_MAX {
+        return ToolResult::failure(id, "read_image: empty or oversized file after read");
     }
     let encoded = base64_encode(&bytes);
+    if let Err(error) = nanus_domain::content::validate_image(media_type, &encoded) {
+        return ToolResult::failure(id, error.to_string());
+    }
     let outcome = ToolOutcome::success_with(
         json!({ "file_path": path, "media_type": media_type, "bytes": bytes.len() }),
         vec![

@@ -5,6 +5,8 @@
 //! assertion, so the workspace's panic-family exemption is restated here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::io::Write as _;
+
 use nanus_adapter_store::{JsonlStore, new_session_id};
 use nanus_domain::{Session, SessionEvent, SessionId, TurnEndReason};
 use nanus_ports::{StoreError, StorePort};
@@ -174,7 +176,7 @@ async fn a_newer_header_version_is_refused_outright() {
     store.save(&written).await.expect("save");
     let body = written
         .to_jsonl()
-        .replacen("\"version\":1", "\"version\":99", 1);
+        .replacen("\"version\":2", "\"version\":99", 1);
     assert!(body.contains("\"version\":99"), "the header was rewritten");
     overwrite_log(&store, written.id(), &body);
     let error = store.load(written.id()).await.expect_err("must fail");
@@ -950,4 +952,40 @@ async fn a_folded_clash_resolves_to_the_lowest_id() {
         "the same session every time, rather than the listing's order"
     );
     drop(dir);
+}
+
+#[tokio::test]
+async fn rejected_content_never_replaces_the_previous_session() {
+    let (_dir, store) = store().await;
+    let original = session("bounded", 123, &["original"]);
+    store.save(&original).await.unwrap();
+    let mut invalid = original.clone();
+    invalid.append(SessionEvent::ToolResult {
+        call_id: nanus_domain::ToolCallId::new("invalid"),
+        content: "summary".into(),
+        content_blocks: Some(vec![]),
+        is_error: false,
+    });
+    assert!(store.save(&invalid).await.is_err());
+    assert_eq!(store.load(original.id()).await.unwrap(), original);
+    let mut oversized = original.clone();
+    oversized.append(SessionEvent::UserMessage {
+        text: "x".repeat(nanus_domain::content::RECORD_BYTES_MAX),
+    });
+    assert!(store.save(&oversized).await.is_err());
+    assert_eq!(store.load(original.id()).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn total_log_reads_are_bounded_even_for_a_valid_header() {
+    let (_dir, store) = store().await;
+    let original = session("bounded-read", 123, &["original"]);
+    store.save(&original).await.unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.session_file(original.id()).unwrap())
+        .unwrap();
+    file.write_all(&vec![b' '; nanus_domain::content::SESSION_BYTES_MAX])
+        .unwrap();
+    assert!(store.load(original.id()).await.is_err());
 }

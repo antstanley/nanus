@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+sha2 = { workspace = true }
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }
 tokio = { workspace = true }
@@ -23,6 +24,9 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+base64 = { workspace = true }
+nanus-adapter-store = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

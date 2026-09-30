@@ -54,7 +54,10 @@ pub fn build_request(config: &DeepSeekConfig, request: &ChatRequest) -> Value {
         "stream_options".to_owned(),
         json!({ "include_usage": true }),
     );
-    body.insert("max_tokens".to_owned(), json!(config.max_tokens()));
+    body.insert(
+        "max_tokens".to_owned(),
+        json!(request.max_tokens.unwrap_or_else(|| config.max_tokens())),
+    );
 
     let effort = request
         .reasoning_effort
@@ -104,6 +107,7 @@ fn encode_message(message: &Message) -> Value {
         Message::System { text } => json!({ "role": "system", "content": text }),
         Message::User { text } => json!({ "role": "user", "content": text }),
         Message::Assistant {
+            replay: _,
             text,
             reasoning,
             tool_calls,
@@ -129,12 +133,10 @@ fn encode_message(message: &Message) -> Value {
             }
             Value::Object(object)
         }
-        Message::Tool {
-            call_id, content, ..
-        } => json!({
+        Message::Tool { call_id, .. } => json!({
             "role": "tool",
             "tool_call_id": call_id.as_str(),
-            "content": content,
+            "content": message.tool_text().unwrap_or_default(),
         }),
     }
 }
@@ -509,6 +511,7 @@ mod tests {
     #[test]
     fn an_empty_assistant_turn_sends_an_empty_string_not_null() {
         let message = Message::Assistant {
+            replay: None,
             text: None,
             reasoning: None,
             tool_calls: vec![ToolCall {
@@ -527,6 +530,7 @@ mod tests {
     #[test]
     fn tool_arguments_are_encoded_as_a_json_string() {
         let message = Message::Assistant {
+            replay: None,
             text: None,
             reasoning: None,
             tool_calls: vec![ToolCall {
@@ -546,6 +550,7 @@ mod tests {
     #[test]
     fn reasoning_content_is_replayed_for_earlier_turns() {
         let message = Message::Assistant {
+            replay: None,
             text: Some("answer".to_owned()),
             reasoning: Some("because".to_owned()),
             tool_calls: Vec::new(),

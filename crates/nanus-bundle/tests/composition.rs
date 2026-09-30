@@ -21,6 +21,7 @@
 // nowhere else to put the failure, and the parent of a re-executed test must stop rather
 // than run the body a second time.
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::exit)]
+#![cfg(feature = "stock-compose")]
 
 use nanus_adapter_config::NanusConfig;
 use nanus_bundle::Selection;
@@ -411,6 +412,7 @@ fn an_absent_usage_report_is_not_recorded_as_zero() {
 
     let mut session = Session::new(SessionId::new("usage"), 0, "/tmp");
     session.append(SessionEvent::AssistantMessage {
+        replay: None,
         text: Some("hello".to_owned()),
         reasoning: None,
         tool_calls: Vec::new(),

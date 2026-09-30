@@ -265,6 +265,7 @@ mod tests {
             text: "read the file".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some(String::from("done")),
             reasoning: None,
             tool_calls: Vec::new(),
@@ -458,6 +459,7 @@ mod tests {
         // spent it.
         let mut session = session();
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some(String::from("done again")),
             reasoning: None,
             tool_calls: Vec::new(),

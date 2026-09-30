@@ -68,6 +68,13 @@ attached has nobody to ask and therefore denies.
 `danger-full-access` is never sent to the model provider as a request; it is a
 local decision, and it means what it says.
 
+An embedding host can install an exact-call `ToolPolicy` for registered tools, including
+reads. Errors/cancellation deny; a one-call grant cannot bypass registry validation. The
+policy adds application scope checks, not OS confinement. A controlled turn races its sticky
+signal against waiting work and drops interrupted futures; the host must terminate detached
+process groups or other side effects. Inline image bytes are verified/bounded and unknown
+model profiles are refused before image I/O/HTTP. The library performs no URL fetch or resizing.
+
 ### The honest caveats
 
 - **A non-zero exit code is not an error**, by design: the command ran and told you

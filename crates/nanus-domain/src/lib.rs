@@ -72,9 +72,11 @@
 
 pub mod agent;
 pub mod approval;
+pub mod content;
 pub mod context;
 pub mod error;
 pub mod goal;
+pub mod image_profile;
 pub mod message;
 pub mod prompt;
 pub mod session;

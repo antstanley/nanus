@@ -60,6 +60,13 @@ that runs a turn.
   handles the composition publishes. See [design decisions](design.md) and
   [architecture](architecture.md).
 
+Library hosts use `nanus-bundle` without default features, supply trusted prompt text and
+ports, and register ordinary tool executors. `with_tool_policy` adds exact-call checks;
+`run_turn_with_control` races a sticky caller signal against idle model, policy, approval
+and tool futures. Cancellation settles unfinished calls once and closes the turn; the
+host remains responsible for stopping detached processes when their futures are dropped.
+The old `run_turn` entry point remains available.
+
 ## The toolset
 
 Seven *registered* tools, and the count is the design: each is a mechanism a shell
@@ -71,7 +78,7 @@ cannot provide as well, not a convenience wrapper. See
 | `read` | Reads a file through a 1-based `offset`/`limit` line window, with line numbers, a byte ceiling, and a note on how to continue. |
 | `write` | Creates or replaces a file. |
 | `edit` | Replaces text, requiring `old_string` to occur exactly once unless `replace_all` is set — an ambiguous or absent match is refused rather than guessed. |
-| `read_image` | Attaches a PNG, JPEG, WebP, or GIF to the conversation as an image content block. |
+| `read_image` | Reads a bounded PNG/JPEG as typed image content when the model has verified image input; otherwise refuses before file I/O. |
 | `glob` | Finds files by path pattern, anchored to the workspace root (`*.rs` for the top level, `**/*.rs` at any depth), with a result cap — and a notice naming the cap when matches were dropped, rather than whenever the cap was reached. |
 | `grep` | Finds text inside files, grouped by file, optionally narrowed by one `include` glob, with capped matches and truncated lines that say so. |
 | `bash` | Runs a program in the workspace root unless a `workdir` says otherwise, with an optional timeout, reporting stdout, stderr, and the exit code. A non-zero exit is a result, not a failure; output is capped and truncated with a notice; the whole process group is killed so grandchildren are not orphaned. |
@@ -109,6 +116,25 @@ model's goal does it with `/goal`, and every change the model makes is drawn as 
 tool registered through the published registry under one of these five names is not offered
 — the loop would run the goal tool for a call by that name anyway — and a warning names it.
 See [the toolset](../crates/nanus-bundle/src/tools/mod.rs).
+
+Image results preserve ordered original text/pixels beside a display summary. PNG/JPEG
+files must decode completely, fit 512 KiB and the selected profile's dimensions. Results
+allow 32 blocks/four images; a request allows eight images/4 MiB. No resizing or URL fetching
+occurs. Anthropic results nest blocks under their call ID/error flag. Chat Completions sends
+all sibling tool messages before labelled user attachments, retaining block order and `detail=high`.
+Those attachment messages are derived and never added to the session log.
+
+`with_request_budget(output, separate_reasoning)` opts into assembled request preflight
+and is required for images. Reasoning already included in the endpoint's output uses zero
+separately. The actual provider encoding counts schemas, text, framing and labels, and
+validated dimensions determine visual charges. Input must fit the input ceiling; input
+plus reservations must fit the smaller caller/model context. Old complete turns are elided
+together; a newest turn that cannot fit fails before HTTP. Stock text requests keep their
+existing fitting behavior unless a host opts in. See [vision evidence](vision-evidence.md).
+
+Opus/Sonnet 5.5 expose 1M context/128K output metadata, adaptive thinking and signed ordered
+assistant replay. Changing system/tools/history strips old signed thinking from derived
+requests. The neutral text/tool response must exactly agree with replay blocks.
 
 ### What a request costs before the conversation
 
@@ -570,9 +596,9 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **Anthropic's extended thinking is not requested.** A tool-using turn requires
-  the signed thinking blocks of the previous turn replayed, and the message model
-  has no place for a signature, so `reasoning_effort` has no effect there.
+- **Built-in image profiles remain Unknown.** Wire/reload fixtures pass for Opus 5.5,
+  Sonnet 5.5 Messages and GPT-6 Astra Chat Completions, but live follow-up evidence is pending.
+  Responses, DeepSeek, z.ai and other combinations have no image profile.
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
 - **The link is Unix-only and local.** No remote mode, no Windows, no

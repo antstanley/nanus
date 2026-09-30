@@ -11,6 +11,7 @@
 // A panic in a test *is* the assertion, and a fixture with no sane default has nowhere
 // else to put the failure. The workspace denies the lint for production code.
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+#![cfg(feature = "stock-compose")]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -79,6 +80,10 @@ impl LlmPort for SharedModel {
         LlmPort::model(&*self.inner)
     }
 
+    fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        self.inner.capabilities(model)
+    }
+
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
         self.inner.stream_chat(request)
     }
@@ -86,7 +91,17 @@ impl LlmPort for SharedModel {
 
 impl LlmPort for ScriptedModel {
     fn model(&self) -> &'static str {
-        "scripted"
+        "claude-sonnet-5-5"
+    }
+
+    fn capabilities(&self, _model: &str) -> nanus_ports::ModelCapabilities {
+        nanus_ports::ModelCapabilities {
+            image_input: nanus_ports::ImageInputSupport::Supported,
+            image_profile: Some(nanus_ports::ImageProfile::AnthropicSonnet55HighPatch28V1),
+            context_window_tokens: Some(1_000_000),
+            max_input_tokens: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+        }
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
@@ -154,7 +169,7 @@ fn config() -> AgentConfig {
     // Full access, so every tool the script calls is permitted by the sandbox and no
     // answerer is needed: these tests are about the shipped tools, and the approval gate
     // has its own tests in `agent_loop`.
-    AgentConfig::new(8, 4, "scripted", 16_384)
+    AgentConfig::new(8, 4, "claude-sonnet-5-5", 16_384)
         .unwrap_or_else(|error| panic!("the test configuration is valid: {error}"))
         .with_sandbox(nanus_domain::SandboxMode::DangerFullAccess)
 }
@@ -166,7 +181,8 @@ async fn run(
     prompt: &str,
 ) -> nanus_bundle::RunOutcome {
     let runner = AgentRunner::new(model, tools, "you are a test", config(), clock())
-        .unwrap_or_else(|error| panic!("the runner builds: {error}"));
+        .unwrap_or_else(|error| panic!("the runner builds: {error}"))
+        .with_request_budget(8192, 0);
     let mut session = Session::new(SessionId::new("e2e"), 0, "/tmp");
     runner
         .run_turn(&mut session, prompt, &mut Silent, None)
@@ -199,6 +215,7 @@ async fn a_conversation_longer_than_the_budget_is_trimmed_with_a_notice() {
             text: format!("question {turn} {}", "x".repeat(300)),
         });
         session.append(SessionEvent::AssistantMessage {
+            replay: None,
             text: Some(format!("answer {turn} {}", "y".repeat(300))),
             reasoning: None,
             tool_calls: Vec::new(),
@@ -542,7 +559,11 @@ async fn a_read_image_outside_the_workspace_is_refused() {
         .parent()
         .unwrap_or_else(|| panic!("the temp dir has a parent"))
         .join("nanus-image-escape-probe.png");
-    std::fs::write(&outside, b"\x89PNG\r\n\x1a\n").unwrap_or_else(|error| panic!("write: {error}"));
+    std::fs::write(
+        &outside,
+        include_bytes!("../../nanus-domain/tests/data/tiny-green-triangle.png"),
+    )
+    .unwrap_or_else(|error| panic!("write: {error}"));
 
     let model = ScriptedModel::new(vec![
         call(
@@ -568,7 +589,11 @@ async fn a_read_image_outside_the_workspace_is_refused() {
     // And the same file *inside* the workspace is read, so the refusal is about the root
     // rather than about images.
     let inside = root.join("inside.png");
-    std::fs::write(&inside, b"\x89PNG\r\n\x1a\n").unwrap_or_else(|error| panic!("write: {error}"));
+    std::fs::write(
+        &inside,
+        include_bytes!("../../nanus-domain/tests/data/tiny-green-triangle.png"),
+    )
+    .unwrap_or_else(|error| panic!("write: {error}"));
     let (tools, _shell) = workspace_tools(root);
     let model = ScriptedModel::new(vec![
         call("c1", "read_image", r#"{"file_path":"inside.png"}"#),

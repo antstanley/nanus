@@ -467,6 +467,7 @@ mod tests {
             arguments: json!({}),
         });
         log.append(SessionEvent::ToolResult {
+            content_blocks: None,
             call_id: ToolCallId::new("c-1"),
             content: "ok".to_owned(),
             is_error: false,
