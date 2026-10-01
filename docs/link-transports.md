@@ -263,6 +263,18 @@ separate risk, and they should not ride on the transport change:
 - No Rust `unsafe` or lint override was needed. The fallback exception above remains unused;
   every crate, including the wrapper, inherits the workspace's forbid and states it in its
   crate root. CI checks those properties, so there is no duplicate lint table to drift.
+- The detached Windows launcher clears inheritance on its original standard handles before
+  spawning with explicit stdin/stdout/stderr. Native validation found that a service otherwise
+  retained its launcher's captured output pipes, even after the launcher exited successfully.
+  `nanus-sys-windows` pins the dependency-free `bun_windows_sys` binding leaf to `=0.1.0` and
+  uses only its safe `SetHandleInformation` declaration; the borrowed handles stay inside the
+  wrapper and are never closed there. This binding comes from
+  [Bao](https://github.com/putao520/bao), rather than the Bun project. The reviewed declaration
+  matches the Win32 by-value API, has no pointer dereference precondition, and reports kernel
+  validation failures. No build script or transitive dependencies are introduced.
+- A Windows shutdown request retains its pipe until `Bye` or EOF, bounded to five seconds.
+  The service and shell-scoped agent use the same client method; dropping immediately after
+  writing could lose an unread request. Unix still returns after sending. No frame changes.
 - Unix retains Tokio's owned socket halves. Windows splits the concrete stream with Tokio's
   safe owned halves; the enum itself uses no boxing or dynamic dispatch.
 - `Client::open` accepts `Into<Stream>`, and `serve` accepts `Into<Listener>`, to keep existing

@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# A dependency-free Win32 binding leaf; only its audited safe SetHandleInformation
+# declaration is used. Keep the version exact because that safety boundary is the API.
+bun_windows_sys = "=0.1.0"
 winsafe = { version = "=0.0.29", default-features = false, features = ["advapi", "kernel"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }

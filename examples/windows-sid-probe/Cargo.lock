@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "bun_windows_sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5968c58ad48a393d005dd7645b6a1200d417a925004d2896a03ac0f2c350385d"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -173,6 +179,7 @@ dependencies = [
 name = "nanus-sys-windows"
 version = "0.1.0"
 dependencies = [
+ "bun_windows_sys",
  "process-wrap",
  "thiserror",
  "tokio",

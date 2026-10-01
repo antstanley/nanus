@@ -47,10 +47,10 @@ never be given.
 
 ## Stopping it
 
-`nanus service stop` connects to the socket and asks the agent to stop. It does not send a
-signal and does not wait for the acknowledgement: the agent finishes the frame it is
-writing, removes its socket, and exits, and a `stop` that hung whenever the agent exited
-before flushing would be worse than one that reports what it asked for.
+`nanus service stop` connects to the local endpoint and asks the agent to stop. It does not
+send a signal. Unix returns after sending; Windows retains the pipe until `Bye` or EOF,
+with a five-second deadline, so closing the client cannot discard an unread request. EOF
+counts as a stopped peer even when its acknowledgement was not flushed.
 
 `SIGTERM` and `SIGINT` are honoured on Unix; Windows foreground service processes
 watch Ctrl-C. Stopping over the link works on both transports.

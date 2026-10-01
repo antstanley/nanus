@@ -206,10 +206,17 @@ fn spawn_detached(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(sink));
-    configure_detached(&mut command);
-    command
-        .spawn()
-        .map_err(|error| format!("cannot start {}: {error}", binary.display()))
+    #[cfg(unix)]
+    {
+        command
+            .spawn()
+            .map_err(|error| format!("cannot start {}: {error}", binary.display()))
+    }
+    #[cfg(windows)]
+    {
+        nanus_sys_windows::spawn_detached(&mut command)
+            .map_err(|error| format!("cannot start {}: {error}", binary.display()))
+    }
 }
 
 /// Waits until the socket answers, the child dies, or the deadline passes.
@@ -346,9 +353,8 @@ pub fn stop(socket: &Path) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())
     })?;
-    // The reply is not waited for: the agent acknowledges and then stops, and a `stop`
-    // that hung whenever the agent stopped before flushing would be worse than one that
-    // reports what it asked for.
+    // Unix only needs to send. Windows retains the pipe until Bye or EOF, so closing
+    // the client cannot discard a shutdown request the server has not consumed yet.
     println!("nanus: asked the service at {} to stop", socket.display());
     Ok(())
 }
@@ -393,19 +399,6 @@ pub fn status(socket: &Path) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-/// Unix detaches in the child, before mounting the agent.
-#[cfg(unix)]
-fn configure_detached(_command: &mut std::process::Command) {}
-
-/// Windows detaches at creation, without opening a second service lifecycle.
-#[cfg(windows)]
-fn configure_detached(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt as _;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
 #[cfg(windows)]

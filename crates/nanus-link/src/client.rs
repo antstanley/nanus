@@ -261,15 +261,41 @@ impl Client {
 
     /// Asks the agent to stop serving.
     ///
-    /// The reply is deliberately not awaited. The agent acknowledges with a `Bye` and
-    /// then stops, and a client that waited for it would hang whenever the agent stopped
-    /// before flushing — which is exactly the failure a `stop` command must not have.
+    /// Unix returns after sending. Windows keeps the pipe open until `Bye` or EOF, with a
+    /// five-second deadline, because closing a pipe client can discard an unread request.
+    /// EOF is accepted because the agent can stop before its acknowledgement is flushed.
     ///
     /// # Errors
     ///
-    /// Returns [`LinkError::Io`] when the request cannot be sent.
+    /// Returns [`LinkError::Io`] when the request cannot be sent. On Windows, also returns
+    /// an error if the server neither acknowledges nor closes within five seconds, or sends
+    /// a different reply: keeping the pipe open prevents an unread request being discarded.
     pub async fn request_shutdown(&mut self) -> LinkResult<()> {
-        self.send(&Request::Shutdown).await
+        self.send(&Request::Shutdown).await?;
+        #[cfg(windows)]
+        wait_for_shutdown(self.next()).await?;
+        Ok(())
+    }
+}
+
+/// Retains the Windows pipe until the server consumes its shutdown request.
+#[cfg(windows)]
+async fn wait_for_shutdown(
+    receive: impl Future<Output = LinkResult<Option<Frame>>>,
+) -> LinkResult<()> {
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), receive)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the agent did not acknowledge shutdown within 5s",
+            )
+        })??;
+    match reply {
+        Some(Frame::Bye) | None => Ok(()),
+        Some(other) => Err(LinkError::protocol(format!(
+            "the agent answered shutdown with {other:?}"
+        ))),
     }
 }
 
@@ -577,5 +603,37 @@ mod tests {
         assert!(opened.is_ok(), "{opened:?}");
         let Ok(client) = opened else { return };
         assert_eq!(client.info(), &expected);
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod pipe_shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_accepts_bye_or_a_peer_that_has_already_closed() {
+        for reply in [Some(Frame::Bye), None] {
+            assert!(
+                wait_for_shutdown(std::future::ready(Ok(reply)))
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_a_wrong_reply_or_a_peer_that_never_answers() {
+        let wrong = std::future::ready(Ok(Some(Frame::Text {
+            delta: String::from("not an acknowledgement"),
+        })));
+        assert!(matches!(
+            wait_for_shutdown(wrong).await,
+            Err(LinkError::Protocol(_))
+        ));
+        let error = wait_for_shutdown(std::future::pending()).await.unwrap_err();
+        assert!(
+            matches!(error, LinkError::Io(source) if source.kind() == std::io::ErrorKind::TimedOut)
+        );
     }
 }

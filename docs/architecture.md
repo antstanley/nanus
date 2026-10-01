@@ -64,7 +64,7 @@ is the only vocabulary the two share.
 | [`nanus-adapter-config`](../crates/nanus-adapter-config) | TOML configuration with a real migration. |
 | [`nanus-bundle`](../crates/nanus-bundle) | The toolset, the agent loop, and the one place that names concrete adapters. |
 | [`nanus-link`](../crates/nanus-link) | The local link: the frame vocabulary, the platform-selected Unix-socket or Windows named-pipe transport, the client an interface uses, and — behind a `server` feature — the half that serves an agent and holds its sessions open. |
-| [`nanus-sys-windows`](../crates/nanus-sys-windows) | The safe Windows SID and Job Object boundary. Empty on Unix; no raw handles or Rust `unsafe` are exposed. |
+| [`nanus-sys-windows`](../crates/nanus-sys-windows) | The safe Windows SID, Job Object, and detached-spawn boundary. Empty on Unix; no raw handles or Rust `unsafe` are exposed. |
 | [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary: `run`, `service`, `config`, `sessions`, `auth`, and the shell-scoped agent behind `tui`. It does not depend on `nanus-tui`. |
 | [`nanus-tui`](../crates/nanus-tui) | The interface: the view, the input buffer, replay, and the terminal event loop. Its own binary (`nanus-tui`), a library for the parts that are testable without a terminal, and no dependency on the agent loop, a toolset, or a provider adapter — it links only the session store it reads recordings from and the configuration adapter it reads its own display preferences from. |
 

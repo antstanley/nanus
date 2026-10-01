@@ -10,3 +10,8 @@ pub use sid::{SidError, current_user_sid};
 mod job;
 #[cfg(windows)]
 pub use job::{Job, JobError, is_process_alive};
+
+#[cfg(windows)]
+mod detach;
+#[cfg(windows)]
+pub use detach::{DetachError, spawn_detached};
