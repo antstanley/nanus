@@ -22,12 +22,13 @@ jobs:
       - name: Lint both binaries and the platform implementation
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test the link and Windows capability boundary
+        if: ${{ !cancelled() }}
         run: cargo test -p nanus-link -p nanus-sys-windows --all-features --locked
       - name: Test Unix shell lifecycle
         if: runner.os != 'Windows'
         run: cargo test -p nanus-adapter-local --test shell --locked
       - name: Test Windows shell lifecycle and grandchild cleanup
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
         run: cargo test -p nanus-adapter-local --test windows_shell --locked
       - name: Build both programs natively
         run: cargo build --workspace --locked

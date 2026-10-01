@@ -346,6 +346,7 @@ async fn delete_removes_the_session_directory() {
         .expect("deleting an absent session succeeds");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn delete_does_not_follow_a_symlink_out_of_the_home() {
     let (_dir, store) = store().await;
@@ -365,6 +366,7 @@ async fn delete_does_not_follow_a_symlink_out_of_the_home() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_save_refuses_to_follow_a_symlink_out_of_the_home() {
     let (_dir, store) = store().await;
@@ -391,6 +393,7 @@ async fn a_save_refuses_to_follow_a_symlink_out_of_the_home() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn naming_refuses_to_follow_a_symlink_out_of_the_home() {
     let (_dir, store) = store().await;
