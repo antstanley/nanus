@@ -4,7 +4,40 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import time
+
+
+def captured_run(command, env, cwd):
+    # communicate() can wait forever after killing a launcher when its detached child
+    # retains a pipe handle. Wait for the process separately and bound the EOF checks.
+    process = subprocess.Popen(command, env=env, cwd=cwd,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = [[], []]
+
+    def read(pipe, chunks):
+        with pipe:
+            while chunk := pipe.read1(8192):
+                chunks.append(chunk)
+
+    readers = [threading.Thread(target=read, args=(pipe, chunks), daemon=True)
+               for pipe, chunks in zip((process.stdout, process.stderr), output)]
+    for reader in readers:
+        reader.start()
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+        raise
+    for reader in readers:
+        reader.join(timeout=2)
+    assert all(not reader.is_alive() for reader in readers), (
+        f"captured output stayed open after {command[1:]} exited with {process.returncode}; "
+        "a descendant retained the launcher's pipe handles"
+    )
+    stdout, stderr = (b''.join(chunks).decode('utf-8', errors='replace') for chunks in output)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def main():
@@ -17,10 +50,8 @@ def main():
         Path(env["NANUS_CONFIG"]).write_text("", encoding="utf-8")
 
         def run(*args):
-            return subprocess.run(
-                [str(binary), *args], env=env, cwd=home, capture_output=True,
-                text=True, timeout=30, check=False,
-            )
+            print(f"checking {' '.join(args)}", flush=True)
+            return captured_run([str(binary), *args], env, home)
 
         initial = run("service", "status")
         assert initial.returncode != 0, "an absent service must report failure"

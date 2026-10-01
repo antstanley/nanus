@@ -13,6 +13,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     env:
       # Avoid optimized code generation while collecting native OS behavior evidence.
       CARGO_PROFILE_TEST_OPT_LEVEL: 0
@@ -38,6 +39,7 @@ jobs:
       - name: Test service endpoint configuration
         run: cargo test -p nanus-cli service::tests --locked
       - name: Test detached start, duplicate refusal, status, stop, and restart
+        timeout-minutes: 2
         run: python scripts/test-local-service.py
       - name: Keep Rust unsafe forbidden in every crate
         shell: bash
