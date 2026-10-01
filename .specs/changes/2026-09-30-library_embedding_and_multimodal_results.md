@@ -231,8 +231,8 @@ Provider wire details must be verified against current primary contracts: [Anthr
 ## Implementation evidence (2026-10-01)
 
 The Rust delta is implemented on this branch. The proposal remains Proposed because the
-exact-model live image follow-ups have no available credentials and native Windows CI
-has not yet run. Built-in image capabilities therefore remain Unknown. Canonical docs
+exact-model live image follow-ups have no available credentials. Native Windows/macOS CI
+passed both minimal and explicit-provider fixtures on revision `890888f8519e988dbd19505d7b63c60e11b9ecfb`. Built-in image capabilities therefore remain Unknown. Canonical docs
 record the implemented seams and these limits; [evidence](../../docs/vision-evidence.md)
 tracks the remaining gates. Wire/reload fixtures are not substituted for live evidence.
 The clean-agent semi-formal review found three defects (text block separators, DeepSeek

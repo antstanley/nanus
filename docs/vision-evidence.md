@@ -1,7 +1,7 @@
 # Vision evidence and embedding verification
 
 The implementation is available; none of the built-in image capabilities is promoted to
-Supported. Live model acceptance and native Windows execution are still pending. The
+Supported. Live model acceptance remains pending; native Windows and macOS execution now pass. The
 [proposal](../.specs/changes/2026-09-30-library_embedding_and_multimodal_results.md) remains
 Proposed until its acceptance gates pass. CI added here verifies the portable library,
 not the Unix CLI/link/service.
@@ -42,7 +42,10 @@ Hype Studio should reserve at most 8192 total. The metadata and caller ceiling a
 before HTTP. Unknown capabilities never infer image support from an alias, vendor or plan.
 Responses returns `unsupported-image-protocol`; other profile-less combinations refuse pixels.
 
-Native macOS has run the standalone downstream fixture both minimally and with explicit
-provider dependencies. `.github/workflows/embedding.yml` runs the same locked fixture on
-Windows/macOS; native Windows evidence must be recorded after that workflow runs. The
-remaining acceptance gates are reported rather than silently counted as passed.
+Native Windows and macOS passed both the minimal and explicit-provider downstream
+configurations on implementation revision `890888f8519e988dbd19505d7b63c60e11b9ecfb`.
+The [native feature-matrix run](https://github.com/antstanley/nanus/actions/runs/36793542070)
+completed successfully on 2026-10-01; every job tested the locked fixture and ran the
+caller-owned host. This proves the supported library subset, not the Unix CLI/link/service.
+Exact-model live vision follow-ups still have no available credentials and are not counted
+as passed. The proposal remains Proposed and all built-in image capabilities remain Unknown.

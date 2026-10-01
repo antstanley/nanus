@@ -94,8 +94,9 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   authorized over OAuth, which speaks the Responses API through an encoder of its own) all run.
   Opus/Sonnet 5.5 request adaptive thinking and preserve signed blocks for unchanged-prefix replay.
 - **Embedding is a separate build boundary.** The minimal runner uses caller-owned local
-  adapters and has a native macOS downstream fixture. A Windows/macOS feature-matrix CI
-  workflow is added; Windows execution evidence is pending. Stock shell/link/service remain Unix-only.
+  adapters. Its native Windows/macOS matrix passed both minimally and with explicit
+  provider dependencies; [tested revision and run](vision-evidence.md). Stock shell/link/service
+  remain Unix-only.
 - **Vision has no promoted built-in profile yet.** Captured PNG/JPEG wire and reload tests
   exist for the three candidate profiles. Exact-model live follow-ups are pending; capabilities
   remain Unknown and image HTTP is refused. [Evidence and limits](vision-evidence.md).
