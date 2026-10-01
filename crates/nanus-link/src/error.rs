@@ -1,10 +1,11 @@
 //! The link's boundary error.
 //!
-//! One enum, because a link fails in one of four ways: a socket operation failed, the
-//! socket could not be reached at all, the peer said something that is not this
-//! protocol, or the peer closed before answering. Nothing vendor-shaped escapes —
-//! `io::Error` is translated here, and the server translates a `BundleError` into
-//! [`LinkError::Agent`] rather than letting the agent's vocabulary reach an interface.
+//! One enum, because a link fails in a handful of ways: a socket operation failed, the
+//! socket could not be reached at all or belongs to someone else, the peer could not prove
+//! it is the user's, the peer said something that is not this protocol, or the peer closed
+//! before answering. Nothing vendor-shaped escapes — `io::Error` is translated here, and the
+//! server translates a `BundleError` into [`LinkError::Agent`] rather than letting the
+//! agent's vocabulary reach an interface.
 
 use std::path::PathBuf;
 
@@ -27,6 +28,37 @@ pub enum LinkError {
         path: PathBuf,
         /// Why the connection failed.
         source: std::io::Error,
+    },
+
+    /// Something is listening at the endpoint, but this process may not open it.
+    ///
+    /// Distinct from [`LinkError::Connect`] because the endpoint is *taken*: by another
+    /// account, or on Windows by an agent running elevated when this process is not. Starting a
+    /// second agent there would only fail to bind.
+    #[error(
+        "an agent is listening at {path}, but this process may not open it \
+         (is it running as another user, or elevated?): {source}"
+    )]
+    Inaccessible {
+        /// The endpoint that was tried.
+        path: PathBuf,
+        /// The refusal.
+        source: std::io::Error,
+    },
+
+    /// The peer at a Windows pipe could not prove it belongs to this user.
+    ///
+    /// The pipe's name is predictable and global, so another account can hold it. A client that
+    /// sees this has sent nothing beyond its challenge; an agent that sees it drops the client.
+    #[error(
+        "refusing the agent link at {path}: {reason}. Another account may be holding this pipe \
+         name, or the agent was built from different sources; stop it and start nanus again"
+    )]
+    Unverified {
+        /// The endpoint, or which side, that failed to prove itself.
+        path: PathBuf,
+        /// Why it was not accepted.
+        reason: String,
     },
 
     /// The peer sent something that is not a frame of this protocol.
@@ -85,6 +117,28 @@ mod tests {
         };
         let rendered = error.to_string();
         assert!(rendered.contains("/tmp/nanus.sock"), "{rendered}");
+    }
+
+    #[test]
+    fn a_refused_endpoint_is_not_reported_as_empty() {
+        let error = LinkError::Inaccessible {
+            path: PathBuf::from("/tmp/nanus.sock"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("/tmp/nanus.sock"), "{rendered}");
+        assert!(!rendered.contains("no agent is listening"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unverified_agent_names_the_pipe_and_the_reason() {
+        let error = LinkError::Unverified {
+            path: PathBuf::from(r"\\.\pipe\nanus-S-1-5-agent"),
+            reason: String::from("the peer does not hold this user's link key"),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("nanus-S-1-5-agent"), "{rendered}");
+        assert!(rendered.contains("link key"), "{rendered}");
     }
 
     #[test]

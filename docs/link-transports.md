@@ -106,6 +106,39 @@ and asserts which principals can write to it. A cross-user connection test is de
 [Tests](#tests)). If the read-back fails, this decision is wrong and the `unsafe`
 question below reopens.
 
+**Same-user handshake.** `first_pipe_instance` refuses a squatter only if the agent binds
+first; when another account owns the name first, the *agent* is the one refused, and an
+interface connects to the squatter. And the default descriptor lets another account open the
+agent's pipe and hold the connection. Checking the pipe's owner or the peer's process would
+close both, but no safe binding for those calls exists in this workspace's dependencies
+(`winsafe` has no `GetNamedPipeServerProcessId` or `GetSecurityInfo`; `interprocess` wraps the
+former but reopens the handle and has no `first_pipe_instance`). **Decided: both ends prove
+knowledge of a per-agent key that only the user can read.** On owning its name, the agent writes
+32 random bytes to `%LOCALAPPDATA%\nanus\run\<pipe name>.key` (atomically, by rename) and
+removes the file when the listener is dropped. The exchange, before the first frame:
+
+1. The client sends `nanus-link-auth1` and a 32-byte nonce.
+2. The agent sends its own nonce and `HMAC-SHA256(key, "server" ‖ client nonce ‖ agent nonce)`.
+3. The client reads the key *now* — after the agent has answered, so it never reads a previous
+   agent's key — verifies, and only then sends `HMAC-SHA256(key, "client" ‖ …)`.
+
+A client that cannot verify the agent fails with `LinkError::Unverified` having sent only its
+challenge. The agent runs its half in the connection's own task with a five-second bound, so a
+connection that never speaks holds up only itself. It lives in the transport, not the protocol:
+the frames and `PROTOCOL_VERSION` are unchanged, and the Unix socket, whose `0700` directory
+already proves the peer, has no handshake. The code is `nanus-link/src/transport/guard.rs`,
+compiled on every platform for its tests. The key lives under local application data rather
+than the nanus home because the pipe name does not depend on the home: two homes reach one
+agent, so they must find one key.
+
+**Endpoint names are checked exactly.** A client or an agent accepts only `\\.\pipe\nanus-`
+followed by ASCII letters, digits, and hyphens. A prefix check let `\\.\pipe\nanus-x\..\..\UNC\host\pipe\p`
+through, and Win32 normalises that to a pipe on another machine.
+
+**A refused accept is not the agent's end.** `serve` logs it, backs off (50 ms, doubling to two
+seconds), and accepts again; when only the *next* pipe instance cannot be created, the client
+that just connected is still served and the instance is created at the next accept.
+
 **No stale endpoints.** A pipe disappears when its last handle closes, so the Unix
 `bind` dance — probe the existing socket, remove it if nothing answers — has no Windows
 counterpart, and the Windows `bind` is simpler for it. A second service on one machine is
@@ -248,11 +281,11 @@ separate risk, and they should not ride on the transport change:
   message, a peer that hangs up before its handshake. Both directions, as everywhere here.
 - A test that a second owner of one pipe name is refused.
 - A test that a pipe created by one user cannot be opened by another is **deferred**: it needs
-  two accounts, and nanus is assumed to run in a single-user, sandboxed environment, so the
-  cross-user case is not a threat this version defends against. The read-back test of the
-  default descriptor stays, because it needs one account. The deferral is a stated limit, not
-  a silent skip: `SAFETY.md` and `service.md` say, when this ships, that the Windows link does
-  not defend against another user on the same machine.
+  two accounts. What another account could do with the pipe is covered instead by the handshake
+  tests, which need one: a squatter that owns the name and answers without the key is refused
+  and sent nothing, a stranger that connects without the key is dropped and the agent keeps
+  serving, and the key is published at bind and removed with the listener. The read-back test
+  of the default descriptor stays. The deferral is a stated limit, not a silent skip.
 - The platform tests are gated by `cfg`, so each OS runs its own and neither runs the
   other's.
 
@@ -271,11 +304,27 @@ separate risk, and they should not ride on the transport change:
   spawning with explicit stdin/stdout/stderr. Native validation found that a service otherwise
   retained its launcher's captured output pipes, even after the launcher exited successfully.
   `nanus-sys-windows` pins the dependency-free `bun_windows_sys` binding leaf to `=0.1.0` and
-  uses only its safe `SetHandleInformation` declaration; the borrowed handles stay inside the
-  wrapper and are never closed there. This binding comes from
+  uses only its safe `SetHandleInformation` declaration (and the `INVALID_HANDLE_VALUE`
+  constant); a CI step fails if the pin moves or another item is used. The borrowed handles stay
+  inside the wrapper and are never closed there. This binding comes from
   [Bao](https://github.com/putao520/bao), rather than the Bun project. The reviewed declaration
   matches the Win32 by-value API, has no pointer dereference precondition, and reports kernel
   validation failures. No build script or transitive dependencies are introduced.
+- The shell passes a `cmd /C` script through raw, as `cmd /S /C "<script>"`, in both the
+  `bash` tool and the interface's `!` escape. The standard library quotes an argument by
+  `CommandLineToArgvW` rules, turning an inner `"` into `\"`, and `cmd` does not undo that, so
+  `git commit -m "fix bug"` reached git as two arguments. Every other request is quoted
+  normally, because the program it names parses its own command line.
+- The shell's job ends with the command: when the leader exits, the job is terminated, so a
+  background process does not outlive the call as it can on Unix. A failure to terminate is
+  logged and the leader's real status is still reported. Children are created with
+  `CREATE_NO_WINDOW`, so a detached service has no console window appear per command.
+- The detached launcher asks for `CREATE_BREAKAWAY_FROM_JOB` and retries without it when the
+  enclosing job refuses ("access denied"), so a service outlives an SSH session or CI step whose
+  job permits leaving, and obeys one that does not.
+- The kernel runtime's shutdown joins blocking workers for at most half a second. An abandoned
+  `stdin` read (Ctrl-C at an approval prompt) otherwise held the exit, and the error message,
+  open until Enter was pressed. `nanus-tui` shuts its runtime down the same way as `nanus`.
 - A Windows shutdown request retains its pipe until `Bye` or EOF, bounded to five seconds.
   The service and shell-scoped agent use the same client method; dropping immediately after
   writing could lose an unread request. Unix still returns after sending. No frame changes.
@@ -312,7 +361,8 @@ separate risk, and they should not ride on the transport change:
 | Question | Decision |
 |---|---|
 | How the user is named in a pipe | **SID**, always computed, never typed |
-| Is the default pipe descriptor enough | **Yes**, held to a read-back test |
+| Is the default pipe descriptor enough | **Yes** for writers, held to a read-back test; identity is proven by the handshake |
+| Who is at the other end of a pipe | **Proven both ways** by an HMAC handshake over a key in the user's local app data |
 | Boxed stream or concrete enum | **Concrete enum** over the two transports |
 | Service Control Manager integration | **None**; detached process or `--foreground` under a supervisor |
 | The `unsafe` rule | **Kept in every crate**; safe dependencies cover the Windows capabilities |

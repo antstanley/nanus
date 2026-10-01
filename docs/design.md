@@ -196,8 +196,9 @@ deliberately, rather than discovering it later as "why is our CLI 40 MB".
 
 The socket is a [local link](../docs/tui.md#the-link): one frame per line of JSON over a
 Unix domain socket, `0600` inside a `0700` directory, or a SID-named local Windows pipe.
-Both carry the same protocol. The Windows default descriptor and its cross-user limit are
-documented in [the transport design](link-transports.md). There is no safe *in-process* channel
+Both carry the same protocol. The Windows default descriptor, and the same-user handshake that
+makes up for a pipe having no private directory, are documented in
+[the transport design](link-transports.md). There is no safe *in-process* channel
 between two processes — sharing memory across a `fork` needs `mmap` and `unsafe`, and this
 workspace forbids `unsafe` everywhere — so a domain socket is what "in memory" reduces to
 when the two ends are two programs.

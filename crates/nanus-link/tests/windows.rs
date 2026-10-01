@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nanus_link::protocol::PROTOCOL_VERSION;
+use nanus_link::transport::guard::{HANDSHAKE_TIMEOUT, Key};
 use nanus_link::transport::{Listener, Stream, bind};
 use nanus_link::wire::{read_request, write_frame};
 use nanus_link::{AgentInfo, Client, Frame, LinkError, Request};
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
 fn endpoint() -> PathBuf {
     // Tests run concurrently and must not use the service's singleton name.
@@ -34,8 +36,20 @@ fn info(version: u32) -> AgentInfo {
 }
 
 async fn pair(listener: &mut Listener, endpoint: &Path) -> (Stream, Stream) {
-    let (server, client) = tokio::join!(listener.accept(), Stream::connect(endpoint));
+    let server = async { listener.accept().await?.verify().await };
+    let (server, client) = tokio::join!(server, Stream::connect(endpoint));
     (server.expect("accept"), client.expect("connect"))
+}
+
+/// Where a client looks for the key of `endpoint`, as the transport computes it.
+fn key_file(endpoint: &Path) -> PathBuf {
+    use etcetera::BaseStrategy as _;
+    let dir = etcetera::choose_base_strategy()
+        .expect("a local data directory")
+        .cache_dir()
+        .join("nanus")
+        .join("run");
+    nanus_link::transport::guard::key_path(&dir, endpoint).expect("a local pipe name")
 }
 
 #[tokio::test]
@@ -151,11 +165,21 @@ async fn the_next_instance_exists_before_an_accepted_stream_is_dispatched() {
     let endpoint = endpoint();
     let mut listener = bind(&endpoint).await.expect("bind");
     let (_server, _client) = pair(&mut listener, &endpoint).await;
-    // Connect without calling accept yet: the next instance must already exist.
-    let _next = Stream::connect(&endpoint)
+    // Open before any accept is in progress: the next instance must already exist. The open is
+    // immediate; only the handshake that follows it waits for the accept.
+    let target = endpoint.clone();
+    let next = tokio::spawn(async move { Stream::connect(&target).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _accepted = listener
+        .accept()
         .await
+        .expect("accept the next client")
+        .verify()
+        .await
+        .expect("the next client proves itself");
+    next.await
+        .expect("connect task")
         .expect("the next instance is available");
-    let _accepted = listener.accept().await.expect("accept the next client");
 }
 
 #[tokio::test]
@@ -172,15 +196,99 @@ async fn a_cancelled_accept_keeps_the_listener_usable() {
 
 #[tokio::test]
 async fn a_remote_endpoint_is_refused_before_connecting_or_binding() {
-    let remote = Path::new(r"\\another-machine\pipe\nanus-agent");
-    assert!(bind(remote).await.is_err());
-    assert_eq!(
-        Stream::connect(remote)
+    for remote in [
+        r"\\another-machine\pipe\nanus-agent",
+        // Passes a prefix test, and Win32 normalises it to a pipe on another machine.
+        r"\\.\pipe\nanus-x\..\..\UNC\another-machine\pipe\nanus-agent",
+    ] {
+        let remote = Path::new(remote);
+        assert!(bind(remote).await.is_err(), "{}", remote.display());
+        let error = Stream::connect(remote).await.expect_err("remote refused");
+        assert!(
+            matches!(&error, LinkError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput),
+            "{error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_client_refuses_a_squatter_without_sending_it_anything() {
+    // Another account's pipe at this user's name: it can answer, but not with this user's key.
+    let endpoint = endpoint();
+    let key = key_file(&endpoint);
+    Key::generate().unwrap().write(&key).unwrap();
+    let mut squatter = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&endpoint)
+        .expect("the squatter owns the name");
+    let squat = async {
+        squatter.connect().await.expect("a client arrives");
+        let mut opening = [0u8; 48];
+        squatter
+            .read_exact(&mut opening)
             .await
-            .expect_err("remote refused")
-            .kind(),
-        std::io::ErrorKind::InvalidInput
+            .expect("its challenge");
+        squatter
+            .write_all(&[7u8; 64])
+            .await
+            .expect("a forged answer");
+        let mut rest = Vec::new();
+        let _ = squatter.read_to_end(&mut rest).await;
+        rest
+    };
+    // A refused connect drops its pipe, which is what ends the squatter's read.
+    let connecting = Client::connect(&endpoint);
+    let (sent, outcome) = tokio::time::timeout(HANDSHAKE_TIMEOUT.saturating_mul(2), async {
+        tokio::join!(squat, connecting)
+    })
+    .await
+    .expect("the refusal is bounded");
+    assert!(
+        matches!(outcome, Err(LinkError::Unverified { .. })),
+        "{:?}",
+        outcome.err()
     );
+    assert!(
+        sent.is_empty(),
+        "the client sent the squatter {} bytes",
+        sent.len()
+    );
+    std::fs::remove_file(&key).unwrap();
+}
+
+#[tokio::test]
+async fn an_agent_refuses_a_client_that_cannot_prove_itself() {
+    let endpoint = endpoint();
+    let mut listener = bind(&endpoint).await.expect("bind");
+    let stranger = async {
+        let mut pipe = ClientOptions::new()
+            .open(&endpoint)
+            .expect("the pipe opens");
+        pipe.write_all(&[b'x'; 64]).await.expect("not a challenge");
+        let mut rest = Vec::new();
+        let _ = pipe.read_to_end(&mut rest).await;
+        rest
+    };
+    let refused = async { listener.accept().await.expect("accept").verify().await };
+    let (received, refused) = tokio::join!(stranger, refused);
+    assert!(refused.is_err(), "the stranger was served");
+    assert!(
+        received.is_empty(),
+        "the stranger was sent {} bytes",
+        received.len()
+    );
+    // The listener is unharmed: an honest client is still served after it.
+    let (_server, _client) = pair(&mut listener, &endpoint).await;
+}
+
+#[tokio::test]
+async fn a_bound_agent_publishes_its_key_and_takes_it_away_when_it_goes() {
+    let endpoint = endpoint();
+    let key = key_file(&endpoint);
+    let listener = bind(&endpoint).await.expect("bind");
+    assert!(Key::read(&key).is_ok(), "the key is published at bind");
+    drop(listener);
+    assert!(!key.exists(), "the key goes with the listener");
 }
 
 #[test]

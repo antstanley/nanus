@@ -39,16 +39,12 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`LinkError::Connect`] when nothing is listening, [`LinkError::Closed`]
-    /// when the peer hung up before its handshake, and [`LinkError::Protocol`] when the
-    /// handshake is not one.
+    /// Returns [`LinkError::Connect`] when nothing is listening, [`LinkError::Inaccessible`]
+    /// when something is but may not be opened, [`LinkError::Unverified`] when a Windows agent
+    /// cannot prove it is this user's, [`LinkError::Closed`] when the peer hung up before its
+    /// handshake, and [`LinkError::Protocol`] when the handshake is not one.
     pub async fn connect(path: &Path) -> LinkResult<Self> {
-        let stream = Stream::connect(path)
-            .await
-            .map_err(|source| LinkError::Connect {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let stream = Stream::connect(path).await?;
         Self::open(stream).await
     }
 

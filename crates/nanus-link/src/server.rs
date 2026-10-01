@@ -1470,15 +1470,28 @@ async fn broadcast_awaited(held: &Held, frame: Frame, except: Option<u64>) {
 
 pub use crate::transport::bind;
 
+/// How long [`serve`] waits after a failed accept before trying again.
+pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
+/// The longest [`serve`] waits between accepts while they keep failing.
+pub const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
 /// Serves connections until `stop` resolves or a client asks the agent to stop.
 ///
 /// Must be driven inside a local task set: the sessions, the turns, and the connections
 /// are all local tasks, because the agent's state is `Rc`-shared and its futures are
 /// therefore not `Send`.
 ///
+/// A failed accept is one lost connection, not the agent's end: it is logged, the loop backs
+/// off for [`ACCEPT_BACKOFF`] (doubling to [`ACCEPT_BACKOFF_MAX`] while failures continue), and
+/// accepting resumes. Before this, one refused accept — which another account can provoke on
+/// Windows by holding every pipe instance — returned from here, aborting the turns in flight and
+/// losing the sessions they were writing.
+///
 /// # Errors
 ///
-/// Returns [`LinkError::Io`] when accepting fails.
+/// None at present; the `Result` is kept for the callers' sake and for a failure that does
+/// warrant stopping.
 pub async fn serve(
     listener: impl Into<Listener>,
     agent: Rc<Agent>,
@@ -1495,6 +1508,7 @@ pub async fn serve(
     let registry = Rc::new(Registry::new(agent, owner));
     let shutdown = Rc::new(Notify::new());
     let mut connections: JoinSet<()> = JoinSet::new();
+    let mut backoff = ACCEPT_BACKOFF;
     tokio::pin!(stop);
     loop {
         tokio::select! {
@@ -1506,10 +1520,35 @@ pub async fn serve(
                 }
             }
             accepted = listener.accept() => {
-                let stream = accepted?;
+                let accepted = match accepted {
+                    Ok(accepted) => {
+                        backoff = ACCEPT_BACKOFF;
+                        accepted
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, ?backoff, "a link connection could not be accepted");
+                        // Slept inside the select so a stop still ends the loop at once.
+                        tokio::select! {
+                            () = &mut stop => break,
+                            () = shutdown.notified() => break,
+                            () = sleep(backoff) => {}
+                        }
+                        backoff = backoff.saturating_mul(2).min(ACCEPT_BACKOFF_MAX);
+                        continue;
+                    }
+                };
                 let registry = Rc::clone(&registry);
                 let shutdown = Rc::clone(&shutdown);
                 connections.spawn_local(async move {
+                    // Verified here, in the connection's own task: a peer that never proves
+                    // itself holds up its own connection rather than every accept after it.
+                    let stream = match accepted.verify().await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::warn!(%error, "a link connection was refused");
+                            return;
+                        }
+                    };
                     if let Err(error) = serve_connection(stream, registry, &shutdown).await {
                         // A client that hung up mid-frame is ordinary; anything else is
                         // worth a line, and neither is worth stopping the agent for.

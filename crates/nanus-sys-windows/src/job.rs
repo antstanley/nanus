@@ -3,8 +3,9 @@
 use std::process::ExitStatus;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use process_wrap::tokio::{ChildWrapper, CommandWrap, JobObject, KillOnDrop};
+use process_wrap::tokio::{ChildWrapper, CommandWrap, CreationFlags, JobObject, KillOnDrop};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use winsafe::{HPROCESS, co};
 
 /// A failure to spawn, inspect, or terminate a Windows job.
@@ -21,9 +22,21 @@ pub struct Job {
 
 impl Job {
     /// Spawns into a Job Object before allowing the child's first instruction to run.
+    ///
+    /// The child gets no console window. A detached service has no console of its own, and a
+    /// console program started from such a process without this flag is given a *new* one — a
+    /// window that appears on the desktop for every shell call the service makes. The output is
+    /// read through pipes, so nothing is lost by not drawing it; a child started from a process
+    /// that does have a console is unaffected beyond not sharing it.
     pub fn spawn(command: Command) -> Result<Self, JobError> {
         let mut command = CommandWrap::from(command);
-        let child = command.wrap(JobObject).wrap(KillOnDrop).spawn()?;
+        // Through the wrapper, not `Command::creation_flags`: the job wrapper sets the flags it
+        // needs to suspend the child, and keeps only flags registered this way beside them.
+        let child = command
+            .wrap(CreationFlags(CREATE_NO_WINDOW))
+            .wrap(JobObject)
+            .wrap(KillOnDrop)
+            .spawn()?;
         let pid = child
             .id()
             .filter(|pid| *pid > 0)

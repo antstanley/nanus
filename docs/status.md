@@ -55,8 +55,8 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   `0600` inside a `0700` directory. Windows SID-named pipes, service detaching, and the Job Object
   shell passed native Windows runtime validation alongside Linux and macOS in
   [the transport matrix](https://github.com/antstanley/nanus/actions/runs/36852736607).
-  There is no remote mode. Windows uses the default
-  descriptor and does not defend against another local user; see
+  There is no remote mode. Windows uses the default descriptor and proves the same user at
+  both ends with a key-based handshake, so a pipe squatted by another account is refused; see
   [the service page](service.md#known-limits) and [the transport design](link-transports.md).
 - **The context budget is an estimate, and the policy is drop-oldest.** A prompt is bounded
   by `context_budget` in estimated tokens — characters over four, plus a small cost per

@@ -162,3 +162,66 @@ async fn a_program_that_cannot_start_is_an_error_and_leaves_no_job() {
     );
     assert_eq!(shell.live_groups(), 0);
 }
+
+#[tokio::test]
+async fn a_quoted_script_reaches_cmd_as_written() {
+    // `cmd` does not undo the standard library's argument escaping, so an escaped script ran
+    // `\"fix` and `bug\"` where the model wrote `"fix bug"`.
+    let dir = tempfile::tempdir().expect("workspace");
+    let shell = LocalShell::unconfined(dir.path());
+    let spaced = dir.path().join("with space");
+    std::fs::create_dir(&spaced).expect("a directory with a space");
+    std::fs::write(spaced.join("note.txt"), "x").expect("a file inside it");
+    let echoed = shell
+        .run(ShellRequest::shell(r#"echo "a b""#, None))
+        .await
+        .expect("echo");
+    assert_eq!(echoed.exit_code, Some(0), "{echoed:?}");
+    assert_eq!(echoed.stdout.text.trim(), r#""a b""#);
+    let listed = shell
+        .run(ShellRequest::shell(
+            r#"dir /b "with space""#,
+            Some(dir.path().to_owned()),
+        ))
+        .await
+        .expect("dir");
+    assert_eq!(listed.exit_code, Some(0), "{listed:?}");
+    assert_eq!(listed.stdout.text.trim(), "note.txt");
+}
+
+#[tokio::test]
+async fn a_direct_request_is_still_quoted_for_the_program_that_parses_it() {
+    // The negative direction: only a `cmd /C` script is passed raw. PowerShell parses its own
+    // command line, so the quotes inside this argument must arrive escaped and come back intact.
+    let dir = tempfile::tempdir().expect("workspace");
+    let shell = LocalShell::unconfined(dir.path());
+    let output = shell
+        .run(powershell(r#"[Console]::Out.Write('x "y" z')"#))
+        .await
+        .expect("powershell");
+    assert_eq!(output.exit_code, Some(0), "{output:?}");
+    assert_eq!(output.stdout.text, r#"x "y" z"#);
+}
+
+#[tokio::test]
+async fn a_background_process_ends_with_the_command_that_started_it() {
+    // Deliberately unlike Unix, where only a timeout signals the group: on Windows the job is the
+    // call's, so what a command leaves running when it exits is ended with it. The leader's own
+    // exit status is still what the call reports.
+    let dir = tempfile::tempdir().expect("workspace");
+    let shell = LocalShell::unconfined(dir.path());
+    let path = dir.path().join("pid");
+    let output = shell
+        .run(powershell(&format!(
+            "$p = Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', \
+             'Start-Sleep 300' -PassThru; \
+             [IO.File]::WriteAllText('{}', [string]$p.Id); exit 4",
+            path.display().to_string().replace('\'', "''")
+        )))
+        .await
+        .expect("the leader exits");
+    assert_eq!(output.exit_code, Some(4));
+    assert!(!output.timed_out);
+    assert_dead(recorded_pid(&path).await).await;
+    assert_eq!(shell.live_groups(), 0);
+}

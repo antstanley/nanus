@@ -21,13 +21,28 @@ pub struct DetachError(#[from] std::io::Error);
 ///
 /// Returns an error if inheritance cannot be cleared on a present standard handle or spawning
 /// fails. Missing standard handles are allowed, so a launcher needs no terminal.
+///
+/// The child asks to break away from any Job Object the launcher is in, so a service started
+/// from a session whose job is killed on close (an OpenSSH session, a CI step) survives it. A
+/// job that does not permit breaking away refuses the request with "access denied"; the spawn is
+/// then retried inside the job, and the service lives exactly as long as that job does — which is
+/// what a job that forbids leaving it is asking for. Being in no job at all is not an error.
 pub fn spawn_detached(command: &mut Command) -> Result<Child, DetachError> {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
     isolate_standard_handles()?;
-    let child = command
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn()?;
+    let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    let child = match command
+        .creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+    {
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            command.creation_flags(detached).spawn()?
+        }
+        spawned => spawned?,
+    };
     assert!(child.id() > 0, "a detached child has a valid process id");
     Ok(child)
 }

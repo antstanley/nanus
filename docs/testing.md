@@ -54,7 +54,10 @@ checks the API surface; it does not prove ACL or process behavior. All three nat
 The CLI smoke test also checks a short-lived filesystem command and detached start, duplicate
 refusal, status, stop, and immediate restart, with captured output reaching EOF after each launcher.
 The cross-user connection test remains deferred; [the transport note](link-transports.md) records
-the default descriptor's grants and the single-user assumption.
+the default descriptor's grants and how the same-user handshake is tested instead. The handshake
+itself (`nanus-link/src/transport/guard.rs`) runs in the ordinary suite on every platform: both
+ends with one key, a squatter, a stranger, a forged proof, silence from either side, and a
+missing key.
 
 **Live vision evidence.** `nanus-bundle/tests/live_vision.rs` is `#[ignore]`d and exists only with
 the `stock-compose` feature, because it spends credit and reads the stored credentials. It sends the
