@@ -326,9 +326,10 @@ fn restrict(path: &Path, mode: u32) -> Result<(), std::io::Error> {
 
 /// Leaves permissions alone where the platform has no mode bits.
 ///
-/// Windows support is not a goal (the link is a Unix socket), so this exists to
-/// keep the crate building rather than to promise confinement.
+/// On Windows, access follows the containing directory's ACL. This backend does
+/// not translate Unix mode bits into an explicit Windows descriptor.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep the fallible Unix contract at shared call sites.
 fn restrict(_path: &Path, _mode: u32) -> Result<(), std::io::Error> {
     Ok(())
 }

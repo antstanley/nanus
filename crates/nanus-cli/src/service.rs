@@ -449,6 +449,7 @@ mod tests {
         assert_eq!(chosen.ok(), Some(PathBuf::from("/tmp/from-config.sock")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn with_neither_the_default_lives_under_the_nanus_home() {
         // The default matters more than the override: it is the path a client computes
@@ -468,6 +469,16 @@ mod tests {
                 .and_then(|name| name.to_str()),
             Some("run")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn with_neither_the_default_matches_the_sid_endpoint_the_client_computes() {
+        let expected = service_endpoint(&home().unwrap()).unwrap();
+        let chosen = socket_path(&config(), None).unwrap();
+        assert_eq!(chosen, expected);
+        assert!(chosen.to_str().unwrap().starts_with(r"\\.\pipe\nanus-S-1-"));
+        assert!(chosen.to_str().unwrap().ends_with("-agent"));
     }
 
     #[test]

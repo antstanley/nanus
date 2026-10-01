@@ -151,6 +151,10 @@ printing any value.
 - Session transcripts are stored under `$NANUS_HOME/sessions/`. A transcript
   contains everything the model saw and produced, including any secret it read.
 
+The file store's `0600`/`0700` permissions apply on Unix. On Windows, files inherit
+the containing directory's ACL; the backend does not set an explicit descriptor.
+Choose a home directory that other users cannot read, or use environment credentials.
+
 What this does **not** do: the file store is not encrypted, so a secret in it is
 readable by anything running as you — as the environment variable already was. The
 point of the store is to get a key *out* of the environment and out of the

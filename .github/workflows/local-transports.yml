@@ -31,6 +31,8 @@ jobs:
         run: cargo test -p nanus-adapter-local --test windows_shell --locked
       - name: Build both programs natively
         run: cargo build --workspace --locked
+      - name: Test service endpoint configuration
+        run: cargo test -p nanus-cli service::tests --locked
       - name: Test detached start, duplicate refusal, status, stop, and restart
         run: python scripts/test-local-service.py
       - name: Keep Rust unsafe forbidden in every crate
