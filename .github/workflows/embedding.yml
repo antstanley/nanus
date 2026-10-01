@@ -21,3 +21,13 @@ jobs:
         run: cargo test --manifest-path examples/embedded/Cargo.toml --locked --features "${{ matrix.features }}"
       - name: Run the caller-owned host
         run: cargo run --manifest-path examples/embedded/Cargo.toml --locked --features "${{ matrix.features }}"
+  # The pipe name is built from the user's SID (docs/link-transports.md), and the call that
+  # reads it is only meaningful on a real Windows host, so this runs there and nowhere else.
+  windows-sid:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Read the current user's SID through the safe winsafe call chain
+        run: cargo test --manifest-path examples/windows-sid-probe/Cargo.toml --locked
