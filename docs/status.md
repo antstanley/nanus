@@ -52,10 +52,11 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   from the first commit until it was first typed into — see
   [the bugs verification found](testing.md#the-bugs-verification-found).
 - **The link is Unix-only and trusts its peer.** A Unix domain socket in the user's own
-  nanus home, `0600` inside a `0700` directory. No remote mode, no Windows (the workspace
-  already depends on `nix` for process groups), and no defence against a process already
-  running as the same user — such a process can read the workspace and the session log
-  regardless. See [the service page](service.md#known-limits).
+  nanus home, `0600` inside a `0700` directory. No remote mode, and no Windows transport
+  for the stock binaries (the shell adapter also depends on `nix` for process groups); only
+  the minimal embedded runner is verified natively on Windows, as described below. There is
+  no defence against a process already running as the same user — such a process can read
+  the workspace and the session log regardless. See [the service page](service.md#known-limits).
 - **The context budget is an estimate, and the policy is drop-oldest.** A prompt is bounded
   by `context_budget` in estimated tokens — characters over four, plus a small cost per
   message — because there is no tokenizer in the harness and the provider's real count

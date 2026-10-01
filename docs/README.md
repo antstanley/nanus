@@ -90,6 +90,23 @@ open. Background for [roadmap item 24](roadmap.md#next-new-capabilities).
 
 Start here if you are picking up the goal work, or designing a feature that spans turns.
 
+## [Link transports note](link-transports.md)
+
+A proposal, not an implementation: a named-pipe transport for Windows beside the Unix
+socket, chosen at compile time under one unchanged protocol, with the seam to extract, the
+access-control and `unsafe` questions it raises, and the order to build it in.
+
+Start here if you are porting the link, or the service, to Windows.
+
+## [Remote link note](remote-link.md)
+
+A proposal, not an implementation: reaching an agent from another machine through a pair
+of relays that carry the local link, so neither the agent nor the interface changes. Covers
+mutual-TLS authentication, the tunnel choices, what a byte relay cannot enforce, and why a
+remote user is, for now, the local user.
+
+Start here if you are about to end the "no remote mode" stance.
+
 ## [Style](style.md)
 
 The Tiger Style rules, which of them are enforced by a tool rather than by review, and how

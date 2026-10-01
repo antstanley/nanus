@@ -612,8 +612,10 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   Unknown and refuse images.
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
-- **The link is Unix-only and local.** No remote mode, no Windows, no
-  authentication — there is no remote mode to secure.
+- **The link is Unix-only and local.** No remote mode, no authentication — there is no
+  remote mode to secure. The stock shell, link, and service are Unix-only, so the `nanus`
+  and `nanus-tui` binaries do not run on Windows; only the minimal embedded runner is
+  verified natively there (see [status](status.md)).
 - **The sandbox is not OS-enforced.** Nothing confines an approved program's
   writes, its network access, or its process table.
 - **A session is claimed for writing.** Two writers on one log cannot silently lose a turn:
