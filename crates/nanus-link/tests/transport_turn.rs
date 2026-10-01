@@ -45,6 +45,56 @@ impl LlmPort for Scripted {
 }
 
 #[test]
+fn shutdown_releases_the_endpoint_after_probes_and_an_idle_connection() {
+    let dir = tempfile::tempdir().expect("store");
+    nanus_kernel::runtime::block_on_local(async {
+        let store = JsonlStore::new(dir.path().to_owned())
+            .await
+            .expect("store")
+            .handle();
+        let runner = AgentRunner::new(
+            Rc::new(Box::new(Scripted)),
+            ToolRegistryHandle::new(ToolRegistry::new()),
+            "you are a test",
+            AgentConfig::new(4, 1, "scripted", 4096).expect("config"),
+            SystemClock::new().handle(),
+        )
+        .expect("runner");
+        let agent = Rc::new(Agent::from_parts(Parts {
+            runner: Rc::new(runner),
+            store,
+            clock: SystemClock::new().handle(),
+            workspace: dir.path().to_owned(),
+            models: vec![String::from("scripted")],
+            tools: 0,
+            switch: None,
+        }));
+        let endpoint = endpoint(dir.path());
+        let listener = bind(&endpoint).await.expect("bind");
+        let serving =
+            tokio::task::spawn_local(nanus_link::serve(listener, agent, std::future::pending()));
+        for _ in 0..3 {
+            drop(Client::connect(&endpoint).await.expect("probe"));
+        }
+        let idle = Client::connect(&endpoint).await.expect("idle connection");
+        let mut stopping = Client::connect(&endpoint).await.expect("stop connection");
+        stopping.request_shutdown().await.expect("stop");
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+            .await
+            .expect("bounded shutdown")
+            .expect("server task")
+            .expect("clean shutdown");
+        drop(idle);
+        drop(stopping);
+        // Unix leaves its socket path for the process owner to remove; pipes have no path.
+        #[cfg(unix)]
+        std::fs::remove_file(&endpoint).expect("remove socket");
+        let rebound = bind(&endpoint).await.expect("the old owner is gone");
+        drop(rebound);
+    });
+}
+
+#[test]
 fn a_real_agent_records_before_done_and_refuses_a_missing_attachment() {
     let dir = tempfile::tempdir().expect("store");
     nanus_kernel::runtime::block_on_local(async {

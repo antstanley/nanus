@@ -1521,11 +1521,14 @@ pub async fn serve(
     }
     // Aborted rather than awaited: a connection part way through a request would
     // otherwise hold the shutdown open.
+    tracing::debug!("stopping link connections");
     connections.shutdown().await;
+    tracing::debug!("link connections have stopped");
     // Turns are the agent's own work rather than a client's, so they are stopped by the
     // agent going away, and stopping means the session they were writing is not recorded.
     let mut turns = std::mem::take(&mut *registry.turns.borrow_mut());
     turns.shutdown().await;
+    tracing::debug!("link turns have stopped");
     Ok(())
 }
 

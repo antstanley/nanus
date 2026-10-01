@@ -46,7 +46,8 @@ def main():
     # Unix socket paths are short; macOS's default temporary directory is often too long.
     temp_root = None if os.name == "nt" else "/tmp"
     with tempfile.TemporaryDirectory(prefix="nanus-service-", dir=temp_root) as home:
-        env = dict(os.environ, NANUS_HOME=home, NANUS_CONFIG=str(Path(home) / "config.toml"))
+        env = dict(os.environ, NANUS_HOME=home, NANUS_CONFIG=str(Path(home) / "config.toml"),
+                   RUST_LOG="nanus_cli=debug,nanus_link=debug")
         Path(env["NANUS_CONFIG"]).write_text("", encoding="utf-8")
 
         def run(*args):
@@ -75,11 +76,16 @@ def main():
             restarted = run("service", "start")
             assert restarted.returncode == 0, restarted.stderr
         finally:
-            run("service", "stop")
-            deadline = time.monotonic() + 10
-            while run("service", "status").returncode == 0:
-                assert time.monotonic() < deadline, "cleanup did not stop the service"
-                time.sleep(0.05)
+            try:
+                run("service", "stop")
+                deadline = time.monotonic() + 10
+                while run("service", "status").returncode == 0:
+                    assert time.monotonic() < deadline, "cleanup did not stop the service"
+                    time.sleep(0.05)
+            finally:
+                log = Path(home) / "nanus-service.log"
+                if log.exists():
+                    print(log.read_text(encoding="utf-8", errors="replace"), flush=True)
 
 
 if __name__ == "__main__":

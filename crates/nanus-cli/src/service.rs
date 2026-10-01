@@ -296,6 +296,7 @@ pub fn serve(pending: Pending, workspace: &Path, socket: &Path) -> Result<(), St
             .await
             .map_err(|error| error.to_string())
     });
+    tracing::debug!("the service link has stopped");
     // The socket is this process's to remove: leaving it behind would make the next
     // `start` look like a service that is already running.
     #[cfg(unix)]
@@ -303,6 +304,7 @@ pub fn serve(pending: Pending, workspace: &Path, socket: &Path) -> Result<(), St
     if let Err(error) = harness.shutdown() {
         tracing::warn!(%error, "the composition did not shut down cleanly");
     }
+    tracing::debug!("the service composition has stopped");
     outcome
 }
 
