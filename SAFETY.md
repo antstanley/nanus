@@ -91,7 +91,7 @@ model profiles are refused before image I/O/HTTP. The library performs no URL fe
 
 The interactive interface has one escape hatch that does not go through the model. A
 prompt that opens with `!` is a shell command **you** are running: the interface echoes
-it, runs it with `sh -c` in the directory it was started in, and draws what came back.
+it, runs it with `sh -c` on Unix or `cmd /C` on Windows in the directory it was started in, and draws what came back.
 
 This is not the agent acting, and it is worth being clear about what it therefore is
 not:
@@ -156,12 +156,20 @@ readable by anything running as you — as the environment variable already was.
 point of the store is to get a key *out* of the environment and out of the
 configuration file, not to defend it from the user's own processes.
 
-## The agent's socket
+## The agent's local link
 
-An agent serving an interface — or a service — listens on a Unix domain socket under
+On Unix, an agent serving an interface — or a service — listens on a domain socket under
 `$NANUS_HOME/run/`. The socket is created `0600` inside a `0700` directory, so only
 your user can connect to it, and it is a local socket: nothing listens on an address
 and no packet reaches a network interface.
+
+On Windows the local endpoint is a SID-named pipe, with remote clients rejected and the
+first instance refusing an existing owner. The default descriptor grants full control to
+the creator, LocalSystem, and Administrators, and read access to Everyone and Anonymous.
+The Windows link does **not** defend against another user on the same machine; single-user
+sandboxed environments are assumed and the cross-user connection test is deferred. The
+actual descriptor is read back by a native test rather than inferred from the pipe name.
+Native Windows runtime verification is pending in the transport CI workflow.
 
 The trust boundary is *processes running as you*, and it is worth being precise about
 what that means. A program that can connect to the socket can send a prompt to an

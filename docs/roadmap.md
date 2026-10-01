@@ -292,7 +292,7 @@ the question is only whether the child needs help.
 |---|---|---|---|
 | 27 | **An OS-enforced sandbox.** | **XL** | Confinement is advisory: the tools refuse or confine writes, but an approved program can do anything the user can, including reach the network. Landlock or seccomp on Linux and `sandbox-exec` on macOS, with the platform and `unsafe` story written down first. |
 | 28 | **Network confinement.** | **XL** | Part of 27, and separable only if 27 lands as a mechanism with more than one policy. |
-| 29 | **Windows support.** | **XL** | The link is a Unix domain socket and the shell adapter depends on `nix` for process groups, so this is a transport plus a process-lifecycle story, not a build flag. |
+| 29 | **Windows support.** | **XL** | SID-named pipes, detached service lifecycle, and a Job Object shell are implemented; native Windows runtime verification remains pending in `local-transports.yml`. See [the transport design](link-transports.md). |
 | 30 | **Automated end-to-end tests for the interface.** | **M** | Raw mode needs a real terminal; a PTY-backed test binary would cover the alternate screen and the drawing that are manual today. |
 | 31 | **Background tasks (`Ctrl+B`).** | **L** | Needs a task model the agent and the session own, not just a key in the interface. |
 

@@ -1,10 +1,12 @@
 # Design note: the local link's transports
 
-**Status: proposed. Nothing here is implemented.** Today the link is a Unix domain socket
-and nothing else; see [the service page](service.md#known-limits) and
-[status](status.md). This note records what to build to give the link a Windows
-transport, and what must not change while doing it. It is roadmap item 29, cut into the
-part that is the link.
+**Status: implemented; native Windows verification pending.** The transport seam,
+SID-named pipes, detached service lifecycle, and Job Object shell are in the tree.
+The Unix tests pass with their test bodies unchanged. The Windows link, capability
+wrapper, and shell tests cross-compile and lint on macOS; runtime evidence must come
+from `.github/workflows/local-transports.yml` on `windows-latest` before Windows support
+is called verified. This note implements the link and process-lifecycle portion of
+roadmap item 29.
 
 ## The decision
 
@@ -250,12 +252,32 @@ separate risk, and they should not ride on the transport change:
 - The platform tests are gated by `cfg`, so each OS runs its own and neither runs the
   other's.
 
-## Open questions
+## Implementation decisions and verification
 
-- Which crate provides the Job Object: `win32job` for the job alone, or `process-wrap` for the
-  whole spawn? The first is narrower and has a single maintainer; the second is far more used
-  but would replace how the shell adapter spawns. Decide against current versions when the
-  shell is ported.
+- `nanus-sys-windows` pins `winsafe` to `=0.0.29` for the SID and uses `process-wrap`
+  10.0.1 for spawning into a kill-on-close Job Object. The latter suspends the process
+  until assignment and resumes it afterwards: assigning an already running child with
+  `win32job` would leave a window for a grandchild to escape. The wrapper exposes no raw
+  handles or FFI types. Its liveness probe checks job cleanup without making an inaccessible
+  process look dead.
+- No Rust `unsafe` or lint override was needed. The fallback exception above remains unused;
+  every crate, including the wrapper, inherits the workspace's forbid and states it in its
+  crate root. CI checks those properties, so there is no duplicate lint table to drift.
+- Unix retains Tokio's owned socket halves. Windows splits the concrete stream with Tokio's
+  safe owned halves; the enum itself uses no boxing or dynamic dispatch.
+- `Client::open` accepts `Into<Stream>`, and `serve` accepts `Into<Listener>`, to keep existing
+  Unix fixtures source compatible. Both protocol implementations still use `wire.rs`, the same
+  protocol version, and the same frame cap.
+- The descriptor read-back uses Windows PowerShell's .NET Framework
+  `PipeStream.GetAccessControl`, on a pipe created by the actual transport. It checks that
+  writers are the current SID, LocalSystem, and Administrators, and that Everyone and Anonymous
+  have only read access. It introduces no Rust FFI. This is intentionally a check of the default
+  descriptor's actual grants, not a claim that it equals Unix `0600`.
+- Windows shell tests exercise output bounds, stdin, failed spawning, timeout, dropped-run
+  cancellation, streamed shutdown, and death of a real grandchild. Service shutdown continues
+  to use the same link request; Windows foreground processes also watch Ctrl-C.
+- The cross-user connection test remains deferred. The native Windows ACL, pipe, Job Object,
+  detached-service smoke test, and binary build results are still pending; cross-compilation is not runtime evidence.
 
 ## Decided
 

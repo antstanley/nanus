@@ -26,12 +26,14 @@ pub const SERVICE_SOCKET: &str = "agent.sock";
 
 /// Returns the directory sockets live in.
 #[must_use]
+#[cfg(unix)]
 pub fn run_dir(home: &Path) -> PathBuf {
     home.join(RUN_DIR)
 }
 
 /// Returns the path the long-running service listens on.
 #[must_use]
+#[cfg(unix)]
 pub fn service_socket(home: &Path) -> PathBuf {
     run_dir(home).join(SERVICE_SOCKET)
 }
@@ -41,10 +43,47 @@ pub fn service_socket(home: &Path) -> PathBuf {
 /// Named after the process rather than chosen randomly so that a socket left behind by
 /// a crash can be attributed to the run that made it.
 #[must_use]
+#[cfg(unix)]
 pub fn attached_socket(home: &Path, pid: u32) -> PathBuf {
     run_dir(home).join(format!("attach-{pid}.sock"))
 }
 
+/// Computes the service endpoint independently at either end of the link.
+///
+/// SID lookup can fail on Windows; a failure never falls back to a shared pipe name.
+pub fn service_endpoint(home: &Path) -> crate::LinkResult<crate::transport::Endpoint> {
+    #[cfg(unix)]
+    {
+        Ok(service_socket(home))
+    }
+    #[cfg(windows)]
+    {
+        let _ = home;
+        pipe_endpoint("agent")
+    }
+}
+
+/// Computes the endpoint of a shell-scoped agent from its owning process.
+pub fn attached_endpoint(home: &Path, pid: u32) -> crate::LinkResult<crate::transport::Endpoint> {
+    #[cfg(unix)]
+    {
+        Ok(attached_socket(home, pid))
+    }
+    #[cfg(windows)]
+    {
+        let _ = home;
+        pipe_endpoint(&format!("attach-{pid}"))
+    }
+}
+
+#[cfg(windows)]
+fn pipe_endpoint(name: &str) -> crate::LinkResult<crate::transport::Endpoint> {
+    let sid = nanus_sys_windows::current_user_sid()
+        .map_err(|error| crate::LinkError::agent(error.to_string()))?;
+    Ok(PathBuf::from(format!(r"\\.\pipe\nanus-{sid}-{name}")))
+}
+
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;

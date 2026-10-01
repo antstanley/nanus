@@ -60,6 +60,7 @@ async fn an_absolute_path_outside_the_root_is_rejected() {
     assert!(matches!(error, FsError::OutsideWorkspace { .. }), "{error}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_symlinked_directory_that_escapes_is_rejected() {
     let (dir, fs) = workspace();

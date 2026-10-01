@@ -28,8 +28,12 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+nanus-sys-windows = { workspace = true }
+
 [dev-dependencies]
 futures = { workspace = true }
+uuid = { workspace = true }
 nanus-adapter-local = { workspace = true }
 nanus-adapter-store = { workspace = true }
 nanus-kernel = { workspace = true }

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use nanus_bundle::compose::Pending;
-use nanus_link::paths::attached_socket;
+use nanus_link::paths::attached_endpoint;
 use nanus_link::server::{Agent, bind, serve};
 
 use crate::block_on_local;
@@ -79,7 +79,8 @@ pub fn resolve_binary() -> Result<PathBuf, String> {
 /// interface cannot be started, or it exits non-zero.
 pub fn attached(pending: Pending, workspace: &Path, arguments: &[OsString]) -> Result<(), String> {
     let binary = resolve_binary()?;
-    let socket = attached_socket(&crate::service::home()?, std::process::id());
+    let socket = attached_endpoint(&crate::service::home()?, std::process::id())
+        .map_err(|error| error.to_string())?;
     let harness = pending.start().map_err(|error| error.to_string())?;
     let agent = Rc::new(Agent::new(&harness, workspace));
 
@@ -107,6 +108,7 @@ pub fn attached(pending: Pending, workspace: &Path, arguments: &[OsString]) -> R
         (served, status.await.ok().flatten())
     });
 
+    #[cfg(unix)]
     let _removed = std::fs::remove_file(&socket);
     if let Err(error) = harness.shutdown() {
         tracing::warn!(%error, "the composition did not shut down cleanly");

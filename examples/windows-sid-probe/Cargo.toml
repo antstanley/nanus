@@ -7,8 +7,7 @@ publish = false
 # A probe, not a product: it checks that the safe `winsafe` call chain
 # `docs/link-transports.md` chose for naming a pipe by the current user's SID returns a
 # usable value on a real Windows host. It is outside the workspace for the same reason
-# `examples/embedded` is, and it is to be absorbed into the Windows wrapper crate's own tests
-# when that crate exists.
+# `examples/embedded` is, and now exercises the product wrapper; the wrapper also carries its own native tests.
 [workspace]
 
 # Not `[lints] workspace = true`: there is no workspace here to inherit from, so the one rule
@@ -17,4 +16,4 @@ publish = false
 unsafe_code = "forbid"
 
 [target.'cfg(windows)'.dependencies]
-winsafe = { version = "=0.0.29", default-features = false, features = ["advapi", "kernel"] }
+nanus-sys-windows = { path = "../../crates/nanus-sys-windows" }

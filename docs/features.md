@@ -612,10 +612,10 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   Unknown and refuse images.
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
-- **The link is Unix-only and local.** No remote mode, no authentication — there is no
-  remote mode to secure. The stock shell, link, and service are Unix-only, so the `nanus`
-  and `nanus-tui` binaries do not run on Windows; only the minimal embedded runner is
-  verified natively there (see [status](status.md)).
+- **The link is local.** Unix sockets and Windows SID-named pipes share the same frames.
+  Windows service lifecycle and the Job Object shell are implemented; native Windows runtime
+  evidence is still pending (see [status](status.md) and [the transport design](link-transports.md)).
+  There is no remote mode, and the Windows link does not defend against another local user.
 - **The sandbox is not OS-enforced.** Nothing confines an approved program's
   writes, its network access, or its process table.
 - **A session is claimed for writing.** Two writers on one log cannot silently lose a turn:

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use nanus_adapter_config::NanusConfig;
 use nanus_bundle::compose::Pending;
-use nanus_link::paths::service_socket;
+use nanus_link::paths::service_endpoint;
 use nanus_link::server::{Agent, bind, serve as serve_link};
 use nanus_link::{Client, LinkError};
 
@@ -101,7 +101,7 @@ pub fn socket_path(config: &NanusConfig, explicit: Option<&Path>) -> Result<Path
     if let Some(path) = explicit.or(config.service_socket.as_deref()) {
         return Ok(path.to_path_buf());
     }
-    Ok(service_socket(&home()?))
+    service_endpoint(&home()?).map_err(|error| error.to_string())
 }
 
 /// Returns the file a detached service logs to.
@@ -206,6 +206,7 @@ fn spawn_detached(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(sink));
+    configure_detached(&mut command);
     command
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", binary.display()))
@@ -262,6 +263,7 @@ async fn wait_until_ready(
 /// someone ran the hidden flag by hand from a job-control shell. That is worth a warning
 /// rather than a failure: the service still works, it is merely still attached to the
 /// terminal that started it.
+#[cfg(unix)]
 fn detach_from_terminal() {
     match nix::unistd::setsid() {
         Ok(_) => tracing::debug!("the service detached into a session of its own"),
@@ -289,6 +291,7 @@ pub fn serve(pending: Pending, workspace: &Path, socket: &Path) -> Result<(), St
     });
     // The socket is this process's to remove: leaving it behind would make the next
     // `start` look like a service that is already running.
+    #[cfg(unix)]
     let _removed = std::fs::remove_file(socket);
     if let Err(error) = harness.shutdown() {
         tracing::warn!(%error, "the composition did not shut down cleanly");
@@ -298,7 +301,7 @@ pub fn serve(pending: Pending, workspace: &Path, socket: &Path) -> Result<(), St
 
 /// Serves connections until a signal asks this process to stop.
 async fn serve_until_signal(
-    listener: tokio::net::UnixListener,
+    listener: impl Into<nanus_link::transport::Listener>,
     agent: Rc<Agent>,
 ) -> Result<(), LinkError> {
     serve_link(listener, agent, shutdown_signal()).await
@@ -308,6 +311,7 @@ async fn serve_until_signal(
 ///
 /// A `shutdown` request over the link is handled inside `nanus_link::serve`; this is the
 /// other door, the one a supervisor and a Ctrl-C use.
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -389,6 +393,32 @@ pub fn status(socket: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Unix detaches in the child, before mounting the agent.
+#[cfg(unix)]
+fn configure_detached(_command: &mut std::process::Command) {}
+
+/// Windows detaches at creation, without opening a second service lifecycle.
+#[cfg(windows)]
+fn configure_detached(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(windows)]
+fn detach_from_terminal() {
+    // The parent already supplied the creation flags. There is no setsid equivalent to call here.
+}
+
+#[cfg(windows)]
+async fn shutdown_signal() {
+    let Ok(mut interrupt) = tokio::signal::windows::ctrl_c() else {
+        return std::future::pending().await;
+    };
+    interrupt.recv().await;
 }
 
 #[cfg(test)]

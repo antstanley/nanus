@@ -1,0 +1,51 @@
+name: Local transports
+on:
+  push:
+    branches: [main, 'codex/windows-*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  local-link:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint both binaries and the platform implementation
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test the link and Windows capability boundary
+        run: cargo test -p nanus-link -p nanus-sys-windows --all-features --locked
+      - name: Test Unix shell lifecycle
+        if: runner.os != 'Windows'
+        run: cargo test -p nanus-adapter-local --test shell --locked
+      - name: Test Windows shell lifecycle and grandchild cleanup
+        if: runner.os == 'Windows'
+        run: cargo test -p nanus-adapter-local --test windows_shell --locked
+      - name: Build both programs natively
+        run: cargo build --workspace --locked
+      - name: Test detached start, duplicate refusal, status, stop, and restart
+        run: python scripts/test-local-service.py
+      - name: Keep Rust unsafe forbidden in every crate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+          workspace = tomllib.loads(Path('Cargo.toml').read_text())
+          assert workspace['workspace']['lints']['rust']['unsafe_code'] == 'forbid'
+          for member in workspace['workspace']['members']:
+              manifest = tomllib.loads((Path(member) / 'Cargo.toml').read_text())
+              assert manifest['lints']['workspace'], member
+              crate = Path(member) / 'src/lib.rs'
+              if not crate.exists():
+                  crate = Path(member) / 'src/main.rs'
+              assert '#![forbid(unsafe_code)]' in crate.read_text(), member
+          PY

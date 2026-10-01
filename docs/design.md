@@ -29,6 +29,11 @@ An agent harness runs commands as `sh -c "…"`, which means the process doing t
 is a **grandchild**. `kill_on_drop(true)` and `Child::kill()` do not reap
 grandchildren. A killed tool leaves a process running behind it.
 
+On Windows the shell uses `cmd /C` and a kill-on-close Job Object through the safe
+`nanus-sys-windows` wrapper. `process-wrap` suspends the child until job assignment,
+so grandchildren cannot escape between spawning and assignment. No Rust `unsafe` exception
+was needed; the workspace forbid remains absolute.
+
 This was measured, not assumed: the experiment is reproducible and the finding is
 recorded in the research repository. `nanus` spawns with `process_group(0)` and kills
 the group. There is a test that reproduces the orphan and asserts it is gone.
@@ -190,7 +195,9 @@ whole view layer in the dependency set of `nanus run`. That trade is worth makin
 deliberately, rather than discovering it later as "why is our CLI 40 MB".
 
 The socket is a [local link](../docs/tui.md#the-link): one frame per line of JSON over a
-Unix domain socket, `0600` inside a `0700` directory. There is no safe *in-process* channel
+Unix domain socket, `0600` inside a `0700` directory, or a SID-named local Windows pipe.
+Both carry the same protocol. The Windows default descriptor and its cross-user limit are
+documented in [the transport design](link-transports.md). There is no safe *in-process* channel
 between two processes — sharing memory across a `fork` needs `mmap` and `unsafe`, and this
 workspace forbids `unsafe` everywhere — so a domain socket is what "in memory" reduces to
 when the two ends are two programs.

@@ -43,6 +43,14 @@ The standalone `examples/embedded` manifest is tested/run with and without `--fe
 its own lockfile and native Windows/macOS CI matrix prevent workspace feature unification from
 hiding adapter imports. Native Windows and live-provider results must be reported separately.
 
+**Local transports.** `.github/workflows/local-transports.yml` builds and lints both binaries
+on Linux, macOS, and Windows, runs the shared link tests plus each platform's transport tests,
+and exercises shell lifecycle on the native OS. `nanus-link/tests/windows.rs` checks real named
+pipes and reads the default descriptor through .NET Framework; `windows_shell.rs` checks real
+Job Object grandchildren on timeout, cancellation, and shutdown. Cross-compiling those tests
+checks the API surface; it does not prove ACL or process behavior. Native Windows evidence for
+this implementation is pending.
+
 **Live vision evidence.** `nanus-bundle/tests/live_vision.rs` is `#[ignore]`d and exists only with
 the `stock-compose` feature, because it spends credit and reads the stored credentials. It sends the
 body each adapter's own `encode` produces for a two-call session and requires a described image and a

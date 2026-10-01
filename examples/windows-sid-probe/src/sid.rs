@@ -1,38 +1,6 @@
-//! The call chain, and the tests that hold it to a real host.
+//! The shipped safe wrapper, exercised on a native Windows host.
 
-use winsafe::{self as w, co};
-
-/// Why the current user's SID could not be read.
-#[derive(Debug, PartialEq, Eq)]
-pub enum SidError {
-    /// A Win32 call failed; carries the system's message.
-    Os(String),
-    /// The token answered with something other than the user it was asked for.
-    NotAUser,
-    /// The token's user has no SID.
-    NoSid,
-}
-
-/// Returns the current process's user SID in its string form, such as `S-1-5-21-…-1001`.
-///
-/// # Errors
-///
-/// Returns [`SidError`] when the token cannot be opened or read, or has no SID.
-pub fn current_user_sid() -> Result<String, SidError> {
-    let token = w::HPROCESS::GetCurrentProcess()
-        .OpenProcessToken(co::TOKEN::QUERY)
-        .map_err(|error| SidError::Os(error.to_string()))?;
-    let info = token
-        .GetTokenInformation(co::TOKEN_INFORMATION_CLASS::User)
-        .map_err(|error| SidError::Os(error.to_string()))?;
-    let w::TokenInfo::User(user) = info else {
-        return Err(SidError::NotAUser);
-    };
-    user.User
-        .Sid()
-        .map(|sid| sid.to_string())
-        .ok_or(SidError::NoSid)
-}
+pub use nanus_sys_windows::{SidError, current_user_sid};
 
 #[cfg(test)]
 mod tests {

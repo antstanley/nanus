@@ -37,11 +37,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::transport::{Listener, OwnedWriteHalf, Stream};
 use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{
@@ -53,8 +53,6 @@ use nanus_domain::{
 };
 use nanus_ports::{ClockHandle, StoreHandle};
 use tokio::io::BufReader;
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -1470,53 +1468,7 @@ async fn broadcast_awaited(held: &Held, frame: Frame, except: Option<u64>) {
     }
 }
 
-/// Binds a listener at `path`, creating the run directory if it is missing.
-///
-/// A socket file left behind by a process that died cannot be bound over, and cannot be
-/// told from a live one by looking at it, so the only honest test is to ask it. The
-/// permissions are narrowed to the owner: a socket that any local user can connect to is
-/// a socket that any local user can drive an agent through.
-///
-/// # Errors
-///
-/// Returns [`LinkError::Io`] when the directory cannot be created, the bind fails, or
-/// the permissions cannot be set.
-pub async fn bind(path: &Path) -> LinkResult<UnixListener> {
-    let Some(parent) = path.parent() else {
-        return Err(LinkError::protocol(format!(
-            "{} has no directory to bind in",
-            path.display()
-        )));
-    };
-    create_run_dir(parent)?;
-    if path.exists() && UnixStream::connect(path).await.is_err() {
-        let removed = tokio::fs::remove_file(path).await;
-        if let Err(error) = removed {
-            tracing::debug!(%error, "a stale socket could not be cleared");
-        }
-    }
-    let listener = UnixListener::bind(path)?;
-    restrict(path)?;
-    Ok(listener)
-}
-
-/// Creates the run directory with owner-only permissions.
-fn create_run_dir(path: &Path) -> LinkResult<()> {
-    if path.is_dir() {
-        return Ok(());
-    }
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.mode(0o700);
-    builder.create(path)?;
-    Ok(())
-}
-
-/// Narrows a socket's permissions to its owner.
-fn restrict(path: &Path) -> LinkResult<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
+pub use crate::transport::bind;
 
 /// Serves connections until `stop` resolves or a client asks the agent to stop.
 ///
@@ -1528,21 +1480,18 @@ fn restrict(path: &Path) -> LinkResult<()> {
 ///
 /// Returns [`LinkError::Io`] when accepting fails.
 pub async fn serve(
-    listener: UnixListener,
+    listener: impl Into<Listener>,
     agent: Rc<Agent>,
     stop: impl Future<Output = ()>,
 ) -> LinkResult<()> {
     // What this agent calls itself in the claim it takes on each session it holds: the socket it
     // answers on, because the sentence a refused writer reads should say *where* the conversation
     // is being written and what to do about it, and a pid does not.
-    let owner = listener
-        .local_addr()
-        .ok()
-        .and_then(|socket| socket.as_pathname().map(Path::to_path_buf))
-        .map_or_else(
-            || format!("a nanus agent (pid {})", std::process::id()),
-            |socket| format!("nanus at {}", socket.display()),
-        );
+    let mut listener = listener.into();
+    let owner = listener.endpoint().map_or_else(
+        || format!("a nanus agent (pid {})", std::process::id()),
+        |endpoint| format!("nanus at {}", endpoint.display()),
+    );
     let registry = Rc::new(Registry::new(agent, owner));
     let shutdown = Rc::new(Notify::new());
     let mut connections: JoinSet<()> = JoinSet::new();
@@ -1557,7 +1506,7 @@ pub async fn serve(
                 }
             }
             accepted = listener.accept() => {
-                let (stream, _address) = accepted?;
+                let stream = accepted?;
                 let registry = Rc::clone(&registry);
                 let shutdown = Rc::clone(&shutdown);
                 connections.spawn_local(async move {
@@ -1639,7 +1588,7 @@ async fn refuse_if_detached(
 // it into a helper per arm would hide that; the complexity is the protocol's, not the logic's.
 #[allow(clippy::cognitive_complexity)]
 async fn serve_connection(
-    stream: UnixStream,
+    stream: Stream,
     registry: Rc<Registry>,
     shutdown: &Rc<Notify>,
 ) -> LinkResult<()> {

@@ -38,7 +38,7 @@ instructions.
 
 ## Repository layout
 
-Fourteen crates in a Cargo workspace. Dependencies point **inward**; this is enforced
+Fifteen crates in a Cargo workspace. Dependencies point **inward**; this is enforced
 by the manifests, not by review. `nanus-domain` has no `tokio`, no `reqwest`, and
 no filesystem, so agent decisions can be tested without a network.
 
@@ -73,7 +73,8 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 | `crates/nanus-adapter-store` | Atomic JSONL session persistence with time-ordered ids. |
 | `crates/nanus-adapter-config` | TOML configuration with a real migration chain. |
 | `crates/nanus-bundle` | The toolset, the agent loop, and the **only** place that names concrete adapters. |
-| `crates/nanus-link` | The local link: the frame vocabulary, the Unix-socket client, and (behind the `server` feature) the half that serves an agent. This is the only thing the core and the interface share. |
+| `crates/nanus-link` | The local link: the frame vocabulary, the platform-selected local client, and (behind the `server` feature) the half that serves an agent. This is the only thing the core and the interface share. |
+| `crates/nanus-sys-windows` | Narrow safe SID lookup and Job Object process ownership. Empty on Unix; no Rust `unsafe` or raw handles are exposed. |
 | `crates/nanus-cli` | The `nanus` binary: `run`, `service`, `config`, `sessions`, and the shell-scoped agent behind `tui`. **It does not depend on `nanus-tui`.** |
 | `crates/nanus-tui` | The interface, as its own binary (`nanus-tui`) plus a library: view, input buffer, replay, and the event loop. It depends on the link client, the session store, and the configuration file it reads its own display preferences from — and on no toolset, provider adapter, or agent loop. |
 

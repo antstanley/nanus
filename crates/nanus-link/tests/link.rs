@@ -9,7 +9,7 @@
 //! The model is scripted, so the suite needs no credential and no network. The point is
 //! the transport and the sessions, not the provider.
 
-#![cfg(feature = "server")]
+#![cfg(all(feature = "server", unix))]
 // A panic in a test *is* the assertion, and a fixture with no sane default has nowhere
 // else to put the failure. The workspace denies the lint for production code.
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]

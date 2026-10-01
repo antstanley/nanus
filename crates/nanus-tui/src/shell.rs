@@ -103,8 +103,12 @@ impl Outcome {
 /// are rooted — the two are the same in the ordinary case of `nanus tui` in a project, and a reader
 /// who attached to a service elsewhere should still get their own shell.
 pub(crate) async fn run(command: &str) -> Outcome {
-    let child = Command::new("sh")
-        .arg("-c")
+    #[cfg(unix)]
+    let (program, flag) = ("sh", "-c");
+    #[cfg(windows)]
+    let (program, flag) = ("cmd", "/C");
+    let child = Command::new(program)
+        .arg(flag)
         .arg(command)
         // The streams are read rather than inherited, so the output can be drawn in the transcript
         // rather than appearing behind the alternate screen the interface is drawing on — and
@@ -283,6 +287,7 @@ mod tests {
     }
 
     /// The whole path: a real shell, a real child process, and the streams back.
+    #[cfg(unix)]
     #[test]
     fn a_command_runs_through_a_shell_and_reports_what_it_did() {
         let ran = nanus_kernel::runtime::block_on_local(async {
@@ -303,6 +308,7 @@ mod tests {
 
     /// A shell's own syntax is the shell's business: the line is handed over whole rather than split
     /// by the interface.
+    #[cfg(unix)]
     #[test]
     fn the_line_is_a_command_line_rather_than_an_argument_list() {
         let piped = nanus_kernel::runtime::block_on_local(async {
@@ -316,10 +322,29 @@ mod tests {
     /// command that hangs: the interface's own standard input is a raw-mode terminal whose keystrokes
     /// belong to the composer, and there is no end of file to give it. This test would never finish if
     /// the terminal were inherited.
+    #[cfg(unix)]
     #[test]
     fn a_command_that_reads_standard_input_gets_an_end_of_input() {
         let read = nanus_kernel::runtime::block_on_local(async { run("cat").await });
         assert!(read.succeeded(), "{read:?}");
         assert_eq!(read.stdout, "", "there was nothing to read, and no wait");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_escape_runs_cmd_and_reports_success_and_failure() {
+        let (success, failure, piped) = nanus_kernel::runtime::block_on_local(async {
+            (
+                run("echo hello").await,
+                run("echo failure 1>&2 & exit /b 3").await,
+                run("echo hello | findstr hello").await,
+            )
+        });
+        assert!(success.succeeded());
+        assert_eq!(success.stdout.trim(), "hello");
+        assert_eq!(failure.status, Some(3));
+        assert!(failure.stderr.contains("failure"));
+        assert!(piped.succeeded());
+        assert_eq!(piped.stdout.trim(), "hello");
     }
 }

@@ -13,6 +13,7 @@ members = [
     "crates/nanus-adapter-config",
     "crates/nanus-bundle",
     "crates/nanus-link",
+    "crates/nanus-sys-windows",
     "crates/nanus-cli",
     "crates/nanus-tui",
 ]
@@ -44,6 +45,7 @@ nanus-adapter-store = { path = "crates/nanus-adapter-store" }
 nanus-adapter-config = { path = "crates/nanus-adapter-config" }
 nanus-bundle = { path = "crates/nanus-bundle" }
 nanus-link = { path = "crates/nanus-link" }
+nanus-sys-windows = { path = "crates/nanus-sys-windows" }
 nanus-cli = { path = "crates/nanus-cli" }
 nanus-tui = { path = "crates/nanus-tui" }
 

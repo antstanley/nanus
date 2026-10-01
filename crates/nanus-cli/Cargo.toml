@@ -27,7 +27,6 @@ nanus-ports = { workspace = true }
 nanus-adapter-config = { workspace = true }
 # `setsid`, so a detached service survives the shell that started it. A safe wrapper
 # rather than a raw syscall, because the workspace forbids `unsafe` everywhere.
-nix = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -42,6 +41,9 @@ proptest = { workspace = true }
 # really removes the directory — all of which are the adapter's behaviour.
 nanus-adapter-store = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [lints]
 workspace = true

@@ -21,8 +21,11 @@
 //! permissions narrowed to that user, so the reachable set is "processes already running
 //! as you", which can read the workspace and the session store anyway.
 //!
-//! The transport is a Unix socket rather than a named pipe because the workspace already
-//! depends on `nix` for process groups, so Windows was never a target.
+//! Windows builds instead use a local named pipe computed from the current user's SID.
+//! Remote clients are rejected and a second owner of the name is refused. The default
+//! descriptor includes privileged principals and read access for Everyone; this link is
+//! intended for single-user sandboxed environments, not cross-user isolation. Both platforms
+//! share the protocol and its frame cap; the transport is selected at compile time.
 //!
 //! ## The two halves
 //!
@@ -55,6 +58,7 @@ pub mod paths;
 pub mod protocol;
 #[cfg(feature = "server")]
 pub mod server;
+pub mod transport;
 pub mod wire;
 
 pub use client::Client;

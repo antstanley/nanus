@@ -15,7 +15,8 @@ nanus service stop         # stop it, cleanly
 ## Starting it
 
 `nanus service start` composes an agent, then runs *this same binary* again with a hidden
-`--detached` flag, which puts the child in a session of its own. Detaching is not
+`--detached` flag, which puts the child in a session of its own on Unix. On Windows the parent creates
+the child with `DETACHED_PROCESS` and `CREATE_NEW_PROCESS_GROUP`. Detaching is not
 cosmetic: a process in the shell's process group receives the hangup when the terminal
 closes, and an agent that dies with the terminal is not a service.
 
@@ -51,8 +52,8 @@ signal and does not wait for the acknowledgement: the agent finishes the frame i
 writing, removes its socket, and exits, and a `stop` that hung whenever the agent exited
 before flushing would be worse than one that reports what it asked for.
 
-`SIGTERM` and `SIGINT` are honoured too, because that is what every supervisor sends and
-what Ctrl-C in `--foreground` means.
+`SIGTERM` and `SIGINT` are honoured on Unix; Windows foreground service processes
+watch Ctrl-C. Stopping over the link works on both transports.
 
 `nanus service status` exits non-zero when nothing is answering, so a script can branch on
 it:
@@ -129,15 +130,33 @@ ignored: `nanus tui` binds its own socket for the agent it starts, so there is n
 the flag to select. For a permanent second service, set `service_socket` in a
 configuration file and select the file with `--config`.
 
+## Windows supervision
+
+There is no Service Control Manager integration and no `LocalSystem` agent. Run the service
+as the same user as the interface, either detached or with `--foreground` under a supervisor.
+Task Scheduler with an **at log on** trigger can run as that user without storing a password
+or requiring administrator rights; NSSM-style wrappers are another option when configured
+for that user's identity. A detached process survives its shell, but ends at logoff and
+is not started at boot when nobody is logged in.
+
+The default endpoint is always computed; `run/agent.sock` and custom filesystem socket paths
+are Unix endpoints. The legacy `--socket` option denotes a full local pipe endpoint on Windows.
+Logs and configuration still use filesystem paths on either platform. Native Windows behavior
+must be verified before treating this port as release support.
+
 ## Known limits
 
-- **The socket is local and Unix-only.** There is no remote mode and no Windows support:
-  the workspace already depends on `nix` for process-group signalling, so Windows was
-  never a target, and the link is a Unix domain socket.
-- **The link trusts its peer.** The socket is `0600` inside a `0700` directory, so only
-  the same user can connect — and a process running as that user can already read the
-  workspace and the session log. The frame-size cap is about not handing unbounded
-  *parsing* to a confused peer, not about defending against a hostile one.
+- **The link is local.** Unix uses a domain socket under the nanus home; Windows uses
+  `\\.\pipe\nanus-<sid>-agent`, computed independently by the client and service from the
+  current user's SID. Windows pipes reject remote clients and refuse a second owner.
+  There is no remote mode. Native Windows verification is pending in
+  [the transport workflow](../.github/workflows/local-transports.yml).
+- **The link trusts its peer.** On Unix the socket is `0600` inside a `0700` directory.
+  Windows uses the default pipe descriptor, whose full-control principals are the creator,
+  LocalSystem, and Administrators, with read access for Everyone and Anonymous. The Windows
+  link does not defend against another user on the same machine; a cross-user connection
+  test is deferred and single-user sandboxed environments are assumed. The descriptor
+  read-back test runs in native Windows CI. The frame cap bounds parsing, not hostile peers.
 - **A session is claimed, not locked.** The agent claims every session it holds, for as long
   as it holds it, so a second `nanus` — a `run --resume`, another service — is refused with a
   sentence naming this agent's socket. The claim is a lock the operating system holds on a

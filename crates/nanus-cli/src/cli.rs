@@ -815,9 +815,19 @@ async fn prepare_service(args: &Options, action: ServiceAction) -> Result<Ready,
 /// Resolves when the signal arrives, or immediately when it cannot be watched for at all — a
 /// platform without the signal, in which case the turn simply runs to completion as it did
 /// before. Nothing here prints: what the reader sees is the turn's own ending.
+#[cfg(unix)]
 async fn watch_for_interrupt(stop: Rc<Stop>) {
     use tokio::signal::unix::{SignalKind, signal};
     let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+        return;
+    };
+    interrupt.recv().await;
+    stop.raise();
+}
+
+#[cfg(windows)]
+async fn watch_for_interrupt(stop: Rc<Stop>) {
+    let Ok(mut interrupt) = tokio::signal::windows::ctrl_c() else {
         return;
     };
     interrupt.recv().await;

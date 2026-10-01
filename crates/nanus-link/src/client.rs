@@ -18,9 +18,8 @@
 
 use std::path::Path;
 
+use crate::transport::{OwnedReadHalf, OwnedWriteHalf, Stream};
 use tokio::io::{AsyncWriteExt as _, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
@@ -44,7 +43,7 @@ impl Client {
     /// when the peer hung up before its handshake, and [`LinkError::Protocol`] when the
     /// handshake is not one.
     pub async fn connect(path: &Path) -> LinkResult<Self> {
-        let stream = UnixStream::connect(path)
+        let stream = Stream::connect(path)
             .await
             .map_err(|source| LinkError::Connect {
                 path: path.to_path_buf(),
@@ -62,8 +61,8 @@ impl Client {
     /// # Errors
     ///
     /// As [`Client::connect`], minus the connection itself.
-    pub async fn open(stream: UnixStream) -> LinkResult<Self> {
-        let (read_half, writer) = stream.into_split();
+    pub async fn open(stream: impl Into<Stream>) -> LinkResult<Self> {
+        let (read_half, writer) = stream.into().into_split();
         let mut reader = BufReader::new(read_half);
         let Some(frame) = read_message::<Frame, _>(&mut reader).await? else {
             return Err(LinkError::Closed);
@@ -320,6 +319,7 @@ impl core::fmt::Debug for Client {
     }
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use tokio::net::UnixStream;

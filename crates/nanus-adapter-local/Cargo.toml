@@ -29,6 +29,9 @@ similar = { workspace = true }
 # workspace's `unsafe_code = "forbid"` stays intact.
 nix = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+nanus-sys-windows = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }

@@ -3,6 +3,7 @@
 //!
 //! An integration-test crate is entirely test code, where a panic *is* the
 //! assertion, so the workspace's panic-family exemption is restated here.
+#![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;

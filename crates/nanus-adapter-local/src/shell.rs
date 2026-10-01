@@ -40,10 +40,20 @@ use nanus_ports::{
     Captured, LocalBoxFuture, SandboxPolicy, ShellError, ShellEvent, ShellOutcome, ShellPort,
     ShellRequest, ShellResult, ShellStream, ensure_within,
 };
+#[cfg(windows)]
+use nanus_sys_windows::Job;
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill, killpg};
+#[cfg(unix)]
 use nix::unistd::Pid;
+#[cfg(windows)]
+use std::collections::BTreeMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt as _};
-use tokio::process::{Child, Command};
+#[cfg(unix)]
+use tokio::process::Child;
+use tokio::process::Command;
+#[cfg(windows)]
+type Child = Arc<Job>;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -68,6 +78,7 @@ const STREAM_DEPTH: usize = 256;
 /// `kill(pid, 0)` succeeds while the process exists and reports `ESRCH` once it is
 /// gone, which is the portable liveness probe the tests use.
 #[must_use]
+#[cfg(unix)]
 pub fn is_alive(pid: i32) -> bool {
     assert!(pid > 0, "a process id is positive");
     kill(Pid::from_raw(pid), None).is_ok()
@@ -79,6 +90,8 @@ struct GroupRegistry {
     /// Live group ids. A set, so insertion is idempotent and its length is the
     /// number of groups shutdown must signal.
     live: HashSet<i32>,
+    #[cfg(windows)]
+    jobs: BTreeMap<i32, Arc<Job>>,
 }
 
 impl GroupRegistry {
@@ -94,6 +107,8 @@ impl GroupRegistry {
     /// `false` is expected after [`LocalShell::kill_all`], which retires groups
     /// eagerly during shutdown.
     fn retire(&mut self, pgid: i32) -> bool {
+        #[cfg(windows)]
+        self.jobs.remove(&pgid);
         self.live.remove(&pgid)
     }
 
@@ -108,6 +123,7 @@ impl GroupRegistry {
     }
 
     /// Takes every live group id, leaving the registry empty.
+    #[cfg(unix)]
     fn take(&mut self) -> Vec<i32> {
         let mut taken: Vec<i32> = self.live.drain().collect();
         taken.sort_unstable();
@@ -243,6 +259,7 @@ async fn join_drain(mut handle: JoinHandle<Captured>) -> Captured {
 }
 
 /// Signals a whole process group.
+#[cfg(unix)]
 fn signal_group(pgid: i32, signal: Signal) -> ShellResult<()> {
     assert!(pgid > 0, "a process group id is positive");
     killpg(Pid::from_raw(pgid), signal).map_err(|source| ShellError::Spawn {
@@ -252,6 +269,7 @@ fn signal_group(pgid: i32, signal: Signal) -> ShellResult<()> {
 }
 
 /// Spawns `command` in its own process group.
+#[cfg(unix)]
 fn spawn_group(
     command: &mut Command,
     program: &str,
@@ -284,6 +302,7 @@ fn spawn_group(
 }
 
 /// Waits for the child, killing the whole group if the budget elapses.
+#[cfg(unix)]
 async fn wait_group(
     child: &mut Child,
     pgid: i32,
@@ -319,6 +338,7 @@ async fn wait_group(
 }
 
 /// Splits an exit status into a code and a signal, one of which is present.
+#[cfg(unix)]
 fn split_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
     use std::os::unix::process::ExitStatusExt as _;
     (status.code(), status.signal())
@@ -351,7 +371,7 @@ async fn run_engine(
     let (mut child, guard, pgid) = spawn_group(&mut command, &request.program, &registry)?;
 
     if let Some(text) = request.stdin.clone()
-        && let Some(mut pipe) = child.stdin.take()
+        && let Some(mut pipe) = take_stdin(&mut child)
     {
         tokio::spawn(async move {
             if let Err(error) = pipe.write_all(text.as_bytes()).await {
@@ -360,8 +380,8 @@ async fn run_engine(
             // Dropping the pipe closes it, which is what unblocks the child.
         });
     }
-    let out_pipe = child.stdout.take();
-    let err_pipe = child.stderr.take();
+    let out_pipe = take_stdout(&mut child);
+    let err_pipe = take_stderr(&mut child);
     let out_sink = sink.clone();
     let err_sink = sink.clone();
     let out_handle = out_pipe.map(|pipe| tokio::spawn(drain(pipe, cap, false, out_sink)));
@@ -499,6 +519,7 @@ impl LocalShell {
     /// This is what shutdown calls. Groups are retired eagerly, so a run that is
     /// still unwinding will find its group already gone and simply not re-retire
     /// it.
+    #[cfg(unix)]
     fn kill_all_blocking(&self) -> usize {
         let groups = lock(&self.registry).take();
         let mut signalled = 0usize;
@@ -584,5 +605,116 @@ impl ShellPort for LocalShell {
 
     fn sandbox(&self) -> SandboxPolicy {
         self.policy.clone()
+    }
+}
+
+#[cfg(unix)]
+fn take_stdin(child: &mut Child) -> Option<tokio::process::ChildStdin> {
+    child.stdin.take()
+}
+#[cfg(unix)]
+fn take_stdout(child: &mut Child) -> Option<tokio::process::ChildStdout> {
+    child.stdout.take()
+}
+#[cfg(unix)]
+fn take_stderr(child: &mut Child) -> Option<tokio::process::ChildStderr> {
+    child.stderr.take()
+}
+#[cfg(windows)]
+// The Unix side needs a mutable child; keep the shared engine's call shape identical.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn take_stdin(child: &mut Child) -> Option<tokio::process::ChildStdin> {
+    child.take_stdin()
+}
+#[cfg(windows)]
+// The Unix side needs a mutable child; keep the shared engine's call shape identical.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn take_stdout(child: &mut Child) -> Option<tokio::process::ChildStdout> {
+    child.take_stdout()
+}
+#[cfg(windows)]
+// The Unix side needs a mutable child; keep the shared engine's call shape identical.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn take_stderr(child: &mut Child) -> Option<tokio::process::ChildStderr> {
+    child.take_stderr()
+}
+
+#[cfg(windows)]
+fn job_error(error: &nanus_sys_windows::JobError) -> ShellError {
+    ShellError::Spawn {
+        program: String::from("the Windows job"),
+        message: error.to_string(),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_group(
+    command: &mut Command,
+    program: &str,
+    registry: &Arc<Mutex<GroupRegistry>>,
+) -> ShellResult<(Child, LiveGroup, i32)> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let command = std::mem::replace(command, Command::new(program));
+    let job = Arc::new(Job::spawn(command).map_err(|error| job_error(&error))?);
+    let pid = i32::try_from(job.pid()).map_err(|_| ShellError::Spawn {
+        program: program.to_owned(),
+        message: String::from("the pid does not fit in an i32"),
+    })?;
+    let guard = LiveGroup::register(registry, pid);
+    let previous = lock(registry).jobs.insert(pid, Arc::clone(&job));
+    assert!(previous.is_none(), "a live job is registered exactly once");
+    Ok((job, guard, pid))
+}
+
+#[cfg(windows)]
+// Waiting mutates the Unix child; the Windows job puts that state behind its mutex.
+#[allow(clippy::needless_pass_by_ref_mut)]
+async fn wait_group(
+    child: &mut Child,
+    pgid: i32,
+    timeout: Option<Duration>,
+) -> ShellResult<(ExitStatus, bool)> {
+    assert!(pgid > 0, "a spawned job has a positive pid");
+    let started = Instant::now();
+    let mut timed_out = false;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| job_error(&error))? {
+            child.terminate().map_err(|error| job_error(&error))?;
+            return Ok((status, timed_out));
+        }
+        if !timed_out && timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            child.terminate().map_err(|error| job_error(&error))?;
+            timed_out = true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(windows)]
+fn split_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
+    (status.code(), None)
+}
+
+#[cfg(windows)]
+impl LocalShell {
+    fn kill_all_blocking(&self) -> usize {
+        let jobs = {
+            let mut registry = lock(&self.registry);
+            registry.live.clear();
+            std::mem::take(&mut registry.jobs)
+        };
+        let mut killed = 0usize;
+        for (pid, job) in jobs {
+            if job.terminate().is_ok() {
+                killed = killed.saturating_add(1);
+            } else {
+                tracing::warn!(pid, "failed to terminate a job during shutdown");
+            }
+        }
+        assert_eq!(lock(&self.registry).len(), 0, "shutdown retires every job");
+        killed
     }
 }

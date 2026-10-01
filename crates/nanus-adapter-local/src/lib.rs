@@ -54,4 +54,6 @@ mod shell;
 
 pub use clock::SystemClock;
 pub use fs::LocalFs;
-pub use shell::{DEFAULT_TIMEOUT_MS, LocalShell, is_alive};
+#[cfg(unix)]
+pub use shell::is_alive;
+pub use shell::{DEFAULT_TIMEOUT_MS, LocalShell};

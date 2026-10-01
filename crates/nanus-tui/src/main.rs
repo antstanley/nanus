@@ -37,7 +37,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use nanus_adapter_store::{JsonlStore, resolve_home};
 use nanus_domain::ApprovalPolicy;
-use nanus_link::paths::service_socket;
+use nanus_link::paths::service_endpoint;
 use nanus_ports::StoreHandle;
 use nanus_tui::runtime::{Remote, Target, run_source, view};
 
@@ -173,7 +173,7 @@ impl Args {
             return Ok(path.clone());
         }
         let home = resolve_home(None).map_err(|error| error.to_string())?;
-        Ok(service_socket(&home))
+        service_endpoint(&home).map_err(|error| error.to_string())
     }
 }
 
