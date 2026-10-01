@@ -330,6 +330,12 @@ design docs too.
   thing an interface must show is a new `Frame` variant, which means a change to
   `nanus-link` and to the server that produces it — not a new field smuggled
   through an existing one.
+- **A Windows pipe peer is proven, not assumed.** A pipe name is global and computable, so both
+  ends of the Windows link run the HMAC handshake in `nanus-link/src/transport/guard.rs` before
+  the first frame, keyed by a file the agent writes under the user's local app data *after* it
+  owns the name. `Listener::accept` returns an `Accepted` that only `verify` turns into a
+  `Stream`, and the server verifies in the connection's task so a silent peer cannot stall
+  accepts. A failed accept is logged and retried, never the end of `serve`.
 - **A session is the agent's, and a connection is a view of one.** The client sends
   `New` or `Attach` before it can prompt, the server owns the session afterwards,
   and a turn runs in its own task so it outlives the client that asked for it. A

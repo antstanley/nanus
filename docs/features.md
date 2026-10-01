@@ -615,7 +615,8 @@ The honest list lives in [status](status.md#known-limits); the headline items:
 - **The link is local.** Unix sockets and Windows SID-named pipes share the same frames.
   Windows service lifecycle and the Job Object shell passed native runtime validation
   (see [status](status.md) and [the transport design and evidence](link-transports.md)).
-  There is no remote mode, and the Windows link does not defend against another local user.
+  There is no remote mode. On Windows both ends prove they are the same user before a frame is
+  exchanged, so a pipe name squatted by another account is refused rather than talked to.
 - **The sandbox is not OS-enforced.** Nothing confines an approved program's
   writes, its network access, or its process table.
 - **A session is claimed for writing.** Two writers on one log cannot silently lose a turn:

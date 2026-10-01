@@ -12,9 +12,19 @@
 
 use core::future::Future;
 use std::cell::RefCell;
+use std::time::Duration;
 
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::LocalSet;
+
+/// How long [`shutdown`] waits for blocking workers before leaving them behind.
+///
+/// A worker that is still busy after this is one that cannot finish on its own: an abandoned
+/// `tokio::io::stdin` read is parked until the person presses Enter, and Ctrl-C at an approval
+/// prompt abandons exactly that. Joining it without a bound held the process open, *before* the
+/// error that explained the exit was printed. Well-behaved workers — the filesystem calls the
+/// store makes — finish in far less than this, so they are still joined rather than abandoned.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 thread_local! {
     /// The current thread's runtime, created lazily.
@@ -115,12 +125,15 @@ pub fn is_installed() -> bool {
     RUNTIME.with(|slot| slot.borrow().is_some())
 }
 
-/// Removes this thread's runtime and waits for its blocking workers to finish.
+/// Removes this thread's runtime and waits, for at most [`SHUTDOWN_GRACE`], for its blocking
+/// workers to finish.
 ///
 /// Call after stopping every composition and dropping its handles, outside async execution.
 /// Repeated calls are harmless. A later [`install`] or [`block_on`] creates a new runtime.
 /// Explicit shutdown matters on Windows: process-exit TLS destruction can run after other
 /// threads have been forcibly terminated, so a worker pool must not be left to that destructor.
+/// A worker still running at the deadline is detached rather than joined; the TLS slot is empty
+/// either way, so no destructor is left to run against it at exit.
 ///
 /// # Panics
 ///
@@ -133,7 +146,9 @@ pub fn shutdown() {
     );
     // Release the TLS borrow before dropping the runtime: its task destructors may consult TLS.
     let runtime = RUNTIME.with(|slot| slot.borrow_mut().take());
-    drop(runtime);
+    if let Some(runtime) = runtime {
+        runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    }
     assert!(!is_installed(), "shutdown removes the thread's runtime");
 }
 
@@ -210,6 +225,25 @@ mod tests {
         assert_eq!(block_on(async { 43 }), 43);
         assert!(is_installed());
         shutdown();
+    }
+
+    #[test]
+    fn runtime_shutdown_does_not_wait_for_a_worker_that_cannot_finish() {
+        // The stand-in for an abandoned stdin read: a blocking task parked on something only
+        // the test can release. Released after the assertion, so no thread outlives the test.
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        block_on(async move {
+            drop(tokio::task::spawn_blocking(move || parked.recv()));
+        });
+        let started = std::time::Instant::now();
+        shutdown();
+        let waited = started.elapsed();
+        assert!(!is_installed());
+        assert!(
+            waited < SHUTDOWN_GRACE.saturating_mul(4),
+            "shutdown waited {waited:?} for a worker that could not finish"
+        );
+        release.send(()).unwrap();
     }
 
     #[test]

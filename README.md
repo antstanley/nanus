@@ -10,7 +10,7 @@ filesystem, the shell, the session log, the model adapter, and the tool registry
 plugin you can remove, replace, or write yourself, and the loop over them is built from
 the handles they publish.
 
-[![tests](https://img.shields.io/badge/tests-1382%20passing-brightgreen)](docs/testing.md)
+[![tests](https://img.shields.io/badge/tests-1403%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
@@ -245,7 +245,7 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [8.0s] 1382 tests run: 1382 passed, 14 skipped
+Summary [7.5s] 1403 tests run: 1403 passed, 14 skipped
 
 $ cargo test --workspace --doc
 11 doctests passed

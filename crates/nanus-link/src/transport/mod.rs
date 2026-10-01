@@ -6,8 +6,10 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::LinkResult;
+use crate::{LinkError, LinkResult};
 
+#[cfg(any(windows, test))]
+pub mod guard;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -45,11 +47,21 @@ pub type OwnedWriteHalf = tokio::net::unix::OwnedWriteHalf;
 pub type OwnedWriteHalf = tokio::io::WriteHalf<Stream>;
 
 impl Stream {
-    /// Connects to a local endpoint.
-    pub async fn connect(endpoint: &Path) -> std::io::Result<Self> {
+    /// Connects to a local endpoint and, where the transport needs it, proves the agent there is
+    /// this user's before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Connect`] when nothing is listening, [`LinkError::Inaccessible`] when
+    /// something is but this process may not open it, and [`LinkError::Unverified`] when the
+    /// agent at a Windows pipe cannot prove it belongs to this user.
+    pub async fn connect(endpoint: &Path) -> LinkResult<Self> {
         #[cfg(unix)]
         {
-            Ok(Self::Unix(tokio::net::UnixStream::connect(endpoint).await?))
+            tokio::net::UnixStream::connect(endpoint)
+                .await
+                .map(Self::Unix)
+                .map_err(|source| refused_connect(endpoint, source))
         }
         #[cfg(windows)]
         {
@@ -67,6 +79,67 @@ impl Stream {
         #[cfg(windows)]
         {
             tokio::io::split(self)
+        }
+    }
+}
+
+/// Classifies a failure to open an endpoint.
+///
+/// "Permission denied" is not "nothing is listening": something *is* there, and it belongs to an
+/// account — or an elevation — this process cannot reach. Folding the two together made a start
+/// spawn a second agent that could only fail to bind.
+fn refused_connect(endpoint: &Path, source: std::io::Error) -> LinkError {
+    let path = endpoint.to_path_buf();
+    if source.kind() == std::io::ErrorKind::PermissionDenied {
+        LinkError::Inaccessible { path, source }
+    } else {
+        LinkError::Connect { path, source }
+    }
+}
+
+/// A connection whose peer has not yet been accepted as this user's.
+///
+/// What [`Listener::accept`] returns, so that a connection cannot be served without being
+/// verified: the only way to the [`Stream`] is [`Accepted::verify`]. Verifying is a separate step
+/// so a server can run it in the connection's own task — a peer that never speaks must hold up
+/// its own connection, not every accept after it.
+#[derive(Debug)]
+#[must_use = "an accepted connection is served only after it is verified"]
+pub struct Accepted {
+    stream: Stream,
+    #[cfg(windows)]
+    key: std::sync::Arc<guard::Key>,
+}
+
+impl Accepted {
+    /// Proves this agent to the peer and requires the peer to prove itself.
+    ///
+    /// On Unix there is nothing to prove: the socket's directory is the user's alone, so a peer
+    /// that reached it already is the user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Io`] when the peer does not hold this user's link key within
+    /// the handshake's timeout.
+    // Unix has nothing to await; the signature is the Windows one, which does.
+    #[cfg_attr(unix, allow(clippy::unused_async, clippy::unused_async_trait_impl))]
+    pub async fn verify(self) -> LinkResult<Stream> {
+        #[cfg(unix)]
+        {
+            Ok(self.stream)
+        }
+        #[cfg(windows)]
+        {
+            let Self { mut stream, key } = self;
+            guard::serve(&mut stream, &key, guard::HANDSHAKE_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("a client was not verified as this user: {error}"),
+                    )
+                })?;
+            Ok(stream)
         }
     }
 }
@@ -138,11 +211,19 @@ pub enum Listener {
 }
 
 impl Listener {
-    /// Accepts a connection. Cancelling an accept leaves the listener usable.
-    pub async fn accept(&mut self) -> LinkResult<Stream> {
+    /// Accepts a connection, to be [verified](Accepted::verify) before it is served. Cancelling
+    /// an accept leaves the listener usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Io`] when the operating system refuses the accept. The listener is
+    /// still usable afterwards, so a server should treat this as one lost connection.
+    pub async fn accept(&mut self) -> LinkResult<Accepted> {
         match self {
             #[cfg(unix)]
-            Self::Unix(listener) => Ok(listener.accept().await?.0.into()),
+            Self::Unix(listener) => Ok(Accepted {
+                stream: listener.accept().await?.0.into(),
+            }),
             #[cfg(windows)]
             Self::Pipe(listener) => listener.accept().await,
         }

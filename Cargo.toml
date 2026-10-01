@@ -111,6 +111,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Bounded in-memory media verification; no filesystem or network image loading.
 base64 = "0.22"
 sha2 = "0.10"
+# The Windows link's same-user handshake: an HMAC over fresh nonces, keyed by a random secret.
+# The same RustCrypto family as `sha2`, and `getrandom` at the version `uuid` already links.
+hmac = "0.12"
+getrandom = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 # Utilities.

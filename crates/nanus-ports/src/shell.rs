@@ -114,7 +114,9 @@ impl ShellRequest {
     ///
     /// This is the form a `bash` tool uses. The script is passed as a single
     /// argument to `sh -c`, so quoting is the script author's responsibility and
-    /// exactly as expressive as the shell itself.
+    /// exactly as expressive as the shell itself. On Windows a runner hands it to
+    /// `cmd /S /C "<script>"` unescaped, for the same reason: `cmd` does not undo the
+    /// standard library's argument quoting, so an escaped script is a different script.
     #[must_use]
     pub fn shell(script: impl Into<String>, cwd: Option<PathBuf>) -> Self {
         Self {

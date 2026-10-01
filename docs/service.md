@@ -136,8 +136,10 @@ There is no Service Control Manager integration and no `LocalSystem` agent. Run 
 as the same user as the interface, either detached or with `--foreground` under a supervisor.
 Task Scheduler with an **at log on** trigger can run as that user without storing a password
 or requiring administrator rights; NSSM-style wrappers are another option when configured
-for that user's identity. A detached process survives its shell, but ends at logoff and
-is not started at boot when nobody is logged in.
+for that user's identity. A detached process survives its shell — and leaves the shell's Job
+Object when that job permits it — but ends at logoff and is not started at boot when nobody is
+logged in. A `nanus service start` run *by the agent*, through its shell tool, does not survive
+the tool call: that job forbids leaving, and ends with the command.
 
 The default endpoint is always computed; `run/agent.sock` and custom filesystem socket paths
 are Unix endpoints. The legacy `--socket` option denotes a full local pipe endpoint on Windows.
@@ -152,12 +154,16 @@ joins its runtime workers before process exit. See [the tested revision and run]
   current user's SID. Windows pipes reject remote clients and refuse a second owner.
   There is no remote mode. The local transports and service lifecycle passed
   [native Linux, macOS, and Windows validation](https://github.com/antstanley/nanus/actions/runs/36852736607).
-- **The link trusts its peer.** On Unix the socket is `0600` inside a `0700` directory.
-  Windows uses the default pipe descriptor, whose full-control principals are the creator,
-  LocalSystem, and Administrators, with read access for Everyone and Anonymous. The Windows
-  link does not defend against another user on the same machine; a cross-user connection
-  test is deferred and single-user sandboxed environments are assumed. The descriptor
-  read-back test runs in native Windows CI. The frame cap bounds parsing, not hostile peers.
+- **The link trusts a peer that is the same user.** On Unix the socket is `0600` inside a
+  `0700` directory. Windows uses the default pipe descriptor, whose full-control principals are
+  the creator, LocalSystem, and Administrators, with read access for Everyone and Anonymous, so
+  both ends prove themselves with a key only the user can read before any frame is exchanged
+  (see [`SAFETY.md`](../SAFETY.md#the-agents-local-link)). A pipe held by another account is
+  refused rather than talked to; `nanus service start` reports it instead of starting a second
+  agent, as it does a pipe this process may not open (an agent running elevated, say). Another
+  account can still slow accepts by opening connections; it cannot stop the agent. The
+  descriptor read-back test runs in native Windows CI. The frame cap bounds parsing, not
+  hostile peers.
 - **A session is claimed, not locked.** The agent claims every session it holds, for as long
   as it holds it, so a second `nanus` — a `run --resume`, another service — is refused with a
   sentence naming this agent's socket. The claim is a lock the operating system holds on a

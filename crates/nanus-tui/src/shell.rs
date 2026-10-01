@@ -104,12 +104,20 @@ impl Outcome {
 /// who attached to a service elsewhere should still get their own shell.
 pub(crate) async fn run(command: &str) -> Outcome {
     #[cfg(unix)]
-    let (program, flag) = ("sh", "-c");
+    let mut shell = Command::new("sh");
+    #[cfg(unix)]
+    shell.arg("-c").arg(command);
     #[cfg(windows)]
-    let (program, flag) = ("cmd", "/C");
-    let child = Command::new(program)
-        .arg(flag)
-        .arg(command)
+    let mut shell = Command::new("cmd");
+    // Appended raw rather than quoted: the standard library escapes an inner `"` as `\"`, which
+    // `cmd` does not undo, so `!dir "C:\Program Files"` would have reached `dir` mangled. `/S`
+    // makes `cmd` strip exactly the outer pair of quotes and run the line between them as typed.
+    #[cfg(windows)]
+    shell
+        .raw_arg("/S")
+        .raw_arg("/C")
+        .raw_arg(format!("\"{command}\""));
+    let child = shell
         // The streams are read rather than inherited, so the output can be drawn in the transcript
         // rather than appearing behind the alternate screen the interface is drawing on — and
         // stdin is closed rather than inherited, so a command cannot take the keyboard the
@@ -346,5 +354,26 @@ mod tests {
         assert!(failure.stderr.contains("failure"));
         assert!(piped.succeeded());
         assert_eq!(piped.stdout.trim(), "hello");
+    }
+
+    /// The line reaches `cmd` as typed, quotes included: escaping it the way the standard library
+    /// escapes an argument turned `"a b"` into `\"a b\"`, which `cmd` does not undo.
+    #[cfg(windows)]
+    #[test]
+    fn a_quoted_windows_line_reaches_cmd_as_typed() {
+        let dir = tempfile::tempdir().expect("directory");
+        let spaced = dir.path().join("with space");
+        std::fs::create_dir(&spaced).expect("a directory with a space");
+        std::fs::write(spaced.join("note.txt"), "x").expect("a file inside it");
+        let (echoed, listed) = nanus_kernel::runtime::block_on_local(async {
+            (
+                run(r#"echo "a b""#).await,
+                run(&format!(r#"dir /b "{}""#, spaced.display())).await,
+            )
+        });
+        assert!(echoed.succeeded(), "{echoed:?}");
+        assert_eq!(echoed.stdout.trim(), r#""a b""#);
+        assert!(listed.succeeded(), "{listed:?}");
+        assert_eq!(listed.stdout.trim(), "note.txt");
     }
 }

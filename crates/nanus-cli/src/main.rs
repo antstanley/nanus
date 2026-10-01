@@ -64,6 +64,8 @@ fn main() -> ExitCode {
     let outcome = nanus_kernel::runtime::block_on(cli::prepare()).and_then(cli::finish);
     // All compositions and handles are gone. Join filesystem workers before Windows process
     // exit can terminate them and run the TLS runtime's destructor against an abandoned pool.
+    // The join is bounded, so a worker that cannot finish — a stdin read abandoned by Ctrl-C at
+    // an approval prompt — does not hold the exit, or the error below, open.
     nanus_kernel::runtime::shutdown();
     tracing::debug!("the command runtime has stopped");
     match outcome {

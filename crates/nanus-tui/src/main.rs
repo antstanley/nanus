@@ -105,7 +105,13 @@ fn main() -> ExitCode {
     // Installing it here means every later `block_on` shares one reactor.
     nanus_kernel::runtime::install();
     let args = Args::parse();
-    match run(&args) {
+    let outcome = run(&args);
+    // Everything `run` opened — the store, the link client — is dropped by now. The runtime goes
+    // explicitly, as the core's does: on Windows, process exit can terminate its blocking workers
+    // (the store's file I/O runs there) before the thread-local destructor that would join them,
+    // and that destructor then waits on threads that no longer exist.
+    nanus_kernel::runtime::shutdown();
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // The message goes to stderr so a redirected stdout stays clean.

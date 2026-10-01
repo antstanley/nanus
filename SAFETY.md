@@ -91,7 +91,9 @@ model profiles are refused before image I/O/HTTP. The library performs no URL fe
 
 The interactive interface has one escape hatch that does not go through the model. A
 prompt that opens with `!` is a shell command **you** are running: the interface echoes
-it, runs it with `sh -c` on Unix or `cmd /C` on Windows in the directory it was started in, and draws what came back.
+it, runs it with `sh -c` on Unix or `cmd /S /C "<line>"` on Windows in the directory it was
+started in, and draws what came back. On Windows the line is handed to `cmd` exactly as typed,
+quotes included, because `cmd` does not undo the escaping a program's arguments are given.
 
 This is not the agent acting, and it is worth being clear about what it therefore is
 not:
@@ -168,14 +170,36 @@ your user can connect to it, and it is a local socket: nothing listens on an add
 and no packet reaches a network interface.
 
 On Windows the local endpoint is a SID-named pipe, with remote clients rejected and the
-first instance refusing an existing owner. The default descriptor grants full control to
-the creator, LocalSystem, and Administrators, and read access to Everyone and Anonymous.
-The Windows link does **not** defend against another user on the same machine; single-user
-sandboxed environments are assumed and the cross-user connection test is deferred. The
-actual descriptor is read back by a native test rather than inferred from the pipe name.
+first instance refusing an existing owner. A pipe has no private directory to live in: its
+name is global and computable by anyone who knows your SID, and the default descriptor grants
+full control to the creator, LocalSystem, and Administrators and read access to Everyone and
+Anonymous. So the pipe alone does not say who is at the other end, in either direction:
+
+- **Another account could own the name first**, and an interface would then be talking to it
+  — prompts, and a credential set from the interface, included.
+- **Another account can open the agent's pipe** and hold the connection.
+
+Both ends therefore prove themselves before a frame is exchanged. When an agent owns its pipe
+name it writes a fresh random key to `%LOCALAPPDATA%\nanus\run\<pipe name>.key`, a directory
+no other account can read, and removes it when it stops. The client challenges the agent, and
+sends nothing more until the agent answers with an HMAC-SHA-256 over two fresh nonces made with
+that key; then it answers the agent's challenge the same way. The key never crosses the pipe. A
+squatter cannot answer, so the client refuses it with a sentence and sends it nothing; a client
+that cannot answer is dropped within five seconds, and the agent goes on serving. The handshake
+lives in `nanus-link/src/transport/guard.rs` and is tested on every platform; the Windows tests
+add a real squatter and a real stranger.
+
+What this does not do: an administrator, or anything running as LocalSystem, can read the key
+and so pass for you — as it could already read your workspace. And another account can still
+open connections faster than they are dropped, which slows the agent's accepts; a refused accept
+is logged and retried rather than stopping the agent, so it does not end turns in flight. The
+endpoint name is checked exactly, as `\\.\pipe\nanus-` followed by letters, digits, and hyphens,
+because a name with `..` in it would otherwise pass a prefix check and resolve to another
+machine.
+
 The ACL read-back, local pipe behavior, Job Object grandchild cleanup, and detached-service
 lifecycle passed [native Windows validation](https://github.com/antstanley/nanus/actions/runs/36852736607)
-at `b13b9a9`; this evidence does not remove the cross-user limitation.
+at `b13b9a9`. The handshake postdates that run.
 
 The trust boundary is *processes running as you*, and it is worth being precise about
 what that means. A program that can connect to the socket can send a prompt to an
@@ -190,9 +214,37 @@ Two consequences worth stating plainly:
 
 - **A service is reachable by anything running as you, for as long as it runs.** Stop
   it when you are done, or run it under a supervisor that does.
-- **Nothing about a service is remote.** There is no port, no TLS, and no
-  authentication, because there is no remote mode to secure. Do not add one by
-  forwarding the socket.
+- **Nothing about a service is remote.** There is no port and no TLS, because there is
+  no remote mode to secure; the Windows handshake proves only that both ends are the same
+  local user. Do not add a remote mode by forwarding the socket or the pipe.
+
+## The shell on Windows
+
+On Unix the `bash` tool runs `sh -c` as the leader of a new process group, and only a timeout
+or shutdown kills the group: a command that starts `server &` and exits leaves it running. On
+Windows the tool runs `cmd /S /C "<script>"` inside a kill-on-close Job Object, and the job is
+the call's. When the command exits, **everything it started ends with it** — a `start /b
+server`, and a `nanus service start` run as a tool, whose service is started inside the job.
+This is deliberate: it is what a job is for, and it is also what closes the pipes a leftover
+process would hold open. Run a long-lived process from your own terminal, not through the
+agent. Children get no console window, so a service running detached does not open one on the
+desktop for each command.
+
+A `nanus service start` from your own terminal asks to leave any job its launcher is in, so a
+service started from an SSH session or a CI step survives it. A job that forbids leaving is
+obeyed, and the service then lasts as long as that job.
+
+## The one Windows binding outside `winsafe` and `process-wrap`
+
+The detached launcher clears inheritance on its own standard handles, which no maintained crate
+offers a safe call for. The one declaration it uses, `SetHandleInformation`, comes from
+`bun_windows_sys`, a dependency-free binding leaf published by the
+[Bao](https://github.com/putao520/bao) project (not Bun). It was audited against the Win32
+signature: the arguments are a handle and two integers, nothing is dereferenced, and failure is a
+return value. The crate is pinned to `=0.1.0`, and CI fails if the version moves or if any other
+item from it is used, so an upgrade or a second use is a new review rather than a silent one.
+Writing the declaration in this repository instead would need `unsafe`, which no crate here may
+contain.
 
 ## Prompt injection
 

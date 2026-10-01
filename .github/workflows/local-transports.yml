@@ -34,6 +34,9 @@ jobs:
       - name: Test Windows shell lifecycle and grandchild cleanup
         if: ${{ !cancelled() && runner.os == 'Windows' }}
         run: cargo test -p nanus-adapter-local --test windows_shell --locked
+      - name: Test the interface's shell escape
+        if: ${{ !cancelled() }}
+        run: cargo test -p nanus-tui --lib shell:: --locked
       - name: Build both programs natively
         run: cargo build --workspace --locked
       - name: Test service endpoint configuration
@@ -56,4 +59,27 @@ jobs:
               if not crate.exists():
                   crate = Path(member) / 'src/main.rs'
               assert '#![forbid(unsafe_code)]' in crate.read_text(), member
+          PY
+      - name: Keep the Windows binding leaf pinned and narrow
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          # `bun_windows_sys` supplies one audited safe declaration; see SAFETY.md. A new version
+          # or a second item from it is a new review, so either fails here rather than passing
+          # unnoticed.
+          import re
+          from pathlib import Path
+          import tomllib
+          manifest = tomllib.loads(Path('crates/nanus-sys-windows/Cargo.toml').read_text())
+          pin = manifest['target']['cfg(windows)']['dependencies']['bun_windows_sys']
+          assert pin == '=0.1.0', pin
+          lock = tomllib.loads(Path('Cargo.lock').read_text())
+          versions = [p['version'] for p in lock['package'] if p['name'] == 'bun_windows_sys']
+          assert versions == ['0.1.0'], versions
+          used = set()
+          for source in Path('crates').rglob('*.rs'):
+              text = source.read_text()
+              for found in re.findall(r'bun_windows_sys::\{?([^;]*?)\}?;', text):
+                  used.update(name.strip().split('::')[-1] for name in found.split(','))
+          assert used == {'INVALID_HANDLE_VALUE', 'SetHandleInformation'}, used
           PY

@@ -94,6 +94,57 @@ fn shutdown_releases_the_endpoint_after_probes_and_an_idle_connection() {
     });
 }
 
+#[cfg(windows)]
+#[test]
+fn an_agent_drops_an_unproven_client_and_keeps_serving() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let dir = tempfile::tempdir().expect("store");
+    nanus_kernel::runtime::block_on_local(async {
+        let store = JsonlStore::new(dir.path().to_owned())
+            .await
+            .expect("store")
+            .handle();
+        let runner = AgentRunner::new(
+            Rc::new(Box::new(Scripted)),
+            ToolRegistryHandle::new(ToolRegistry::new()),
+            "you are a test",
+            AgentConfig::new(4, 1, "scripted", 4096).expect("config"),
+            SystemClock::new().handle(),
+        )
+        .expect("runner");
+        let agent = Rc::new(Agent::from_parts(Parts {
+            runner: Rc::new(runner),
+            store,
+            clock: SystemClock::new().handle(),
+            workspace: dir.path().to_owned(),
+            models: vec![String::from("scripted")],
+            tools: 0,
+            switch: None,
+        }));
+        let endpoint = endpoint(dir.path());
+        let listener = bind(&endpoint).await.expect("bind");
+        let serving =
+            tokio::task::spawn_local(nanus_link::serve(listener, agent, std::future::pending()));
+        let mut stranger = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&endpoint)
+            .expect("the pipe opens");
+        stranger
+            .write_all(&[b'x'; 64])
+            .await
+            .expect("not a challenge");
+        let mut received = Vec::new();
+        let _ = stranger.read_to_end(&mut received).await;
+        assert!(
+            received.is_empty(),
+            "the stranger was sent {} bytes",
+            received.len()
+        );
+        let mut client = Client::connect(&endpoint).await.expect("still serving");
+        client.request_shutdown().await.expect("stop");
+        serving.await.expect("server task").expect("clean shutdown");
+    });
+}
+
 #[test]
 fn a_real_agent_records_before_done_and_refuses_a_missing_attachment() {
     let dir = tempfile::tempdir().expect("store");

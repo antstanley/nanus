@@ -337,6 +337,36 @@ async fn wait_group(
     }
 }
 
+/// Passes the request's arguments to the program, exactly as the request holds them.
+#[cfg(unix)]
+fn apply_args(command: &mut Command, request: &ShellRequest) {
+    command.args(&request.args);
+}
+
+/// Passes the request's arguments to the program; a `cmd /C` script goes through verbatim.
+///
+/// `cmd` does not parse its command line with the rules the standard library quotes for: those
+/// turn every `"` inside an argument into `\"`, and `cmd /C` strips only the outermost pair of
+/// quotes, so `git commit -m "fix bug"` reached git as the two arguments `\"fix` and `bug\"`. A
+/// shell-wrapped request therefore becomes `cmd /S /C "<script>"`, appended raw: `/S` is what
+/// makes `cmd` remove exactly the first and the last quote and run what is between them as
+/// written. Every other request — including a direct one to some other program — is quoted
+/// normally, because that program is the one that will parse it.
+#[cfg(windows)]
+fn apply_args(command: &mut Command, request: &ShellRequest) {
+    match request.args.as_slice() {
+        [_flag, script] if request.is_shell_wrapped() => {
+            command
+                .raw_arg("/S")
+                .raw_arg("/C")
+                .raw_arg(format!("\"{script}\""));
+        }
+        _ => {
+            command.args(&request.args);
+        }
+    }
+}
+
 /// Splits an exit status into a code and a signal, one of which is present.
 #[cfg(unix)]
 fn split_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
@@ -361,7 +391,7 @@ async fn run_engine(
     }
     let started = Instant::now();
     let mut command = Command::new(&request.program);
-    command.args(&request.args);
+    apply_args(&mut command, &request);
     if let Some(cwd) = request.cwd.as_ref() {
         command.current_dir(cwd);
     }
@@ -669,6 +699,15 @@ fn spawn_group(
     Ok((job, guard, pid))
 }
 
+/// Waits for the job's leader, ending the whole job when the leader exits or the budget elapses.
+///
+/// This is where Windows deliberately differs from Unix. A Unix group is signalled only on a
+/// timeout, so `nohup server &` outlives the call. Here the job is the call's: when the leader
+/// exits, everything it started goes with it — `start /b server` included, and a `nanus service
+/// start` run as a tool, whose service is started inside the job. Ending the tree is also what
+/// closes the pipes a leftover descendant would hold open, which the drain would otherwise wait out.
+/// The last owner closing the job kills the tree regardless, so terminating here only makes it
+/// prompt; a failure to do so is reported and the leader's real status is still returned.
 #[cfg(windows)]
 // Waiting mutates the Unix child; the Windows job puts that state behind its mutex.
 #[allow(clippy::needless_pass_by_ref_mut)]
@@ -682,7 +721,9 @@ async fn wait_group(
     let mut timed_out = false;
     loop {
         if let Some(status) = child.try_wait().map_err(|error| job_error(&error))? {
-            child.terminate().map_err(|error| job_error(&error))?;
+            if let Err(error) = child.terminate() {
+                tracing::warn!(%error, pgid, "the job outlived its leader and could not be ended");
+            }
             return Ok((status, timed_out));
         }
         if !timed_out && timeout.is_some_and(|limit| started.elapsed() >= limit) {
