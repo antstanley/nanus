@@ -270,8 +270,11 @@ separate risk, and they should not ride on the transport change:
   protocol version, and the same frame cap.
 - The descriptor read-back uses Windows PowerShell's .NET Framework
   `PipeStream.GetAccessControl`, on a pipe created by the actual transport. It checks that
-  writers are the current SID, LocalSystem, and Administrators, and that Everyone and Anonymous
-  have only read access. It introduces no Rust FFI. This is intentionally a check of the default
+  writers are confined to the current SID, LocalSystem, and Administrators, and that Everyone
+  and Anonymous have only read access. It reads the owner too: an elevated token can make
+  Administrators the creator owner, so a separate grant for the user SID is not required in
+  that case. The owner, LocalSystem, and Administrators must all have write access. It introduces
+  no Rust FFI. This is intentionally a check of the default
   descriptor's actual grants, not a claim that it equals Unix `0600`.
 - Windows shell tests exercise output bounds, stdin, failed spawning, timeout, dropped-run
   cancellation, streamed shutdown, and death of a real grandchild. Service shutdown continues
