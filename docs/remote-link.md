@@ -155,8 +155,8 @@ relay papers over.
 4. **Edge limits.**
 5. **A second tunnel** (QUIC or SSH) only if a measured need appears, behind its feature.
 
-Step 2 does not need the Windows transport; the relay talks to whatever local endpoint the
-platform has. Remote access to a Windows agent waits on that work, not the reverse.
+Step 2 talks to whatever local endpoint the platform has. Both Unix sockets and Windows
+named pipes are implemented; remote access still waits on the relay work described above.
 
 ## Tests
 

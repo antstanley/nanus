@@ -34,8 +34,8 @@ Start here if you want to come back to work tomorrow.
 
 An agent that outlives the shell: starting it detached or under a supervisor, stopping it
 without a signal, the socket and log it uses, and what a second service on one machine
-looks like. Also the limits — a service is local, Unix-only, and trusts the user it runs
-as.
+looks like. Also the limits — a service is local, uses Unix sockets or Windows pipes, and
+trusts the user it runs as.
 
 Start here if you want an agent that is still there tomorrow.
 
@@ -92,9 +92,9 @@ Start here if you are picking up the goal work, or designing a feature that span
 
 ## [Link transports note](link-transports.md)
 
-A proposal, not an implementation: a named-pipe transport for Windows beside the Unix
-socket, chosen at compile time under one unchanged protocol, with the seam to extract, the
-access-control and `unsafe` questions it raises, and the order to build it in.
+The implemented local transports: Windows named pipes beside Unix sockets, chosen at compile
+time under one protocol. Records the access-control decisions, safe Windows capabilities,
+service and shell lifecycle, native validation evidence, and the deferred cross-user test.
 
 Start here if you are porting the link, or the service, to Windows.
 

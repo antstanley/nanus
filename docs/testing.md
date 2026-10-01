@@ -45,11 +45,16 @@ hiding adapter imports. Native Windows and live-provider results must be reporte
 
 **Local transports.** `.github/workflows/local-transports.yml` builds and lints both binaries
 on Linux, macOS, and Windows, runs the shared link tests plus each platform's transport tests,
-and exercises shell lifecycle on the native OS. `nanus-link/tests/windows.rs` checks real named
-pipes and reads the default descriptor through .NET Framework; `windows_shell.rs` checks real
-Job Object grandchildren on timeout, cancellation, and shutdown. Cross-compiling those tests
-checks the API surface; it does not prove ACL or process behavior. Native Windows evidence for
-this implementation is pending.
+and exercises kernel shutdown and shell lifecycle on the native OS. `nanus-link/tests/windows.rs`
+checks real named pipes and reads the default descriptor through .NET Framework;
+`windows_shell.rs` checks real Job Object grandchildren on timeout, cancellation, and shutdown.
+Cross-compiling those tests
+checks the API surface; it does not prove ACL or process behavior. All three native jobs passed at
+`b13b9a9` in [run 36852736607](https://github.com/antstanley/nanus/actions/runs/36852736607).
+The CLI smoke test also checks a short-lived filesystem command and detached start, duplicate
+refusal, status, stop, and immediate restart, with captured output reaching EOF after each launcher.
+The cross-user connection test remains deferred; [the transport note](link-transports.md) records
+the default descriptor's grants and the single-user assumption.
 
 **Live vision evidence.** `nanus-bundle/tests/live_vision.rs` is `#[ignore]`d and exists only with
 the `stock-compose` feature, because it spends credit and reads the stored credentials. It sends the

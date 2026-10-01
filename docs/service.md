@@ -141,16 +141,17 @@ is not started at boot when nobody is logged in.
 
 The default endpoint is always computed; `run/agent.sock` and custom filesystem socket paths
 are Unix endpoints. The legacy `--socket` option denotes a full local pipe endpoint on Windows.
-Logs and configuration still use filesystem paths on either platform. Native Windows behavior
-must be verified before treating this port as release support.
+Logs and configuration still use filesystem paths on either platform. Native Windows validation
+passed detached start, duplicate refusal, status, stop, and immediate restart; the CLI explicitly
+joins its runtime workers before process exit. See [the tested revision and run](link-transports.md).
 
 ## Known limits
 
 - **The link is local.** Unix uses a domain socket under the nanus home; Windows uses
   `\\.\pipe\nanus-<sid>-agent`, computed independently by the client and service from the
   current user's SID. Windows pipes reject remote clients and refuse a second owner.
-  There is no remote mode. Native Windows verification is pending in
-  [the transport workflow](../.github/workflows/local-transports.yml).
+  There is no remote mode. The local transports and service lifecycle passed
+  [native Linux, macOS, and Windows validation](https://github.com/antstanley/nanus/actions/runs/36852736607).
 - **The link trusts its peer.** On Unix the socket is `0600` inside a `0700` directory.
   Windows uses the default pipe descriptor, whose full-control principals are the creator,
   LocalSystem, and Administrators, with read access for Everyone and Anonymous. The Windows

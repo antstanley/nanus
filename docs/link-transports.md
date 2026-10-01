@@ -1,12 +1,13 @@
 # Design note: the local link's transports
 
-**Status: implemented; native Windows verification pending.** The transport seam,
+**Status: implemented and verified natively on Linux, macOS, and Windows.** The transport seam,
 SID-named pipes, detached service lifecycle, and Job Object shell are in the tree.
-The Unix tests pass with their test bodies unchanged. The Windows link, capability
-wrapper, and shell tests cross-compile and lint on macOS; runtime evidence must come
-from `.github/workflows/local-transports.yml` on `windows-latest` before Windows support
-is called verified. This note implements the link and process-lifecycle portion of
-roadmap item 29.
+The Unix tests pass with their test bodies unchanged. The native matrix passed at
+[`b13b9a9`](https://github.com/antstanley/nanus/commit/b13b9a963ef890fc501e875128fa8eb0556a2b82)
+in [run 36852736607](https://github.com/antstanley/nanus/actions/runs/36852736607), including
+real pipes and ACL read-back, Job Object grandchildren, both binary builds, and detached
+start/status/stop/restart. This note implements the link and process-lifecycle portion of
+roadmap item 29; the cross-user connection test remains deferred.
 
 ## The decision
 
@@ -114,6 +115,9 @@ still a collision, reported by `first_pipe_instance`.
 one off, or there is a window in which a client finds no pipe. The accept loop owns that.
 
 ## The `unsafe` constraint
+
+The exception and lint override below describe the design's fallback. The implementation
+uses safe dependencies and needed neither: every workspace crate still forbids Rust `unsafe`.
 
 The repository forbids `unsafe` at the workspace level (`unsafe_code = "forbid"`) and says
 there must never be any. The rule stays. Windows has two jobs this design needs that only
@@ -297,8 +301,11 @@ separate risk, and they should not ride on the transport change:
 - Windows shell tests exercise output bounds, stdin, failed spawning, timeout, dropped-run
   cancellation, streamed shutdown, and death of a real grandchild. Service shutdown continues
   to use the same link request; Windows foreground processes also watch Ctrl-C.
-- The cross-user connection test remains deferred. The native Windows ACL, pipe, Job Object,
-  detached-service smoke test, and binary build results are still pending; cross-compilation is not runtime evidence.
+- Native Windows passed 56 kernel tests, 41 link unit tests, two real-agent transport tests,
+  ten pipe tests including ACL read-back, five capability tests, six shell lifecycle tests,
+  and five service configuration tests. Kernel/link doctests, both binary builds, a short-lived
+  filesystem command, and the complete detached-service smoke test passed in the same run.
+  The cross-user connection test remains deferred; single-user sandboxed environments are assumed.
 
 ## Decided
 
@@ -308,7 +315,7 @@ separate risk, and they should not ride on the transport change:
 | Is the default pipe descriptor enough | **Yes**, held to a read-back test |
 | Boxed stream or concrete enum | **Concrete enum** over the two transports |
 | Service Control Manager integration | **None**; detached process or `--foreground` under a supervisor |
-| The `unsafe` rule | **Kept**, with a single exception: one Windows wrapper crate, a narrow safe API, nothing else |
-| How the wrapper may contain `unsafe` | By opting out of `[lints] workspace = true` with its own table, differing from the workspace's only in `unsafe_code`; **not added until the crate exists**, and unused if safe crates suffice |
+| The `unsafe` rule | **Kept in every crate**; safe dependencies cover the Windows capabilities |
+| The proposed wrapper exception | **Unused**; the wrapper inherits the workspace lint table and forbids `unsafe` in its root |
 | Cross-user pipe test | **Deferred**; single-user sandboxed environments assumed, stated as a limit |
 | The SID lookup | **`winsafe`**, pinned to an exact version (`=0.0.29`) because it is pre-1.0, with only the `advapi` and `kernel` features, depended on rather than writing FFI; held to `examples/windows-sid-probe` in CI |

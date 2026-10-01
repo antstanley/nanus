@@ -613,8 +613,8 @@ The honest list lives in [status](status.md#known-limits); the headline items:
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
 - **The link is local.** Unix sockets and Windows SID-named pipes share the same frames.
-  Windows service lifecycle and the Job Object shell are implemented; native Windows runtime
-  evidence is still pending (see [status](status.md) and [the transport design](link-transports.md)).
+  Windows service lifecycle and the Job Object shell passed native runtime validation
+  (see [status](status.md) and [the transport design and evidence](link-transports.md)).
   There is no remote mode, and the Windows link does not defend against another local user.
 - **The sandbox is not OS-enforced.** Nothing confines an approved program's
   writes, its network access, or its process table.

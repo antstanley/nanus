@@ -53,8 +53,9 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   [the bugs verification found](testing.md#the-bugs-verification-found).
 - **The link is local and trusts its peer.** Unix uses a socket in the user's nanus home,
   `0600` inside a `0700` directory. Windows SID-named pipes, service detaching, and the Job Object
-  shell are implemented and cross-compiled, with native Windows runtime verification pending in
-  `.github/workflows/local-transports.yml`. There is no remote mode. Windows uses the default
+  shell passed native Windows runtime validation alongside Linux and macOS in
+  [the transport matrix](https://github.com/antstanley/nanus/actions/runs/36852736607).
+  There is no remote mode. Windows uses the default
   descriptor and does not defend against another local user; see
   [the service page](service.md#known-limits) and [the transport design](link-transports.md).
 - **The context budget is an estimate, and the policy is drop-oldest.** A prompt is bounded
@@ -100,7 +101,7 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 - **Embedding is a separate build boundary.** The minimal runner uses caller-owned local
   adapters. Its native Windows/macOS matrix passed both minimally and with explicit
   provider dependencies; [tested revision and run](vision-evidence.md). Stock shell/link/service
-  now have a Windows implementation, with native verification still pending.
+  passed the separate native Windows/Linux/macOS transport matrix; [evidence](link-transports.md).
 - **Vision is promoted for eight exact models.** Opus 5.5, Sonnet 5.5, GPT-6 Astra, GPT-6.1 Sol,
   GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed live image and call-reference follow-ups; all other models stay Unknown and refuse image HTTP.
   [Evidence and limits](vision-evidence.md).

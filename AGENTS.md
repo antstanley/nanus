@@ -275,6 +275,11 @@ local set, and a set that is merely entered never polls what it spawned. Both
 halves have bitten this repository in production, so treat them as rules rather
 than advice.
 
+The CLI stops its compositions and drops their handles before calling
+`nanus_kernel::runtime::shutdown()`, synchronously, before returning from `main`.
+Keep that explicit executor teardown: Windows process exit can terminate worker threads
+before TLS destructors run, so leaving the runtime's worker pool there can hang the process.
+
 ## Invariants that are enforced by tests
 
 These are load-bearing; changing them means changing the tests and usually the
@@ -344,7 +349,8 @@ design docs too.
   (`subscription`: `high`), then `medium`.
 - **Embedding excludes stock adapters by default-feature opt-out.** `stock-compose` gates
   concrete composition/provider/auth/selection together. Keep downstream/minimal gates clean;
-  native Windows applies to this subset, not the Unix shell/link/service.
+  native Windows validates this subset independently. Stock shell/link/service have their own
+  Linux/macOS/Windows matrix in `.github/workflows/local-transports.yml`.
 - **A session records what produced it, and "absent" is not "default".** The header
   carries the configuration and each model turn carries the model and effort that
   produced it, both optional: a session recorded before a field existed reports the
@@ -450,9 +456,10 @@ secrets, read [`SAFETY.md`](SAFETY.md). Key points:
 
 - The sandbox is **reported, not OS-enforced**; a shell command that writes
   outside the workspace root is outside the workspace root.
-- The shell adapter spawns with `process_group(0)` and kills the group, because
+- On Unix the shell adapter spawns with `process_group(0)` and kills the group, because
   `sh -c` runs the real work in a grandchild that `kill_on_drop` cannot reap.
-  Keep the process-group test passing.
+  On Windows it assigns a suspended child to a kill-on-close Job Object before resuming it.
+  Keep the native process-group and Job Object grandchild tests passing.
 - A non-zero exit from `bash` is a result, not a harness failure.
 - Never log or serialise the API key; never let a secret reach a request body.
 

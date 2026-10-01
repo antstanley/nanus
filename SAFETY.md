@@ -173,7 +173,9 @@ the creator, LocalSystem, and Administrators, and read access to Everyone and An
 The Windows link does **not** defend against another user on the same machine; single-user
 sandboxed environments are assumed and the cross-user connection test is deferred. The
 actual descriptor is read back by a native test rather than inferred from the pipe name.
-Native Windows runtime verification is pending in the transport CI workflow.
+The ACL read-back, local pipe behavior, Job Object grandchild cleanup, and detached-service
+lifecycle passed [native Windows validation](https://github.com/antstanley/nanus/actions/runs/36852736607)
+at `b13b9a9`; this evidence does not remove the cross-user limitation.
 
 The trust boundary is *processes running as you*, and it is worth being precise about
 what that means. A program that can connect to the socket can send a prompt to an
