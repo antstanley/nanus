@@ -25,9 +25,9 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint both binaries and the platform implementation
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test the link and Windows capability boundary
+      - name: Test the kernel, link, and Windows capability boundary
         if: ${{ !cancelled() }}
-        run: cargo test -p nanus-link -p nanus-sys-windows --all-features --locked
+        run: cargo test -p nanus-kernel -p nanus-link -p nanus-sys-windows --all-features --locked
       - name: Test Unix shell lifecycle
         if: runner.os != 'Windows'
         run: cargo test -p nanus-adapter-local --test shell --locked

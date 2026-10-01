@@ -8,6 +8,7 @@
 //!
 //! A caller that already owns a runtime on this thread keeps it: the harness
 //! installs its runtime once at startup and every later `block_on` reuses it.
+//! A binary calls [`shutdown`] after its compositions have stopped, before process exit.
 
 use core::future::Future;
 use std::cell::RefCell;
@@ -114,6 +115,28 @@ pub fn is_installed() -> bool {
     RUNTIME.with(|slot| slot.borrow().is_some())
 }
 
+/// Removes this thread's runtime and waits for its blocking workers to finish.
+///
+/// Call after stopping every composition and dropping its handles, outside async execution.
+/// Repeated calls are harmless. A later [`install`] or [`block_on`] creates a new runtime.
+/// Explicit shutdown matters on Windows: process-exit TLS destruction can run after other
+/// threads have been forcibly terminated, so a worker pool must not be left to that destructor.
+///
+/// # Panics
+///
+/// Panics if called inside a Tokio runtime. Runtime shutdown must be synchronous, like mounting
+/// and unmounting a composition.
+pub fn shutdown() {
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "runtime shutdown must happen outside async execution"
+    );
+    // Release the TLS borrow before dropping the runtime: its task destructors may consult TLS.
+    let runtime = RUNTIME.with(|slot| slot.borrow_mut().take());
+    drop(runtime);
+    assert!(!is_installed(), "shutdown removes the thread's runtime");
+}
+
 /// Builds the single-threaded runtime every kernel future runs on.
 fn build_runtime() -> Runtime {
     let built = Builder::new_current_thread().enable_all().build();
@@ -173,5 +196,30 @@ mod tests {
             assert!(is_installed());
         });
         assert!(is_installed());
+    }
+
+    #[test]
+    fn runtime_shutdown_joins_workers_and_allows_a_fresh_runtime() {
+        let value = block_on(async { tokio::task::spawn_blocking(|| 42).await.unwrap() });
+        assert_eq!(value, 42);
+        assert!(is_installed());
+        shutdown();
+        assert!(!is_installed());
+        shutdown();
+        assert!(!is_installed());
+        assert_eq!(block_on(async { 43 }), 43);
+        assert!(is_installed());
+        shutdown();
+    }
+
+    #[test]
+    fn runtime_shutdown_inside_async_execution_is_refused_without_removing_it() {
+        block_on(async {
+            assert!(std::panic::catch_unwind(shutdown).is_err());
+            assert!(is_installed());
+        });
+        assert!(is_installed());
+        assert_eq!(block_on(async { 44 }), 44);
+        shutdown();
     }
 }

@@ -275,6 +275,12 @@ separate risk, and they should not ride on the transport change:
 - A Windows shutdown request retains its pipe until `Bye` or EOF, bounded to five seconds.
   The service and shell-scoped agent use the same client method; dropping immediately after
   writing could lose an unread request. Unix still returns after sending. No frame changes.
+- The CLI explicitly shuts down the kernel's thread-local runtime after every composition and
+  handle has gone, before returning from `main`. Native Windows tracing showed the service's
+  connections, turns, and composition all stopping, followed by a process-exit hang. A runtime's
+  filesystem worker pool must be joined before Windows process-exit TLS destruction can encounter
+  terminated threads. The smoke test also runs a short-lived `sessions` command to exercise that
+  boundary independently of a shutdown frame.
 - Unix retains Tokio's owned socket halves. Windows splits the concrete stream with Tokio's
   safe owned halves; the enum itself uses no boxing or dynamic dispatch.
 - `Client::open` accepts `Into<Stream>`, and `serve` accepts `Into<Listener>`, to keep existing

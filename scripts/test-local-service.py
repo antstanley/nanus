@@ -54,6 +54,10 @@ def main():
             print(f"checking {' '.join(args)}", flush=True)
             return captured_run([str(binary), *args], env, home)
 
+        # A short-lived command also creates filesystem workers. Its process must exit after
+        # the result, so runtime teardown is tested independently of an agent's shutdown frame.
+        listed = run("sessions")
+        assert listed.returncode == 0, listed.stderr
         initial = run("service", "status")
         assert initial.returncode != 0, "an absent service must report failure"
         try:

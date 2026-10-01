@@ -76,6 +76,13 @@ stock shell or secret fallback is pulled into that minimal library. Direct runne
 needs no kernel mount. Kernel composition still uses async preparation then synchronous mounting.
 The [downstream fixture](../examples/embedded) demonstrates the boundary on a local executor.
 
+The CLI installs the kernel's thread-local executor once, composes asynchronously, and mounts
+and unmounts synchronously. After all compositions and handles are gone, it explicitly calls
+`nanus_kernel::runtime::shutdown()` before returning from `main`. This joins filesystem workers
+before Windows process-exit TLS destruction can encounter a pool whose threads were terminated.
+An embedded host using this executor should do the same when it has finished with every context;
+a later call to `block_on` can install a fresh runtime.
+
 ## Why the interface is a separate program
 
 An earlier revision had one binary that served both. It read well — one configuration

@@ -62,6 +62,10 @@ fn main() -> ExitCode {
     // both from one `block_on` is what produced "cannot start a runtime from within a
     // runtime".
     let outcome = nanus_kernel::runtime::block_on(cli::prepare()).and_then(cli::finish);
+    // All compositions and handles are gone. Join filesystem workers before Windows process
+    // exit can terminate them and run the TLS runtime's destructor against an abandoned pool.
+    nanus_kernel::runtime::shutdown();
+    tracing::debug!("the command runtime has stopped");
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
