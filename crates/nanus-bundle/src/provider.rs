@@ -132,6 +132,11 @@ pub struct Plan {
     /// when a `base_url` moves where the request goes. `None` for a provider whose adapter has one
     /// shape of its own — Anthropic's Messages API — where the field would be a guess.
     pub protocol: Option<Protocol>,
+    /// The reasoning effort this plan starts at when the configuration names none.
+    ///
+    /// `None` leaves the adapter's own default. It is a default and not a setting: a
+    /// configuration that names a step, or a remembered selection, wins over it.
+    pub effort: Option<nanus_ports::ReasoningEffort>,
 }
 
 /// `DeepSeek`'s plans: one endpoint, no tiers.
@@ -142,6 +147,7 @@ static DEEPSEEK_PLANS: [Plan; 1] = [Plan {
     refusal: None,
     credential: None,
     protocol: Some(Protocol::ChatCompletions),
+    effort: None,
 }];
 
 /// z.ai's plans: the API and the coding subscription, the same protocol at two hosts and two keys.
@@ -157,6 +163,7 @@ static ZAI_PLANS: [Plan; 2] = [
         refusal: None,
         credential: None,
         protocol: Some(Protocol::ChatCompletions),
+        effort: None,
     },
     Plan {
         name: "coding",
@@ -170,6 +177,7 @@ static ZAI_PLANS: [Plan; 2] = [
             env: "ZAI_CODING_API_KEY",
         }),
         protocol: Some(Protocol::ChatCompletions),
+        effort: None,
     },
 ];
 
@@ -177,12 +185,13 @@ static ZAI_PLANS: [Plan; 2] = [
 static ANTHROPIC_PLANS: [Plan; 1] = [Plan {
     name: DEFAULT_PLAN,
     endpoint: nanus_adapter_anthropic::DEFAULT_BASE_URL,
-    model: Some("claude-sonnet-5"),
+    model: Some("claude-sonnet-5-5"),
     refusal: None,
     credential: None,
     // The Messages API is not chat completions, and the adapter that speaks it has one shape: there
     // is nothing here for a plan to choose between.
     protocol: None,
+    effort: None,
 }];
 
 /// `OpenAI`'s plans: the API, and the `ChatGPT` subscription reached with an OAuth authorization.
@@ -199,16 +208,18 @@ static OPENAI_PLANS: [Plan; 2] = [
         refusal: None,
         credential: None,
         protocol: Some(Protocol::ChatCompletions),
+        effort: None,
     },
     Plan {
         name: "subscription",
         endpoint: "https://chatgpt.com/backend-api/codex",
-        model: Some("gpt-5.3-codex"),
+        model: Some("gpt-6.1-sol"),
         refusal: None,
         credential: Some(PlanCredential::Oauth {
             account: "openai:subscription",
         }),
         protocol: Some(Protocol::Responses),
+        effort: Some(nanus_ports::ReasoningEffort::High),
     },
 ];
 
@@ -521,6 +532,19 @@ impl Selection {
         }
     }
 
+    /// Returns the effort to start at: the configuration's step when it names one, then the
+    /// plan's own default, then the neutral default.
+    #[must_use]
+    pub fn effort(
+        &self,
+        configured: Option<nanus_adapter_config::ReasoningEffort>,
+    ) -> nanus_ports::ReasoningEffort {
+        configured
+            .map(nanus_adapter_config::ReasoningEffort::to_port)
+            .or(self.plan.effort)
+            .unwrap_or_else(|| nanus_adapter_config::ReasoningEffort::default().to_port())
+    }
+
     /// Returns the models a client may switch this run between.
     #[must_use]
     pub const fn models(&self) -> &'static [&'static str] {
@@ -608,7 +632,7 @@ mod tests {
             ..config()
         };
         let selection = Selection::resolve(&anthropic).expect("anthropic resolves");
-        assert_eq!(selection.model(), "claude-sonnet-5");
+        assert_eq!(selection.model(), "claude-sonnet-5-5");
         assert_eq!(selection.endpoint(), "https://api.anthropic.com/v1");
         // And a provider that does not use the effort knob says so.
         assert!(!selection.provider().effort_applies());
@@ -651,18 +675,44 @@ mod tests {
         );
     }
 
+    /// The subscription plan starts on `gpt-6.1-sol` at `high`; a step the configuration names
+    /// wins, and the API plan keeps the neutral default.
+    #[test]
+    fn the_subscription_plan_defaults_to_sol_on_high_unless_a_step_is_named() {
+        use nanus_adapter_config::ReasoningEffort as Configured;
+        let subscription = NanusConfig {
+            provider: Some(String::from("openai")),
+            plan: Some(String::from("subscription")),
+            ..config()
+        };
+        let selection = Selection::resolve(&subscription).expect("the plan resolves");
+        assert_eq!(selection.model(), "gpt-6.1-sol");
+        assert_eq!(selection.effort(None), nanus_ports::ReasoningEffort::High);
+        // An explicit `medium` is a choice, not an absence, and it must survive.
+        assert_eq!(
+            selection.effort(Some(Configured::Medium)),
+            nanus_ports::ReasoningEffort::Medium
+        );
+        let api = NanusConfig {
+            provider: Some(String::from("openai")),
+            ..config()
+        };
+        let selection = Selection::resolve(&api).expect("the api plan resolves");
+        assert_eq!(selection.effort(None), nanus_ports::ReasoningEffort::Medium);
+    }
+
     /// An explicit model or endpoint wins over the plan's, because the more specific
     /// instruction is the one a person typed.
     #[test]
     fn an_explicit_model_and_endpoint_win() {
         let config = NanusConfig {
             provider: Some(String::from("openai")),
-            model: Some(String::from("gpt-5-mini")),
+            model: Some(String::from("gpt-5.6-luna")),
             base_url: Some(String::from("https://gateway.internal/v1")),
             ..config()
         };
         let selection = Selection::resolve(&config).expect("an override resolves");
-        assert_eq!(selection.model(), "gpt-5-mini");
+        assert_eq!(selection.model(), "gpt-5.6-luna");
         assert_eq!(selection.endpoint(), "https://gateway.internal/v1");
     }
 

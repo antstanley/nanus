@@ -78,7 +78,7 @@ cannot provide as well, not a convenience wrapper. See
 | `read` | Reads a file through a 1-based `offset`/`limit` line window, with line numbers, a byte ceiling, and a note on how to continue. |
 | `write` | Creates or replaces a file. |
 | `edit` | Replaces text, requiring `old_string` to occur exactly once unless `replace_all` is set — an ambiguous or absent match is refused rather than guessed. |
-| `read_image` | Reads a bounded PNG/JPEG as typed image content when the model has verified image input; otherwise refuses before file I/O. |
+| `read_image` | Reads a bounded PNG/JPEG/WebP/GIF (still GIFs only) as typed image content when the model has verified image input; otherwise refuses before file I/O. |
 | `glob` | Finds files by path pattern, anchored to the workspace root (`*.rs` for the top level, `**/*.rs` at any depth), with a result cap — and a notice naming the cap when matches were dropped, rather than whenever the cap was reached. |
 | `grep` | Finds text inside files, grouped by file, optionally narrowed by one `include` glob, with capped matches and truncated lines that say so. |
 | `bash` | Runs a program in the workspace root unless a `workdir` says otherwise, with an optional timeout, reporting stdout, stderr, and the exit code. A non-zero exit is a result, not a failure; output is capped and truncated with a notice; the whole process group is killed so grandchildren are not orphaned. |
@@ -195,21 +195,26 @@ which one is in use.
 |---|---|---|---|
 | `deepseek` (default) | `nanus-adapter-deepseek` | `deepseek-flash`, `deepseek-v4-pro` | `api` |
 | `zai` | `nanus-adapter-openai` | `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2` | `api`, `coding` |
-| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
-| `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.3-codex`, `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `subscription`¹ |
+| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5` | `api` |
+| `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | `api`, `subscription`¹ |
 
 ¹ The OpenAI `subscription` plan is a ChatGPT account **authorized with OAuth** rather than a typed
 key: choosing it runs the device flow, files the token set under `openai:subscription`, and reaches
 the account through the **Responses API** — the items-shaped wire that backend speaks, with the
 grant's access token as the bearer, the account named in its own header, and an expired access token
 renewed from the refresh token rather than sent and refused.
+On the `api` plan, models from `gpt-5.6` on (read from the id's version, so a later model is
+covered) go to the Responses API too, chosen per request; older ids stay on chat completions. A
+conversation holding images stays on chat completions, because the Responses encoder has no image
+items yet. The plan starts on `gpt-6.1-sol` at `high` effort; a `reasoning_effort` in the configuration, or a
+remembered selection, wins over that default.
 
 - **A plan is an endpoint, a default model, a wire, and a credential.** z.ai's `coding` plan is
   the same protocol and a key of its own at a different host; OpenAI's `subscription` plan is a
   `ChatGPT` account, authorized in a browser, that serves the Responses API rather than chat
   completions. `base_url` moves where a request goes, not which of the two it is.
 - **OpenAI's `coding` plan is gone.** It was a default model — `gpt-5.3-codex` — on the API with
-  the API key, and the same model is one `model = "gpt-5.3-codex"` away on the `api` plan, so
+  the API key (OpenAI has since shut that model down on the API, and it is no longer offered), so
   `plan = "coding"` with `provider = "openai"` is refused by name rather than kept as a second
   spelling of the API plan. z.ai's `coding` plan is unaffected: it is a different host and a
   different key.
@@ -223,10 +228,14 @@ renewed from the refresh token rather than sent and refused.
   the generation was thinking, decoded from each provider's own spelling.
 - **Request controls**: `max_tokens` (default 128000, capped at the provider's
   documented ceiling because a request above it is refused rather than truncated)
-  and `reasoning_effort` (`minimal` / `low` / `medium` / `high`, default `medium`).
-  The effort reaches DeepSeek, z.ai (as a thinking mode) and OpenAI (as its own
-  four-step scale); it is **not** sent to Anthropic, which is reported where it is
-  configured rather than silently ignored.
+  and `reasoning_effort` (`minimal` / `low` / `medium` / `high`; when the file names none, the
+  plan's own default applies — `high` for OpenAI's `subscription` plan — and then `medium`).
+  The configured step reaches DeepSeek, z.ai (as a thinking mode) and OpenAI (as its own
+  scale). Anthropic is different: the file's `reasoning_effort` is **not** applied to it, and a
+  step the reader *chooses* — in the interface, or remembered from a switch — is sent as
+  `output_config.effort` (`low` through `max`) to the 5-series models (Sonnet 5.5, Opus 5.5, Fable 5.1,
+  and the earlier Sonnet 5 and Opus 5). Haiku 4.5 takes no effort at all, so none is sent and none is
+  offered. Opus 5.5, Sonnet 5.5 and Fable 5.1 also request adaptive thinking.
 - **Retired model ids do not resolve**, and a model id belongs to the provider that
   offers it: naming a DeepSeek id with `provider = "openai"` is a request the
   provider refuses rather than a quiet substitution.
@@ -348,7 +357,7 @@ this build offers.
 | `base_url` | the plan's endpoint | an override, for a proxy or a gateway |
 | `model` | the plan's or provider's default | any id the provider serves |
 | `max_tokens` | `128000` | per-response budget, capped at the provider's ceiling |
-| `reasoning_effort` | `medium` | `minimal`, `low`, `medium`, `high` |
+| `reasoning_effort` | the plan's default, then `medium` | `minimal`, `low`, `medium`, `high` |
 | `approval_policy` | `per_call` | `per_call`, `permitted`, `all_calls` |
 | `sandbox_mode` | `read_only` | `read_only`, `workspace_write`, `danger_full_access` |
 | `max_steps_per_turn` | `512` | steps in one turn |
@@ -596,9 +605,11 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **Built-in image profiles remain Unknown.** Wire/reload fixtures pass for Opus 5.5,
-  Sonnet 5.5 Messages and GPT-6 Astra Chat Completions, but live follow-up evidence is pending.
-  Responses, DeepSeek, z.ai and other combinations have no image profile.
+- **Image input is Supported for eight exact models.** Opus 5.5, Sonnet 5.5, and on the `api` plan
+  over the Responses API GPT-6 Astra, GPT-6.1 Sol, GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed
+  live follow-ups; see [vision evidence](vision-evidence.md). The same six OpenAI models are Supported on the `ChatGPT`
+  subscription backend, which was run separately. Every other model, DeepSeek and z.ai stay
+  Unknown and refuse images.
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
 - **The link is Unix-only and local.** No remote mode, no Windows, no

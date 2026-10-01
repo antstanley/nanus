@@ -166,7 +166,13 @@ fn the_pending_split_mounts_and_runs_a_turn() {
     );
     assert_eq!(
         origin.effort.as_deref(),
-        Some(settings.reasoning_effort.to_port().as_str()),
+        Some(
+            settings
+                .reasoning_effort
+                .unwrap_or_default()
+                .to_port()
+                .as_str()
+        ),
         "the effort comes from the adapter, which is what fills in an unset one"
     );
     assert!(

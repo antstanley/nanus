@@ -66,11 +66,18 @@ pub fn validate_image(media_type: &str, data: &str) -> Result<ImageDimensions, C
         image::guess_format(&bytes).map_err(|_| ContentError::new("invalid image magic"))?;
     if !matches!(
         (media_type, format),
-        ("image/png", ImageFormat::Png) | ("image/jpeg", ImageFormat::Jpeg)
+        ("image/png", ImageFormat::Png)
+            | ("image/jpeg", ImageFormat::Jpeg)
+            | ("image/webp", ImageFormat::WebP)
+            | ("image/gif", ImageFormat::Gif)
     ) {
         return Err(ContentError::new(
-            "media type conflicts with PNG/JPEG magic",
+            "media type conflicts with PNG/JPEG/WebP/GIF magic",
         ));
+    }
+    if format == ImageFormat::Gif && is_animated_gif(&bytes) {
+        // Providers read a still: an animation would be silently reduced to one frame.
+        return Err(ContentError::new("animated GIF images are not supported"));
     }
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(2576);
@@ -93,6 +100,13 @@ pub fn validate_image(media_type: &str, data: &str) -> Result<ImageDimensions, C
         ));
     }
     Ok(ImageDimensions { width, height })
+}
+
+/// Whether a GIF holds more than one frame, decoding no more than the second.
+fn is_animated_gif(bytes: &[u8]) -> bool {
+    use image::AnimationDecoder as _;
+    image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+        .is_ok_and(|decoder| decoder.into_frames().take(2).count() > 1)
 }
 
 /// Verifies a present block list; absence is the separate legacy-text meaning.
@@ -172,10 +186,12 @@ mod tests {
     }
 
     #[test]
-    fn png_and_jpeg_require_complete_matching_media_and_bounded_dimensions() {
+    fn png_jpeg_webp_and_gif_require_complete_matching_media_and_bounded_dimensions() {
         for (format, media) in [
             (ImageFormat::Png, "image/png"),
             (ImageFormat::Jpeg, "image/jpeg"),
+            (ImageFormat::WebP, "image/webp"),
+            (ImageFormat::Gif, "image/gif"),
         ] {
             let data = encoded(format, 7, 9);
             assert_eq!(
@@ -185,7 +201,7 @@ mod tests {
                     height: 9
                 }
             );
-            assert!(validate_image("image/gif", &data).is_err());
+            assert!(validate_image("image/bmp", &data).is_err());
             let wrong = if media == "image/png" {
                 "image/jpeg"
             } else {
@@ -204,6 +220,23 @@ mod tests {
             );
             assert!(validate_image(media, &encoded(format, 2577, 1)).is_err());
         }
+    }
+
+    /// A still GIF is accepted, and an animation is refused rather than silently reduced to its
+    /// first frame.
+    #[test]
+    fn an_animated_gif_is_refused_and_a_still_one_is_not() {
+        let frame = || image::Frame::new(image::RgbaImage::new(4, 4));
+        let encode = |frames: Vec<image::Frame>| {
+            let mut out = Vec::new();
+            image::codecs::gif::GifEncoder::new(&mut out)
+                .encode_frames(frames)
+                .unwrap();
+            base64::engine::general_purpose::STANDARD.encode(out)
+        };
+        assert!(validate_image("image/gif", &encode(vec![frame()])).is_ok());
+        let error = validate_image("image/gif", &encode(vec![frame(), frame()])).unwrap_err();
+        assert!(error.to_string().contains("animated"), "{error}");
     }
 
     #[test]

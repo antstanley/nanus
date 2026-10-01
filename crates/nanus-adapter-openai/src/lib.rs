@@ -162,14 +162,31 @@ impl OpenAiLlm {
         self.config.vendor()
     }
 
-    /// The full endpoint a request is posted to.
+    /// The full endpoint a request for the configured model is posted to.
     #[must_use]
     pub fn endpoint(&self) -> String {
+        self.endpoint_for(self.config.model())
+    }
+
+    /// The full endpoint a request for `model` is posted to.
+    ///
+    /// The model, not the adapter, decides the wire: see [`OpenAiConfig::protocol_for`].
+    #[must_use]
+    pub fn endpoint_for(&self, model: &str) -> String {
+        self.url(self.config.protocol_for(model))
+    }
+
+    /// The wire a request takes: its model's.
+    fn protocol_of(&self, request: &ChatRequest) -> Protocol {
+        self.config.protocol_for(&request.model)
+    }
+
+    fn url(&self, protocol: Protocol) -> String {
         let base = self.config.base_url().trim_end_matches('/');
         // Postcondition: a usable base URL is absolute, so a misconfigured one fails
         // here rather than as a confusing transport error later.
         assert!(base.starts_with("http"), "a base URL is absolute");
-        format!("{base}{}", self.config.protocol().path())
+        format!("{base}{}", protocol.path())
     }
 
     /// Encodes a request as the JSON body the vendor expects.
@@ -178,7 +195,7 @@ impl OpenAiLlm {
     /// performing a request.
     #[must_use]
     pub fn encode(&self, request: &ChatRequest) -> serde_json::Value {
-        match self.config.protocol() {
+        match self.protocol_of(request) {
             Protocol::ChatCompletions => wire::build_request(&self.config, request),
             Protocol::Responses => responses::build_request(&self.config, request),
         }
@@ -202,12 +219,31 @@ impl LlmPort for OpenAiLlm {
     }
 
     fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
-        if self.config.vendor() == Vendor::OpenAi && model == "gpt-6-astra" {
+        if self.config.vendor() == Vendor::OpenAi
+            && (matches!(model, "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-luna")
+                || nanus_ports::capabilities::ImageProfile::for_openai_model(model).is_some())
+        {
+            // Verified live against `api.openai.com` on the Responses wire, which is where this
+            // model is sent: chat completions refuses function tools beside an effort. The
+            // `ChatGPT` backend is a different endpoint and has no evidence of its own.
+            // Two endpoints have evidence — the public API and the `ChatGPT` backend — and each
+            // was run with every model that has a profile, so the profile is the whole answer.
+            let profile = nanus_ports::capabilities::ImageProfile::for_openai_model(model);
+            let verified = profile.is_some();
             nanus_ports::ModelCapabilities {
+                image_input: if verified {
+                    nanus_ports::ImageInputSupport::Supported
+                } else {
+                    nanus_ports::ImageInputSupport::Unknown
+                },
+                image_profile: profile,
                 context_window_tokens: Some(1_050_000),
-                max_input_tokens: Some(1_050_000),
+                max_input_tokens: Some(if model == "gpt-6-astra" {
+                    1_050_000
+                } else {
+                    922_000
+                }),
                 max_output_tokens: Some(128_000),
-                ..nanus_ports::ModelCapabilities::default()
             }
         } else {
             nanus_ports::ModelCapabilities::default()
@@ -226,11 +262,7 @@ impl LlmPort for OpenAiLlm {
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
-        if self.config.protocol() == Protocol::Responses
-            && nanus_ports::capabilities::has_images(&request.messages)
-        {
-            return error_stream("unsupported-image-protocol: OpenAI Responses");
-        }
+        let protocol = self.protocol_of(&request);
         if let Err(error) = nanus_ports::capabilities::validate_image_input(
             self.capabilities(&request.model),
             &request,
@@ -259,17 +291,16 @@ impl LlmPort for OpenAiLlm {
         tracing::debug!(
             vendor = %self.config.vendor(),
             model = %request.model,
-            endpoint = %self.endpoint(),
+            endpoint = %self.url(protocol),
             messages = request.messages.len(),
             tools = request.tools.len(),
             "dispatching a chat completion"
         );
 
         let client = self.client.clone();
-        let endpoint = self.endpoint();
+        let endpoint = self.url(protocol);
         let api_key = self.config.api_key().to_owned();
         let vendor = self.config.vendor();
-        let protocol = self.config.protocol();
         // A subscription names the account in its own header; the API does not.
         let account_id = self.config.account_id().map(str::to_owned);
         // The host survives as an owned value inside the stream: the transport
@@ -433,6 +464,33 @@ mod tests {
             zai.endpoint(),
             "https://api.z.ai/api/paas/v4/chat/completions"
         );
+    }
+
+    /// A switch between models changes the endpoint and the body with it, because the adapter was
+    /// built once and the request names the model.
+    #[test]
+    fn a_newer_model_is_posted_to_responses_and_an_older_one_to_chat_completions() {
+        let Some(llm) = adapter(Vendor::OpenAi) else {
+            return;
+        };
+        assert_eq!(
+            llm.endpoint_for("gpt-6.1-sol"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            llm.endpoint_for("gpt-5"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        let newer = llm.encode(&ChatRequest::new(
+            "gpt-6.1-sol",
+            vec![nanus_domain::Message::user("hi")],
+        ));
+        assert!(newer.get("input").is_some() && newer.get("messages").is_none());
+        let older = llm.encode(&ChatRequest::new(
+            "gpt-5",
+            vec![nanus_domain::Message::user("hi")],
+        ));
+        assert!(older.get("messages").is_some() && older.get("input").is_none());
     }
 
     #[test]

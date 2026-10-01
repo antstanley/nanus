@@ -63,7 +63,7 @@ pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
     body.insert("stream".to_owned(), json!(true));
     if matches!(
         request.model.as_str(),
-        "claude-opus-5-5" | "claude-sonnet-5-5"
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1"
     ) {
         body.insert("thinking".to_owned(), json!({ "type": "adaptive" }));
     }
@@ -212,12 +212,21 @@ fn encode_messages_with_prefix(messages: &[Message], system: &Value, tools: &Val
                     blocks.push(json!({ "type": "text", "text": text }));
                 }
                 for call in tool_calls {
+                    // The arguments are an object here, not a JSON string. A call whose
+                    // arguments never parsed is logged as the raw string so the registry
+                    // can say why it was refused; the API refuses a non-object `input`
+                    // and would refuse every later request in the session, so the
+                    // replay carries an empty object instead.
+                    let input = if call.arguments.is_object() {
+                        call.arguments.clone()
+                    } else {
+                        json!({})
+                    };
                     blocks.push(json!({
                         "type": "tool_use",
                         "id": call.id.as_str(),
                         "name": call.name.as_str(),
-                        // The arguments are an object here, not a JSON string.
-                        "input": call.arguments,
+                        "input": input,
                     }));
                 }
                 // Precondition: the domain's fold drops an empty assistant turn, and
@@ -388,7 +397,15 @@ impl StreamAccumulator {
             }
             Some("content_block_stop") => {
                 if let Some(raw) = self.replay_arguments.remove(&index) {
-                    match serde_json::from_str::<Value>(&raw) {
+                    // The API opens a call with an empty `partial_json` delta, and a
+                    // tool that takes no arguments never sends another: empty means
+                    // "no arguments", exactly as the assembler and the loop read it.
+                    let raw = if raw.trim().is_empty() {
+                        "{}"
+                    } else {
+                        raw.as_str()
+                    };
+                    match serde_json::from_str::<Value>(raw) {
                         Ok(input) => {
                             if let Some(block) = self.replay_blocks.get_mut(&index) {
                                 block["input"] = input;
@@ -722,6 +739,66 @@ mod tests {
         assert_eq!(turns[2]["role"], json!("user"));
         assert_eq!(turns[2]["content"][0]["type"], json!("tool_result"));
         assert_eq!(turns[2]["content"][0]["tool_use_id"], json!("toolu_1"));
+    }
+
+    /// A call whose arguments never parsed is logged as a raw string; replaying it as
+    /// `input` would make the API refuse every later request in the session.
+    #[test]
+    fn a_tool_call_with_unparsed_arguments_replays_as_an_empty_object() {
+        let messages = vec![
+            Message::user("hi"),
+            Message::assistant(
+                None,
+                None,
+                vec![
+                    ToolCall::new(
+                        ToolCallId::new("bad"),
+                        tool_name("read"),
+                        json!("{not json"),
+                    ),
+                    ToolCall::new(
+                        ToolCallId::new("good"),
+                        tool_name("read"),
+                        json!({ "p": 1 }),
+                    ),
+                ],
+            ),
+        ];
+        let body = build_request(&config(), &request(messages));
+        let blocks = &body["messages"][1]["content"];
+        assert_eq!(blocks[0]["input"], json!({}), "{blocks:?}");
+        assert_eq!(blocks[1]["input"], json!({ "p": 1 }), "{blocks:?}");
+    }
+
+    /// A tool that takes no arguments opens with an empty `partial_json` delta and may
+    /// send nothing else; that is "no arguments", not a failed response.
+    #[test]
+    fn a_streamed_call_with_only_an_empty_argument_delta_is_not_an_error() {
+        let mut accumulator = StreamAccumulator::default();
+        for frame in [
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "c", "name": "get_goal", "input": {} } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "" } }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+        ] {
+            accumulator.observe_frame(&frame);
+        }
+        while let Some(event) = accumulator.take_ready() {
+            assert!(!matches!(event, LlmEvent::Error(_)), "{event:?}");
+        }
+        // And the other direction: a fragment that is not JSON still fails.
+        let mut accumulator = StreamAccumulator::default();
+        for frame in [
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "c", "name": "read", "input": {} } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{oops" } }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+        ] {
+            accumulator.observe_frame(&frame);
+        }
+        let mut failed = false;
+        while let Some(event) = accumulator.take_ready() {
+            failed |= matches!(event, LlmEvent::Error(_));
+        }
+        assert!(failed, "malformed streamed arguments must still fail");
     }
 
     /// Nothing is sent that the API does not define, and the required ceiling is.

@@ -11,16 +11,22 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [55.2s] 1210 tests run: 1210 passed, 0 skipped
+Summary [8.0s] 1382 tests run: 1382 passed, 14 skipped
 
 $ cargo test --workspace --doc
-10 doctests passed
+11 doctests passed
 
 $ cargo clippy -p nanus-tui --no-default-features --all-targets
 0 warnings, 0 errors
 
-$ cargo test -p nanus-tui --no-default-features
-Summary [0.1s] 326 tests run: 326 passed, 0 skipped
+$ cargo nextest run -p nanus-bundle --no-default-features
+Summary [0.3s] 134 tests run: 134 passed, 0 skipped
+
+$ cargo test --manifest-path examples/embedded/Cargo.toml --locked --features providers
+10 passed (7 without the feature)
+
+$ cargo nextest run -p nanus-tui --no-default-features
+Summary [0.6s] 342 tests run: 342 passed, 0 skipped
 ```
 
 **The last two are the interface's view layer on its own.** `nanus-tui` carries its terminal
@@ -37,6 +43,35 @@ The standalone `examples/embedded` manifest is tested/run with and without `--fe
 its own lockfile and native Windows/macOS CI matrix prevent workspace feature unification from
 hiding adapter imports. Native Windows and live-provider results must be reported separately.
 
+**Live vision evidence.** `nanus-bundle/tests/live_vision.rs` is `#[ignore]`d and exists only with
+the `stock-compose` feature, because it spends credit and reads the stored credentials. It sends the
+body each adapter's own `encode` produces for a two-call session and requires a described image and a
+call-referencing follow-up, for every promoted model and every accepted format, against the public
+APIs and the `ChatGPT` subscription backend. Run it deliberately with
+`cargo nextest run -p nanus-bundle --test live_vision --run-ignored ignored-only`; a stored
+subscription authorization must be current (run `nanus run` once to renew it). The results and the
+promotion rule are in [vision evidence](vision-evidence.md).
+
+The 14 skipped tests are the `#[ignore]`d live ones below. One test,
+`a_configuration_without_a_key_still_composes_unconfigured`, asserts the state of a machine with no
+provider credential stored; on a machine where `nanus auth set` has been used it fails because of
+the environment, not the code, so a clean-checkout run in CI or a fresh account is the reference.
+
+**What the live evidence covers.** Every model with an image profile, on each endpoint that serves
+it, for PNG, JPEG, WebP and still GIF:
+
+| Endpoint | Models |
+|---|---|
+| Anthropic Messages | `claude-opus-5-5`, `claude-sonnet-5-5` |
+| OpenAI Responses (`api.openai.com`) | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
+| OpenAI Responses (`ChatGPT` subscription) | the same six |
+
+Fable 5.1, Haiku 4.5, DeepSeek and z.ai have no image profile and are tested only for the refusal
+before HTTP. The offered model lists themselves are pinned by tests in each adapter
+(`the_offered_models_belong_to_their_vendor`, `the_documented_numbers_are_what_the_api_expects`) and
+the plan defaults by `every_provider_has_its_own_credential_and_models`, so a retired id cannot
+creep back without a test changing.
+
 ## The tests that matter most
 
 **Caller policy and wakeable cancellation.** `nanus-bundle/tests/embedding.rs` drives never-ready
@@ -44,7 +79,7 @@ model/policy/approval/tool futures without sleeps. It checks exact grants/denial
 pairing and host teardown. The downstream fixture reuses those cases without stock adapters.
 
 **Multimodal persistence and assembled requests.** Domain/store tests bound media and logs;
-Anthropic/OpenAI fixtures decode captured PNG/JPEG bytes before/after store reload and verify
+Anthropic/OpenAI fixtures decode captured PNG/JPEG/WebP/GIF bytes before/after store reload and verify
 call pairing, block order, errors and absent summaries. Native dimension and output/reasoning
 bounds are checked separately. Wire success does not promote a profile without live follow-ups.
 
@@ -86,7 +121,9 @@ serves names the path rather than reporting a syscall.
 
 **The live path.** The harness has been run against the real DeepSeek API and the
 resulting session log inspected: a four-step turn with tool calls, results fed back, and
-per-step token accounting.
+per-step token accounting. It has since been run end to end with `nanus run` against Anthropic
+(Sonnet 5.5), OpenAI's API (`gpt-6-astra`) and a `ChatGPT` subscription (`gpt-6.1-sol`), including a
+`read_image` turn on each, and the sessions were inspected for the model and effort recorded.
 
 ## The bugs verification found
 
@@ -290,12 +327,13 @@ a non-conflict rather than a self-refusal. The socket test that used to write a 
 hand now holds a real lock from a second store, because a file nobody holds is exactly what it
 means not to be claimed.
 
-**A plan ran a model the agent did not offer.** `Selection` resolves `plan = "coding"` for
-`openai` to `gpt-5-codex`, and the offered list was `gpt-5` and `gpt-5-mini`. A client could
-cycle away from the coding model and never back — the cycle treats an unknown current id as a
-fresh start — and `SetModel` would have refused the id the session was already running. The
-model is now in the offered list, and the provider table's invariant test checks *every* plan's
-default rather than only the default plan.
+**A plan ran a model the agent did not offer.** `Selection` resolved a plan's default model that
+the adapter's own offered list did not contain (at the time, OpenAI's coding plan resolved to
+`gpt-5-codex` while the list was `gpt-5` and `gpt-5-mini`). A client could cycle away from that
+model and never back — the cycle treats an unknown current id as a fresh start — and `SetModel`
+would refuse the id the session was already running. Every plan's default model must now be
+offered, and the provider table's invariant test checks *every* plan's default rather than only the
+default plan; it is what keeps today's `gpt-6.1-sol` subscription default honest.
 
 **A doc comment landed on the wrong function.** `domain_policy` lost its own first line to
 `wire_effort` above it. Private items are not covered by `missing_docs`, so nothing could see it.

@@ -313,6 +313,10 @@ pub struct AgentRunner {
     policy: Option<Rc<dyn ToolPolicy>>,
     /// Explicit combined request reservation; unset preserves stock text behavior.
     request_reservation: Option<(u32, u32)>,
+    /// The reservation a request takes only when it carries pixels, for the stock composition:
+    /// text requests keep the provider's own output ceiling, and an image request still has the
+    /// explicit output the preflight demands.
+    image_reservation: Option<(u32, u32)>,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -364,6 +368,7 @@ impl AgentRunner {
             config,
             policy: None,
             request_reservation: None,
+            image_reservation: None,
         })
     }
 
@@ -381,6 +386,14 @@ impl AgentRunner {
     #[must_use]
     pub const fn with_request_budget(mut self, output: u32, separate_reasoning: u32) -> Self {
         self.request_reservation = Some((output, separate_reasoning));
+        self
+    }
+
+    /// Sets the reservation an image-carrying request takes when no explicit
+    /// [`with_request_budget`](Self::with_request_budget) is set; text requests are unaffected.
+    #[must_use]
+    pub const fn with_image_request_budget(mut self, output: u32, separate_reasoning: u32) -> Self {
+        self.image_reservation = Some((output, separate_reasoning));
         self
     }
 
@@ -796,7 +809,10 @@ impl AgentRunner {
         request.tools = self.offered_schemas();
         request.reasoning_effort = self.effort.get();
         let images = nanus_ports::capabilities::has_images(&messages);
-        if let Some((output, reasoning)) = self.request_reservation {
+        let reservation = self
+            .request_reservation
+            .or_else(|| self.image_reservation.filter(|_| images));
+        if let Some((output, reasoning)) = reservation {
             request.max_tokens = Some(output);
             request.separate_reasoning_tokens = reasoning;
         }

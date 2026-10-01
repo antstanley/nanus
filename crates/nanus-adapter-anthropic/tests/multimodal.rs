@@ -109,33 +109,42 @@ async fn exact_anthropic_profiles_encode_ordered_pixels_nested_under_original_ca
             );
             assert!(!encoded.to_string().contains("DISPLAY SUMMARY ONLY"));
         }
+        // Promoted on the live evidence in `docs/vision-evidence.md`, with its own profile.
+        let promoted = adapter.capabilities(model);
         assert_eq!(
-            adapter.capabilities(model).image_input,
-            nanus_ports::ImageInputSupport::Unknown
+            promoted.image_input,
+            nanus_ports::ImageInputSupport::Supported
         );
-        assert!(adapter.capabilities(model).image_profile.is_none());
+        assert_eq!(
+            promoted.require_image_profile(model).unwrap().model(),
+            model
+        );
     }
 }
 
 #[tokio::test]
 async fn unpromoted_images_are_refused_before_trying_the_configured_http_endpoint() {
     use futures::StreamExt as _;
-    let adapter = nanus_adapter_anthropic::AnthropicLlm::new(
-        nanus_adapter_anthropic::AnthropicConfig::with_base_url(
-            "claude-opus-5-5",
-            "fixture-key",
-            "http://127.0.0.1:1",
-        ),
-    )
-    .unwrap();
-    let events: Vec<_> = adapter
-        .stream_chat(ChatRequest::new(
-            "claude-opus-5-5",
-            fixture("claude-opus-5-5").derive_messages(),
-        ))
-        .collect()
-        .await;
-    assert!(
-        matches!(events.as_slice(), [nanus_ports::LlmEvent::Error(message)] if message.contains("Unknown"))
-    );
+    for model in [
+        "claude-fable-5-1",
+        "claude-haiku-4-5-20251001",
+        "arbitrary-alias",
+    ] {
+        let adapter = nanus_adapter_anthropic::AnthropicLlm::new(
+            nanus_adapter_anthropic::AnthropicConfig::with_base_url(
+                model,
+                "fixture-key",
+                "http://127.0.0.1:1",
+            ),
+        )
+        .unwrap();
+        let events: Vec<_> = adapter
+            .stream_chat(ChatRequest::new(model, fixture(model).derive_messages()))
+            .collect()
+            .await;
+        assert!(
+            matches!(events.as_slice(), [nanus_ports::LlmEvent::Error(message)] if message.contains("Unknown")),
+            "{model}: {events:?}"
+        );
+    }
 }

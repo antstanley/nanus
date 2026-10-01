@@ -207,8 +207,12 @@ pub struct NanusConfig {
     pub model: Option<String>,
     /// The per-response token budget.
     pub max_tokens: u32,
-    /// How much reasoning to ask for.
-    pub reasoning_effort: ReasoningEffort,
+    /// How much reasoning to ask for, when the file names a step.
+    ///
+    /// Absent means the plan's own default effort, and where the plan has none,
+    /// [`ReasoningEffort::default`]. Absent is not the same as `medium`: a plan may default higher,
+    /// and a file that writes `medium` must keep it.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Whether a tool call needs a human decision.
     pub approval_policy: ApprovalPolicy,
     /// What a tool call may touch.
@@ -259,7 +263,7 @@ impl Default for NanusConfig {
             base_url: None,
             model: None,
             max_tokens: DEFAULT_MAX_TOKENS,
-            reasoning_effort: ReasoningEffort::default(),
+            reasoning_effort: None,
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,

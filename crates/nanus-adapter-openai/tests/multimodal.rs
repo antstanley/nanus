@@ -74,8 +74,10 @@ fn decoded(encoded: &str) -> Vec<u8> {
         .unwrap()
 }
 
+/// A Responses-first model is sent pixels as input items: every call is answered with a label
+/// first, then the original ordered text and pixels follow as one user item per result.
 #[tokio::test]
-async fn openai_completes_the_tool_group_before_labelled_ordered_pixel_attachments_after_reload() {
+async fn a_responses_first_model_gets_labelled_ordered_input_images_after_the_tool_group() {
     let adapter = nanus_adapter_openai::OpenAiLlm::new(nanus_adapter_openai::OpenAiConfig::new(
         nanus_adapter_openai::Vendor::OpenAi,
         "gpt-6-astra",
@@ -84,7 +86,66 @@ async fn openai_completes_the_tool_group_before_labelled_ordered_pixel_attachmen
     .unwrap();
     let original = fixture("gpt-6-astra");
     for session in [original.clone(), reload(&original).await] {
-        let encoded = adapter.encode(&ChatRequest::new("gpt-6-astra", session.derive_messages()));
+        let body = adapter.encode(&ChatRequest::new("gpt-6-astra", session.derive_messages()));
+        assert!(body.get("messages").is_none(), "{body}");
+        let items = body["input"].as_array().unwrap();
+        let kinds: Vec<_> = items
+            .iter()
+            .map(|item| {
+                item["type"]
+                    .as_str()
+                    .or_else(|| item["role"].as_str())
+                    .unwrap_or_else(|| panic!("{item}"))
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "user",
+                "function_call",
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "function_call_output",
+                "user",
+                "user"
+            ]
+        );
+        for (index, id, media, bytes, error) in [
+            (7, "first", "image/png", PNG, false),
+            (8, "last", "image/jpeg", JPEG, true),
+        ] {
+            let content = items[index]["content"].as_array().unwrap();
+            assert_eq!(
+                content[0]["text"],
+                nanus_ports::capabilities::attachment_label(&ToolCallId::new(id), error)
+            );
+            assert_eq!(content[1]["text"], format!("original text for {id}"));
+            assert_eq!(content[3]["text"], format!("trailing text for {id}"));
+            assert_eq!(content[2]["type"], "input_image");
+            let prefix = format!("data:{media};base64,");
+            let url = content[2]["image_url"].as_str().unwrap();
+            assert_eq!(decoded(url.strip_prefix(&prefix).unwrap()), bytes);
+        }
+        assert!(!body.to_string().contains("DISPLAY SUMMARY ONLY"));
+    }
+    // A conversation without pixels takes the same wire.
+    let plain = ChatRequest::new("gpt-6-astra", vec![nanus_domain::Message::user("hi")]);
+    assert!(adapter.encode(&plain).get("input").is_some());
+}
+
+#[tokio::test]
+async fn openai_completes_the_tool_group_before_labelled_ordered_pixel_attachments_after_reload() {
+    let adapter = nanus_adapter_openai::OpenAiLlm::new(nanus_adapter_openai::OpenAiConfig::new(
+        nanus_adapter_openai::Vendor::OpenAi,
+        "gpt-5",
+        "fixture-key",
+    ))
+    .unwrap();
+    let original = fixture("gpt-5");
+    for session in [original.clone(), reload(&original).await] {
+        let encoded = adapter.encode(&ChatRequest::new("gpt-5", session.derive_messages()));
         let messages = encoded["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 7);
         assert_eq!(
@@ -122,17 +183,37 @@ async fn openai_completes_the_tool_group_before_labelled_ordered_pixel_attachmen
         );
         assert!(!encoded.to_string().contains("DISPLAY SUMMARY ONLY"));
     }
+    // Promoted on the live evidence in `docs/vision-evidence.md`.
     assert_eq!(
         adapter.capabilities("gpt-6-astra").image_input,
-        nanus_ports::ImageInputSupport::Unknown
+        nanus_ports::ImageInputSupport::Supported
     );
+    // Each exact model carries its own profile; a neighbour without evidence has none.
+    for model in [
+        "gpt-6.1-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ] {
+        let caps = adapter.capabilities(model);
+        assert_eq!(caps.image_input, nanus_ports::ImageInputSupport::Supported);
+        assert_eq!(caps.require_image_profile(model).unwrap().model(), model);
+    }
+    for model in ["gpt-5.5", "gpt-5", "gpt-6.2-sol", "gpt-6-astra-mini"] {
+        assert_eq!(
+            adapter.capabilities(model).image_input,
+            nanus_ports::ImageInputSupport::Unknown,
+            "{model}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn every_unpromoted_vendor_or_model_refuses_pixels_before_http() {
     use futures::StreamExt as _;
     for (vendor, model) in [
-        (nanus_adapter_openai::Vendor::OpenAi, "gpt-6-astra"),
+        (nanus_adapter_openai::Vendor::OpenAi, "gpt-5.5"),
         (nanus_adapter_openai::Vendor::OpenAi, "arbitrary-alias"),
         (nanus_adapter_openai::Vendor::Zai, "gpt-6-astra"),
     ] {
@@ -156,25 +237,42 @@ async fn every_unpromoted_vendor_or_model_refuses_pixels_before_http() {
 }
 
 #[tokio::test]
-async fn responses_refuses_images_with_a_specific_pre_http_reason() {
+async fn the_chatgpt_backend_supports_every_profiled_model_and_refuses_the_rest_before_http() {
     use futures::StreamExt as _;
     let mut config = nanus_adapter_openai::OpenAiConfig::with_base_url(
         nanus_adapter_openai::Vendor::OpenAi,
-        "gpt-6-astra",
+        "gpt-5.5",
         "fixture",
         "http://127.0.0.1:1",
     );
     config.set_protocol(nanus_adapter_openai::Protocol::Responses);
     let adapter = nanus_adapter_openai::OpenAiLlm::new(config).unwrap();
+    // The backend was run with every profiled model, so those are Supported there too.
+    for model in [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ] {
+        assert_eq!(
+            adapter.capabilities(model).image_input,
+            nanus_ports::ImageInputSupport::Supported,
+            "{model}"
+        );
+    }
+    // A model with no profile is refused before any HTTP, on this endpoint as on the API.
     let events: Vec<_> = adapter
         .stream_chat(ChatRequest::new(
-            "gpt-6-astra",
-            fixture("gpt-6-astra").derive_messages(),
+            "gpt-5.5",
+            fixture("gpt-5.5").derive_messages(),
         ))
         .collect()
         .await;
     assert!(
         matches!(events.as_slice(), [nanus_ports::LlmEvent::Error(reason)]
-        if reason == "unsupported-image-protocol: OpenAI Responses")
+        if reason.contains("Unknown")),
+        "{events:?}"
     );
 }

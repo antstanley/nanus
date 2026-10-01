@@ -39,24 +39,22 @@ pub const ZAI_API_KEY_ENV: &str = "ZAI_API_KEY";
 /// still works, but the provider refuses the effort field — which is why the
 /// offered list is the reasoning family.
 ///
-/// The coding model is in the list because a plan resolves to it: the `subscription` plan's
-/// default model is `gpt-5.3-codex`, and a plan whose default model the agent does not offer
-/// would put a client on a model it could cycle away from and never back to, and `SetModel`
-/// would refuse the id the session was already running.
+/// Every plan's default model is in the list, because a plan whose default the agent does not
+/// offer would put a client on a model it could cycle away from and never back to, and
+/// `SetModel` would refuse the id the session was already running.
 ///
 /// The current flagships come first, so the fallback default is one of them, and the
 /// previous generation stays behind them rather than being dropped: a session resumed
-/// against `gpt-5` can still cycle back to it, and removing an offered id would strand
-/// exactly the runs that predate the update.
-static OPENAI_MODELS: [&str; 8] = [
+/// against `gpt-5.6-sol` can still cycle back to it, and removing an offered id would strand
+/// exactly the runs that predate the update. The ids `OpenAI`'s deprecations page lists as shut
+/// down (`gpt-5.3-codex`, `gpt-5-mini`, `gpt-5-codex`) are gone.
+static OPENAI_MODELS: [&str; 6] = [
     "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
-    "gpt-5.3-codex",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5-codex",
 ];
 
 /// The models offered for z.ai, in cycling order.
@@ -182,7 +180,8 @@ impl core::fmt::Display for Vendor {
 /// The two are different APIs rather than options of one: the conversation is messages with
 /// `choices` deltas in one, and items with named events in the other. Which one is a fact of the
 /// endpoint — a `ChatGPT` subscription is reached through `responses`, the API through
-/// `chat/completions` — so it travels with the configuration.
+/// `chat/completions` — so it travels with the configuration. On the API, `OpenAI`'s newer
+/// models are the exception: [`OpenAiConfig::protocol_for`] sends them to `responses`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
     /// `chat/completions`: the conversation as messages, streamed as `choices` deltas.
@@ -192,6 +191,30 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    /// Whether `OpenAI` serves `model` through the Responses API first: the `gpt-5.6` generation
+    /// and everything numbered after it.
+    ///
+    /// Read from the id's version rather than from a list, so a model `OpenAI` ships next month is
+    /// already on the right wire. An id that does not begin `gpt-` followed by a version — an
+    /// `o`-series name, a gateway's alias — is not claimed, because guessing a wire for a name
+    /// the table cannot read would break a request that worked.
+    #[must_use]
+    pub fn responses_first(model: &str) -> bool {
+        let Some(rest) = model.strip_prefix("gpt-") else {
+            return false;
+        };
+        let version: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let mut parts = version.split('.');
+        let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+        let minor = parts
+            .next()
+            .map_or(Some(0), |part| part.parse::<u32>().ok());
+        matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= (5, 6))
+    }
+
     /// Returns the path appended to a base URL for this protocol.
     #[must_use]
     pub const fn path(self) -> &'static str {
@@ -260,6 +283,21 @@ impl OpenAiConfig {
     #[must_use]
     pub const fn protocol(&self) -> Protocol {
         self.protocol
+    }
+
+    /// Returns the request shape a request for `model` takes.
+    ///
+    /// The configured shape is the endpoint's own, and an endpoint that serves only the Responses
+    /// API stays on it. On the other shape, `OpenAI`'s own models from the `gpt-5.6` generation on
+    /// are sent to `responses` instead, per request rather than per adapter, so a switch between
+    /// a newer and an older model changes the wire with it. z.ai has no Responses API.
+    #[must_use]
+    pub fn protocol_for(&self, model: &str) -> Protocol {
+        if self.vendor == Vendor::OpenAi && Protocol::responses_first(model) {
+            Protocol::Responses
+        } else {
+            self.protocol
+        }
     }
 
     /// Sets the request shape, for an endpoint that speaks the other one.
@@ -448,7 +486,7 @@ pub const fn effort_spelling(effort: ReasoningEffort) -> &'static str {
     effort.as_str()
 }
 
-/// The effort steps `OpenAI`'s `gpt-5.6` family takes: `none` through `max`.
+/// The effort steps `OpenAI`'s `gpt-5.6` family and `gpt-6-luna` take: `none` through `max`.
 const OPENAI_FULL: &[ReasoningEffort] = &[
     ReasoningEffort::None,
     ReasoningEffort::Low,
@@ -458,7 +496,7 @@ const OPENAI_FULL: &[ReasoningEffort] = &[
     ReasoningEffort::Max,
 ];
 
-/// The steps a model takes that has no `none`: `gpt-6-astra`.
+/// The steps a model takes that has no `none`: `gpt-6-astra` and `gpt-6.1-sol`.
 const OPENAI_NO_NONE: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
@@ -491,8 +529,8 @@ const OPENAI_LEGACY: &[ReasoningEffort] = &[
 #[must_use]
 pub fn openai_effort_levels(model: &str) -> &'static [ReasoningEffort] {
     match model {
-        "gpt-6-astra" => OPENAI_NO_NONE,
-        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => OPENAI_FULL,
+        "gpt-6-astra" | "gpt-6.1-sol" => OPENAI_NO_NONE,
+        "gpt-6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => OPENAI_FULL,
         "gpt-5.3-codex" => OPENAI_CODEX,
         _ => OPENAI_LEGACY,
     }
@@ -548,6 +586,54 @@ mod tests {
         assert_ne!(ZAI_BASE_URL, ZAI_CODING_BASE_URL);
     }
 
+    /// The Responses API is the first wire from the `gpt-5.6` generation on, read from the id's
+    /// version so a future model is covered, and not for an id the table cannot read.
+    #[test]
+    fn the_responses_api_is_first_from_gpt_5_6_on() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6",
+            "gpt-5.10-sol",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "gpt-7",
+            "gpt-10-pro",
+        ] {
+            assert!(Protocol::responses_first(model), "{model}");
+        }
+        for model in [
+            "gpt-5",
+            "gpt-5-2025-08-07",
+            "gpt-5.3-codex",
+            "gpt-5.5",
+            "gpt-4o",
+            "gpt-4.1",
+            "o3",
+            "chatgpt-4o-latest",
+            "gpt-",
+            "gpt-turbo",
+            "glm-5.3",
+            "",
+        ] {
+            assert!(!Protocol::responses_first(model), "{model}");
+        }
+    }
+
+    /// The wire is chosen per request: a newer `OpenAI` model is sent to `responses`, an older one
+    /// stays on the endpoint's own shape, and z.ai never leaves chat completions.
+    #[test]
+    fn the_wire_follows_the_model_on_the_api_plan() {
+        let openai = OpenAiConfig::new(Vendor::OpenAi, "gpt-5", "key");
+        assert_eq!(openai.protocol_for("gpt-6.1-sol"), Protocol::Responses);
+        assert_eq!(openai.protocol_for("gpt-5"), Protocol::ChatCompletions);
+        let zai = OpenAiConfig::new(Vendor::Zai, "glm-5.3", "key");
+        assert_eq!(zai.protocol_for("gpt-6.1-sol"), Protocol::ChatCompletions);
+        let mut subscription = OpenAiConfig::new(Vendor::OpenAi, "gpt-5.3-codex", "token");
+        subscription.set_protocol(Protocol::Responses);
+        assert_eq!(subscription.protocol_for("gpt-5"), Protocol::Responses);
+    }
+
     /// The offered models are the vendor's own, and none of them is another
     /// vendor's.
     #[test]
@@ -556,13 +642,11 @@ mod tests {
             Vendor::OpenAi.models(),
             [
                 "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
-                "gpt-5.3-codex",
-                "gpt-5",
-                "gpt-5-mini",
-                "gpt-5-codex",
             ]
         );
         assert_eq!(
@@ -647,6 +731,16 @@ mod tests {
         assert!(
             !Vendor::OpenAi
                 .effort_levels("gpt-6-astra")
+                .contains(&ReasoningEffort::None)
+        );
+        assert!(
+            !Vendor::OpenAi
+                .effort_levels("gpt-6.1-sol")
+                .contains(&ReasoningEffort::None)
+        );
+        assert!(
+            Vendor::OpenAi
+                .effort_levels("gpt-6-luna")
                 .contains(&ReasoningEffort::None)
         );
         // The previous generation stops at `high`.

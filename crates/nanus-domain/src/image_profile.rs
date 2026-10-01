@@ -9,8 +9,18 @@ pub enum ImageProfile {
     AnthropicOpus55HighPatch28V1,
     /// Anthropic Messages, Sonnet 5.5, independently verified, version 1.
     AnthropicSonnet55HighPatch28V1,
-    /// `OpenAI` Chat Completions, Astra, high detail and 32-pixel patches, version 1.
+    /// `OpenAI` Astra, high detail and 32-pixel patches, version 1.
     OpenAiAstraHighPatch32V1,
+    /// `OpenAI` GPT-6.1 Sol, high detail and 32-pixel patches, version 1.
+    OpenAiSol61HighPatch32V1,
+    /// `OpenAI` GPT-6 Luna, high detail and 32-pixel patches, version 1.
+    OpenAiLuna6HighPatch32V1,
+    /// `OpenAI` GPT-5.6 Sol, high detail and 32-pixel patches, version 1.
+    OpenAiSol56HighPatch32V1,
+    /// `OpenAI` GPT-5.6 Terra, high detail and 32-pixel patches, version 1.
+    OpenAiTerra56HighPatch32V1,
+    /// `OpenAI` GPT-5.6 Luna, high detail and 32-pixel patches, version 1.
+    OpenAiLuna56HighPatch32V1,
 }
 
 impl ImageProfile {
@@ -21,6 +31,11 @@ impl ImageProfile {
             Self::AnthropicOpus55HighPatch28V1 => "anthropic-opus55-high-patch28-v1",
             Self::AnthropicSonnet55HighPatch28V1 => "anthropic-sonnet55-high-patch28-v1",
             Self::OpenAiAstraHighPatch32V1 => "openai-astra-high-patch32-v1",
+            Self::OpenAiSol61HighPatch32V1 => "openai-sol61-high-patch32-v1",
+            Self::OpenAiLuna6HighPatch32V1 => "openai-luna6-high-patch32-v1",
+            Self::OpenAiSol56HighPatch32V1 => "openai-sol56-high-patch32-v1",
+            Self::OpenAiTerra56HighPatch32V1 => "openai-terra56-high-patch32-v1",
+            Self::OpenAiLuna56HighPatch32V1 => "openai-luna56-high-patch32-v1",
         }
     }
 
@@ -31,7 +46,40 @@ impl ImageProfile {
             Self::AnthropicOpus55HighPatch28V1 => "claude-opus-5-5",
             Self::AnthropicSonnet55HighPatch28V1 => "claude-sonnet-5-5",
             Self::OpenAiAstraHighPatch32V1 => "gpt-6-astra",
+            Self::OpenAiSol61HighPatch32V1 => "gpt-6.1-sol",
+            Self::OpenAiLuna6HighPatch32V1 => "gpt-6-luna",
+            Self::OpenAiSol56HighPatch32V1 => "gpt-5.6-sol",
+            Self::OpenAiTerra56HighPatch32V1 => "gpt-5.6-terra",
+            Self::OpenAiLuna56HighPatch32V1 => "gpt-5.6-luna",
         }
+    }
+
+    /// The profile for an exact `OpenAI` model id, when one exists.
+    ///
+    /// A profile is not inherited by a neighbouring model: an id not named here has none, whatever
+    /// its family.
+    #[must_use]
+    pub fn for_openai_model(model: &str) -> Option<Self> {
+        [
+            Self::OpenAiAstraHighPatch32V1,
+            Self::OpenAiSol61HighPatch32V1,
+            Self::OpenAiLuna6HighPatch32V1,
+            Self::OpenAiSol56HighPatch32V1,
+            Self::OpenAiTerra56HighPatch32V1,
+            Self::OpenAiLuna56HighPatch32V1,
+        ]
+        .into_iter()
+        .find(|profile| profile.model() == model)
+    }
+
+    /// Whether this is one of the `OpenAI` profiles, which share one patch rule: 32-pixel patches
+    /// on a 1024-pixel edge, charged at 1.2 tokens a patch.
+    #[must_use]
+    pub const fn is_openai(self) -> bool {
+        !matches!(
+            self,
+            Self::AnthropicOpus55HighPatch28V1 | Self::AnthropicSonnet55HighPatch28V1
+        )
     }
 
     /// Largest image file in bytes.
@@ -56,7 +104,7 @@ impl ImageProfile {
     pub fn visual_patches(self, dimensions: ImageDimensions) -> Result<u32, ContentError> {
         let (edge, patch) = match self {
             Self::AnthropicOpus55HighPatch28V1 | Self::AnthropicSonnet55HighPatch28V1 => (2576, 28),
-            Self::OpenAiAstraHighPatch32V1 => (1024, 32),
+            _ => (1024, 32),
         };
         let ImageDimensions { width, height } = dimensions;
         if width == 0 || height == 0 || width > edge || height > edge {
@@ -65,7 +113,7 @@ impl ImageProfile {
         let patches = ceil_div(width, patch)?
             .checked_mul(ceil_div(height, patch)?)
             .ok_or_else(|| ContentError::new("image patch arithmetic overflow"))?;
-        if self != Self::OpenAiAstraHighPatch32V1 && patches > 4784 {
+        if !self.is_openai() && patches > 4784 {
             return Err(ContentError::new("image exceeds 4784 visual patches"));
         }
         Ok(patches)
@@ -76,7 +124,7 @@ impl ImageProfile {
     /// This includes framing and 25% safety headroom; it is not a billed token count.
     pub fn reserved_tokens(self, dimensions: ImageDimensions) -> Result<u32, ContentError> {
         let patches = self.visual_patches(dimensions)?;
-        let base = if self == Self::OpenAiAstraHighPatch32V1 {
+        let base = if self.is_openai() {
             ceil_div(
                 patches
                     .checked_mul(6)
@@ -169,6 +217,44 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn every_openai_profile_shares_one_patch_rule_and_belongs_to_one_exact_model() {
+        for profile in [
+            ImageProfile::OpenAiAstraHighPatch32V1,
+            ImageProfile::OpenAiSol61HighPatch32V1,
+            ImageProfile::OpenAiLuna6HighPatch32V1,
+            ImageProfile::OpenAiSol56HighPatch32V1,
+            ImageProfile::OpenAiTerra56HighPatch32V1,
+            ImageProfile::OpenAiLuna56HighPatch32V1,
+        ] {
+            assert!(profile.is_openai(), "{}", profile.id());
+            assert_eq!(
+                ImageProfile::for_openai_model(profile.model()),
+                Some(profile)
+            );
+            assert_eq!(
+                profile
+                    .reserved_tokens(ImageDimensions {
+                        width: 1024,
+                        height: 1024
+                    })
+                    .unwrap(),
+                1577
+            );
+            assert!(
+                profile
+                    .reserved_tokens(ImageDimensions {
+                        width: 1025,
+                        height: 1
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(ImageProfile::for_openai_model("gpt-5.5"), None);
+        assert_eq!(ImageProfile::for_openai_model("claude-opus-5-5"), None);
+        assert!(!ImageProfile::AnthropicOpus55HighPatch28V1.is_openai());
         let profile = ImageProfile::OpenAiAstraHighPatch32V1;
         assert_eq!(
             profile

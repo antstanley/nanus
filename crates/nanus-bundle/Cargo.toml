@@ -54,6 +54,14 @@ base64 = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
+image = { workspace = true }
+
+# The live vision checks name the stock adapters and credential stores, so they exist only where
+# those do; the minimal runner build must not need them.
+[[test]]
+name = "live_vision"
+required-features = ["stock-compose"]
 
 [lints]
 workspace = true

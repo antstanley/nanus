@@ -10,7 +10,7 @@ filesystem, the shell, the session log, the model adapter, and the tool registry
 plugin you can remove, replace, or write yourself, and the loop over them is built from
 the handles they publish.
 
-[![tests](https://img.shields.io/badge/tests-1210%20passing-brightgreen)](docs/testing.md)
+[![tests](https://img.shields.io/badge/tests-1382%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
@@ -245,10 +245,10 @@ $ cargo clippy --workspace --all-targets --all-features
 0 warnings, 0 errors
 
 $ cargo nextest run --workspace --all-features
-Summary [55.2s] 1210 tests run: 1210 passed, 0 skipped
+Summary [8.0s] 1382 tests run: 1382 passed, 14 skipped
 
 $ cargo test --workspace --doc
-10 doctests passed
+11 doctests passed
 ```
 
 `unsafe` appears nowhere — every crate forbids it *and* the workspace denies it, because

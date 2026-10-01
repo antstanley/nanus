@@ -813,8 +813,8 @@ a provider says "do not think" and the rest are degrees of thinking, so a toggle
 invent what "on" means for a reader who had already chosen `low`.
 
 The steps each model takes travel with the handshake, beside the models, because the adapter is
-what knows them: OpenAI's `gpt-5.6` family takes `none` through `max` while `gpt-5.3-codex` stops
-at `xhigh` and the previous generation at `high`, Anthropic's 5-series takes `low` through `max`
+what knows them: OpenAI's `gpt-5.6` family and `gpt-6-luna` take `none` through `max`, `gpt-6-astra` and `gpt-6.1-sol`
+start at `low`, and an id the table does not know takes the previous generation's `minimal` through `high`, Anthropic's 5-series takes `low` through `max`
 while Haiku 4.5 and the previous generation take no effort parameter at all, and z.ai's GLM-5.3
 models cannot turn thinking off, so `none` is not offered for them.
 

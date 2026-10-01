@@ -91,15 +91,18 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   points — but a call that blocks the thread blocks all of them.
 - **Four providers, every plan they ship usable.** `deepseek`, `zai` (its API and a coding plan
   with a key of its own), `anthropic`, and `openai` (its API and a `ChatGPT` subscription
-  authorized over OAuth, which speaks the Responses API through an encoder of its own) all run.
-  Opus/Sonnet 5.5 request adaptive thinking and preserve signed blocks for unchanged-prefix replay.
+  authorized over OAuth, which speaks the Responses API through an encoder of its own) all run;
+  on the API plan, `gpt-5.6` and later models are sent to the Responses API too, chosen per request.
+  The subscription backend refuses an output ceiling, so none is sent there, and its plan starts on
+  `gpt-6.1-sol` at `high`. Opus/Sonnet 5.5 and Fable 5.1 request adaptive thinking; Opus/Sonnet 5.5
+  preserve signed blocks for unchanged-prefix replay.
 - **Embedding is a separate build boundary.** The minimal runner uses caller-owned local
   adapters. Its native Windows/macOS matrix passed both minimally and with explicit
   provider dependencies; [tested revision and run](vision-evidence.md). Stock shell/link/service
   remain Unix-only.
-- **Vision has no promoted built-in profile yet.** Captured PNG/JPEG wire and reload tests
-  exist for the three candidate profiles. Exact-model live follow-ups are pending; capabilities
-  remain Unknown and image HTTP is refused. [Evidence and limits](vision-evidence.md).
+- **Vision is promoted for eight exact models.** Opus 5.5, Sonnet 5.5, GPT-6 Astra, GPT-6.1 Sol,
+  GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed live image and call-reference follow-ups; all other models stay Unknown and refuse image HTTP.
+  [Evidence and limits](vision-evidence.md).
 - **Only the macOS keychain ships as a platform secret store.** `SecretPort` and the
   `SecretBackend` trait are the seam, and a `0600` file and the environment are the
   fallbacks that work everywhere, but a Linux Secret Service or a Windows Credential

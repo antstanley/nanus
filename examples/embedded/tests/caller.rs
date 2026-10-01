@@ -54,7 +54,8 @@ fn every_provider_preserves_plain_text_block_line_boundaries() {
     ))
     .unwrap();
     assert_eq!(
-        openai.encode(&ChatRequest::new("gpt-6-astra", messages.clone()))["messages"][2]["content"],
+        // A chat-first model: `gpt-5.6` and later are sent to the Responses API instead.
+        openai.encode(&ChatRequest::new("gpt-5", messages.clone()))["messages"][2]["content"],
         "first\nsecond\n"
     );
     let mut config = openai.config().clone();

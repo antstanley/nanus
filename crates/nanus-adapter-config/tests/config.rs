@@ -69,9 +69,12 @@ fn the_built_in_defaults_are_the_documented_ones() {
     assert_eq!(config.max_tokens, DEFAULT_MAX_TOKENS);
     assert_eq!(config.max_steps_per_turn, DEFAULT_MAX_STEPS_PER_TURN);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
-    assert_eq!(config.reasoning_effort, ReasoningEffort::Medium);
     assert_eq!(
-        config.reasoning_effort.to_port(),
+        config.reasoning_effort, None,
+        "no step is named by default, so a plan's own default can apply"
+    );
+    assert_eq!(
+        ReasoningEffort::default().to_port(),
         nanus_ports::ReasoningEffort::Medium
     );
     assert_eq!(config.approval_policy, ApprovalPolicy::PerCall);
@@ -167,8 +170,7 @@ fn the_permission_and_effort_spellings_parse() {
     )
     .expect("seed");
     let config = NanusConfig::load(Some(&path)).expect("load");
-    assert_eq!(config.reasoning_effort, ReasoningEffort::Minimal);
-    assert_eq!(config.reasoning_effort.as_wire(), "minimal");
+    assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Minimal));
     assert_eq!(config.approval_policy, ApprovalPolicy::Permitted);
     assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
 }
@@ -313,7 +315,7 @@ fn save_then_load_round_trips() {
         base_url: Some(String::from("https://api.z.ai/api/coding/paas/v4")),
         model: Some(String::from("glm-4.5")),
         max_tokens: 1234,
-        reasoning_effort: ReasoningEffort::Low,
+        reasoning_effort: Some(ReasoningEffort::Low),
         approval_policy: ApprovalPolicy::AllCalls,
         sandbox_mode: SandboxMode::DangerFullAccess,
         system_prompt: Some(String::from("be terse")),

@@ -40,15 +40,19 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
     }
     body.insert("input".to_owned(), encode_input(&request.messages));
     // The provider's ceiling, not the configured budget: a request above it is refused rather than
-    // truncated, so sending it would fail every step.
-    body.insert(
-        "max_output_tokens".to_owned(),
-        json!(
-            request
-                .max_tokens
-                .unwrap_or_else(|| config.effective_max_tokens())
-        ),
-    );
+    // truncated, so sending it would fail every step. The `ChatGPT` backend — the endpoint whose own
+    // shape this is — answers `Unsupported parameter: max_output_tokens`, so it is left to its own
+    // ceiling there; the public API takes it.
+    if config.protocol() != crate::Protocol::Responses {
+        body.insert(
+            "max_output_tokens".to_owned(),
+            json!(
+                request
+                    .max_tokens
+                    .unwrap_or_else(|| config.effective_max_tokens())
+            ),
+        );
+    }
     let effort = request
         .reasoning_effort
         .unwrap_or_else(|| config.reasoning_effort());
@@ -97,7 +101,14 @@ fn instructions(messages: &[Message]) -> Option<String> {
 #[must_use]
 pub fn encode_input(messages: &[Message]) -> Value {
     let mut items: Vec<Value> = Vec::new();
+    // Pixels are not a tool output on this wire: a result that carries an image is answered with
+    // a label, and the original ordered text and pixels follow as a user item once the whole group
+    // of results has been answered, so every call is answered before anything else is said.
+    let mut attachments: Vec<Value> = Vec::new();
     for message in messages {
+        if !matches!(message, Message::Tool { .. }) {
+            items.append(&mut attachments);
+        }
         match message {
             // Lifted into `instructions`; not repeated here.
             Message::System { .. } => {}
@@ -123,6 +134,37 @@ pub fn encode_input(messages: &[Message]) -> Value {
                     }));
                 }
             }
+            Message::Tool {
+                call_id,
+                content_blocks: Some(blocks),
+                is_error,
+                ..
+            } if blocks
+                .iter()
+                .any(|block| matches!(block, nanus_domain::ContentBlock::Image { .. })) =>
+            {
+                let label = nanus_ports::capabilities::attachment_label(call_id, *is_error);
+                items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id.as_str(),
+                    "output": label,
+                }));
+                let mut content = vec![json!({ "type": "input_text", "text": label })];
+                content.extend(blocks.iter().map(|block| match block {
+                    nanus_domain::ContentBlock::Text(text) => {
+                        json!({ "type": "input_text", "text": text })
+                    }
+                    nanus_domain::ContentBlock::Image {
+                        media_type,
+                        data_base64,
+                    } => json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{media_type};base64,{data_base64}"),
+                        "detail": "high",
+                    }),
+                }));
+                attachments.push(json!({ "role": "user", "content": content }));
+            }
             Message::Tool { call_id, .. } => items.push(json!({
                 "type": "function_call_output",
                 "call_id": call_id.as_str(),
@@ -130,6 +172,7 @@ pub fn encode_input(messages: &[Message]) -> Value {
             })),
         }
     }
+    items.append(&mut attachments);
     Value::Array(items)
 }
 
@@ -421,6 +464,18 @@ mod tests {
 
     fn request(messages: Vec<Message>) -> ChatRequest {
         ChatRequest::new("gpt-5.3-codex", messages)
+    }
+
+    /// The `ChatGPT` backend refuses an output ceiling; the public API takes one.
+    #[test]
+    fn only_the_public_api_is_sent_an_output_ceiling() {
+        let messages = vec![Message::user("hi")];
+        let api = build_request(&config(), &request(messages.clone()));
+        assert!(api["max_output_tokens"].as_u64().is_some(), "{api}");
+        let mut backend = config();
+        backend.set_protocol(crate::Protocol::Responses);
+        let body = build_request(&backend, &request(messages));
+        assert!(body.get("max_output_tokens").is_none(), "{body}");
     }
 
     fn name(raw: &str) -> ToolName {

@@ -847,7 +847,7 @@ fn build_deepseek(
         .map_err(|error| BundleError::config(error.to_string()))?;
     // The configuration carries its own spelling of the effort so a TOML file can
     // name it; the adapter speaks the ports vocabulary.
-    adapter.set_reasoning_effort(config.reasoning_effort.to_port());
+    adapter.set_reasoning_effort(selection.effort(config.reasoning_effort));
     DeepSeekLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
 }
 
@@ -886,16 +886,16 @@ fn compatible_config(
     adapter
         .set_max_tokens(config.max_tokens)
         .map_err(|error| BundleError::config(error.to_string()))?;
-    adapter.set_reasoning_effort(config.reasoning_effort.to_port());
+    adapter.set_reasoning_effort(selection.effort(config.reasoning_effort));
     Ok(adapter)
 }
 
 /// Builds the `Anthropic` adapter.
 ///
-/// The configured reasoning effort is deliberately **not** applied: Anthropic's
-/// thinking needs the signed blocks of the previous turn replayed, which the message
-/// model has no place for, so the adapter never asks for thinking — see its crate
-/// documentation. Passing the effort in would imply it reached the wire.
+/// The file's `reasoning_effort` is deliberately **not** applied here: its scale is neutral
+/// and the models that take an effort take a wider one, so a step reaches Anthropic only when a
+/// reader chooses it, per request, as `output_config.effort`. Adaptive thinking and the signed
+/// blocks it needs replayed are the adapter's own business — see its crate documentation.
 fn build_anthropic(
     config: &NanusConfig,
     selection: &Selection,
@@ -960,14 +960,26 @@ fn build_runner(
     .with_sandbox(config.sandbox_mode);
     // The runner is given the same handle the context publishes, so registering a tool
     // later is visible on the next request rather than requiring a rebuild.
-    AgentRunner::new(
+    let runner = AgentRunner::new(
         Rc::clone(llm),
         tools.clone(),
         format!("{prompt}\n\n{runtime}"),
         agent,
         clock.clone(),
-    )
+    )?;
+    // A request that carries pixels needs an explicit output reservation, and the configured
+    // ceiling (128K) would not fit the default budget beside any input. A quarter of the budget
+    // is reserved, capped at 16K — below every offered model's own ceiling, so it holds after a
+    // model switch — and only for those requests. Both vendors count reasoning inside the output.
+    let image_output = config
+        .max_tokens
+        .min(config.context_budget.checked_div(4).unwrap_or(0))
+        .min(IMAGE_OUTPUT_RESERVATION_MAX);
+    Ok(runner.with_image_request_budget(image_output, 0))
 }
+
+/// The most output tokens an image-carrying request reserves in the stock composition.
+const IMAGE_OUTPUT_RESERVATION_MAX: u32 = 16_000;
 
 /// Mounts the adapters and the tool provider on a kernel.
 ///

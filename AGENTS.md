@@ -128,9 +128,11 @@ cargo nextest run -p nanus-bundle end_to_end
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))
 for retry-and-fail-fast behaviour: `cargo nextest run --profile ci --workspace`.
 
-The current baseline is 1210 tests, 10 doctests, 0 clippy warnings. If you change
-that number, note that a few prose files quote it (the README badge/transcript
-and `docs/testing.md`); agents should not chase those numbers unless asked.
+The current baseline is 1382 tests (plus 14 `#[ignore]`d live ones), 11 doctests, 0 clippy
+warnings. If you change that number, note that a few prose files quote it (the README
+badge/transcript and `docs/testing.md`); agents should not chase those numbers unless asked.
+`a_configuration_without_a_key_still_composes_unconfigured` expects a machine with no provider
+credential stored, so it fails on one that has them: that is the environment, not a regression.
 
 ## Running the binary
 
@@ -333,6 +335,12 @@ design docs too.
   replay are bounded. Version 1 cannot smuggle these fields. Store saves use `try_to_jsonl`;
   failed saves must leave the original intact. Image capability defaults Unknown until exact
   profile wire/reload and live-follow-up evidence pass. Do not guess support from a model label.
+- **For OpenAI, the wire follows the model.** `gpt-5.6` and later (read from the id's version) go
+  to the Responses API per request on the API plan; the `subscription` plan is Responses already and
+  is sent no `max_output_tokens`, which that backend refuses. An image profile belongs to one exact
+  model id and is promoted only on live evidence (`nanus-bundle/tests/live_vision.rs`, `#[ignore]`d).
+  `reasoning_effort` in the configuration is optional: absent means the plan's default
+  (`subscription`: `high`), then `medium`.
 - **Embedding excludes stock adapters by default-feature opt-out.** `stock-compose` gates
   concrete composition/provider/auth/selection together. Keep downstream/minimal gates clean;
   native Windows applies to this subset, not the Unix shell/link/service.

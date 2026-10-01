@@ -152,6 +152,25 @@ resume until a person re-arms it. It is deliberately last, because a driver rein
 the unattended-loop cost hazard the turn budget exists to prevent and needs a goal budget first.
 See [the goal research note](goal-research.md).
 
+## Shipped: images in tool results, and a current model lineup
+
+Unplanned by number, because it arrived as one change to what a tool result may carry. A result is
+now an ordered list of text and image blocks, kept in the session (format version 2; readers accept 1
+and 2), and a model sees the original pixels rather than a summary.
+
+| Item | Where it landed |
+|---|---|
+| **`read_image` returns real pixels.** PNG, JPEG, WebP and still GIF, bounded (512 KiB a file, four images a result, eight a request); an animated GIF is refused. | `nanus-domain/src/content.rs`, `nanus-bundle/src/tools/read.rs` |
+| **Image input is promoted per exact model, on live evidence.** Opus 5.5, Sonnet 5.5, and GPT-6 Astra, GPT-6.1 Sol, GPT-6 Luna and GPT-5.6 Sol, Terra and Luna, on both the public API and the `ChatGPT` subscription; every other model refuses before HTTP. | `nanus-domain/src/image_profile.rs`, [vision evidence](vision-evidence.md), `nanus-bundle/tests/live_vision.rs` |
+| **The Responses API is the first wire for OpenAI's `gpt-5.6` and later models**, chosen per request from the id's version, with pixels as `input_image` items. | `nanus-adapter-openai/src/{config,responses,lib}.rs` |
+| **The model lists follow the vendors' own pages.** Anthropic leads with Sonnet 5.5, Opus 5.5, Fable 5.1 and Haiku 4.5; OpenAI with GPT-6 Astra, GPT-6.1 Sol and GPT-6 Luna. Ids the vendors have shut down are gone. | `nanus-adapter-{anthropic,openai}/src/config.rs` |
+| **A plan can carry a default effort.** The `subscription` plan starts on `gpt-6.1-sol` at `high`; `reasoning_effort` in the configuration is now optional so a file's own step wins. | `nanus-bundle/src/provider.rs`, `nanus-adapter-config` |
+| **An adapter-free runner**, for hosts that bring their own ports, policy and cancellation. | `nanus-bundle` (`stock-compose` feature), `examples/embedded` |
+
+Still open here: image support for Fable 5.1, Haiku 4.5, DeepSeek and z.ai (each needs a profile and
+a live run), Responses-native images inside `function_call_output` instead of a following user item,
+and a per-configuration override of the wire for a gateway that serves only chat completions.
+
 ## Next: new capabilities
 
 Two additions larger than a feature but short of a rewrite: a way to package behaviour, and a

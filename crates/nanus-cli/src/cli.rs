@@ -1492,14 +1492,14 @@ async fn show_config(args: &Options) -> Result<(), String> {
     // configuration is the whole answer, exactly as it was before there was ever a record.
     let remembered_effort =
         compose::store_home().map_or(None, |home| compose::apply_remembered(&mut config, &home));
-    let effort = remembered_effort.map_or_else(
-        || format!("{:?}", config.reasoning_effort),
-        |effort| effort.as_str().to_owned(),
-    );
     // Resolved rather than echoed: the file may name none of the provider, plan, or
     // model, and what a run will actually use is the useful answer. A configuration
     // that cannot resolve is refused here, with the same sentence a run would give.
     let selection = Selection::resolve(&config).map_err(|error| error.to_string())?;
+    // The plan's own default is what a run starts at when the file names no step, so that is what
+    // is printed, not the neutral default.
+    let effort = remembered_effort.unwrap_or_else(|| selection.effort(config.reasoning_effort));
+    let effort = effort.as_str();
     let path = NanusConfig::source_path(args.config.as_deref()).map_or_else(
         |_| String::from("<unavailable>"),
         |path| path.display().to_string(),

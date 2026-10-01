@@ -72,17 +72,16 @@ pub const API_VERSION: &str = "2023-06-01";
 /// pinned, so both forms name one immutable model.
 ///
 /// The current lineup comes first, so the fallback default is one of them, and the
-/// previous generation stays behind it rather than being dropped: a session resumed
-/// against a 4.x model can still cycle back to it.
-static MODELS: [&str; 8] = [
-    "claude-sonnet-5",
-    "claude-opus-5",
+/// legacy-but-available 5-series models stay behind it rather than being dropped: a session
+/// resumed against one can still cycle back to it. The dated Claude 4 snapshots are not
+/// offered: Anthropic's models overview no longer lists them.
+static MODELS: [&str; 6] = [
     "claude-sonnet-5-5",
     "claude-opus-5-5",
     "claude-fable-5-1",
     "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-20250514",
+    "claude-sonnet-5",
+    "claude-opus-5",
 ];
 
 /// The documented maximum output tokens the adapter will send.
@@ -98,7 +97,7 @@ pub const MAX_OUTPUT_TOKENS: u32 = 64_000;
 #[must_use]
 pub fn model_max_output_tokens(model: &str) -> u32 {
     match model {
-        "claude-opus-5-5" | "claude-sonnet-5-5" => 128_000,
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1" => 128_000,
         _ => MAX_OUTPUT_TOKENS,
     }
 }
@@ -296,14 +295,12 @@ mod tests {
         assert_eq!(
             AnthropicConfig::models(),
             [
-                "claude-sonnet-5",
-                "claude-opus-5",
                 "claude-sonnet-5-5",
                 "claude-opus-5-5",
                 "claude-fable-5-1",
                 "claude-haiku-4-5-20251001",
-                "claude-sonnet-4-20250514",
-                "claude-opus-4-20250514",
+                "claude-sonnet-5",
+                "claude-opus-5",
             ]
         );
     }
@@ -360,7 +357,7 @@ mod tests {
     }
     #[test]
     fn each_five_point_five_model_has_its_own_standard_output_ceiling() {
-        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
             let mut config = AnthropicConfig::new(model, "fixture-key");
             config.set_max_tokens(128_000).unwrap();
             assert_eq!(config.effective_max_tokens(), 128_000);
