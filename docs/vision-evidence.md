@@ -62,8 +62,9 @@ call `beta` returns text. Each model must describe a green triangle, then name `
 that returned the image. A call id is not used because Anthropic never shows it to the model. All
 combinations (eight models × PNG, JPEG, WebP, GIF) passed, non-streamed and without tools in the
 request. The real agent then ran `nanus run` with `read_image` end to end on Sonnet 5.5 and
-`gpt-6-astra`: the tool, the image request and the answer all completed. Tested on an uncommitted
-tree above `b1a1854`; record the commit that carries it.
+`gpt-6-astra`: the tool, the image request and the answer all completed. Every run on this page was
+made on the working tree that became commit `479f6de` (parent `b1a1854`); only documentation and
+test-count text changed between those runs and the commit.
 
 `gpt-6-astra` is sent to the Responses API (chat completions refuses function tools beside a
 reasoning effort), with pixels as `input_image` items after the group of tool results. The
