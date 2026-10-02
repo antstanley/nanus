@@ -38,7 +38,7 @@ instructions.
 
 ## Repository layout
 
-Fifteen crates in a Cargo workspace. Dependencies point **inward**; this is enforced
+Sixteen crates in a Cargo workspace. Dependencies point **inward**; this is enforced
 by the manifests, not by review. `nanus-domain` has no `tokio`, no `reqwest`, and
 no filesystem, so agent decisions can be tested without a network.
 
@@ -72,6 +72,7 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 | `crates/nanus-adapter-local` | Rooted filesystem, process-group shell, clamping clock. |
 | `crates/nanus-adapter-store` | Atomic JSONL session persistence with time-ordered ids. |
 | `crates/nanus-adapter-config` | TOML configuration with a real migration chain. |
+| `crates/nanus-tool-video` | The optional `read_video` tool: FFprobe/FFmpeg sampling, and delivery as images or as a same-provider vision model's text. Depends on the domain and ports only; `nanus-bundle` installs it when `read_video = true`. |
 | `crates/nanus-bundle` | The toolset, the agent loop, and the **only** place that names concrete adapters. |
 | `crates/nanus-link` | The local link: the frame vocabulary, the platform-selected local client, and (behind the `server` feature) the half that serves an agent. This is the only thing the core and the interface share. |
 | `crates/nanus-sys-windows` | Narrow safe SID lookup, Job Object ownership, and detached spawning with isolated standard handles. Empty on Unix; no Rust `unsafe` or raw handles are exposed. |
@@ -173,6 +174,8 @@ Contract to preserve:
   `compact` (the default) is one line each, `full` is the whole argument block and the whole
   reasoning segment. The interface reads it itself, from the same file the core reads, so
   the setting reaches every way the interface is started. See `docs/tui.md`.
+- `read_video` / `ffmpeg_dir` — whether the agent offers the optional `read_video` tool, and where
+  `ffmpeg` and `ffprobe` live when they are not on `PATH`. Off by default. See `docs/features.md`.
 - `markdown` / `mermaid` — whether the interface renders the model's answers as markdown
   and draws `mermaid` fences as text diagrams. Both default to `true`. Only the model's
   *answer* is ever parsed: reasoning and tool output are drawn verbatim, so a diff cannot
@@ -285,10 +288,16 @@ before TLS destructors run, so leaving the runtime's worker pool there can hang 
 These are load-bearing; changing them means changing the tests and usually the
 design docs too.
 
-- **Exactly seven registered tools:** `read`, `write`, `edit`, `read_image`, `glob`,
+- **Exactly seven registered tools in the stock set:** `read`, `write`, `edit`, `read_image`, `glob`,
   `grep`, `bash`. There are assertions on this count and on the name list in
   `nanus-bundle`. The count is a design decision (see `docs/design.md`), not an
   accident.
+- **`read_video` is an extension, not an eighth stock tool.** `build_toolset` still returns seven.
+  `nanus-bundle` registers `read_video` from `nanus-tool-video` only when `read_video = true`, after
+  the provider switch exists, and refuses to start when FFmpeg is missing or lacks a mandatory
+  component. It declares `Execute` access, and its analysis model is on the **same provider, plan,
+  endpoint and credential account** as the conversation (`ProviderSwitch::adapter_for`): only the
+  model id differs. A provider with no model that has live image evidence has no analysis route.
 - **Exactly five goal tools, offered beside them and *not* registered:**
   `get_goal`, `create_goal`, `update_goal`, `pause_goal`, `abandon_goal`. Their
   effect is a `goal/change` record in the session log, which a `'static` tool

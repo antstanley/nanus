@@ -253,6 +253,37 @@ someone who wants it to do something else: a `README.md`, a code comment, a test
 fixture, a web page. Treat the model's instructions as untrusted input, not as your
 instructions. Concretely:
 
+## `read_video`
+
+An optional tool, off by default (`read_video = true`). It runs `ffprobe` and `ffmpeg`, so it
+declares `Execute` access and the approval policy applies to it exactly as to `bash`; it is never
+labelled a read.
+
+- **What runs.** A fixed pair of executables, taken from `ffmpeg_dir` or `PATH` at startup, with
+  structured arguments, no shell, no stdin and a cleared environment. Nothing in a model's
+  arguments reaches a command line: the source is copied to a temporary file with a fixed name, and
+  the model chooses only a path, an interval, a frame count and a question.
+- **What it will not read.** The path goes through the rooted filesystem port, so a path outside the
+  workspace is refused. FFmpeg is run with `-protocol_whitelist file`, and a container that refers to
+  other files or streams (concat lists, HLS and DASH playlists, image sequences) is refused.
+  A protocol whitelist alone does not confine a decoder: **this is not an OS sandbox**, and a
+  hostile file is still parsed by FFmpeg as your user. Treat videos from untrusted sources the way
+  you treat any file you open in a media player, and keep `per_call` approval if that matters.
+- **What it bounds.** Source size and duration, dimensions, frame count and size, decoder output,
+  per-process and whole-call time, and result text. A dropped call kills the decoder, and the
+  temporary copy is removed on every exit path.
+- **What leaves the machine.** Stills, never the video or its audio, and only to the provider already
+  in use. With `analyze`, up to four JPEGs go to a vision model on the **same provider, plan,
+  endpoint and credential account** as the conversation; the credential is read by account name and
+  a key stored for one plan is never sent to another. This is a second, paid request that the
+  main-loop token and goal budgets do not count, so it has a budget of its own
+  (`video_analysis_budget`): reserved before the request is sent, settled to the usage the provider
+  reports, and kept whole when the request fails, reports nothing or is cancelled, because cancelling
+  locally does not stop the provider generating. It is one request with no retry, and the manifest
+  records the reported usage.
+- **What a result is.** Text inside a video, and the analysis model's answer, are untrusted data. The
+  analysis is told so, and the result labels it as a model's reading of sampled stills.
+
 - Prefer `read-only` or `workspace-write` over `danger-full-access`.
 - Prefer `per_call` (the default) or `permitted` when a human is watching, and keep
   `all_calls` for an environment that contains the blast radius.

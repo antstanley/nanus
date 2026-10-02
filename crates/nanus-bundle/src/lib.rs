@@ -110,6 +110,8 @@ pub mod provider;
 #[cfg(feature = "stock-compose")]
 pub mod selection;
 pub mod tools;
+#[cfg(feature = "stock-compose")]
+mod video;
 
 pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
 #[cfg(feature = "stock-compose")]

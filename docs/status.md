@@ -35,6 +35,15 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 
 ## Known limits
 
+- **`read_video` is verified on Anthropic and OpenAI only.** DeepSeek and z.ai have no model with
+  live image evidence, so there `analyze` and `auto` report that instead of guessing; qualifying them
+  needs their credentials and a profile each, which have not been done. FFmpeg decoding was
+  exercised on macOS with FFmpeg 9.0.2 only. A dropped call kills its decoder (tested on Unix with a
+  stand-in process), but the Linux and Windows decoder paths, and Windows process teardown, are
+  untested; there is no grandchild test because FFmpeg starts none. Admission is by declared worst
+  case, so two four-frame reads in one step are refused by the 4 MiB request cap (the second is
+  asked to retry), which is conservative by design. The analysis budget is per agent process and
+  does not survive a restart. See [the evidence](vision-evidence.md#read_video).
 - **Live tool calling is replayed from a captured trace.** `live_wire.rs` replays a real
   response recorded from `api.deepseek.com` — a `bash` call whose arguments arrived a few
   characters at a time — byte for byte, in `crates/nanus-bundle/tests/data/`. That is what

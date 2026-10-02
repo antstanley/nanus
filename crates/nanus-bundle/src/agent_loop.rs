@@ -981,6 +981,10 @@ impl AgentRunner {
             }
         }
 
+        // Before anything runs: reserve room for the pixels each permitted call may return, in call
+        // order, against what this turn already holds. A call that cannot be admitted is answered
+        // here with a bounded failure and its work never starts.
+        self.admit_images(session, calls, &mut results, progress);
         let permitted: Vec<usize> = (0..calls.len())
             .filter(|index| results[*index].is_none())
             .collect();
@@ -1063,6 +1067,63 @@ impl AgentRunner {
         is_cancelled(progress, control)
     }
 
+    /// Admits each permitted call whose tool declares an image envelope, or refuses it.
+    ///
+    /// The newest turn cannot be elided to make room, so the images it already holds count against
+    /// the model's per-request caps with the worst case of every call admitted before this one.
+    /// Without this, a batch of results that cannot fit is only discovered when the *next* request
+    /// is built, after every call has run and been paid for, and the turn ends in a context error.
+    /// A model without a verified image profile is not admitted against: it cannot retain pixels
+    /// at all, and a tool that has none to return is not charged for the declaration.
+    fn admit_images(
+        &self,
+        session: &Session,
+        calls: &[ToolCall],
+        results: &mut [Option<ToolResult>],
+        progress: &mut dyn Progress,
+    ) {
+        let model = self.model();
+        let capabilities = self.llm.borrow().capabilities(&model);
+        let Ok(profile) = capabilities.require_image_profile(&model) else {
+            return;
+        };
+        let (mut images, mut bytes) = turn_images(session);
+        let max_images = profile.max_request_images();
+        let max_bytes = profile.max_request_bytes();
+        for (index, call) in calls.iter().enumerate() {
+            if results[index].is_some() {
+                continue;
+            }
+            let Some(envelope) = self
+                .tools
+                .borrow()
+                .get(&call.name)
+                .and_then(nanus_domain::ToolDefinition::result_images)
+            else {
+                continue;
+            };
+            let count = usize::try_from(envelope.max_images).unwrap_or(usize::MAX);
+            let worst = count.saturating_mul(base64_len(envelope.max_bytes_each));
+            if images.saturating_add(count) > max_images || bytes.saturating_add(worst) > max_bytes
+            {
+                let refusal = ToolResult::failure(
+                    call.id.clone(),
+                    format!(
+                        "{}: not run, because its images might not fit. This turn already holds \
+                         {images} image(s) and {bytes} encoded bytes, this call may add {count} \
+                         and up to {worst} bytes, and a request holds at most {max_images} images \
+                         and {max_bytes} bytes. Ask again after this step, or ask for fewer images.",
+                        call.name
+                    ),
+                );
+                results[index] = Some(self.finish_result(call, refusal, progress));
+            } else {
+                images = images.saturating_add(count);
+                bytes = bytes.saturating_add(worst);
+            }
+        }
+    }
+
     /// Reports only validated outcomes, as each work phase completes.
     fn finish_result(
         &self,
@@ -1070,8 +1131,40 @@ impl AgentRunner {
         result: ToolResult,
         progress: &mut dyn Progress,
     ) -> ToolResult {
+        let result = self.hold_to_envelope(call, result);
         let result = self.validate_result_images(bounded_result(result));
         progress.tool_finished(&call.id, &call.name, !result.outcome.is_success());
+        result
+    }
+
+    /// Replaces a result that carries more images than its tool declared.
+    ///
+    /// The declaration is what admission reserved against, so a result that exceeds it would
+    /// spend room another call was promised.
+    fn hold_to_envelope(&self, call: &ToolCall, result: ToolResult) -> ToolResult {
+        let Some(envelope) = self
+            .tools
+            .borrow()
+            .get(&call.name)
+            .and_then(nanus_domain::ToolDefinition::result_images)
+        else {
+            return result;
+        };
+        let carried = result
+            .outcome
+            .content()
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::Image { .. }))
+            .count();
+        if carried > usize::try_from(envelope.max_images).unwrap_or(usize::MAX) {
+            return ToolResult::failure(
+                result.call_id,
+                format!(
+                    "{}: the result carried {carried} images but the tool declared at most {}",
+                    call.name, envelope.max_images
+                ),
+            );
+        }
         result
     }
 
@@ -1223,6 +1316,43 @@ impl AgentRunner {
         }
         Some(denied_result(call, &reason, outcome))
     }
+}
+
+/// The encoded length of `bytes` bytes as padded base64.
+fn base64_len(bytes: u32) -> usize {
+    usize::try_from(bytes)
+        .unwrap_or(usize::MAX)
+        .div_ceil(3)
+        .saturating_mul(4)
+}
+
+/// The images, and their encoded bytes, the newest turn already retains.
+///
+/// The newest turn starts at the last user message and cannot be dropped to make room, which is
+/// why it is the part of the transcript admission has to count.
+fn turn_images(session: &Session) -> (usize, usize) {
+    let messages = session.derive_messages();
+    let start = messages
+        .iter()
+        .rposition(|message| matches!(message, nanus_domain::Message::User { .. }))
+        .unwrap_or(0);
+    let mut images = 0_usize;
+    let mut bytes = 0_usize;
+    for message in messages.iter().skip(start) {
+        if let nanus_domain::Message::Tool {
+            content_blocks: Some(blocks),
+            ..
+        } = message
+        {
+            for block in blocks {
+                if let ContentBlock::Image { data_base64, .. } = block {
+                    images = images.saturating_add(1);
+                    bytes = bytes.saturating_add(data_base64.len());
+                }
+            }
+        }
+    }
+    (images, bytes)
 }
 
 /// Bounds the record before retaining model content; a limit failure is model-visible.

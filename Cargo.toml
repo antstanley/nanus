@@ -11,6 +11,7 @@ members = [
     "crates/nanus-adapter-local",
     "crates/nanus-adapter-store",
     "crates/nanus-adapter-config",
+    "crates/nanus-tool-video",
     "crates/nanus-bundle",
     "crates/nanus-link",
     "crates/nanus-sys-windows",
@@ -43,6 +44,7 @@ nanus-adapter-secret = { path = "crates/nanus-adapter-secret" }
 nanus-adapter-local = { path = "crates/nanus-adapter-local" }
 nanus-adapter-store = { path = "crates/nanus-adapter-store" }
 nanus-adapter-config = { path = "crates/nanus-adapter-config" }
+nanus-tool-video = { path = "crates/nanus-tool-video" }
 nanus-bundle = { path = "crates/nanus-bundle" }
 nanus-link = { path = "crates/nanus-link" }
 nanus-sys-windows = { path = "crates/nanus-sys-windows" }

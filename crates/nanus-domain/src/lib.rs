@@ -100,6 +100,6 @@ pub use session::{
     SessionId, SessionLog, SessionSeq, TurnEndReason,
 };
 pub use tool::{
-    ContentBlock, TOOL_NAME_MAX_LEN, ToolCall, ToolDefinition, ToolError, ToolExecutor, ToolFuture,
-    ToolName, ToolOutcome, ToolRegistry, ToolResult, ToolSchema,
+    ContentBlock, ImageEnvelope, TOOL_NAME_MAX_LEN, ToolCall, ToolDefinition, ToolError,
+    ToolExecutor, ToolFuture, ToolName, ToolOutcome, ToolRegistry, ToolResult, ToolSchema,
 };

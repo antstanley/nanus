@@ -83,7 +83,12 @@ pub fn read_image_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, ReadImageExecutor { fs }).with_access(ToolAccess::Read)
+    ToolDefinition::new(schema, ReadImageExecutor { fs })
+        .with_access(ToolAccess::Read)
+        .with_result_images(
+            1,
+            u32::try_from(nanus_domain::content::IMAGE_BYTES_MAX).unwrap_or(u32::MAX),
+        )
 }
 
 /// Executes `read`.

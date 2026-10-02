@@ -1729,6 +1729,7 @@ dependencies = [
  "nanus-domain",
  "nanus-kernel",
  "nanus-ports",
+ "nanus-tool-video",
  "proptest",
  "reqwest",
  "serde",
@@ -1841,6 +1842,24 @@ dependencies = [
  "tokio",
  "windows",
  "winsafe",
+]
+
+[[package]]
+name = "nanus-tool-video"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "image",
+ "nanus-adapter-local",
+ "nanus-domain",
+ "nanus-ports",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

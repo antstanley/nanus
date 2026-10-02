@@ -21,6 +21,7 @@ stock-compose = [
     "dep:nanus-adapter-secret",
     "dep:nanus-adapter-local",
     "dep:nanus-adapter-store",
+    "dep:nanus-tool-video",
     "dep:toml",
 ]
 
@@ -38,6 +39,8 @@ nanus-adapter-anthropic = { workspace = true, optional = true }
 nanus-adapter-secret = { workspace = true, optional = true }
 nanus-adapter-local = { workspace = true, optional = true }
 nanus-adapter-store = { workspace = true, optional = true }
+# The optional `read_video` tool, installed only when the configuration asks for it.
+nanus-tool-video = { workspace = true, optional = true }
 futures = { workspace = true }
 serde = { workspace = true }
 globset = { workspace = true }

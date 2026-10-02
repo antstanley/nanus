@@ -1,6 +1,6 @@
 # Change: Optional read_video extension
 
-**Status:** Proposed · **Date:** 2026-10-01 · **Owner:** Ant Stanley · **Target:** Repo-maintained optional tool extension
+**Status:** Partially implemented (2026-10-02) · **Date:** 2026-10-01 · **Owner:** Ant Stanley · **Target:** Repo-maintained optional tool extension
 
 Provide `read_video` as an optional extension maintained in this repository at
 `crates/nanus-tool-video`. FFprobe will inspect local media and FFmpeg will sample timestamped
@@ -14,6 +14,35 @@ The [provider research](../research/2026-10-01-video_provider_support.md) distin
 capabilities from current Nanus evidence. Provider scope remains DeepSeek, z.ai, Anthropic
 and OpenAI; additional providers are evaluated after harness support ships. WebM demuxing
 and AV1 decoding are explicit requirements alongside FFmpeg's standard available codecs.
+
+## Implementation status, 2026-10-02
+
+Implemented in `crates/nanus-tool-video`, `nanus-domain` (`ImageEnvelope`), `nanus-bundle` (`video.rs`, admission in
+`agent_loop.rs`), installed by `read_video = true`: FFprobe/FFmpeg sampling with the mandatory codec/demuxer check
+at startup, the bounded rooted source, `auto`/`frames`/`analyze`, the manifest, same-provider analysis for
+**Anthropic** (`claude-sonnet-5-5`) and **OpenAI** (`gpt-6-luna`, API and subscription), an analysis budget
+(reserve before sending, settle to reported usage, keep the whole reservation on failure, missing usage or
+cancellation), and batch image admission. Verified live on every Anthropic and OpenAI model and plan in the
+catalogue, including a live refusal of an over-capacity second call; see
+[the evidence](../../docs/vision-evidence.md#read_video).
+
+Not implemented, and why the change stays open:
+
+- **DeepSeek and z.ai routes.** No model there has an image profile with live evidence and neither credential is stored
+  here, so they cannot be qualified; `analyze` and `auto` report that rather than guessing. The spec's "every
+  configured model" claim is therefore **not** met.
+- **Linux and Windows certification,** and process-lifecycle evidence beyond a dropped call killing the decoder on Unix.
+
+Narrower than specified: admission is a generic *declared-envelope* reservation (`with_result_images`) against the
+newest turn and the model's image and byte caps, not the full `ToolAdmission` projection with selection epochs and
+cross-chunk failure slots; a model switch during a step is caught by the existing next-request validation, not
+by admission. The analysis budget is per agent process and is not persisted.
+
+Deviations from the text above: an `end_ms` past the end of the video is clamped with a warning rather than
+refused (live OpenAI models send `end_ms: 60000` for every clip); the analysis request carries a one-line
+`sample_frames` declaration because providers refuse an image-bearing tool result without a declared tool, and
+any call to it fails the analysis; the sampler is `centres-nearest-after-v2`, a coarse input seek then an exact
+output seek, because MPEG program streams land an input seek late.
 
 ## Motivation
 

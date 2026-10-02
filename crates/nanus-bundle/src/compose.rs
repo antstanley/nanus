@@ -306,6 +306,11 @@ impl Pending {
             runner: Rc::clone(&runner),
             selection: core::cell::RefCell::new(self.selection),
         });
+        // Optional tools go on after the switch exists, because the one there is routes
+        // through it. The stock seven are already registered and are not touched.
+        if self.config.read_video {
+            crate::video::install(&switch, &self.config, Rc::clone(&self.fs))?;
+        }
         Ok(Harness {
             context,
             runner,
@@ -368,6 +373,48 @@ impl ProviderSwitch {
             models.insert(0, current);
         }
         models
+    }
+
+    /// Whether the model in force has verified image input on the adapter in force.
+    ///
+    /// Read from the runner at the moment of the question, not remembered: a switch of model or
+    /// provider changes the answer between two calls, and `read_video` must follow it.
+    pub(crate) fn main_model_sees_images(&self) -> bool {
+        let model = self.runner.model();
+        let capabilities = self.runner.llm().capabilities(&model);
+        capabilities.image_input == nanus_ports::ImageInputSupport::Supported
+            && capabilities.require_image_profile(&model).is_ok()
+    }
+
+    /// The registry the runner dispatches from, for registering an optional tool.
+    pub(crate) fn runner_tools(&self) -> &ToolRegistryHandle {
+        self.runner.tools()
+    }
+
+    /// The selection in force, copied out.
+    pub(crate) fn current_selection(&self) -> Selection {
+        self.selection.borrow().clone()
+    }
+
+    /// Builds an adapter for `model` on the provider, plan, endpoint and credential in force.
+    ///
+    /// The one way a helper model is reached: the provider, plan, endpoint and credential account
+    /// all come from the selection in force, so a helper can never be a different provider or be
+    /// sent a key stored for another plan. Only the model id differs.
+    pub(crate) async fn adapter_for(
+        &self,
+        model: &str,
+    ) -> Result<(LlmHandle, Selection), BundleError> {
+        let current = self.current_selection();
+        let mut config = self.config.clone();
+        config.provider = Some(current.provider().name().to_owned());
+        config.plan = Some(current.plan().name.to_owned());
+        config.base_url = Some(current.endpoint().to_owned());
+        config.model = Some(model.to_owned());
+        let selection = Selection::resolve(&config)?;
+        let credential = resolve_credential(&self.secrets, &selection).await?;
+        let llm = build_llm(&config, &selection, &credential)?;
+        Ok((llm, selection))
     }
 
     /// Returns whether a credential is configured for `provider`'s `plan`.
@@ -613,7 +660,7 @@ async fn build_adapter(
 ///
 /// Returns [`BundleError::Credential`] when no store holds a credential, and the sentence
 /// names both ways to supply one, because either may be the one a reader can act on.
-async fn resolve_credential(
+pub(crate) async fn resolve_credential(
     secrets: &SecretHandle,
     selection: &Selection,
 ) -> Result<Secret, BundleError> {
@@ -785,7 +832,7 @@ const _: () = assert!(DEFAULT_MAX_TOKENS <= DEFAULT_MAX_OUTPUT_TOKENS);
 ///
 /// This is the one place that maps a provider to an adapter, which is what keeps every
 /// other crate ignorant of which vendor speaks which protocol.
-fn build_llm(
+pub(crate) fn build_llm(
     config: &NanusConfig,
     selection: &Selection,
     key: &Secret,

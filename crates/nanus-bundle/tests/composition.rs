@@ -324,6 +324,68 @@ impl nanus_domain::ToolExecutor for Unused {
     }
 }
 
+/// `read_video` is an optional tool: the stock seven are untouched, and a configuration that
+/// asks for it either gets it or fails to start with a sentence naming what is missing.
+#[test]
+fn read_video_is_offered_only_when_the_configuration_asks_for_it() {
+    in_child_process("read_video_is_offered_only_when_the_configuration_asks_for_it");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let start = |settings: &NanusConfig| {
+        runtime
+            .block_on(compose(settings))
+            .expect("composes")
+            .start()
+    };
+
+    // Not asked for: seven tools and five goal tools, and no video tool.
+    let plain = start(&config(dir.path())).expect("mounts");
+    assert_eq!(plain.tool_count(), 12);
+    let has_video = |harness: &nanus_bundle::compose::Harness| {
+        let name = nanus_domain::ToolName::new("read_video").expect("a valid name");
+        harness.runner.tools().borrow().contains(&name)
+    };
+    assert!(
+        !has_video(&plain),
+        "the stock set does not carry the extension"
+    );
+
+    // Asked for, with no FFmpeg where the configuration says to look: the start is refused,
+    // and the sentence says where it looked.
+    let missing = NanusConfig {
+        read_video: true,
+        ffmpeg_dir: Some(dir.path().join("no-ffmpeg-here")),
+        ..config(dir.path())
+    };
+    let Err(error) = start(&missing) else {
+        panic!("an agent configured for read_video without FFmpeg must not start");
+    };
+    assert!(error.to_string().contains("ffmpeg"), "{error}");
+
+    // Asked for, with FFmpeg on this machine: the tool is registered beside the others and is
+    // gated as a program, never as a read.
+    if nanus_tool_video::FfmpegDecoder::prepare(None).is_ok() {
+        let asked = NanusConfig {
+            read_video: true,
+            ..config(dir.path())
+        };
+        let harness = start(&asked).expect("mounts with the tool");
+        assert_eq!(harness.tool_count(), 13);
+        assert!(has_video(&harness));
+        let name = nanus_domain::ToolName::new("read_video").expect("a valid name");
+        let access = harness
+            .runner
+            .tools()
+            .borrow()
+            .get(&name)
+            .map(nanus_domain::ToolDefinition::access);
+        assert_eq!(access, Some(nanus_domain::ToolAccess::Execute));
+    }
+}
+
 #[test]
 fn mounting_from_inside_a_runtime_fails_loudly() {
     in_child_process("mounting_from_inside_a_runtime_fails_loudly");

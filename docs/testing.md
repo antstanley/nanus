@@ -394,3 +394,43 @@ Injection is what made this visible: the parsed event was already in hand, and t
 "what does the modifier do to the character" had simply not been asked of it.
 
 [shift-issue]: https://github.com/ratatui/templates/issues/26
+
+## `read_video` — local and live verification, 2026-10-02
+
+`nanus-tool-video` adds 23 tests and `nanus-bundle` eight. Against a real FFmpeg 9.0.2 they encode an
+eight-second clip of four solid colours and assert on the *pixels* that come back, not on a count:
+H.264, HEVC, VP8, VP9 and AV1 in WebM and MP4, MPEG-4 in AVI, MPEG-2 and MJPEG in Matroska each yield
+red, green, blue, yellow in order at the quarter centres. Others cover a nonzero container start
+time (MPEG-TS), pixel aspect ratio with the 1024-pixel bound, `auto` resolving to text for a model
+without image input, and the negative cases: a text file, a concat list, a directory, a path outside
+the workspace, a start past the end, and a route or mode that cannot be delivered, which must be
+refused with **zero** source opens. A private temporary root proves the snapshot is removed after a
+success and after a failure, and a stand-in process proves a dropped run kills its child. The analyzer
+is driven by a scripted model and must send the exact JPEG bytes in order with their labels, once, with
+no other tool; a cut-off, empty, tool-calling, errored, over-long or unfinished answer must be a failure
+and never a result; and the analysis budget settles to reported usage but keeps the whole reservation
+for a missing report, a failure, and a request dropped while genuinely in flight. A model without
+verified image input must not become a route.
+
+`nanus-bundle/tests/admission.rs` is the design's counterexample as a test: three calls that may each
+return four images with room for eight run two and refuse the third before its executor starts; images
+a turn already holds count against a later step; the 4 MiB byte cap can refuse before the image cap; a
+result over its declared envelope is replaced; and a tool that declares nothing, or a model with no
+image profile, is not admitted against. Disabling the admission call makes three of the five fail. The
+composition test asserts the stock set stays at seven, that `read_video` is registered only on request
+with `Execute` access, and that asking for it without FFmpeg refuses to start.
+
+Bugs this found: an `ffmpeg` that logs more than its pipe holds (HEVC prints its SEI payload for every
+decoded frame) deadlocked when stderr was read to a cap and then abandoned, so the log is now always
+drained and only its tail kept; OpenAI models send `end_ms: 60000` for every clip, which a strict check
+turned into a failed first call on all fourteen OpenAI runs; and an edit declaring the tool's image envelope
+silently did not apply because the formatter had already reflowed the text, which only the live admission
+run noticed, so the declaration now has its own test.
+
+All gates passed on 2026-10-02 with an isolated `NANUS_HOME`: fmt; clippy with no warnings on the
+workspace, the minimal TUI and the minimal bundle; 1,478 workspace tests with the 14 live tests skipped
+(one earlier run of the suite flagged a test as leaky and ten consecutive reruns did not, nor did 25 of the
+video crate alone, so it is recorded as not reproduced); the doctests; 342 minimal-TUI and 139 minimal-bundle
+tests; the locked embedding fixture, 7 tests and 10 with providers. The live evidence is in
+[vision-evidence](vision-evidence.md#read_video); `scripts/live-read-video.sh` reproduces it and spends
+credit. Not run: native Windows or Linux, and any provider but Anthropic and OpenAI.

@@ -83,6 +83,49 @@ cannot provide as well, not a convenience wrapper. See
 | `grep` | Finds text inside files, grouped by file, optionally narrowed by one `include` glob, with capped matches and truncated lines that say so. |
 | `bash` | Runs a program in the workspace root unless a `workdir` says otherwise, with an optional timeout, reporting stdout, stderr, and the exit code. A non-zero exit is a result, not a failure; output is capped and truncated with a notice; the whole process group is killed so grandchildren are not orphaned. |
 
+### `read_video` (optional)
+
+Off unless `read_video = true`. Needs `ffmpeg` and `ffprobe` (on `PATH`, or in `ffmpeg_dir`); the
+agent refuses to start without them, or with a build that lacks the WebM/Matroska, MP4/MOV, AVI
+and MPEG demuxers or the H.264, HEVC, MPEG-4, MPEG-2, MJPEG, VP8, VP9 and AV1 decoders. Nothing is
+installed for you.
+
+`read_video(file_path, mode, start_ms, end_ms, max_frames, question)` samples up to four JPEGs from
+the centres of equal portions of a window of at most 60 seconds, each labelled with its actual
+source timestamp. `mode` is `auto` (the default), `frames`, or `analyze`:
+
+- **`frames`** returns the stills to the conversation model. It is refused unless that exact model
+  has verified image input, and the refusal happens before the file is opened.
+- **`analyze`** sends the same stills, once, to a vision model **on the same provider, plan, endpoint
+  and credential account** and returns its text. The conversation model never sees pixels.
+- **`auto`** is `frames` when the conversation model has verified image input and `analyze` otherwise.
+
+The analysis models are `claude-sonnet-5-5` (Anthropic) and `gpt-6-luna` (OpenAI API and
+subscription). DeepSeek and z.ai have no model with live image evidence, so on them `analyze`
+reports that rather than guessing, and `auto` reaches it for the same reason.
+
+Every result begins with a JSON manifest: the source digest, container, codec, interval, each
+frame's timestamp, size and digest, the sampler and decoder versions, warnings, and for an analysis
+the provider, plan, model, endpoint origin and reported usage. Audio is omitted and said to be. An
+`end_ms` past the end of the video is clamped with a warning; a `start_ms` past it is refused.
+
+Two guards sit outside the tool. **Admission:** a tool may declare how many images a result can carry
+and how large each is (`ToolDefinition::with_result_images`; `read_image` declares one, `read_video`
+four of at most 512 KiB). Before a step's calls run, the runner reserves that worst case in call
+order against the images the newest turn already holds and the model's caps (eight images, 4 MiB
+encoded); a call that cannot be admitted is answered with a short failure and never starts, and a
+result that exceeds its declaration is replaced by a failure. A tool that declares nothing is neither
+admitted against nor bound. **Budget:** each analysis reserves its estimated input plus the whole
+output ceiling against `video_analysis_budget` before it is sent, and settles to the usage the
+provider reports; a request that fails, reports no usage or is cancelled keeps its whole reservation,
+and a budget that cannot cover one answer refuses the call before the file is opened.
+
+Bounds: a 128 MiB source of at most an hour, 8192 pixels an edge; four JPEGs of at most 512 KiB and
+1024 pixels on the long edge; 30 seconds per decoder process and 180 for the whole call; 32 KiB of
+result text; an analysis is one request with no retry. The tool declares `Execute` access, so the
+approval policy applies to it as to `bash`. See [SAFETY.md](../SAFETY.md#read_video) and the
+[evidence](vision-evidence.md#read_video).
+
 Only a tool's `name`, `description`, and `parameters` may reach the model; the
 executable half is not serialisable, so the allowlist is carried by the types.
 
@@ -387,6 +430,9 @@ Environment variables:
 | `NANUS_TUI` | Override the path to the interface binary. |
 | `NO_COLOR` | Render with no colour at all, keeping bold and italic. |
 | `RUST_LOG` | Tracing filter for the service and core logs. |
+| `read_video` | `false` | offer the optional [`read_video`](#read_video-optional) tool |
+| `ffmpeg_dir` | `PATH` | the directory holding `ffmpeg` and `ffprobe` |
+| `video_analysis_budget` | `200000` | tokens `read_video` may spend on analysis requests per agent process |
 
 ## The command line
 

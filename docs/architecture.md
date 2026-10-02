@@ -62,6 +62,7 @@ is the only vocabulary the two share.
 | [`nanus-adapter-local`](../crates/nanus-adapter-local) | Rooted filesystem, process-group shell, clamping clock. |
 | [`nanus-adapter-store`](../crates/nanus-adapter-store) | Atomic JSONL session persistence with time-ordered ids, and the names sessions are known by. |
 | [`nanus-adapter-config`](../crates/nanus-adapter-config) | TOML configuration with a real migration. |
+| [`nanus-tool-video`](../crates/nanus-tool-video) | The optional `read_video` tool: an FFprobe/FFmpeg decoder, a rooted size-bounded source, and delivery as sampled JPEGs or as a same-provider vision model's text. Depends on the domain and ports only — it names no provider — and is not part of the stock seven. |
 | [`nanus-bundle`](../crates/nanus-bundle) | The toolset, the agent loop, and the one place that names concrete adapters. |
 | [`nanus-link`](../crates/nanus-link) | The local link: the frame vocabulary, the platform-selected Unix-socket or Windows named-pipe transport, the client an interface uses, and — behind a `server` feature — the half that serves an agent and holds its sessions open. |
 | [`nanus-sys-windows`](../crates/nanus-sys-windows) | The safe Windows SID, Job Object, and detached-spawn boundary. Empty on Unix; no raw handles or Rust `unsafe` are exposed. |

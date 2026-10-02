@@ -57,6 +57,13 @@ model must choose between — the shipped seven are about 1,200 estimated tokens
 wire, on every request ([measured](features.md#what-a-request-costs-before-the-conversation)).
 A tool earns its place by being irreplaceable, not by being convenient.
 
+A host may register more tools beside the seven; they are counted in that host's requests and are
+not part of this design's count. `read_video` is the first: `nanus-tool-video` is a separate crate,
+`build_toolset` never mentions it, and the stock composition installs it only when the
+configuration says `read_video = true`. It earns its place the same way — a decoder is a
+mechanism the shell cannot hand a model — but it is optional because it needs a program most
+machines do not have and costs a schema in every request.
+
 Beside them are five more the model is offered: `get_goal` · `create_goal` · `update_goal`
 · `pause_goal` · `abandon_goal`. The rule above is not relaxed for them — no shell command
 can mutate a session's durable objective, so each is a mechanism in the same sense. They

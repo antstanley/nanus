@@ -73,3 +73,40 @@ reasoning effort), with pixels as `input_image` items after the group of tool re
 passed there, and the real agent ran `read_image` end to end on `gpt-6.1-sol` over it. Fable 5.1
 and Haiku 4.5 have no evidence and stay Unknown. A profile belongs to one exact model id, so a later model (`gpt-6.2-sol`,
 say) is Unknown until it has a profile and its own live run.
+
+## `read_video`
+
+`read_video` ([the tool](features.md#read_video-optional)) was run through the real agent on
+2026-10-02, over a generated eight-second clip: four colours (red, green, blue, yellow), two seconds
+each, carrying one to four white squares. The expected answer is exact — 1040 ms red with one square,
+3040 ms green with two, 5040 ms blue with three, 7040 ms yellow with four — and a run counts only when
+the model reproduces the colours in order. The agent was `nanus run --approval permitted` with
+`read_video = true`, the credentials its own store holds, and an isolated `NANUS_HOME`.
+
+| Conversation model | Plan | Delivery `auto` chose | Result |
+|---|---|---|---|
+| `claude-opus-5-5`, `claude-sonnet-5-5` | api | frames (pixels to the model) | correct |
+| `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5` | api | analysis by `claude-sonnet-5-5` | correct |
+| `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | api | frames | correct |
+| the same six | subscription | frames | correct |
+| `claude-sonnet-5-5`, `gpt-6-luna` with `mode: analyze` | api, and subscription for `gpt-6-luna` | analysis by the same model | correct |
+| `claude-haiku-4-5-20251001` with `mode: frames` | api | refused before the file was opened; the model retried `auto` | correct after the retry |
+
+That is 23 runs, every one reproducing the colours and timestamps. Frames are sent to the main
+model only where it has the profile above; for every other Anthropic model the analysis request goes
+to `claude-sonnet-5-5` on the same account, and the manifest names it. Each of the fourteen OpenAI runs failed its first
+call, because OpenAI models fill every optional argument and sent `end_ms: 60000` for an eight-second
+clip. The tool now clamps an overshooting `end_ms` to the end of the video and says so in the manifest's
+warnings, and nine representative runs from `scripts/live-read-video.sh` afterwards had no failed call.
+The persisted manifest on the subscription endpoint carries provider, plan, model, endpoint origin
+(`https://chatgpt.com`, no path), protocol, profile version and the usage the backend reported.
+
+Admission was exercised live too: asked for two parallel four-frame reads in one step, `claude-sonnet-5-5` got
+the first and was refused the second *before it ran* ("this turn already holds 4 image(s) and 2796208 encoded
+bytes, this call may add 4 and up to 2796208 bytes, and a request holds at most 8 images and 4194304 bytes"),
+and reported the refusal accurately. The same run before the tool declared its envelope let both calls through,
+which is how an edit that silently did not apply was caught.
+
+Not covered by this evidence: DeepSeek and z.ai (no model with live image evidence, so no analysis
+route), and native Windows and Linux (see [status](status.md#known-limits)). A later model has no analysis route until it has a profile
+and its own live run, exactly as above. Reproduce with `scripts/live-read-video.sh`, which spends credit.

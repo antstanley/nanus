@@ -555,8 +555,25 @@ pub struct ToolDefinition {
     schema: ToolSchema,
     /// What a call to this tool can touch, for the sandbox and the approval gate.
     access: ToolAccess,
+    /// The images a result may carry, when the tool declares it.
+    result_images: Option<ImageEnvelope>,
     /// The executable half.
     executor: Box<dyn ToolExecutor>,
+}
+
+/// What a tool declares about the pixels its result may carry.
+///
+/// A runner that knows it reserves room for the declared worst case before the tool runs, so a
+/// batch of results that cannot fit into the next request is refused up front rather than after
+/// the work and its cost. A tool that declares an envelope is held to it: a result with more
+/// images is replaced by a failure. A tool that declares none is not admitted against and not
+/// bound, which is the behaviour every tool had before the declaration existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageEnvelope {
+    /// The most images one result may carry.
+    pub max_images: u32,
+    /// The largest decoded file of any one of them, in bytes.
+    pub max_bytes_each: u32,
 }
 
 impl ToolDefinition {
@@ -572,6 +589,7 @@ impl ToolDefinition {
         Self {
             schema,
             access: ToolAccess::default(),
+            result_images: None,
             executor: Box::new(executor),
         }
     }
@@ -584,6 +602,21 @@ impl ToolDefinition {
     pub const fn with_access(mut self, access: ToolAccess) -> Self {
         self.access = access;
         self
+    }
+
+    /// Declares the images a result of this tool may carry; see [`ImageEnvelope`].
+    pub const fn with_result_images(mut self, max_images: u32, max_bytes_each: u32) -> Self {
+        self.result_images = Some(ImageEnvelope {
+            max_images,
+            max_bytes_each,
+        });
+        self
+    }
+
+    /// Returns the declared image envelope, if any.
+    #[must_use]
+    pub const fn result_images(&self) -> Option<ImageEnvelope> {
+        self.result_images
     }
 
     /// Returns what a call to this tool can touch.
@@ -624,6 +657,7 @@ impl fmt::Debug for ToolDefinition {
         f.debug_struct("ToolDefinition")
             .field("schema", &self.schema)
             .field("access", &self.access)
+            .field("result_images", &self.result_images)
             .field("executor", &"<boxed>")
             .finish()
     }

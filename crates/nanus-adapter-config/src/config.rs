@@ -169,6 +169,9 @@ impl core::fmt::Display for TuiDetail {
     }
 }
 
+/// The default tokens `read_video` may spend on analysis over one agent's life.
+pub const DEFAULT_VIDEO_ANALYSIS_BUDGET: u64 = 200_000;
+
 /// The whole of nanus's durable configuration.
 ///
 /// `#[serde(default)]` is at the *struct* level, so a file that sets one field
@@ -237,6 +240,25 @@ pub struct NanusConfig {
     /// A diagram that cannot be parsed falls back to the fence's source whether this is
     /// set or not; the setting is for a reader who would rather always see the source.
     pub mermaid: bool,
+    /// Whether the agent offers the optional `read_video` tool.
+    ///
+    /// Off by default: the tool runs `FFmpeg`, which most machines do not have, and it adds a
+    /// description to every request. When on, the agent refuses to start if `FFmpeg` is missing
+    /// or lacks WebM/Matroska demuxing, AV1 decoding, or another mandatory component, rather than
+    /// offering a tool that would fail on first use. See `docs/features.md`.
+    pub read_video: bool,
+    /// The directory holding `ffmpeg` and `ffprobe`, when they are not on `PATH`.
+    ///
+    /// Read only when `read_video` is on. The two executables are always taken from the same
+    /// place, so a mismatched pair cannot be assembled from two installations.
+    pub ffmpeg_dir: Option<PathBuf>,
+    /// Tokens `read_video` may spend on analysis requests over the life of one agent.
+    ///
+    /// An analysis is a second, paid call to a vision model that the conversation's own budgets do
+    /// not count. Each is reserved against this before it is sent and settled from the usage the
+    /// provider reports; a request that fails, reports nothing or is cancelled keeps its whole
+    /// reservation. Read only when `read_video` is on. Zero refuses every analysis.
+    pub video_analysis_budget: u64,
     /// An override for the built-in system prompt.
     pub system_prompt: Option<String>,
     /// An override for the workspace root the tools are confined to.
@@ -272,6 +294,9 @@ impl Default for NanusConfig {
             tui_detail: TuiDetail::default(),
             markdown: true,
             mermaid: true,
+            read_video: false,
+            ffmpeg_dir: None,
+            video_analysis_budget: DEFAULT_VIDEO_ANALYSIS_BUDGET,
             system_prompt: None,
             workspace_root: None,
             service_socket: None,
