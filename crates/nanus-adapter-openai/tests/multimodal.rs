@@ -243,7 +243,7 @@ async fn the_chatgpt_backend_supports_every_profiled_model_and_refuses_the_rest_
         nanus_adapter_openai::Vendor::OpenAi,
         "gpt-5.5",
         "fixture",
-        "http://127.0.0.1:1",
+        nanus_adapter_openai::OPENAI_SUBSCRIPTION_BASE_URL,
     );
     config.set_protocol(nanus_adapter_openai::Protocol::Responses);
     let adapter = nanus_adapter_openai::OpenAiLlm::new(config).unwrap();

@@ -1,6 +1,6 @@
 //! # nanus-adapter-deepseek
 //!
-//! The only model provider nanus supports: `DeepSeek`, over its OpenAI-compatible
+//! The `DeepSeek` model provider, over its OpenAI-compatible
 //! chat-completions endpoint.
 //!
 //! ## Why this crate is narrow on purpose
@@ -40,7 +40,11 @@
 
 mod config;
 mod error;
-mod image_support;
+mod metadata;
+
+#[cfg(test)]
+mod metadata_tests;
+mod response;
 mod wire;
 
 pub use config::{
@@ -97,9 +101,6 @@ use nanus_ports::{ChatRequest, LlmEvent, LlmPort, LlmStream};
 
 /// The path appended to a configured base URL for a chat completion.
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
-
-/// Maximum length of an error body echoed back to the caller.
-const BODY_SNIPPET_MAX: usize = 2_000;
 
 /// A stream of model events.
 type EventStream = Pin<Box<dyn futures::Stream<Item = LlmEvent> + 'static>>;
@@ -191,19 +192,28 @@ impl LlmPort for DeepSeekLlm {
         effort_levels()
     }
 
+    fn tool_call_support(
+        &self,
+        model: &str,
+        request_effort: Option<ReasoningEffort>,
+    ) -> nanus_ports::ToolCallSupport {
+        metadata::tool_support(&self.config, model, request_effort)
+    }
+
+    fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        metadata::capabilities(&self.config, model)
+    }
+
     fn estimate_request(
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        metadata::validate_output(&self.config, request)?;
         nanus_ports::capabilities::estimate_payload(
             self.capabilities(&request.model),
             request,
             &self.encode(request),
         )
-    }
-
-    fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
-        image_support::capabilities(&self.config, model)
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
@@ -213,9 +223,7 @@ impl LlmPort for DeepSeekLlm {
         ) {
             return error_stream(&error.to_string());
         }
-        if request.context_budget.is_some()
-            || nanus_ports::capabilities::has_images(&request.messages)
-        {
+        if metadata::requires_preflight(&self.config, &request) {
             let checked = self.estimate_request(&request).and_then(|estimate| {
                 nanus_ports::capabilities::validate_estimate(
                     self.capabilities(&request.model),
@@ -247,6 +255,7 @@ impl LlmPort for DeepSeekLlm {
         // stream: the transport failure is reported after `&self` has gone out of scope.
         let host = self.config.base_url().to_owned();
         let stream_host = host.clone();
+        let limits = self.config.response_limits();
 
         let response = async move {
             let sent = client
@@ -274,7 +283,7 @@ impl LlmPort for DeepSeekLlm {
                 // that byte on the wrong side of the split.
                 let head = futures::stream::iter([LlmEvent::ResponseHead]);
                 let announced: EventStream =
-                    Box::pin(head.chain(decode(response, stream_host.clone())));
+                    Box::pin(head.chain(response::decode(response, stream_host.clone(), limits)));
                 announced
             }
             Err(message) => error_stream_owned(message),
@@ -291,85 +300,6 @@ fn error_stream(message: &str) -> LlmStream {
 /// A one-event stream carrying an error message.
 fn error_stream_owned(message: String) -> LlmStream {
     Box::pin(futures::stream::iter(vec![LlmEvent::Error(message)]))
-}
-
-/// Decodes a successful streaming response into model events.
-///
-/// `host` is the base URL the request was sent to, carried so that a failure part-way through
-/// the body names the same endpoint the request did.
-fn decode(response: reqwest::Response, host: String) -> EventStream {
-    let status = response.status();
-    if !status.is_success() {
-        // The body carries DeepSeek's own message, which is the only useful thing
-        // to show a user. It is truncated so a large error page cannot flood the
-        // transcript.
-        let body = async move {
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("<{error}>"));
-            truncate(&text, BODY_SNIPPET_MAX)
-        };
-        let stream = futures::stream::once(body).map(move |body| {
-            LlmEvent::Error(DeepSeekError::status(status.as_u16(), body).to_string())
-        });
-        return Box::pin(stream);
-    }
-
-    let mut bytes = response.bytes_stream();
-    let mut decoder = wire::SseDecoder::new();
-    let mut accumulator = wire::StreamAccumulator::default();
-    let mut done = false;
-
-    let stream = futures::stream::poll_fn(move |cx| {
-        loop {
-            if let Some(event) = accumulator.take_ready() {
-                return core::task::Poll::Ready(Some(event));
-            }
-            if done {
-                // Every event has been emitted. Ending here rather than waiting for
-                // the socket to close means a stalled connection cannot hold a
-                // turn open.
-                return core::task::Poll::Ready(None);
-            }
-            match bytes.poll_next_unpin(cx) {
-                core::task::Poll::Ready(Some(Ok(chunk))) => {
-                    for line in decoder.push(&chunk) {
-                        accumulator.observe_line(&line);
-                    }
-                    if decoder.is_done() {
-                        // The sentinel means the server has sent everything. The
-                        // accumulator must be closed *here*: it is what emits the
-                        // assembled tool calls and the usage report, and setting `done`
-                        // without closing it would drop both. Tool calls arrive as
-                        // fragments, so they cannot be emitted until the stream ends —
-                        // and this is where it ends.
-                        accumulator.close();
-                        done = true;
-                    }
-                }
-                core::task::Poll::Ready(Some(Err(error))) => {
-                    accumulator.fail(DeepSeekError::transport(&error, &host).to_string());
-                    done = true;
-                }
-                core::task::Poll::Ready(None) => {
-                    // A server that closes without a trailing newline still sent its
-                    // last frame, so the decoder's tail is flushed before the
-                    // accumulator is closed. Dropping it would lose the final delta
-                    // of a response — typically the tool call that ends a step.
-                    if let Some(tail) = decoder.finish() {
-                        accumulator.observe_line(&tail);
-                    }
-                    // A stream that ends without `[DONE]` is still usable: whatever
-                    // arrived is real, so it is emitted rather than discarded.
-                    accumulator.close();
-                    done = true;
-                }
-                core::task::Poll::Pending => return core::task::Poll::Pending,
-            }
-        }
-    });
-    Box::pin(stream)
 }
 
 /// Truncates `text` to at most `max` bytes, on a character boundary.

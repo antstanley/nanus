@@ -35,6 +35,10 @@
 
 mod config;
 mod error;
+
+mod response;
+#[cfg(test)]
+mod tool_support_tests;
 mod wire;
 
 pub use config::{
@@ -50,9 +54,6 @@ use nanus_ports::{ChatRequest, LlmEvent, LlmPort, LlmStream};
 
 /// The path appended to a configured base URL for a message request.
 const MESSAGES_PATH: &str = "/messages";
-
-/// Maximum length of an error body echoed back to the caller.
-const BODY_SNIPPET_MAX: usize = 2_000;
 
 /// A stream of model events.
 type EventStream = Pin<Box<dyn futures::Stream<Item = LlmEvent> + 'static>>;
@@ -150,7 +151,31 @@ impl LlmPort for AnthropicLlm {
         effort_levels(model)
     }
 
+    fn tool_call_support(
+        &self,
+        model: &str,
+        request_effort: Option<ReasoningEffort>,
+    ) -> nanus_ports::ToolCallSupport {
+        if self.config.base_url().trim_end_matches('/') != DEFAULT_BASE_URL
+            || !matches!(
+                model,
+                "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1"
+            )
+        {
+            return nanus_ports::ToolCallSupport::Unknown;
+        }
+        let effective = request_effort.or_else(|| self.reasoning_effort(model));
+        if effective.is_some_and(|effort| effort_levels(model).contains(&effort)) {
+            nanus_ports::ToolCallSupport::Supported
+        } else {
+            nanus_ports::ToolCallSupport::Unsupported
+        }
+    }
+
     fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        if self.config.base_url().trim_end_matches('/') != DEFAULT_BASE_URL {
+            return nanus_ports::ModelCapabilities::default();
+        }
         match model {
             "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1" => {
                 nanus_ports::ModelCapabilities {
@@ -183,6 +208,10 @@ impl LlmPort for AnthropicLlm {
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        nanus_ports::tool_support::validate_input(
+            self.tool_call_support(&request.model, request.reasoning_effort),
+            request,
+        )?;
         nanus_ports::capabilities::estimate_payload(
             self.capabilities(&request.model),
             request,
@@ -193,6 +222,12 @@ impl LlmPort for AnthropicLlm {
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
         if let Err(error) = nanus_ports::capabilities::validate_image_input(
             self.capabilities(&request.model),
+            &request,
+        ) {
+            return error_stream(&error.to_string());
+        }
+        if let Err(error) = nanus_ports::tool_support::validate_input(
+            self.tool_call_support(&request.model, request.reasoning_effort),
             &request,
         ) {
             return error_stream(&error.to_string());
@@ -232,6 +267,7 @@ impl LlmPort for AnthropicLlm {
         // failure is reported after `&self` has gone out of scope.
         let host = self.config.base_url().to_owned();
         let stream_host = host.clone();
+        let limits = self.config.response_limits();
 
         let response = async move {
             let sent = client
@@ -255,10 +291,11 @@ impl LlmPort for AnthropicLlm {
         let stream = futures::stream::once(response).flat_map(move |outcome| match outcome {
             Ok(response) => {
                 let head = futures::stream::iter([LlmEvent::ResponseHead]);
-                let announced: EventStream = Box::pin(head.chain(decode(
+                let announced: EventStream = Box::pin(head.chain(response::decode(
                     response,
                     stream_host.clone(),
                     prefix_digest.clone(),
+                    limits,
                 )));
                 announced
             }
@@ -276,81 +313,6 @@ fn error_stream(message: &str) -> LlmStream {
 /// A one-event stream carrying an error message.
 fn error_stream_owned(message: String) -> LlmStream {
     Box::pin(futures::stream::iter(vec![LlmEvent::Error(message)]))
-}
-
-/// Decodes a successful streaming response into model events.
-///
-/// `host` is the base URL the request was sent to, carried so that a failure part
-/// way through the body names the same endpoint the request did.
-fn decode(response: reqwest::Response, host: String, prefix_digest: String) -> EventStream {
-    let status = response.status();
-    if !status.is_success() {
-        // The body carries Anthropic's own message, which is the only useful thing
-        // to show a user. It is excerpted so a large error page cannot flood the
-        // transcript.
-        let body = async move {
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("<{error}>"));
-            nanus_ports::error_body_snippet(&text, BODY_SNIPPET_MAX)
-        };
-        let stream = futures::stream::once(body).map(move |body| {
-            LlmEvent::Error(AnthropicError::status(status.as_u16(), body).to_string())
-        });
-        return Box::pin(stream);
-    }
-
-    let mut bytes = response.bytes_stream();
-    let mut decoder = wire::SseDecoder::new();
-    let mut accumulator = wire::StreamAccumulator::with_prefix(prefix_digest);
-    let mut done = false;
-
-    let stream = futures::stream::poll_fn(move |cx| {
-        loop {
-            if let Some(event) = accumulator.take_ready() {
-                return core::task::Poll::Ready(Some(event));
-            }
-            if done {
-                // Every event has been emitted. Ending here rather than waiting for
-                // the socket to close means a stalled connection cannot hold a turn
-                // open.
-                return core::task::Poll::Ready(None);
-            }
-            match bytes.poll_next_unpin(cx) {
-                core::task::Poll::Ready(Some(Ok(chunk))) => {
-                    for line in decoder.push(&chunk) {
-                        accumulator.observe_line(&line);
-                    }
-                    // There is no sentinel in this protocol: the stream is over when
-                    // `message_stop` has been seen, which is what closes the
-                    // accumulator.
-                    if accumulator.is_closed() {
-                        done = true;
-                    }
-                }
-                core::task::Poll::Ready(Some(Err(error))) => {
-                    accumulator.fail(AnthropicError::transport(&error, &host).to_string());
-                    done = true;
-                }
-                core::task::Poll::Ready(None) => {
-                    // A server that closes without a trailing newline still sent its
-                    // last frame, so the decoder's tail is flushed before the
-                    // accumulator is closed.
-                    if let Some(tail) = decoder.finish() {
-                        accumulator.observe_line(&tail);
-                    }
-                    // A stream that ended without `message_stop` is still usable:
-                    // whatever arrived is real, so it is emitted rather than
-                    // discarded.
-                    accumulator.close();
-                    done = true;
-                }
-                core::task::Poll::Pending => return core::task::Poll::Pending,
-            }
-        }
-    });
-    Box::pin(stream)
 }
 
 #[cfg(test)]

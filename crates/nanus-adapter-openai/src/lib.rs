@@ -44,12 +44,21 @@
 mod config;
 mod error;
 pub mod oauth;
+mod response;
+mod tool_support;
+
 pub mod responses;
+#[cfg(test)]
+mod tool_support_tests;
 mod wire;
+mod zai;
+#[cfg(test)]
+mod zai_tests;
 
 pub use config::{
-    OPENAI_API_KEY_ENV, OPENAI_BASE_URL, OpenAiConfig, Protocol, Vendor, ZAI_API_KEY_ENV,
-    ZAI_BASE_URL, ZAI_CODING_BASE_URL, effort_spelling, openai_effort_levels, zai_effort_levels,
+    OPENAI_API_KEY_ENV, OPENAI_BASE_URL, OPENAI_SUBSCRIPTION_BASE_URL, OpenAiConfig, Protocol,
+    ProtocolPreference, Vendor, ZAI_API_KEY_ENV, ZAI_BASE_URL, ZAI_CODING_BASE_URL,
+    effort_spelling, openai_effort_levels, zai_effort_levels,
 };
 pub use error::OpenAiError;
 pub use nanus_ports::ReasoningEffort;
@@ -57,9 +66,6 @@ pub use nanus_ports::ReasoningEffort;
 use core::pin::Pin;
 use futures::StreamExt as _;
 use nanus_ports::{ChatRequest, LlmEvent, LlmPort, LlmStream};
-
-/// Maximum length of an error body echoed back to the caller.
-const BODY_SNIPPET_MAX: usize = 2_000;
 
 /// A stream of model events.
 type EventStream = Pin<Box<dyn futures::Stream<Item = LlmEvent> + 'static>>;
@@ -77,6 +83,24 @@ enum Decoder {
 }
 
 impl Decoder {
+    fn set_response_limits(&mut self, limits: Option<nanus_ports::ResponseLimits>) {
+        match self {
+            Self::Chat(accumulator) => accumulator.set_response_limits(limits),
+            Self::Responses(accumulator) => accumulator.set_response_limits(limits),
+        }
+    }
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Chat(accumulator) => accumulator.is_closed(),
+            Self::Responses(accumulator) => accumulator.is_closed(),
+        }
+    }
+    fn terminal_received(&self, sentinel: bool) -> bool {
+        match self {
+            Self::Chat(accumulator) => sentinel || accumulator.is_closed(),
+            Self::Responses(accumulator) => accumulator.terminal_received(),
+        }
+    }
     fn take_ready(&mut self) -> Option<LlmEvent> {
         match self {
             Self::Chat(accumulator) => accumulator.take_ready(),
@@ -130,8 +154,11 @@ impl OpenAiLlm {
     /// # Errors
     ///
     /// Returns [`OpenAiError::Client`] when the underlying HTTP client cannot be
-    /// constructed, which happens only when the platform TLS stack is unavailable.
+    /// constructed, or `UnsupportedProtocol` when an exact policy conflicts with its endpoint.
     pub fn new(config: OpenAiConfig) -> Result<Self, OpenAiError> {
+        config
+            .resolve_protocol(config.model())
+            .map_err(|_| OpenAiError::UnsupportedProtocol)?;
         let client = reqwest::Client::builder()
             .build()
             .map_err(|source| OpenAiError::client(&source))?;
@@ -170,7 +197,8 @@ impl OpenAiLlm {
 
     /// The full endpoint a request for `model` is posted to.
     ///
-    /// The model, not the adapter, decides the wire: see [`OpenAiConfig::protocol_for`].
+    /// The caller's exact preference wins; otherwise the model and fallback select the wire.
+    /// This diagnostic accessor does not validate endpoint compatibility.
     #[must_use]
     pub fn endpoint_for(&self, model: &str) -> String {
         self.url(self.config.protocol_for(model))
@@ -179,6 +207,22 @@ impl OpenAiLlm {
     /// The wire a request takes: its model's.
     fn protocol_of(&self, request: &ChatRequest) -> Protocol {
         self.config.protocol_for(&request.model)
+    }
+
+    fn checked_protocol(&self, request: &ChatRequest) -> nanus_ports::LlmResult<Protocol> {
+        let protocol = self.config.resolve_protocol(&request.model)?;
+        if matches!(
+            self.config.protocol_preference(),
+            ProtocolPreference::Exact(_)
+        ) && protocol == Protocol::Responses
+            && !self.config.sends_output_ceiling()
+            && request.max_tokens.is_some()
+        {
+            return Err(nanus_ports::LlmError::Unsupported {
+                feature: "this exact endpoint cannot honor an explicit output ceiling".into(),
+            });
+        }
+        Ok(protocol)
     }
 
     fn url(&self, protocol: Protocol) -> String {
@@ -191,8 +235,8 @@ impl OpenAiLlm {
 
     /// Encodes a request as the JSON body the vendor expects.
     ///
-    /// Exposed so tests and diagnostics can inspect the exact wire payload without
-    /// performing a request.
+    /// Raw encoding for wire inspection, without capability or endpoint validation.
+    /// `estimate_request` and `stream_chat` validate before estimating or dispatching.
     #[must_use]
     pub fn encode(&self, request: &ChatRequest) -> serde_json::Value {
         match self.protocol_of(request) {
@@ -208,45 +252,46 @@ impl LlmPort for OpenAiLlm {
     }
 
     fn reasoning_effort(&self, _model: &str) -> Option<ReasoningEffort> {
-        // Both vendors take the same scale on the wire now, so a chosen step is a fact
-        // worth recording for either. Every model either vendor offers takes it, so the id
-        // does not change the answer.
+        // Record the captured default. Admission separately checks the request model and endpoint.
         Some(self.config.reasoning_effort())
     }
 
     fn effort_levels(&self, model: &str) -> &'static [ReasoningEffort] {
-        self.config.vendor().effort_levels(model)
+        zai::efforts(&self.config, model)
+            .unwrap_or_else(|| self.config.vendor().effort_levels(model))
+    }
+
+    fn tool_call_support(
+        &self,
+        model: &str,
+        request_effort: Option<ReasoningEffort>,
+    ) -> nanus_ports::ToolCallSupport {
+        tool_support::support(&self.config, model, request_effort)
     }
 
     fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
-        if self.config.vendor() == Vendor::OpenAi
-            && (matches!(model, "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-luna")
-                || nanus_ports::capabilities::ImageProfile::for_openai_model(model).is_some())
+        if self.config.vendor() == Vendor::Zai {
+            return zai::capabilities(&self.config, model);
+        }
+        if !self.config.has_verified_responses_endpoint()
+            || !matches!(self.config.resolve_protocol(model), Ok(Protocol::Responses))
         {
-            // Verified live against `api.openai.com` on the Responses wire, which is where this
-            // model is sent: chat completions refuses function tools beside an effort. The
-            // `ChatGPT` backend is a different endpoint and has no evidence of its own.
-            // Two endpoints have evidence — the public API and the `ChatGPT` backend — and each
-            // was run with every model that has a profile, so the profile is the whole answer.
-            let profile = nanus_ports::capabilities::ImageProfile::for_openai_model(model);
-            let verified = profile.is_some();
-            nanus_ports::ModelCapabilities {
-                image_input: if verified {
-                    nanus_ports::ImageInputSupport::Supported
-                } else {
-                    nanus_ports::ImageInputSupport::Unknown
-                },
-                image_profile: profile,
-                context_window_tokens: Some(1_050_000),
-                max_input_tokens: Some(if model == "gpt-6-astra" {
-                    1_050_000
-                } else {
-                    922_000
-                }),
-                max_output_tokens: Some(128_000),
-            }
-        } else {
-            nanus_ports::ModelCapabilities::default()
+            return nanus_ports::ModelCapabilities::default();
+        }
+        let Some(profile) = nanus_ports::capabilities::ImageProfile::for_openai_model(model) else {
+            return nanus_ports::ModelCapabilities::default();
+        };
+        // Evidence belongs to an exact model on these Responses endpoints, never Chat or a proxy.
+        nanus_ports::ModelCapabilities {
+            image_input: nanus_ports::ImageInputSupport::Supported,
+            image_profile: Some(profile),
+            context_window_tokens: Some(1_050_000),
+            max_input_tokens: Some(if model == "gpt-6-astra" {
+                1_050_000
+            } else {
+                922_000
+            }),
+            max_output_tokens: Some(128_000),
         }
     }
 
@@ -254,24 +299,35 @@ impl LlmPort for OpenAiLlm {
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
-        nanus_ports::capabilities::estimate_payload(
-            self.capabilities(&request.model),
+        self.checked_protocol(request)?;
+        zai::validate(&self.config, request)?;
+        let capabilities = self.capabilities(&request.model);
+        nanus_ports::capabilities::validate_image_input(capabilities, request)?;
+        nanus_ports::tool_support::validate_input(
+            self.tool_call_support(&request.model, request.reasoning_effort),
             request,
-            &self.encode(request),
-        )
+        )?;
+        nanus_ports::capabilities::estimate_payload(capabilities, request, &self.encode(request))
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
-        let protocol = self.protocol_of(&request);
+        let protocol = match self.checked_protocol(&request) {
+            Ok(protocol) => protocol,
+            Err(error) => return error_stream(&error.to_string()),
+        };
         if let Err(error) = nanus_ports::capabilities::validate_image_input(
             self.capabilities(&request.model),
             &request,
         ) {
             return error_stream(&error.to_string());
         }
-        if request.context_budget.is_some()
-            || nanus_ports::capabilities::has_images(&request.messages)
-        {
+        if let Err(error) = nanus_ports::tool_support::validate_input(
+            self.tool_call_support(&request.model, request.reasoning_effort),
+            &request,
+        ) {
+            return error_stream(&error.to_string());
+        }
+        if zai::requires_preflight(&self.config, &request) {
             let checked = self.estimate_request(&request).and_then(|estimate| {
                 nanus_ports::capabilities::validate_estimate(
                     self.capabilities(&request.model),
@@ -307,6 +363,7 @@ impl LlmPort for OpenAiLlm {
         // failure is reported after `&self` has gone out of scope.
         let host = self.config.base_url().to_owned();
         let stream_host = host.clone();
+        let limits = self.config.response_limits();
 
         let response = async move {
             let mut sent = client
@@ -333,17 +390,19 @@ impl LlmPort for OpenAiLlm {
                 // this is the earliest moment the fact is true.
                 let head = futures::stream::iter([LlmEvent::ResponseHead]);
                 let announced: EventStream = match protocol {
-                    Protocol::ChatCompletions => Box::pin(head.chain(decode(
+                    Protocol::ChatCompletions => Box::pin(head.chain(response::decode(
                         response,
                         stream_host.clone(),
                         vendor,
                         Decoder::Chat(Box::default()),
+                        limits,
                     ))),
-                    Protocol::Responses => Box::pin(head.chain(decode(
+                    Protocol::Responses => Box::pin(head.chain(response::decode(
                         response,
                         stream_host.clone(),
                         vendor,
                         Decoder::Responses(Box::default()),
+                        limits,
                     ))),
                 };
                 announced
@@ -362,83 +421,6 @@ fn error_stream(message: &str) -> LlmStream {
 /// A one-event stream carrying an error message.
 fn error_stream_owned(message: String) -> LlmStream {
     Box::pin(futures::stream::iter(vec![LlmEvent::Error(message)]))
-}
-
-/// Decodes a successful streaming response into model events.
-///
-/// `host` is the base URL the request was sent to, carried so that a failure part
-/// way through the body names the same endpoint the request did.
-fn decode(
-    response: reqwest::Response,
-    host: String,
-    vendor: Vendor,
-    mut accumulator: Decoder,
-) -> EventStream {
-    let status = response.status();
-    if !status.is_success() {
-        // The body carries the vendor's own message, which is the only useful thing
-        // to show a user. It is excerpted so a large error page cannot flood the
-        // transcript.
-        let body = async move {
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("<{error}>"));
-            nanus_ports::error_body_snippet(&text, BODY_SNIPPET_MAX)
-        };
-        let stream = futures::stream::once(body).map(move |body| {
-            LlmEvent::Error(OpenAiError::status(vendor, status.as_u16(), body).to_string())
-        });
-        return Box::pin(stream);
-    }
-
-    let mut bytes = response.bytes_stream();
-    let mut decoder = wire::SseDecoder::new();
-    let mut done = false;
-
-    let stream = futures::stream::poll_fn(move |cx| {
-        loop {
-            if let Some(event) = accumulator.take_ready() {
-                return core::task::Poll::Ready(Some(event));
-            }
-            if done {
-                // Every event has been emitted. Ending here rather than waiting for
-                // the socket to close means a stalled connection cannot hold a turn
-                // open.
-                return core::task::Poll::Ready(None);
-            }
-            match bytes.poll_next_unpin(cx) {
-                core::task::Poll::Ready(Some(Ok(chunk))) => {
-                    for line in decoder.push(&chunk) {
-                        accumulator.observe_line(&line);
-                    }
-                    if decoder.is_done() {
-                        // The sentinel means the server has sent everything, and the
-                        // accumulator must be closed *here*: it is what emits the
-                        // assembled tool calls and the usage report.
-                        accumulator.close();
-                        done = true;
-                    }
-                }
-                core::task::Poll::Ready(Some(Err(error))) => {
-                    accumulator.fail(OpenAiError::transport(&error, &host).to_string());
-                    done = true;
-                }
-                core::task::Poll::Ready(None) => {
-                    // A server that closes without a trailing newline still sent its
-                    // last frame, so the decoder's tail is flushed before the
-                    // accumulator is closed.
-                    if let Some(tail) = decoder.finish() {
-                        accumulator.observe_line(&tail);
-                    }
-                    accumulator.close();
-                    done = true;
-                }
-                core::task::Poll::Pending => return core::task::Poll::Pending,
-            }
-        }
-    });
-    Box::pin(stream)
 }
 
 #[cfg(test)]

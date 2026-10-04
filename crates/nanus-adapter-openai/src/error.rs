@@ -27,6 +27,10 @@ pub enum OpenAiError {
         reason: &'static str,
     },
 
+    /// The caller's exact protocol is incompatible with its vendor/endpoint.
+    #[error("exact protocol is unsupported by the configured vendor/endpoint")]
+    UnsupportedProtocol,
+
     /// The HTTP client could not be constructed.
     #[error("could not build the HTTP client: {message}")]
     Client {
@@ -117,7 +121,8 @@ impl OpenAiError {
             Self::MalformedFrame { .. }
             | Self::MissingCredential { .. }
             | Self::InvalidConfig { .. }
-            | Self::Client { .. } => false,
+            | Self::Client { .. }
+            | Self::UnsupportedProtocol => false,
         }
     }
 }

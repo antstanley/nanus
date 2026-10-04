@@ -32,9 +32,6 @@ use serde_json::{Map, Value, json};
 
 use crate::config::AnthropicConfig;
 
-/// The server-sent-events framer, shared with every adapter that streams this way.
-pub use nanus_ports::SseFrames as SseDecoder;
-
 /// Builds the JSON body for a message request.
 #[must_use]
 pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
@@ -280,6 +277,7 @@ pub fn encode_tools(tools: &[ToolSchema]) -> Value {
 /// the prompt count arrives at the start and the output count at the end.
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
+    limits: Option<nanus_ports::ResponseLimits>,
     ready: Vec<LlmEvent>,
     input_tokens: u32,
     cache_read_tokens: u32,
@@ -294,6 +292,11 @@ pub struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    /// Installs immutable caller budgets before observing any frame.
+    pub fn set_response_limits(&mut self, limits: Option<nanus_ports::ResponseLimits>) {
+        self.limits = limits;
+    }
+
     /// Starts a stream whose signed content is bound to this exact request prefix.
     pub fn with_prefix(prefix_digest: String) -> Self {
         Self {
@@ -318,14 +321,27 @@ impl StreamAccumulator {
 
     /// Records a failure as a terminal event.
     pub fn fail(&mut self, message: String) {
+        if self.limits.is_some() {
+            self.ready.clear();
+            self.replay_blocks.clear();
+            self.replay_arguments.clear();
+            self.finish = None;
+        }
         self.ready.push(LlmEvent::Error(message));
         self.closed = true;
     }
 
     /// Observes one decoded SSE payload.
     pub fn observe_line(&mut self, payload: &str) {
+        if self.limits.is_some() && self.closed {
+            return;
+        }
         let parsed: Result<Value, _> = serde_json::from_str(payload);
         let Ok(value) = parsed else {
+            if self.limits.is_some() {
+                self.fail("malformed stream: provider payload is not JSON".into());
+                return;
+            }
             self.ready.push(LlmEvent::Error(format!(
                 "the server sent a frame that is not JSON: {}",
                 truncate_for_message(payload)
@@ -341,6 +357,21 @@ impl StreamAccumulator {
     /// date and adds event kinds, and a client that refused an unknown one would
     /// break on a release note.
     pub fn observe_frame(&mut self, frame: &Value) {
+        if let Some(limits) = self.limits {
+            if self.closed {
+                return;
+            }
+            if let Err(error) = limits.frame(frame) {
+                self.fail(error.to_string());
+                return;
+            }
+        }
+        if let Some(limits) = self.limits
+            && let Err(error) = self.check_replay_frame(frame, limits)
+        {
+            self.fail(error.to_string());
+            return;
+        }
         self.observe_replay(frame);
         if self.closed {
             return;
@@ -363,6 +394,60 @@ impl StreamAccumulator {
             // adds: nothing the harness acts on.
             _ => {}
         }
+    }
+
+    fn check_replay_frame(
+        &self,
+        frame: &Value,
+        limits: nanus_ports::ResponseLimits,
+    ) -> nanus_ports::LlmResult<()> {
+        if let Some(index) = frame.get("index") {
+            let index = index
+                .as_u64()
+                .ok_or_else(|| nanus_ports::LlmError::MalformedStream {
+                    message: "invalid assistant block index".into(),
+                })?;
+            limits.index(index)?;
+        }
+        let added = match frame.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                if self.replay_blocks.len() >= limits.tool_slots() {
+                    return Err(nanus_ports::LlmError::ResponseLimit {
+                        resource: "assistant block slots",
+                        limit: limits.tool_slots(),
+                    });
+                }
+                frame
+                    .get("content_block")
+                    .map(|block| {
+                        nanus_domain::content::serialized_size(block, limits.event_bytes())
+                    })
+                    .transpose()
+                    .map_err(|_| nanus_ports::LlmError::ResponseLimit {
+                        resource: "assistant replay bytes",
+                        limit: limits.event_bytes(),
+                    })?
+                    .unwrap_or(0)
+            }
+            Some("content_block_delta") => frame.get("delta").map_or(0, |delta| {
+                let field = match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => "text",
+                    Some("thinking_delta") => "thinking",
+                    Some("signature_delta") => "signature",
+                    Some("input_json_delta") => "partial_json",
+                    _ => return 0,
+                };
+                delta.get(field).and_then(Value::as_str).map_or(0, str::len)
+            }),
+            _ => 0,
+        };
+        nanus_ports::ResponseLimits::add(
+            "assistant replay bytes",
+            self.replay_bytes,
+            added,
+            limits.event_bytes(),
+        )?;
+        Ok(())
     }
 
     /// Reassembles original blocks, including signatures that carry no visible text.
@@ -506,12 +591,20 @@ impl StreamAccumulator {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if id.is_empty() {
+            if self.limits.is_some() {
+                self.fail("malformed stream: tool call has no id".into());
+                return;
+            }
             self.ready.push(LlmEvent::Error(format!(
                 "the model opened tool call {index} with no id"
             )));
             return;
         }
         let Ok(name) = ToolName::new(name) else {
+            if self.limits.is_some() {
+                self.fail("malformed stream: tool call has invalid name".into());
+                return;
+            }
             self.ready.push(LlmEvent::Error(format!(
                 "the model requested a tool whose name is not usable: {:?}",
                 truncate_for_message(name)
@@ -591,18 +684,27 @@ impl StreamAccumulator {
             if blocks.iter().any(|block| {
                 block["type"] == "thinking" && block["signature"].as_str().is_none_or(str::is_empty)
             }) {
-                self.ready.push(LlmEvent::Error(
-                    "thinking block has no completed signature".into(),
-                ));
+                self.fail("thinking block has no completed signature".into());
                 return;
             }
-            self.ready.push(LlmEvent::AssistantReplay(
-                nanus_domain::message::AssistantReplay {
-                    protocol: "anthropic.messages".into(),
-                    prefix_digest: self.prefix_digest.clone(),
-                    blocks,
-                },
-            ));
+            let replay = nanus_domain::message::AssistantReplay {
+                protocol: "anthropic.messages".into(),
+                prefix_digest: self.prefix_digest.clone(),
+                blocks,
+            };
+            if let Some(limits) = self.limits
+                && nanus_domain::content::serialized_size(&replay, limits.event_bytes()).is_err()
+            {
+                self.fail(
+                    nanus_ports::LlmError::ResponseLimit {
+                        resource: "assistant replay bytes",
+                        limit: limits.event_bytes(),
+                    }
+                    .to_string(),
+                );
+                return;
+            }
+            self.ready.push(LlmEvent::AssistantReplay(replay));
         }
         let usage = Usage::new(
             self.prompt_tokens(),
@@ -1238,3 +1340,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "wire_bounds_tests.rs"]
+mod bounds_tests;

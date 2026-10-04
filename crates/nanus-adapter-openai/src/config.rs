@@ -14,6 +14,9 @@ use crate::error::OpenAiError;
 /// `OpenAI`'s API host, with the version prefix its documentation requires.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// The Responses endpoint whose subscription image profiles have recorded live evidence.
+pub const OPENAI_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
 /// z.ai's pay-as-you-go API host.
 pub const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 
@@ -190,6 +193,16 @@ pub enum Protocol {
     Responses,
 }
 
+/// Caller-selected wire policy, independent of the stock plan's fallback protocol.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProtocolPreference {
+    /// Preserve stock model-dependent routing and the configured fallback.
+    #[default]
+    Automatic,
+    /// Use exactly this wire or fail before HTTP; never redirect to the other API.
+    Exact(Protocol),
+}
+
 impl Protocol {
     /// Whether `OpenAI` serves `model` through the Responses API first: the `gpt-5.6` generation
     /// and everything numbered after it.
@@ -238,7 +251,9 @@ pub struct OpenAiConfig {
     max_tokens: u32,
     reasoning_effort: ReasoningEffort,
     temperature: Option<f32>,
+    response_limits: Option<nanus_ports::ResponseLimits>,
     protocol: Protocol,
+    protocol_preference: ProtocolPreference,
     /// The `ChatGPT` account a subscription request names in its own header.
     ///
     /// `None` for the API, which names the account by its key alone. The id is not a secret: it is
@@ -256,17 +271,29 @@ impl core::fmt::Debug for OpenAiConfig {
             .field("max_tokens", &self.max_tokens)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("temperature", &self.temperature)
+            .field("response_limits", &self.response_limits)
             .field("protocol", &self.protocol)
+            .field("protocol_preference", &self.protocol_preference)
             .field("account_id", &self.account_id)
             .finish()
     }
 }
 
 impl OpenAiConfig {
+    /// Selects generic transport/decoder budgets before any request is dispatched.
+    pub fn set_response_limits(&mut self, limits: nanus_ports::ResponseLimits) {
+        self.response_limits = Some(limits);
+    }
+    /// Absent limits preserve the stock provider behavior.
+    #[must_use]
+    pub const fn response_limits(&self) -> Option<nanus_ports::ResponseLimits> {
+        self.response_limits
+    }
+
     /// Builds a configuration for `model` at the vendor's default endpoint.
     #[must_use]
     pub fn new(vendor: Vendor, model: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self {
+        let mut config = Self {
             vendor,
             model: model.into(),
             api_key: api_key.into(),
@@ -274,9 +301,13 @@ impl OpenAiConfig {
             max_tokens: vendor.max_output_tokens(),
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
+            response_limits: None,
             protocol: Protocol::ChatCompletions,
+            protocol_preference: ProtocolPreference::Automatic,
             account_id: None,
-        }
+        };
+        config.reasoning_effort = crate::zai::default_effort(&config);
+        config
     }
 
     /// Returns the request shape this configuration speaks.
@@ -285,7 +316,8 @@ impl OpenAiConfig {
         self.protocol
     }
 
-    /// Returns the request shape a request for `model` takes.
+    /// Returns the selected request shape without validating endpoint compatibility.
+    /// Use `resolve_protocol` before dispatch or estimation.
     ///
     /// The configured shape is the endpoint's own, and an endpoint that serves only the Responses
     /// API stays on it. On the other shape, `OpenAI`'s own models from the `gpt-5.6` generation on
@@ -293,6 +325,9 @@ impl OpenAiConfig {
     /// a newer and an older model changes the wire with it. z.ai has no Responses API.
     #[must_use]
     pub fn protocol_for(&self, model: &str) -> Protocol {
+        if let ProtocolPreference::Exact(protocol) = self.protocol_preference {
+            return protocol;
+        }
         if self.vendor == Vendor::OpenAi && Protocol::responses_first(model) {
             Protocol::Responses
         } else {
@@ -300,7 +335,77 @@ impl OpenAiConfig {
         }
     }
 
-    /// Sets the request shape, for an endpoint that speaks the other one.
+    /// The caller's policy; absent configuration retains stock automatic routing.
+    #[must_use]
+    pub const fn protocol_preference(&self) -> ProtocolPreference {
+        self.protocol_preference
+    }
+
+    /// Installs a policy without changing the fallback protocol or endpoint.
+    /// # Errors
+    /// Refuses exact Responses for z.ai and exact Chat for the subscription endpoint.
+    /// A rejected policy leaves the configuration unchanged.
+    pub fn set_protocol_preference(
+        &mut self,
+        preference: ProtocolPreference,
+    ) -> nanus_ports::LlmResult<()> {
+        self.check_protocol_preference(preference)?;
+        self.protocol_preference = preference;
+        Ok(())
+    }
+
+    /// Resolves the actual wire and rechecks it against the current vendor/endpoint.
+    /// # Errors
+    /// Refuses an incompatible exact policy, including after an endpoint edit.
+    pub fn resolve_protocol(&self, model: &str) -> nanus_ports::LlmResult<Protocol> {
+        self.check_protocol_preference(self.protocol_preference)?;
+        Ok(self.protocol_for(model))
+    }
+
+    fn check_protocol_preference(
+        &self,
+        preference: ProtocolPreference,
+    ) -> nanus_ports::LlmResult<()> {
+        let refused = match preference {
+            ProtocolPreference::Exact(Protocol::Responses) if self.vendor == Vendor::Zai => true,
+            ProtocolPreference::Exact(Protocol::ChatCompletions)
+                if self.base_url.trim_end_matches('/') == OPENAI_SUBSCRIPTION_BASE_URL =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if refused {
+            return Err(nanus_ports::LlmError::Unsupported {
+                feature: "exact protocol is unsupported by the configured vendor/endpoint".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether the encoded Responses request can carry an output ceiling.
+    /// Automatic preserves the legacy plan hint; exact policy follows the actual endpoint.
+    #[must_use]
+    pub fn sends_output_ceiling(&self) -> bool {
+        match self.protocol_preference {
+            ProtocolPreference::Automatic => self.protocol != Protocol::Responses,
+            ProtocolPreference::Exact(_) => {
+                self.base_url.trim_end_matches('/') != OPENAI_SUBSCRIPTION_BASE_URL
+            }
+        }
+    }
+
+    /// Whether this exact base URL has recorded Responses capability evidence.
+    pub fn has_verified_responses_endpoint(&self) -> bool {
+        self.vendor == Vendor::OpenAi
+            && matches!(
+                self.base_url.trim_end_matches('/'),
+                OPENAI_BASE_URL | OPENAI_SUBSCRIPTION_BASE_URL
+            )
+    }
+
+    /// Sets the stock fallback/plan protocol. Exact preference, if present, still wins.
+    /// This preserves historical automatic routing; use `set_protocol_preference` for an exact wire.
     pub fn set_protocol(&mut self, protocol: Protocol) {
         self.protocol = protocol;
     }
@@ -329,6 +434,7 @@ impl OpenAiConfig {
     ) -> Self {
         let mut config = Self::new(vendor, model, api_key);
         config.base_url = base_url.into();
+        config.reasoning_effort = crate::zai::default_effort(&config);
         config
     }
 

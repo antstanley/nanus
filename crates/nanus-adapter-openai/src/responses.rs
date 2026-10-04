@@ -43,7 +43,7 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
     // truncated, so sending it would fail every step. The `ChatGPT` backend — the endpoint whose own
     // shape this is — answers `Unsupported parameter: max_output_tokens`, so it is left to its own
     // ceiling there; the public API takes it.
-    if config.protocol() != crate::Protocol::Responses {
+    if config.sends_output_ceiling() {
         body.insert(
             "max_output_tokens".to_owned(),
             json!(
@@ -212,6 +212,7 @@ struct PartialCall {
 /// as fragments keyed by an item, so the call cannot be reported until the stream ends.
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
+    limits: Option<nanus_ports::ResponseLimits>,
     ready: Vec<LlmEvent>,
     calls: Vec<PartialCall>,
     usage: Option<Usage>,
@@ -220,6 +221,21 @@ pub struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    /// Sets response budgets before observation begins.
+    pub fn set_response_limits(&mut self, limits: Option<nanus_ports::ResponseLimits>) {
+        self.limits = limits;
+    }
+    /// Responses has its own terminal payload and need not send a transport sentinel.
+    #[must_use]
+    pub const fn terminal_received(&self) -> bool {
+        self.closed || self.finish.is_some()
+    }
+    /// Whether a terminal event has been queued.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     /// Takes the next ready event, if any.
     pub fn take_ready(&mut self) -> Option<LlmEvent> {
         if self.ready.is_empty() {
@@ -230,14 +246,27 @@ impl StreamAccumulator {
 
     /// Records a failure as a terminal event.
     pub fn fail(&mut self, message: String) {
+        if self.limits.is_some() {
+            self.ready.clear();
+            self.calls.clear();
+            self.usage = None;
+            self.finish = None;
+        }
         self.ready.push(LlmEvent::Error(message));
         self.closed = true;
     }
 
     /// Observes one decoded SSE payload.
     pub fn observe_line(&mut self, payload: &str) {
+        if self.limits.is_some() && self.closed {
+            return;
+        }
         let parsed: Result<Value, _> = serde_json::from_str(payload);
         let Ok(value) = parsed else {
+            if self.limits.is_some() {
+                self.fail("malformed stream: provider payload is not JSON".into());
+                return;
+            }
             self.ready.push(LlmEvent::Error(format!(
                 "the server sent a frame that is not JSON: {}",
                 crate::wire::truncate_for_message(payload)
@@ -249,6 +278,15 @@ impl StreamAccumulator {
 
     /// Observes one decoded event.
     pub fn observe_frame(&mut self, frame: &Value) {
+        if let Some(limits) = self.limits {
+            if self.closed {
+                return;
+            }
+            if let Err(error) = self.check_frame(frame, limits) {
+                self.fail(error.to_string());
+                return;
+            }
+        }
         // A failure can arrive as an `error` event or as a `response.failed` one, and either way it
         // is the reason the turn stopped.
         if let Some(message) = error_message(frame) {
@@ -296,6 +334,65 @@ impl StreamAccumulator {
             "response.incomplete" => self.finish = Some(FinishReason::Length),
             _ => {}
         }
+    }
+
+    fn check_frame(
+        &self,
+        frame: &Value,
+        limits: nanus_ports::ResponseLimits,
+    ) -> nanus_ports::LlmResult<()> {
+        limits.frame(frame)?;
+        let kind = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind == "response.function_call_arguments.delta" {
+            let id = non_empty_str(frame, "item_id").unwrap_or_default();
+            if let Some(call) = self.calls.iter().find(|call| call.item_id == id) {
+                let added = frame
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len);
+                let arguments = nanus_ports::ResponseLimits::add(
+                    "tool-call bytes",
+                    call.arguments.len(),
+                    added,
+                    limits.event_bytes(),
+                )?;
+                limits.call_bytes(&call.call_id, &call.name, arguments)?;
+            }
+        }
+        if matches!(
+            kind,
+            "response.output_item.added" | "response.output_item.done"
+        ) && let Some(item) = frame.get("item")
+            && item.get("type").and_then(Value::as_str) == Some("function_call")
+        {
+            if kind == "response.output_item.added" && self.calls.len() >= limits.tool_slots() {
+                return Err(nanus_ports::LlmError::ResponseLimit {
+                    resource: "tool-call slots",
+                    limit: limits.tool_slots(),
+                });
+            }
+            let previous = if kind == "response.output_item.done" {
+                let id = non_empty_str(item, "id").unwrap_or_default();
+                self.calls.iter().find(|call| call.item_id == id)
+            } else {
+                None
+            };
+            let id = non_empty_str(item, "call_id")
+                .or_else(|| previous.map(|call| call.call_id.as_str()))
+                .unwrap_or_default();
+            let name = non_empty_str(item, "name")
+                .or_else(|| previous.map(|call| call.name.as_str()))
+                .unwrap_or_default();
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map_or_else(|| previous.map_or(0, |call| call.arguments.len()), str::len);
+            limits.call_bytes(id, name, arguments)?;
+        }
+        Ok(())
     }
 
     /// Starts a partial call when a function call item is added.
@@ -352,6 +449,14 @@ impl StreamAccumulator {
     /// Emits the accumulated tool calls and the terminal event.
     pub fn close(&mut self) {
         if self.closed {
+            return;
+        }
+        if self.limits.is_some()
+            && self.calls.iter().any(|call| {
+                call.call_id.is_empty() || nanus_domain::ToolName::new(call.name.clone()).is_err()
+            })
+        {
+            self.fail("malformed stream: invalid completed tool call".into());
             return;
         }
         self.closed = true;
@@ -683,3 +788,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "responses_bounds_tests.rs"]
+mod bounds_tests;

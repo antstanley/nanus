@@ -70,10 +70,13 @@ pub mod control;
 pub mod error;
 pub mod fs;
 pub mod llm;
+pub mod response_frames;
+pub mod response_limits;
 pub mod secret;
 pub mod shell;
 pub mod sse;
 pub mod store;
+pub mod tool_support;
 
 use core::future::Future;
 use core::pin::Pin;
@@ -102,6 +105,7 @@ pub use shell::{
 };
 pub use sse::SseFrames;
 pub use store::{SessionSummary, StoreError, StoreHandle, StorePort, StoreResult};
+pub use tool_support::ToolCallSupport;
 
 /// A boxed future that need not be `Send`.
 ///
@@ -148,6 +152,11 @@ pub fn clock_key() -> ServiceKey<ClockHandle> {
 pub fn secret_key() -> ServiceKey<SecretHandle> {
     ServiceKey::of("secret")
 }
+
+/// Shared optional bounded SSE reader.
+pub use response_frames::ResponseFrames;
+/// Caller-selected provider response/framing budgets.
+pub use response_limits::ResponseLimits;
 
 #[cfg(test)]
 mod tests {

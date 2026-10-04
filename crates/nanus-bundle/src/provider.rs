@@ -163,7 +163,7 @@ static ZAI_PLANS: [Plan; 2] = [
         refusal: None,
         credential: None,
         protocol: Some(Protocol::ChatCompletions),
-        effort: None,
+        effort: Some(nanus_ports::ReasoningEffort::Max),
     },
     Plan {
         name: "coding",
@@ -212,7 +212,7 @@ static OPENAI_PLANS: [Plan; 2] = [
     },
     Plan {
         name: "subscription",
-        endpoint: "https://chatgpt.com/backend-api/codex",
+        endpoint: nanus_adapter_openai::OPENAI_SUBSCRIPTION_BASE_URL,
         model: Some("gpt-6.1-sol"),
         refusal: None,
         credential: Some(PlanCredential::Oauth {
@@ -539,9 +539,20 @@ impl Selection {
         &self,
         configured: Option<nanus_adapter_config::ReasoningEffort>,
     ) -> nanus_ports::ReasoningEffort {
+        let plan_effort = if self.provider == Provider::Zai
+            && self.plan.name == DEFAULT_PLAN
+            && (self.endpoint.trim_end_matches('/') != nanus_adapter_openai::ZAI_BASE_URL
+                || !matches!(
+                    self.model.as_str(),
+                    "glm-5.3-flashx" | "glm-5.3-flash" | "glm-5.3" | "glm-5.2"
+                )) {
+            None
+        } else {
+            self.plan.effort
+        };
         configured
             .map(nanus_adapter_config::ReasoningEffort::to_port)
-            .or(self.plan.effort)
+            .or(plan_effort)
             .unwrap_or_else(|| nanus_adapter_config::ReasoningEffort::default().to_port())
     }
 
@@ -596,6 +607,42 @@ mod tests {
 
     fn config() -> NanusConfig {
         NanusConfig::default()
+    }
+
+    #[test]
+    fn zai_api_defaults_to_native_max_without_changing_explicit_effort_or_coding() {
+        let mut config = NanusConfig {
+            provider: Some("zai".into()),
+            ..config()
+        };
+        let selection = Selection::resolve(&config).expect("API selection");
+        assert_eq!(selection.endpoint(), nanus_adapter_openai::ZAI_BASE_URL);
+        assert_eq!(selection.effort(None), nanus_ports::ReasoningEffort::Max);
+        assert_eq!(
+            selection.effort(Some(nanus_adapter_config::ReasoningEffort::Medium)),
+            nanus_ports::ReasoningEffort::Medium
+        );
+        config.plan = Some("coding".into());
+        let selection = Selection::resolve(&config).expect("Coding selection");
+        assert_eq!(
+            selection.endpoint(),
+            nanus_adapter_openai::ZAI_CODING_BASE_URL
+        );
+        assert_eq!(selection.effort(None), nanus_ports::ReasoningEffort::Medium);
+        config.plan = None;
+        config.base_url = Some("https://gateway.invalid/api/paas/v4".into());
+        assert_eq!(
+            Selection::resolve(&config).expect("gateway").effort(None),
+            nanus_ports::ReasoningEffort::Medium
+        );
+        config.base_url = None;
+        config.model = Some("glm-future".into());
+        assert_eq!(
+            Selection::resolve(&config)
+                .expect("unknown model")
+                .effort(None),
+            nanus_ports::ReasoningEffort::Medium
+        );
     }
 
     /// A configuration that names nothing runs the shipped default, and the model is

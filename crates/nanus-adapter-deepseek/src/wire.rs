@@ -10,14 +10,6 @@ use serde_json::{Map, Value, json};
 
 use crate::config::DeepSeekConfig;
 
-/// The server-sent-events framer.
-///
-/// The framing is not `DeepSeek`'s: every provider that streams this way frames
-/// its payloads identically, so the decoder lives in [`nanus_ports`] where it is
-/// tested once and shared. What is this module's business is the JSON *inside* a
-/// payload, which is what [`StreamAccumulator`] decodes.
-pub use nanus_ports::SseFrames as SseDecoder;
-
 /// The most tool calls one response may carry.
 ///
 /// A ceiling on a number a provider supplies, because it sizes an allocation. No model calls
@@ -251,6 +243,7 @@ struct PartialToolCall {
 /// calls, and emits the calls at [`StreamAccumulator::close`].
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
+    limits: Option<nanus_ports::ResponseLimits>,
     ready: Vec<LlmEvent>,
     calls: Vec<PartialToolCall>,
     usage: Option<Usage>,
@@ -259,6 +252,11 @@ pub struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    /// Installs immutable caller budgets before observing any frame.
+    pub fn set_response_limits(&mut self, limits: Option<nanus_ports::ResponseLimits>) {
+        self.limits = limits;
+    }
+
     /// Takes the next ready event, if any.
     pub fn take_ready(&mut self) -> Option<LlmEvent> {
         if self.ready.is_empty() {
@@ -269,6 +267,12 @@ impl StreamAccumulator {
 
     /// Records a failure as a terminal event.
     pub fn fail(&mut self, message: String) {
+        if self.limits.is_some() {
+            self.ready.clear();
+            self.calls.clear();
+            self.usage = None;
+            self.finish = None;
+        }
         self.ready.push(LlmEvent::Error(message));
         self.closed = true;
     }
@@ -278,8 +282,15 @@ impl StreamAccumulator {
     /// A payload that is not valid JSON is reported as an error event rather than
     /// ignored: silence would hide a protocol change.
     pub fn observe_line(&mut self, payload: &str) {
+        if self.limits.is_some() && self.closed {
+            return;
+        }
         let parsed: Result<Value, _> = serde_json::from_str(payload);
         let Ok(value) = parsed else {
+            if self.limits.is_some() {
+                self.fail("malformed stream: provider payload is not JSON".into());
+                return;
+            }
             self.ready.push(LlmEvent::Error(format!(
                 "the server sent a frame that is not JSON: {}",
                 truncate_for_message(payload)
@@ -291,6 +302,15 @@ impl StreamAccumulator {
 
     /// Observes one decoded frame.
     pub fn observe_frame(&mut self, frame: &Value) {
+        if let Some(limits) = self.limits {
+            if self.closed {
+                return;
+            }
+            if let Err(error) = limits.frame(frame) {
+                self.fail(error.to_string());
+                return;
+            }
+        }
         // Usage is null on every chunk but the last, so it is read whenever present.
         if let Some(usage) = frame.get("usage").filter(|value| !value.is_null()) {
             self.usage = Some(decode_usage(usage));
@@ -317,13 +337,30 @@ impl StreamAccumulator {
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 self.observe_tool_call_delta(call);
+                if self.limits.is_some() && self.closed {
+                    break;
+                }
             }
         }
     }
 
     /// Folds one `tool_calls` delta into the partial call it belongs to.
     fn observe_tool_call_delta(&mut self, delta: &Value) {
+        if self.limits.is_some()
+            && delta
+                .get("index")
+                .is_some_and(|index| index.as_u64().is_none())
+        {
+            self.fail("malformed stream: invalid tool-call index".into());
+            return;
+        }
         let index = delta.get("index").and_then(Value::as_u64).unwrap_or(0);
+        if let Some(limits) = self.limits
+            && let Err(error) = self.check_call_delta(delta, index, limits)
+        {
+            self.fail(error.to_string());
+            return;
+        }
         // An index beyond any plausible response is a protocol violation rather than a call:
         // it is used to size a vector, so an index of 2^64-1 would allocate until the process
         // died. Folding it into slot zero keeps the arguments in order rather than dropping
@@ -356,12 +393,51 @@ impl StreamAccumulator {
         }
     }
 
+    fn check_call_delta(
+        &self,
+        delta: &Value,
+        index: u64,
+        limits: nanus_ports::ResponseLimits,
+    ) -> nanus_ports::LlmResult<()> {
+        let index = limits.index(index)?;
+        let slot = self.calls.get(index);
+        let id = non_empty_str(delta, "id")
+            .or_else(|| slot.map(|slot| slot.id.as_str()))
+            .unwrap_or_default();
+        let function = delta.get("function");
+        let name = function
+            .and_then(|function| non_empty_str(function, "name"))
+            .or_else(|| slot.map(|slot| slot.name.as_str()))
+            .unwrap_or_default();
+        let fragment = function
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments = nanus_ports::ResponseLimits::add(
+            "tool-call bytes",
+            slot.map_or(0, |slot| slot.arguments.len()),
+            fragment.len(),
+            limits.event_bytes(),
+        )?;
+        limits.call_bytes(id, name, arguments)
+    }
+
     /// Emits the accumulated tool calls and the terminal event.
     ///
     /// Called when the stream ends, whether by the `[DONE]` sentinel or by the
     /// socket closing.
     pub fn close(&mut self) {
         if self.closed {
+            return;
+        }
+        if self.limits.is_some()
+            && self.calls.iter().any(|call| {
+                !(call.id.is_empty() && call.name.is_empty() && call.arguments.is_empty())
+                    && (call.id.is_empty()
+                        || nanus_domain::ToolName::new(call.name.clone()).is_err())
+            })
+        {
+            self.fail("malformed stream: invalid completed tool call".into());
             return;
         }
         self.closed = true;
@@ -817,3 +893,7 @@ mod tests {
         assert_eq!(assembled.calls.len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "response_bounds_tests.rs"]
+mod response_bounds_tests;

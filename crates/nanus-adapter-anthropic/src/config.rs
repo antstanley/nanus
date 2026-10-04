@@ -113,6 +113,7 @@ pub struct AnthropicConfig {
     base_url: String,
     max_tokens: u32,
     temperature: Option<f32>,
+    response_limits: Option<nanus_ports::ResponseLimits>,
 }
 
 impl core::fmt::Debug for AnthropicConfig {
@@ -123,11 +124,22 @@ impl core::fmt::Debug for AnthropicConfig {
             .field("base_url", &self.base_url)
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
+            .field("response_limits", &self.response_limits)
             .finish()
     }
 }
 
 impl AnthropicConfig {
+    /// Selects generic transport/decoder budgets before any request is dispatched.
+    pub fn set_response_limits(&mut self, limits: nanus_ports::ResponseLimits) {
+        self.response_limits = Some(limits);
+    }
+    /// Absent limits preserve the stock provider behavior.
+    #[must_use]
+    pub const fn response_limits(&self) -> Option<nanus_ports::ResponseLimits> {
+        self.response_limits
+    }
+
     /// Builds a configuration for `model` at the documented endpoint.
     #[must_use]
     pub fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
@@ -137,6 +149,7 @@ impl AnthropicConfig {
             base_url: DEFAULT_BASE_URL.to_owned(),
             max_tokens: MAX_OUTPUT_TOKENS,
             temperature: None,
+            response_limits: None,
         }
     }
 

@@ -30,11 +30,11 @@ pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 /// The environment variable the API key is read from.
 pub const API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
-/// `DeepSeek`'s documented default output ceiling for the current models.
+/// The adapter's default output reservation for the current models.
 ///
-/// Declared here rather than taken from the ports crate because it is a provider
-/// fact: another provider would have a different default, and the ports crate
-/// deliberately carries no provider numbers.
+/// This retained library policy is neither the server's default nor its maximum.
+/// Exact-model capability metadata supplies the documented maximum independently;
+/// an explicit request reservation takes precedence over this configured default.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 256_000;
 
 /// The adapter's settings.
@@ -50,6 +50,7 @@ pub struct DeepSeekConfig {
     max_tokens: u32,
     reasoning_effort: ReasoningEffort,
     temperature: Option<f32>,
+    response_limits: Option<nanus_ports::ResponseLimits>,
 }
 
 impl core::fmt::Debug for DeepSeekConfig {
@@ -61,11 +62,22 @@ impl core::fmt::Debug for DeepSeekConfig {
             .field("max_tokens", &self.max_tokens)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("temperature", &self.temperature)
+            .field("response_limits", &self.response_limits)
             .finish()
     }
 }
 
 impl DeepSeekConfig {
+    /// Selects generic transport/decoder budgets before any request is dispatched.
+    pub fn set_response_limits(&mut self, limits: nanus_ports::ResponseLimits) {
+        self.response_limits = Some(limits);
+    }
+    /// Absent limits preserve the stock provider behavior.
+    #[must_use]
+    pub const fn response_limits(&self) -> Option<nanus_ports::ResponseLimits> {
+        self.response_limits
+    }
+
     /// Builds a configuration for `model` with an explicit key.
     #[must_use]
     pub fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
@@ -76,6 +88,7 @@ impl DeepSeekConfig {
             max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
+            response_limits: None,
         }
     }
 

@@ -93,6 +93,21 @@ pub trait LlmPort {
         crate::ModelCapabilities::default()
     }
 
+    /// Reports tool support for this exact model, configured wire/endpoint and effective effort.
+    ///
+    /// `request_effort = None` inherits the adapter's configured default; it differs from
+    /// `Some(ReasoningEffort::None)`, which explicitly disables reasoning. This local query
+    /// never reads credentials or performs network I/O. Unknown preserves existing adapters;
+    /// an embedding host may require Supported before admitting a registry or request.
+    fn tool_call_support(
+        &self,
+        model: &str,
+        request_effort: Option<ReasoningEffort>,
+    ) -> crate::ToolCallSupport {
+        let _ = (model, request_effort);
+        crate::ToolCallSupport::Unknown
+    }
+
     /// Estimates the fully translated request without network access.
     ///
     /// Concrete providers override this with their actual encoder. The default serves fake
@@ -391,6 +406,14 @@ pub enum LlmEvent {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum LlmError {
+    /// A caller-selected provider response budget was exhausted before retention.
+    #[error("response limit exceeded: {resource} (maximum {limit})")]
+    ResponseLimit {
+        /// The bounded resource, never provider content or a credential.
+        resource: &'static str,
+        /// The caller's byte or count ceiling.
+        limit: usize,
+    },
     /// No usable credential was found for the provider.
     #[error("no credentials for provider {provider}")]
     MissingCredentials {

@@ -66,6 +66,166 @@ Nanus currently documents its canonical architecture and behavior in `docs/`, no
 >
 > Extend context estimation with the dimension-based profile charges below, plus text/system/tool-schema/framing costs and the actual configured output/reasoning reservation. Use checked integer arithmetic with upward rounding; overflow and missing profile/ceiling metadata are pre-HTTP failures. Estimate against the assembled request after encoder translation, counting replayed images every time and charging attachment labels once. Bound serialised model requests to 4 MiB and eight images, in addition to the existing result/session caps; count encoded bytes separately from image tokens. Keep whole-turn drop-oldest behavior, preserve call/result/attachment groups and report elision; if the current turn alone cannot fit, return a typed context-limit failure without HTTP. Estimates are safety reservations, not provider billing or a promise that an endpoint cannot reject a request. No price catalogue or dollar-cost estimator is added.
 
+#### Embedding audit: exact protocol, text-model ceilings and pre-event bounds
+
+The Hype integration audit of pinned revision `479f6de5fcab18899e5eb0e3268d4316ee8efe08` found three remaining generic seams. This evidence supplements the historical implementation section below; it does not claim the remaining work shipped.
+
+- **Exact protocol selection.** `OpenAiConfig::set_protocol(ChatCompletions)` is overridden by `protocol_for` for current OpenAI model ids. Add a caller-selected exact protocol preference alongside the existing automatic routing. Automatic remains the stock default; Exact either uses that protocol or returns a typed unsupported error before HTTP. Never silently redirect an exact Chat Completions request to Responses. Capability/image-profile queries must use the actual configured vendor, endpoint and protocol, and tests must cover automatic routing, both exact preferences and protocol-mismatched images. Hype's current proposal still requires Chat Completions; upstream Responses evidence does not satisfy that gate. Whether Hype adopts Responses is an explicit consumer decision.
+- **Text-model ceilings.** The pinned DeepSeek adapter inherits unknown capabilities and z.ai receives the OpenAI adapter's unknown metadata. Populate optional input/context/output ceilings for each offered API model from independently checked provider documentation, with exact-model entries and source/evidence references. No provider-wide guess, alias fallback or custom-model inheritance is permitted. Preserve Unsupported/Unknown image input for text-only combinations. Tests prove valid output reservations fit each entry, invalid ceilings refuse before HTTP, and custom ids stay unknown. Stock text behavior is preserved when no embedding ceiling requirement is selected; an embedding consumer may refuse incomplete metadata.
+- **Bounds before events.** The pinned `SseFrames::push` extends an unbounded pending byte vector before producing events, so a consumer's event-byte limit cannot bound an unterminated SSE line. Add opt-in adapter transport/decoder limits selected by callers before streaming: partial line and decoded-event bytes, total response bytes, event count and tool-call slots. Check remaining capacity before extending buffers or allocating decoded values; a large chunk cannot be buffered first and checked later. Bound non-success response bodies before decoding rather than calling unbounded `Response::text`. On overflow return one ordinary typed/model error, close/drop the response, and preserve no partial assistant replay as a completed response. Fragmented UTF-8, exact-bound and one-over-bound lines/chunks, many small events, excessive indexed calls, oversized error bodies and quiet cancellation must have fixtures. The consumer still owns its request/turn deadlines and cancellation policy; no desktop/setup/prompt concepts enter Nanus.
+
+**Local implementation, 2026-10-02:** `ResponseLimits`/`ResponseFrames` and the three API
+config setters now implement the pre-event seam on the current working copy. Limits count raw
+response bytes and SSE data payloads (including unknown kinds), not decoded `LlmEvent` count;
+consumers retain their own decoded-event/record limits. JSON framing and call-content checks precede
+copies/extensions, and complete signed replay checks its serialized envelope before emission.
+Opt-in streams refuse malformed UTF-8/JSON and missing protocol termination, clear retained partial
+calls/replay, emit one terminal error and drop the response. Absent limits preserve stock behavior.
+Local real-socket and accumulator fixtures cover all four API grammars; verification is recorded in
+[the response-limit review](2026-10-02-response_limits.review.md). This is unpublished local work,
+not a new immutable dependency pin or native Windows/live-provider evidence. Text-model ceilings
+remain unimplemented; exact-protocol progress is recorded below.
+
+**Local exact-protocol implementation, 2026-10-02:** `ProtocolPreference::Automatic` preserves
+stock routing; `Exact(ChatCompletions | Responses)` overrides model/fallback routing or returns a
+typed unsupported refusal for an incompatible vendor/endpoint. Rejected preferences do not mutate
+configuration, and endpoint edits are rechecked before construction/estimation/HTTP. Capability
+queries now require the actual selected Responses wire, exact model and one of its recorded API or
+subscription endpoints. Chat and custom endpoints remain Unknown; no Chat image profile is promoted.
+Exact Responses output controls follow the actual endpoint, while Automatic retains stock plan
+handling. An explicit ceiling that the exact endpoint cannot honor is refused before HTTP.
+See [the exact-protocol review](2026-10-02-exact_protocol.review.md) for nine fixtures and all required
+verification gates. This is unpublished local work and does not adopt a new Hype dependency pin or
+change Hype's proposed Chat contract; text-model ceiling metadata remains open.
+
+#### Provider admission evidence and tool-support seam — 2026-10-03
+
+A fresh public-source audit resolves main to [`80a0f79b5db9d5f3d10c8eedc467bd754fadb604`](https://github.com/antstanley/nanus/commit/80a0f79b5db9d5f3d10c8eedc467bd754fadb604).
+That revision publishes the optional video tool and includes the Windows source changes;
+it does not publish the local exact-protocol/response-limit changes above. The local z.ai text-ceiling
+and generic tool-support requirements remain open; DeepSeek progress is recorded below. The earlier dated local/public assessments are
+historical evidence, not statements that the video extension is still unpublished.
+
+Checked primary contracts supply the following starting evidence, not completed capability
+entries or image promotions:
+
+| Exact API model | Context / maximum output evidence | Tool or image qualification |
+|---|---|---|
+| `deepseek-flash` | 1,048,576 / 393,216 tokens in the [models response](https://api-docs.deepseek.com/api/list-models/) | The current response lists text and image input; preserve Unknown images until this exact wire/replay/profile gate passes. |
+| `deepseek-v4-pro` | 1,048,576 / 393,216 tokens in the same exact-model response | The response lists text input only; do not inherit Flash's image modality. |
+| `glm-5.3` | 1M context / 128K maximum output in the [model contract](https://docs.z.ai/guides/llm/glm-5.3) | Text model; do not infer the limits of `glm-5.3-flashx`, `glm-5.3-flash` or `glm-5.2` from this entry. |
+| `gpt-6-astra` | 1,050,000 / 128,000 tokens in the [model contract](https://developers.openai.com/api/docs/models/gpt-6-astra) | Tools require Responses; Chat accepts text without tool calling. Image evidence stays independent. |
+| `gpt-6.1-sol` | 1,050,000 / 128,000 tokens in the [model contract](https://developers.openai.com/api/docs/models/gpt-6.1-sol) | Tool calling requires Responses; Chat supports text completion without tool calling. |
+| `gpt-6-luna` | 1,050,000 / 128,000 tokens in the [model contract](https://developers.openai.com/api/docs/models/gpt-6-luna) | Chat tool calling requires explicit `reasoning_effort=none`; the configured/default reasoning effort is a different case. |
+
+Retrieve and retain each exact model/endpoint contract when implementing its entry. Context
+and output evidence does not establish a separate input limit: supply a justified input bound
+and always subtract the actual output/separate-reasoning reservation from combined context.
+Do not convert ambiguous `M`/`K` prose to a precise integer without supporting evidence, inherit
+limits across aliases/models, copy pricing quotas into context metadata, or promote image
+support because text metadata is now known. Custom endpoints/ids stay unknown.
+
+**Local DeepSeek text metadata, 2026-10-03:** the working copy now supplies exact
+`deepseek-flash` and `deepseek-v4-pro` entries only on `https://api.deepseek.com` (with
+an optional trailing slash). Both report 1,048,576 combined-context tokens and 393,216
+maximum output tokens, independently listed in the linked models response. The input
+bound is the same combined-context upper bound, not a separately documented input quota;
+actual output and separately reserved reasoning are still charged against that context.
+Custom hosts, paths, aliases and ids inherit no limits. Flash images remain Unknown with
+no profile; Pro images are Unsupported because its exact contract lists text only.
+
+The concrete estimator and stream reject zero or above-maximum output before HTTP,
+including configured defaults and requests without an explicit context budget. Valid explicit
+output takes precedence over the retained 256,000-token library default; that default is
+neither the server default nor its maximum. Existing neutral effort mapping is unchanged.
+Seven new fixtures cover the actual encoders, zero/one/maximum/one-over output, assembled
+input-plus-reservation below/at/above context, endpoint/id isolation and no-contact refusal.
+A positive TCP control proves the fixture routes valid requests to its own local listener.
+No provider request or real credential is used.
+
+Verification: 48 DeepSeek tests pass; warning-denying all-target/all-feature workspace
+Clippy and rustfmt pass. Minimal embedding passes 139 tests and two doctests; standalone
+consumers pass seven tests without providers and ten with explicit synthetic providers;
+the runtime-free TUI passes 342 tests and warning-denying Clippy. An isolated copy of the
+actual Hype provider wrapper passes three local-path metadata/budget/identity fixtures.
+The complete stock-feature Nanus suite and workspace doctests were not run in this audit:
+stock composition and the shipped secret-chain fixture can consult the user's native
+credential stores, which a temporary `NANUS_HOME` does not isolate. These safe gates do not
+substitute for that remaining hermetic full-workspace gate, immutable publication/adoption,
+generic tool-support metadata, z.ai ceilings or live/platform acceptance. Hype's published
+pin, tool registry and production files remain unchanged. Source hashes and actual failed,
+corrected and final logs are retained under `/private/tmp/hype-provider-admission`.
+
+**Additional generic seam, proposed:** add a defaulted local
+`LlmPort::tool_call_support(model, request_effort)` query returning
+`ToolCallSupport::{Supported, Unsupported, Unknown}`. The adapter resolves the optional request
+effort against its actual configured default and keys the answer by exact model, vendor,
+endpoint and resolved protocol. `Option::None` means no override; it is distinct from
+`Some(ReasoningEffort::None)`. Unknown is the backward-compatible trait default. No credentials,
+network, app templates, skills or Claude plugin metadata participate in this query.
+
+Known unsupported combinations refuse requests containing tool definitions or tool-bearing
+history before HTTP. Check actual assistant call/result replay, including requests whose current
+tool list is empty; never erase history or tools to obtain a text-only request. Stock automatic
+routing and valid text-only behavior remain unchanged; stock unknown combinations are not
+silently declared Supported. An embedding host may require Supported before admitting a tool
+registry and before every request. It must not silently alter protocol, effort or model to make
+that check pass.
+
+Independent fixtures must cover Sol exact Chat text acceptance and tool/replay refusal,
+Sol Responses tool support, Luna Chat with explicit None versus inherited/default and other
+efforts, endpoint/model/protocol changes, unknown ids/proxies, and effort overrides on the same
+adapter. Image metadata is tested independently in both directions. Use fake credentials and
+local recorded transports to assert refusal before any HTTP; retain live exact-wire follow-up
+as a separate acceptance gate. This requirement does not introduce a skill/plugin layer or
+change the seven-tool default registry.
+
+#### Local generic tool-support implementation — 2026-10-03
+
+The additional seam above is now implemented locally: `ToolCallSupport` and the defaulted
+`LlmPort::tool_call_support(model, request_effort)` are exported by `nanus-ports`. Legacy/fake
+ports default to Unknown. The query performs no I/O and contains no skills, templates,
+plugin registry, provider composition or credential selection. Stock Unknown requests retain
+existing behavior; a strict embedding host must require Supported itself.
+
+Exact official-endpoint entries are independent of image profiles and text ceilings:
+
+- DeepSeek Flash and V4 Pro support ordinary Chat function tools with their existing neutral
+  effort mapping, including reasoning passback; their different image states are unchanged.
+- OpenAI Astra, Sol and Luna and the three exact GPT-5.6 Sol/Terra/Luna ids support Responses
+  with their advertised native effort values. Astra/Sol Chat is Unsupported. Luna Chat is
+  Supported only when the actual inherited or explicit effort is `ReasoningEffort::None`.
+  Older models' Chat, subscription endpoints, z.ai, custom ids and gateways stay Unknown.
+  [Function-calling restrictions](https://developers.openai.com/api/docs/guides/function-calling)
+  and each exact model contract are checked independently; no image proof is reused as tools proof.
+- Anthropic Opus 5.5, Sonnet 5.5 and Fable 5.1 support ordinary Messages tool use with their
+  advertised native effort levels. Literal None/Minimal is Unsupported for tool-bearing requests
+  because the existing encoder otherwise coerces those controls to low; this does not claim
+  Anthropic low effort is unsupported. Existing text-only mapping is preserved. Forced tool
+  choice is not emitted. Custom gateways now inherit neither official image/text metadata nor
+  tool support. [Messages tool contract](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls).
+
+Concrete OpenAI/Anthropic estimation and streaming refuse known Unsupported definitions,
+assistant calls and tool results before HTTP, even with an empty current tool list. Valid signed
+Messages replay must agree exactly with neutral calls before its original blocks are emitted;
+it cannot hide executable calls from this check. Output/context/image validation stays separate.
+No protocol, selected model, default effort or seven-tool registry change is made.
+
+Fourteen new fixtures pass within 262 affected-crate tests and one port doctest. Final rustfmt,
+warning-denying workspace Clippy, minimal-bundle lint/139 tests/two doctests, runtime-free TUI
+lint/342 tests and locked standalone consumers (seven without providers, ten with synthetic
+providers) pass. The isolated Hype wrapper spike passes three prior metadata fixtures and one
+new four-model forwarding/replay/selection fixture after explicit temporary admission and
+query-delegation changes. It is a prototype, not a production-source or immutable-pin update;
+Hype's current wrapper would otherwise retain the legacy Unknown trait default.
+
+Initial lifetime/constructor-order lint failures were corrected without suppression, and the
+Anthropic no-contact fixture now has a timeout. Actual failed and final logs, guarded source
+baselines and the isolated host copy are retained under `/private/tmp/hype-tool-support`.
+The complete stock-feature suite and workspace doctests remain explicitly unrun because their
+native credential lookups are not isolated by `NANUS_HOME`. Native Windows, exact live-wire
+acceptance, z.ai ceilings, published immutable adoption and app `read_video` ports remain gates.
+
 #### N4 image profiles and capability promotion
 
 These are the required initial implementation profiles, not a claim that current Nanus can send pixels. Each is keyed by exact model, adapter vendor and protocol. Before evidence is checked in, `image_input=Unknown` and `image_profile=None`; only the listed profile may become Supported after its gate passes. A returned Supported capability must contain matching validated limits/estimation metadata. Unknown/Unsupported always refuses image content. Other model IDs require a separate tested profile change rather than inheriting provider-wide support.
@@ -219,6 +379,56 @@ Implementation order: feature isolation and a Windows minimal compile fixture; T
 Provider wire details must be verified against current primary contracts: [Anthropic vision](https://platform.claude.com/docs/en/build-with-claude/vision), [OpenAI image input](https://developers.openai.com/api/docs/guides/images-vision) and the applicable endpoint's tool-result schema. Captured request tests must prove the chosen multimodal mapping is accepted, including an OpenAI tool result followed by user image input. Static shape assumptions do not establish live acceptance.
 
 ## Acceptance criteria
+
+### Local caller-owned video snapshots — 2026-10-03
+
+The optional video crate's source port now has an external construction seam:
+`Snapshot::from_owned_file` checks a caller-verified fixed-name absolute source receipt
+and retains an opaque thread-safe owner; `retain_owner` lets physical decoder workers
+retain it through teardown. The constructor performs no I/O and does not authenticate
+the file or its scope. Stock TempDir cleanup now uses the same final-reference lifetime,
+with existing source copy/hash/bounds unchanged. This closes the private cleanup-field
+barrier to caller `VideoSource` implementations; it does not supply Hype's actual
+bounded media adapter, decoder, routing, approvals or image/result accounting.
+See the [video proposal](2026-10-01-read_video_extension.md#caller-owned-snapshot-seam--2026-10-03)
+and [certificate](2026-10-03-video_snapshot.review.md) for demonstrated checks and limits.
+The seam remains local unpublished work; no skill/plugin knowledge or Hype pin change.
+
+### Local z.ai API admission implementation — 2026-10-03
+
+The companion adapter now supplies exact Chat API metadata for `glm-5.3-flashx`,
+`glm-5.3-flash`, `glm-5.3` and `glm-5.2` only at
+`https://api.z.ai/api/paas/v4` (optional trailing slash). Context/input metadata uses
+the conservative decimal interpretation 1,000,000 of the advertised 1M context;
+output uses the API's explicit 1..131,072 range. Ordinary function-tool support is
+independent of image metadata. Text GLM-5.3/5.2 images are Unsupported; Flash/FlashX
+images remain Unknown without a profile or live capability promotion.
+
+The [thinking contract](https://docs.z.ai/guides/capabilities/thinking) distinguishes
+API requests from Coding Plan: the GLM-5.3 variants' API accepts only low/high/max;
+GLM-5.2 accepts all seven neutral spellings, including none/minimal with thinking
+enabled. The existing literal encoder and enabled switch remain correct; do not
+infer the Coding Plan's server mappings on the API. Exact API effort lists and
+default max now come from the configured endpoint/model; stock bundle selection
+retains that valid default without overriding explicit configuration. Coding Plan,
+custom endpoints, different vendors and unknown ids inherit no API evidence and
+retain their existing defaults/behavior. Endpoint edits preserve captured effort;
+request admission revalidates it and fails visibly if the new API rejects it.
+
+Before HTTP, known API text and tool requests validate effort, zero/excess output,
+the 128-function limit and actual serialized input plus output/reasoning reservation
+against model/caller/record bounds, even without an explicit caller budget. Estimates
+remain available for whole-turn elision; the stream checks fit before dispatch.
+The [API reference](https://docs.z.ai/api-reference/llm/chat-completion) and exact
+model pages provide contract evidence; local fixtures use fictional keys and loopback
+transport only. The [semi-formal certificate](2026-10-03-zai_api_admission.review.md)
+records source resolution, corrected findings, tests and remaining limitations.
+
+This is local unpublished functionality. Hype still consumes its earlier immutable
+revision and has not adopted these metadata/admission APIs. Live provider wire/tool
+follow-ups, image profiles, native Windows evidence and original embedding acceptance
+remain open. No skill/plugin/template concept, toolset count or stock video authority
+is added to Nanus by this delta.
 
 1. `cargo tree -p nanus-bundle --no-default-features` contains no concrete adapter/CLI/TUI/link dependency. A minimal downstream fixture with caller fake ports builds/tests on macOS and Windows; explicit provider adapter dependencies also compile on both. Default Unix CLI/TUI/service still run through the original composition path.
 2. Optional policy sees every registered tool with exact arguments before execution. Denial of an in-scope Read prevents I/O; AllowOnce runs exactly the given write; UseDefault preserves every approval mode; errors/unknown/malformed calls cannot bypass validation. No stock tool-count change or truthful-access-class rewrite is needed.
