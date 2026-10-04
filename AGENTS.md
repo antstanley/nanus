@@ -23,6 +23,7 @@ should read the relevant page before changing a subsystem:
 | [`docs/architecture.md`](docs/architecture.md) | Touching crate boundaries or the plugin/kernel model. |
 | [`docs/design.md`](docs/design.md) | Changing a deliberate design decision (toolset size, approval, budget). |
 | [`docs/testing.md`](docs/testing.md) | Adding tests or wondering what "verified" means here. |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Changing a hot path, or claiming something got faster or leaner. |
 | [`docs/status.md`](docs/status.md) | Depending on something; includes known limits. |
 | [`docs/features.md`](docs/features.md) | Checking whether a capability exists before relying on it. |
 | [`docs/roadmap.md`](docs/roadmap.md) | Picking up planned work, or checking whether something is intended. |
@@ -38,7 +39,7 @@ instructions.
 
 ## Repository layout
 
-Sixteen crates in a Cargo workspace. Dependencies point **inward**; this is enforced
+Seventeen crates in a Cargo workspace. Dependencies point **inward**; this is enforced
 by the manifests, not by review. `nanus-domain` has no `tokio`, no `reqwest`, and
 no filesystem, so agent decisions can be tested without a network.
 
@@ -78,6 +79,7 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 | `crates/nanus-sys-windows` | Narrow safe SID lookup, Job Object ownership, and detached spawning with isolated standard handles. Empty on Unix; no Rust `unsafe` or raw handles are exposed. |
 | `crates/nanus-cli` | The `nanus` binary: `run`, `service`, `config`, `sessions`, and the shell-scoped agent behind `tui`. **It does not depend on `nanus-tui`.** |
 | `crates/nanus-tui` | The interface, as its own binary (`nanus-tui`) plus a library: view, input buffer, replay, and the event loop. It depends on the link client, the session store, and the configuration file it reads its own display preferences from — and on no toolset, provider adapter, or agent loop. |
+| `crates/nanus-bench` | Criterion benchmarks, unpublished: wall time, heap allocations, and bytes allocated on the hot paths. A leaf that depends on what it measures and that nothing depends on; it installs an instrumented global allocator, so it must stay out of every shipped binary. |
 
 ## Toolchain and setup
 
@@ -125,6 +127,15 @@ cargo build --release --workspace
 # Run a subset while iterating.
 cargo nextest run -p nanus-bundle
 cargo nextest run -p nanus-bundle end_to_end
+```
+
+Benchmarks are not a gate, but a change to a hot path should be measured against a baseline
+rather than argued. See [`docs/benchmarks.md`](docs/benchmarks.md):
+
+```sh
+cargo bench -p nanus-bench -- --save-baseline before   # on the parent revision
+cargo bench -p nanus-bench -- --baseline before        # on the change
+scripts/bench-baseline.py before                       # the saved baseline as a table
 ```
 
 Use the `ci` nextest profile (defined in [`.config/nextest.toml`](.config/nextest.toml))

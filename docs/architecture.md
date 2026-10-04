@@ -68,6 +68,7 @@ is the only vocabulary the two share.
 | [`nanus-sys-windows`](../crates/nanus-sys-windows) | The safe Windows SID, Job Object, and detached-spawn boundary. Empty on Unix; no raw handles or Rust `unsafe` are exposed. |
 | [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary: `run`, `service`, `config`, `sessions`, `auth`, and the shell-scoped agent behind `tui`. It does not depend on `nanus-tui`. |
 | [`nanus-tui`](../crates/nanus-tui) | The interface: the view, the input buffer, replay, and the terminal event loop. Its own binary (`nanus-tui`), a library for the parts that are testable without a terminal, and no dependency on the agent loop, a toolset, or a provider adapter — it links only the session store it reads recordings from and the configuration adapter it reads its own display preferences from. |
+| [`nanus-bench`](../crates/nanus-bench) | Criterion benchmarks, unpublished: wall time, heap allocations, and bytes allocated. A leaf off to one side of the graph — it depends on the crates it measures and nothing depends on it — because it installs an instrumented global allocator. See [benchmarks](benchmarks.md). |
 
 `nanus-bundle` defaults to `stock-compose`, which owns concrete adapters, provider selection,
 authorization and remembered selection. A dependency with `default-features = false` exposes

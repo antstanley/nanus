@@ -12,6 +12,7 @@ the handles they publish.
 
 [![tests](https://img.shields.io/badge/tests-1403%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
+[![benchmarks](https://img.shields.io/badge/benchmarks-111%20baselined-blueviolet)](docs/benchmarks.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -256,6 +257,30 @@ the manifest lint alone does not cover doctests. For what that buys you, why the
 exactly seven registered tools, how the crates fit together, and the two bugs verification
 caught that
 reasoning did not, see [**the documentation**](docs/).
+
+### What does it cost?
+
+```console
+$ cargo bench -p nanus-bench -- --save-baseline main
+$ scripts/bench-baseline.py main --by-area
+```
+
+Every hot path has a [criterion](https://docs.rs/criterion/latest/criterion/) benchmark,
+measured three ways: wall time, heap allocations, and bytes allocated. The counts come from
+an instrumented allocator, so they repeat exactly on any machine and catch a stray clone that
+a timing would bury in noise. From the current baseline, on an Apple M2:
+
+| Path | Time | Allocations |
+|---|---:|---:|
+| A whole turn through the agent loop, fresh session | 37.8 µs | 974 |
+| The same turn on 100 turns of history | 784 µs | 12,809 |
+| A request body for 100 turns of history (DeepSeek) | 536 µs | 7,131 |
+| Saving a 500-turn session | 18.1 ms | 23,549 |
+| One interface frame of a 100-turn conversation | 7.4 ms | 134,941 |
+
+The harness's own overhead is microseconds against a model's seconds; the interface's redraw
+on a long session is the first thing that will not keep up. The methodology, all 111
+benchmarks, and what the numbers show are in [**docs/benchmarks.md**](docs/benchmarks.md).
 
 ## Acknowledgements
 

@@ -17,6 +17,7 @@ members = [
     "crates/nanus-sys-windows",
     "crates/nanus-cli",
     "crates/nanus-tui",
+    "crates/nanus-bench",
 ]
 default-members = ["crates/nanus-kernel"]
 

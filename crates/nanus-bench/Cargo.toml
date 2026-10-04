@@ -1,0 +1,80 @@
+[package]
+name = "nanus-bench"
+description = "Criterion benchmarks for nanus: wall time, heap allocations, and bytes allocated on the harness's hot paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+# The library holds the measurements, not benchmarks. Left benchable, `cargo bench` would run its
+# libtest harness too, which refuses criterion's flags (`--save-baseline`) and fails the command.
+[lib]
+bench = false
+
+[dependencies]
+nanus-domain = { workspace = true }
+serde_json = { workspace = true }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# The instrumented allocator: its `GlobalAlloc` impl is the crate's, so installing it needs no
+# `unsafe` here, which is what lets this crate keep the workspace's `forbid(unsafe_code)`.
+stats_alloc = "0.1"
+
+[dev-dependencies]
+nanus-kernel = { workspace = true }
+nanus-ports = { workspace = true }
+nanus-link = { workspace = true }
+nanus-adapter-store = { workspace = true }
+nanus-adapter-local = { workspace = true }
+nanus-adapter-deepseek = { workspace = true }
+nanus-adapter-anthropic = { workspace = true }
+nanus-adapter-openai = { workspace = true }
+# The runner and the tools without stock composition: a benchmark supplies its own model, and
+# must never reach a credential store.
+nanus-bundle = { path = "../nanus-bundle", default-features = false }
+# The view layer alone: what a frame costs to draw, with no terminal, link, or store.
+nanus-tui = { path = "../nanus-tui", default-features = false }
+ratatui = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "session"
+harness = false
+
+[[bench]]
+name = "wire"
+harness = false
+
+[[bench]]
+name = "link"
+harness = false
+
+[[bench]]
+name = "tui"
+harness = false
+
+[[bench]]
+name = "kernel"
+harness = false
+
+[[bench]]
+name = "store"
+harness = false
+
+[[bench]]
+name = "tools"
+harness = false
+
+[[bench]]
+name = "agent_loop"
+harness = false
