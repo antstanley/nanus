@@ -252,6 +252,8 @@ pub struct OpenAiConfig {
     reasoning_effort: ReasoningEffort,
     temperature: Option<f32>,
     response_limits: Option<nanus_ports::ResponseLimits>,
+    function_strictness: Option<bool>,
+    stateless_responses: bool,
     protocol: Protocol,
     protocol_preference: ProtocolPreference,
     /// The `ChatGPT` account a subscription request names in its own header.
@@ -272,6 +274,8 @@ impl core::fmt::Debug for OpenAiConfig {
             .field("reasoning_effort", &self.reasoning_effort)
             .field("temperature", &self.temperature)
             .field("response_limits", &self.response_limits)
+            .field("function_strictness", &self.function_strictness)
+            .field("stateless_responses", &self.stateless_responses)
             .field("protocol", &self.protocol)
             .field("protocol_preference", &self.protocol_preference)
             .field("account_id", &self.account_id)
@@ -280,6 +284,30 @@ impl core::fmt::Debug for OpenAiConfig {
 }
 
 impl OpenAiConfig {
+    /// Selects bounded original-item replay on the exact public Responses API.
+    /// Disabled by default. Construction/requests refuse incompatible endpoints or missing limits.
+    pub const fn set_stateless_responses(&mut self, enabled: bool) {
+        self.stateless_responses = enabled;
+    }
+
+    /// Whether dispatch uses bounded original-item replay and source/fitting receipts.
+    #[must_use]
+    pub const fn stateless_responses(&self) -> bool {
+        self.stateless_responses
+    }
+
+    /// Selects an explicit function-schema policy; absence retains the provider default.
+    /// No parameters are rewritten. Strict schemas are checked before estimation or HTTP.
+    pub fn set_function_strictness(&mut self, strict: Option<bool>) {
+        self.function_strictness = strict;
+    }
+
+    /// Explicit strict/non-strict policy, or the stock omitted field.
+    #[must_use]
+    pub const fn function_strictness(&self) -> Option<bool> {
+        self.function_strictness
+    }
+
     /// Selects generic transport/decoder budgets before any request is dispatched.
     pub fn set_response_limits(&mut self, limits: nanus_ports::ResponseLimits) {
         self.response_limits = Some(limits);
@@ -302,6 +330,8 @@ impl OpenAiConfig {
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
             response_limits: None,
+            function_strictness: None,
+            stateless_responses: false,
             protocol: Protocol::ChatCompletions,
             protocol_preference: ProtocolPreference::Automatic,
             account_id: None,

@@ -113,6 +113,7 @@ fn signed_replay_cannot_smuggle_pixels_or_change_the_executable_response() {
     let good = AssistantReplay {
         protocol: "anthropic.messages".into(),
         prefix_digest: "a".repeat(64),
+        context_receipt: None,
         blocks: vec![
             serde_json::json!({
                 "type": "thinking", "thinking": "", "signature": "opaque"

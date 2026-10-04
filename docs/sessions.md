@@ -47,6 +47,18 @@ beside display summaries, so resuming does not need the original image file. Sig
 assistant blocks are retained for unchanged-prefix replay. Older binaries cannot read v2
 bodies; there is no destructive bulk migration or automatic downgrade.
 
+The local Responses preparation additionally validates `openai.responses` replay in v2
+records. Its closed reasoning/message/function subset retains original ciphertext, phase,
+annotations and ordered call identities; exact neutral text/calls must agree on reload.
+Annotations grant no tool, URL or filesystem authority. Optional closed `context_receipt` binds
+source/body hashes and exact fitting counts/budget; absent fields preserve the previous envelope.
+The pure request preparer checks prior receipts against complete immutable original history and
+controls before replaying original items, including after whole-turn elision. Opaque-only completed
+Responses output remains in the surface fold. These are consistency hashes, not ciphertext
+signatures. Explicit library opt-in selects this source/body-aware transport. Pure estimation may
+substitute only final balanced batch result values; dispatch requires exact source. Default stock
+composition stays unchanged; publication/adoption and live/native acceptance are not established.
+
 `try_to_jsonl` validates content and 4 MiB records/64 MiB total logs. The store uses it before
 atomic replacement and bounds reads before parsing, leaving the existing log intact on failed
 save. The legacy infallible `to_jsonl` remains for trusted in-memory compatibility; hosts should

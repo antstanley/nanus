@@ -30,6 +30,12 @@
 
 use crate::message::Message;
 
+mod projection;
+pub use projection::{
+    ContextProjection, identify as identify_projection,
+    identify_results as identify_tool_result_projection,
+};
+
 /// Characters per token in the estimate.
 const CHARS_PER_TOKEN: usize = 4;
 
@@ -148,20 +154,33 @@ pub fn fit(messages: Vec<Message>, budget: u32) -> Result<Fitted, FitError> {
 pub fn fit_with(
     messages: Vec<Message>,
     budget: u32,
+    cost: impl FnMut(&[Message]) -> u32,
+) -> Result<Fitted, FitError> {
+    let source: std::sync::Arc<[Message]> = messages.into();
+    fit_with_source(&source, budget, cost)
+}
+
+/// Fits a borrowed immutable source without deleting the original history.
+/// The result owns only its fitted message projection; notices and whole-turn policy are unchanged.
+/// # Errors
+/// Returns [`FitError::TooLarge`] if the newest complete turn cannot fit.
+pub fn fit_with_source(
+    messages: &[Message],
+    budget: u32,
     mut cost: impl FnMut(&[Message]) -> u32,
 ) -> Result<Fitted, FitError> {
-    let head = leading_prompt(&messages);
+    let head = leading_prompt(messages);
     let tail = &messages[head..];
     let turns = split_turns(tail);
     if turns.is_empty() {
         // No human turn at all: there is nothing to drop and nothing to answer, so the only
         // question is whether the prompt itself fits.
-        let estimated = cost(&messages);
+        let estimated = cost(messages);
         if estimated > budget {
             return Err(FitError::TooLarge { estimated, budget });
         }
         return Ok(Fitted {
-            messages,
+            messages: messages.to_vec(),
             elision: None,
         });
     }

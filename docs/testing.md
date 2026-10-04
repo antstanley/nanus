@@ -1,5 +1,65 @@
 # Testing and verification
 
+## Explicit Responses transport and prospective estimation — 2026-10-05
+
+The extension passes 537 affected tests, minimal-runner/TUI nextest 161/342 and embedded default/
+providers 7/13; all 13 scoped formatting, Clippy, doctest and Windows-target minimal-library gates
+pass. No drift exists in 232 frozen runtime inputs; 188 new-file functions are at most 59 lines.
+Four actual socket/runner fixtures cover admitted POST/SSE, complete-batch estimates/results,
+v2 reload and lower-budget fitting; truncated completion with zero executors; opaque-only reload
+and next-user replay; and HTTP redirect refusal with no connection to a second origin. Two pure
+request/config and two projection cases cover narrow final-batch value substitution and its strict
+separation from dispatch. These fixtures use fictional keys and a private transport socket override;
+production still derives the fixed public endpoint and opts in only when explicitly configured.
+
+The [transport certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#explicit-transportprospective-estimation-certificate--5-october-2026)
+records fixed redirect, accepted-socket mode, actual context-budget selection and minimal dev-
+dependency findings. Logs/source receipts are in `/private/tmp/hype-responses-transport`.
+No publication, Hype pin/readiness change, paid model, real credential store or native execution
+is claimed. Windows compilation covers the minimal library, not the OpenAI transport's native
+runtime. All previously required host/platform/live acceptance remains separate.
+
+## Original/fitted Responses request preparation — 2026-10-04
+
+The extension passes 529 affected domain/ports/provider/store tests, 161 minimal-runner and
+342 runtime-free TUI nextest cases, minimal runner doctests and standalone embedded default/
+providers (7/13). Workspace/minimal/TUI/downstream warning-denying Clippy, both formatting
+checks and Windows MSVC-target minimal-library Clippy pass. All 231 frozen runtime inputs
+remain unchanged through these final gates. The added receipt/projection/history/request cases
+include a concrete-cap image fitting regression and a downstream pure-preparer → real decoder
+→ minimal runner → sibling tools → v2 reload → admitted continuation fixture.
+
+The [request certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#originalfitted-request-patch-certificate--4-october-2026)
+records corrected encrypted-content inclusion, aggregate image-cap timing, opaque-only source
+folding, controls-before-clone bounds and internal receipt boxing. Four request cases exercise
+exact original items and body/source hashes, fitting and changed controls/source/batch refusals;
+three projection, two history and two additional domain cases cover the adjacent contracts.
+Logs and source receipts are in `/private/tmp/hype-responses-context`; 153 new-file functions
+are at most 59 lines. The candidate is local/unpublished. Stock transport and prospective
+final-batch integration are incomplete; credential-aware stock composition, native Windows
+execution and exact-model live acceptance remain unrun. No real credentials or API were used.
+
+## Local Responses decoder and function policy preparation — 2026-10-04
+
+The isolated ee1-based candidate passes 519 domain/ports/provider/store tests, including
+six function-policy, six domain-replay, seven accumulator and two real fragmented HTTP/SSE
+cases. It also passes 159 minimal-runner nextest cases, 342 runtime-free TUI cases, minimal
+runner doctests, standalone embedded default/providers (7/12 tests), workspace/minimal/TUI
+and downstream warning-denying Clippy, and formatting. Two new downstream cases drive the
+real decoder into the minimal runner and v2 serialization/reload; malformed/incomplete replay
+does not execute its fictional tool. The supplied decoder digest is trusted fixture input,
+so these cases do not prove request-prefix admission or actual continuation encoding.
+Windows MSVC-target domain/ports/minimal-library Clippy passes; native execution remains unrun.
+
+Runtime/source/config inputs were frozen; only OpenAI-local files changed after the earlier
+minimal/TUI gates, and the final affected gates were repeated with no frozen-input drift.
+Evidence is in `/private/tmp/hype-responses-resume`; the
+[certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#local-decoderpolicy-patch-certificate--4-october-2026)
+records the corrected phase/usage, envelope-before-clone, provider ceilings and stock-default
+findings. The candidate is unpublished. No Hype pin change, paid request, real credential
+lookup, personal Chrome, native Windows execution or complete stateless replay is claimed.
+Credential-aware stock composition and exact-model live gates remain unrun.
+
 ## Optional complete-batch admission — 2026-10-03
 
 Final domain/ports/minimal runner nextest passes 419 tests, no skips; all-feature

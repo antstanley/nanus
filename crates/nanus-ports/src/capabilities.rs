@@ -67,12 +67,32 @@ pub fn validate_image_input(
     capabilities: ModelCapabilities,
     request: &ChatRequest,
 ) -> LlmResult<()> {
-    if !has_images(&request.messages) {
+    validate_images(capabilities, &request.model, &request.messages, true)
+}
+
+/// Validates every original image before fitting, without applying a fitted-request count cap.
+/// # Errors
+/// Refuses unsupported/mismatched profiles, malformed pixels and invalid per-image dimensions.
+pub fn validate_history_image_input(
+    capabilities: ModelCapabilities,
+    model: &str,
+    messages: &[Message],
+) -> LlmResult<()> {
+    validate_images(capabilities, model, messages, false)
+}
+
+fn validate_images(
+    capabilities: ModelCapabilities,
+    model: &str,
+    messages: &[Message],
+    request_count: bool,
+) -> LlmResult<()> {
+    if !has_images(messages) {
         return Ok(());
     }
-    let profile = capabilities.require_image_profile(&request.model)?;
+    let profile = capabilities.require_image_profile(model)?;
     let mut images = 0_usize;
-    for message in &request.messages {
+    for message in messages {
         if let Message::Tool {
             content_blocks: Some(blocks),
             ..
@@ -90,7 +110,7 @@ pub fn validate_image_input(
                 } = block
                 {
                     images = images.saturating_add(1);
-                    if images > profile.max_request_images() {
+                    if request_count && images > profile.max_request_images() {
                         return Err(LlmError::Unsupported {
                             feature: "more than eight request images".into(),
                         });

@@ -865,14 +865,17 @@ impl AgentRunner {
             // Validate every retained image against the newly selected model, before elision.
             let model = self.llm.borrow().clone();
             let caps = model.capabilities(&request.model);
-            let mut probe = request.clone();
-            probe.messages.clone_from(&messages);
-            model
-                .estimate_request(&probe)
-                .map_err(|error| BundleError::context(error.to_string()))?;
+            nanus_ports::capabilities::validate_history_image_input(
+                caps,
+                &request.model,
+                &messages,
+            )
+            .map_err(|error| BundleError::context(error.to_string()))?;
+            let source: std::sync::Arc<[nanus_domain::Message]> = messages.into();
+            request.source_history = Some(std::sync::Arc::clone(&source));
             let mut failure = None;
-            let fitted = nanus_domain::context::fit_with(
-                messages,
+            let fitted = nanus_domain::context::fit_with_source(
+                &source,
                 self.config.context_budget.min(u32::MAX.saturating_sub(1)),
                 |candidate| {
                     let mut probe = request.clone();

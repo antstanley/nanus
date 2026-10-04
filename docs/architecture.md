@@ -69,6 +69,14 @@ is the only vocabulary the two share.
 | [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary: `run`, `service`, `config`, `sessions`, `auth`, and the shell-scoped agent behind `tui`. It does not depend on `nanus-tui`. |
 | [`nanus-tui`](../crates/nanus-tui) | The interface: the view, the input buffer, replay, and the terminal event loop. Its own binary (`nanus-tui`), a library for the parts that are testable without a terminal, and no dependency on the agent loop, a toolset, or a provider adapter — it links only the session store it reads recordings from and the configuration adapter it reads its own display preferences from. |
 
+The local Responses preparation keeps function strictness and original-item streaming in the
+OpenAI adapter, protocol-specific shape/neutral agreement in the pure domain and propagation in
+the existing minimal runner. App prompts, dependency installation and source/payment authority
+remain outside these crates. The pure request preparer validates original/fitted receipts using
+optional immutable port metadata; the minimal runner preserves that source through fitting.
+Explicit library opt-in selects the admitted transport/decoder and permits only final complete-
+batch value substitution for pure estimation. Actual dispatch retains strict source identity.
+
 `nanus-bundle` defaults to `stock-compose`, which owns concrete adapters, provider selection,
 authorization and remembered selection. A dependency with `default-features = false` exposes
 only the runner/tools and their domain/kernel/port dependencies. The host supplies its own
