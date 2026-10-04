@@ -12,11 +12,11 @@ One agent, with three lifetimes. What differs between the modes is how long the
 agent lives and how it is reached, not what it does — there is one code path
 that runs a turn.
 
-| Mode | Lifetime | Reached by |
-|---|---|---|
-| `nanus run <task>` | one turn | stdout, in the same process |
+| Mode                         | Lifetime        | Reached by                               |
+| ---------------------------- | --------------- | ---------------------------------------- |
+| `nanus run <task>`           | one turn        | stdout, in the same process              |
 | `nanus tui` / a bare `nanus` | the interface's | the local link, for a shell-scoped agent |
-| `nanus service` | until stopped | the local link, for a process |
+| `nanus service`              | until stopped   | the local link, for a process            |
 
 - **Headless one-shot runs**, with the answer on stdout and nothing else.
   Reasoning and tool activity go to stderr (`--verbose`), and the exit code is
@@ -33,10 +33,10 @@ that runs a turn.
   and a human abort, that nothing mints yet.
 - **A bounded prompt.** Every step replays the whole log, so a long session
   eventually exceeds the model's window. `context_budget` (default 64000 estimated
-  tokens) is the ceiling for one request: past it the *oldest turns* are dropped,
+  tokens) is the ceiling for one request: past it the _oldest turns_ are dropped,
   whole, with a notice the model reads where the gap is, and the reader is told —
   the CLI on stderr and the interface as a notice in the transcript. A turn whose
-  *newest* part does not fit is refused with a sentence naming the field rather
+  _newest_ part does not fit is refused with a sentence naming the field rather
   than sent to a provider that would refuse the request. The estimate is
   characters over four plus a small per-message cost, deliberately approximate:
   there is no tokenizer here, the provider reports the real count with every
@@ -55,7 +55,7 @@ that runs a turn.
   the session log, the model adapter, and the tool registry mount on the kernel as
   services, so a different provider, toolset, store, or filesystem is a plugin rather
   than an edit to the loop — and unloading one withdraws it and deactivates what
-  depended on it. The permission policy and the agent loop are *not* plugins: the
+  depended on it. The permission policy and the agent loop are _not_ plugins: the
   policy is a configuration value the loop reads, and the loop is built over the
   handles the composition publishes. See [design decisions](design.md) and
   [architecture](architecture.md).
@@ -67,23 +67,43 @@ and tool futures. Cancellation settles unfinished calls once and closes the turn
 host remains responsible for stopping detached processes when their futures are dropped.
 The old `run_turn` entry point remains available.
 
+An optional embedding `with_tool_admission` port receives the full unelided pending
+request and its fitted failure base, all calls/denials, exact capabilities and held
+pure estimator before any goal or registered executor. Actual retained durable events
+also reach the host independently of prospective slots and provider fitting. Host-owned reserve/admit/live
+dispatch/raw-and-normalized-result/ordered-commit callbacks retain logical capacity
+across every chunk. Adapter/model/effort changes queue until the last step hold drops.
+Unreserved teardown retires unused local handles; physical workers remain host-owned.
+This unpublished [local contract](../.specs/changes/2026-10-03-tool_batch_admission.md)
+provides no budget policy, skill/plugin discovery or desktop authority by itself.
+
 ## The toolset
 
-Seven *registered* tools, and the count is the design: each is a mechanism a shell
+Seven _registered_ tools, and the count is the design: each is a mechanism a shell
 cannot provide as well, not a convenience wrapper. See
 [design decisions](design.md#seven-tools-and-the-count-is-the-design).
 
-| Tool | What it does |
-|---|---|
-| `read` | Reads a file through a 1-based `offset`/`limit` line window, with line numbers, a byte ceiling, and a note on how to continue. |
-| `write` | Creates or replaces a file. |
-| `edit` | Replaces text, requiring `old_string` to occur exactly once unless `replace_all` is set — an ambiguous or absent match is refused rather than guessed. |
-| `read_image` | Reads a bounded PNG/JPEG/WebP/GIF (still GIFs only) as typed image content when the model has verified image input; otherwise refuses before file I/O. |
-| `glob` | Finds files by path pattern, anchored to the workspace root (`*.rs` for the top level, `**/*.rs` at any depth), with a result cap — and a notice naming the cap when matches were dropped, rather than whenever the cap was reached. |
-| `grep` | Finds text inside files, grouped by file, optionally narrowed by one `include` glob, with capped matches and truncated lines that say so. |
-| `bash` | Runs a program in the workspace root unless a `workdir` says otherwise, with an optional timeout, reporting stdout, stderr, and the exit code. A non-zero exit is a result, not a failure; output is capped and truncated with a notice; the whole process group is killed so grandchildren are not orphaned. |
+| Tool         | What it does                                                                                                                                                                                                                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read`       | Reads a file through a 1-based `offset`/`limit` line window, with line numbers, a byte ceiling, and a note on how to continue.                                                                                                                                                                                |
+| `write`      | Creates or replaces a file.                                                                                                                                                                                                                                                                                   |
+| `edit`       | Replaces text, requiring `old_string` to occur exactly once unless `replace_all` is set — an ambiguous or absent match is refused rather than guessed.                                                                                                                                                        |
+| `read_image` | Reads a bounded PNG/JPEG/WebP/GIF (still GIFs only) as typed image content when the model has verified image input; otherwise refuses before file I/O.                                                                                                                                                        |
+| `glob`       | Finds files by path pattern, anchored to the workspace root (`*.rs` for the top level, `**/*.rs` at any depth), with a result cap — and a notice naming the cap when matches were dropped, rather than whenever the cap was reached.                                                                          |
+| `grep`       | Finds text inside files, grouped by file, optionally narrowed by one `include` glob, with capped matches and truncated lines that say so.                                                                                                                                                                     |
+| `bash`       | Runs a program in the workspace root unless a `workdir` says otherwise, with an optional timeout, reporting stdout, stderr, and the exit code. A non-zero exit is a result, not a failure; output is capped and truncated with a notice; the whole process group is killed so grandchildren are not orphaned. |
 
 ### `read_video` (optional)
+
+Embedding hosts can implement `VideoSource` directly. `Snapshot::from_owned_file`
+retains a host-verified fixed-name absolute source file through an opaque thread-safe
+owner, checking receipt shape/128 MiB claimed length without filesystem or credential
+I/O. The host verifies authority, immutable bytes, digest and identity and owns cleanup.
+Physical decoder workers clone `retain_owner()` and keep that lease through process/
+reader join, so call cancellation cannot remove a still-owned copy. Stock FsSource's
+existing TempDir/copy behavior is preserved. This local unpublished seam and its
+[certificate](../.specs/changes/2026-10-03-video_snapshot.review.md) do not establish
+Hype integration, image budget acceptance or native Windows execution.
 
 Off unless `read_video = true`. Needs `ffmpeg` and `ffprobe` (on `PATH`, or in `ffmpeg_dir`); the
 agent refuses to start without them, or with a build that lacks the WebM/Matroska, MP4/MOV, AVI
@@ -133,20 +153,20 @@ executable half is not serialisable, so the allowlist is carried by the types.
 
 Five more, offered with the seven and dispatched by the loop rather than the registry:
 
-| Tool | What it does |
-|---|---|
-| `get_goal` | Reads the session's durable objective — its text, whether it is active, paused, complete, or abandoned, and any note on it. |
-| `create_goal` | Creates a goal for work that will not fit in one turn, from an objective stated as an outcome. Refused while an open goal exists, so a second create cannot silently drop the first. |
-| `update_goal` | Gives the goal a new objective, resumes it (`status: "active"`), or marks it complete (`status: "complete"`) — the last requiring `evidence` of what was checked. |
-| `pause_goal` | Suspends a goal that cannot be worked on now, with an optional reason. |
-| `abandon_goal` | Gives up on a goal that cannot be achieved, with a required reason. Terminal, and not completion: the objective was not met. |
+| Tool           | What it does                                                                                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `get_goal`     | Reads the session's durable objective — its text, whether it is active, paused, complete, or abandoned, and any note on it.                                                          |
+| `create_goal`  | Creates a goal for work that will not fit in one turn, from an objective stated as an outcome. Refused while an open goal exists, so a second create cannot silently drop the first. |
+| `update_goal`  | Gives the goal a new objective, resumes it (`status: "active"`), or marks it complete (`status: "complete"`) — the last requiring `evidence` of what was checked.                    |
+| `pause_goal`   | Suspends a goal that cannot be worked on now, with an optional reason.                                                                                                               |
+| `abandon_goal` | Gives up on a goal that cannot be achieved, with a required reason. Terminal, and not completion: the objective was not met.                                                         |
 
 They are the one set that is **not registered**, because their effect is a `goal/change`
 record appended to the session log: a tool executor is `'static` and cannot borrow the
 session a turn holds, so the agent loop runs them itself — see
 [the goal](roadmap.md#shipped-the-goal). They are not a convenience wrapper
 either: no shell command can mutate a session's durable objective. The distinction the
-seven-tool rule defends is *irreplaceable mechanism versus convenience*, and a goal tool
+seven-tool rule defends is _irreplaceable mechanism versus convenience_, and a goal tool
 is on the mechanism side.
 
 Clearing a goal — removing the objective outright — is deliberately **not** among them.
@@ -187,35 +207,35 @@ floor before the first human word. Measured from the
 shipped defaults (`deepseek-flash`, `per_call`, `read_only`, 512 steps/turn) by
 serialising the schemas through the DeepSeek encoder:
 
-| Piece | Characters | Estimated tokens |
-|---|---|---|
-| `DEFAULT_SYSTEM_PROMPT` | 433 | ~108 |
-| `## Runtime` section (cwd, model, policy, sandbox) | 133 | ~33 |
-| Step-budget sentence | 274 | ~69 |
-| **System message, as the harness sizes it** | **844** | **215** |
-| The seven registered tool schemas, on the wire | 4,755 | ~1,188 |
-| The five goal tool schemas, on the wire | 2,418 | ~605 |
-| **Total, every request** | **~8,017** | **~2,008** |
+| Piece                                              | Characters | Estimated tokens |
+| -------------------------------------------------- | ---------- | ---------------- |
+| `DEFAULT_SYSTEM_PROMPT`                            | 433        | ~108             |
+| `## Runtime` section (cwd, model, policy, sandbox) | 133        | ~33              |
+| Step-budget sentence                               | 274        | ~69              |
+| **System message, as the harness sizes it**        | **844**    | **215**          |
+| The seven registered tool schemas, on the wire     | 4,755      | ~1,188           |
+| The five goal tool schemas, on the wire            | 2,418      | ~605             |
+| **Total, every request**                           | **~8,017** | **~2,008**       |
 
-| Tool | Estimated tokens |
-|---|---|
-| `edit` | ~207 |
-| `grep` | ~206 |
-| `glob` | ~185 |
-| `write` | ~183 |
-| `bash` | ~166 |
-| `read` | ~151 |
-| `read_image` | ~90 |
-| `update_goal` | ~179 |
-| `abandon_goal` | ~121 |
-| `create_goal` | ~117 |
-| `pause_goal` | ~106 |
-| `get_goal` | ~81 |
+| Tool           | Estimated tokens |
+| -------------- | ---------------- |
+| `edit`         | ~207             |
+| `grep`         | ~206             |
+| `glob`         | ~185             |
+| `write`        | ~183             |
+| `bash`         | ~166             |
+| `read`         | ~151             |
+| `read_image`   | ~90              |
+| `update_goal`  | ~179             |
+| `abandon_goal` | ~121             |
+| `create_goal`  | ~117             |
+| `pause_goal`   | ~106             |
+| `get_goal`     | ~81              |
 
 "Estimated" is the same approximation `context_budget` uses — characters over four, plus
 four tokens per message. Each row is rounded on its own, so they need not sum exactly: the
 harness sizes the assembled system message at 844 characters and charges 215 estimated
-tokens for it, the message framing included. A real tokenizer counts *more* on JSON, which
+tokens for it, the message framing included. A real tokenizer counts _more_ on JSON, which
 is punctuation-heavy, so the provider's reported prompt tokens are the number to check a
 budget against. The `cwd` in the runtime section is the one piece that moves with where
 you run; the system prompt can be overridden with `system_prompt`, and the runtime section
@@ -224,7 +244,7 @@ and budget sentence are appended to whatever replaces it.
 Two things follow, and both are recorded rather than hidden. The tool schemas are **not**
 charged to `context_budget`: the estimator folds messages, and the schemas ride in the
 request outside it, so the real prompt is larger than the budget accounts for. And the
-seven-tool limit is a cost decision as well as a design one — an eighth *registered* tool
+seven-tool limit is a cost decision as well as a design one — an eighth _registered_ tool
 is roughly 100–200 more estimated tokens in every request of every turn, which is part of
 why the goal tools are five and not fifteen.
 
@@ -234,12 +254,12 @@ Four providers, selected with `provider` in the configuration. Each is an adapte
 that implements `LlmPort`, and nothing in the tools, the domain, or the loop knows
 which one is in use.
 
-| Provider | Adapter | Models offered | Plans |
-|---|---|---|---|
-| `deepseek` (default) | `nanus-adapter-deepseek` | `deepseek-flash`, `deepseek-v4-pro` | `api` |
-| `zai` | `nanus-adapter-openai` | `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2` | `api`, `coding` |
-| `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5` | `api` |
-| `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | `api`, `subscription`¹ |
+| Provider             | Adapter                   | Models offered                                                                                                              | Plans                  |
+| -------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `deepseek` (default) | `nanus-adapter-deepseek`  | `deepseek-flash`, `deepseek-v4-pro`                                                                                         | `api`                  |
+| `zai`                | `nanus-adapter-openai`    | `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2`                                                                     | `api`, `coding`        |
+| `anthropic`          | `nanus-adapter-anthropic` | `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5` | `api`                  |
+| `openai`             | `nanus-adapter-openai`    | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`                                  | `api`, `subscription`¹ |
 
 ¹ The OpenAI `subscription` plan is a ChatGPT account **authorized with OAuth** rather than a typed
 key: choosing it runs the device flow, files the token set under `openai:subscription`, and reaches
@@ -264,6 +284,59 @@ remembered selection, wins over that default.
 - **Streaming responses** over SSE, with reasoning content and tool calls
   reassembled from their frames. DeepSeek and z.ai send `data:`-framed chunks ending
   in `[DONE]`; Anthropic sends event-typed frames ending in `message_stop`.
+- **Exact wire selection for library hosts.** `OpenAiConfig::set_protocol_preference` accepts
+  `Automatic` (the stock default) or `Exact(ChatCompletions | Responses)`. Exact selection overrides
+  model routing and the fallback set by `set_protocol`; an incompatible z.ai/subscription wire is
+  refused without changing the preference. Endpoint edits are rechecked before construction and
+  dispatch. Capability/image evidence is specific to the selected Responses wire and its exact
+  known API/subscription endpoints; Chat, custom gateways and unprofiled models remain Unknown.
+  Exact Responses output controls follow the actual endpoint. A requested explicit ceiling is
+  refused when that endpoint cannot honor it. Automatic retains legacy plan handling and routing;
+  raw `encode` remains an unchecked wire-inspection helper, not a capability or acceptance claim.
+- **Optional response budgets for library hosts.** Construct `nanus_ports::ResponseLimits`
+  and install it with each API config's `set_response_limits` before constructing the adapter.
+  Budgets cover partial SSE lines, JSON data payloads/assembled call content, raw response bytes,
+  data-payload count, tool/block slots and non-success HTTP body bytes. Checks precede owned
+  buffer extensions and JSON decoding; completed signed Anthropic replay also checks its full
+  serialized envelope. These are logical byte/count bounds, not allocator/TLS/client RSS bounds.
+  Bounded streams reject invalid UTF-8, malformed JSON and incomplete protocol termination,
+  discard retained partial calls/replay on failure and release the HTTP body at failure/termination.
+  The count is SSE data payloads, including unknown kinds, rather than the number of `LlmEvent`s
+  produced from them; hosts may additionally bound their own decoded events and stored records.
+  Limits are absent by default: stock CLI/TUI composition retains legacy framing and EOF handling.
+  Hosts still own request/turn deadlines, cancellation and teardown of tool effects.
+- **Exact DeepSeek text limits.** On `https://api.deepseek.com`, the exact ids
+  `deepseek-flash` and `deepseek-v4-pro` each report 1,048,576 combined-context tokens and
+  393,216 maximum output tokens. The input bound is that combined-context upper bound,
+  with every actual output/separate-reasoning reservation still deducted from the context.
+  The [models response](https://api-docs.deepseek.com/api/list-models/) supplies each entry
+  independently. Custom endpoints and ids stay unknown. Zero or oversized output refuses
+  before HTTP even without an explicit context budget; a valid request override takes
+  precedence over the configured output default. Text metadata does not qualify images:
+  Flash remains Unknown, and Pro is Unsupported because its contract lists text input only.
+- **Local tool-support admission metadata.** `LlmPort::tool_call_support(model, request_effort)`
+  returns `ToolCallSupport::{Supported, Unsupported, Unknown}` for the actual endpoint/wire/model
+  and effective effort; absence inherits the adapter default, while explicit `ReasoningEffort::None`
+  disables reasoning where representable. Legacy ports default Unknown. Official exact DeepSeek
+  Flash/Pro and Anthropic Opus/Sonnet 5.5/Fable 5.1 ordinary tools have local entries. Six exact
+  OpenAI models have Responses entries; Astra/Sol Chat refuses tools, Luna Chat requires effective
+  None, and other Chat/subscription/custom combinations remain Unknown. Known z.ai API entries
+  are scoped separately below; Coding Plan has no inherited API evidence. Images and token
+  metadata remain independent. OpenAI/Anthropic known Unsupported tool definitions or call/result
+  replay refuse before HTTP even when the current tool list is empty; unknown stock behavior and
+  valid text-only mapping remain. Strict hosts must query/delegate and require Supported themselves.
+  Anthropic None/Minimal tool controls refuse rather than qualifying through coercion to low;
+  native low effort is supported. [Contracts and scoped verification](../.specs/changes/2026-09-30-library_embedding_and_multimodal_results.md#local-generic-tool-support-implementation--2026-10-03).
+- **Exact z.ai API admission.** Official Chat requests for `glm-5.3-flashx`, `glm-5.3-flash`,
+  `glm-5.3` and `glm-5.2` have local text/output and ordinary function-tool metadata. The
+  advertised 1M context is conservatively interpreted as decimal 1,000,000; the exact output
+  maximum is 131,072. GLM-5.3 variants accept low/high/max on the API; GLM-5.2 accepts all seven
+  neutral spellings with enabled thinking. Known API models start at max. Explicit choices win
+  and invalid choices refuse before HTTP. Direct text requests also check context/output and
+  the 128-function limit without requiring a caller budget. Coding Plan, custom endpoints and
+  unknown ids retain stock defaults/behavior and Unknown metadata. Text-only GLM-5.3/5.2 image
+  input is Unsupported; Flash/FlashX images remain Unknown with no image profile or promotion.
+  [Contract, fixtures and limits](../.specs/changes/2026-10-03-zai_api_admission.review.md).
 - **Tool calling** for all four, including DeepSeek's reasoning passback and its
   empty assistant turn sent as `content: ""`, and Anthropic's `tool_use` /
   `tool_result` content blocks.
@@ -272,10 +345,11 @@ remembered selection, wins over that default.
 - **Request controls**: `max_tokens` (default 128000, capped at the provider's
   documented ceiling because a request above it is refused rather than truncated)
   and `reasoning_effort` (`minimal` / `low` / `medium` / `high`; when the file names none, the
-  plan's own default applies — `high` for OpenAI's `subscription` plan — and then `medium`).
+  plan's own default applies — `high` for OpenAI's `subscription` plan, `max` for known z.ai API
+  models on their verified endpoint — and then `medium`).
   The configured step reaches DeepSeek, z.ai (as a thinking mode) and OpenAI (as its own
   scale). Anthropic is different: the file's `reasoning_effort` is **not** applied to it, and a
-  step the reader *chooses* — in the interface, or remembered from a switch — is sent as
+  step the reader _chooses_ — in the interface, or remembered from a switch — is sent as
   `output_config.effort` (`low` through `max`) to the 5-series models (Sonnet 5.5, Opus 5.5, Fable 5.1,
   and the earlier Sonnet 5 and Opus 5). Haiku 4.5 takes no effort at all, so none is sent and none is
   offered. Opus 5.5, Sonnet 5.5 and Fable 5.1 also request adaptive thinking.
@@ -393,46 +467,46 @@ model, and a file that sets `provider` alone gets that provider's host and model
 An unknown provider or plan is refused at startup with a sentence naming the ones
 this build offers.
 
-| Field | Default | Values |
-|---|---|---|
-| `provider` | `deepseek` | `deepseek`, `zai`, `anthropic`, `openai` |
-| `plan` | the provider's default | `api`, `coding` (z.ai), `subscription` (OpenAI, authorized with OAuth) |
-| `base_url` | the plan's endpoint | an override, for a proxy or a gateway |
-| `model` | the plan's or provider's default | any id the provider serves |
-| `max_tokens` | `128000` | per-response budget, capped at the provider's ceiling |
-| `reasoning_effort` | the plan's default, then `medium` | `minimal`, `low`, `medium`, `high` |
-| `approval_policy` | `per_call` | `per_call`, `permitted`, `all_calls` |
-| `sandbox_mode` | `read_only` | `read_only`, `workspace_write`, `danger_full_access` |
-| `max_steps_per_turn` | `512` | steps in one turn |
-| `context_budget` | `64000` | estimated prompt tokens for one request |
-| `max_parallel_tools` | `4` | how many of a step's calls may be in flight at once |
-| `tui_detail` | `compact` | `compact`, `full` |
-| `markdown` | `true` | render the model's answers as markdown |
-| `mermaid` | `true` | draw `mermaid` fences as text diagrams |
-| `system_prompt` | built-in | override the system prompt |
-| `workspace_root` | the current directory | root the tools are confined to |
-| `service_socket` | `<nanus home>/run/agent.sock` | where a service listens |
-| `service_log` | `<nanus home>/nanus-service.log` | where a detached service writes |
-| `config_version` | the build's version | the schema the file was written with; a newer one is refused, and a missing one is read as the pre-1.0 shape and migrated |
+| Field                   | Default                           | Values                                                                                                                    |
+| ----------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `provider`              | `deepseek`                        | `deepseek`, `zai`, `anthropic`, `openai`                                                                                  |
+| `plan`                  | the provider's default            | `api`, `coding` (z.ai), `subscription` (OpenAI, authorized with OAuth)                                                    |
+| `base_url`              | the plan's endpoint               | an override, for a proxy or a gateway                                                                                     |
+| `model`                 | the plan's or provider's default  | any id the provider serves                                                                                                |
+| `max_tokens`            | `128000`                          | per-response budget, capped at the provider's ceiling                                                                     |
+| `reasoning_effort`      | the plan's default, then `medium` | `minimal`, `low`, `medium`, `high`                                                                                        |
+| `approval_policy`       | `per_call`                        | `per_call`, `permitted`, `all_calls`                                                                                      |
+| `sandbox_mode`          | `read_only`                       | `read_only`, `workspace_write`, `danger_full_access`                                                                      |
+| `max_steps_per_turn`    | `512`                             | steps in one turn                                                                                                         |
+| `context_budget`        | `64000`                           | estimated prompt tokens for one request                                                                                   |
+| `max_parallel_tools`    | `4`                               | how many of a step's calls may be in flight at once                                                                       |
+| `tui_detail`            | `compact`                         | `compact`, `full`                                                                                                         |
+| `markdown`              | `true`                            | render the model's answers as markdown                                                                                    |
+| `mermaid`               | `true`                            | draw `mermaid` fences as text diagrams                                                                                    |
+| `read_video`            | `false`                           | offer the optional [`read_video`](#read_video-optional) tool                                                              |
+| `ffmpeg_dir`            | `PATH`                            | the directory holding `ffmpeg` and `ffprobe`                                                                              |
+| `video_analysis_budget` | `200000`                          | tokens `read_video` may spend on analysis requests per agent process                                                      |
+| `system_prompt`         | built-in                          | override the system prompt                                                                                                |
+| `workspace_root`        | the current directory             | root the tools are confined to                                                                                            |
+| `service_socket`        | `<nanus home>/run/agent.sock`     | where a service listens                                                                                                   |
+| `service_log`           | `<nanus home>/nanus-service.log`  | where a detached service writes                                                                                           |
+| `config_version`        | the build's version               | the schema the file was written with; a newer one is refused, and a missing one is read as the pre-1.0 shape and migrated |
 
 Environment variables:
 
-| Variable | Effect |
-|---|---|
-| `DEEPSEEK_API_KEY` | DeepSeek credential. The last store in the chain; never stored, serialised, or rendered by the harness. |
-| `ZAI_API_KEY` | z.ai credential, for the `api` plan. The `coding` plan has its own
-  (`ZAI_CODING_API_KEY`). |
-| `ANTHROPIC_API_KEY` | Anthropic credential. |
-| `OPENAI_API_KEY` | OpenAI credential, for the `api` plan. The `subscription` plan is authorized,
-  not keyed: see `nanus auth login`. |
-| `NANUS_CONFIG` | Override the configuration file path. |
-| `NANUS_HOME` | Override the session-store home (and the default socket and log paths). |
-| `NANUS_TUI` | Override the path to the interface binary. |
-| `NO_COLOR` | Render with no colour at all, keeping bold and italic. |
-| `RUST_LOG` | Tracing filter for the service and core logs. |
-| `read_video` | `false` | offer the optional [`read_video`](#read_video-optional) tool |
-| `ffmpeg_dir` | `PATH` | the directory holding `ffmpeg` and `ffprobe` |
-| `video_analysis_budget` | `200000` | tokens `read_video` may spend on analysis requests per agent process |
+| Variable                           | Effect                                                                                                  |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `DEEPSEEK_API_KEY`                 | DeepSeek credential. The last store in the chain; never stored, serialised, or rendered by the harness. |
+| `ZAI_API_KEY`                      | z.ai credential, for the `api` plan. The `coding` plan has its own                                      |
+| (`ZAI_CODING_API_KEY`).            |
+| `ANTHROPIC_API_KEY`                | Anthropic credential.                                                                                   |
+| `OPENAI_API_KEY`                   | OpenAI credential, for the `api` plan. The `subscription` plan is authorized,                           |
+| not keyed: see `nanus auth login`. |
+| `NANUS_CONFIG`                     | Override the configuration file path.                                                                   |
+| `NANUS_HOME`                       | Override the session-store home (and the default socket and log paths).                                 |
+| `NANUS_TUI`                        | Override the path to the interface binary.                                                              |
+| `NO_COLOR`                         | Render with no colour at all, keeping bold and italic.                                                  |
+| `RUST_LOG`                         | Tracing filter for the service and core logs.                                                           |
 
 ## The command line
 
@@ -441,25 +515,25 @@ accepted and does nothing, because the default already is what it asks for — s
 carries the answer and nothing else on every run — and it conflicts with `--verbose`,
 which asks for progress on stderr.
 
-| Command | What it does |
-|---|---|
-| `nanus run [--name NAME \| --resume NAME\|ID] <TASK>` | One prompt, one answer on stdout, then exit. |
-| `nanus tui` / `nanus ui` | Start the interface against a shell-scoped agent. |
-| `nanus tui --connect [--socket PATH]` | Talk to a `nanus service` instead. |
-| `nanus tui --resume REF` / `--name NAME` | Open or record a particular session. |
-| `nanus tui --session [ID] [--scroll ROWS]` | Read a recorded transcript; no key needed. |
-| `nanus service start [--foreground] [--socket PATH] [--log PATH]` | Start a service, detached by default. |
-| `nanus service stop [--socket PATH]` | Ask a running service to stop. |
-| `nanus service status [--socket PATH]` | Report whether one is running, and which sessions it holds; non-zero when nothing answers. |
-| `nanus config` | Print the effective configuration and the provider, plan, model, and endpoint it resolves to; no key needed. |
-| `nanus auth set <PROVIDER>[:<PLAN>]` | Store a key, read from standard input. |
-| `nanus auth login <PROVIDER>[:<PLAN>]` | Authorize a plan that is reached with a browser rather than a key; waits for the service. |
-| `nanus auth clear <PROVIDER>[:<PLAN>]` | Remove a stored credential, key or authorization. |
-| `nanus auth status` | Report which providers and plans have a credential, and where a key is read from; no key needed. |
-| `nanus sessions` | List recorded sessions, newest first; no key needed. |
-| `nanus sessions name <NAME> <SESSION>` | Record or change a session's name. |
-| `nanus sessions delete <NAME\|ID>` | Remove a session and release its name. |
-| `nanus sessions show [--json] <NAME\|ID>` | Report what a session ran under and what it spent; no key needed. |
+| Command                                                           | What it does                                                                                                 |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `nanus run [--name NAME \| --resume NAME\|ID] <TASK>`             | One prompt, one answer on stdout, then exit.                                                                 |
+| `nanus tui` / `nanus ui`                                          | Start the interface against a shell-scoped agent.                                                            |
+| `nanus tui --connect [--socket PATH]`                             | Talk to a `nanus service` instead.                                                                           |
+| `nanus tui --resume REF` / `--name NAME`                          | Open or record a particular session.                                                                         |
+| `nanus tui --session [ID] [--scroll ROWS]`                        | Read a recorded transcript; no key needed.                                                                   |
+| `nanus service start [--foreground] [--socket PATH] [--log PATH]` | Start a service, detached by default.                                                                        |
+| `nanus service stop [--socket PATH]`                              | Ask a running service to stop.                                                                               |
+| `nanus service status [--socket PATH]`                            | Report whether one is running, and which sessions it holds; non-zero when nothing answers.                   |
+| `nanus config`                                                    | Print the effective configuration and the provider, plan, model, and endpoint it resolves to; no key needed. |
+| `nanus auth set <PROVIDER>[:<PLAN>]`                              | Store a key, read from standard input.                                                                       |
+| `nanus auth login <PROVIDER>[:<PLAN>]`                            | Authorize a plan that is reached with a browser rather than a key; waits for the service.                    |
+| `nanus auth clear <PROVIDER>[:<PLAN>]`                            | Remove a stored credential, key or authorization.                                                            |
+| `nanus auth status`                                               | Report which providers and plans have a credential, and where a key is read from; no key needed.             |
+| `nanus sessions`                                                  | List recorded sessions, newest first; no key needed.                                                         |
+| `nanus sessions name <NAME> <SESSION>`                            | Record or change a session's name.                                                                           |
+| `nanus sessions delete <NAME\|ID>`                                | Remove a session and release its name.                                                                       |
+| `nanus sessions show [--json] <NAME\|ID>`                         | Report what a session ran under and what it spent; no key needed.                                            |
 
 A bare `nanus` starts the interface when there is a terminal and prints usage
 when there is not. The usage text is built from the same parser the commands
@@ -596,7 +670,7 @@ The Cordis-style kernel is the framework underneath. See
 [architecture](architecture.md#how-the-two-halves-fit).
 
 - **Revertible effects**: every registration records its inverse, and unloading
-  a plugin reverts in reverse *activation* order — not reverse declaration order, which
+  a plugin reverts in reverse _activation_ order — not reverse declaration order, which
   differs as soon as a plugin is written above something it depends on. A withdrawal
   also waits for the deactivations it causes, however deep the chain, so a dependent's
   teardown still resolves what it borrowed. `tests/composition.rs` asserts the trace
@@ -654,9 +728,9 @@ The honest list lives in [status](status.md#known-limits); the headline items:
 - **Image input is Supported for nine exact models.** Opus 5.5, Sonnet 5.5, and on the `api` plan
   over the Responses API GPT-6 Astra, GPT-6.1 Sol, GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed
   live follow-ups; see [vision evidence](vision-evidence.md). The same six OpenAI models are Supported on the `ChatGPT`
-  subscription backend, which was run separately. `deepseek-flash` is the ninth, Supported on its own
-  endpoint with a measured profile; `deepseek-v4-pro` is explicitly Unsupported. Every other model and
-  z.ai stay Unknown and refuse images.
+  subscription backend, which was run separately. `deepseek-flash` is Supported on its own endpoint
+  with a measured profile. Other models and z.ai stay Unknown and refuse images; DeepSeek V4 Pro is
+  explicitly Unsupported.
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
 - **The link is local.** Unix sockets and Windows SID-named pipes share the same frames.

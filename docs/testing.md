@@ -1,5 +1,87 @@
 # Testing and verification
 
+## Optional complete-batch admission — 2026-10-03
+
+Final domain/ports/minimal runner nextest passes 419 tests, no skips; all-feature
+admission passes 24. Fifteen new actual-runner fixtures and an epoch unit verify
+complete history/pending replay and actual durable events without fabricated slots,
+all chunks, raw private values versus normalized
+model content, ordinary/host denials, cancellation, goal tools, future drop, ordered
+commit and held selection. Four scoped doctests and standalone embedded default/
+providers (7/10) pass. Final whole-workspace/minimal all-target/all-feature Clippy,
+Windows-target domain/ports/minimal library Clippy and formatting pass. Runtime-free
+TUI tests (342) and lint passed at the preceding checkpoint; its unchanged consumers
+also compile in final workspace Clippy.
+
+The [certificate](../.specs/changes/2026-10-03-tool_batch_admission.md#semi-formal-proposal-review)
+records fixed incomplete-call projection and private-value normalization findings.
+Failed and final logs remain under `/private/tmp/hype-tool-admission`. Credential-aware
+stock workspace tests/doctests and native Windows execution remain unrun. This seam
+is local and unpublished; no Hype immutable adoption or consumer complete-budget
+implementation, secret store, personal Chrome or paid model use is inferred.
+
+## Declared image file-byte enforcement — 2026-10-03
+
+The unpublished generic runner fix passes final domain/minimal-bundle nextest:
+320 tests, no skips; the all-feature admission suite passes nine cases with no skips.
+Four added runner fixtures and one domain fixture cover exact
+raw bytes and the next byte within the same base64 quantum, all padding cases,
+every image in success/failure outcomes, zero bounds, malformed encoding/media/MIME,
+text-only results and a refused result beside a valid batch neighbor. The pure counter
+shares the bounded canonical file decoder with existing complete-media validation.
+
+Formatting, whole-workspace all-target/all-feature warning-denying Clippy, minimal
+bundle Clippy, three domain/minimal-bundle doctests, standalone embedded default
+(7 tests) and providers (10 tests), and Windows-target domain/minimal-bundle library
+Clippy pass. The [certificate](../.specs/changes/2026-10-03-enforce_image_envelope_bytes.md#semi-formal-proposal-review)
+and `/private/tmp/hype-image-envelope` logs record scope. Credential-aware stock
+workspace tests/doctests and native Windows execution remain unrun. No actual secret
+or personal browser is used. The app's immutable pin is not changed by this fix;
+full-request/token/analysis admission and original video acceptance remain separate.
+
+## Caller-owned video snapshot checks — 2026-10-03
+
+The local unpublished snapshot seam passes eleven library/snapshot nextest cases and
+ten existing real FFmpeg cases, whole-workspace all-target/all-feature warning-denying
+Clippy, formatting and Windows-target library Clippy. The video doctest command passes
+with zero examples. Four new external fixtures exercise the actual tool with typed JPEG
+and manifest delivery, owner retention across a dropped call and physical worker join,
+receipt refusal with another owner still retained, and I/O-free inclusive size bounds.
+Existing FFmpeg tests confirm stock source cleanup and pixels/codec/container behavior.
+
+Initial fixture compilation used the private executor field and wrong outcome shape;
+the public ToolDefinition::execute/ToolResult.outcome API corrects it. Initial lint
+findings in the newly used owner field and its initializer were corrected without
+suppression. All source/doc baselines, failures and final logs are retained under
+`/private/tmp/hype-video-snapshot`; the [certificate](../.specs/changes/2026-10-03-video_snapshot.review.md)
+traces lifetime and admission scope. No secret store, personal Chrome or paid model is
+used. Windows compile evidence does not establish execution. Hype's production pin,
+tool registration and original acceptance remain unchanged; credential-aware stock
+workspace tests/doctests remain explicitly unrun.
+
+## Local z.ai API admission checks — 2026-10-03
+
+The unpublished exact-endpoint/model z.ai delta passes adapter nextest (93 tests),
+pure provider-table nextest (13 tests, 143 filtered), minimal bundle nextest (139 tests),
+runtime-free TUI nextest (342 tests), whole-workspace formatting and all-target/all-feature
+warning-denying Clippy, including the minimal bundle/runtime-free TUI feature gate.
+The OpenAI adapter doctest command passes with zero examples.
+Seven new adapter fixtures cover effort/scope/default matrices, actual function-tool
+and grouped replay encoding, GLM-5.2 none/minimal, exact serialized context/output/tool
+limits, pre-TCP refusal without caller budgets, and a positive loopback dispatch.
+One new pure bundle fixture covers API max, explicit override and unchanged Coding Plan/
+gateway/unknown-model defaults. Fixtures use fictional keys and local sockets; tests
+named `live_wire` in the adapter are local socket fixtures, not paid model requests.
+
+The initial full workspace Clippy found an unqualified bundle port type; the corrected
+run exits 0 with no suppression. Full stock composition/workspace doctests are deliberately
+unrun because they can read the real credential store; changing Nanus home is insufficient
+Keychain isolation. No live provider acceptance, image promotion, native Windows execution
+or immutable Hype adoption is inferred. The [certificate](../.specs/changes/2026-10-03-zai_api_admission.review.md)
+and retained `/private/tmp/hype-zai-admission` logs/baselines record the exact scope.
+
+## Earlier whole-repository baseline
+
 Every number here is reproducible from a clean checkout. Nothing in this page is a
 claim about intent; each line is the output of a command.
 
@@ -76,11 +158,11 @@ the environment, not the code, so a clean-checkout run in CI or a fresh account 
 **What the live evidence covers.** Every model with an image profile, on each endpoint that serves
 it, for PNG, JPEG, WebP and still GIF:
 
-| Endpoint | Models |
-|---|---|
-| Anthropic Messages | `claude-opus-5-5`, `claude-sonnet-5-5` |
-| OpenAI Responses (`api.openai.com`) | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
-| OpenAI Responses (`ChatGPT` subscription) | the same six |
+| Endpoint                                  | Models                                                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Anthropic Messages                        | `claude-opus-5-5`, `claude-sonnet-5-5`                                                     |
+| OpenAI Responses (`api.openai.com`)       | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
+| OpenAI Responses (`ChatGPT` subscription) | the same six                                                                               |
 
 Fable 5.1, Haiku 4.5, DeepSeek and z.ai have no image profile and are tested only for the refusal
 before HTTP. The offered model lists themselves are pinned by tests in each adapter
@@ -143,20 +225,20 @@ per-step token accounting. It has since been run end to end with `nanus run` aga
 
 ## The bugs verification found
 
-All of them were found *because* the thing was exercised rather than read, and all of them
+All of them were found _because_ the thing was exercised rather than read, and all of them
 are now pinned by tests. They are recorded because a project claiming rigour should show
 what rigour caught.
 
 **The `[DONE]` sentinel silently dropped every tool call.** The end-of-stream sentinel
 ended the byte-reading loop without closing the accumulator — and the accumulator is what
 emits assembled tool calls and usage. Tool-call arguments arrive as fragments, so they
-*cannot* be emitted until the stream ends. Every live tool call was discarded and the loop
+_cannot_ be emitted until the stream ends. Every live tool call was discarded and the loop
 saw an empty turn. A plain "say hi" worked perfectly, which is exactly why it survived
 until a run that actually called a tool.
 
 **`glob`'s pattern was not anchored.** `globset` lets `*` cross a directory separator by
 default, and the matcher tested absolute paths — so `*.rs` matched at every depth, and a
-bare pattern matched *everything*. `*.rs` and `**/*.rs` were indistinguishable, which
+bare pattern matched _everything_. `*.rs` and `**/*.rs` were indistinguishable, which
 meant a model could not express "top level only". Now `*.rs` is the root level,
 `**/*.rs` is every depth, and `src/*.rs` stops at the separator.
 
@@ -180,16 +262,16 @@ the recording, not of the session.
 kernel's state is `Rc`-shared and its futures are not `Send` — `tokio::spawn` cannot carry
 them, so `spawn_local` is the only option, and it panics outside a `LocalSet`. Nothing had
 ever entered one. The code dated from the first commit and had never executed: every test
-covered the view, none covered the turn, and the interface had only ever been *read from*.
+covered the view, none covered the turn, and the interface had only ever been _read from_.
 Reported by the first person to type into it. The loop is now driven by `block_on_local`,
-which enters a local set *and* runs the runtime so the spawned task is polled — entering
+which enters a local set _and_ runs the runtime so the spawned task is polled — entering
 alone would leave the task un-polled — and the loop is async, because awaiting a keystroke
 synchronously would stall the very turn the local task exists to keep moving. A test now
 submits a prompt against a scripted model and waits for the answer.
 
 **The newest line could not be scrolled to.** A scroll offset counts display rows: a
 reader scrolls rows, and the viewport is measured in rows. The transcript was counted in
-logical *lines*, and the renderer wraps. Every wrapped line therefore put the bottom out of
+logical _lines_, and the renderer wraps. Every wrapped line therefore put the bottom out of
 reach by exactly the rows it wrapped into — so opening a session stopped short of its end,
 and a notice appended to a long transcript landed below the fold, invisible. Both units are
 now rows, and the tail is anchored to the bottom of the viewport, since a wrapped final
@@ -213,12 +295,12 @@ could never be let go. Both ways of moving had it, and both are now tested separ
 because fixing one arm of a two-arm bug is exactly the mistake the first version of the
 test made: it exercised `new` and passed against a build with `attach` still broken.
 
-**A session could evict itself.** Room was made for a new session *after* it was in the
+**A session could evict itself.** Room was made for a new session _after_ it was in the
 registry, so when every other held session was in use the newcomer was the only eviction
 candidate and was dropped immediately. The client was then handed a conversation the agent
 no longer held — invisible to a listing, unreachable by a second client, and loaded a
 second time by anyone who tried. Reaching it needs every other session attached, which is
-why the first version of *that* test also proved nothing: the oldest idle session is
+why the first version of _that_ test also proved nothing: the oldest idle session is
 evicted first, so the test has to fill the registry before opening one more.
 
 The lesson both times was the same, and it is about tests rather than code: a regression
@@ -226,30 +308,29 @@ test is only a regression test if it fails against the code it was written for. 
 these was checked by reverting the fix and watching the test fail — and two of the four
 did not, which is how the tests got rewritten.
 
-
 ## The bugs a certificate review found
 
 A later pass over the whole tree — every crate read in dependency order, then each finding
 confirmed by running something — turned up six more. What they have in common is that they
-are all *cross-scope*: each one is a disagreement between two parts that are individually
+are all _cross-scope_: each one is a disagreement between two parts that are individually
 correct and individually tested.
 
 **A deactivation cascade could not hand its own binding back.** Unloading a provider retires
 its bindings and reverts its effects only after the sweep, so a consumer that required them
 still resolves them while it is being torn down — the ordering the first review fixed. But a
-consumer that *also provides* something had its own binding removed the moment it was
+consumer that _also provides_ something had its own binding removed the moment it was
 deactivated, and the sweep only reached the plugin that required it on the next pass. So in
 a chain of three, the far end's `unmount` resolved nothing. The fix is the same discipline
 one level up: a deactivation retires and parks, the sweep runs to a fixed point with every
 binding still resolvable, and only then is anything withdrawn — a withdrawal waits for the
 deactivations it causes, at any depth. The suite could not see it because every fixture in
-`nanus-kernel/tests/composition.rs` was a *pair*: no test had a plugin that both requires and
+`nanus-kernel/tests/composition.rs` was a _pair_: no test had a plugin that both requires and
 provides, so no test had a cascade. There is a three-plugin chain now, and it fails against
 the old kernel.
 
 **A tool result was paired with the wrong call.** A step writes every call it made and then
 every result, so the entry before a result is the last call of the batch rather than the one
-it answers. The recorded transcript therefore labelled a result with the *next* call's name —
+it answers. The recorded transcript therefore labelled a result with the _next_ call's name —
 which is not cosmetic: the interface pairs a result with the call above it, so a two-call
 step drew the first call as still running, drew its output under the second tool, and drew
 the last result twice. The log had the answer all along in `call_id`, which nothing used.
@@ -261,7 +342,7 @@ are tested against a two-call step, since a one-call step cannot tell either of 
 
 **`bash` ran in the wrong directory.** The tool's schema says its working directory defaults
 to the workspace root, and the system prompt repeats it. It sent no working directory at all,
-so the child inherited the *process's* — identical while the workspace root is unset, and
+so the child inherited the _process's_ — identical while the workspace root is unset, and
 different the moment it is configured, which is also the whole of the difference for a
 service. Every test ran with the two the same.
 
@@ -287,10 +368,10 @@ calls both.
 
 Three smaller ones, recorded because they are the same kind of thing: `Ctrl+C` at an approval
 prompt did nothing (the turn is asleep on the answer, so the stop flag never reached its
-checkpoint; the key then denied the call *and* asked for the stop, and has since been made
+checkpoint; the key then denied the call _and_ asked for the stop, and has since been made
 copy-only everywhere, so `n` denies and `Esc` stops), `--scroll` without
 `--session` was accepted and ignored, and a capped search reported `truncated` whenever the
-cap was *reached* rather than when a match was dropped, which is a confident falsehood a
+cap was _reached_ rather than when a match was dropped, which is a confident falsehood a
 model cannot check.
 
 ## The defects a second certificate review found
@@ -301,12 +382,12 @@ pinned by a test now, and the two that were reachable were reproduced before the
 
 **A client attaching as a turn ended drew the turn twice.** The agent snapshots the running turn
 when it answers an attachment; the interface reads the log from the store a moment later. A turn
-that *ended* between those two instants is in the log, and the backlog that carries it was still
+that _ended_ between those two instants is in the log, and the backlog that carries it was still
 delivered, so the prompt and the answer were drawn once from the store and again from the batch.
 The claim the design rests on — "a client finds a finished turn in the store and a running one in
 the batch, never both and never neither" — was true of the agent's own two stores and false for
 the client's two reads. The attachment now carries the log's position when the batch was taken,
-and the client, which reads the log *after*, recognises a log that has moved past it and drops
+and the client, which reads the log _after_, recognises a log that has moved past it and drops
 the redundant batch. Pinned by
 [`backlog_is_redundant`](../crates/nanus-tui/src/runtime.rs) with the frame itself
 (`forwarded`), and by a socket test that asserts the count an attachment reports is the log's own
@@ -321,23 +402,23 @@ a log today (writes are whole-file and atomic, and nothing saves mid-turn), whic
 reading of both sides finds it: the fold's own comment claimed the log was producible and the
 encoders' comments claimed the fold could not produce it. The message is now skipped with the
 calls it was kept for, and the invariant test that had been asserting the unencodable shape has
-its call answered so that it tests what it says: the reasoning of a *tool-using* turn survives.
+its call answered so that it tests what it says: the reasoning of a _tool-using_ turn survives.
 
 **An attachment's own reply could be dropped silently.** `Attached` and `Backlog` are queued
 without waiting, because a wait inside the attachment's synchronous region would let a live frame
 in ahead of them. A client whose queue was already full then never received the reply it was
-waiting for, and the frames it *did* receive were discarded as belonging to the session it was
+waiting for, and the frames it _did_ receive were discarded as belonging to the session it was
 leaving — a hang with nothing to read. A connection with no room is now unregistered and refused
 on the awaiting path, which the client's own reading makes room for.
 
 **Taking over a stale claim was not a decision between two processes.** The claim promised that
-`O_EXCL` decided a race, and it did — for a *fresh* claim. A claim whose holder was gone was
-taken over with an atomic *replace*, which is not exclusive: two writers starting at the same
+`O_EXCL` decided a race, and it did — for a _fresh_ claim. A claim whose holder was gone was
+taken over with an atomic _replace_, which is not exclusive: two writers starting at the same
 instant, both finding the same dead pid, both replaced it and both believed they were first.
 That is the silent overwrite the claim exists to prevent, in the crash-and-restart case it exists
 to survive. The claim is now the operating system's own `flock`: atomic between processes,
 released by the kernel when the holder exits however it exits, so a stale claim is not a state a
-reader has to detect at all. The file stays as the *label* that names the holder for the refusal
+reader has to detect at all. The file stays as the _label_ that names the holder for the refusal
 sentence, and the store's own map is what makes a re-claim from the process that already holds it
 a non-conflict rather than a self-refusal. The socket test that used to write a claim file by
 hand now holds a real lock from a second store, because a file nobody holds is exactly what it
@@ -348,7 +429,7 @@ the adapter's own offered list did not contain (at the time, OpenAI's coding pla
 `gpt-5-codex` while the list was `gpt-5` and `gpt-5-mini`). A client could cycle away from that
 model and never back — the cycle treats an unknown current id as a fresh start — and `SetModel`
 would refuse the id the session was already running. Every plan's default model must now be
-offered, and the provider table's invariant test checks *every* plan's default rather than only the
+offered, and the provider table's invariant test checks _every_ plan's default rather than only the
 default plan; it is what keeps today's `gpt-6.1-sol` subscription default honest.
 
 **A doc comment landed on the wrong function.** `domain_policy` lost its own first line to
@@ -359,11 +440,11 @@ default plan; it is what keeps today's `gpt-6.1-sol` subscription default honest
 One more, reported from a real terminal rather than found by anything here, and worth
 recording because the cause was a whole class of defect rather than a typo.
 
-**`Shift+Enter` typed a `j`.** On Ghostty, `shift+enter` is bound to *send a newline* — the
+**`Shift+Enter` typed a `j`.** On Ghostty, `shift+enter` is bound to _send a newline_ — the
 terminal types a line feed instead of reporting a key, so no keyboard protocol is involved.
 In raw mode a line feed is `Ctrl+J`, and terminals report control bytes as `Ctrl+<letter>`.
 The interface's key handler ended in a catch-all that inserted any character and looked at
-no modifiers, so `Ctrl+J` inserted `j`. The same arm was inserting a letter for *every*
+no modifiers, so `Ctrl+J` inserted `j`. The same arm was inserting a letter for _every_
 control key it had not claimed: `Ctrl+K` typed `k`, and `Ctrl+H` typed `h` for a byte that
 is also backspace.
 
@@ -380,13 +461,13 @@ swallowing those would stop some keyboards typing at all.
 
 The same investigation turned up a hazard this interface happens to avoid, and it is worth
 recording because the next binding may not. A terminal that reports modifiers attaches
-`SHIFT` to the characters those modifiers produce: `?` arrives as `Char('?')` *with*
+`SHIFT` to the characters those modifiers produce: `?` arrives as `Char('?')` _with_
 `SHIFT`. A binding that compares whole key events then fails for exactly the keys someone
 tests by pressing them, while `Shift-?` works — [ratatui/templates#26][shift-issue]. The key
-handler here reads the key *code* and ignores modifiers when inserting text, so typing is
+handler here reads the key _code_ and ignores modifiers when inserting text, so typing is
 unaffected, and there is now a test that fails if that stops being true.
 
-Asking the same question of the *control* bindings found one that was wrong, by injecting
+Asking the same question of the _control_ bindings found one that was wrong, by injecting
 the bytes a terminal sends for `Ctrl+C` with Caps Lock on: `Char('C')` with `CONTROL`.
 Nothing happened — with the keyboard protocol enabled, the interface could not be quit and
 its toggles were dead for anyone typing in capitals. The bindings now match either case.
@@ -395,10 +476,32 @@ Injection is what made this visible: the parsed event was already in hand, and t
 
 [shift-issue]: https://github.com/ratatui/templates/issues/26
 
+## Opt-in response limits — local verification, 2026-10-02
+
+The response-policy patch adds 35 fixtures, including all four real local-HTTP grammars.
+The required `+1.98.0` gates passed: workspace fmt/clippy (no warnings), 1,438 nextest tests
+with 14 existing live tests skipped, and 11 doctests. TUI without default features passed
+clippy and 342 tests; minimal bundle passed clippy, 134 tests and 2 doctests; the locked
+standalone example passed 7 tests, or 10 with explicit providers. `NANUS_HOME` was isolated
+for these runs; no live-provider call was made. The final full nextest run had no leak flag.
+See [the certificate](../.specs/changes/2026-10-02-response_limits.review.md) for scope,
+intermediate failures, exact budget semantics and untested native/live gates. This local
+result does not publish a new dependency revision or prove a consumer selected these limits.
+
+## Exact protocol selection — local verification, 2026-10-02
+
+Nine new fixtures exercise stock/Exact routing, incompatible vendor/endpoint refusal, capability
+scope, image refusal, explicit output ceilings and real local HTTP URLs/payloads/decoders.
+All required `+1.98.0` gates passed: fmt/clippy with no warnings, 1,447 workspace tests (14 existing
+live skips), 11 doctests, 342 minimal TUI tests, 134 minimal bundle tests plus 2 doctests, and 7/10
+locked standalone embedding tests. The final full run had no leak flag. Tests used an isolated
+`NANUS_HOME`; no live API request was made. See [the certificate](../.specs/changes/2026-10-02-exact_protocol.review.md)
+for exact scope and the remaining adoption/platform/live gates.
+
 ## `read_video` — local and live verification, 2026-10-02
 
 `nanus-tool-video` adds 23 tests and `nanus-bundle` eight. Against a real FFmpeg 9.0.2 they encode an
-eight-second clip of four solid colours and assert on the *pixels* that come back, not on a count:
+eight-second clip of four solid colours and assert on the _pixels_ that come back, not on a count:
 H.264, HEVC, VP8, VP9 and AV1 in WebM and MP4, MPEG-4 in AVI, MPEG-2 and MJPEG in Matroska each yield
 red, green, blue, yellow in order at the quarter centres. Others cover a nonzero container start
 time (MPEG-TS), pixel aspect ratio with the 1024-pixel bound, `auto` resolving to text for a model

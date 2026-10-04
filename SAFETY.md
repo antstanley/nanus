@@ -19,7 +19,7 @@ root.
 
 Two independent settings govern how much freedom the model has. The **sandbox mode**
 is the standing permission — what a tool call may do without anyone being asked —
-and the **approval policy** decides what happens to a call *outside* it.
+and the **approval policy** decides what happens to a call _outside_ it.
 
 **Sandbox mode** (`read_only` by default).
 
@@ -35,12 +35,12 @@ and the **approval policy** decides what happens to a call *outside* it.
   allowed. Approval is one-shot unless you choose otherwise.
 - `permitted` — a call that cannot destroy anything runs without asking. A call
   that looks destructive — a command that deletes or overwrites — still prompts,
-  *unless* every path it names is inside a temporary directory, where a destructive
+  _unless_ every path it names is inside a temporary directory, where a destructive
   command is the ordinary way to clean up. Prefer this over `per_call` when you
   want the agent to work without being asked about every read-only shell command,
   but still want a person in the loop for a deletion.
 - `all_calls` — every call the sandbox does not permit runs without asking. This is
-  a free for all, and it is only safe where the *environment* is the containment:
+  a free for all, and it is only safe where the _environment_ is the containment:
   a container, a virtual machine, or a machine whose contents are disposable. Do
   not choose it on a laptop with your work on it, and note that it does not
   enforce anything itself — it removes the gate rather than adding a wall.
@@ -75,6 +75,32 @@ signal against waiting work and drops interrupted futures; the host must termina
 process groups or other side effects. Inline image bytes are verified/bounded and unknown
 model profiles are refused before image I/O/HTTP. The library performs no URL fetch or resizing.
 
+Declared image results must honor both the count and exact raw image-file byte
+envelope, including failure content. Canonical base64 decoding is globally bounded;
+invalid or over-declared content becomes a bounded failure without pixels before
+progress completion and session retention. Full media/profile validation still runs.
+`content::image_file_bytes` alone checks encoding and file size, not media or pixels.
+Envelopes remain capacity metadata: they grant no source/effect authority and do not
+bound the complete next request, tokens, host checkpoint or additional model charges.
+Effects already performed by a tool are not rolled back by result refusal.
+
+An optional embedding `with_tool_admission` port receives the full unelided pending
+request and its fitted failure base, all calls/denials, exact capabilities and held
+pure estimator before any goal or registered executor. Actual retained durable events
+also reach the host independently of prospective slots and provider fitting. Host-owned reserve/admit/live
+dispatch/raw-and-normalized-result/ordered-commit callbacks retain logical capacity
+across every chunk. Adapter/model/effort changes queue until the last step hold drops.
+Unreserved teardown retires unused local handles; physical workers remain host-owned.
+This unpublished [local contract](.specs/changes/2026-10-03-tool_batch_admission.md)
+provides no budget policy, skill/plugin discovery or desktop authority by itself.
+
+API library consumers can opt into `ResponseLimits` before streaming. These bound the bytes
+retained for partial SSE lines, JSON payloads, tool-call assembly and HTTP error bodies, plus raw
+response totals and payload/slot counts. Oversized or incomplete bounded responses fail and release
+the body; no partial signed replay or completed tool-call batch is emitted as a success. Stock
+composition leaves these limits absent. They do not cap TLS/HTTP-client/allocator overhead or stop a
+silent provider by themselves: the host must still impose deadlines and drive cancellation.
+
 ### The honest caveats
 
 - **A non-zero exit code is not an error**, by design: the command ran and told you
@@ -106,7 +132,7 @@ not:
   where you are. `!cd /` is a shell command, and so is `!rm -rf` with the path of your
   choosing. It is exactly what typing the same line into your terminal would do.
 - **It is not approved, because there is nobody to ask.** Approval exists because a
-  *model* asked for a call and a person should decide. You are the person, and you
+  _model_ asked for a call and a person should decide. You are the person, and you
   typed it.
 - **It does not read your keyboard.** Its standard input is closed rather than handed
   the terminal, because the terminal's keystrokes are the composer's — a command that
@@ -159,7 +185,7 @@ Choose a home directory that other users cannot read, or use environment credent
 
 What this does **not** do: the file store is not encrypted, so a secret in it is
 readable by anything running as you — as the environment variable already was. The
-point of the store is to get a key *out* of the environment and out of the
+point of the store is to get a key _out_ of the environment and out of the
 configuration file, not to defend it from the user's own processes.
 
 ## The agent's local link
@@ -201,11 +227,11 @@ The ACL read-back, local pipe behavior, Job Object grandchild cleanup, and detac
 lifecycle passed [native Windows validation](https://github.com/antstanley/nanus/actions/runs/36852736607)
 at `b13b9a9`. The handshake postdates that run.
 
-The trust boundary is *processes running as you*, and it is worth being precise about
+The trust boundary is _processes running as you_, and it is worth being precise about
 what that means. A program that can connect to the socket can send a prompt to an
 agent that reads and writes files and runs programs with your permissions. Such a
 program could already do all of those things itself — it runs as you — so the socket
-grants it no new capability. What it does grant is *plausible deniability*: work done
+grants it no new capability. What it does grant is _plausible deniability_: work done
 through the socket is recorded in the session log under a session the agent created,
 not under the caller's name. Treat the log as the record of what was asked, and
 remember that anything running as you could have added to it.
@@ -246,13 +272,6 @@ item from it is used, so an upgrade or a second use is a new review rather than 
 Writing the declaration in this repository instead would need `unsafe`, which no crate here may
 contain.
 
-## Prompt injection
-
-A harness that reads files and fetches content will eventually read text written by
-someone who wants it to do something else: a `README.md`, a code comment, a test
-fixture, a web page. Treat the model's instructions as untrusted input, not as your
-instructions. Concretely:
-
 ## `read_video`
 
 An optional tool, off by default (`read_video = true`). It runs `ffprobe` and `ffmpeg`, so it
@@ -283,6 +302,13 @@ labelled a read.
   records the reported usage.
 - **What a result is.** Text inside a video, and the analysis model's answer, are untrusted data. The
   analysis is told so, and the result labels it as a model's reading of sampled stills.
+
+## Prompt injection
+
+A harness that reads files and fetches content will eventually read text written by
+someone who wants it to do something else: a `README.md`, a code comment, a test
+fixture, a web page. Treat the model's instructions as untrusted input, not as your
+instructions. Concretely:
 
 - Prefer `read-only` or `workspace-write` over `danger-full-access`.
 - Prefer `per_call` (the default) or `permitted` when a human is watching, and keep

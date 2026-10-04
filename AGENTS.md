@@ -66,7 +66,7 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 | `crates/nanus-domain` | Messages, the tool contract, the append-only session log, prompt assembly, approval policy, the turn machine. Pure. |
 | `crates/nanus-ports` | The boundary: port traits (`LlmPort`, `FsPort`, `ShellPort`, `StorePort`, `ClockPort`) and the service keys that let provider and consumer meet without sharing a value. No I/O. |
 | `crates/nanus-adapter-deepseek` | Request encoding, SSE decoding, streaming, tool-call reassembly. |
-| `crates/nanus-adapter-openai` | The same protocol for the OpenAI-compatible vendors, OpenAI and z.ai, which differ in a vendor table rather than per line. |
+| `crates/nanus-adapter-openai` | OpenAI-compatible transport for OpenAI and z.ai, with vendor tables and exact endpoint/model admission modules; API evidence does not qualify Coding Plan or gateways. |
 | `crates/nanus-adapter-anthropic` | The Messages API: a top-level system field, tool results as user turns, event-typed streaming. |
 | `crates/nanus-adapter-secret` | The credential stores: a chain of `SecretBackend`s — the macOS keychain, a `0600` file, the environment — behind `SecretPort`. |
 | `crates/nanus-adapter-local` | Rooted filesystem, process-group shell, clamping clock. |
@@ -356,10 +356,14 @@ design docs too.
   replay are bounded. Version 1 cannot smuggle these fields. Store saves use `try_to_jsonl`;
   failed saves must leave the original intact. Image capability defaults Unknown until exact
   profile wire/reload and live-follow-up evidence pass. Do not guess support from a model label.
-- **For OpenAI, the wire follows the model.** `gpt-5.6` and later (read from the id's version) go
+- **For OpenAI, Automatic routing follows the model.** `gpt-5.6` and later (read from the id's version) go
   to the Responses API per request on the API plan; the `subscription` plan is Responses already and
   is sent no `max_output_tokens`, which that backend refuses. An image profile belongs to one exact
   model id and is promoted only on live evidence (`nanus-bundle/tests/live_vision.rs`, `#[ignore]`d).
+  Library hosts may choose `ProtocolPreference::Exact`: the chosen wire overrides automatic model
+  routing or is refused before HTTP. Capability/image evidence belongs to the actual selected wire,
+  exact model and known endpoint; Chat/proxy support cannot inherit Responses evidence. Raw `encode`
+  is inspection only. Exact endpoint output ceilings cannot be silently dropped.
   `reasoning_effort` in the configuration is optional: absent means the plan's default
   (`subscription`: `high`), then `medium`.
 - **Embedding excludes stock adapters by default-feature opt-out.** `stock-compose` gates

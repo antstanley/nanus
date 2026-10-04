@@ -15,6 +15,54 @@ capabilities from current Nanus evidence. Provider scope remains DeepSeek, z.ai,
 and OpenAI; additional providers are evaluated after harness support ships. WebM demuxing
 and AV1 decoding are explicit requirements alongside FFmpeg's standard available codecs.
 
+## Caller-owned snapshot seam — 2026-10-03
+
+The local working copy adds `Snapshot::from_owned_file(path, sha256, byte_len, owner)`
+and `retain_owner()`. The constructor accepts a host-verified immutable fixed-name
+`source` file and an opaque `Arc<dyn Any + Send + Sync>` lease. It validates receipt
+shape and the existing 128 MiB ceiling without reading, copying, probing, spawning or
+discovering credentials. A valid receipt shape does not establish filesystem scope,
+content digest or physical identity; the caller's rooted snapshot adapter owns those
+checks and the final cleanup policy. Empty claimed length remains representable as
+in the existing source, with format validity determined by the decoder.
+
+Physical workers retain the opaque owner before leaving the local call, and release it
+only after their process/readers have joined. Dropping a call/future cannot remove a
+copy still held by such a worker. Stock `FsSource` now retains its existing TempDir in
+the same opaque owner; copy/hash/bounds and relative temp-root behavior are unchanged.
+Snapshot Debug omits the owner. The public source trait can therefore be implemented
+directly by a host without enlarging its ordinary authoring-file port or invoking stock
+composition. This is a generic media lifetime seam, with no app workflow, skill or plugin.
+
+Four external-caller fixtures cover actual image/manifest delivery, retained physical
+worker ownership and final cleanup, rejected receipt transfer, and I/O-free inclusive
+receipt bounds. Eleven library/snapshot tests and ten existing real FFmpeg regressions
+pass; workspace warning-denying Clippy, formatting and Windows-target library Clippy
+pass. The package doctest command passes with zero examples. The
+[semi-formal certificate](2026-10-03-video_snapshot.review.md) records initial fixture/lint
+corrections and scope. This seam is unpublished and Hype has not adopted or registered
+the extension. Native Windows execution and original video/provider acceptance remain open.
+
+## Generic returned-image byte enforcement — 2026-10-03
+
+The local unpublished [envelope fix](2026-10-03-enforce_image_envelope_bytes.md)
+now enforces the reserved raw-file bytes of every image, including failure content,
+before completion/progress retention. Exact equality, all base64 padding cases,
+next-byte overflow and mixed-call isolation pass actual-runner tests. The published
+80a0f79b pin still checks count only. This closes the narrow local returned-byte gap;
+it does not implement full `ToolAdmission` request/token projections or desktop
+worker/source/payment authority, and does not complete this video proposal.
+
+## Generic complete-batch lifecycle prerequisite — 2026-10-03
+
+The unpublished [optional admission implementation](2026-10-03-tool_batch_admission.md)
+now supplies full/fitted pending request and actual durable-event projections, held selection, owned batch
+reservation callbacks and raw/normalized validation before progress. It passes 419
+credential-free domain/ports/minimal tests and 24 all-feature admission cases. This
+implements the generic lifecycle seam only; the host still owes complete result/wire/
+token/checkpoint budgets, source/worker/selection authority and analysis charges.
+Published 80a0f79b and Hype's pin lack it. Original native/provider/video gates remain open.
+
 ## Implementation status, 2026-10-02
 
 Implemented in `crates/nanus-tool-video`, `nanus-domain` (`ImageEnvelope`), `nanus-bundle` (`video.rs`, admission in
@@ -35,7 +83,7 @@ Not implemented, and why the change stays open:
   profile and is the analysis model for DeepSeek, and `deepseek-v4-pro` is shown live not to read images.
 - **Linux and Windows certification,** and process-lifecycle evidence beyond a dropped call killing the decoder on Unix.
 
-Narrower than specified: admission is a generic *declared-envelope* reservation (`with_result_images`) against the
+Narrower than specified: admission is a generic _declared-envelope_ reservation (`with_result_images`) against the
 newest turn and the model's image and byte caps, not the full `ToolAdmission` projection with selection epochs and
 cross-chunk failure slots; a model switch during a step is caught by the existing next-request validation, not
 by admission. The analysis budget is per agent process and is not persisted.
@@ -64,14 +112,14 @@ account; it does not authorize a different provider, plan or credential destinat
 The canonical specification remains in `docs/` and Rust contracts; there is no global
 JSON Schema to change. Apply these additions only after implementation and verification.
 
-| Canonical page and heading | Change |
-|---|---|
-| [Architecture → What each crate owns](../../docs/architecture.md#what-each-crate-owns) | Add the optional extension/host boundary. |
-| [Design → Seven tools, and the count is the design](../../docs/design.md#seven-tools-and-the-count-is-the-design) | Add the distinction between stock and host-installed tools. |
-| [Features → The toolset](../../docs/features.md#the-toolset) | Add the installed tool's bounded contract. |
-| [Sessions → What a session is](../../docs/sessions.md#what-a-session-is) | Add replay/provenance rules using existing text/image content. |
-| [Safety → Defaults, and what they do not protect you from](../../SAFETY.md#defaults-and-what-they-do-not-protect-you-from) | Add process, disclosure and host policy rules. |
-| [Testing → The tests that matter most](../../docs/testing.md#the-tests-that-matter-most) | Add extension and video evidence gates. |
+| Canonical page and heading                                                                                                 | Change                                                         |
+| -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| [Architecture → What each crate owns](../../docs/architecture.md#what-each-crate-owns)                                     | Add the optional extension/host boundary.                      |
+| [Design → Seven tools, and the count is the design](../../docs/design.md#seven-tools-and-the-count-is-the-design)          | Add the distinction between stock and host-installed tools.    |
+| [Features → The toolset](../../docs/features.md#the-toolset)                                                               | Add the installed tool's bounded contract.                     |
+| [Sessions → What a session is](../../docs/sessions.md#what-a-session-is)                                                   | Add replay/provenance rules using existing text/image content. |
+| [Safety → Defaults, and what they do not protect you from](../../SAFETY.md#defaults-and-what-they-do-not-protect-you-from) | Add process, disclosure and host policy rules.                 |
+| [Testing → The tests that matter most](../../docs/testing.md#the-tests-that-matter-most)                                   | Add extension and video evidence gates.                        |
 
 ## Proposed changes
 
@@ -109,7 +157,7 @@ JSON Schema to change. Apply these additions only after implementation and verif
 ### Features → The toolset (Add)
 
 > Installed hosts offer `read_video(file_path, mode, start_ms, end_ms, max_frames,
-> question)`. Every route samples images using FFmpeg. Default `auto` returns images to a
+question)`. Every route samples images using FFmpeg. Default `auto` returns images to a
 > verified vision model or a text interpretation from the configured analysis model.
 > Explicit `frames` and `analyze` select the result form. Support covers every configured
 > model the harness supports, including text-only models, through the declared analysis
@@ -138,11 +186,18 @@ JSON Schema to change. Apply these additions only after implementation and verif
 Examples (the executor applies defaults):
 
 ```json
-{"file_path":"recordings/repro.webm","start_ms":12000,"end_ms":20000,"max_frames":4}
+{ "file_path": "recordings/repro.webm", "start_ms": 12000, "end_ms": 20000, "max_frames": 4 }
 ```
 
 ```json
-{"file_path":"recordings/repro-av1.mp4","mode":"analyze","start_ms":12000,"end_ms":20000,"max_frames":4,"question":"Describe the visible steps and error."}
+{
+  "file_path": "recordings/repro-av1.mp4",
+  "mode": "analyze",
+  "start_ms": 12000,
+  "end_ms": 20000,
+  "max_frames": 4,
+  "question": "Describe the visible steps and error."
+}
 ```
 
 #### Data flow and result
@@ -222,19 +277,19 @@ proved with fixtures; codec documentation alone is not local execution evidence.
 
 #### Bounds and capabilities
 
-| Bound | Proposed initial policy |
-|---|---|
-| Input snapshot / source duration | 128 MiB / one hour; refuse larger before decoding. |
-| Formats/codecs | Self-contained formats enabled in the certified FFmpeg build; WebM and AV1 mandatory. |
-| Decoder | 2 worker threads, 512 MiB worker memory, 30-second probe/decode deadline. |
-| Temporary storage | 256 MiB per call; one media job per extension instance. |
-| Inspection / complete call | 60 seconds of source time / 180-second wall deadline. |
-| Frame output | Up to 4 JPEGs, 512 KiB each, both edges ≤1024 pixels, preserving aspect ratio. |
-| Analysis media | Same ≤4 JPEGs/2 MiB decoded file bytes; existing image profile/request byte caps apply. |
-| Analysis work | One backend request, no automatic retries; target 2048 answer tokens, not a universal generation ceiling. |
-| Provider generation | Enforce 2048 tokens only where the exact wire supports that ceiling; subscription uses its qualified backend ceiling. |
-| Analysis context | At most 32000 estimated input tokens, plus the actual output/reasoning reservation described below. |
-| Manifest + answer + labels | At most 32 KiB UTF-8 combined; bounded stream collection, overflow cancels and fails. |
+| Bound                            | Proposed initial policy                                                                                               |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Input snapshot / source duration | 128 MiB / one hour; refuse larger before decoding.                                                                    |
+| Formats/codecs                   | Self-contained formats enabled in the certified FFmpeg build; WebM and AV1 mandatory.                                 |
+| Decoder                          | 2 worker threads, 512 MiB worker memory, 30-second probe/decode deadline.                                             |
+| Temporary storage                | 256 MiB per call; one media job per extension instance.                                                               |
+| Inspection / complete call       | 60 seconds of source time / 180-second wall deadline.                                                                 |
+| Frame output                     | Up to 4 JPEGs, 512 KiB each, both edges ≤1024 pixels, preserving aspect ratio.                                        |
+| Analysis media                   | Same ≤4 JPEGs/2 MiB decoded file bytes; existing image profile/request byte caps apply.                               |
+| Analysis work                    | One backend request, no automatic retries; target 2048 answer tokens, not a universal generation ceiling.             |
+| Provider generation              | Enforce 2048 tokens only where the exact wire supports that ceiling; subscription uses its qualified backend ceiling. |
+| Analysis context                 | At most 32000 estimated input tokens, plus the actual output/reasoning reservation described below.                   |
+| Manifest + answer + labels       | At most 32 KiB UTF-8 combined; bounded stream collection, overflow cancels and fails.                                 |
 
 These are extension policies, not provider maxima or claims of measured performance.
 An adapter must enforce each bound while reading/writing/allocating; checking metadata and
@@ -319,12 +374,12 @@ routes and budgets when enabled. Hosts may override the analysis model with anot
 verified model on that same provider/plan. No model-facing argument selects a host, plan,
 credential or analysis model. No extra provider account is required by the default routes.
 
-| Current selection | Default analysis model on that provider/plan | Qualification needed |
-|---|---|---|
-| DeepSeek API: `deepseek-flash`, `deepseek-v4-pro` | `deepseek-flash` | Add/capture/live-verify Flash image profile on the DeepSeek API. Pro stays text-only. |
-| z.ai API or coding: `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2` | `glm-5.3-flash` | Qualify image input independently on API and coding endpoints with their respective account. |
-| Anthropic API: `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5` | `claude-sonnet-5-5` | Existing exact image profile; verify this tool's sampled-frame request and text replay. |
-| OpenAI API or subscription: `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | `gpt-6-luna` | Existing exact image profiles; independently exercise API/subscription streaming and budgets. |
+| Current selection                                                                                                                          | Default analysis model on that provider/plan | Qualification needed                                                                          |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| DeepSeek API: `deepseek-flash`, `deepseek-v4-pro`                                                                                          | `deepseek-flash`                             | Add/capture/live-verify Flash image profile on the DeepSeek API. Pro stays text-only.         |
+| z.ai API or coding: `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2`                                                                | `glm-5.3-flash`                              | Qualify image input independently on API and coding endpoints with their respective account.  |
+| Anthropic API: `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5` | `claude-sonnet-5-5`                          | Existing exact image profile; verify this tool's sampled-frame request and text replay.       |
+| OpenAI API or subscription: `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`                     | `gpt-6-luna`                                 | Existing exact image profiles; independently exercise API/subscription streaming and budgets. |
 
 This table is the current inventory, not a new model allowlist. Derive acceptance coverage
 from the harness's provider/model/plan catalogue so a new offered model cannot silently
@@ -444,12 +499,12 @@ implemented authority. This adds no core content variant or global schema sideca
       "additionalProperties": false,
       "required": ["file_path"],
       "properties": {
-        "file_path": {"type": "string", "minLength": 1, "maxLength": 4096},
-        "mode": {"enum": ["auto", "frames", "analyze"], "default": "auto"},
-        "start_ms": {"type": "integer", "minimum": 0, "maximum": 3600000, "default": 0},
-        "end_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
-        "max_frames": {"type": "integer", "minimum": 1, "maximum": 4, "default": 4},
-        "question": {"type": "string", "minLength": 1, "maxLength": 4096}
+        "file_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "mode": { "enum": ["auto", "frames", "analyze"], "default": "auto" },
+        "start_ms": { "type": "integer", "minimum": 0, "maximum": 3600000, "default": 0 },
+        "end_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+        "max_frames": { "type": "integer", "minimum": 1, "maximum": 4, "default": 4 },
+        "question": { "type": "string", "minLength": 1, "maxLength": 4096 }
       }
     },
     "VideoFrame": {
@@ -457,51 +512,100 @@ implemented authority. This adds no core content variant or global schema sideca
       "additionalProperties": false,
       "required": ["timestamp_ms", "width", "height", "sha256"],
       "properties": {
-        "timestamp_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},
-        "width": {"type": "integer", "minimum": 1, "maximum": 1024},
-        "height": {"type": "integer", "minimum": 1, "maximum": 1024},
-        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        "timestamp_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
+        "width": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
       }
     },
     "VideoAnalysisProvenance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider", "plan", "model", "endpoint_origin", "protocol", "profile_version", "processing"],
+      "required": [
+        "provider",
+        "plan",
+        "model",
+        "endpoint_origin",
+        "protocol",
+        "profile_version",
+        "processing"
+      ],
       "properties": {
-        "provider": {"type": "string", "minLength": 1, "maxLength": 64},
-        "plan": {"type": "string", "minLength": 1, "maxLength": 64},
-        "model": {"type": "string", "minLength": 1, "maxLength": 256},
-        "endpoint_origin": {"type": "string", "format": "uri", "maxLength": 256},
-        "protocol": {"type": "string", "minLength": 1, "maxLength": 64},
-        "profile_version": {"type": "string", "minLength": 1, "maxLength": 128},
-        "processing": {"type": "string", "minLength": 1, "maxLength": 1024},
-        "usage": {"type": "object", "additionalProperties": false, "properties": {"input_tokens": {"type": "integer", "minimum": 0}, "output_tokens": {"type": "integer", "minimum": 0}, "reasoning_tokens": {"type": "integer", "minimum": 0}}, "minProperties": 1}
+        "provider": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "plan": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "endpoint_origin": { "type": "string", "format": "uri", "maxLength": 256 },
+        "protocol": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "profile_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "processing": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 },
+            "reasoning_tokens": { "type": "integer", "minimum": 0 }
+          },
+          "minProperties": 1
+        }
       }
     },
     "VideoReadManifest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["file_path", "source_sha256", "duration_ms", "start_ms", "end_ms", "mode", "method", "audio", "frames", "warnings", "requested_mode", "container", "video_codec", "video_stream", "decoder_version", "sampler_version"],
+      "required": [
+        "file_path",
+        "source_sha256",
+        "duration_ms",
+        "start_ms",
+        "end_ms",
+        "mode",
+        "method",
+        "audio",
+        "frames",
+        "warnings",
+        "requested_mode",
+        "container",
+        "video_codec",
+        "video_stream",
+        "decoder_version",
+        "sampler_version"
+      ],
       "properties": {
-        "file_path": {"type": "string", "minLength": 1, "maxLength": 4096},
-        "source_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-        "duration_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
-        "start_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},
-        "end_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
-        "mode": {"enum": ["frames", "analyze"]},
-        "method": {"const": "sampled_frames"},
-        "audio": {"const": "omitted"},
-        "frames": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/VideoFrame"}, "minItems": 1},
-        "warnings": {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 1024}},
-        "backend": {"$ref": "#/$defs/VideoAnalysisProvenance"},
-        "requested_mode": {"enum": ["auto", "frames", "analyze"]},
-        "container": {"type": "string", "minLength": 1, "maxLength": 256},
-        "video_codec": {"type": "string", "minLength": 1, "maxLength": 256},
-        "decoder_version": {"type": "string", "minLength": 1, "maxLength": 256},
-        "sampler_version": {"type": "string", "minLength": 1, "maxLength": 256},
-        "video_stream": {"type": "integer", "minimum": 0, "maximum": 1023}
+        "file_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "source_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+        "start_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
+        "end_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+        "mode": { "enum": ["frames", "analyze"] },
+        "method": { "const": "sampled_frames" },
+        "audio": { "const": "omitted" },
+        "frames": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/VideoFrame" },
+          "minItems": 1
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "type": "string", "maxLength": 1024 }
+        },
+        "backend": { "$ref": "#/$defs/VideoAnalysisProvenance" },
+        "requested_mode": { "enum": ["auto", "frames", "analyze"] },
+        "container": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "video_codec": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "decoder_version": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "sampler_version": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "video_stream": { "type": "integer", "minimum": 0, "maximum": 1023 }
       },
-      "allOf": [{"if": {"properties": {"mode": {"const": "frames"}}}, "then": {"not": {"required": ["backend"]}}, "else": {"required": ["backend"]}}]
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "frames" } } },
+          "then": { "not": { "required": ["backend"] } },
+          "else": { "required": ["backend"] }
+        }
+      ]
     }
   }
 }
@@ -533,17 +637,17 @@ new proposed APIs, not schema/wire entities or existing capabilities. The runner
 batch/session context; the host owns capacity and charge state. Default/minimal composition
 must keep working without an admission implementation or dependency on the video crate.
 
-| Existing entry point | Reuse / implication |
-|---|---|
-| `crates/nanus-domain/src/tool.rs` — ToolDefinition, ToolExecutor, ToolRegistry | Existing schema/access/executor seam; explicit registration with duplicate refusal. |
-| `crates/nanus-bundle/src/lib.rs` — build_toolset, ToolRegistryHandle, tools_plugin | Keep stock set intact; host creates one shared registry before runner startup. |
+| Existing entry point                                                                             | Reuse / implication                                                                                                             |
+| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/nanus-domain/src/tool.rs` — ToolDefinition, ToolExecutor, ToolRegistry                   | Existing schema/access/executor seam; explicit registration with duplicate refusal.                                             |
+| `crates/nanus-bundle/src/lib.rs` — build_toolset, ToolRegistryHandle, tools_plugin               | Keep stock set intact; host creates one shared registry before runner startup.                                                  |
 | `crates/nanus-bundle/src/agent_loop.rs` — gate, run_tools, validate_result_images, build_request | Reuse policy/cancellation; add optional generic admission projection/reservation/commit callbacks, without read_video dispatch. |
-| `crates/nanus-ports/src/control.rs` — ToolPolicy, TurnControl | Add separate ToolAdmission contracts; policy stays an exact-call permission decision. |
-| `crates/nanus-adapter-openai/src/responses.rs`; capabilities estimate | Preserve subscription ceiling omission; qualify generation accounting and reserve the actual ceiling in local estimation. |
-| `crates/nanus-bundle/src/tools/read.rs` — read_image_tool | Pattern for typed image results, not a suitable whole-video reader. |
-| `crates/nanus-domain/src/content.rs`; `nanus-ports/src/capabilities.rs` | Reuse media validation/limits and exact-model request estimation. |
-| `crates/nanus-ports/src/fs.rs` — FsPort; `control.rs` — TurnControl | Existing rooting/cancellation concepts; bounded snapshot I/O belongs to host media adapter. |
-| `crates/nanus-domain/src/session.rs`; adapter-store; examples/embedded | Existing v2 persistence and host-provided tools; add installation/replay examples when shipped. |
+| `crates/nanus-ports/src/control.rs` — ToolPolicy, TurnControl                                    | Add separate ToolAdmission contracts; policy stays an exact-call permission decision.                                           |
+| `crates/nanus-adapter-openai/src/responses.rs`; capabilities estimate                            | Preserve subscription ceiling omission; qualify generation accounting and reserve the actual ceiling in local estimation.       |
+| `crates/nanus-bundle/src/tools/read.rs` — read_image_tool                                        | Pattern for typed image results, not a suitable whole-video reader.                                                             |
+| `crates/nanus-domain/src/content.rs`; `nanus-ports/src/capabilities.rs`                          | Reuse media validation/limits and exact-model request estimation.                                                               |
+| `crates/nanus-ports/src/fs.rs` — FsPort; `control.rs` — TurnControl                              | Existing rooting/cancellation concepts; bounded snapshot I/O belongs to host media adapter.                                     |
+| `crates/nanus-domain/src/session.rs`; adapter-store; examples/embedded                           | Existing v2 persistence and host-provided tools; add installation/replay examples when shipped.                                 |
 
 Implementation starts with generic batch admission and endpoint generation-budget policies,
 then the repo-owned crate and FFmpeg/FFprobe probing/sampling, `auto` routing and tools-disabled

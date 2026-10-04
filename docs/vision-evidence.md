@@ -48,7 +48,11 @@ one serialized byte per token after translation. Base64 contributes to bytes, no
 reasoning outside that ceiling. Hosts that include reasoning in output use zero separately;
 Hype Studio should reserve at most 8192 total. The metadata and caller ceiling are checked
 before HTTP. Unknown capabilities never infer image support from an alias, vendor or plan.
-Responses returns `unsupported-image-protocol`; other profile-less combinations refuse pixels.
+Profiles apply only to their exact recorded vendor, model, Responses/Messages wire and endpoint.
+OpenAI Chat and custom gateways remain Unknown and refuse pixels; raw encoding fixtures do not
+promote support. Automatic routing and caller-selected Exact routing query the actual chosen wire.
+The [exact-protocol review](../.specs/changes/2026-10-02-exact_protocol.review.md) records this local
+selection/refusal policy without claiming new live acceptance.
 
 Native Windows and macOS passed both the minimal and explicit-provider downstream
 configurations on implementation revision `890888f8519e988dbd19505d7b63c60e11b9ecfb`.
@@ -108,8 +112,8 @@ bytes, this call may add 4 and up to 2796208 bytes, and a request holds at most 
 and reported the refusal accurately. The same run before the tool declared its envelope let both calls through,
 which is how an edit that silently did not apply was caught.
 
-Not covered by this evidence: z.ai (no model with live image evidence and no stored credential, so no analysis
-route), and native Windows and Linux (see [status](status.md#known-limits)). A later model has no analysis route until it has a profile
+Not covered by this evidence: z.ai (no model with live image evidence and no stored credential, so no
+analysis route), and native Windows and Linux (see [status](status.md#known-limits)). A later model has no analysis route until it has a profile
 and its own live run, exactly as above. Reproduce with `scripts/live-read-video.sh`, which spends credit.
 
 ## DeepSeek, 2026-10-04
@@ -133,10 +137,6 @@ measurement and on the same live protocol the other models passed.
   profile `deepseek-flash-area-v1` reserves `256 + ceil(pixels / 1024)` tokens per image, about twice
   the measured slope, and a unit test fails if a reservation ever falls under a measured cost. It is a
   safety figure, not a billed count, and DeepSeek may change its pricing without notice.
-- **The endpoint agrees.** `GET https://api.deepseek.com/models` on 2026-10-04 lists `deepseek-flash`
-  with `input_modalities: ["text", "image"]` and `deepseek-v4-pro` with `["text"]`, and gives both a
-  context window of 1,048,576 and a maximum output of 393,216, which are the ceilings the adapter
-  records (an image request is refused without known ceilings).
 - **Pro stays refused.** `deepseek-v4-pro` accepted the same request and returned an empty answer
   without describing the picture, so it is Unsupported on evidence rather than assumption
   (`deepseek_v4_pro_is_not_shown_to_read_images`). Other ids, aliases and any other endpoint inherit

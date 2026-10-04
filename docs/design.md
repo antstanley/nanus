@@ -5,13 +5,13 @@ deliberate divergence from it. They are written down because a reader comparing 
 with [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) will otherwise
 assume the differences are mistakes.
 
-Most of them are divergences *toward* a guarantee: something the reference leaves to
+Most of them are divergences _toward_ a guarantee: something the reference leaves to
 convention, `nanus` makes a property of the types.
 
 ### Safe Rust, because the model is writing the code
 
 `unsafe` appears **nowhere** in this repository. Every crate carries
-`#![forbid(unsafe_code)]` *and* the workspace sets the lint — because the manifest lint
+`#![forbid(unsafe_code)]` _and_ the workspace sets the lint — because the manifest lint
 alone does not cover doctests, and a guarantee with an asterisk is not a guarantee.
 
 This matters more than it sounds. A harness asks a language model to produce code that
@@ -47,7 +47,7 @@ truncated after.
 
 `read` · `write` · `edit` · `read_image` · `glob` · `grep` · `bash`
 
-Each one is a mechanism a shell *cannot* provide as well — a bounded read window, an
+Each one is a mechanism a shell _cannot_ provide as well — a bounded read window, an
 exactly-once edit, a unified diff, a capped search that reports when it hit the cap.
 Not one of them is a convenience wrapper around something `sh` already does.
 
@@ -67,12 +67,12 @@ machines do not have and costs a schema in every request.
 Beside them are five more the model is offered: `get_goal` · `create_goal` · `update_goal`
 · `pause_goal` · `abandon_goal`. The rule above is not relaxed for them — no shell command
 can mutate a session's durable objective, so each is a mechanism in the same sense. They
-are *not registered*, and the split is structural rather than stylistic: their effect is a
+are _not registered_, and the split is structural rather than stylistic: their effect is a
 record in the session log, and a tool executor is `'static`, so it cannot borrow the session
 a turn holds. The agent loop runs them itself. The count that is the design is the count of
 tools the registry dispatches; the goal tools are the loop's own and are offered with them,
 and the two lists meet in exactly one place — the runner, which sends the schemas and
-advertises the count. What they may *not* do is clear a goal: removing the objective is the
+advertises the count. What they may _not_ do is clear a goal: removing the objective is the
 person's decision, and `/goal clear` is where it lives.
 
 ### Only three fields of a tool can reach the model
@@ -80,10 +80,30 @@ person's decision, and `/goal clear` is where it lives.
 A tool's `name`, `description`, and `parameters` may be serialised into a request. Its
 executor, timeout, and presenters may not.
 
-This is not a convention, it is a property of the types: the executable half is *not*
+This is not a convention, it is a property of the types: the executable half is _not_
 `Serialize`, so there is no code path by which a filesystem root, a sandbox policy, or a
 session id can be encoded into a request body. The allowlist is carried by the compiler,
 and a test asserts the serialised key set is exactly those three.
+
+A tool's optional `ImageEnvelope` is also local metadata. Admission reserves its
+declared count and per-image raw file bytes; the runner checks every returned image
+in success and failure content before progress completion or session retention.
+Malformed encoding or an exceeded declaration becomes an image-free bounded failure.
+`content::image_file_bytes` shares the globally bounded canonical base64 decoder with
+media validation; it counts file bytes, not pixels, and does not validate media by itself.
+Undeclared results retain ordinary global/profile validation. This promise does not
+reserve full request/token, host audit or separately paid analysis capacity, confer
+source permission, terminate workers or roll back completed effects.
+
+An optional embedding `with_tool_admission` port receives the full unelided pending
+request and its fitted failure base, all calls/denials, exact capabilities and held
+pure estimator before any goal or registered executor. Actual retained durable events
+also reach the host independently of prospective slots and provider fitting. Host-owned reserve/admit/live
+dispatch/raw-and-normalized-result/ordered-commit callbacks retain logical capacity
+across every chunk. Adapter/model/effort changes queue until the last step hold drops.
+Unreserved teardown retires unused local handles; physical workers remain host-owned.
+This unpublished [local contract](../.specs/changes/2026-10-03-tool_batch_admission.md)
+provides no budget policy, skill/plugin discovery or desktop authority by itself.
 
 ### Approval is a three-state axis, fail-closed at the default
 
@@ -107,7 +127,7 @@ refuses to name the state only hides where it was chosen. Nothing about it is si
 status line always says which state is in force, and Shift+Tab opens the dialog that chooses
 between them.
 
-An answer may also be *standing*: the interface's "always allow" records the tool for the
+An answer may also be _standing_: the interface's "always allow" records the tool for the
 session, so the same question is not asked again for the rest of that conversation. The
 record is per session and in memory, so nothing about it is written to the log or outlives
 the agent.
@@ -159,11 +179,11 @@ reach is the same in all three cases, because the interface is always a client. 
 what keeps the modes from becoming three agent implementations that agree until they do
 not: there is one code path that runs a turn for someone to watch.
 
-| Mode | Lifetime | Reach |
-|---|---|---|
-| `run` | one turn | stdout, in the same process |
-| `tui` | the interface's | a socket, for a local task |
-| `service` | until stopped | the same socket, for a process |
+| Mode      | Lifetime        | Reach                          |
+| --------- | --------------- | ------------------------------ |
+| `run`     | one turn        | stdout, in the same process    |
+| `tui`     | the interface's | a socket, for a local task     |
+| `service` | until stopped   | the same socket, for a process |
 
 The service is not a special case of the interface, and the interface is not a special
 case of the one-shot run. They are three answers to "how long", on top of one answer to
@@ -171,7 +191,7 @@ case of the one-shot run. They are three answers to "how long", on top of one an
 
 ### A session belongs to the agent, not to the connection
 
-The first version made a connection *be* a conversation: connect, and you had a session.
+The first version made a connection _be_ a conversation: connect, and you had a session.
 It was pleasant and it made the lifetimes fall out — close the interface, close the agent —
 but it also meant a conversation could not be reached twice. Resuming was reading, and a
 session an agent was still holding was unreachable, because nothing could name it.
@@ -183,7 +203,7 @@ a time per session, a client that attaches mid-turn missing the frames already s
 registry that has to bound itself. The benefit is that a conversation is a thing rather
 than an event, which is what makes naming, resuming, and watching the same feature.
 
-Sessions are also deliberately *not* streamed over the link. A client that wants the
+Sessions are also deliberately _not_ streamed over the link. A client that wants the
 conversation reads it from the store, where it is already durable, rather than receiving a
 second copy that would make the socket a second source of truth. The link carries what
 happened, not what was.
@@ -205,20 +225,21 @@ The socket is a [local link](../docs/tui.md#the-link): one frame per line of JSO
 Unix domain socket, `0600` inside a `0700` directory, or a SID-named local Windows pipe.
 Both carry the same protocol. The Windows default descriptor, and the same-user handshake that
 makes up for a pipe having no private directory, are documented in
-[the transport design](link-transports.md). There is no safe *in-process* channel
+[the transport design](link-transports.md). There is no safe _in-process_ channel
 between two processes — sharing memory across a `fork` needs `mmap` and `unsafe`, and this
 workspace forbids `unsafe` everywhere — so a domain socket is what "in memory" reduces to
 when the two ends are two programs.
+
 ## The two halves, and why they are the mechanism
 
-The kernel provides *spatiotemporal composability*. The two words are worth unpacking,
+The kernel provides _spatiotemporal composability_. The two words are worth unpacking,
 because they name the actual mechanism rather than a mood:
 
-- **Temporal** — every mutation a component makes is recorded *with its inverse*.
+- **Temporal** — every mutation a component makes is recorded _with its inverse_.
   Unloading the component reverts those effects in reverse order, so services withdraw,
   listeners unregister, and consumers deactivate. There is no partial teardown and no
   stale registration. It is tested by asserting the revert order, not by inspection.
-- **Spatial** — a component declares the services it needs (its *coeffects*), and the
+- **Spatial** — a component declares the services it needs (its _coeffects_), and the
   runtime activates it when they appear and deactivates it when they vanish. Load order
   is a dependency, never a boot script. The tool provider and the model adapter can be
   staged in either order.
