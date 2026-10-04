@@ -572,7 +572,7 @@ pub struct ToolDefinition {
 pub struct ImageEnvelope {
     /// The most images one result may carry.
     pub max_images: u32,
-    /// The largest decoded file of any one of them, in bytes.
+    /// Largest raw image-file bytes after base64 decode, enforced on success and failure content.
     pub max_bytes_each: u32,
 }
 

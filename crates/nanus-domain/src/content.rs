@@ -46,13 +46,16 @@ pub struct ImageDimensions {
     pub height: u32,
 }
 
-/// Verifies encoded size, media magic, dimensions and complete decode in that order.
+/// Counts exact image-file bytes after canonical base64 and global file-bound validation.
 ///
-/// The model-neutral bound admits every initial profile. A request must also enforce
-/// its selected profile's tighter edge/patch limits before reaching the provider.
-/// No file or URL is opened. Allocation is capped at 32 MiB, with dimensions inspected
-/// before allocating a pixel buffer; only PNG and JPEG decoders are compiled in.
-pub fn validate_image(media_type: &str, data: &str) -> Result<ImageDimensions, ContentError> {
+/// This is a size check, not media validation: callers still use [`validate_image`] for
+/// magic, dimensions and pixels. It decodes a bounded temporary file buffer, never a pixel
+/// buffer, and performs no I/O. Raw lengths sharing one base64 quantum stay distinct.
+pub fn image_file_bytes(data: &str) -> Result<usize, ContentError> {
+    decode_image_file(data).map(|bytes| bytes.len())
+}
+
+fn decode_image_file(data: &str) -> Result<Vec<u8>, ContentError> {
     if data.is_empty() || data.len() > IMAGE_BASE64_MAX {
         return Err(ContentError::new("empty or oversized base64 image"));
     }
@@ -62,6 +65,19 @@ pub fn validate_image(media_type: &str, data: &str) -> Result<ImageDimensions, C
     if bytes.is_empty() || bytes.len() > IMAGE_BYTES_MAX {
         return Err(ContentError::new("empty or oversized image file"));
     }
+    assert!(!bytes.is_empty());
+    assert!(bytes.len() <= IMAGE_BYTES_MAX);
+    Ok(bytes)
+}
+
+/// Verifies encoded size, media magic, dimensions and complete decode in that order.
+///
+/// The model-neutral bound admits every initial profile. A request must also enforce
+/// its selected profile's tighter edge/patch limits before reaching the provider.
+/// No file or URL is opened. Allocation is capped at 32 MiB, with dimensions inspected
+/// before allocating a pixel buffer; only PNG and JPEG decoders are compiled in.
+pub fn validate_image(media_type: &str, data: &str) -> Result<ImageDimensions, ContentError> {
+    let bytes = decode_image_file(data)?;
     let format =
         image::guess_format(&bytes).map_err(|_| ContentError::new("invalid image magic"))?;
     if !matches!(
@@ -237,6 +253,29 @@ mod tests {
         assert!(validate_image("image/gif", &encode(vec![frame()])).is_ok());
         let error = validate_image("image/gif", &encode(vec![frame(), frame()])).unwrap_err();
         assert!(error.to_string().contains("animated"), "{error}");
+    }
+
+    #[test]
+    fn file_size_uses_canonical_raw_bytes_and_refuses_the_first_over_global_limit() {
+        for count in 1..=3 {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(vec![23; count]);
+            assert_eq!(image_file_bytes(&encoded).unwrap(), count);
+            assert_eq!(encoded.len(), 4);
+        }
+        for data in ["", "%%%", "YQ", "YQ=", "YR==", "a==="] {
+            assert!(image_file_bytes(data).is_err(), "{data}");
+        }
+        let exact = base64::engine::general_purpose::STANDARD.encode(vec![23; IMAGE_BYTES_MAX]);
+        let excess =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![23; IMAGE_BYTES_MAX.saturating_add(1)]);
+        assert_eq!(
+            exact.len(),
+            excess.len(),
+            "same base64 quantum, different raw size"
+        );
+        assert_eq!(image_file_bytes(&exact).unwrap(), IMAGE_BYTES_MAX);
+        assert!(image_file_bytes(&excess).is_err());
     }
 
     #[test]

@@ -2,16 +2,17 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use nanus_ports::LocalBoxFuture;
 
 use crate::VideoError;
 
-/// A local copy of the source, hashed once, that is removed when it is dropped.
+/// A local copy of the source, hashed once, retained through physical decoder completion.
 ///
 /// Probing and decoding both read this exact copy, so the digest in the manifest names the
 /// bytes that were decoded even when the original changes underneath the call.
-#[derive(Debug)]
+/// The host/stock owner cleans up only after the snapshot and all retained workers release it.
 pub struct Snapshot {
     /// Where the copy lives; the file name is fixed so no model text reaches a command line.
     pub path: PathBuf,
@@ -19,8 +20,73 @@ pub struct Snapshot {
     pub sha256: String,
     /// The copied length.
     pub byte_len: u64,
-    /// Owns the directory: dropping the snapshot is the cleanup, on every exit path.
-    pub(crate) _directory: Option<tempfile::TempDir>,
+    /// Opaque host/stock lease; its final release owns cleanup, including physical workers.
+    pub(crate) owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl Snapshot {
+    /// Retains a caller-owned immutable file without reading, copying or decoding it.
+    ///
+    /// The host must verify the file's authority, identity, digest and length before construction.
+    /// `owner` must retain that exact file and perform cleanup only after its final release.
+    /// The absolute path must name a fixed `source` file, never an unchecked model argument.
+    /// This constructor checks receipt shape/size only; it grants no filesystem authority.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a non-absolute/non-fixed path, malformed SHA-256 or over-bound claimed length.
+    /// Refusal releases this owner reference; other physical owners remain responsible for cleanup.
+    pub fn from_owned_file(
+        path: PathBuf,
+        sha256: String,
+        byte_len: u64,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, VideoError> {
+        if !path.is_absolute()
+            || path.file_name() != Some(std::ffi::OsStr::new("source"))
+            || path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+            || sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || byte_len > crate::source::SNAPSHOT_BYTES_MAX
+        {
+            return Err(VideoError::Source(
+                "read_video: invalid owned snapshot receipt".to_owned(),
+            ));
+        }
+        assert!(path.is_absolute());
+        assert!(byte_len <= crate::source::SNAPSHOT_BYTES_MAX);
+        Ok(Self {
+            path,
+            sha256,
+            byte_len,
+            owner,
+        })
+    }
+
+    /// Retains only lifetime ownership for a physical decoder worker, without new source I/O.
+    ///
+    /// A dropped call/future is not physical process completion. Workers retain this lease until
+    /// their process/reader teardown has joined; the host defines the actual cleanup policy.
+    #[must_use]
+    pub fn retain_owner(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        Arc::clone(&self.owner)
+    }
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Snapshot")
+            .field("path", &self.path)
+            .field("sha256", &self.sha256)
+            .field("byte_len", &self.byte_len)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What probing learned about a source.

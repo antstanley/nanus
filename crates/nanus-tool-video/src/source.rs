@@ -1,6 +1,7 @@
 //! The rooted source: a workspace file, copied once under a size ceiling.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use nanus_ports::{FsHandle, LocalBoxFuture};
 use sha2::{Digest as _, Sha256};
@@ -89,7 +90,7 @@ impl VideoSource for FsSource {
                 path: copy,
                 sha256,
                 byte_len,
-                _directory: Some(directory),
+                owner: Arc::new(directory),
             })
         })
     }

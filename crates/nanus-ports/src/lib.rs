@@ -76,6 +76,7 @@ pub mod secret;
 pub mod shell;
 pub mod sse;
 pub mod store;
+pub mod tool_admission;
 pub mod tool_support;
 
 use core::future::Future;
@@ -105,6 +106,9 @@ pub use shell::{
 };
 pub use sse::SseFrames;
 pub use store::{SessionSummary, StoreError, StoreHandle, StorePort, StoreResult};
+pub use tool_admission::{
+    AdmissionError, ToolAdmission, ToolBatchProjection, ToolBatchReservation,
+};
 pub use tool_support::ToolCallSupport;
 
 /// A boxed future that need not be `Send`.

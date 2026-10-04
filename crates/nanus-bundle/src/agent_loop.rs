@@ -35,6 +35,13 @@
 use core::fmt::Write as _;
 use std::rc::Rc;
 
+#[path = "agent_loop/admission.rs"]
+mod admission;
+#[path = "agent_loop/dispatch.rs"]
+mod dispatch;
+#[path = "agent_loop/selection.rs"]
+mod selection;
+
 use nanus_domain::{
     AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ContentBlock, SandboxMode,
     Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId, ToolName,
@@ -317,6 +324,10 @@ pub struct AgentRunner {
     /// text requests keep the provider's own output ceiling, and an image request still has the
     /// explicit output the preflight demands.
     image_reservation: Option<(u32, u32)>,
+    /// Optional caller-owned complete batch admission.
+    admission: Option<Rc<dyn nanus_ports::ToolAdmission>>,
+    /// Stable selection and three bounded pending choices during admitted steps.
+    selection: selection::Selection,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -369,6 +380,8 @@ impl AgentRunner {
             policy: None,
             request_reservation: None,
             image_reservation: None,
+            admission: None,
+            selection: selection::Selection::default(),
         })
     }
 
@@ -376,6 +389,14 @@ impl AgentRunner {
     #[must_use]
     pub fn with_tool_policy(mut self, policy: Rc<dyn ToolPolicy>) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    /// Adds complete host batch admission without changing permissions or stock defaults.
+    /// Model/adapter/effort setters queue while an admitted step is held through commit.
+    #[must_use]
+    pub fn with_tool_admission(mut self, admission: Rc<dyn nanus_ports::ToolAdmission>) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -448,7 +469,9 @@ impl AgentRunner {
             !model.trim().is_empty(),
             "a model id that is being switched to is not empty"
         );
-        model.clone_into(&mut self.model.borrow_mut());
+        if !self.selection.model(model) {
+            model.clone_into(&mut self.model.borrow_mut());
+        }
     }
 
     /// Returns the reasoning effort the next request will carry.
@@ -472,7 +495,9 @@ impl AgentRunner {
     /// [`AgentRunner::set_approval`], the change takes effect on the next request, including the
     /// next step of a turn that is already running.
     pub fn set_effort(&self, effort: Option<nanus_ports::ReasoningEffort>) {
-        self.effort.set(effort);
+        if !self.selection.effort(effort) {
+            self.effort.set(effort);
+        }
     }
 
     /// Returns the effort steps the adapter takes for `model`, in increasing order.
@@ -496,7 +521,9 @@ impl AgentRunner {
     /// effort at all (Anthropic), and a standing choice that outlived the provider it was made
     /// for would be reported as in force where it cannot be honoured.
     pub fn set_llm(&self, llm: LlmHandle) {
-        *self.llm.borrow_mut() = llm;
+        if !self.selection.llm(&llm) {
+            *self.llm.borrow_mut() = llm;
+        }
     }
 
     /// Returns the model adapter in force.
@@ -710,6 +737,7 @@ impl AgentRunner {
         approver: Option<&dyn Approver>,
         control: Option<&dyn TurnControl>,
     ) -> Result<StepOutcome, BundleError> {
+        let _selection_hold = self.hold_selection()?;
         let (turn, step) = position;
         session.append(SessionEvent::StepStart { turn, step });
         let (request, elision) = match self.build_request(session) {
@@ -774,10 +802,26 @@ impl AgentRunner {
                 StepOutcome::FinalAnswer
             }
         } else {
-            if self
-                .run_tools(session, &assembled.calls, progress, approver, control)
+            let interrupted = match self
+                .run_tools(
+                    session,
+                    &assembled.calls,
+                    progress,
+                    dispatch::Phase {
+                        position,
+                        approver,
+                        control,
+                    },
+                )
                 .await
             {
+                Ok(interrupted) => interrupted,
+                Err(error) => {
+                    session.append(SessionEvent::StepEnd { turn, step });
+                    return Err(error);
+                }
+            };
+            if interrupted {
                 StepOutcome::Interrupted
             } else {
                 StepOutcome::ToolCalls {
@@ -957,9 +1001,17 @@ impl AgentRunner {
         session: &mut Session,
         calls: &[ToolCall],
         progress: &mut dyn Progress,
-        approver: Option<&dyn Approver>,
-        control: Option<&dyn TurnControl>,
-    ) -> bool {
+        context: dispatch::Phase<'_>,
+    ) -> Result<bool, BundleError> {
+        let dispatch::Phase {
+            position,
+            approver,
+            control,
+        } = context;
+        let mut unreserved = admission::Unreserved {
+            admission: self.admission.clone(),
+            calls,
+        };
         for call in calls {
             session.append(SessionEvent::ToolCall {
                 call_id: call.id.clone(),
@@ -968,103 +1020,40 @@ impl AgentRunner {
             });
             progress.tool_started(&call.id, &call.name, &call.arguments);
         }
-
-        let mut results: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
-        for (index, call) in calls.iter().enumerate() {
-            let denial = if is_cancelled(progress, control) {
-                Some(interrupted_result(call))
-            } else {
-                self.gate(call, approver, control).await
-            };
-            if let Some(denied) = denial {
-                results[index] = Some(self.finish_result(call, denied, progress));
-            }
-        }
-
-        // Before anything runs: reserve room for the pixels each permitted call may return, in call
-        // order, against what this turn already holds. A call that cannot be admitted is answered
-        // here with a bounded failure and its work never starts.
+        let mut results = self.gate_batch(calls, progress, approver, control).await;
         self.admit_images(session, calls, &mut results, progress);
-        let permitted: Vec<usize> = (0..calls.len())
-            .filter(|index| results[*index].is_none())
-            .collect();
-        // The loop's own tools are run here, before the registry's. A goal change is a record
-        // in the session log, and this function is the one place that holds the session while a
-        // turn runs, so the goal tools are dispatched with it rather than through the registry —
-        // which does not hold them. Running them first means a step that both changes the goal
-        // and reads a file leaves the goal in the log before any result is recorded, so a
-        // resumed session cannot see the second without the first.
-        let (goal_indexes, registry_indexes): (Vec<usize>, Vec<usize>) = permitted
-            .iter()
-            .copied()
-            .partition(|index| crate::goal_tools::is_goal_tool(&calls[*index].name));
-        for index in goal_indexes {
-            let result = if is_cancelled(progress, control) {
-                interrupted_result(&calls[index])
-            } else {
-                self.run_goal_tool(session, &calls[index], progress)
-            };
-            results[index] = Some(self.finish_result(&calls[index], result, progress));
-        }
-
-        for batch in registry_indexes.chunks(self.parallel_limit()) {
-            // `join_all` polls the batch together on this thread, so a call that awaits
-            // leaves the others room to run: cooperative concurrency rather than
-            // parallelism, because the kernel and its futures are deliberately `!Send`.
-            //
-            // The registry is borrowed for the *dispatch* and not for the await that
-            // follows: a `ToolFuture` is `'static` and owns whatever it needs, so holding a
-            // borrow across the batch would only risk meeting the borrow a registration
-            // takes.
-            let running = batch.iter().map(|index| async {
-                let call = &calls[*index];
-                if control.is_some_and(TurnControl::is_cancelled) {
-                    return interrupted_result(call);
-                }
-                let work = self.tools.borrow().execute(call.clone());
-                until_cancelled(control, work)
-                    .await
-                    .unwrap_or_else(|| interrupted_result(call))
-            });
-            let finished = if is_cancelled(progress, control) {
-                batch
-                    .iter()
-                    .map(|index| interrupted_result(&calls[*index]))
-                    .collect()
-            } else {
-                futures::future::join_all(running).await
-            };
-            for (index, result) in batch.iter().zip(finished) {
-                results[*index] = Some(self.finish_result(&calls[*index], result, progress));
+        let reservation = match self.reserve_batch(session, position, calls, &results) {
+            Ok(reservation) => {
+                unreserved.admission = None; // Owned lease now retires handles even on Drop.
+                reservation
             }
+            Err(error) => {
+                self.refuse_unanswered(calls, &mut results, progress);
+                Self::append_results(session, calls, results);
+                return Err(error);
+            }
+        };
+        let lease = reservation.as_deref();
+        self.admit_batch(calls, &mut results, progress, lease);
+        self.execute_permitted(
+            session,
+            calls,
+            &mut results,
+            progress,
+            dispatch::Dispatch {
+                control,
+                reservation: lease,
+            },
+        )
+        .await;
+        Self::append_results(session, calls, results);
+        if let Some(lease) = lease {
+            let (request, _) = self.build_request(session)?;
+            lease
+                .commit(&request)
+                .map_err(|error| BundleError::context(error.to_string()))?;
         }
-
-        // Postcondition: every call was either denied or executed, so the results below
-        // answer every call the model made.
-        assert!(
-            results.iter().all(Option::is_some),
-            "every tool call has a result"
-        );
-        for (call, result) in calls.iter().zip(results) {
-            let Some(result) = result else {
-                continue;
-            };
-            let is_error = !result.outcome.is_success();
-            let content = render_content(result.outcome.content());
-            // The result answers the call it names: the pairing is by id as well as by
-            // position, which is what a replay of the log reads.
-            assert_eq!(
-                call.id, result.call_id,
-                "a result answers the call it names"
-            );
-            session.append(SessionEvent::ToolResult {
-                content_blocks: Some(result.outcome.content().to_vec()),
-                call_id: result.call_id,
-                content,
-                is_error,
-            });
-        }
-        is_cancelled(progress, control)
+        Ok(is_cancelled(progress, control))
     }
 
     /// Admits each permitted call whose tool declares an image envelope, or refuses it.
@@ -1131,25 +1120,19 @@ impl AgentRunner {
         result: ToolResult,
         progress: &mut dyn Progress,
     ) -> ToolResult {
-        let result = self.hold_to_envelope(call, result);
-        let result = self.validate_result_images(bounded_result(result));
-        progress.tool_finished(&call.id, &call.name, !result.outcome.is_success());
-        result
+        self.finish_admitted(call, result, progress, None)
     }
 
-    /// Replaces a result that carries more images than its tool declared.
+    /// Replaces a result exceeding its declared image count or raw file-byte envelope.
     ///
     /// The declaration is what admission reserved against, so a result that exceeds it would
     /// spend room another call was promised.
-    fn hold_to_envelope(&self, call: &ToolCall, result: ToolResult) -> ToolResult {
-        let Some(envelope) = self
+    fn hold_to_envelope(&self, call: &ToolCall, result: &ToolResult) -> Option<ToolResult> {
+        let envelope = self
             .tools
             .borrow()
             .get(&call.name)
-            .and_then(nanus_domain::ToolDefinition::result_images)
-        else {
-            return result;
-        };
+            .and_then(nanus_domain::ToolDefinition::result_images)?;
         let carried = result
             .outcome
             .content()
@@ -1157,15 +1140,32 @@ impl AgentRunner {
             .filter(|block| matches!(block, ContentBlock::Image { .. }))
             .count();
         if carried > usize::try_from(envelope.max_images).unwrap_or(usize::MAX) {
-            return ToolResult::failure(
-                result.call_id,
+            return Some(ToolResult::failure(
+                result.call_id.clone(),
                 format!(
                     "{}: the result carried {carried} images but the tool declared at most {}",
                     call.name, envelope.max_images
                 ),
-            );
+            ));
         }
-        result
+        for block in result.outcome.content() {
+            if let ContentBlock::Image { data_base64, .. } = block {
+                let fits =
+                    nanus_domain::content::image_file_bytes(data_base64).is_ok_and(|bytes| {
+                        usize::try_from(envelope.max_bytes_each).is_ok_and(|limit| bytes <= limit)
+                    });
+                if !fits {
+                    return Some(ToolResult::failure(
+                        result.call_id.clone(),
+                        format!(
+                            "{}: result image is invalid or exceeds the declared {} raw file bytes",
+                            call.name, envelope.max_bytes_each
+                        ),
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Rechecks pixels from custom executors before retaining their result.
@@ -1356,7 +1356,7 @@ fn turn_images(session: &Session) -> (usize, usize) {
 }
 
 /// Bounds the record before retaining model content; a limit failure is model-visible.
-fn bounded_result(result: ToolResult) -> ToolResult {
+fn bounded_result(result: &ToolResult) -> ToolResult {
     let blocks = result.outcome.content();
     if blocks.is_empty() {
         let payload = match &result.outcome {
@@ -1364,7 +1364,7 @@ fn bounded_result(result: ToolResult) -> ToolResult {
             nanus_domain::ToolOutcome::Failure { message, .. } => {
                 if message.len() > nanus_domain::content::RECORD_BYTES_MAX {
                     return ToolResult::failure(
-                        result.call_id,
+                        result.call_id.clone(),
                         "tool failure text exceeds record limit",
                     );
                 }
@@ -1374,10 +1374,10 @@ fn bounded_result(result: ToolResult) -> ToolResult {
         if let Err(error) =
             nanus_domain::content::serialized_size(payload, nanus_domain::content::RECORD_BYTES_MAX)
         {
-            return ToolResult::failure(result.call_id, error.to_string());
+            return ToolResult::failure(result.call_id.clone(), error.to_string());
         }
     } else if let Err(error) = nanus_domain::content::validate_blocks(blocks) {
-        return ToolResult::failure(result.call_id, error.to_string());
+        return ToolResult::failure(result.call_id.clone(), error.to_string());
     }
     let blocks = if blocks.is_empty() {
         vec![ContentBlock::Text(result.render_text())]
@@ -1399,14 +1399,14 @@ fn bounded_result(result: ToolResult) -> ToolResult {
         .map(|_| ())
     });
     if let Err(error) = validation {
-        return ToolResult::failure(result.call_id, error.to_string());
+        return ToolResult::failure(result.call_id.clone(), error.to_string());
     }
     let outcome = if result.is_success() {
         nanus_domain::ToolOutcome::success_with(serde_json::Value::Null, blocks)
     } else {
         nanus_domain::ToolOutcome::failure_with(result.render_text(), blocks)
     };
-    ToolResult::new(result.call_id, outcome)
+    ToolResult::new(result.call_id.clone(), outcome)
 }
 
 /// Checks both cancellation sources at an effect boundary.

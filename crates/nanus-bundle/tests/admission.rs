@@ -96,20 +96,27 @@ fn jpeg() -> String {
 struct Frames {
     images: usize,
     ran: Rc<Cell<u32>>,
+    observation: Option<ToolOutcome>,
 }
 
 impl ToolExecutor for Frames {
     fn execute(&self, call: ToolCall) -> ToolFuture {
         self.ran.set(self.ran.get().saturating_add(1));
-        let blocks: Vec<ContentBlock> = (0..self.images)
-            .map(|_| ContentBlock::Image {
-                media_type: "image/jpeg".into(),
-                data_base64: jpeg(),
-            })
-            .collect();
-        Box::pin(
-            async move { ToolResult::new(call.id, ToolOutcome::success_with(json!({}), blocks)) },
-        )
+        let outcome = self
+            .observation
+            .as_ref()
+            .filter(|_| call.id.as_str() == "call-0")
+            .cloned()
+            .unwrap_or_else(|| {
+                let blocks: Vec<ContentBlock> = (0..self.images)
+                    .map(|_| ContentBlock::Image {
+                        media_type: "image/jpeg".into(),
+                        data_base64: jpeg(),
+                    })
+                    .collect();
+                ToolOutcome::success_with(json!({}), blocks)
+            });
+        Box::pin(async move { ToolResult::new(call.id, outcome) })
     }
 }
 
@@ -120,6 +127,16 @@ fn runner(
     profile: bool,
     declared: Option<(u32, u32)>,
     actual: usize,
+) -> (AgentRunner, Rc<Cell<u32>>) {
+    runner_outcome(script, profile, declared, actual, None)
+}
+
+fn runner_outcome(
+    script: Vec<Vec<LlmEvent>>,
+    profile: bool,
+    declared: Option<(u32, u32)>,
+    actual: usize,
+    observation: Option<ToolOutcome>,
 ) -> (AgentRunner, Rc<Cell<u32>>) {
     let ran = Rc::new(Cell::new(0));
     let schema = ToolSchema {
@@ -132,6 +149,7 @@ fn runner(
         Frames {
             images: actual,
             ran: Rc::clone(&ran),
+            observation,
         },
     )
     .with_access(nanus_domain::ToolAccess::Read);
@@ -277,3 +295,228 @@ async fn a_model_without_a_profile_is_not_admitted_against() {
         .unwrap();
     assert_eq!(ran.get(), 3, "all three run: none of them returns pixels");
 }
+
+/// Canonical JPEG payloads exercise all padding lengths and equality vs the next raw byte.
+#[tokio::test]
+async fn each_image_honors_exact_file_bytes_even_within_one_base64_quantum() {
+    let base = base64::engine::general_purpose::STANDARD
+        .decode(jpeg())
+        .unwrap();
+    let mut padding = std::collections::BTreeSet::new();
+    for extra in 0..3 {
+        let mut bytes = base.clone();
+        bytes.extend(vec![0; extra]);
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        nanus_domain::content::validate_image("image/jpeg", &data).unwrap();
+        padding.insert(data.bytes().rev().take_while(|byte| *byte == b'=').count());
+        let length = u32::try_from(bytes.len()).unwrap();
+        for (limit, expected_error) in [(length, false), (length.saturating_sub(1), true)] {
+            let block = ContentBlock::Image {
+                media_type: "image/jpeg".into(),
+                data_base64: data.clone(),
+            };
+            let outcome = ToolOutcome::success_with(json!({}), vec![block]);
+            let (runner, ran) = runner_outcome(
+                vec![calls(1), answer()],
+                true,
+                Some((1, limit)),
+                0,
+                Some(outcome),
+            );
+            let mut session = session();
+            runner
+                .run_turn(&mut session, "inspect", &mut Silent, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                ran.get(),
+                1,
+                "outcome validation does not undo executor effects"
+            );
+            let result = results(&session);
+            assert_eq!(result[0].0, "call-0");
+            assert_eq!(result[0].1, expected_error);
+            if expected_error {
+                assert!(result[0].2.contains("raw file bytes"));
+                assert_no_images(&session);
+            }
+        }
+    }
+    assert_eq!(padding, [0, 1, 2].into_iter().collect());
+}
+
+fn assert_no_images(session: &Session) {
+    for event in session.log().events() {
+        if let SessionEvent::ToolResult {
+            content_blocks: Some(blocks),
+            ..
+        } = event
+        {
+            assert!(
+                blocks
+                    .iter()
+                    .all(|block| !matches!(block, ContentBlock::Image { .. }))
+            );
+        }
+    }
+}
+
+/// Failure pixels must also honor admission; malformed encoding and zero-byte envelopes refuse.
+#[tokio::test]
+async fn failure_images_invalid_encoding_and_zero_envelopes_cannot_retain_pixels() {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(jpeg())
+        .unwrap();
+    let length = u32::try_from(raw.len()).unwrap();
+    for (count, limit, mime, data) in [
+        (1, length.saturating_sub(1), "image/jpeg", jpeg()),
+        (1, 0, "image/jpeg", jpeg()),
+        (0, length, "image/jpeg", jpeg()),
+        (1, length, "image/jpeg", "%%%".into()),
+        (1, length, "image/jpeg", "AAAA".into()),
+        (1, length, "image/png", jpeg()),
+    ] {
+        let outcome = ToolOutcome::failure_with(
+            "fictional failure".into(),
+            vec![
+                ContentBlock::Text("untrusted observation".into()),
+                ContentBlock::Image {
+                    media_type: mime.into(),
+                    data_base64: data,
+                },
+            ],
+        );
+        let (runner, ran) = runner_outcome(
+            vec![calls(1), answer()],
+            true,
+            Some((count, limit)),
+            0,
+            Some(outcome),
+        );
+        let mut session = session();
+        runner
+            .run_turn(&mut session, "inspect", &mut Silent, None)
+            .await
+            .unwrap();
+        assert_eq!(ran.get(), 1);
+        let result = results(&session);
+        assert_eq!(result[0].0, "call-0");
+        assert!(result[0].1 && result[0].2.len() < 1024);
+        assert_no_images(&session);
+    }
+}
+
+/// Declared and undeclared text-only results remain ordinary observations with no image charge.
+#[tokio::test]
+async fn text_observations_and_valid_failure_pixels_preserve_their_independent_status() {
+    let length = u32::try_from(
+        base64::engine::general_purpose::STANDARD
+            .decode(jpeg())
+            .unwrap()
+            .len(),
+    )
+    .unwrap();
+    let pixel = ContentBlock::Image {
+        media_type: "image/jpeg".into(),
+        data_base64: jpeg(),
+    };
+    for (declared, outcome, expected_error) in [
+        (
+            Some((0, 0)),
+            ToolOutcome::success_with(json!({}), vec![ContentBlock::Text("observed".into())]),
+            false,
+        ),
+        (
+            Some((1, length)),
+            ToolOutcome::failure_with("failure".into(), vec![pixel.clone()]),
+            true,
+        ),
+        (
+            None,
+            ToolOutcome::success_with(json!({}), vec![pixel]),
+            false,
+        ),
+    ] {
+        let (runner, ran) =
+            runner_outcome(vec![calls(1), answer()], true, declared, 0, Some(outcome));
+        let mut session = session();
+        runner
+            .run_turn(&mut session, "inspect", &mut Silent, None)
+            .await
+            .unwrap();
+        assert_eq!(ran.get(), 1);
+        assert_eq!(results(&session)[0].1, expected_error);
+        if declared == Some((0, 0)) {
+            assert_no_images(&session);
+        } else {
+            assert!(session.log().events().iter().any(|event| matches!(event,
+                SessionEvent::ToolResult { content_blocks: Some(blocks), .. }
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Image { .. }))
+            )));
+        }
+    }
+}
+
+/// Every image is bounded; invalid first-call pixels do not disturb an admitted valid neighbor.
+#[tokio::test]
+async fn an_oversized_second_image_is_refused_without_spending_the_next_calls_pixels() {
+    let mut bytes = base64::engine::general_purpose::STANDARD
+        .decode(jpeg())
+        .unwrap();
+    let limit = u32::try_from(bytes.len()).unwrap();
+    bytes.push(0);
+    let excess = base64::engine::general_purpose::STANDARD.encode(bytes);
+    nanus_domain::content::validate_image("image/jpeg", &excess).unwrap();
+    let outcome = ToolOutcome::success_with(
+        json!({}),
+        vec![
+            ContentBlock::Image {
+                media_type: "image/jpeg".into(),
+                data_base64: jpeg(),
+            },
+            ContentBlock::Image {
+                media_type: "image/jpeg".into(),
+                data_base64: excess,
+            },
+        ],
+    );
+    let (runner, ran) = runner_outcome(
+        vec![calls(2), answer()],
+        true,
+        Some((2, limit)),
+        1,
+        Some(outcome),
+    );
+    let mut session = session();
+    runner
+        .run_turn(&mut session, "inspect", &mut Silent, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ran.get(),
+        2,
+        "both calls were admitted and physically executed"
+    );
+    let recorded = results(&session);
+    assert_eq!(
+        recorded.iter().map(|result| result.1).collect::<Vec<_>>(),
+        [true, false]
+    );
+    for event in session.log().events() {
+        if let SessionEvent::ToolResult {
+            call_id,
+            content_blocks: Some(blocks),
+            ..
+        } = event
+        {
+            let images = blocks
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::Image { .. }))
+                .count();
+            assert_eq!(images, usize::from(call_id.as_str() == "call-1"));
+        }
+    }
+}
+
+#[path = "admission/host.rs"]
+mod host;
