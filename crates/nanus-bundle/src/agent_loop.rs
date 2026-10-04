@@ -39,15 +39,21 @@ use std::rc::Rc;
 mod admission;
 #[path = "agent_loop/dispatch.rs"]
 mod dispatch;
+#[path = "agent_loop/records.rs"]
+mod records;
 #[path = "agent_loop/selection.rs"]
 mod selection;
+#[path = "agent_loop/stream.rs"]
+mod stream;
 
 use nanus_domain::{
     AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ContentBlock, SandboxMode,
     Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId, ToolName,
     ToolResult, TurnEndReason, TurnMachine, Usage,
 };
-use nanus_ports::{ChatRequest, ClockHandle, FinishReason, LlmEvent, LlmHandle};
+#[cfg(test)]
+use nanus_ports::LlmEvent;
+use nanus_ports::{ChatRequest, ClockHandle, FinishReason, LlmHandle};
 
 use nanus_ports::control::until_cancelled;
 use nanus_ports::{ToolPolicy, ToolPolicyDecision, TurnControl};
@@ -326,6 +332,8 @@ pub struct AgentRunner {
     image_reservation: Option<(u32, u32)>,
     /// Optional caller-owned complete batch admission.
     admission: Option<Rc<dyn nanus_ports::ToolAdmission>>,
+    /// Optional caller-owned admission before user/model record append.
+    records: Option<Rc<dyn nanus_ports::RecordAdmission>>,
     /// Stable selection and three bounded pending choices during admitted steps.
     selection: selection::Selection,
 }
@@ -381,6 +389,7 @@ impl AgentRunner {
             request_reservation: None,
             image_reservation: None,
             admission: None,
+            records: None,
             selection: selection::Selection::default(),
         })
     }
@@ -397,6 +406,17 @@ impl AgentRunner {
     #[must_use]
     pub fn with_tool_admission(mut self, admission: Rc<dyn nanus_ports::ToolAdmission>) -> Self {
         self.admission = Some(admission);
+        self
+    }
+
+    /// Adds original-record admission before user/model append and provider contact.
+    /// Owned reservations retain logical capacity independently of physical worker teardown.
+    #[must_use]
+    pub fn with_record_admission(
+        mut self,
+        admission: Rc<dyn nanus_ports::RecordAdmission>,
+    ) -> Self {
+        self.records = Some(admission);
         self
     }
 
@@ -645,36 +665,72 @@ impl AgentRunner {
         let machine = TurnMachine::new(self.config.clone())
             .map_err(|error| BundleError::Config(error.to_string()))?;
         let turn = session.log().current_turn().saturating_add(1);
+        let reservation = self.reserve_turn_records(session, turn, message, progress, control)?;
         session.append(SessionEvent::TurnStart { turn });
         session.append(SessionEvent::UserMessage {
             text: message.to_owned(),
         });
+        let steps = self
+            .drive_turn(
+                session,
+                &machine,
+                progress,
+                dispatch::Phase {
+                    position: (turn, 0),
+                    approver,
+                    control,
+                },
+                reservation.as_deref(),
+            )
+            .await?;
+        assert!(
+            session.log().last_turn_end().is_some(),
+            "a finished run has a turn end"
+        );
+        Ok(RunOutcome {
+            session_id: session.id().clone(),
+            answer: last_assistant_text(session),
+            reason: session
+                .log()
+                .last_turn_end()
+                .cloned()
+                .unwrap_or(TurnEndReason::Blocked),
+            steps,
+            usage: session.usage_totals(),
+        })
+    }
 
-        let mut answer = String::new();
+    async fn drive_turn(
+        &self,
+        session: &mut Session,
+        machine: &TurnMachine,
+        progress: &mut dyn Progress,
+        context: dispatch::Phase<'_>,
+        reservation: Option<&dyn nanus_ports::TurnRecordReservation>,
+    ) -> Result<u32, BundleError> {
+        let turn = context.position.0;
         let mut steps = 0_u32;
         loop {
-            // A stop asked for between steps is taken here, before another request is
-            // issued. The machine owns the mapping from a step outcome to a recorded
-            // reason, so this goes through it rather than writing the reason into the log
-            // directly — one vocabulary for why a turn ended, wherever that happens.
-            let step_outcome = if is_cancelled(progress, control) {
+            let step_outcome = if is_cancelled(progress, context.control) {
                 StepOutcome::Interrupted
             } else {
-                let step = steps.saturating_add(1);
-                steps = step;
-                progress.step_started(step);
+                steps = steps.saturating_add(1);
+                progress.step_started(steps);
                 match self
-                    .run_step(session, (turn, step), progress, approver, control)
+                    .run_step(
+                        session,
+                        progress,
+                        dispatch::Phase {
+                            position: (turn, steps),
+                            approver: context.approver,
+                            control: context.control,
+                        },
+                        reservation,
+                    )
                     .await
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        // A step that failed still has to close its turn. Returning here
-                        // without one left a log ending at `step_start` — no `step_end`, no
-                        // `turn_end` — which is the one state the domain says a resumed
-                        // session must never be handed, and which the closing postcondition
-                        // below never got to check. The reason goes through the machine, as
-                        // every other reason does.
                         let reason = machine
                             .decide(
                                 session.log(),
@@ -684,7 +740,7 @@ impl AgentRunner {
                             )
                             .turn_end_reason();
                         if let Some(reason) = reason {
-                            session.append(SessionEvent::TurnEnd { turn, reason });
+                            Self::end_turn_records(session, turn, reason, reservation)?;
                         }
                         assert!(
                             session.log().last_turn_end().is_some(),
@@ -694,143 +750,80 @@ impl AgentRunner {
                     }
                 }
             };
-            let decision = machine.decide(session.log(), &step_outcome);
-            // The machine owns the mapping from a decision to a recorded reason, so
-            // the two vocabularies cannot drift.
-            let Some(reason) = decision.turn_end_reason() else {
+            let Some(reason) = machine
+                .decide(session.log(), &step_outcome)
+                .turn_end_reason()
+            else {
                 continue;
             };
-            session.append(SessionEvent::TurnEnd { turn, reason });
-            break;
+            Self::end_turn_records(session, turn, reason, reservation)?;
+            return Ok(steps);
         }
-
-        // The answer is the last assistant message that carried text: a turn that
-        // ended on a tool call has no final prose, and reporting the previous step's
-        // text would misrepresent what the model concluded.
-        answer.push_str(&last_assistant_text(session));
-        let outcome = RunOutcome {
-            session_id: session.id().clone(),
-            answer,
-            reason: session
-                .log()
-                .last_turn_end()
-                .cloned()
-                .unwrap_or(TurnEndReason::Blocked),
-            steps,
-            usage: session.usage_totals(),
-        };
-        // Postcondition: the turn is closed in the log, so a resumed session does not
-        // find an open turn.
-        assert!(
-            session.log().last_turn_end().is_some(),
-            "a finished run has a turn end"
-        );
-        Ok(outcome)
     }
 
-    /// Runs one step: one request, then its tools.
+    /// The selection and step reservation remain held through the actual closing record.
     async fn run_step(
         &self,
         session: &mut Session,
-        position: (u32, u32),
         progress: &mut dyn Progress,
-        approver: Option<&dyn Approver>,
-        control: Option<&dyn TurnControl>,
+        context: dispatch::Phase<'_>,
+        turn_reservation: Option<&dyn nanus_ports::TurnRecordReservation>,
     ) -> Result<StepOutcome, BundleError> {
         let _selection_hold = self.hold_selection()?;
-        let (turn, step) = position;
-        session.append(SessionEvent::StepStart { turn, step });
-        let (request, elision) = match self.build_request(session) {
-            Ok(built) => built,
-            Err(error) => {
-                session.append(SessionEvent::StepEnd { turn, step });
-                return Err(error);
-            }
-        };
+        let position = context.position;
+        let (request, elision, reservation) =
+            self.begin_step_records(session, position, turn_reservation)?;
         if let Some(elision) = &elision {
             progress.elided(elision);
         }
-        if let Err(error) = nanus_ports::capabilities::validate_image_input(
+        let result = self
+            .perform_step(session, request, progress, context, reservation.as_deref())
+            .await;
+        Self::end_step_records(session, position, reservation.as_deref())?;
+        result
+    }
+
+    async fn perform_step(
+        &self,
+        session: &mut Session,
+        request: ChatRequest,
+        progress: &mut dyn Progress,
+        context: dispatch::Phase<'_>,
+        reservation: Option<&dyn nanus_ports::StepRecordReservation>,
+    ) -> Result<StepOutcome, BundleError> {
+        nanus_ports::capabilities::validate_image_input(
             self.llm.borrow().capabilities(&request.model),
             &request,
-        ) {
-            session.append(SessionEvent::StepEnd { turn, step });
-            return Err(BundleError::Model(error.to_string()));
+        )
+        .map_err(|error| BundleError::Model(error.to_string()))?;
+        if reservation.is_some() && is_cancelled(progress, context.control) {
+            return Ok(StepOutcome::Interrupted);
         }
         let mut stream = self.llm.borrow().stream_chat(request);
-        let assembled = match self.consume_stream(&mut stream, progress, control).await {
-            Ok(assembled) => assembled,
-            Err(error) => {
-                // The step ends before the turn does: a log with a step that never finished
-                // is one a reader has to guess about, and the turn above is closed by
-                // `run_turn` whatever happened here.
-                session.append(SessionEvent::StepEnd { turn, step });
-                return Err(error);
-            }
-        };
-
-        // The assistant message is appended before its tools run, so a crash between
-        // the two leaves a record of what was asked for rather than a silently
-        // dropped step.
-        session.append(SessionEvent::AssistantMessage {
-            replay: assembled.replay.clone(),
-            // An empty string is recorded as `None`, which is what the wire shape
-            // needs: the adapter sends `""` rather than null, and a transcript that
-            // said "some text" for an empty turn would misdescribe it.
-            text: non_empty(&assembled.text),
-            reasoning: non_empty(&assembled.reasoning),
-            tool_calls: assembled.calls.clone(),
-            usage: assembled.usage,
-            interrupted: assembled.interrupted,
-            // What produced this message, recorded beside what it cost. The model is the
-            // one the request named; the effort comes from the adapter, which is the
-            // component that fills in an unset effort and so the only one that knows what
-            // was actually asked for.
-            model: Some(self.model()),
-            effort: self.effort().map(|effort| effort.as_str().to_owned()),
-        });
-
-        // An interrupted step is *interrupted*, not a step that called tools: what the
-        // model was part way through asking for was never run, and running it would do
-        // work the reader has just asked to stop.
-        let step_outcome = if assembled.interrupted {
-            StepOutcome::Interrupted
-        } else if assembled.calls.is_empty() {
-            if assembled.finish == FinishReason::Length {
+        let assembled = self
+            .consume_stream(&mut stream, progress, context.control)
+            .await?;
+        drop(stream); // Release the model response before host validation or native dispatch.
+        let interrupted = assembled.interrupted;
+        let max_tokens = assembled.finish == FinishReason::Length;
+        let calls = self.append_model_records(session, context.position, assembled, reservation)?;
+        if interrupted {
+            return Ok(StepOutcome::Interrupted);
+        }
+        if calls.is_empty() {
+            return Ok(if max_tokens {
                 StepOutcome::MaxTokens
             } else {
                 StepOutcome::FinalAnswer
-            }
+            });
+        }
+        if self.run_tools(session, &calls, progress, context).await? {
+            Ok(StepOutcome::Interrupted)
         } else {
-            let interrupted = match self
-                .run_tools(
-                    session,
-                    &assembled.calls,
-                    progress,
-                    dispatch::Phase {
-                        position,
-                        approver,
-                        control,
-                    },
-                )
-                .await
-            {
-                Ok(interrupted) => interrupted,
-                Err(error) => {
-                    session.append(SessionEvent::StepEnd { turn, step });
-                    return Err(error);
-                }
-            };
-            if interrupted {
-                StepOutcome::Interrupted
-            } else {
-                StepOutcome::ToolCalls {
-                    count: u32::try_from(assembled.calls.len()).unwrap_or(u32::MAX),
-                }
-            }
-        };
-        session.append(SessionEvent::StepEnd { turn, step });
-        Ok(step_outcome)
+            Ok(StepOutcome::ToolCalls {
+                count: u32::try_from(calls.len()).unwrap_or(u32::MAX),
+            })
+        }
     }
 
     /// Assembles the request the model sees, fitted to the prompt budget.
@@ -898,90 +891,6 @@ impl AgentRunner {
             .map_err(|error| BundleError::context(error.to_string()))?;
         request.messages = fitted.messages;
         Ok((request, fitted.elision))
-    }
-
-    /// Consumes a model stream into an assembled assistant turn.
-    async fn consume_stream(
-        &self,
-        stream: &mut nanus_ports::LlmStream,
-        progress: &mut dyn Progress,
-        control: Option<&dyn TurnControl>,
-    ) -> Result<Assembled, BundleError> {
-        use futures::StreamExt as _;
-
-        let mut assembled = Assembled::default();
-        loop {
-            let next = until_cancelled(control, stream.next()).await;
-            let Some(next) = next else {
-                assembled.interrupt();
-                break;
-            };
-            let Some(event) = next else { break };
-            // A stop asked for while the model is streaming is taken at the next token
-            // rather than at the end of the response: waiting out a long answer to a
-            // question nobody wants answered any more is the whole thing the reader is
-            // trying to avoid. What the model has already said is kept and marked
-            // interrupted, because a conversation that forgets words the reader watched
-            // arrive is worse than one that keeps them — but the tool calls it was part way
-            // through naming are *dropped*: a call in the log with no result to answer it
-            // would be replayed as one that ran, and the next request would be refused for
-            // a call nothing ever answered.
-            if is_cancelled(progress, control) {
-                assembled.interrupt();
-                break;
-            }
-            match event {
-                LlmEvent::TextDelta(delta) => {
-                    progress.text(&delta);
-                    assembled.text.push_str(&delta);
-                }
-                LlmEvent::ReasoningDelta(delta) => {
-                    progress.reasoning(&delta);
-                    assembled.reasoning.push_str(&delta);
-                }
-                LlmEvent::ToolCallDelta {
-                    id,
-                    name,
-                    arguments_delta,
-                    ..
-                } => {
-                    progress.tool_call(&arguments_delta);
-                    assembled.absorb(id, name, &arguments_delta);
-                }
-                LlmEvent::AssistantReplay(replay) => {
-                    replay
-                        .validate()
-                        .map_err(|error| BundleError::Model(error.to_string()))?;
-                    assembled.replay = Some(replay);
-                }
-                LlmEvent::ResponseHead => progress.response_head(),
-                LlmEvent::Usage(usage) => {
-                    progress.usage(&usage);
-                    assembled.usage = Some(usage);
-                }
-                LlmEvent::Finished { reason } => assembled.finish = reason,
-                LlmEvent::Error(message) => {
-                    // The failure is recorded as a turn-level error so the session
-                    // explains why it stopped, rather than appearing truncated.
-                    return Err(BundleError::Model(message));
-                }
-            }
-        }
-        // Asked once more now the stream has ended, which is the last moment before this step's
-        // tool calls would run. A stop that arrives during the *closing* await — the end of the
-        // response body, after the last event — is not seen by the check inside the loop,
-        // because there is no next event to see it at, and running a command the reader has
-        // just asked to stop is the one thing stopping is for.
-        if is_cancelled(progress, control) {
-            assembled.interrupt();
-        }
-        assembled.settle();
-        if let Some(replay) = &assembled.replay {
-            replay
-                .validate_response(Some(&assembled.text), &assembled.calls)
-                .map_err(|error| BundleError::Model(error.to_string()))?;
-        }
-        Ok(assembled)
     }
 
     /// Runs every tool call in one step.
@@ -1470,25 +1379,14 @@ pub fn render_content(blocks: &[ContentBlock]) -> String {
     rendered
 }
 
-/// Returns `Some` for non-empty text.
-///
-/// A provider that streams nothing has produced no text, and recording an empty
-/// string would make the surface fold treat the turn as content-bearing.
-fn non_empty(text: &str) -> Option<String> {
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_owned())
-    }
-}
-
-/// Returns the text of the last assistant message that carried any.
+/// Returns the last nonempty assistant text from the current turn only.
 fn last_assistant_text(session: &Session) -> String {
     session
         .log()
         .events()
         .iter()
         .rev()
+        .take_while(|event| !matches!(event, SessionEvent::TurnStart { .. }))
         .find_map(|event| match event {
             SessionEvent::AssistantMessage {
                 text: Some(text), ..

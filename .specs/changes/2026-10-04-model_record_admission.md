@@ -200,3 +200,20 @@ No publication or Hype dependency adoption occurred. Hype's original authority/l
 consumer and live/native platform acceptance remain unbuilt. The prepared publication
 bookmark remains at `4d24df7d`; its pending approval does not authorize publishing this
 new candidate. No paid model, OS secret store or personal Chrome was used.
+
+## Reconciled record and Responses candidate — 5 October 2026
+
+A new isolated child of `dc9cb6104e5aea9c2544b9d164af4d6b1e2e9a4e` selectively reconciles
+this port with current public-ee1 source-history fitting, explicit Responses transport and
+prospective final-result estimation. It preserves the owner checkout, older record candidate
+and sealed Responses parent. The [combined patch certificate](2026-10-05-record_responses_reconciliation.review.md)
+resolves the actual functions and records two reproduced fixes: canceled turns cannot return
+old-turn answers, and opt-in host counting precedes runner-side Responses replay parsing.
+
+Fourteen scoped gates pass with 249 frozen inputs unchanged: affected tests 539, minimal
+runner 183, all-feature admission/embedding 53, embedded default/providers 29/35, runtime-
+free TUI 342, two minimal doctests, formatting, warning-denying Clippy and Windows-target
+minimal-library Clippy. Five actual Hype capacity-consumer tests also pass separately.
+Counts overlap; no native Windows, credential-aware stock, paid/live API or complete Hype
+production authority is inferred. The local evidence directory is `/private/tmp/hype-record-responses`.
+This owner's proposal remains Proposed pending publication and actual production adoption.

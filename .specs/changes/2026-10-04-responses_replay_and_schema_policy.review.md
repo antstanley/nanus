@@ -368,3 +368,12 @@ cases cover four actual socket/runner paths, two estimator/config and two projec
 Publication/adoption, host record/batch authority, native Windows execution and exact-model live
 acceptance remain open. Credential-aware stock composition was not run. This certificate grants
 no ciphertext authentication and no Hype production readiness or full migration completion.
+
+## Original-record reconciliation — 5 October 2026
+
+The [combined certificate](2026-10-05-record_responses_reconciliation.review.md) covers a new
+isolated child of sealed `dc9cb610`, retaining current Responses source/receipt/transport
+definitions while adding original-record admission. Actual stock and hosted HTTP/runner/
+reload/fitting fixtures pass. It fixes cross-turn cancellation answers and defers runner-side
+Responses argument parsing until after host record admission. Neither the sealed parent nor
+production Hype pins are rewritten. Publication/adoption and original acceptance remain open.

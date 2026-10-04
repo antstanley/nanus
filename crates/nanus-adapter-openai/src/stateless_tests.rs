@@ -9,6 +9,9 @@ use nanus_domain::{
 use nanus_ports::{ClockPort, ToolAdmission, ToolBatchProjection, ToolBatchReservation};
 use serde_json::{Value, json};
 use std::cell::Cell;
+
+#[path = "stateless_tests/records.rs"]
+mod records;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
@@ -227,15 +230,21 @@ fn runner(model: FixtureModel, executed: Rc<Cell<usize>>, budget: u32) -> AgentR
 struct Admit {
     adapter: Rc<OpenAiLlm>,
     count: Rc<Cell<usize>>,
+    trace: Option<records::Trace>,
 }
 struct Lease {
     adapter: Rc<OpenAiLlm>,
+    trace: Option<records::Trace>,
 }
 impl ToolAdmission for Admit {
     fn reserve(
         &self,
         p: &ToolBatchProjection<'_>,
     ) -> Result<Box<dyn ToolBatchReservation>, nanus_ports::AdmissionError> {
+        if let Some(trace) = &self.trace {
+            assert_eq!(trace.borrow().last(), Some(&"model"));
+            trace.borrow_mut().push("batch");
+        }
         let mut candidate = p.request.clone();
         for message in candidate.messages.iter_mut().rev().take(p.calls.len()) {
             if let Message::Tool {
@@ -259,6 +268,7 @@ impl ToolAdmission for Admit {
         self.count.set(self.count.get().checked_add(1).unwrap());
         Ok(Box::new(Lease {
             adapter: Rc::clone(&self.adapter),
+            trace: self.trace.clone(),
         }))
     }
 }
@@ -279,7 +289,19 @@ impl ToolBatchReservation for Lease {
     }
     fn commit(&self, request: &ChatRequest) -> Result<(), nanus_ports::AdmissionError> {
         assert!(self.adapter.prepare_responses(request).is_ok());
+        if let Some(trace) = &self.trace {
+            assert_eq!(trace.borrow().last(), Some(&"batch"));
+            trace.borrow_mut().push("commit");
+        }
         Ok(())
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push("drop-batch");
+        }
     }
 }
 
@@ -308,10 +330,20 @@ fn assert_wire_requests(requests: &[Value]) {
 
 #[tokio::test]
 async fn actual_admission_transport_runner_and_reload_keep_original_items_and_fit_complete_turns() {
+    actual_admission_transport(false).await;
+}
+
+#[tokio::test]
+async fn original_record_and_batch_leases_cover_actual_transport_reload_and_whole_turn_fitting() {
+    actual_admission_transport(true).await;
+}
+
+async fn actual_admission_transport(record_admission: bool) {
     let (endpoint, worker) = server(vec![frames(&original_items()), answer(), answer()]);
     let adapter = Rc::new(adapter());
     let executed = Rc::new(Cell::new(0));
     let admitted = Rc::new(Cell::new(0));
+    let trace = records::Trace::default();
     let model = FixtureModel {
         adapter: Rc::clone(&adapter),
         endpoint: endpoint.clone(),
@@ -319,7 +351,9 @@ async fn actual_admission_transport_runner_and_reload_keep_original_items_and_fi
     let first = runner(model, Rc::clone(&executed), 64_000).with_tool_admission(Rc::new(Admit {
         adapter: Rc::clone(&adapter),
         count: Rc::clone(&admitted),
+        trace: record_admission.then(|| trace.clone()),
     }));
+    let first = records::install(first, &trace, record_admission, false);
     let mut session = Session::new(SessionId::new("fictional-http"), 123, "/fictional");
     let result = tokio::time::timeout(
         Duration::from_secs(5),
@@ -340,6 +374,7 @@ async fn actual_admission_transport_runner_and_reload_keep_original_items_and_fi
         Rc::clone(&executed),
         16_384,
     );
+    let second = records::install(second, &trace, record_admission, false);
     assert!(
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -355,6 +390,11 @@ async fn actual_admission_transport_runner_and_reload_keep_original_items_and_fi
     assert_wire_requests(&requests);
     assert!(loaded.try_to_jsonl().unwrap().contains(&"x".repeat(40_000)));
     assert_eq!(executed.get(), 2);
+    if record_admission {
+        assert_eq!(*trace.borrow(), records::SUCCESS_TRACE);
+    } else {
+        assert!(trace.borrow().is_empty());
+    }
 }
 
 #[tokio::test]

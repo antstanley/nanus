@@ -1,5 +1,26 @@
 # Testing and verification
 
+## Original record admission reconciled with Responses — 2026-10-05
+
+The combined local candidate passes all 14 scoped gates: 539 affected domain/ports/provider/
+store tests, 183 minimal-runner cases, 53 all-feature admission/embedding cases, two minimal
+runner doctests, embedded default/providers 29/35 and runtime-free TUI 342; formatting,
+workspace/minimal/TUI/downstream Clippy and Windows-target minimal-library Clippy pass.
+All 249 frozen runtime/config/test inputs remain unchanged. Six actual HTTP fixtures include
+original record/batch ownership, strict Responses transport, reload and whole-turn fitting,
+and refusal before any executor. Twenty-two added runner cases include the prior record
+fixtures and three reconciliation regressions. Ninety-four reviewed functions are at most
+60 lines. Suites overlap. The separate actual Hype capacity consumer passes five cases and
+locked Clippy; Hype's full verifier passes 1083 Rust and 132 frontend tests with 17 explicit
+native/manual acceptance ignores.
+
+The [combined certificate](../.specs/changes/2026-10-05-record_responses_reconciliation.review.md)
+records fixed old-turn cancellation answers, runner-side Responses parsing before host
+counting, duplicate merge methods and fixture/dependency lifetime findings. Evidence is in
+`/private/tmp/hype-record-responses`. The candidate is local/unpublished; original production
+host authority/adoption and live/native/platform acceptance remain open. No paid provider,
+real credential store or personal Chrome was used.
+
 ## Explicit Responses transport and prospective estimation — 2026-10-05
 
 The extension passes 537 affected tests, minimal-runner/TUI nextest 161/342 and embedded default/
