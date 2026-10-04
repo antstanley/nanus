@@ -100,9 +100,9 @@ source timestamp. `mode` is `auto` (the default), `frames`, or `analyze`:
   and credential account** and returns its text. The conversation model never sees pixels.
 - **`auto`** is `frames` when the conversation model has verified image input and `analyze` otherwise.
 
-The analysis models are `claude-sonnet-5-5` (Anthropic) and `gpt-6-luna` (OpenAI API and
-subscription). DeepSeek and z.ai have no model with live image evidence, so on them `analyze`
-reports that rather than guessing, and `auto` reaches it for the same reason.
+The analysis models are `claude-sonnet-5-5` (Anthropic), `gpt-6-luna` (OpenAI API and
+subscription) and `deepseek-flash` (DeepSeek). z.ai has no model with live image evidence, so on it
+`analyze` reports that rather than guessing, and `auto` reaches it for the same reason.
 
 Every result begins with a JSON manifest: the source digest, container, codec, interval, each
 frame's timestamp, size and digest, the sampler and decoder versions, warnings, and for an analysis
@@ -651,11 +651,12 @@ The Cordis-style kernel is the framework underneath. See
 
 The honest list lives in [status](status.md#known-limits); the headline items:
 
-- **Image input is Supported for eight exact models.** Opus 5.5, Sonnet 5.5, and on the `api` plan
+- **Image input is Supported for nine exact models.** Opus 5.5, Sonnet 5.5, and on the `api` plan
   over the Responses API GPT-6 Astra, GPT-6.1 Sol, GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed
   live follow-ups; see [vision evidence](vision-evidence.md). The same six OpenAI models are Supported on the `ChatGPT`
-  subscription backend, which was run separately. Every other model, DeepSeek and z.ai stay
-  Unknown and refuse images.
+  subscription backend, which was run separately. `deepseek-flash` is the ninth, Supported on its own
+  endpoint with a measured profile; `deepseek-v4-pro` is explicitly Unsupported. Every other model and
+  z.ai stay Unknown and refuse images.
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
 - **The link is local.** Unix sockets and Windows SID-named pipes share the same frames.

@@ -97,8 +97,48 @@ fn insert_effort(body: &mut Map<String, Value>, effort: ReasoningEffort) {
 /// Encodes the conversation in `DeepSeek`'s message shape.
 #[must_use]
 pub fn encode_messages(messages: &[Message]) -> Value {
-    let encoded: Vec<Value> = messages.iter().map(encode_message).collect();
-    Value::Array(encoded)
+    // Chat completions carries pixels in a *user* message, not in a tool message. A tool result
+    // with images therefore becomes a labelled tool message plus a user attachment, and the
+    // attachments of a run of consecutive results follow the whole run, after every tool message
+    // its assistant turn is owed. Anything else is encoded as it always was.
+    let mut turns = Vec::new();
+    let mut attachments = Vec::new();
+    for message in messages {
+        if !matches!(message, Message::Tool { .. }) {
+            turns.append(&mut attachments);
+        }
+        if let Message::Tool {
+            call_id,
+            content_blocks: Some(blocks),
+            is_error,
+            ..
+        } = message
+            && blocks
+                .iter()
+                .any(|block| matches!(block, nanus_domain::ContentBlock::Image { .. }))
+        {
+            let label = nanus_ports::capabilities::attachment_label(call_id, *is_error);
+            turns.push(
+                json!({ "role": "tool", "tool_call_id": call_id.as_str(), "content": label }),
+            );
+            let mut content = vec![json!({ "type": "text", "text": label })];
+            content.extend(blocks.iter().map(|block| match block {
+                nanus_domain::ContentBlock::Text(text) => json!({ "type": "text", "text": text }),
+                nanus_domain::ContentBlock::Image {
+                    media_type,
+                    data_base64,
+                } => json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{media_type};base64,{data_base64}") },
+                }),
+            }));
+            attachments.push(json!({ "role": "user", "content": content }));
+        } else {
+            turns.push(encode_message(message));
+        }
+    }
+    turns.append(&mut attachments);
+    Value::Array(turns)
 }
 
 /// Encodes one message.

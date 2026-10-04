@@ -40,6 +40,7 @@
 
 mod config;
 mod error;
+mod image_support;
 mod wire;
 
 pub use config::{
@@ -199,6 +200,10 @@ impl LlmPort for DeepSeekLlm {
             request,
             &self.encode(request),
         )
+    }
+
+    fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        image_support::capabilities(&self.config, model)
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {

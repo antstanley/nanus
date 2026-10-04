@@ -26,6 +26,9 @@ const SUBSCRIPTION: &str = "subscription";
 
 /// The model that reads frames for `provider`, when one has verified image input.
 ///
+/// z.ai has none: no model there has a profile with live evidence, and its credentials were never
+/// available to gather it.
+///
 /// A model qualifies by having an exact image profile with live evidence in
 /// `docs/vision-evidence.md`; nothing here infers support from a name. Both are the smaller
 /// of the provider's verified models, because describing four stills does not need the largest.
@@ -33,7 +36,8 @@ const fn analysis_model(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::Anthropic => Some("claude-sonnet-5-5"),
         Provider::OpenAi => Some("gpt-6-luna"),
-        Provider::DeepSeek | Provider::Zai => None,
+        Provider::DeepSeek => Some("deepseek-flash"),
+        Provider::Zai => None,
     }
 }
 
@@ -67,7 +71,7 @@ impl VideoRouting for StockRouting {
             let Some(model) = analysis_model(provider) else {
                 return Err(VideoError::Unavailable(format!(
                     "read_video: {provider} has no model with verified image input, so frames \
-                     cannot be described there; switch to anthropic or openai"
+                     cannot be described there; switch to anthropic, openai or deepseek"
                 )));
             };
             let (llm, selection) = switch
@@ -153,12 +157,13 @@ mod tests {
 
     #[test]
     fn only_providers_with_verified_image_models_have_a_route() {
+        // z.ai is the one stock provider with nothing to route to.
         assert_eq!(
             analysis_model(Provider::Anthropic),
             Some("claude-sonnet-5-5")
         );
         assert_eq!(analysis_model(Provider::OpenAi), Some("gpt-6-luna"));
-        assert_eq!(analysis_model(Provider::DeepSeek), None);
+        assert_eq!(analysis_model(Provider::DeepSeek), Some("deepseek-flash"));
         assert_eq!(analysis_model(Provider::Zai), None);
     }
 

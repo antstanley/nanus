@@ -1,7 +1,7 @@
 # Vision evidence and embedding verification
 
-The implementation is available. Eight exact models are promoted to Supported on live evidence
-from 2026-10-01 (below); every other model, plan and wire stays Unknown and refuses pixels. Native
+The implementation is available. Nine exact models are promoted to Supported on live evidence
+from 2026-10-01 and 2026-10-04 (below); every other model, plan and wire stays Unknown and refuses pixels. Native
 Windows and macOS execution also pass. The
 [proposal](../.specs/changes/2026-09-30-library_embedding_and_multimodal_results.md) remains
 Proposed until its acceptance gates pass. CI added here verifies the portable library,
@@ -18,6 +18,7 @@ not the Unix CLI/link/service.
 | `gpt-5.6-terra` / Responses (`api.openai.com`) | `openai-terra56-high-patch32-v1` | Shared OpenAI encoder test | Passed live 2026-10-01 (PNG, JPEG, WebP, GIF); Supported |
 | the six OpenAI models above / Responses (`chatgpt.com/backend-api/codex`, `subscription` plan) | their profiles above | Shared OpenAI encoder test | Each passed live 2026-10-01 on this endpoint (PNG, JPEG, WebP, GIF); Supported |
 | `gpt-5.6-luna` / Responses (`api.openai.com`) | `openai-luna56-high-patch32-v1` | Shared OpenAI encoder test | Passed live 2026-10-01 (PNG, JPEG, WebP, GIF); Supported |
+| `deepseek-flash` / chat completions (`api.deepseek.com`) | `deepseek-flash-area-v1` | `nanus-adapter-deepseek/tests/multimodal.rs`, with store reload | Passed live 2026-10-04 (PNG, JPEG, WebP, GIF), non-streamed; Supported |
 
 The fictional fixture is a green triangle on white, supplied as PNG and JPEG. Tests compare
 complete decoded file bytes, original text order, IDs and error flags after actual store reload.
@@ -107,6 +108,45 @@ bytes, this call may add 4 and up to 2796208 bytes, and a request holds at most 
 and reported the refusal accurately. The same run before the tool declared its envelope let both calls through,
 which is how an edit that silently did not apply was caught.
 
-Not covered by this evidence: DeepSeek and z.ai (no model with live image evidence, so no analysis
+Not covered by this evidence: z.ai (no model with live image evidence and no stored credential, so no analysis
 route), and native Windows and Linux (see [status](status.md#known-limits)). A later model has no analysis route until it has a profile
 and its own live run, exactly as above. Reproduce with `scripts/live-read-video.sh`, which spends credit.
+
+## DeepSeek, 2026-10-04
+
+`deepseek-flash` is promoted to Supported on `api.deepseek.com` chat completions, with the credential
+the harness already stores. DeepSeek documents image input for Flash (JPEG, PNG, GIF and WebP as
+base64 data URLs, up to 8192 pixels a side) but not what an image costs, so the profile rests on
+measurement and on the same live protocol the other models passed.
+
+- **Wire.** The adapter now encodes a tool result that carries pixels as the other chat-completions
+  adapter does: a tool message holding only the attachment label, then one user message of ordered
+  text and `image_url` data-URL parts after the whole tool group. A conversation without pixels
+  encodes exactly as before. `nanus-adapter-deepseek/tests/multimodal.rs` compares the decoded bytes,
+  order, labels and error flags, before and after a store reload.
+- **Live.** Through the adapter's own `encode`, `deepseek-flash` described a green triangle for PNG,
+  JPEG, WebP and a still GIF, and a follow-up naming only the call that produced the picture
+  answered `alpha` each time (`deepseek_flash_reads_a_tool_result_image_and_follows_the_call`).
+- **Price.** Prompt tokens were measured against a text-only twin with thinking off: 209 for 28×28
+  and 256×256, 217 for 640×360, 391 for 1024×576, 677 for 1024×1024 and 1017 for 2000×1000, each
+  including about 200 for the attachment framing (`deepseek_flash_image_token_cost_by_size`). The
+  profile `deepseek-flash-area-v1` reserves `256 + ceil(pixels / 1024)` tokens per image, about twice
+  the measured slope, and a unit test fails if a reservation ever falls under a measured cost. It is a
+  safety figure, not a billed count, and DeepSeek may change its pricing without notice.
+- **The endpoint agrees.** `GET https://api.deepseek.com/models` on 2026-10-04 lists `deepseek-flash`
+  with `input_modalities: ["text", "image"]` and `deepseek-v4-pro` with `["text"]`, and gives both a
+  context window of 1,048,576 and a maximum output of 393,216, which are the ceilings the adapter
+  records (an image request is refused without known ceilings).
+- **Pro stays refused.** `deepseek-v4-pro` accepted the same request and returned an empty answer
+  without describing the picture, so it is Unsupported on evidence rather than assumption
+  (`deepseek_v4_pro_is_not_shown_to_read_images`). Other ids, aliases and any other endpoint inherit
+  nothing and are refused before HTTP.
+- **`read_video`.** Four runs through the real agent reproduced the colours and timestamps:
+  `deepseek-flash` received the frames (`auto`); `deepseek-v4-pro` was routed to `deepseek-flash` on the
+  same account and the manifest names it; `analyze` on Flash returned its own reading; and `mode:
+  frames` on Pro was refused before the file was opened and the model recovered with `auto`.
+
+One behaviour worth knowing: with thinking on, DeepSeek demands the `reasoning_content` of an assistant
+turn whose tool results follow it directly, but not when a user message (the pixel attachment)
+intervenes. The loop always records and replays that reasoning, so this only matters to a synthetic
+session that has none, as the price measurement's twin did.

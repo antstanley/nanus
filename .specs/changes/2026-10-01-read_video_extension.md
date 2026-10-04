@@ -20,17 +20,19 @@ and AV1 decoding are explicit requirements alongside FFmpeg's standard available
 Implemented in `crates/nanus-tool-video`, `nanus-domain` (`ImageEnvelope`), `nanus-bundle` (`video.rs`, admission in
 `agent_loop.rs`), installed by `read_video = true`: FFprobe/FFmpeg sampling with the mandatory codec/demuxer check
 at startup, the bounded rooted source, `auto`/`frames`/`analyze`, the manifest, same-provider analysis for
-**Anthropic** (`claude-sonnet-5-5`) and **OpenAI** (`gpt-6-luna`, API and subscription), an analysis budget
+**Anthropic** (`claude-sonnet-5-5`), **OpenAI** (`gpt-6-luna`, API and subscription) and **DeepSeek**
+(`deepseek-flash`), an analysis budget
 (reserve before sending, settle to reported usage, keep the whole reservation on failure, missing usage or
-cancellation), and batch image admission. Verified live on every Anthropic and OpenAI model and plan in the
+cancellation), and batch image admission. Verified live on every Anthropic, OpenAI and DeepSeek model and plan in the
 catalogue, including a live refusal of an over-capacity second call; see
 [the evidence](../../docs/vision-evidence.md#read_video).
 
 Not implemented, and why the change stays open:
 
-- **DeepSeek and z.ai routes.** No model there has an image profile with live evidence and neither credential is stored
-  here, so they cannot be qualified; `analyze` and `auto` report that rather than guessing. The spec's "every
-  configured model" claim is therefore **not** met.
+- **A z.ai route.** No z.ai model has an image profile with live evidence and its credential is not stored here, so it
+  cannot be qualified; `analyze` and `auto` report that rather than guessing. The spec's "every configured model" claim
+  is therefore **not** met for z.ai. DeepSeek was qualified on 2026-10-04: `deepseek-flash` is Supported with a measured
+  profile and is the analysis model for DeepSeek, and `deepseek-v4-pro` is shown live not to read images.
 - **Linux and Windows certification,** and process-lifecycle evidence beyond a dropped call killing the decoder on Unix.
 
 Narrower than specified: admission is a generic *declared-envelope* reservation (`with_result_images`) against the

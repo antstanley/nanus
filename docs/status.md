@@ -35,9 +35,9 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 
 ## Known limits
 
-- **`read_video` is verified on Anthropic and OpenAI only.** DeepSeek and z.ai have no model with
-  live image evidence, so there `analyze` and `auto` report that instead of guessing; qualifying them
-  needs their credentials and a profile each, which have not been done. FFmpeg decoding was
+- **`read_video` is verified on Anthropic, OpenAI and DeepSeek.** z.ai has no model with live image
+  evidence and no stored credential, so there `analyze` and `auto` report that instead of guessing.
+  DeepSeek's image price is undocumented, so its profile reserves about twice what was measured. FFmpeg decoding was
   exercised on macOS with FFmpeg 9.0.2 only. A dropped call kills its decoder (tested on Unix with a
   stand-in process), but the Linux and Windows decoder paths, and Windows process teardown, are
   untested; there is no grandchild test because FFmpeg starts none. Admission is by declared worst
@@ -111,8 +111,8 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   adapters. Its native Windows/macOS matrix passed both minimally and with explicit
   provider dependencies; [tested revision and run](vision-evidence.md). Stock shell/link/service
   passed the separate native Windows/Linux/macOS transport matrix; [evidence](link-transports.md).
-- **Vision is promoted for eight exact models.** Opus 5.5, Sonnet 5.5, GPT-6 Astra, GPT-6.1 Sol,
-  GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed live image and call-reference follow-ups; all other models stay Unknown and refuse image HTTP.
+- **Vision is promoted for nine exact models.** Opus 5.5, Sonnet 5.5, GPT-6 Astra, GPT-6.1 Sol,
+  GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed live image and call-reference follow-ups; `deepseek-flash` is the ninth (DeepSeek V4 Pro is explicitly Unsupported); all other models stay Unknown and refuse image HTTP.
   [Evidence and limits](vision-evidence.md).
 - **Only the macOS keychain ships as a platform secret store.** `SecretPort` and the
   `SecretBackend` trait are the seam, and a `0600` file and the environment are the

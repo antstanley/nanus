@@ -122,6 +122,31 @@ async fn key(account: &str) -> String {
     secret.expose().to_owned()
 }
 
+/// The answer text of a non-streamed response, whichever API shaped it: chat completions
+/// (`choices`), Anthropic (`content` blocks) or `OpenAI` Responses (`output` items, each a message
+/// whose content carries `output_text` parts; reasoning items have none).
+fn extract_answer(value: &Value) -> String {
+    if let Some(content) = value["choices"][0]["message"]["content"].as_str() {
+        return content.to_owned();
+    }
+    if let Some(blocks) = value["content"].as_array() {
+        return blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    value["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Posts a non-streamed copy of `body` and returns the answer text, or fails with the API's own
 /// error body (which never contains the credential).
 async fn post(url: &str, headers: &[(&str, String)], mut body: Value) -> String {
@@ -137,28 +162,7 @@ async fn post(url: &str, headers: &[(&str, String)], mut body: Value) -> String 
     let text = response.text().await.unwrap();
     assert!(status.is_success(), "{url} answered {status}: {text}");
     let value: Value = serde_json::from_str(&text).unwrap();
-    // Anthropic: `content` blocks. OpenAI Responses: `output` items, each a message whose content
-    // carries `output_text` parts (reasoning items have none).
-    let answer = value["content"].as_array().map_or_else(
-        || {
-            value["output"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|item| item["content"].as_array())
-                .flatten()
-                .filter_map(|part| part["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        },
-        |blocks| {
-            blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        },
-    );
+    let answer = extract_answer(&value);
     assert!(
         !answer.trim().is_empty(),
         "an empty answer from {url}: {text}"
@@ -395,4 +399,172 @@ async fn chatgpt_gpt_5_6_terra_reads_a_tool_result_image_and_follows_the_call() 
 #[ignore = "live: spends subscription quota"]
 async fn chatgpt_gpt_5_6_luna_reads_a_tool_result_image_and_follows_the_call() {
     chatgpt_subscription("gpt-5.6-luna").await;
+}
+
+/// `deepseek-flash` on the chat-completions endpoint, through the adapter's own encoding.
+async fn deepseek(model: &str) {
+    let api_key = key("deepseek").await;
+    let llm = nanus_adapter_deepseek::DeepSeekLlm::new(
+        nanus_adapter_deepseek::DeepSeekConfig::new(model, api_key.clone()),
+    )
+    .unwrap();
+    let headers = [("authorization", format!("Bearer {api_key}"))];
+    for (media, bytes) in formats() {
+        let first = session(media, &bytes, model);
+        let mut body = llm.encode(&ChatRequest::new(model, first.derive_messages()));
+        body["max_tokens"] = json!(8000);
+        let answer = post(&llm.endpoint(), &headers, body).await;
+        assert_shape(&answer, model, media);
+        let second = follow_up(first, &answer, model);
+        let mut body = llm.encode(&ChatRequest::new(model, second.derive_messages()));
+        body["max_tokens"] = json!(8000);
+        let reference = post(&llm.endpoint(), &headers, body).await;
+        assert_reference(&reference, model, media);
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn deepseek_flash_reads_a_tool_result_image_and_follows_the_call() {
+    deepseek("deepseek-flash").await;
+}
+
+/// `deepseek-v4-pro` is recorded as not taking images. This asks the API directly, so the record
+/// is evidence rather than an assumption: the request must be refused, or answered without having
+/// seen the picture. If it ever starts describing the triangle this fails, and the model is a
+/// candidate for a profile of its own.
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn deepseek_v4_pro_is_not_shown_to_read_images() {
+    let model = "deepseek-v4-pro";
+    let api_key = key("deepseek").await;
+    let llm = nanus_adapter_deepseek::DeepSeekLlm::new(
+        nanus_adapter_deepseek::DeepSeekConfig::new(model, api_key.clone()),
+    )
+    .unwrap();
+    let mut body = llm.encode(&ChatRequest::new(
+        model,
+        session("image/png", PNG, model).derive_messages(),
+    ));
+    body["max_tokens"] = json!(8000);
+    body["stream"] = json!(false);
+    // Only valid on a stream.
+    body.as_object_mut().unwrap().remove("stream_options");
+    let response = reqwest::Client::new()
+        .post(llm.endpoint())
+        .header("authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    eprintln!(
+        "[{model}] status {status}: {}",
+        &text[..text.len().min(400)]
+    );
+    if status.is_success() {
+        let answer = extract_answer(&serde_json::from_str(&text).unwrap()).to_lowercase();
+        eprintln!("[{model}] answer: {}", &answer[..answer.len().min(300)]);
+        assert!(
+            !(answer.contains("triangle") && answer.contains("green")),
+            "{model} described the picture; it may take images now: {answer}"
+        );
+    }
+}
+
+/// What `deepseek-flash` charges, in prompt tokens, for an image of a given size.
+///
+/// `DeepSeek` documents the limits of an image but not its price, so the profile's reservation has
+/// to rest on a measurement: each size is sent once beside a text-only twin of the same request,
+/// and the difference in `usage.prompt_tokens` is what the picture cost. Prints a table; it
+/// asserts only that the cost is positive and grows with the area, which is what a reservation
+/// formula can lean on.
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn deepseek_flash_image_token_cost_by_size() {
+    let model = "deepseek-flash";
+    let api_key = key("deepseek").await;
+    let llm = nanus_adapter_deepseek::DeepSeekLlm::new(
+        nanus_adapter_deepseek::DeepSeekConfig::new(model, api_key.clone()),
+    )
+    .unwrap();
+    let headers = [("authorization", format!("Bearer {api_key}"))];
+    let prompt_tokens = |value: &Value| value["usage"]["prompt_tokens"].as_u64().unwrap();
+    let ask = |body: Value| {
+        let headers = &headers;
+        let url = llm.endpoint();
+        async move {
+            let mut body = body;
+            body["stream"] = json!(false);
+            body.as_object_mut().unwrap().remove("stream_options");
+            body["max_tokens"] = json!(16);
+            // Thinking off for both twins: with it on, a tool result that directly continues an
+            // assistant turn is refused without that turn's reasoning, and this synthetic session
+            // has none to give. The two requests must differ only by the picture.
+            body["thinking"] = json!({ "type": "disabled" });
+            body.as_object_mut().unwrap().remove("reasoning_effort");
+            let response = reqwest::Client::new()
+                .post(url)
+                .header("authorization", headers[0].1.clone())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert!(status.is_success(), "answered {status}: {text}");
+            serde_json::from_str::<Value>(&text).unwrap()
+        }
+    };
+    let mut costs = Vec::new();
+    for (width, height) in [
+        (28, 28),
+        (256, 256),
+        (640, 360),
+        (1024, 576),
+        (1024, 1024),
+        (2000, 1000),
+    ] {
+        // Smooth noise so the encoder cannot collapse the picture into nothing.
+        let pixels = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([
+                u8::try_from((x * 7 + y * 3) % 256).unwrap(),
+                u8::try_from((x * 5 + y * 11) % 256).unwrap(),
+                u8::try_from((x + y * 13) % 256).unwrap(),
+            ])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        pixels.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let with_image = session("image/png", png.get_ref(), model);
+        let mut twin = session("image/png", png.get_ref(), model);
+        // The text-only twin: the same session with the picture's result replaced by text.
+        twin = {
+            let mut text_only = Session::new(SessionId::new("calibration-twin"), 1, "/live");
+            for event in twin.log().events() {
+                let mut event = event.clone();
+                if let SessionEvent::ToolResult { content_blocks, .. } = &mut event {
+                    *content_blocks = None;
+                }
+                text_only.append(event);
+            }
+            text_only
+        };
+        let image_body = llm.encode(&ChatRequest::new(model, with_image.derive_messages()));
+        let text_body = llm.encode(&ChatRequest::new(model, twin.derive_messages()));
+        eprintln!("[calibration {width}x{height}] sending the image request");
+        let with = prompt_tokens(&ask(image_body).await);
+        eprintln!("[calibration {width}x{height}] sending the text-only twin");
+        let without = prompt_tokens(&ask(text_body).await);
+        let cost = with.saturating_sub(without);
+        eprintln!(
+            "[deepseek-flash {width}x{height}] image cost {cost} prompt tokens ({with} vs {without})"
+        );
+        costs.push((u64::from(width) * u64::from(height), cost));
+    }
+    assert!(costs.iter().all(|(_, cost)| *cost > 0), "{costs:?}");
+    assert!(
+        costs.windows(2).all(|pair| pair[1].1 >= pair[0].1),
+        "the cost does not fall as the area grows: {costs:?}"
+    );
 }
