@@ -61,6 +61,7 @@ impl AgentRunner {
             calls,
             outcomes: results,
             estimate: &estimate,
+            managed: None,
         };
         let reservation = admission
             .reserve(&projection)

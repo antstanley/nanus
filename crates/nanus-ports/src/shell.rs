@@ -85,6 +85,51 @@ pub trait ShellPort {
 
     /// Returns the sandbox policy this port enforces.
     fn sandbox(&self) -> SandboxPolicy;
+
+    /// Runs a command as [`ShellPort::run`] does, feeding exact pipe bytes to the capture sinks
+    /// *before* the preview cap.
+    ///
+    /// Streams stay separate; nothing claims a merged order. Exit, signal, timeout, cancellation
+    /// and process-group cleanup are exactly those of `run`. A sink failure disables further
+    /// capture for that stream while its pipe keeps draining, so capture can never deadlock a
+    /// process. Unsupported by default, and an unsupported port says so before anything runs.
+    fn run_with_capture(
+        &self,
+        request: ShellRequest,
+        capture: ShellCapture,
+    ) -> LocalBoxFuture<'_, ShellResult<CapturedOutcome>> {
+        let _ = (request, capture);
+        Box::pin(async { Err(ShellError::CaptureUnsupported) })
+    }
+}
+
+/// The two sinks one captured command writes to.
+#[derive(Default)]
+pub struct ShellCapture {
+    /// Standard output's sink.
+    pub stdout: Option<Box<dyn crate::artifact::RawCaptureSink>>,
+    /// Standard error's sink.
+    pub stderr: Option<Box<dyn crate::artifact::RawCaptureSink>>,
+}
+
+impl core::fmt::Debug for ShellCapture {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShellCapture")
+            .field("stdout", &self.stdout.is_some())
+            .field("stderr", &self.stderr.is_some())
+            .finish()
+    }
+}
+
+/// A captured command's outcome and what each sink finalized to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedOutcome {
+    /// The ordinary outcome, preview caps included.
+    pub outcome: ShellOutcome,
+    /// Standard output's finalization, when a sink was given.
+    pub stdout: Option<crate::artifact::CaptureFinalization>,
+    /// Standard error's finalization, when a sink was given.
+    pub stderr: Option<crate::artifact::CaptureFinalization>,
 }
 
 /// The result type of every shell operation.
@@ -438,6 +483,10 @@ pub enum ShellError {
         /// The rendered failure.
         message: String,
     },
+
+    /// This port cannot capture output for the archive.
+    #[error("this shell cannot capture output for the archive")]
+    CaptureUnsupported,
 }
 
 #[cfg(test)]

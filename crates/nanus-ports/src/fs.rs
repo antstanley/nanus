@@ -81,6 +81,56 @@ pub trait FsPort {
     /// the workspace root is refused by the port rather than by the caller remembering to
     /// ask, which is what keeps a tool from being the one place that forgets.
     fn read_bytes<'a>(&'a self, path: &'a Path) -> LocalBoxFuture<'a, FsResult<Vec<u8>>>;
+
+    /// Reads at most `max_bytes` bytes of a file from `offset`, from one opened handle.
+    ///
+    /// Confinement is checked on the handle actually opened, not on the path alone, so a file
+    /// swapped for a link between the check and the read is refused. The result names the file's
+    /// identity at the time of the read and the digest of the returned range — never a claim
+    /// about the whole file's contents from metadata alone.
+    fn read_range<'a>(
+        &'a self,
+        path: &'a Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> LocalBoxFuture<'a, FsResult<RangeRead>> {
+        let _ = (offset, max_bytes);
+        Box::pin(async move {
+            Err(FsError::Unsupported {
+                path: path.to_path_buf(),
+                operation: "ranged read",
+            })
+        })
+    }
+}
+
+/// The identity of a file at the moment it was read: enough to say it changed, not to prove
+/// that it did not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    /// Its length in bytes.
+    pub len: u64,
+    /// Its modification time, in nanoseconds since the Unix epoch, when the platform reports one.
+    pub modified_ns: Option<u128>,
+    /// A platform file id (device and inode on Unix), when there is one.
+    pub file_id: Option<String>,
+}
+
+/// One bounded window of a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeRead {
+    /// The path that was read.
+    pub path: PathBuf,
+    /// The first byte returned.
+    pub offset: u64,
+    /// The bytes.
+    pub bytes: Vec<u8>,
+    /// The file's identity when it was read.
+    pub identity: FileIdentity,
+    /// SHA-256 of the returned bytes.
+    pub range_sha256: nanus_domain::context::managed::Digest,
+    /// Whether the window reached the end of the file.
+    pub eof: bool,
 }
 
 /// The result type of every filesystem operation.
@@ -533,6 +583,15 @@ pub enum FsError {
         path: PathBuf,
         /// The rendered failure.
         message: String,
+    },
+
+    /// This filesystem does not implement the operation.
+    #[error("{operation} is not supported for {path}")]
+    Unsupported {
+        /// The path involved.
+        path: PathBuf,
+        /// What was asked for.
+        operation: &'static str,
     },
 }
 

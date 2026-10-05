@@ -1853,6 +1853,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
+ "getrandom 0.4.3",
  "globset",
  "image",
  "nanus-adapter-anthropic",
@@ -1909,6 +1910,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "time",
  "tracing",

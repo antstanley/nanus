@@ -39,6 +39,8 @@ use std::rc::Rc;
 mod admission;
 #[path = "agent_loop/dispatch.rs"]
 mod dispatch;
+#[path = "agent_loop/managed.rs"]
+mod managed;
 #[path = "agent_loop/records.rs"]
 mod records;
 #[path = "agent_loop/selection.rs"]
@@ -172,6 +174,21 @@ pub trait Progress {
     /// and the same turn read back show the same notices in the same places. `None` is a goal
     /// cleared, which no goal tool does today, but the log can hold one.
     fn goal_changed(&mut self, _goal: Option<&nanus_domain::Goal>) {}
+
+    /// A managed request was prepared, and this is the context status it was prepared under.
+    ///
+    /// Reported once per managed step, before the request is sent, so a watcher sees the
+    /// revision, the pressure and the hidden counts the model is about to answer from.
+    fn context_status(&mut self, _status: &nanus_domain::context::managed::ContextStatus) {}
+
+    /// A context decision settled: a proposal accepted, rejected or cancelled, or a fit made.
+    fn context_decision(&mut self, _decision: &nanus_domain::context::managed::ContextDecision) {}
+
+    /// A checkpoint was acknowledged, and the durable frontier is now its receipt's.
+    ///
+    /// Not a turn's end: a managed turn checkpoints several times as it runs, and a watcher
+    /// that already shows the records it covers only moves its watermark.
+    fn checkpointed(&mut self, _receipt: &nanus_domain::context::managed::CheckpointReceipt) {}
 
     /// Whether the turn should stop.
     ///
@@ -1523,6 +1540,8 @@ impl Assembled {
 /// Why the model stopped, re-exported so a consumer of [`RunOutcome`] can name the
 /// vocabulary without importing the ports crate.
 pub use nanus_ports::FinishReason as ModelFinishReason;
+
+pub use managed::{ManagedRun, TurnHost};
 
 #[cfg(test)]
 mod tests {

@@ -337,7 +337,7 @@ fn an_unsupported_version_is_rejected() {
         Session::from_jsonl(raw),
         Err(SessionError::UnsupportedVersion {
             found: 99,
-            expected: 2
+            expected: 3
         })
     ));
 }

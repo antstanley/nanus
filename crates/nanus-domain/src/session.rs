@@ -48,6 +48,11 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::context::managed::ids::{Digest, ErrorCode, Hasher};
+use crate::context::managed::records::{
+    ArtifactReceipt, ContextDecision, ContextModeRecord, ProjectionRevision, RecoveryRecord,
+    RequestAttemptRecord,
+};
 use crate::goal::Goal;
 use crate::message::{Message, ToolCallId, Usage};
 use crate::tool::{ToolCall, ToolName};
@@ -55,8 +60,19 @@ use crate::tool::{ToolCall, ToolName};
 /// The format tag every session header carries.
 pub const SESSION_FORMAT_TAG: &str = "nanus.session";
 
-/// The session file format version this crate writes and accepts.
+/// The session body version this crate writes for an ordinary session, and accepts.
+///
+/// A session that never enabled managed context is written as version 2 exactly as before, so
+/// legacy sessions keep their bytes. Readers accept versions 1, 2 and
+/// [`SESSION_FORMAT_VERSION_MANAGED`].
 pub const SESSION_FORMAT_VERSION: u32 = 2;
+
+/// The body version of a session that has enabled managed context.
+///
+/// Version 3 adds the context, artifact, attempt and recovery records. A session is upgraded
+/// only by an explicit activation, never downgraded, and an older body that carries a v3
+/// record is refused.
+pub const SESSION_FORMAT_VERSION_MANAGED: u32 = 3;
 
 /// Maximum number of characters in a derived session title.
 const TITLE_MAX_CHARS: usize = 72;
@@ -309,6 +325,92 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         goal: Option<Goal>,
     },
+    /// The session's context policy changed, by a person or the host — never by the model.
+    ///
+    /// This and the five records below exist only in a version-3 body: an older body that
+    /// carries one is refused rather than read, so a v3 fact cannot be smuggled into a log a
+    /// reader treats as legacy. Each is harness bookkeeping and never reaches a model.
+    #[serde(rename = "context/mode")]
+    ContextMode {
+        /// The change.
+        payload: Box<ContextModeRecord>,
+    },
+    /// A projection revision was accepted: the full hidden set and complete note array.
+    #[serde(rename = "context/revision")]
+    ContextRevision {
+        /// The revision.
+        payload: Box<ProjectionRevision>,
+    },
+    /// What became of a proposal, an automatic fit or a reset.
+    #[serde(rename = "context/decision")]
+    ContextDecision {
+        /// The decision.
+        payload: Box<ContextDecision>,
+    },
+    /// An archived stream was published under this session.
+    #[serde(rename = "artifact/published")]
+    ArtifactPublished {
+        /// The receipt, which is the authoritative manifest of the object.
+        payload: Box<ArtifactReceipt>,
+    },
+    /// A model request attempt's intent, or its outcome.
+    #[serde(rename = "request/attempt")]
+    RequestAttempt {
+        /// The attempt record.
+        payload: Box<RequestAttemptRecord>,
+    },
+    /// A resumed session closed what a crash left open.
+    #[serde(rename = "context/recovery")]
+    ContextRecovery {
+        /// The recovery record.
+        payload: Box<RecoveryRecord>,
+    },
+}
+
+impl SessionEvent {
+    /// Returns `true` for a record only a version-3 body may hold.
+    #[must_use]
+    pub const fn is_managed_record(&self) -> bool {
+        matches!(
+            self,
+            Self::ContextMode { .. }
+                | Self::ContextRevision { .. }
+                | Self::ContextDecision { .. }
+                | Self::ArtifactPublished { .. }
+                | Self::RequestAttempt { .. }
+                | Self::ContextRecovery { .. }
+        )
+    }
+
+    /// Checks the invariants a managed record states about itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the managed-context code of the first broken invariant.
+    pub fn validate_managed(&self) -> Result<(), ErrorCode> {
+        match self {
+            Self::ContextMode { payload } => payload.policy.validate(),
+            Self::ContextRevision { payload } => payload.validate(),
+            Self::ArtifactPublished { payload } => payload.validate(),
+            Self::RequestAttempt { payload } => payload.validate(),
+            Self::ContextDecision { payload } => {
+                let id = payload.decision_id.len();
+                if id == 0 || id > crate::context::managed::limits::DECISION_ID_MAX {
+                    Err(ErrorCode::SourceCorrupt)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::ContextRecovery { payload } => {
+                if payload.unmatched_attempt_ids.len() > 16 {
+                    Err(ErrorCode::SourceCorrupt)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// An append-only sequence of [`SessionEvent`]s.
@@ -396,6 +498,22 @@ impl SessionLog {
     /// Folds the log into the message list a model would be shown.
     #[must_use]
     pub fn derive_messages(&self) -> Vec<Message> {
+        self.derive_messages_indexed(|_| true)
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// Folds the log as [`SessionLog::derive_messages`] does, keeping only the events `keep`
+    /// accepts and pairing each message with the sequence of the event it came from.
+    ///
+    /// The one fold both replays share: managed context selects by event, and doing it inside
+    /// the fold rather than after it is what guarantees a selected request is the raw replay
+    /// minus whole events — the same unanswered-call filtering, the same skipped turns, the same
+    /// order. Which calls count as answered is judged over the whole log, so hiding a result's
+    /// event never makes its call look unanswered to a kept assistant message.
+    #[must_use]
+    pub fn derive_messages_indexed(&self, keep: impl Fn(u64) -> bool) -> Vec<(u64, Message)> {
         // Which calls some result answers. Collected first because a call can only be judged
         // against results that follow it, and the fold below is a single pass.
         let answered: Vec<&ToolCallId> = self
@@ -406,11 +524,15 @@ impl SessionLog {
                 _ => None,
             })
             .collect();
-        let mut messages: Vec<Message> = Vec::new();
-        for event in &self.events {
+        let mut messages: Vec<(u64, Message)> = Vec::new();
+        for (index, event) in self.events.iter().enumerate() {
+            let seq = u64::try_from(index).unwrap_or(u64::MAX);
+            if !keep(seq) {
+                continue;
+            }
             match event {
                 SessionEvent::UserMessage { text } => {
-                    messages.push(Message::user(text.clone()));
+                    messages.push((seq, Message::user(text.clone())));
                 }
                 SessionEvent::AssistantMessage {
                     text,
@@ -453,12 +575,15 @@ impl SessionLog {
                         } else {
                             None
                         };
-                        messages.push(Message::Assistant {
-                            text: text.clone(),
-                            reasoning: reasoning.clone(),
-                            tool_calls: calls,
-                            replay,
-                        });
+                        messages.push((
+                            seq,
+                            Message::Assistant {
+                                text: text.clone(),
+                                reasoning: reasoning.clone(),
+                                tool_calls: calls,
+                                replay,
+                            },
+                        ));
                     }
                 }
                 SessionEvent::ToolResult {
@@ -467,19 +592,28 @@ impl SessionLog {
                     content,
                     is_error,
                 } => {
-                    messages.push(Message::Tool {
-                        call_id: call_id.clone(),
-                        content: content.clone(),
-                        content_blocks: content_blocks.clone(),
-                        is_error: *is_error,
-                    });
+                    messages.push((
+                        seq,
+                        Message::Tool {
+                            call_id: call_id.clone(),
+                            content: content.clone(),
+                            content_blocks: content_blocks.clone(),
+                            is_error: *is_error,
+                        },
+                    ));
                 }
                 SessionEvent::TurnStart { .. }
                 | SessionEvent::TurnEnd { .. }
                 | SessionEvent::StepStart { .. }
                 | SessionEvent::StepEnd { .. }
                 | SessionEvent::ToolCall { .. }
-                | SessionEvent::GoalChange { .. } => {}
+                | SessionEvent::GoalChange { .. }
+                | SessionEvent::ContextMode { .. }
+                | SessionEvent::ContextRevision { .. }
+                | SessionEvent::ContextDecision { .. }
+                | SessionEvent::ArtifactPublished { .. }
+                | SessionEvent::RequestAttempt { .. }
+                | SessionEvent::ContextRecovery { .. } => {}
             }
         }
         // Postcondition: the fold only removes events, never invents messages.
@@ -714,6 +848,24 @@ pub enum SessionError {
         detail: String,
     },
 
+    /// A body older than version 3 carries a managed-context record.
+    #[error("session event on line {line} is a version-3 record in a version-{version} body")]
+    ManagedRecordInLegacyBody {
+        /// The 1-based line the event was read from.
+        line: u64,
+        /// The body version the header declared.
+        version: u32,
+    },
+
+    /// A managed-context record breaks an invariant it states about itself.
+    #[error("session event on line {line} is an invalid managed record: {code}")]
+    InvalidManagedRecord {
+        /// The 1-based line the event was read from.
+        line: u64,
+        /// The broken invariant.
+        code: ErrorCode,
+    },
+
     /// The event lines are not numbered contiguously from zero.
     #[error("session event on line {line} has sequence {found}, expected {expected}")]
     NonContiguousSequence {
@@ -785,6 +937,8 @@ pub struct Session {
     cwd: String,
     /// The harness configuration it was created under, when one was known.
     origin: Option<Origin>,
+    /// The body version this session is written as: 2, or 3 once managed context is enabled.
+    body_version: u32,
     /// The event log.
     log: SessionLog,
 }
@@ -798,8 +952,30 @@ impl Session {
             created_at_ms,
             cwd: cwd.into(),
             origin: None,
+            body_version: SESSION_FORMAT_VERSION,
             log: SessionLog::new(),
         }
+    }
+
+    /// Returns the body version this session is written as.
+    #[must_use]
+    pub const fn body_version(&self) -> u32 {
+        self.body_version
+    }
+
+    /// Returns `true` once the session may hold managed-context records.
+    #[must_use]
+    pub const fn is_managed_body(&self) -> bool {
+        self.body_version >= SESSION_FORMAT_VERSION_MANAGED
+    }
+
+    /// Upgrades the body to version 3, which is what lets it hold managed-context records.
+    ///
+    /// Idempotent and one-way: nothing downgrades a body, because the records a v3 body holds
+    /// are facts a v2 reader would silently drop.
+    pub fn upgrade_to_managed_body(&mut self) {
+        self.body_version = SESSION_FORMAT_VERSION_MANAGED;
+        assert!(self.is_managed_body());
     }
 
     /// Records the harness configuration this session is being run under.
@@ -967,15 +1143,7 @@ impl Session {
     /// than write a corrupt file.
     #[must_use]
     pub fn to_jsonl(&self) -> String {
-        let header = SessionHeader {
-            format: SESSION_FORMAT_TAG.to_owned(),
-            version: SESSION_FORMAT_VERSION,
-            id: self.id.as_str().to_owned(),
-            created_at_ms: self.created_at_ms,
-            cwd: self.cwd.clone(),
-            origin: self.origin.clone(),
-        };
-        let mut out = encode(&header);
+        let mut out = encode(&self.header());
         assert!(!out.is_empty(), "the session header encodes");
         out.push('\n');
         for (index, event) in self.log.events().iter().enumerate() {
@@ -988,14 +1156,27 @@ impl Session {
         out
     }
 
-    /// Encodes a bounded version-2 session, validating content before any store write.
+    /// Encodes a bounded session, validating content before any store write.
     ///
     /// # Errors
     ///
-    /// Refuses malformed media, oversized records and sessions exceeding 64 MiB.
+    /// Refuses malformed media, oversized records, sessions exceeding 64 MiB, a managed record
+    /// in a body older than version 3, and a managed record that breaks its own invariants.
     pub fn try_to_jsonl(&self) -> Result<String, SessionError> {
         let mut total = 0_usize;
         for (index, event) in self.log.events().iter().enumerate() {
+            let line = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2);
+            if event.is_managed_record() {
+                if !self.is_managed_body() {
+                    return Err(SessionError::ManagedRecordInLegacyBody {
+                        line,
+                        version: self.body_version,
+                    });
+                }
+                event
+                    .validate_managed()
+                    .map_err(|code| SessionError::InvalidManagedRecord { line, code })?;
+            }
             if let SessionEvent::ToolResult {
                 content_blocks: Some(blocks),
                 ..
@@ -1042,14 +1223,7 @@ impl Session {
         }
         // The header contains caller-owned strings as well, so bound the whole serialized
         // session before allocating it; this also counts the header's newline.
-        let header = SessionHeader {
-            format: SESSION_FORMAT_TAG.to_owned(),
-            version: SESSION_FORMAT_VERSION,
-            id: self.id.as_str().to_owned(),
-            created_at_ms: self.created_at_ms,
-            cwd: self.cwd.clone(),
-            origin: self.origin.clone(),
-        };
+        let header = self.header();
         let size = crate::content::serialized_size(&header, crate::content::RECORD_BYTES_MAX)
             .map_err(|error| SessionError::BadHeader {
                 line: 1,
@@ -1064,6 +1238,52 @@ impl Session {
                 reason: "session exceeds 64 MiB".into(),
             })?;
         Ok(self.to_jsonl())
+    }
+
+    /// Builds the header line this session is written with.
+    fn header(&self) -> SessionHeader {
+        SessionHeader {
+            format: SESSION_FORMAT_TAG.to_owned(),
+            version: self.body_version,
+            id: self.id.as_str().to_owned(),
+            created_at_ms: self.created_at_ms,
+            cwd: self.cwd.clone(),
+            origin: self.origin.clone(),
+        }
+    }
+
+    /// Returns the digest of the stored header and the first `count` event lines.
+    ///
+    /// The one prefix encoder validation, persistence and fixtures share: the bytes are exactly
+    /// the first lines [`Session::try_to_jsonl`] writes, LF terminators included, at this
+    /// session's body version. So a frontier's digest at the full count is the digest of the
+    /// whole stored file, and a store can recompute it from disk without re-encoding anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NonContiguousSequence`] for a count past the log's end.
+    pub fn prefix_digest(&self, count: u64) -> Result<Digest, SessionError> {
+        let events = usize::try_from(count)
+            .ok()
+            .and_then(|count| self.log.events().get(..count))
+            .ok_or_else(|| SessionError::NonContiguousSequence {
+                line: 1,
+                expected: u64::try_from(self.log.len()).unwrap_or(u64::MAX),
+                found: count,
+            })?;
+        let mut hasher = Hasher::new();
+        hasher.update(encode(&self.header()).as_bytes());
+        hasher.update(b"\n");
+        hash_lines(&mut hasher, events);
+        Ok(hasher.finish())
+    }
+
+    /// Returns the digest of every event line, header excluded.
+    #[must_use]
+    pub fn body_digest(&self) -> Digest {
+        let mut hasher = Hasher::new();
+        hash_lines(&mut hasher, self.log.events());
+        hasher.finish()
     }
 
     /// Decodes a session from JSONL.
@@ -1123,6 +1343,7 @@ impl Session {
                     line: number,
                     detail: error.to_string(),
                 })?;
+            check_managed_record(&parsed.event, header.as_ref(), number)?;
             if let SessionEvent::AssistantMessage {
                 replay: Some(replay),
                 text,
@@ -1149,11 +1370,17 @@ impl Session {
         }
         let header = header.ok_or(SessionError::MissingHeader)?;
         log.assert_contiguous();
+        let body_version = if header.version >= SESSION_FORMAT_VERSION_MANAGED {
+            SESSION_FORMAT_VERSION_MANAGED
+        } else {
+            SESSION_FORMAT_VERSION
+        };
         let session = Self {
             id: SessionId::new(header.id),
             created_at_ms: header.created_at_ms,
             cwd: header.cwd,
             origin: header.origin,
+            body_version,
             log,
         };
         // Postcondition: the decoded log has exactly the events the file numbered.
@@ -1181,10 +1408,13 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
             ),
         });
     }
-    if !matches!(header.version, 1 | SESSION_FORMAT_VERSION) {
+    if !matches!(
+        header.version,
+        1 | SESSION_FORMAT_VERSION | SESSION_FORMAT_VERSION_MANAGED
+    ) {
         return Err(SessionError::UnsupportedVersion {
             found: header.version,
-            expected: SESSION_FORMAT_VERSION,
+            expected: SESSION_FORMAT_VERSION_MANAGED,
         });
     }
     if header.id.is_empty() {
@@ -1196,6 +1426,33 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
         });
     }
     Ok(header)
+}
+
+/// Feeds the encoded event lines, each with its LF, numbered from zero.
+fn hash_lines(hasher: &mut Hasher, events: &[SessionEvent]) {
+    for (index, event) in events.iter().enumerate() {
+        let seq = SessionSeq::new(u64::try_from(index).unwrap_or(u64::MAX));
+        hasher.update(encode(&SessionLineRef { seq, event }).as_bytes());
+        hasher.update(b"\n");
+    }
+}
+
+/// Refuses a managed record in an older body, and one that breaks its own invariants.
+fn check_managed_record(
+    event: &SessionEvent,
+    header: Option<&SessionHeader>,
+    line: u64,
+) -> Result<(), SessionError> {
+    if !event.is_managed_record() {
+        return Ok(());
+    }
+    let version = header.map_or(0, |header| header.version);
+    if version < SESSION_FORMAT_VERSION_MANAGED {
+        return Err(SessionError::ManagedRecordInLegacyBody { line, version });
+    }
+    event
+        .validate_managed()
+        .map_err(|code| SessionError::InvalidManagedRecord { line, code })
 }
 
 /// Encodes a value as compact JSON.
@@ -1805,6 +2062,102 @@ mod tests {
         assert!(matches!(decoded, Err(SessionError::BadHeader { .. })));
     }
 
+    /// A decision record; the smallest managed record there is.
+    fn decision() -> SessionEvent {
+        SessionEvent::ContextDecision {
+            payload: Box::new(ContextDecision {
+                decision_id: "d:1".into(),
+                outcome: crate::context::managed::DecisionOutcome::Rejected,
+                revision: None,
+                error_code: Some(ErrorCode::StaleBase),
+            }),
+        }
+    }
+
+    /// T01/T14: a legacy session keeps its version-2 bytes, and a managed record cannot be
+    /// written into one or read out of one.
+    #[test]
+    fn a_managed_record_needs_a_version_three_body() {
+        let mut legacy = session();
+        record_read_turn(&mut legacy);
+        assert!(
+            legacy
+                .to_jsonl()
+                .starts_with(r#"{"format":"nanus.session","version":2,"#)
+        );
+        legacy.append(decision());
+        assert!(matches!(
+            legacy.try_to_jsonl(),
+            Err(SessionError::ManagedRecordInLegacyBody { version: 2, .. })
+        ));
+        let smuggled = framed(&[(0, serde_json::to_value(decision()).unwrap_or_default())]);
+        assert!(matches!(
+            Session::from_jsonl(&smuggled),
+            Err(SessionError::ManagedRecordInLegacyBody {
+                line: 2,
+                version: 2
+            })
+        ));
+
+        let mut managed = legacy.clone();
+        managed.upgrade_to_managed_body();
+        let encoded = managed.try_to_jsonl().unwrap_or_default();
+        assert!(encoded.starts_with(r#"{"format":"nanus.session","version":3,"#));
+        assert!(
+            encoded.contains(r#""type":"context/decision","payload":"#),
+            "{encoded}"
+        );
+        let decoded = Session::from_jsonl(&encoded);
+        assert_eq!(decoded.as_ref().map(Session::body_version), Ok(3));
+        assert_eq!(decoded, Ok(managed));
+    }
+
+    /// A managed record that contradicts itself is refused on read.
+    #[test]
+    fn an_invalid_managed_record_is_refused() {
+        let mut managed = session();
+        managed.upgrade_to_managed_body();
+        managed.append(SessionEvent::ContextDecision {
+            payload: Box::new(ContextDecision {
+                decision_id: String::new(),
+                outcome: crate::context::managed::DecisionOutcome::Rejected,
+                revision: None,
+                error_code: None,
+            }),
+        });
+        assert!(matches!(
+            managed.try_to_jsonl(),
+            Err(SessionError::InvalidManagedRecord { .. })
+        ));
+        let raw = managed.to_jsonl();
+        assert!(matches!(
+            Session::from_jsonl(&raw),
+            Err(SessionError::InvalidManagedRecord { line: 2, .. })
+        ));
+    }
+
+    /// The prefix digest is the digest of exactly the stored bytes, at every count.
+    #[test]
+    fn the_prefix_digest_hashes_the_stored_lines() {
+        let mut managed = session();
+        managed.upgrade_to_managed_body();
+        record_read_turn(&mut managed);
+        let encoded = managed.try_to_jsonl().unwrap_or_default();
+        let total = u64::try_from(managed.event_count()).unwrap_or(0);
+        assert_eq!(
+            managed.prefix_digest(total),
+            Ok(Digest::of(encoded.as_bytes()))
+        );
+        let header_and_two: usize = encoded.split_inclusive('\n').take(3).map(str::len).sum();
+        assert_eq!(
+            managed.prefix_digest(2),
+            Ok(Digest::of(&encoded.as_bytes()[..header_and_two]))
+        );
+        let body: String = encoded.split_inclusive('\n').skip(1).collect();
+        assert_eq!(managed.body_digest(), Digest::of(body.as_bytes()));
+        assert!(managed.prefix_digest(total.saturating_add(1)).is_err());
+    }
+
     #[test]
     fn a_bad_version_is_rejected_as_its_own_error() {
         let raw = header_line(SESSION_FORMAT_TAG, 99, "s");
@@ -1813,7 +2166,7 @@ mod tests {
             decoded,
             Err(SessionError::UnsupportedVersion {
                 found: 99,
-                expected: SESSION_FORMAT_VERSION
+                expected: SESSION_FORMAT_VERSION_MANAGED
             })
         );
     }

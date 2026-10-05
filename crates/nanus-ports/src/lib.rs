@@ -64,8 +64,10 @@
     clippy::manual_unwrap_or_default
 )]
 
+pub mod artifact;
 pub mod capabilities;
 pub mod clock;
+pub mod context;
 pub mod control;
 pub mod error;
 pub mod fs;
@@ -85,18 +87,27 @@ use core::pin::Pin;
 
 use nanus_kernel::ServiceKey;
 
+pub use artifact::{
+    ArtifactError, ArtifactHandle, ArtifactStore, CaptureFailure, CaptureFinalization,
+    CaptureLease, CaptureLimits, RawCaptureSink, SendBoxFuture,
+};
 pub use capabilities::{ImageInputSupport, ImageProfile, ModelCapabilities, RequestEstimate};
 pub use clock::{ClockHandle, ClockPort};
+pub use context::{
+    CheckpointError, CheckpointReason, CheckpointView, ContextRuntime, ExpectedCheckpoint,
+    FinalizedArtifact, PersistenceState, Reconciled, SessionCheckpoint, TurnRuntime,
+};
 pub use control::{PolicyError, ToolPolicy, ToolPolicyDecision, TurnControl};
 pub use error::{PortError, PortResult};
 pub use fs::{
-    DirEntry, EditOutcome, FileMeta, FileRead, FsError, FsHandle, FsPort, FsResult, SearchKind,
-    SearchMatch, SearchOutcome, SearchQuery, WriteMode, WriteOutcome, check_edit_count,
-    ensure_within, normalize, occurrence_count,
+    DirEntry, EditOutcome, FileIdentity, FileMeta, FileRead, FsError, FsHandle, FsPort, FsResult,
+    RangeRead, SearchKind, SearchMatch, SearchOutcome, SearchQuery, WriteMode, WriteOutcome,
+    check_edit_count, ensure_within, normalize, occurrence_count,
 };
 pub use llm::{
     ChatRequest, FinishReason, LlmError, LlmEvent, LlmHandle, LlmPort, LlmResult, LlmStream,
-    ReasoningEffort, ToolCallAssembler, error_body_snippet, truncate_chars,
+    ManagedRequest, ManagedSupport, OVERSIZED_ARGUMENTS, PreparedModelCall, ReasoningEffort,
+    ToolArgumentLimits, ToolCallAssembler, error_body_snippet, truncate_chars,
 };
 pub use nanus_domain::{ApprovalOutcome, ApprovalPolicy, SandboxMode, ToolAccess};
 pub use record_admission::{
@@ -105,9 +116,9 @@ pub use record_admission::{
 };
 pub use secret::{Secret, SecretError, SecretHandle, SecretPort, SecretResult};
 pub use shell::{
-    Captured, DEFAULT_MAX_OUTPUT_BYTES, PLATFORM_SHELL, PLATFORM_SHELL_FLAG, SandboxPolicy,
-    ShellError, ShellEvent, ShellHandle, ShellOutcome, ShellPort, ShellRequest, ShellResult,
-    ShellStream,
+    Captured, CapturedOutcome, DEFAULT_MAX_OUTPUT_BYTES, PLATFORM_SHELL, PLATFORM_SHELL_FLAG,
+    SandboxPolicy, ShellCapture, ShellError, ShellEvent, ShellHandle, ShellOutcome, ShellPort,
+    ShellRequest, ShellResult, ShellStream,
 };
 pub use sse::SseFrames;
 pub use store::{SessionSummary, StoreError, StoreHandle, StorePort, StoreResult};

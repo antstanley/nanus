@@ -64,6 +64,19 @@ pub enum BundleError {
     /// The kernel refused a composition step.
     #[error("composition failed: {0}")]
     Kernel(String),
+
+    /// Managed context refused, with its stable code.
+    ///
+    /// Distinct from [`BundleError::Context`], which is the legacy fitter's refusal: a managed
+    /// refusal names one of the closed codes a host and a test can act on, and never carries
+    /// source content.
+    #[error("managed context refused ({code}): {message}")]
+    Managed {
+        /// The stable code.
+        code: nanus_domain::context::managed::ErrorCode,
+        /// A bounded, content-free explanation.
+        message: String,
+    },
 }
 
 impl BundleError {
@@ -91,6 +104,26 @@ impl BundleError {
     /// Builds a [`BundleError::Session`].
     pub fn session(message: impl Into<String>) -> Self {
         Self::Session(message.into())
+    }
+
+    /// Builds a [`BundleError::Managed`].
+    pub fn managed(
+        code: nanus_domain::context::managed::ErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Managed {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The managed-context code, for a managed refusal.
+    #[must_use]
+    pub const fn managed_code(&self) -> Option<nanus_domain::context::managed::ErrorCode> {
+        match self {
+            Self::Managed { code, .. } => Some(*code),
+            _ => None,
+        }
     }
 }
 

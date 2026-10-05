@@ -42,6 +42,8 @@ nanus-adapter-store = { workspace = true, optional = true }
 # The optional `read_video` tool, installed only when the configuration asks for it.
 nanus-tool-video = { workspace = true, optional = true }
 futures = { workspace = true }
+# The process-held key a managed session seals its recall and inspect cursors with.
+getrandom = { workspace = true }
 serde = { workspace = true }
 globset = { workspace = true }
 tokio = { workspace = true }

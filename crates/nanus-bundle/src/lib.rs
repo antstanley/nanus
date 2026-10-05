@@ -100,6 +100,7 @@ pub mod agent_loop;
 pub mod args;
 #[cfg(feature = "stock-compose")]
 pub mod authorize;
+pub mod checkpoint;
 #[cfg(feature = "stock-compose")]
 pub mod compose;
 pub mod error;
@@ -113,9 +114,10 @@ pub mod tools;
 #[cfg(feature = "stock-compose")]
 mod video;
 
-pub use agent_loop::{AgentRunner, Approver, Progress, RunOutcome, Silent};
+pub use agent_loop::{AgentRunner, Approver, ManagedRun, Progress, RunOutcome, Silent, TurnHost};
 #[cfg(feature = "stock-compose")]
 pub use authorize::PendingAuth;
+pub use checkpoint::{SessionContext, StoreCheckpoint};
 #[cfg(feature = "stock-compose")]
 pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, ProviderSwitch, compose};
 pub use error::BundleError;

@@ -13,10 +13,12 @@
 
 use std::path::PathBuf;
 
+use nanus_domain::context::managed::{CheckpointReceipt, ErrorCode};
 use nanus_domain::{Session, SessionId};
 use serde::{Deserialize, Serialize};
 
 use crate::LocalBoxFuture;
+use crate::context::{CheckpointError, CheckpointView, ExpectedCheckpoint};
 
 /// A shared, key-addressable session store.
 pub type StoreHandle = std::rc::Rc<Box<dyn StorePort>>;
@@ -40,6 +42,10 @@ pub trait StorePort {
     /// Deleting a session that is not there is not an error: the caller asked
     /// for it to be gone, and it is. Any name it was known by goes with it, so a
     /// later session cannot inherit an alias for something that no longer exists.
+    ///
+    /// Deletion takes exclusive ownership first: a session another writer holds is refused with
+    /// [`StoreError::Locked`]. The id is retired with the session, so a stale save through a
+    /// handle that still holds the old conversation cannot recreate it.
     fn delete<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<()>>;
 
     /// Records `name` as another way to reach an existing session.
@@ -113,6 +119,40 @@ pub trait StorePort {
     /// Releasing a claim this process does not hold does nothing: the holder is whoever the
     /// operating system says it is, and a claim held by another process is not ours to release.
     fn release_lock(&self, id: &SessionId);
+
+    /// Reads the identity of the stored file: its body version, digest and event count.
+    ///
+    /// [`ExpectedCheckpoint::Absent`] when nothing is stored. The digest is of the bytes on
+    /// disk, never of a re-encoding, which is what lets a checkpoint detect an older writer.
+    fn stored_identity<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> LocalBoxFuture<'a, StoreResult<ExpectedCheckpoint>> {
+        let _ = id;
+        Box::pin(async {
+            Err(StoreError::Unsupported {
+                operation: "stored identity",
+            })
+        })
+    }
+
+    /// Commits a checkpoint under this process's claim on the session.
+    ///
+    /// Verifies the expected stored identity and the exact candidate, that every newly referenced
+    /// artifact is finalized, and every bound, then atomically replaces the file. The default
+    /// refuses with the previous file untouched.
+    fn checkpoint<'a>(
+        &'a self,
+        view: CheckpointView<'a>,
+    ) -> LocalBoxFuture<'a, Result<CheckpointReceipt, CheckpointError>> {
+        let _ = view;
+        Box::pin(async { Err(CheckpointError::NotCommitted(ErrorCode::UnsupportedMode)) })
+    }
+
+    /// The archive this store keeps beside its sessions, when it keeps one.
+    fn artifacts(&self) -> Option<&dyn crate::artifact::ArtifactStore> {
+        None
+    }
 }
 
 /// The result type of every store operation.
@@ -226,6 +266,20 @@ pub enum StoreError {
         path: PathBuf,
         /// The rendered failure.
         message: String,
+    },
+
+    /// The session was deleted, and its id cannot be written again.
+    #[error("session {id} was deleted; its id is retired")]
+    Retired {
+        /// The retired id.
+        id: String,
+    },
+
+    /// This store does not implement the operation.
+    #[error("this store does not support {operation}")]
+    Unsupported {
+        /// What was asked for.
+        operation: &'static str,
     },
 }
 
