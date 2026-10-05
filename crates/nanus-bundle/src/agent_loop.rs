@@ -696,6 +696,7 @@ impl AgentRunner {
                     position: (turn, 0),
                     approver,
                     control,
+                    managed: None,
                 },
                 reservation.as_deref(),
             )
@@ -741,6 +742,7 @@ impl AgentRunner {
                             position: (turn, steps),
                             approver: context.approver,
                             control: context.control,
+                            managed: None,
                         },
                         reservation,
                     )
@@ -786,7 +788,7 @@ impl AgentRunner {
         context: dispatch::Phase<'_>,
         turn_reservation: Option<&dyn nanus_ports::TurnRecordReservation>,
     ) -> Result<StepOutcome, BundleError> {
-        let _selection_hold = self.hold_selection()?;
+        let _selection_hold = self.hold_selection(false)?;
         let position = context.position;
         let (request, elision, reservation) =
             self.begin_step_records(session, position, turn_reservation)?;
@@ -818,7 +820,12 @@ impl AgentRunner {
         }
         let mut stream = self.llm.borrow().stream_chat(request);
         let assembled = self
-            .consume_stream(&mut stream, progress, context.control)
+            .consume_stream(
+                &mut stream,
+                progress,
+                context.control,
+                nanus_ports::ToolArgumentLimits::default(),
+            )
             .await?;
         drop(stream); // Release the model response before host validation or native dispatch.
         let interrupted = assembled.interrupted;
@@ -936,6 +943,7 @@ impl AgentRunner {
             position,
             approver,
             control,
+            managed,
         } = context;
         let mut unreserved = admission::Unreserved {
             admission: self.admission.clone(),
@@ -949,9 +957,24 @@ impl AgentRunner {
             });
             progress.tool_started(&call.id, &call.name, &call.arguments);
         }
-        let mut results = self.gate_batch(calls, progress, approver, control).await;
+        // A mutating proposal must be alone in its batch: one that is not refuses every call in
+        // the batch, in model order, before any approval, admission or effect.
+        let mut results = match managed.and_then(|_| Self::refuse_mixed(calls)) {
+            Some(refused) => refused
+                .into_iter()
+                .zip(calls)
+                .map(|(result, call)| Some(self.finish_result(call, result, progress)))
+                .collect(),
+            None => {
+                self.gate_batch(calls, progress, approver, (control, managed.is_some()))
+                    .await
+            }
+        };
+        if let Some(managed) = managed {
+            Self::refuse_over_capacity(session, calls, &mut results, managed);
+        }
         self.admit_images(session, calls, &mut results, progress);
-        let reservation = match self.reserve_batch(session, position, calls, &results) {
+        let reservation = match self.reserve_batch(session, position, calls, &results, managed) {
             Ok(reservation) => {
                 unreserved.admission = None; // Owned lease now retires handles even on Drop.
                 reservation
@@ -964,6 +987,10 @@ impl AgentRunner {
         };
         let lease = reservation.as_deref();
         self.admit_batch(calls, &mut results, progress, lease);
+        if let Some(managed) = managed {
+            self.reserve_captures(session, calls, &results, managed)
+                .await;
+        }
         self.execute_permitted(
             session,
             calls,
@@ -972,12 +999,19 @@ impl AgentRunner {
             dispatch::Dispatch {
                 control,
                 reservation: lease,
+                managed,
             },
         )
         .await;
         Self::append_results(session, calls, results);
+        if let Some(managed) = managed {
+            Self::publish_captures(session, calls, managed);
+        }
         if let Some(lease) = lease {
-            let (request, _) = self.build_request(session)?;
+            let request = match managed {
+                Some(managed) => self.effective_request(session, managed)?,
+                None => self.build_request(session)?.0,
+            };
             lease
                 .commit(&request)
                 .map_err(|error| BundleError::context(error.to_string()))?;
@@ -1176,12 +1210,16 @@ impl AgentRunner {
         call: &ToolCall,
         approver: Option<&dyn Approver>,
         control: Option<&dyn TurnControl>,
+        managed: bool,
     ) -> Option<ToolResult> {
         if control.is_some_and(TurnControl::is_cancelled) {
             return Some(interrupted_result(call));
         }
         if crate::goal_tools::is_goal_tool(&call.name) {
             return None;
+        }
+        if managed && crate::context_tools::is_context_tool(&call.name) {
+            return self.gate_context(call, control).await;
         }
         // The access is copied out and the borrow released before anything is awaited: the
         // decision below can take as long as a person takes, and a registry borrow held that
@@ -1437,6 +1475,8 @@ struct Assembled {
     partial: Vec<PartialCall>,
     /// Whether the stream was cut short by a stop request rather than finishing.
     interrupted: bool,
+    /// Raw argument limits by tool name; empty outside a managed step.
+    limits: nanus_ports::ToolArgumentLimits,
 }
 
 impl Assembled {
@@ -1468,6 +1508,7 @@ impl Default for Assembled {
             usage: None,
             partial: Vec::new(),
             interrupted: false,
+            limits: nanus_ports::ToolArgumentLimits::default(),
         }
     }
 }
@@ -1478,6 +1519,8 @@ struct PartialCall {
     id: Option<ToolCallId>,
     name: Option<ToolName>,
     arguments: String,
+    /// Whether the arguments passed their tool's limit and were dropped unparsed.
+    oversized: bool,
 }
 
 impl Assembled {
@@ -1490,7 +1533,11 @@ impl Assembled {
                     id,
                     name,
                     arguments: arguments.to_owned(),
+                    oversized: false,
                 });
+                if let Some(last) = self.partial.last_mut() {
+                    bound(last, &self.limits);
+                }
                 return;
             }
             None => {
@@ -1507,7 +1554,10 @@ impl Assembled {
         if name.is_some() {
             target.name = name;
         }
-        target.arguments.push_str(arguments);
+        if !target.oversized {
+            target.arguments.push_str(arguments);
+        }
+        bound(target, &self.limits);
     }
 
     /// Turns the partial calls into complete ones.
@@ -1520,6 +1570,14 @@ impl Assembled {
                 continue;
             };
             let id = call.id.unwrap_or_else(|| ToolCallId::new(""));
+            if call.oversized {
+                self.calls.push(ToolCall::new(
+                    id,
+                    name,
+                    serde_json::Value::String(nanus_ports::OVERSIZED_ARGUMENTS.to_owned()),
+                ));
+                continue;
+            }
             // An empty fragment is a legitimate "no arguments"; anything that does
             // not parse remains a non-object string, and the registry's validation turns
             // that into a message rather than a silent no-op.
@@ -1534,6 +1592,22 @@ impl Assembled {
             });
             self.calls.push(ToolCall::new(id, name, arguments));
         }
+    }
+}
+
+/// Drops a call's buffered arguments once they pass its tool's limit.
+///
+/// Checked whenever the name is known — including a name that arrives after its arguments —
+/// and before anything is parsed, so an oversized context call never becomes a JSON value and
+/// never holds more than its limit in memory past the delta that crossed it.
+fn bound(call: &mut PartialCall, limits: &nanus_ports::ToolArgumentLimits) {
+    let limit = call
+        .name
+        .as_ref()
+        .and_then(|name| limits.limit_for(name.as_str()));
+    if limit.is_some_and(|limit| call.arguments.len() > limit) {
+        call.oversized = true;
+        call.arguments = String::new();
     }
 }
 
@@ -2561,6 +2635,12 @@ mod tests {
             SessionEvent::ToolCall { .. } => "tool_call",
             SessionEvent::ToolResult { .. } => "tool_result",
             SessionEvent::GoalChange { .. } => "goal_change",
+            SessionEvent::ContextMode { .. } => "context_mode",
+            SessionEvent::ContextRevision { .. } => "context_revision",
+            SessionEvent::ContextDecision { .. } => "context_decision",
+            SessionEvent::ArtifactPublished { .. } => "artifact_published",
+            SessionEvent::RequestAttempt { .. } => "request_attempt",
+            SessionEvent::ContextRecovery { .. } => "context_recovery",
         }
     }
 

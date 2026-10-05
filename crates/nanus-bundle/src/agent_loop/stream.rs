@@ -10,10 +10,14 @@ impl AgentRunner {
         stream: &mut nanus_ports::LlmStream,
         progress: &mut dyn Progress,
         control: Option<&dyn TurnControl>,
+        limits: nanus_ports::ToolArgumentLimits,
     ) -> Result<Assembled, BundleError> {
         use futures::StreamExt as _;
 
-        let mut assembled = Assembled::default();
+        let mut assembled = Assembled {
+            limits,
+            ..Assembled::default()
+        };
         loop {
             let next = until_cancelled(control, stream.next()).await;
             let Some(next) = next else {

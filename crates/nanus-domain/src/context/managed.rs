@@ -31,7 +31,7 @@ pub mod state;
 pub mod tooling;
 
 pub use compile::{
-    Effective, GoalProvenance, MANUAL_POLICY_V1, NoticeFacts, Reminder, Selection,
+    Effective, GoalProvenance, MANUAL_POLICY_V1, MEMORY_LABEL, NoticeFacts, Reminder, Selection,
     derive_effective_context, manual_policy_digest,
 };
 pub use fragments::{Fragment, Fragments, MANAGE_TOOL, RECALL_TOOL};

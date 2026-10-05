@@ -103,11 +103,13 @@ pub mod authorize;
 pub mod checkpoint;
 #[cfg(feature = "stock-compose")]
 pub mod compose;
+pub mod context_tools;
 pub mod error;
 pub mod goal_tools;
 pub mod guard;
 #[cfg(feature = "stock-compose")]
 pub mod provider;
+mod recall;
 #[cfg(feature = "stock-compose")]
 pub mod selection;
 pub mod tools;

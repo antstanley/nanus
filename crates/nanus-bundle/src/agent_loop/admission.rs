@@ -29,6 +29,7 @@ impl AgentRunner {
         position: (u32, u32),
         calls: &[ToolCall],
         results: &[Option<ToolResult>],
+        managed: Option<&super::managed::ManagedTurn<'_>>,
     ) -> Result<Option<Box<dyn ToolBatchReservation>>, BundleError> {
         let Some(admission) = &self.admission else {
             return Ok(None);
@@ -44,12 +45,17 @@ impl AgentRunner {
             .map(|(call, result)| Some(result.clone().unwrap_or_else(|| refusal(call))))
             .collect();
         Self::append_results(&mut prospective, calls, base);
-        let (fitted_base, _) = self.build_request(&prospective)?;
+        // A managed step's next request is its effective one; the legacy fitter never runs here.
+        let fitted_base = match managed {
+            Some(managed) => self.effective_request(&prospective, managed)?,
+            None => self.build_request(&prospective)?.0,
+        };
         let mut request = fitted_base.clone();
         request.messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
         request.messages.extend(prospective.derive_messages());
         let llm = self.llm();
         let estimate = |request: &nanus_ports::ChatRequest| llm.estimate_request(request);
+        let revision = managed.map(|_| super::managed::ManagedTurn::revision(session));
         let projection = ToolBatchProjection {
             session_id: session.id(),
             position,
@@ -61,7 +67,11 @@ impl AgentRunner {
             calls,
             outcomes: results,
             estimate: &estimate,
-            managed: None,
+            managed: revision.map(|revision| nanus_ports::tool_admission::ManagedProjection {
+                revision,
+                effective: &fitted_base,
+                estimate_effective: &estimate,
+            }),
         };
         let reservation = admission
             .reserve(&projection)

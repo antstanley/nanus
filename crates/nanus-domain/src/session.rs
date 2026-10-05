@@ -1156,6 +1156,16 @@ impl Session {
         out
     }
 
+    /// Returns the exact byte length [`Session::try_to_jsonl`] would produce, without
+    /// allocating it: every check that encoder makes, and the 64 MiB bound.
+    ///
+    /// # Errors
+    ///
+    /// The same refusals as [`Session::try_to_jsonl`].
+    pub fn encoded_len(&self) -> Result<usize, SessionError> {
+        self.checked_len()
+    }
+
     /// Encodes a bounded session, validating content before any store write.
     ///
     /// # Errors
@@ -1163,6 +1173,18 @@ impl Session {
     /// Refuses malformed media, oversized records, sessions exceeding 64 MiB, a managed record
     /// in a body older than version 3, and a managed record that breaks its own invariants.
     pub fn try_to_jsonl(&self) -> Result<String, SessionError> {
+        let length = self.checked_len()?;
+        let encoded = self.to_jsonl();
+        assert_eq!(
+            encoded.len(),
+            length,
+            "the checked length is the encoded length"
+        );
+        Ok(encoded)
+    }
+
+    /// Validates and measures the encoding; the body of [`Session::try_to_jsonl`].
+    fn checked_len(&self) -> Result<usize, SessionError> {
         let mut total = 0_usize;
         for (index, event) in self.log.events().iter().enumerate() {
             let line = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2);
@@ -1236,8 +1258,7 @@ impl Session {
             .ok_or_else(|| SessionError::BadHeader {
                 line: 1,
                 reason: "session exceeds 64 MiB".into(),
-            })?;
-        Ok(self.to_jsonl())
+            })
     }
 
     /// Builds the header line this session is written with.

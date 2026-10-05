@@ -36,13 +36,50 @@ pub struct ManagedState {
 impl ManagedState {
     /// Folds and validates the managed records of a log.
     ///
+    /// A reset is a barrier. What came before the last reset revision is read only for the
+    /// facts a reset preserves — the policy records, the highest revision number, the last
+    /// decision — and is never validated as a selection, so a reset recovers a session whose
+    /// earlier projection is invalid without executing it. Everything from the reset on is
+    /// validated strictly.
+    ///
     /// # Errors
     ///
     /// Returns the code of the first record that breaks the chain.
     pub fn fold(log: &SessionLog) -> Result<Self, ErrorCode> {
+        let events = log.events();
+        let barrier = events
+            .iter()
+            .rposition(|event| {
+                matches!(event, SessionEvent::ContextRevision { payload }
+                    if payload.reason == super::records::RevisionReason::Reset)
+            })
+            .unwrap_or(0);
         let mut state = Self::default();
+        for (index, event) in events.iter().enumerate().take(barrier) {
+            match event {
+                SessionEvent::ContextMode { payload } => {
+                    state.policy = Some(payload.policy);
+                    state.mode_seq = u64::try_from(index).ok();
+                }
+                SessionEvent::ContextRevision { payload } => {
+                    state.max_revision = state.max_revision.max(payload.revision);
+                    state.accepted = Some((**payload).clone());
+                }
+                SessionEvent::ContextDecision { payload } => {
+                    state.last_decision = Some((**payload).clone());
+                }
+                _ => {}
+            }
+        }
+        state.fold_strict(events, barrier)?;
+        Ok(state)
+    }
+
+    /// Folds `events[start..]` strictly onto the state the prefix left.
+    fn fold_strict(&mut self, events: &[SessionEvent], start: usize) -> Result<(), ErrorCode> {
+        let state = self;
         let mut accepted_ids: BTreeSet<&str> = BTreeSet::new();
-        for (index, event) in log.events().iter().enumerate() {
+        for (index, event) in events.iter().enumerate().skip(start) {
             let seq = u64::try_from(index).map_err(|_| ErrorCode::SourceCorrupt)?;
             match event {
                 SessionEvent::ContextMode { payload } => {
@@ -56,8 +93,14 @@ impl ManagedState {
                         .max_revision
                         .checked_add(1)
                         .ok_or(ErrorCode::StaleBase)?;
+                    // A reset's base is the highest number before it, whatever was selected.
+                    let base = if index == start && start > 0 {
+                        state.max_revision
+                    } else {
+                        state.revision()
+                    };
                     let chained = payload.revision == next
-                        && payload.base_revision == state.revision()
+                        && payload.base_revision == base
                         && payload.base_frontier.event_count <= seq;
                     if !chained || !accepted_ids.insert(&payload.decision_id) {
                         return Err(ErrorCode::StaleBase);
@@ -79,7 +122,7 @@ impl ManagedState {
                 _ => {}
             }
         }
-        Ok(state)
+        Ok(())
     }
 
     /// Returns the highest syntactically valid revision number, without validating selections.
@@ -494,6 +537,43 @@ mod tests {
         assert_eq!(
             ManagedState::fold(replayed.log()),
             Err(ErrorCode::StaleBase)
+        );
+    }
+
+    /// T35: a reset revision is a barrier — an invalid selection before it is never validated
+    /// or executed, numbers keep rising, and the selection after it is empty.
+    #[test]
+    fn a_reset_recovers_an_invalid_projection_and_keeps_numbers_monotonic() {
+        let mut session = session();
+        session.append(SessionEvent::UserMessage { text: "go".into() });
+        work(&mut session, "a", "read");
+        let first = revision(&session, 1, 0, Vec::new());
+        session.append(SessionEvent::ContextRevision { payload: first });
+        let jump = revision(&session, 5, 1, Vec::new());
+        session.append(SessionEvent::ContextRevision { payload: jump });
+        assert!(
+            ManagedState::fold(session.log()).is_err(),
+            "a broken chain refuses"
+        );
+        assert_eq!(ManagedState::highest_revision(session.log()), 5);
+
+        let mut reset = revision(&session, 6, 5, Vec::new());
+        reset.reason = RevisionReason::Reset;
+        reset.author = RevisionAuthor::Host;
+        session.append(SessionEvent::ContextRevision { payload: reset });
+        let state = ManagedState::fold(session.log());
+        assert_eq!(state.as_ref().map(ManagedState::revision), Ok(6));
+        assert_eq!(state.as_ref().map(|state| state.hidden().len()), Ok(0));
+
+        let mut restarted = session.clone();
+        let mut low = revision(&restarted, 6, 5, Vec::new());
+        low.reason = RevisionReason::Reset;
+        low.author = RevisionAuthor::Host;
+        low.decision_id = "d:again".into();
+        restarted.append(SessionEvent::ContextRevision { payload: low });
+        assert!(
+            ManagedState::fold(restarted.log()).is_err(),
+            "numbers never restart"
         );
     }
 
