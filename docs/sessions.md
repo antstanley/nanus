@@ -65,6 +65,22 @@ save. The legacy infallible `to_jsonl` remains for trusted in-memory compatibili
 use the fallible writer. CLI/link projections show summaries, never duplicate image blobs.
 The runner mutates memory; hosts own saving before success/Done acknowledgment.
 
+A session that enables [managed context](context-management.md) is written as body version 3 and
+also retains its context mode, revision and decision records, archive receipts, request-attempt
+records and recovery records. Readers accept versions 1, 2 and 3; an older body that carries one
+of the version-3 records is refused rather than read. The model's effective request is a derived
+view and never replaces the transcript. A managed host checkpoints accepted events and projection
+changes before the next model request uses them, so a checkpoint can hold a settled open turn: it
+is not a completed answer. Enabling upgrades a body through that checkpoint; nothing downgrades
+one. Archived shell output lives beside the log, under the session's own directory:
+
+```text
+    01a09a98-.../
+      artifacts/
+        <uuid>.raw         a finalized capture, named by its artifact/published receipt
+        <uuid>.partial     staging, or an orphan nothing references
+```
+
 ## Naming
 
 A name is how a session is found again, so it is taken for good: starting a second session
@@ -125,11 +141,16 @@ the port says deleting something absent is not an error: the caller asked for it
 and it is. Reporting success for a typo would leave somebody believing a conversation is
 gone while it is still on disk.
 
-Deleting removes the session's directory, so its name and its log go together and no alias
-is left pointing at nothing. It is not reversible, and nothing here knows whether an agent
-somewhere is holding the session: a held session can still be saved again by the turn
-writing it, which recreates the directory. Stop the agent, or attach and let it go, before
-deleting one it is serving.
+Deleting removes the session's directory, so its name, its log and its archive go together and
+no alias is left pointing at nothing. It is not reversible.
+
+Deletion requires exclusive session ownership: a session held by another writer is refused, by
+name, exactly as a second writer is. The deletion retires the session's id and moves the whole
+directory into the store's trash in one step, then removes the bytes and reclaims their archive
+quota. A stale save — a writer that loaded the session before it was deleted — cannot recreate
+it: a save, a checkpoint or a claim for a retired id is refused. A crash part way through is
+finished the next time the store opens, and never reversed. Names continue to be aliases rather
+than identity, and go with the session. This applies to every session, legacy ones included.
 
 ## What a session says about itself
 
@@ -201,10 +222,18 @@ Two things about the claim are worth knowing. It is a file beside the log (`lock
 operating system locks while the holder has it open, labelled with the holder's pid and a
 word for what it is. The lock is what decides — it is atomic, so two writers starting at the
 same instant cannot both be first — and the kernel releases it when the holder exits, however
-it exits, so a lock a crashed process left behind is not an owner anybody has to detect. And
-it is advisory: any process can write a session's log directly, and `nanus sessions delete`
-does not consult it. What it defends against is another `nanus` — the ordinary way two
-writers meet — not a deliberate one.
+it exits, so a lock a crashed process left behind is not an owner anybody has to detect.
+Session deletion consults exclusive ownership and retires the session id. The claim remains
+advisory against unrelated same-user programs that edit files directly; supported `nanus`
+deletion and save operations cannot race to recreate a retired conversation.
+
+A resumed managed session validates its last committed projection and artifact references
+before it runs. A checkpoint that holds an open turn is closed as interrupted under the writer
+claim before new work is admitted: a recovery record, an `unknown_dispatch` outcome for every
+request intent that never finished, and the turn's end. Nothing reruns an old tool call or treats
+a saved request intent as a completed response. Missing artifacts are reported as unavailable
+evidence. An invalid projection refuses managed continuation until the session's context is
+explicitly reset to legacy replay, or the store is repaired.
 
 Reading without continuing is `nanus tui --session`, which needs no agent and no key,
 because a transcript that has already been written down is just a file.
@@ -291,8 +320,6 @@ flight and is emptied as soon as that turn is in the log.
   holding a session and a connection racing to open the same one would be — are one claim
   rather than two, and the store answers a re-claim from the process that already has it.
   That is correct for the shipped agents, which are one per process.
-- **Deleting does not consult the claim.** `nanus sessions delete` removes a session another
-  agent is writing, and the holder's next save recreates the directory. Stop the agent first.
 - **No deletion in the interface.** `nanus sessions delete <ref>` removes a session and
   releases its name; the interface has no key for it yet, so a conversation is removed from
   the CLI rather than from the screen it is being read on.
