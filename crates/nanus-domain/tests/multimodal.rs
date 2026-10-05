@@ -137,3 +137,64 @@ fn signed_replay_cannot_smuggle_pixels_or_change_the_executable_response() {
         );
     }
 }
+
+/// Newer Claude models add `caller` to a `tool_use` block; the API takes the block back with it,
+/// so a replay that carries it must validate — and survive a session file — while a caller of
+/// any other shape, or any other unknown field, is still refused, and the error names it.
+#[test]
+fn a_tool_call_naming_its_caller_replays_and_a_malformed_caller_does_not() {
+    use nanus_domain::message::AssistantReplay;
+    use nanus_domain::{ToolCall, ToolCallId, ToolName};
+    let call = ToolCall::new(
+        ToolCallId::new("toolu_01"),
+        ToolName::new("read").unwrap(),
+        serde_json::json!({"file_path": "src/lib.rs"}),
+    );
+    let with_caller = |caller: serde_json::Value| AssistantReplay {
+        protocol: "anthropic.messages".into(),
+        prefix_digest: "a".repeat(64),
+        blocks: vec![serde_json::json!({
+            "type": "tool_use", "id": "toolu_01", "name": "read",
+            "input": {"file_path": "src/lib.rs"}, "caller": caller
+        })],
+    };
+    for caller in [
+        serde_json::json!({"type": "direct"}),
+        serde_json::json!({"type": "code_execution_20260120", "tool_id": "srvtoolu_01"}),
+    ] {
+        let replay = with_caller(caller);
+        assert!(
+            replay
+                .validate_response(None, std::slice::from_ref(&call))
+                .is_ok()
+        );
+        let round =
+            serde_json::from_value::<AssistantReplay>(serde_json::to_value(&replay).unwrap());
+        assert_eq!(
+            round.unwrap(),
+            replay,
+            "the caller survives a session file unchanged"
+        );
+    }
+    for caller in [
+        serde_json::json!("direct"),
+        serde_json::json!({}),
+        serde_json::json!({"type": ""}),
+        serde_json::json!({"type": "direct", "extra": "hidden"}),
+        serde_json::json!({"type": "code_execution_20260120", "tool_id": ""}),
+    ] {
+        assert!(with_caller(caller.clone()).validate().is_err(), "{caller}");
+    }
+    let unknown = AssistantReplay {
+        blocks: vec![serde_json::json!({
+            "type": "tool_use", "id": "toolu_01", "name": "read",
+            "input": {}, "toolset": "hidden"
+        })],
+        ..with_caller(serde_json::json!({"type": "direct"}))
+    };
+    let error = unknown.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("tool_use") && error.contains("toolset"),
+        "{error}"
+    );
+}

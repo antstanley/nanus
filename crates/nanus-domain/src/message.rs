@@ -340,7 +340,20 @@ fn validate_replay_block(block: &Value) -> Result<(), crate::content::ContentErr
                     .is_some_and(|name| ToolName::new(name).is_ok())
                 && block["input"].is_object() =>
         {
-            &["type", "id", "name", "input"]
+            // Newer models name who invoked the tool — `{"type": "direct"}`, or a server tool
+            // with its id — and the API accepts the block back with it. Kept, so the replay is
+            // the original block; checked, so it is the documented shape and nothing more.
+            match object.get("caller") {
+                None => &["type", "id", "name", "input"],
+                Some(caller) if is_tool_caller(caller) => {
+                    &["type", "id", "name", "input", "caller"]
+                }
+                Some(_) => {
+                    return Err(ContentError::new(
+                        "malformed caller on a tool_use replay block",
+                    ));
+                }
+            }
         }
         _ => {
             return Err(ContentError::new(
@@ -349,9 +362,38 @@ fn validate_replay_block(block: &Value) -> Result<(), crate::content::ContentErr
         }
     };
     if object.len() != fields.len() || !object.keys().all(|key| fields.contains(&key.as_str())) {
-        return Err(ContentError::new("unknown assistant replay fields"));
+        // Field names, never values: a value can be a signature or tool input, and the names are
+        // what a reader needs to tell a provider's new field from a malformed block.
+        let unexpected: Vec<&str> = object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !fields.contains(key))
+            .collect();
+        let kind = block["type"].as_str().unwrap_or("?");
+        return Err(ContentError::new(format!(
+            "unknown assistant replay fields on a {kind} block: {}",
+            unexpected.join(", ")
+        )));
     }
     Ok(())
+}
+
+/// Whether a `tool_use` block's `caller` has the documented shape: an object with a non-empty
+/// string `type` (`direct`, or a server tool's version) and, for a server tool, a non-empty
+/// string `tool_id`, and no other field.
+fn is_tool_caller(caller: &Value) -> bool {
+    let Some(object) = caller.as_object() else {
+        return false;
+    };
+    let non_empty = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    non_empty("type")
+        && object.keys().all(|key| key == "type" || key == "tool_id")
+        && (!object.contains_key("tool_id") || non_empty("tool_id"))
 }
 
 impl<'de> Deserialize<'de> for AssistantReplay {
