@@ -48,11 +48,18 @@ pub struct Source {
 }
 impl Source {
     pub fn new() -> LlmResult<Self> {
+        Self::tagged(b"")
+    }
+    pub fn revised() -> LlmResult<Self> {
+        Self::tagged(b"nanus.responses.instructions.v1:")
+    }
+    fn tagged(tag: &[u8]) -> LlmResult<Self> {
         let mut writer = Writer {
             hash: Sha256::new(),
             used: 0,
             limit: nanus_domain::content::SESSION_BYTES_MAX,
         };
+        writer.write_all(tag).map_err(|_| refused())?;
         writer.write_all(b"[").map_err(|_| refused())?;
         Ok(Self {
             writer,

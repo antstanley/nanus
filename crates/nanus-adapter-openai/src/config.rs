@@ -254,6 +254,7 @@ pub struct OpenAiConfig {
     response_limits: Option<nanus_ports::ResponseLimits>,
     function_strictness: Option<bool>,
     stateless_responses: bool,
+    instruction_revisions: bool,
     protocol: Protocol,
     protocol_preference: ProtocolPreference,
     /// The `ChatGPT` account a subscription request names in its own header.
@@ -276,6 +277,7 @@ impl core::fmt::Debug for OpenAiConfig {
             .field("response_limits", &self.response_limits)
             .field("function_strictness", &self.function_strictness)
             .field("stateless_responses", &self.stateless_responses)
+            .field("instruction_revisions", &self.instruction_revisions)
             .field("protocol", &self.protocol)
             .field("protocol_preference", &self.protocol_preference)
             .field("account_id", &self.account_id)
@@ -294,6 +296,19 @@ impl OpenAiConfig {
     #[must_use]
     pub const fn stateless_responses(&self) -> bool {
         self.stateless_responses
+    }
+
+    /// Allows trusted leading-System changes at new user turns in stateless Responses.
+    /// Disabled by default. Requires stateless mode and revision-aware history from its start;
+    /// legacy receipts are never upgraded or rewritten. No model output can enable this policy.
+    pub const fn set_instruction_revisions(&mut self, enabled: bool) {
+        self.instruction_revisions = enabled;
+    }
+
+    /// Whether original response receipts retain bounded historical instruction snapshots.
+    #[must_use]
+    pub const fn instruction_revisions(&self) -> bool {
+        self.instruction_revisions
     }
 
     /// Selects an explicit function-schema policy; absence retains the provider default.
@@ -332,6 +347,7 @@ impl OpenAiConfig {
             response_limits: None,
             function_strictness: None,
             stateless_responses: false,
+            instruction_revisions: false,
             protocol: Protocol::ChatCompletions,
             protocol_preference: ProtocolPreference::Automatic,
             account_id: None,

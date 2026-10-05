@@ -42,6 +42,7 @@ fn context_receipts_are_closed_bounded_optional_and_cannot_be_relabelled_as_mess
             .is_none()
     );
     let receipt = ReplayContext {
+        instructions: None,
         budget: 64000,
         dropped_turns: 1,
         dropped_messages: 3,

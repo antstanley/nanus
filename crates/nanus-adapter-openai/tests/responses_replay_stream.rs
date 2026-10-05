@@ -374,6 +374,7 @@ fn complete_replay_envelope_and_escaping_are_counted_before_retaining_the_last_i
 fn admitted_context_receipts_survive_original_items_and_count_before_each_clone() {
     use nanus_domain::message::ReplayContext;
     let receipt = ReplayContext {
+        instructions: None,
         budget: 64000,
         dropped_turns: 1,
         dropped_messages: 4,

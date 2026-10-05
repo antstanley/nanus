@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::{OPENAI_BASE_URL, OpenAiConfig, Protocol, ProtocolPreference, Vendor};
 
 mod digest;
+mod instructions;
 
 /// An admitted exact JSON body and receipts, for a caller-managed stateless Responses dispatch.
 /// Preparation performs no HTTP or tool execution and authenticates no provider ciphertext.
@@ -69,8 +70,9 @@ fn prepare_mode(
     .map_err(|_| refused())?;
     nanus_domain::content::serialized_size(source, nanus_domain::content::SESSION_BYTES_MAX)
         .map_err(|_| refused())?;
+    let instructions = instructions::capture(config, source)?;
     let controls = controls(config, request, source)?;
-    let source_digest = source_prefixes(source, &controls)?;
+    let source_digest = source_prefixes(source, &controls, instructions.as_deref())?;
     crate::function_policy::validate(config, request)?;
     let mut body = super::build_with_input(
         config,
@@ -85,8 +87,10 @@ fn prepare_mode(
         dropped_messages: projection.dropped_messages,
         source_digest,
         wire_digest,
+        instructions,
     };
-    let prefix_digest = binding(&controls, &context_receipt)?;
+    instructions::context_budget(config, &context_receipt)?;
+    let prefix_digest = instructions::original_binding(&controls, &context_receipt)?;
     let estimate = nanus_ports::capabilities::estimate_payload(caps, request, &body)?;
     // Pure measurement must return the complete cost so callers can reserve or refuse it.
     // It grants no receipt to the caller; actual preparation/dispatch still requires a fit.
@@ -117,6 +121,7 @@ fn validate(
     if config.vendor() != Vendor::OpenAi
         || config.base_url().trim_end_matches('/') != OPENAI_BASE_URL
         || config.account_id().is_some()
+        || (config.instruction_revisions() && !config.stateless_responses())
         || config.response_limits().is_none()
         || config.protocol_preference() != ProtocolPreference::Exact(Protocol::Responses)
         || config.resolve_protocol(&request.model)? != Protocol::Responses
@@ -195,8 +200,13 @@ fn binding(controls: &Value, context: &ReplayContext) -> LlmResult<String> {
     )
 }
 
-fn source_prefixes(source: &[Message], controls: &Value) -> LlmResult<String> {
-    let mut hash = digest::Source::new()?;
+fn source_prefixes(
+    source: &[Message],
+    controls: &Value,
+    current: Option<&nanus_domain::message::ReplayInstructions>,
+) -> LlmResult<String> {
+    let mut hash = instructions::source_hash(current.is_some())?;
+    let mut continuity = instructions::Continuity::new(current);
     let mut turns = Vec::new();
     let mut pending = VecDeque::new();
     let mut seen = BTreeSet::new();
@@ -206,8 +216,15 @@ fn source_prefixes(source: &[Message], controls: &Value) -> LlmResult<String> {
         .ok_or_else(refused)?;
     for (index, message) in source.iter().enumerate() {
         match message {
-            Message::System { .. } if index < head => {}
-            Message::User { .. } if pending.is_empty() => turns.push(index),
+            Message::System { .. } if index < head => {
+                if current.is_some() {
+                    continue;
+                }
+            }
+            Message::User { .. } if pending.is_empty() => {
+                turns.push(index);
+                continuity.user();
+            }
             Message::Assistant {
                 replay: Some(replay),
                 text,
@@ -222,8 +239,9 @@ fn source_prefixes(source: &[Message], controls: &Value) -> LlmResult<String> {
                     .map_err(|_| refused())?;
                 let context = replay.context_receipt.as_deref().ok_or_else(refused)?;
                 validate_original_fit(context, &turns, head)?;
+                continuity.observe(context.instructions.as_deref())?;
                 if context.source_digest != hash.prefix()?
-                    || replay.prefix_digest != binding(controls, context)?
+                    || replay.prefix_digest != instructions::original_binding(controls, context)?
                 {
                     return Err(refused());
                 }
@@ -242,6 +260,7 @@ fn source_prefixes(source: &[Message], controls: &Value) -> LlmResult<String> {
     if !pending.is_empty() {
         return Err(refused());
     }
+    continuity.finish()?;
     hash.prefix()
 }
 

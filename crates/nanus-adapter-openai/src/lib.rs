@@ -171,6 +171,9 @@ impl OpenAiLlm {
         {
             return Err(OpenAiError::UnsupportedProtocol);
         }
+        if config.instruction_revisions() && !config.stateless_responses() {
+            return Err(OpenAiError::UnsupportedProtocol);
+        }
         let builder = reqwest::Client::builder();
         // A receipt names one exact endpoint. Redirects cannot silently select a different one.
         let builder = if config.stateless_responses() {

@@ -20,7 +20,7 @@ use core::fmt;
 mod replay_context;
 mod responses_replay;
 
-pub use replay_context::ReplayContext;
+pub use replay_context::{ReplayContext, ReplayInstructions};
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;

@@ -59,6 +59,17 @@ signatures. Explicit library opt-in selects this source/body-aware transport. Pu
 substitute only final balanced batch result values; dispatch requires exact source. Default stock
 composition stays unchanged; publication/adoption and live/native acceptance are not established.
 
+An additional default-off `set_instruction_revisions(true)` adapter policy permits trusted
+leading-System changes at new user turns in stateless Responses. Original contexts retain a
+version-1 instruction snapshot (at most 64 texts and 256 KiB serialized, including escaping),
+with its ordered-array digest. Current instructions travel in the new request; old receipts stay
+bound to their original instructions and unchanged nonprompt controls. The tagged source hash
+retains complete user/assistant/tool history and earlier snapshots. Mid-turn changes, mixed legacy
+histories and missing/altered evidence refuse. Legacy default mode and its serialized hashes stay
+unchanged; opting in never manufactures snapshots for existing responses. Complete snapshots count
+against decoder/record/session limits. These consistency receipts authenticate no external file or
+ciphertext. Downstream consumer and live acceptance are separate from the local adapter tests.
+
 `try_to_jsonl` validates content and 4 MiB records/64 MiB total logs. The store uses it before
 atomic replacement and bounds reads before parsing, leaving the existing log intact on failed
 save. The legacy infallible `to_jsonl` remains for trusted in-memory compatibility; hosts should

@@ -10,6 +10,9 @@ use nanus_ports::{ChatRequest, LlmEvent, ReasoningEffort, ResponseLimits};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+#[path = "responses_request/instructions.rs"]
+mod instructions;
+
 #[path = "responses_request/cost.rs"]
 mod cost;
 

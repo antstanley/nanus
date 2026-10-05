@@ -1,5 +1,13 @@
 # Testing and verification
 
+## Trusted instruction revisions — 2026-10-05
+
+The local default-off instruction-revision policy passes fourteen scoped gates. Original completed
+responses survive changed prompts, session JSONL reload and whole-turn fitting; mid-turn changes,
+legacy/mode mismatch and altered source/control/snapshot evidence refuse. Snapshot count, escaped
+byte and complete decoder limits are exercised. The [certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#instruction-revision-implementation-certificate--5-october-2026)
+records suite counts and scope. Actual downstream adoption and native/live acceptance remain distinct.
+
 ## Responses image costs and pure measurement — 2026-10-05
 
 The local correction passes fourteen scoped gates and retains all 251 frozen runtime inputs.
