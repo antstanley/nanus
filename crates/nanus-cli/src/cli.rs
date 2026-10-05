@@ -988,12 +988,12 @@ fn run_turn(
     finish_harness(&harness)?;
     recorded?;
 
-    report_answer(outcome.map_err(|error| error.to_string())?, verbose)
+    report_answer(&outcome.map_err(|error| error.to_string())?, verbose)
 }
 
 /// Prints a finished run's answer on stdout and its totals on stderr, and says whether it
 /// completed.
-fn report_answer(outcome: nanus_bundle::RunOutcome, verbose: bool) -> Result<(), String> {
+fn report_answer(outcome: &nanus_bundle::RunOutcome, verbose: bool) -> Result<(), String> {
     // A trailing newline is the only decoration stdout gets, and it is there so the
     // answer is a line.
     print!("{}", outcome.answer);
@@ -1128,7 +1128,7 @@ fn run_managed(
     harness.store.release_lock(&id);
     finish_harness(harness)?;
     named?;
-    report_answer(ran.outcome.map_err(|error| error.to_string())?, verbose)
+    report_answer(&ran.outcome.map_err(|error| error.to_string())?, verbose)
 }
 
 /// The sentence a managed run's persistence state warrants, when it warrants one.
@@ -1865,7 +1865,10 @@ mod tests {
         let Ok(args) = args else {
             return;
         };
-        let Some(Command::Run { task, resume, name }) = args.command else {
+        let Some(Command::Run {
+            task, resume, name, ..
+        }) = args.command
+        else {
             panic!("expected a run command");
         };
         assert_eq!(task, vec!["summarize", "this", "repo"]);
