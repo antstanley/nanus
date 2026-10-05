@@ -6,9 +6,9 @@ Current behavior and architecture remain documented in [the documentation index]
 
 ## Change specs
 
-- [Stateless Responses replay and function policy](changes/2026-10-04-responses_replay_and_schema_policy.md) — Local sealed adapter implementation; host instruction revisions, prospective cost measurement and genuine multimodal request input remain required before Hype readiness. Includes the scoped host integration certificate.
+- [Stateless Responses replay and function policy](changes/2026-10-04-responses_replay_and_schema_policy.md) — Local sealed replay and image-cost/measurement corrections; native consumer image/read delivery and replay are locally verified; trusted instruction revisions and changed-brief reload are locally verified; genuine multimodal request input remains required before downstream readiness. Includes the scoped host and cost certificates.
 
-- [Optional admission before user and model records](changes/2026-10-04-model_record_admission.md) — Proposed in this checkout; isolated local candidate implemented and reviewed with final scoped tests/lint/Windows cross-compilation passing. Unpublished; no Hype consumer/adoption or live/native acceptance.
+- [Optional admission before user and model records](changes/2026-10-04-model_record_admission.md) — Proposed in this checkout; isolated local candidate implemented and reviewed with final scoped tests/lint/Windows cross-compilation passing. Unpublished; no downstream consumer/adoption or live/native acceptance.
 
 - [Optional complete tool-batch admission](changes/2026-10-03-tool_batch_admission.md) — Implemented locally, unpublished; complete projections, raw/normalized validation and held-selection callbacks pass scoped credential-free gates. Consumer budgets/authority and native acceptance remain separate.
 - [Enforce declared image-envelope bytes](changes/2026-10-03-enforce_image_envelope_bytes.md) — Implemented locally, unpublished; exact success/failure file-byte enforcement passes credential-free library/downstream gates, with an inline semi-formal certificate; stock credential-aware gates and native Windows execution remain unrun.
@@ -17,10 +17,9 @@ Current behavior and architecture remain documented in [the documentation index]
   snapshots are implemented; remaining provider routes/native certification stay open.
 - [Caller-owned video snapshot certificate](changes/2026-10-03-video_snapshot.review.md) —
   external source construction and opaque lifetime retention, with scoped regressions and
-  no claim of Hype adoption or native Windows execution.
+  no claim of downstream adoption or native Windows execution.
 
-- [Library embedding, argument-aware policy and multimodal tool results](changes/2026-09-30-library_embedding_and_multimodal_results.md) — Proposed; supports the embedded Hype Studio host without Claude plugin support.
-- [Cross-repository semi-formal review](../../hype-studio/.specs/changes/2026-09-30-embed_nanus_rust_agent.review.md) — review of this dependency and the app migration.
+- [Library embedding, argument-aware policy and multimodal tool results](changes/2026-09-30-library_embedding_and_multimodal_results.md) — Proposed; supports an embedding host without Claude plugin support.
 
 - [read_video design review and verification](changes/2026-10-01-read_video_extension.review.md) — Independent semi-formal findings, fixes and successful recheck; records schema checks and repository gate results.
 

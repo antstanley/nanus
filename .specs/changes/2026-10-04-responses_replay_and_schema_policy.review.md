@@ -1,12 +1,12 @@
 # Semi-formal review: Responses policy and replay proposal
 
-**Date:** 2026-10-04 · **Scope:** the [proposed generic change](2026-10-04-responses_replay_and_schema_policy.md), against public Nanus ee1 and Hype B7. This file retains the initial specification review and subsequent scoped patch certificates; none establishes live-model acceptance.
+**Date:** 2026-10-04 · **Scope:** the [proposed generic change](2026-10-04-responses_replay_and_schema_policy.md), against public Nanus ee1 and the consumer's revision under review. This file retains the initial specification review and subsequent scoped patch certificates; none establishes live-model acceptance.
 
 ## Premises
 
 P1. Public ee1 supplies exact routing/tool metadata/response budgets but omits Responses strictness and retains only display reasoning. Existing AssistantReplay validates Anthropic Messages exclusively.
 
-P2. Hype retains optional native tool parameters, manually persists completed sessions and requires encrypted reasoning and call/output continuity. It cannot compensate by dropping tools or changing the selected model.
+P2. The downstream consumer retains optional native tool parameters, manually persists completed sessions and requires encrypted reasoning and call/output continuity. It cannot compensate by dropping tools or changing the selected model.
 
 P3. Nanus remains a minimal provider-neutral harness. App prompts, installers, source authority and paid-analysis decisions remain outside it. Existing stock wire defaults and Anthropic replay must remain valid.
 
@@ -68,7 +68,7 @@ INTERNAL: envelope fields, protocol discriminator, opt-in defaults, bounds and f
 
 ### Step 5 — Edge cases and fixed findings
 
-The review found missing named canonical additions and a loose root schema fragment; explicit per-target Add blocks and an AssistantReplay $def now resolve both. It also caught an incorrect 1 MiB claim for Nanus's existing record limit: the actual limit is 4 MiB; Hype's stricter 1 MiB line limit is now stated separately. Opaque cryptographic validity and hex-case compatibility were corrected above. Supported item-schema evidence and original/live acceptance remain explicit implementation requirements.
+The review found missing named canonical additions and a loose root schema fragment; explicit per-target Add blocks and an AssistantReplay $def now resolve both. It also caught an incorrect 1 MiB claim for Nanus's existing record limit: the actual limit is 4 MiB; a host's stricter 1 MiB line limit is now stated separately. Opaque cryptographic validity and hex-case compatibility were corrected above. Supported item-schema evidence and original/live acceptance remain explicit implementation requirements.
 
 This pass read every named target section end to end, not every unrelated section of the four whole canonical pages. The verdict reflects that context limit; it does not certify repo-wide canonical accuracy.
 
@@ -86,7 +86,7 @@ SUGGESTIONS:
 
 P1: The isolated ee1-based candidate changes OpenAI configuration/function encoders,
 adds a separately constructed replay decoder and extends domain validation for Responses.
-It does not enable replay in stock `stream_chat`, publish a revision or change Hype's pin.
+It does not enable replay in stock `stream_chat`, publish a revision or change a downstream pin.
 
 P2: The implemented scope must preserve exact optional parameters, original completed opaque
 items and neutral text/calls; reject invalid/incomplete/over-budget observations before tools;
@@ -179,7 +179,7 @@ inputs: their final changes are confined to the optional OpenAI adapter and its 
 The first local test invocation failed because sandboxed localhost bind was denied; the
 fictional fixture rerun passed. Intermediate lint findings and one ambiguous fixture integer
 were corrected; no lint suppression or weakened production approval was added. Logs and
-source/file receipts remain in `/private/tmp/hype-responses-resume`.
+source/file receipts were kept locally outside the repository.
 
 Windows MSVC-target domain/ports/minimal-library Clippy also passes; this is compilation,
 not native Windows execution or OpenAI transport acceptance. Review of 100 new-file functions
@@ -277,8 +277,7 @@ doctests; embedded default/providers (7/13), Clippy and formatting; runtime-free
 (342) and Clippy; Windows MSVC-target domain/ports/minimal-library Clippy. No drift exists
 in 231 frozen runtime/config/test inputs. Review of 153 new-file functions finds a maximum
 of 59 lines and none over 70. All 86 scoped local links resolve and the JSON fragment
-parses. Logs and source/count receipts are retained under
-`/private/tmp/hype-responses-context`.
+parses. Logs and source/count receipts were kept locally outside the repository.
 
 Intermediate new fixtures had constructor/closure type mistakes and initially omitted required
 added/delta observations; these were corrected to exercise the actual complete decoder lifecycle.
@@ -296,7 +295,7 @@ logic with a narrowly defined result comparison. The preceding immutable-source 
 P2: Actual HTTP must send the exact admitted original-item body and decode using its captured
 receipt. Pure estimates may substitute final complete-batch values but authorize no dispatch.
 P3: Default automatic/Chat/subscription/gateway behavior, existing providers and stock composition
-remain unchanged. Hype's published pin/readiness are not changed by this local preparation.
+remain unchanged. The consumer's published pin/readiness are not changed by this local preparation.
 
 ### Function resolution
 
@@ -362,12 +361,12 @@ nextest 161, Clippy/doctests; embedded default/providers 7/13, Clippy/formatting
 nextest 342 and Clippy; workspace formatting/all-target/all-feature Clippy; Windows MSVC-target
 minimal-library Clippy. All 232 frozen runtime/config/test inputs remain unchanged. Eight new
 cases cover four actual socket/runner paths, two estimator/config and two projection paths.
-188 new-file functions are at most 59 lines. Evidence: `/private/tmp/hype-responses-transport`.
+188 new-file functions are at most 59 lines. Evidence was kept locally outside the repository.
 
 **LIKELY_CORRECT for explicit local transport and prospective estimation; high confidence.**
 Publication/adoption, host record/batch authority, native Windows execution and exact-model live
 acceptance remain open. Credential-aware stock composition was not run. This certificate grants
-no ciphertext authentication and no Hype production readiness or full migration completion.
+no ciphertext authentication and no downstream production readiness or full migration completion.
 
 ## Original-record reconciliation — 5 October 2026
 
@@ -376,4 +375,144 @@ isolated child of sealed `dc9cb610`, retaining current Responses source/receipt/
 definitions while adding original-record admission. Actual stock and hosted HTTP/runner/
 reload/fitting fixtures pass. It fixes cross-turn cancellation answers and defers runner-side
 Responses argument parsing until after host record admission. Neither the sealed parent nor
-production Hype pins are rewritten. Publication/adoption and original acceptance remain open.
+production downstream pins are rewritten. Publication/adoption and original acceptance remain open.
+
+## Responses image-cost and prospective-measurement certificate — 5 October 2026
+
+**Premises.** The consumer needs exact assembled wire bytes and conservative input charges,
+with encoded images replaced by profile costs. Pure estimation must expose an oversized valid
+candidate's complete cost; only actual preparation/transport grants dispatch admission. Source,
+replay, function policy, output reservation and complete final-batch projection remain unchanged.
+
+**Resolution.** `capabilities::estimate_payload` calls `encoded_image_bytes`, now also traversing
+Responses user message `input` content. `responses_image_bytes` accepts only the emitted inline
+`input_image` position; function items, assistant messages, arbitrary schemas and JSON inside text
+retain their complete byte charge. The same `visual_cost` still validates/counts retained pixels.
+`responses::request::prepare_mode` always validates shape, source history, original receipts and
+final-batch projection. It skips only the final `validate_estimate` for the private prospective
+branch; the public estimator returns a cost, never `PreparedResponses`. Preparation and actual
+transport retain the fit check.
+
+**Traces.** Actual valid PNG/JPEG -> exact body -> wire-byte charge including base64 -> input
+charge excluding encoded image strings plus the same visual profile. Different compressible/noisy
+files with identical dimensions change wire bytes but not visual input charges. Image-shaped fields
+in tools, calls, call outputs, assistant messages and text retain all growth. Original completed
+Responses items and paired pixel results pass the actual encoder/preparer. An oversized final
+result produces a conservative estimate; strict preparation and stream dispatch still refuse.
+
+**Regression and edges.** The image regression failed on the parent (684 versus 222 tokens for
+its smallest fixture); the prospective regression failed because measurement prematurely applied
+context admission. Both pass after the fix. Original-source substitutions outside the last complete
+batch and incompatible replay/controls remain rejected by the existing suite. The first broad pass
+found test-only unnecessary qualifications and clones; these were corrected without suppressions.
+The first sandboxed focused run could not bind twelve loopback listeners; the authorized fixture
+rerun passed without any real credential or provider endpoint.
+
+**Verdict: CORRECT for the scoped cost/measurement correction; integration remains PARTIAL.**
+The consumer's actual native result envelope, trusted prompt revisions and real multimodal analysis
+input remain separate consumer work. No app budget/result bound is changed, no effect authority
+is inferred from a number, and no live provider or native Windows execution is established.
+
+**Verification.** All 14 scoped gates pass, with 251 runtime/config/test inputs unchanged:
+affected domain/ports/provider/store tests, minimal runner, all-feature admission/embedding,
+minimal/downstream/runtime-free TUI lint and tests, doctests, formatting and Windows-target minimal
+library lint. Exact per-suite counts are in `/private/tmp/nanus-responses-cost/verification.json`;
+logs and the two red regressions are retained beside it. The suites overlap. Forty-eight functions
+in the changed files are within 70 lines (maximum 59). Credential-aware stock runtime tests and
+paid acceptance remain unrun. This candidate is unpublished and does not change the public pin.
+
+
+## Native consumer cost-adoption evidence — 5 October 2026
+
+The consumer's child of `4610487dd1bc180c53af197f5398fda904d829da` consumes sealed cost source
+`bd5ac14ba17c63dc330c6abe1462a9204ba843ad` with a 251-file receipt. Its six actual coordinator
+fixtures pass, using the original provider encoder/decoder and fictional HTTP only. PNG pixels,
+file text and original provider items survive tool continuation, completed checkpoint reload and
+a new user turn. Native audit records show no repeated effect. An oversized text observation stays
+complete in the audit while the model receives only the bounded refusal and continues successfully.
+
+Function resolution corrects the earlier capacity inference: the consumer's own planner reserves
+full durable/audit envelopes; its own batch type checks actual model delivery against unchanged
+limits, and commit checks again. Prospective oversized costs need not fit as requests. The initial
+old-expectation fixture failed because the tools now succeeded; the corrected positive and adjacent
+overflow cases pass. No result bounds, request budgets, source checks or replay receipts were relaxed.
+The app guard still refuses production readiness for prompt-revision and multimodal-analysis gaps.
+See the consumer's review for its full gate; no live provider/native Windows acceptance is claimed.
+
+## Instruction-revision representation review — 5 October 2026
+
+**Premises.** The host may change its trusted leading System prompt at the next user turn;
+recorded provider items, neutral history and all other dispatch controls remain original.
+Legacy receipts contain no historical instruction snapshot and cannot prove a past revision.
+
+**Resolution.** Explicit `OpenAiConfig` policy authorizes revision mode. Request preparation
+captures bounded original System text; `ReplayContext` carries a versioned snapshot through the
+existing completed decoder/runner/session path. Source-prefix validation uses a tagged incremental
+non-System hash, and validates the unchanged original binding against the captured instructions.
+The complete previous replay objects remain in that hash. Provider output supplies no snapshots.
+
+**Trace.** System A + user 1 -> original response/snapshot A -> persistence -> System B +
+unchanged history + user 2 -> verify response with A -> dispatch B -> capture B. A changed user,
+result, call, schema, effort or snapshot cannot pass the old source/control binding. In-turn
+changes refuse. Whole-turn fitting retains the original source and original fitting counts.
+
+**Findings addressed before implementation.** A policy flag alone would authorize mid-tool-loop
+prompt changes: track the latest user boundary and require equal snapshots within that turn.
+A new mode must not reinterpret old digests: omit the new field for legacy receipts and domain-tag
+the new source hash; reject mixed histories. Historical snapshots duplicate prompt bytes, so use
+explicit count/escaped-byte bounds before cloning and retain complete decoder/record accounting.
+Do not recompute old receipts, hash only visible fitted history, or scan all old prefixes afresh.
+
+**Verdict: LIKELY_CORRECT representation, implementation and consumer proof still required.**
+The domain stores bounded data only. The adapter owns policy and consistency, while the consumer retains
+brief composition and authority. Native/live/package acceptance is not implied by this review.
+
+
+## Instruction-revision implementation certificate — 5 October 2026
+
+**Premises and resolution.** Default-off `set_instruction_revisions` requires exact public
+stateless mode at construction and pure preparation. `capture` counts borrowed leading System
+texts and their escaped snapshot before copying. `ReplayContext::validate` enforces the closed
+version/count/byte shape on domain reload. `source_prefixes` uses the tagged incremental source
+hash and `Continuity`; `original_binding` checks the snapshot digest and borrows historical text
+with current unchanged controls. Only this new mode uses the new borrowed binding format; absent
+snapshots retain the original serialized context and canonical binding bytes. The stream copies
+its context from request preparation, and existing replay capacity counting includes the snapshot.
+
+**Traces.** Original response A -> new host/user turn B -> original A items remain -> response B
+-> completed session JSONL reload -> empty current instructions C -> old A/B snapshots and items
+remain -> whole-turn elision verifies all original source first. Changing an elided user or an
+observed historical tool result refuses. Changing current instructions during a tool turn refuses.
+Changing source/header, model, effort, temperature, schema, strictness, output, snapshot text,
+version or identity refuses; even recomputing a forged snapshot's own digest cannot satisfy the
+unchanged original binding. Legacy/mode mismatch and erased snapshots refuse rather than upgrade.
+
+**Findings fixed.** The original positive regression failed on the parent. Capture now precedes
+control-value allocation, so a large prompt cannot force a snapshot copy before its bound check.
+Historical binding serializes borrowed data rather than cloning combined controls/snapshots.
+The initial malformed-snapshot test targeted `replay` instead of the actual `assistant_replay`
+wire key; the corrected test asserts the real location before mutation. The decoder error fixture
+uses the actual string event boundary. Two test-only lint findings (division and redundant clone)
+were corrected without suppressions. The stream-capacity case proves snapshots consume the selected
+event envelope; exact escaped byte and count limits pass, and the next unit refuses.
+
+**Verification.** All fourteen scoped gates pass with **255 frozen inputs** unchanged:
+provider/domain/ports/store tests, minimal runner, all-feature admission/embedding, standalone
+embedding, runtime-free TUI, formatting, Clippy and Windows-target minimal-library Clippy.
+Seventeen focused original request cases pass. The source review covers 44 functions, at most
+63 lines. Exact suite counts and logs are in `/private/tmp/nanus-responses-instructions/verification.json`;
+the parent failure is retained in `red.log`. The suites overlap; credential-aware stock runtime,
+real providers, native Windows and packaged acceptance were not run.
+
+**Verdict: LIKELY_CORRECT for local instruction revisions; consumer adoption remains required.**
+No original receipt is rewritten, source history is never discarded to permit a revision, and
+no prompt/skill/plugin/setup concept enters the harness. Genuine multimodal analysis, immutable
+publication and original acceptance remain separate work.
+
+
+**Downstream consumer evidence.** Sealed source `dcd7c75ae00b729fb21f74b925866dd3cd84f4f8`
+is consumed through seven local patches and a 255-file receipt. All six actual coordinator cases
+pass, including changed published brief -> new prompt with original response -> stop/reload
+-> same session and retained prior replies. This replaces the former expected refusal. Native
+image/read replay, oversized-result refusal, malformed streams and credential-free app guard
+remain covered. The consumer's own review records its full gate; no live/Windows evidence is inferred.
