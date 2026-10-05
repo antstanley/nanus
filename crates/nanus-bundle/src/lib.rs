@@ -100,6 +100,7 @@ pub mod agent_loop;
 pub mod args;
 #[cfg(feature = "stock-compose")]
 pub mod authorize;
+pub mod capture;
 pub mod checkpoint;
 #[cfg(feature = "stock-compose")]
 pub mod compose;
@@ -119,6 +120,7 @@ mod video;
 pub use agent_loop::{AgentRunner, Approver, ManagedRun, Progress, RunOutcome, Silent, TurnHost};
 #[cfg(feature = "stock-compose")]
 pub use authorize::PendingAuth;
+pub use capture::CaptureBroker;
 pub use checkpoint::{SessionContext, StoreCheckpoint};
 #[cfg(feature = "stock-compose")]
 pub use compose::{DEFAULT_SYSTEM_PROMPT, Harness, ProviderSwitch, compose};
@@ -198,6 +200,34 @@ pub fn build_toolset(
     fs: &FsHandle,
     shell: &ShellHandle,
 ) -> Result<ToolRegistry, nanus_domain::ToolError> {
+    register_toolset(fs, tools::bash_tool(Rc::clone(shell)))
+}
+
+/// Builds the same seven tools as [`build_toolset`], with a `bash` that archives a call's output
+/// when `broker` holds a capture lease for it.
+///
+/// Nothing else differs: the names, the schemas and the count are those of [`build_toolset`], and
+/// a call with no lease filed runs and renders exactly as it would there. See [`capture`].
+///
+/// # Errors
+///
+/// As [`build_toolset`].
+pub fn build_toolset_with_capture(
+    fs: &FsHandle,
+    shell: &ShellHandle,
+    broker: &CaptureBroker,
+) -> Result<ToolRegistry, nanus_domain::ToolError> {
+    register_toolset(
+        fs,
+        tools::bash_tool_with_capture(Rc::clone(shell), broker.clone()),
+    )
+}
+
+/// Registers the six filesystem tools beside the given `bash`.
+fn register_toolset(
+    fs: &FsHandle,
+    bash: ToolDefinition,
+) -> Result<ToolRegistry, nanus_domain::ToolError> {
     let mut registry = ToolRegistry::new();
     let definitions: [ToolDefinition; 7] = [
         tools::read_tool(Rc::clone(fs)),
@@ -206,7 +236,7 @@ pub fn build_toolset(
         tools::read_image_tool(Rc::clone(fs)),
         tools::glob_tool(Rc::clone(fs)),
         tools::grep_tool(Rc::clone(fs)),
-        tools::bash_tool(Rc::clone(shell)),
+        bash,
     ];
     for definition in definitions {
         registry.register(definition)?;
@@ -364,6 +394,24 @@ mod tests {
                 "write"
             ]
         );
+    }
+
+    /// The archiving toolset is the same seven tools with the same schemas: capture is a host
+    /// decision, so nothing about it reaches what the model is offered.
+    #[test]
+    fn the_capturing_toolset_offers_exactly_what_the_plain_one_does() {
+        let broker = CaptureBroker::new();
+        let (Ok(plain), Ok(capturing)) = (
+            build_toolset(&fs_handle(), &shell_handle()),
+            build_toolset_with_capture(&fs_handle(), &shell_handle(), &broker),
+        ) else {
+            panic!("both toolsets build");
+        };
+        assert_eq!(capturing.len(), 7);
+        let wire = |registry: &ToolRegistry| serde_json::to_string(&registry.schemas()).ok();
+        assert!(wire(&plain).is_some());
+        assert_eq!(wire(&plain), wire(&capturing));
+        assert!(broker.is_empty(), "building a toolset files nothing");
     }
 
     #[test]
