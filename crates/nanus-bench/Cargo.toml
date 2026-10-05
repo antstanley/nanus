@@ -78,3 +78,7 @@ harness = false
 [[bench]]
 name = "agent_loop"
 harness = false
+
+[[bench]]
+name = "managed"
+harness = false
