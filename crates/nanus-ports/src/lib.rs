@@ -101,8 +101,9 @@ pub use control::{PolicyError, ToolPolicy, ToolPolicyDecision, TurnControl};
 pub use error::{PortError, PortResult};
 pub use fs::{
     DirEntry, EditOutcome, FileIdentity, FileMeta, FileRead, FsError, FsHandle, FsPort, FsResult,
-    RangeRead, SearchKind, SearchMatch, SearchOutcome, SearchQuery, WriteMode, WriteOutcome,
-    check_edit_count, ensure_within, normalize, occurrence_count,
+    RANGE_READ_MAX_BYTES, RangeRead, SearchCoverage, SearchKind, SearchMatch, SearchOutcome,
+    SearchQuery, WriteMode, WriteOutcome, check_edit_count, ensure_within, normalize,
+    occurrence_count,
 };
 pub use llm::{
     ChatRequest, FinishReason, LlmError, LlmEvent, LlmHandle, LlmPort, LlmResult, LlmStream,

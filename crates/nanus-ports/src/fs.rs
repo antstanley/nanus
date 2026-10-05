@@ -88,6 +88,11 @@ pub trait FsPort {
     /// swapped for a link between the check and the read is refused. The result names the file's
     /// identity at the time of the read and the digest of the returned range — never a claim
     /// about the whole file's contents from metadata alone.
+    ///
+    /// A `max_bytes` above [`RANGE_READ_MAX_BYTES`] is clamped to it rather than refused: the
+    /// result's length and `eof` already say exactly what was read, so a caller that asked for
+    /// more learns it from the answer. An `offset` at or past the end is not an error either; it
+    /// is an empty window with `eof` set, because "there is nothing there" is the true answer.
     fn read_range<'a>(
         &'a self,
         path: &'a Path,
@@ -103,6 +108,12 @@ pub trait FsPort {
         })
     }
 }
+
+/// The most bytes one [`FsPort::read_range`] call returns.
+///
+/// A window is a bounded view, and the bound is the port's rather than each caller's, so no
+/// consumer can turn a ranged read back into a whole-file read by asking for a large one.
+pub const RANGE_READ_MAX_BYTES: usize = 65_536;
 
 /// The identity of a file at the moment it was read: enough to say it changed, not to prove
 /// that it did not.
@@ -319,6 +330,15 @@ pub struct SearchQuery {
     pub case_sensitive: bool,
     /// Whether hidden files are searched.
     pub include_hidden: bool,
+    /// One glob a file must match to be searched at all, when set.
+    ///
+    /// It is part of the query, and not a filter over the result, because the match cap is
+    /// applied to what the search *returns*: filtering afterwards let matches in excluded
+    /// files fill the cap and hide the match the caller asked for. The glob is matched
+    /// against the path relative to the search root, the full path, and the file name, with
+    /// `*` free to cross a separator, so `*.rs` means "every Rust file" at any depth.
+    #[serde(default)]
+    pub include: Option<String>,
 }
 
 impl SearchQuery {
@@ -339,6 +359,7 @@ impl SearchQuery {
             max_file_bytes: Self::DEFAULT_MAX_FILE_BYTES,
             case_sensitive: true,
             include_hidden: false,
+            include: None,
         }
     }
 
@@ -378,6 +399,13 @@ impl SearchQuery {
         self.include_hidden = true;
         self
     }
+
+    /// Searches only the files that match `include`.
+    #[must_use]
+    pub fn with_include(mut self, include: impl Into<String>) -> Self {
+        self.include = Some(include.into());
+        self
+    }
 }
 
 /// One line that matched.
@@ -391,8 +419,13 @@ pub struct SearchMatch {
     pub line: String,
 }
 
-/// What a search found, and whether it stopped early.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What a search found, whether it stopped early, and what it did not look at.
+///
+/// The skip counts exist because "no matches" is only as true as the set of files searched.
+/// A file over the size cap, a binary file and an unreadable file are each passed over
+/// without an error — which is right for a search — and each is a place a match could be
+/// that the result cannot speak for. [`SearchOutcome::coverage`] folds them into one answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchOutcome {
     /// The matches, in traversal order.
     pub matches: Vec<SearchMatch>,
@@ -400,6 +433,59 @@ pub struct SearchOutcome {
     pub truncated: bool,
     /// How many files were considered.
     pub files_scanned: u64,
+    /// How many files a content search passed over for being above the size cap.
+    #[serde(default)]
+    pub skipped_large: u64,
+    /// How many files a content search passed over as binary or as not UTF-8.
+    #[serde(default)]
+    pub skipped_binary: u64,
+    /// How many files a content search could not read.
+    #[serde(default)]
+    pub skipped_unreadable: u64,
+}
+
+impl SearchOutcome {
+    /// How many files in scope were passed over rather than searched.
+    #[must_use]
+    pub const fn skipped(&self) -> u64 {
+        self.skipped_large
+            .saturating_add(self.skipped_binary)
+            .saturating_add(self.skipped_unreadable)
+    }
+
+    /// Whether the result speaks for every file in scope.
+    ///
+    /// Derived rather than stored, so it cannot disagree with the counts it summarises: a
+    /// search is complete only when nothing was skipped and the cap dropped nothing.
+    #[must_use]
+    pub const fn coverage(&self) -> SearchCoverage {
+        if self.truncated || self.skipped() > 0 {
+            SearchCoverage::Partial
+        } else {
+            SearchCoverage::Complete
+        }
+    }
+}
+
+/// Whether a search looked everywhere it was asked to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchCoverage {
+    /// Every file in scope was searched and no match was dropped.
+    Complete,
+    /// Some file was skipped, or the match cap dropped a match.
+    Partial,
+}
+
+impl SearchCoverage {
+    /// The label a result carries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
 }
 
 /// How many times `needle` occurs in `haystack`.
@@ -754,5 +840,51 @@ mod tests {
         assert_eq!(literal.max_results, 5);
         assert!(!literal.case_sensitive);
         assert!(literal.include_hidden);
+        assert_eq!(literal.include, None, "every file is searched unless asked");
+        let narrowed = SearchQuery::literal("/work", "TODO").with_include("*.rs");
+        assert_eq!(narrowed.include.as_deref(), Some("*.rs"));
+    }
+
+    #[test]
+    fn a_search_that_skipped_nothing_is_complete_and_one_that_skipped_a_file_is_not() {
+        let complete = SearchOutcome::default();
+        assert_eq!(complete.coverage(), SearchCoverage::Complete);
+        for partial in [
+            SearchOutcome {
+                skipped_large: 1,
+                ..SearchOutcome::default()
+            },
+            SearchOutcome {
+                skipped_binary: 1,
+                ..SearchOutcome::default()
+            },
+            SearchOutcome {
+                skipped_unreadable: 1,
+                ..SearchOutcome::default()
+            },
+            SearchOutcome {
+                truncated: true,
+                ..SearchOutcome::default()
+            },
+        ] {
+            assert_eq!(partial.coverage(), SearchCoverage::Partial, "{partial:?}");
+        }
+        assert_eq!(SearchCoverage::Partial.as_str(), "partial");
+        assert_eq!(SearchCoverage::Complete.as_str(), "complete");
+    }
+
+    #[test]
+    fn a_query_and_an_outcome_written_before_the_new_fields_still_read() {
+        let outcome = r#"{"matches":[],"truncated":false,"files_scanned":3}"#;
+        let outcome: SearchOutcome = serde_json::from_str(outcome).expect("an old outcome reads");
+        assert_eq!(outcome.files_scanned, 3);
+        assert_eq!(outcome.skipped(), 0);
+        let query = r#"{"root":"/w","pattern":"x","kind":"literal","max_results":1,
+            "max_file_bytes":1,"case_sensitive":true,"include_hidden":false}"#;
+        let query: SearchQuery = serde_json::from_str(query).expect("an old query reads");
+        assert_eq!(query.include, None);
+        // The other direction: a field of the wrong shape is still refused.
+        let wrong = r#"{"matches":[],"truncated":false,"files_scanned":3,"skipped_large":"x"}"#;
+        assert!(serde_json::from_str::<SearchOutcome>(wrong).is_err());
     }
 }
