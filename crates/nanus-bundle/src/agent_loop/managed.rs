@@ -109,6 +109,8 @@ pub(super) struct ManagedTurn<'a> {
     durable: Cell<u64>,
     /// Finalized archive objects the next checkpoint will newly reference.
     artifacts: RefCell<Vec<FinalizedArtifact>>,
+    /// Receipts of streams that could not be reserved, waiting for their call's result.
+    unpublished: RefCell<Vec<nanus_domain::context::managed::ArtifactReceipt>>,
     /// The current step's preparation, staged proposal and attempt.
     step: RefCell<step::StepState>,
     /// The reminder state when the host lends no context runtime.
@@ -130,6 +132,7 @@ impl<'a> ManagedTurn<'a> {
             persistence: RefCell::new(None),
             durable: Cell::new(durable),
             artifacts: RefCell::new(Vec::new()),
+            unpublished: RefCell::new(Vec::new()),
             step: RefCell::new(step::StepState::default()),
             reminder: Cell::new(context.map_or_else(Default::default, ContextRuntime::reminder)),
         }

@@ -2,11 +2,14 @@
 
 use nanus_domain::context::managed::proposal::cursor;
 use nanus_domain::context::managed::{
+    ArtifactReceipt, CaptureReason, CaptureStatus, CaptureStream, RawEncoding,
+};
+use nanus_domain::context::managed::{
     ContextDecision, ContextManageInput, ContextRecallInput, ContextStatus, DecisionOutcome,
     ErrorCode, FragmentDescriptor, MANAGE_TOOL, ManageAction, ManageResult, ManageStatus, limits,
     proposal, state,
 };
-use nanus_domain::{Session, ToolCall, ToolOutcome, ToolResult};
+use nanus_domain::{Session, SessionEvent, ToolCall, ToolOutcome, ToolResult};
 use nanus_ports::control::until_cancelled;
 use nanus_ports::{ToolPolicyDecision, TurnControl};
 
@@ -313,11 +316,13 @@ impl AgentRunner {
 
     /// Whether this runner can capture shell output for the archive.
     pub(in crate::agent_loop) const fn can_capture(&self) -> bool {
-        let _ = self;
-        false
+        self.capture.is_some()
     }
 
-    /// Reserves archive capture for the permitted shell calls of a batch.
+    /// Reserves archive capture for the permitted `bash` calls of a batch.
+    ///
+    /// Best effort once a call is authorized: a refused reservation becomes an unavailable
+    /// receipt for each stream and never changes whether, or how, the command runs.
     pub(in crate::agent_loop) async fn reserve_captures(
         &self,
         session: &Session,
@@ -325,16 +330,80 @@ impl AgentRunner {
         results: &[Option<ToolResult>],
         turn: &ManagedTurn<'_>,
     ) {
-        let _ = (session, calls, results, turn);
+        let (Some(broker), Some(archive)) = (
+            &self.capture,
+            turn.context.and_then(nanus_ports::ContextRuntime::archive),
+        ) else {
+            return;
+        };
+        if !turn.policy().capture_shell {
+            return;
+        }
+        for (call, result) in calls.iter().zip(results) {
+            if result.is_some() || call.name.as_str() != "bash" {
+                continue;
+            }
+            let limits = nanus_ports::CaptureLimits::default();
+            match archive
+                .reserve_capture(session.id(), &call.id, limits)
+                .await
+            {
+                Ok(lease) => {
+                    // A lease left over for this id is handed back and released here.
+                    drop(broker.insert(lease));
+                }
+                Err(failure) => turn.unpublished.borrow_mut().extend(
+                    [CaptureStream::Stdout, CaptureStream::Stderr]
+                        .map(|stream| unavailable(call, stream, failure.reason())),
+                ),
+            }
+        }
     }
 
-    /// Publishes the receipts of a batch's captures, after its results.
+    /// Publishes the receipts of a batch's captures after its results, and queues every
+    /// finalized object for the next checkpoint to verify.
     pub(in crate::agent_loop) fn publish_captures(
+        &self,
         session: &mut Session,
         calls: &[ToolCall],
         turn: &ManagedTurn<'_>,
     ) {
-        let _ = (session, calls, turn);
+        let pending = core::mem::take(&mut *turn.unpublished.borrow_mut());
+        for receipt in pending {
+            session.append(SessionEvent::ArtifactPublished {
+                payload: Box::new(receipt),
+            });
+        }
+        let Some(broker) = &self.capture else {
+            return;
+        };
+        for call in calls {
+            for finalization in broker.take_finalizations(&call.id) {
+                if let Some(artifact) = finalization.artifact {
+                    turn.artifacts.borrow_mut().push(artifact);
+                }
+                session.append(SessionEvent::ArtifactPublished {
+                    payload: Box::new(finalization.receipt),
+                });
+            }
+            broker.discard(&call.id);
+        }
+    }
+}
+
+/// The receipt of a stream nothing could be reserved for.
+fn unavailable(call: &ToolCall, stream: CaptureStream, reason: CaptureReason) -> ArtifactReceipt {
+    ArtifactReceipt {
+        artifact_id: None,
+        call_id: call.id.as_str().to_owned(),
+        stream,
+        retained_bytes: 0,
+        observed_bytes: 0,
+        retained_sha256: None,
+        status: CaptureStatus::Unavailable,
+        reason,
+        encoding: RawEncoding::Raw,
+        chunk_sha256: Vec::new(),
     }
 }
 

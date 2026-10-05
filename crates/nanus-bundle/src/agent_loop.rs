@@ -353,6 +353,8 @@ pub struct AgentRunner {
     records: Option<Rc<dyn nanus_ports::RecordAdmission>>,
     /// Stable selection and three bounded pending choices during admitted steps.
     selection: selection::Selection,
+    /// How archive leases reach the `bash` tool, when its output can be captured.
+    capture: Option<crate::CaptureBroker>,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -408,6 +410,7 @@ impl AgentRunner {
             admission: None,
             records: None,
             selection: selection::Selection::default(),
+            capture: None,
         })
     }
 
@@ -434,6 +437,16 @@ impl AgentRunner {
         admission: Rc<dyn nanus_ports::RecordAdmission>,
     ) -> Self {
         self.records = Some(admission);
+        self
+    }
+
+    /// Lets a managed session with shell capture archive `bash` output through `broker`.
+    ///
+    /// The broker must be the one the registry's `bash` tool was built with
+    /// ([`crate::build_toolset_with_capture`]); a lease handed to any other is never taken.
+    #[must_use]
+    pub fn with_capture(mut self, broker: crate::CaptureBroker) -> Self {
+        self.capture = Some(broker);
         self
     }
 
@@ -1005,7 +1018,7 @@ impl AgentRunner {
         .await;
         Self::append_results(session, calls, results);
         if let Some(managed) = managed {
-            Self::publish_captures(session, calls, managed);
+            self.publish_captures(session, calls, managed);
         }
         if let Some(lease) = lease {
             let request = match managed {
