@@ -408,9 +408,14 @@ iteration; held bytes are per structure built.
 | `sse/limited/segments` | 352.22 µs | 5.6% | 3,155 | 502.67 KiB |
 | `sse/sse_frames/frames` | 707.63 µs | 5.0% | 10,025 | 1.11 MiB |
 | `sse/sse_frames/segments` | 746.88 µs | 3.6% | 8,167 | 966.49 KiB |
-| `stream/anthropic` | 12.42 ms | 10.0% | 36,346 | 34.14 MiB |
+| `stream/anthropic` | 13.89 ms | 8.5% | 30,359 | 3.62 MiB |
 | `stream/deepseek` | 21.04 ms | 11.2% | 52,791 | 7.19 MiB |
 | `stream/openai_chat` | 23.75 ms | 5.4% | 52,790 | 7.11 MiB |
+
+`stream/anthropic` was re-recorded after the Anthropic adapter stopped copying its reply on
+every delta ([below](#what-the-baseline-shows)); it was 12.42 ms, 36,346 allocations and
+34.14 MiB. Its time did not move beyond the noise: on a loopback stream the bytes were the cost,
+not the clock. Its bytes vary by about 1% between runs with how the loopback reads split.
 
 ### What the layout cache changed
 
@@ -441,8 +446,7 @@ drawing a 100-turn session fell from about 2 MiB to about 0.5 MiB.
 ## What the baseline shows
 
 These are observations from the numbers above, recorded so that a fix can be measured
-against them. The first two were found by the first baseline and are fixed; the rest have not
-been changed.
+against them. Those marked fixed have been changed and measured again; the rest have not.
 
 - **Fixed: the interface redrew the whole conversation on every frame.** A frame of a 100-turn
   transcript cost ten times one of 10 turns, and a token at 100 turns about 12.6 ms — a ceiling
@@ -458,11 +462,12 @@ been changed.
   resizing, or toggling a display setting renders every block once at the new conditions:
   `draw/first/100` is about 3 ms and 44 K allocations. That is once per act rather than once
   per frame, and the next thing to make incremental if sessions grow much longer.
-- **Anthropic streaming copies its accumulated reply on every delta.** `absorb_replay_delta`
-  (`crates/nanus-adapter-anthropic/src/wire.rs`) clones the block's text so far, appends the
-  fragment, and stores it back, so the cost is quadratic in the reply's length:
-  `wire/stream/anthropic` allocates 34 MiB for a ~240 KB body, against 7 MiB for DeepSeek
-  decoding a ~460 KB one.
+- **Fixed: Anthropic streaming copied its accumulated reply on every delta.**
+  `absorb_replay_delta` (`crates/nanus-adapter-anthropic/src/wire.rs`) cloned the block's text
+  so far, appended the fragment, and stored it back, so the cost was quadratic in the reply's
+  length: `wire/stream/anthropic` allocated 34.14 MiB for a ~240 KB body. It now appends in
+  place, and allocates 3.62 MiB (30,359 allocations, from 36,346) — about 15.5 bytes per body
+  byte, as DeepSeek and OpenAI do.
 - **The unlimited SSE framer allocates a `Vec` per line.** `SseFrames::push` (`legacy`)
   makes 2.6 times the allocations of the limited `ResponseFrames` reader on the same body.
 - **A grep that finds little is the expensive grep.** `grep/rare` and `grep/include_rs`

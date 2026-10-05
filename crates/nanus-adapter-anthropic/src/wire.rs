@@ -456,6 +456,13 @@ impl StreamAccumulator {
         match frame.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 if let Some(block) = frame.get("content_block") {
+                    // Every later write assigns a field of the stored block, and assigning
+                    // a field of a string or an array panics. Refusing anything but an
+                    // object here, the one place a block is stored, keeps that true.
+                    if !block.is_object() {
+                        self.fail("malformed stream: assistant block is not an object".into());
+                        return;
+                    }
                     if self.replay_blocks.len() >= 256 {
                         self.fail("more than 256 assistant blocks".into());
                         return;
@@ -531,13 +538,12 @@ impl StreamAccumulator {
                 .or_default()
                 .push_str(fragment);
         } else if let Some(block) = self.replay_blocks.get_mut(&index) {
-            let mut text = block
-                .get(field)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            text.push_str(fragment);
-            block[field] = Value::String(text);
+            // Appended in place. Copying the text so far to append one fragment made a
+            // reply cost the square of its length in allocation.
+            match block.get_mut(field) {
+                Some(Value::String(text)) => text.push_str(fragment),
+                _ => block[field] = Value::String(fragment.to_owned()),
+            }
         }
     }
 
@@ -1327,6 +1333,47 @@ mod tests {
             assert_eq!(changed["messages"][1]["content"][0]["type"], "tool_use");
             assert!(!changed.to_string().contains("opaque-signature"));
         }
+    }
+
+    #[test]
+    fn replay_text_is_joined_whether_or_not_the_block_opened_with_it() {
+        // The thinking block opens with its fields and the text block without its own, so
+        // one grows a string the start carried and the other has to start one.
+        let mut accumulator = StreamAccumulator::default();
+        for frame in [
+            json!({ "type": "content_block_start", "index": 0,
+                "content_block": { "type": "thinking", "thinking": "", "signature": "" } }),
+            json!({ "type": "content_block_start", "index": 1,
+                "content_block": { "type": "text" } }),
+            json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "one " } }),
+            json!({ "type": "content_block_delta", "index": 1,
+                "delta": { "type": "text_delta", "text": "first" } }),
+            json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "two" } }),
+            json!({ "type": "content_block_delta", "index": 1,
+                "delta": { "type": "text_delta", "text": " second" } }),
+            json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "signature_delta", "signature": "signed" } }),
+            json!({ "type": "message_stop" }),
+        ] {
+            accumulator.observe_frame(&frame);
+        }
+        let mut replay = None;
+        while let Some(event) = accumulator.take_ready() {
+            if let LlmEvent::AssistantReplay(blocks) = event {
+                replay = Some(blocks);
+            }
+        }
+        let replay = replay.expect("signed blocks retained");
+        assert_eq!(
+            replay.blocks[0],
+            json!({ "type": "thinking", "thinking": "one two", "signature": "signed" })
+        );
+        assert_eq!(
+            replay.blocks[1],
+            json!({ "type": "text", "text": "first second" })
+        );
     }
 
     #[test]
