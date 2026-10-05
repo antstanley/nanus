@@ -183,6 +183,21 @@ pub trait VideoAnalyzer {
     /// The route's identity, recorded in the manifest.
     fn provenance(&self) -> Provenance;
 
+    /// Refuses, before the source is opened, a call this route could not afford.
+    ///
+    /// Asked with the call's question and frame count, before any copy or decode, and answered
+    /// from a worst case: `frames` stills of [`FRAME_EDGE_MAX`](crate::ffmpeg::FRAME_EDGE_MAX)
+    /// pixels a side. It is a cheap early refusal, not the charge: [`VideoAnalyzer::analyze`] still
+    /// accounts for the stills that were actually sampled. Defaults to admitting every call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VideoError::Analysis`] when the route's allowance cannot cover the worst case.
+    fn admit(&self, question: &str, frames: u32) -> Result<(), VideoError> {
+        let _ = (question, frames);
+        Ok(())
+    }
+
     /// Sends exactly these stills, once, with no retry.
     fn analyze<'a>(
         &'a self,

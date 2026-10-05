@@ -207,12 +207,34 @@ struct Run {
     success: bool,
 }
 
+/// Why a bounded run produced nothing usable.
+enum RunError {
+    /// It printed more than its output bound and was killed for it.
+    OutputBound,
+    /// Anything else: a spawn failure, a pipe error, or the deadline.
+    Failed(VideoError),
+}
+
+impl From<RunError> for VideoError {
+    fn from(error: RunError) -> Self {
+        match error {
+            RunError::OutputBound => {
+                Self::Decoder("the decoder printed more than its output bound".to_owned())
+            }
+            RunError::Failed(error) => error,
+        }
+    }
+}
+
 /// Runs `binary` with no shell, no stdin and a cleared environment, under a deadline.
 ///
 /// Output beyond `stdout_max` kills the process: an unbounded pipe is how a hostile file would
-/// turn into unbounded memory. Dropping the future kills the child too, so a cancelled call
-/// leaves nothing running.
-async fn run(binary: &Path, args: &[String], stdout_max: usize) -> Result<Run, VideoError> {
+/// turn into unbounded memory. It is killed the moment the bound is crossed, not at the deadline:
+/// a process whose stdout is no longer read blocks on the write and never closes its stderr, so
+/// waiting for both pipes to end would turn every overflow into a thirty-second stall. Dropping
+/// the future kills the child too, so a cancelled call leaves nothing running.
+async fn run(binary: &Path, args: &[String], stdout_max: usize) -> Result<Run, RunError> {
+    let failed = |message: String| RunError::Failed(VideoError::Decoder(message));
     let mut child = Command::new(binary)
         .args(args)
         .env_clear()
@@ -221,17 +243,24 @@ async fn run(binary: &Path, args: &[String], stdout_max: usize) -> Result<Run, V
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|error| VideoError::Decoder(format!("{}: {error}", binary.display())))?;
+        .map_err(|error| failed(format!("{}: {error}", binary.display())))?;
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
-        return Err(VideoError::Decoder("the decoder has no pipes".to_owned()));
+        return Err(failed("the decoder has no pipes".to_owned()));
     };
     let cap = |limit: usize| u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
     let work = async {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = out.take(cap(stdout_max));
-        let (read_out, read_err) =
-            tokio::join!(out.read_to_end(&mut stdout), drain_tail(err, &mut stderr));
+        let read_stdout = async {
+            let read = out.read_to_end(&mut stdout).await;
+            if stdout.len() > stdout_max {
+                // Unblocks the stderr drain below: a dead process closes its pipes.
+                let _ignored = child.start_kill();
+            }
+            read
+        };
+        let (read_out, read_err) = tokio::join!(read_stdout, drain_tail(err, &mut stderr));
         read_out.and(read_err)?;
         if stdout.len() > stdout_max {
             return Ok(None);
@@ -245,17 +274,16 @@ async fn run(binary: &Path, args: &[String], stdout_max: usize) -> Result<Run, V
     match finished {
         Err(_) => {
             let _ignored = child.kill().await;
-            Err(VideoError::Decoder(format!(
+            Err(failed(format!(
                 "the decoder ran past its {}-second deadline",
                 PROCESS_DEADLINE.as_secs()
             )))
         }
-        Ok(Err(error)) => Err(VideoError::Decoder(error.to_string())),
+        Ok(Err(error)) => Err(failed(error.to_string())),
         Ok(Ok(None)) => {
+            // Reaps the child the bound already killed.
             let _ignored = child.kill().await;
-            Err(VideoError::Decoder(
-                "the decoder printed more than its output bound".to_owned(),
-            ))
+            Err(RunError::OutputBound)
         }
         Ok(Ok(Some((stdout, stderr, status)))) => Ok(Run {
             stdout,
@@ -350,16 +378,21 @@ impl FfmpegDecoder {
         info: &MediaInfo,
         target_ms: u64,
     ) -> Result<Option<SampledFrame>, VideoError> {
-        let offset = i64::try_from(target_ms)
-            .unwrap_or(i64::MAX)
-            .saturating_add(info.start_offset_ms);
+        let target = i64::try_from(target_ms).unwrap_or(i64::MAX);
+        let offset = target.saturating_add(info.start_offset_ms);
         // A coarse seek into the input, then an exact one on the output: with `-copyts` the
         // second is absolute, so a container whose index lands the first one late (MPEG
         // program streams do) still yields the frame at the target rather than a later one.
+        //
+        // The two seeks are on different clocks. FFmpeg adds the file's start time to an input
+        // `-ss` itself, so the coarse seek is relative to the start of the video and must not
+        // carry the offset again: counted twice, a stream starting 20 seconds in is sought 20
+        // seconds past every target, and from past the end nothing decodes at all. The stream's
+        // start is never before the file's, so this lands at or before `offset - preroll`.
         let exact = format!("{:.3}", ms_to_seconds(offset.max(0)));
         let coarse = format!(
             "{:.3}",
-            ms_to_seconds(offset.saturating_sub(SEEK_PREROLL_MS).max(0))
+            ms_to_seconds(target.saturating_sub(SEEK_PREROLL_MS).max(0))
         );
         for quality in ["4", "10", "20"] {
             let args = frame_arguments(snapshot, info, [&coarse, &exact], quality);
@@ -367,8 +400,8 @@ impl FfmpegDecoder {
             let produced = match produced {
                 Ok(produced) => produced,
                 // A frame over the byte bound is retried at lower quality; anything else is final.
-                Err(VideoError::Decoder(message)) if message.contains("output bound") => continue,
-                Err(error) => return Err(error),
+                Err(RunError::OutputBound) => continue,
+                Err(RunError::Failed(error)) => return Err(error),
             };
             if !produced.success {
                 return Err(VideoError::Media(format!(
@@ -670,6 +703,33 @@ mod tests {
         assert!(missing.iter().any(|m| m.contains("hevc")), "{missing:?}");
         assert!(missing.iter().any(|m| m.contains("avi")), "{missing:?}");
         assert!(!missing.iter().any(|m| m.contains("webm")), "{missing:?}");
+    }
+
+    /// A process that overflows its output bound is killed at once and reported as the bound,
+    /// which is what lets a frame too large at one quality be retried at a lower one. Waiting for
+    /// it instead stalls on the blocked write until the deadline, and reads as a timeout.
+    #[cfg(unix)]
+    #[test]
+    fn an_output_over_its_bound_is_cut_off_at_once_not_at_the_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let flood = ["-c".to_owned(), "head -c 4000000 /dev/zero".to_owned()];
+        let result = runtime.block_on(run(Path::new("/bin/sh"), &flood, 1024 * 1024));
+        assert!(matches!(result, Err(RunError::OutputBound)));
+        assert!(
+            started.elapsed() < PROCESS_DEADLINE / 3,
+            "the overflow took {:?}",
+            started.elapsed()
+        );
+        // The other direction: output within the bound is returned whole, not cut off.
+        let small = ["-c".to_owned(), "head -c 1000 /dev/zero".to_owned()];
+        let Ok(within) = runtime.block_on(run(Path::new("/bin/sh"), &small, 1024 * 1024)) else {
+            panic!("output within the bound is not an error");
+        };
+        assert_eq!((within.stdout.len(), within.success), (1000, true));
     }
 
     /// Dropping a call kills its decoder: a cancelled `read_video` leaves nothing running.

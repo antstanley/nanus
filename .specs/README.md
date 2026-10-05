@@ -1,10 +1,12 @@
 # Nanus change specifications
 
-**Status:** Draft · **Date:** 2026-10-04 · **Owner:** Ant Stanley · **Scope:** Repo-wide proposals
+**Status:** Draft · **Date:** 2026-10-05 · **Owner:** Ant Stanley · **Scope:** Repo-wide proposals
 
 Current behavior and architecture remain documented in [the documentation index](../docs/README.md). This directory holds requested change proposals, not a second canonical description of the implemented code.
 
 ## Change specs
+
+- [Stateless Responses replay and function policy](changes/2026-10-04-responses_replay_and_schema_policy.md) — Local sealed adapter implementation; host instruction revisions, prospective cost measurement and genuine multimodal request input remain required before Hype readiness. Includes the scoped host integration certificate.
 
 - [Optional admission before user and model records](changes/2026-10-04-model_record_admission.md) — Proposed in this checkout; isolated local candidate implemented and reviewed with final scoped tests/lint/Windows cross-compilation passing. Unpublished; no Hype consumer/adoption or live/native acceptance.
 

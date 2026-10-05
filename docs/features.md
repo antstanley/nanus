@@ -138,10 +138,12 @@ result that exceeds its declaration is replaced by a failure. A tool that declar
 admitted against nor bound. **Budget:** each analysis reserves its estimated input plus the whole
 output ceiling against `video_analysis_budget` before it is sent, and settles to the usage the
 provider reports; a request that fails, reports no usage or is cancelled keeps its whole reservation,
-and a budget that cannot cover one answer refuses the call before the file is opened.
+and a budget that cannot cover the call's worst case — its question, the requested frames at 1024
+pixels a side, and one answer — refuses it before the file is opened.
 
 Bounds: a 128 MiB source of at most an hour, 8192 pixels an edge; four JPEGs of at most 512 KiB and
-1024 pixels on the long edge; 30 seconds per decoder process and 180 for the whole call; 32 KiB of
+1024 pixels on the long edge; 30 seconds per decoder process and 180 for the whole call, whose failure names the stage it
+interrupted; 32 KiB of
 result text; an analysis is one request with no retry. The tool declares `Execute` access, so the
 approval policy applies to it as to `bash`. See [SAFETY.md](../SAFETY.md#read_video) and the
 [evidence](vision-evidence.md#read_video).

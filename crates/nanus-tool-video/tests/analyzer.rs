@@ -362,3 +362,33 @@ fn a_budget_that_cannot_cover_an_answer_refuses_before_any_request() {
     };
     assert!(error.to_string().contains("analysis budget"), "{error}");
 }
+
+/// Admission is the worst case known before the video is opened: four full-size stills can be
+/// refused by a budget that covers one answer, and one still on the same budget is admitted.
+#[test]
+fn admission_refuses_what_the_budget_cannot_cover_at_full_size() {
+    let llm: nanus_ports::LlmHandle = Rc::new(Box::new(Scripted {
+        events: Vec::new(),
+        requests: Rc::default(),
+        supported: true,
+    }));
+    let budget = nanus_tool_video::AnalysisBudget::new(6_000);
+    let analyzer = LlmAnalyzer::new(llm, "gpt-6-luna", provenance())
+        .expect("a verified model")
+        .with_budget(Rc::clone(&budget))
+        .expect("the budget covers one answer");
+    let error = analyzer
+        .admit("what changed?", 4)
+        .expect_err("four 1024-pixel stills and an answer exceed 6000 tokens");
+    assert!(error.to_string().contains("analysis budget"), "{error}");
+    analyzer
+        .admit("what changed?", 1)
+        .expect("one still and an answer fit in 6000 tokens");
+    assert_eq!(budget.spent(), 0, "admission reserves nothing");
+
+    // With no budget there is nothing to refuse against.
+    let hanging: nanus_ports::LlmHandle = Rc::new(Box::new(Hanging));
+    let unbudgeted =
+        LlmAnalyzer::new(hanging, "gpt-6-luna", provenance()).expect("a verified model");
+    assert!(unbudgeted.admit("what changed?", 4).is_ok());
+}

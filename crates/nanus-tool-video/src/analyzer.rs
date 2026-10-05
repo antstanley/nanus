@@ -4,15 +4,16 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use futures::StreamExt as _;
+use nanus_domain::content::ImageDimensions;
 use nanus_domain::{ContentBlock, Message, ToolCall, ToolCallId, ToolName, ToolSchema};
 use nanus_ports::{
-    ChatRequest, FinishReason, ImageInputSupport, LlmEvent, LlmHandle, LocalBoxFuture,
-    ReasoningEffort,
+    ChatRequest, FinishReason, ImageInputSupport, ImageProfile, LlmEvent, LlmHandle,
+    LocalBoxFuture, ReasoningEffort,
 };
 use serde_json::json;
 
 use crate::VideoError;
-use crate::media::{Analysis, AnalysisRequest, AnalysisUsage, Provenance, VideoAnalyzer};
+use crate::media::{Analysis, AnalysisRequest, AnalysisUsage, Provenance, VideoAnalyzer, Window};
 
 /// The most answer text one analysis may return.
 pub const ANSWER_BYTES_MAX: usize = 24 * 1024;
@@ -22,6 +23,9 @@ pub const ANSWER_TOKENS: u32 = 2048;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 /// The name of the declaration that lets a provider accept an image-bearing tool result.
 const CARRIER: &str = "sample_frames";
+/// What admission allows per still beyond its pixels: the label and the wire's image framing,
+/// charged at a token a byte as the estimate charges text. Both are well under this.
+const STILL_TEXT_TOKENS: u64 = 256;
 
 /// A host-owned allowance of tokens for analysis requests.
 ///
@@ -101,6 +105,7 @@ impl Reservation {
 pub struct LlmAnalyzer {
     llm: LlmHandle,
     model: String,
+    profile: ImageProfile,
     provenance: Provenance,
     request_tokens: u32,
     budget: Option<std::rc::Rc<AnalysisBudget>>,
@@ -137,6 +142,7 @@ impl LlmAnalyzer {
         Ok(Self {
             llm,
             model: model.to_owned(),
+            profile,
             provenance,
             request_tokens: ANSWER_TOKENS,
             budget: None,
@@ -228,6 +234,43 @@ impl LlmAnalyzer {
         Ok(chat)
     }
 
+    /// The most one call of `frames` stills could reserve, known before any still exists.
+    ///
+    /// The request's text is estimated as it will be sent, with the widest window a call can
+    /// name; each still is reserved at the sampler's largest size, with room for its label.
+    fn worst_case_tokens(&self, question: &str, frames: u32) -> Result<u64, VideoError> {
+        let fail =
+            |error: &dyn std::fmt::Display| VideoError::Analysis(format!("read_video: {error}"));
+        let widest = crate::args::SOURCE_MS_MAX;
+        let text = self.request(&AnalysisRequest {
+            question: question.to_owned(),
+            window: Window {
+                start_ms: widest,
+                end_ms: widest,
+            },
+            frames: Vec::new(),
+        })?;
+        let estimate = self
+            .llm
+            .estimate_request(&text)
+            .map_err(|error| fail(&error))?;
+        let edge = crate::ffmpeg::FRAME_EDGE_MAX;
+        let still = self
+            .profile
+            .reserved_tokens(ImageDimensions {
+                width: edge,
+                height: edge,
+            })
+            .map_err(|error| fail(&error))?;
+        Ok(u64::from(estimate.input_tokens)
+            .saturating_add(
+                u64::from(still)
+                    .saturating_add(STILL_TEXT_TOKENS)
+                    .saturating_mul(u64::from(frames)),
+            )
+            .saturating_add(u64::from(self.request_tokens)))
+    }
+
     /// The lowest effort step the model takes: describing stills does not need deliberation.
     fn cheapest_effort(&self) -> Option<ReasoningEffort> {
         let levels = self.llm.effort_levels(&self.model);
@@ -251,6 +294,21 @@ Do not call any tool.";
 impl VideoAnalyzer for LlmAnalyzer {
     fn provenance(&self) -> Provenance {
         self.provenance.clone()
+    }
+
+    fn admit(&self, question: &str, frames: u32) -> Result<(), VideoError> {
+        let Some(budget) = &self.budget else {
+            return Ok(());
+        };
+        let needed = self.worst_case_tokens(question, frames)?;
+        if needed > budget.remaining() {
+            return Err(VideoError::Analysis(format!(
+                "read_video: the analysis budget has {} tokens left and {frames} stills may \
+                 need {needed}; ask for fewer frames",
+                budget.remaining()
+            )));
+        }
+        Ok(())
     }
 
     fn analyze<'a>(

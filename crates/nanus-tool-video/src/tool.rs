@@ -1,5 +1,6 @@
 //! The tool itself: validation, routing, sampling and delivery.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -104,6 +105,20 @@ impl ToolExecutor for ReadVideoExecutor {
 
 /// Validates the call and runs it under the whole-call deadline.
 async fn outcome(services: &VideoServices, call: &ToolCall) -> ToolOutcome {
+    outcome_within(services, call, CALL_DEADLINE).await
+}
+
+/// [`outcome`] under `deadline`, which a test can make short.
+///
+/// The deadline is shorter than the sum of the stages' own (a probe and four frames at thirty
+/// seconds each, and two minutes of analysis), so a call can run out of time in any of them.
+/// The failure names the stage that was running, because "the call was slow" does not tell the
+/// model whether a shorter window, fewer frames, or a different mode would help.
+async fn outcome_within(
+    services: &VideoServices,
+    call: &ToolCall,
+    deadline: Duration,
+) -> ToolOutcome {
     let request = match call
         .arguments_object()
         .map_err(|error| VideoError::Argument(error.to_string()))
@@ -112,14 +127,45 @@ async fn outcome(services: &VideoServices, call: &ToolCall) -> ToolOutcome {
         Ok(request) => request,
         Err(error) => return ToolOutcome::failure(error.to_string()),
     };
-    match tokio::time::timeout(CALL_DEADLINE, read(services, &request)).await {
+    let stage = Cell::new(Stage::Routing);
+    match tokio::time::timeout(deadline, read(services, &request, &stage)).await {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(error)) => ToolOutcome::failure(error.to_string()),
         Err(_) => ToolOutcome::failure(format!(
-            "read_video: the call ran past its {}-second deadline",
-            CALL_DEADLINE.as_secs()
+            "read_video: the call ran past its {}-second deadline while {}",
+            deadline.as_secs(),
+            stage.get().doing()
         )),
     }
+}
+
+/// What a call was doing, for a deadline that interrupts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Routing,
+    Copying,
+    Probing,
+    Sampling,
+    Delivering,
+    Analysing,
+}
+
+impl Stage {
+    const fn doing(self) -> &'static str {
+        match self {
+            Self::Routing => "choosing an analysis route",
+            Self::Copying => "copying the source",
+            Self::Probing => "probing the source",
+            Self::Sampling => "sampling frames",
+            Self::Delivering => "assembling the frames",
+            Self::Analysing => "waiting for the analysis model",
+        }
+    }
+}
+
+/// The question an analysis is asked: the caller's, or the default.
+fn question(request: &VideoReadArguments) -> &str {
+    request.question.as_deref().unwrap_or(DEFAULT_QUESTION)
 }
 
 /// The resolved delivery.
@@ -132,9 +178,10 @@ enum Delivery {
 async fn read(
     services: &VideoServices,
     request: &VideoReadArguments,
+    stage: &Cell<Stage>,
 ) -> Result<ToolOutcome, VideoError> {
-    // The route is settled before the file is opened: a call that cannot be delivered must not
-    // cost a copy, a decode or a paid request.
+    // The route is settled before the file is opened: a call that cannot be delivered, or that
+    // the route cannot afford, must not cost a copy, a decode or a paid request.
     let delivery = match request.mode {
         RequestedMode::Frames => {
             if !services.routing.main_model_sees_images() {
@@ -148,12 +195,17 @@ async fn read(
         }
         RequestedMode::Auto if services.routing.main_model_sees_images() => Delivery::Frames,
         RequestedMode::Auto | RequestedMode::Analyze => {
-            Delivery::Analyze(services.routing.analyzer().await?)
+            let analyzer = services.routing.analyzer().await?;
+            analyzer.admit(question(request), request.max_frames)?;
+            Delivery::Analyze(analyzer)
         }
     };
+    stage.set(Stage::Copying);
     let snapshot = services.source.snapshot(&request.file_path).await?;
+    stage.set(Stage::Probing);
     let info = services.decoder.probe(&snapshot).await?;
     let (window, clamped) = resolve_window(request, &info)?;
+    stage.set(Stage::Sampling);
     let mut sample = services
         .decoder
         .sample(&snapshot, &info, window, request.max_frames)
@@ -162,6 +214,10 @@ async fn read(
     // Nothing below reads the source again; dropping the snapshot removes the copy.
     let digest = snapshot.sha256.clone();
     drop(snapshot);
+    stage.set(match delivery {
+        Delivery::Frames => Stage::Delivering,
+        Delivery::Analyze(_) => Stage::Analysing,
+    });
     deliver(request, &info, window, &digest, sample, delivery).await
 }
 
@@ -265,10 +321,7 @@ async fn deliver(
             set(&mut manifest, "mode", json!("analyze"));
             let analysis = analyzer
                 .analyze(&AnalysisRequest {
-                    question: request
-                        .question
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_QUESTION.to_owned()),
+                    question: question(request).to_owned(),
                     window,
                     frames: sample.frames.clone(),
                 })
@@ -338,4 +391,167 @@ fn backend(provenance: &Provenance, analysis: &Analysis) -> Value {
         );
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use nanus_domain::ToolCallId;
+    use nanus_ports::LocalBoxFuture;
+
+    use super::*;
+    use crate::media::Snapshot;
+
+    /// A source whose copy never finishes, counting how often it was asked.
+    #[derive(Default)]
+    struct StalledSource {
+        opened: Cell<u32>,
+    }
+
+    impl VideoSource for StalledSource {
+        fn snapshot<'a>(&'a self, _: &'a str) -> LocalBoxFuture<'a, Result<Snapshot, VideoError>> {
+            self.opened.set(self.opened.get().saturating_add(1));
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Never reached: every call here stops at or before the copy.
+    struct NoDecoder;
+
+    impl VideoDecoder for NoDecoder {
+        fn probe<'a>(
+            &'a self,
+            _: &'a Snapshot,
+        ) -> LocalBoxFuture<'a, Result<MediaInfo, VideoError>> {
+            Box::pin(async { Err(VideoError::Decoder("unused".to_owned())) })
+        }
+
+        fn sample<'a>(
+            &'a self,
+            _: &'a Snapshot,
+            _: &'a MediaInfo,
+            _: Window,
+            _: u32,
+        ) -> LocalBoxFuture<'a, Result<Sample, VideoError>> {
+            Box::pin(async { Err(VideoError::Decoder("unused".to_owned())) })
+        }
+    }
+
+    /// An analyzer that admits a call or refuses it, and is never asked to analyse.
+    struct Gate {
+        admits: bool,
+    }
+
+    impl VideoAnalyzer for Gate {
+        fn provenance(&self) -> Provenance {
+            Provenance {
+                provider: "fake".to_owned(),
+                plan: "api".to_owned(),
+                model: "fake-vision".to_owned(),
+                endpoint_origin: "https://fake.invalid".to_owned(),
+                protocol: "test".to_owned(),
+                profile_version: "test-v1".to_owned(),
+                processing: "none".to_owned(),
+            }
+        }
+
+        fn admit(&self, _: &str, _: u32) -> Result<(), VideoError> {
+            if self.admits {
+                Ok(())
+            } else {
+                Err(VideoError::Analysis(
+                    "read_video: the analysis budget is spent".to_owned(),
+                ))
+            }
+        }
+
+        fn analyze<'a>(
+            &'a self,
+            _: &'a AnalysisRequest,
+        ) -> LocalBoxFuture<'a, Result<Analysis, VideoError>> {
+            Box::pin(async { Err(VideoError::Analysis("unused".to_owned())) })
+        }
+    }
+
+    /// A route to `analyzer`, or one that never answers when there is none.
+    struct Route {
+        sees_images: bool,
+        analyzer: Option<Rc<dyn VideoAnalyzer>>,
+    }
+
+    impl VideoRouting for Route {
+        fn main_model_sees_images(&self) -> bool {
+            self.sees_images
+        }
+
+        fn analyzer(&self) -> LocalBoxFuture<'_, Result<Rc<dyn VideoAnalyzer>, VideoError>> {
+            match self.analyzer.clone() {
+                Some(analyzer) => Box::pin(async move { Ok(analyzer) }),
+                None => Box::pin(std::future::pending()),
+            }
+        }
+    }
+
+    /// Runs one call under a short deadline, returning its message and how often the source opened.
+    fn attempt(route: Route, mode: &str) -> (String, u32) {
+        let source = Rc::new(StalledSource::default());
+        let services = VideoServices {
+            source: Rc::<StalledSource>::clone(&source),
+            decoder: Rc::new(NoDecoder),
+            routing: Rc::new(route),
+        };
+        let call = ToolCall::new(
+            ToolCallId::new("call-1"),
+            ToolName::new("read_video").unwrap(),
+            json!({"file_path": "clip.mp4", "mode": mode}),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(outcome_within(&services, &call, Duration::from_millis(20)));
+        assert!(!outcome.is_success(), "{outcome:?}");
+        let message = outcome.message().unwrap_or_default().to_owned();
+        (message, source.opened.get())
+    }
+
+    #[test]
+    fn a_call_that_runs_out_of_time_names_the_stage_it_was_in() {
+        let frames = Route {
+            sees_images: true,
+            analyzer: None,
+        };
+        let (copying, _) = attempt(frames, "frames");
+        assert!(
+            copying.contains("deadline while copying the source"),
+            "{copying}"
+        );
+        let no_answer = Route {
+            sees_images: false,
+            analyzer: None,
+        };
+        let (routing, opened) = attempt(no_answer, "analyze");
+        assert!(
+            routing.contains("deadline while choosing an analysis route"),
+            "{routing}"
+        );
+        assert_eq!(opened, 0);
+    }
+
+    #[test]
+    fn a_call_the_route_cannot_afford_is_refused_before_the_source_is_opened() {
+        let refusing = Route {
+            sees_images: false,
+            analyzer: Some(Rc::new(Gate { admits: false })),
+        };
+        let (refused, opened) = attempt(refusing, "analyze");
+        assert!(refused.contains("budget"), "{refused}");
+        assert_eq!(opened, 0, "no copy for a call that cannot be paid for");
+        // The other direction: an admitted call goes on to open the source.
+        let admitting = Route {
+            sees_images: false,
+            analyzer: Some(Rc::new(Gate { admits: true })),
+        };
+        let (_, opened) = attempt(admitting, "analyze");
+        assert_eq!(opened, 1);
+    }
 }

@@ -281,32 +281,37 @@ fn every_mandatory_codec_and_container_yields_the_right_frames_in_order() {
 #[test]
 fn a_nonzero_source_start_is_normalised_to_the_start_of_the_video() {
     let harness = harness(true, false);
-    make_clip(
-        harness.workspace.path(),
-        "offset.ts",
-        &["-c:v", "libx264", "-pix_fmt", "yuv420p"],
-        "",
-    );
-    let outcome = run(
-        &harness,
-        json!({"file_path": "offset.ts", "mode": "frames", "start_ms": 4000, "end_ms": 8000}),
-    );
-    assert!(outcome.is_success(), "{outcome:?}");
-    let colours: Vec<_> = images(&outcome)
-        .iter()
-        .map(|jpeg| colour_of(jpeg))
-        .collect();
-    assert_eq!(colours, ["blue", "blue", "yellow", "yellow"]);
-    let stamps: Vec<i64> = manifest(&outcome)["frames"]
-        .as_array()
-        .expect("frames")
-        .iter()
-        .map(|frame| frame["timestamp_ms"].as_i64().expect("ms"))
-        .collect();
-    assert!(
-        stamps.iter().all(|stamp| (4000..8000).contains(stamp)),
-        "{stamps:?}"
-    );
+    // MPEG-TS starts at 1.4 s by default, inside the coarse seek's preroll. The second clip
+    // starts at 21.4 s, past it, which is where a start counted twice sought past the end.
+    let clips: [(&str, &[&str]); 2] = [
+        ("offset.ts", &[]),
+        ("late.ts", &["-output_ts_offset", "20"]),
+    ];
+    for (name, offset) in clips {
+        let mut encoder = vec!["-c:v", "libx264", "-pix_fmt", "yuv420p"];
+        encoder.extend_from_slice(offset);
+        make_clip(harness.workspace.path(), name, &encoder, "");
+        let outcome = run(
+            &harness,
+            json!({"file_path": name, "mode": "frames", "start_ms": 4000, "end_ms": 8000}),
+        );
+        assert!(outcome.is_success(), "{name}: {outcome:?}");
+        let colours: Vec<_> = images(&outcome)
+            .iter()
+            .map(|jpeg| colour_of(jpeg))
+            .collect();
+        assert_eq!(colours, ["blue", "blue", "yellow", "yellow"], "{name}");
+        let stamps: Vec<i64> = manifest(&outcome)["frames"]
+            .as_array()
+            .expect("frames")
+            .iter()
+            .map(|frame| frame["timestamp_ms"].as_i64().expect("ms"))
+            .collect();
+        assert!(
+            stamps.iter().all(|stamp| (4000..8000).contains(stamp)),
+            "{name}: {stamps:?}"
+        );
+    }
 }
 
 #[test]
