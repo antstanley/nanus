@@ -7,6 +7,9 @@
 //!
 //! ```text
 //! <home>/sessions/<encoded-session-id>/session.jsonl
+//! <home>/sessions/<encoded-session-id>/artifacts/<uuid>.raw   (the shell archive)
+//! <home>/retired/<encoded-session-id>                         (a deleted, retired id)
+//! <home>/trash/                                               (deletions being removed)
 //! ```
 //!
 //! | Precedence | Source |
@@ -26,6 +29,18 @@
 //! - **Cheap identity.** A listing parses each header strictly and the body only
 //!   leniently, so a damaged body still lists with correct id, time, and
 //!   directory, and one unreadable session never hides the others.
+
+//! ## What managed context adds
+//!
+//! - **Checkpoints.** [`nanus_ports::StorePort::checkpoint`] replaces the file only under this
+//!   process's claim and only over the stored identity the caller expects — the digest of the
+//!   bytes on disk — and says whether a failure left the previous file intact
+//!   (`NotCommitted`) or cannot know (`CommitOutcomeUnknown`).
+//! - **Deletion retires the id.** A held session is refused; a deleted one can never be saved,
+//!   claimed or checkpointed again, so a stale handle cannot resurrect it.
+//! - **A bounded archive.** Raw shell output is captured beside its session under per-session
+//!   and per-store quotas, read back only after its chunk digests verify, and collected by
+//!   [`JsonlStore::collect_garbage`] once no receipt references it.
 //!
 //! ## Publishing the adapter
 //!
@@ -63,4 +78,4 @@
 
 mod store;
 
-pub use store::{HOME_ENV, JsonlStore, new_session_id, resolve_home};
+pub use store::{ArchiveQuota, GcReport, HOME_ENV, JsonlStore, new_session_id, resolve_home};

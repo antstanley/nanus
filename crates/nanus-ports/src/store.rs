@@ -26,6 +26,11 @@ pub type StoreHandle = std::rc::Rc<Box<dyn StorePort>>;
 /// The session store port.
 pub trait StorePort {
     /// Writes a session, replacing any stored copy.
+    ///
+    /// # Errors
+    ///
+    /// An adapter that retires deleted ids returns [`StoreError::Retired`] for one, and
+    /// recreates nothing.
     fn save<'a>(&'a self, session: &'a Session) -> LocalBoxFuture<'a, StoreResult<()>>;
 
     /// Reads a session by id.
@@ -105,7 +110,8 @@ pub trait StorePort {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Locked`] when another process holds it.
+    /// Returns [`StoreError::Locked`] when another process holds it, and
+    /// [`StoreError::Retired`] for a deleted id: a claim is the first step of writing.
     fn lock<'a>(&'a self, id: &'a SessionId, owner: &'a str)
     -> LocalBoxFuture<'a, StoreResult<()>>;
 
