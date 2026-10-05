@@ -442,6 +442,8 @@ impl SessionLog {
                         .collect();
                     // Completed opaque Responses reasoning can be empty display text; it still
                     // belongs in the original source. Unanswered calls cannot carry that replay.
+                    // Such a turn is one only stateless Responses can send: every other encoder
+                    // skips it (`Message::is_replay_only`), so a resume elsewhere still works.
                     let has_opaque = replay.as_ref().is_some_and(|replay| {
                         replay.protocol == "openai.responses" && calls.len() == tool_calls.len()
                     });

@@ -66,5 +66,10 @@ image = { workspace = true }
 name = "live_vision"
 required-features = ["stock-compose"]
 
+# Drives every stock adapter's encoder, so it exists only where they do.
+[[test]]
+name = "resume_across_providers"
+required-features = ["stock-compose"]
+
 [lints]
 workspace = true

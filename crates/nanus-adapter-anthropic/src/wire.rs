@@ -204,6 +204,10 @@ fn encode_messages_with_prefix(messages: &[Message], system: &Value, tools: &Val
                     turns.push(json!({ "role": "assistant", "content": replay.blocks }));
                     continue;
                 }
+                // Another protocol's opaque turn: nothing in it can be said here.
+                if message.is_replay_only() {
+                    continue;
+                }
                 let mut blocks: Vec<Value> = Vec::new();
                 if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
                     blocks.push(json!({ "type": "text", "text": text }));
@@ -226,8 +230,9 @@ fn encode_messages_with_prefix(messages: &[Message], system: &Value, tools: &Val
                         "input": input,
                     }));
                 }
-                // Precondition: the domain's fold drops an empty assistant turn, and
-                // the API refuses a content array with no blocks.
+                // Precondition: the domain's fold drops an empty assistant turn, a
+                // replay-only one was skipped above, and the API refuses a content
+                // array with no blocks.
                 assert!(
                     !blocks.is_empty(),
                     "an assistant turn carries text or tool calls"

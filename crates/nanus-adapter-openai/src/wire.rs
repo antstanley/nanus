@@ -123,6 +123,10 @@ pub fn encode_messages(messages: &[Message]) -> Value {
         if !matches!(message, Message::Tool { .. }) {
             turns.append(&mut attachments);
         }
+        // Another protocol's opaque turn: nothing in it can be said here.
+        if message.is_replay_only() {
+            continue;
+        }
         if let Message::Tool {
             call_id,
             content_blocks: Some(blocks),

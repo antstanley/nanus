@@ -627,6 +627,31 @@ impl Message {
             Self::Tool { content, .. } => content.is_empty(),
         }
     }
+
+    /// Returns `true` for an assistant turn that only the protocol which produced it can send.
+    ///
+    /// A completed stateless Responses turn can have no display text and no calls and still carry
+    /// opaque reasoning that API wants replayed, so the fold keeps it. Every other encoder has
+    /// nothing to put in such a turn — each provider refuses an assistant turn with neither text
+    /// nor calls — so it skips the turn. Without this, a session recorded through stateless
+    /// Responses could not be resumed on any other provider: the encoders assert that an
+    /// assistant turn says something, and assertions stay on in release builds.
+    #[must_use]
+    pub fn is_replay_only(&self) -> bool {
+        match self {
+            Self::Assistant {
+                text,
+                tool_calls,
+                replay,
+                ..
+            } => {
+                replay.is_some()
+                    && text.as_ref().is_none_or(String::is_empty)
+                    && tool_calls.is_empty()
+            }
+            Self::System { .. } | Self::User { .. } | Self::Tool { .. } => false,
+        }
+    }
 }
 
 /// The `id`/`type`/`function` envelope the wire protocol requires for a tool call.
