@@ -42,7 +42,7 @@ mod grep;
 mod read;
 mod write;
 
-pub use bash::bash_tool;
+pub use bash::{bash_tool, bash_tool_with_capture};
 pub use edit::edit_tool;
 pub use glob::glob_tool;
 pub use grep::grep_tool;
