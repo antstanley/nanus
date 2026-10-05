@@ -489,6 +489,12 @@ impl AgentRunner {
         }
     }
 
+    /// The context policy a session recorded last; the legacy default when it recorded none.
+    #[must_use]
+    pub fn context_policy(session: &Session) -> ContextPolicy {
+        recorded_policy(session)
+    }
+
     /// Reports the session's context status without preparing a model call that is sent.
     ///
     /// The estimate comes from a dry preparation of the accepted selection, so it is the cost the

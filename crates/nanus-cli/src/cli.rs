@@ -94,6 +94,29 @@ pub struct Args {
     pub command: Option<Command>,
 }
 
+/// How `nanus run` manages a session's context.
+///
+/// Every flag is optional, and an absent one changes nothing: a resumed session keeps the
+/// policy it recorded, and a new one is legacy. A change is recorded in the session before the
+/// turn that uses it, so the transcript says which turns ran under which policy.
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct ContextArgs {
+    /// `legacy` replays the log and drops whole old turns to fit; `managed` keeps every user
+    /// message, hides completed old tool work to fit, lets the model recall it, and saves the
+    /// session at every step.
+    #[arg(long, value_name = "MODE", value_parser = ["legacy", "managed"])]
+    pub context_mode: Option<String>,
+
+    /// Output tokens every managed request reserves.
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+    pub context_output_reserve: Option<u32>,
+
+    /// Archive shell output before its preview is cut, so it can be recalled. Managed only:
+    /// it never turns managed context on by itself.
+    #[arg(long)]
+    pub capture_shell_evidence: bool,
+}
+
 /// What the binary was asked to do.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -114,6 +137,10 @@ pub enum Command {
         /// resuming one that is live elsewhere is a way to lose a turn.
         #[arg(long, value_name = "NAME|ID")]
         resume: Option<String>,
+
+        /// How the session's context is managed.
+        #[command(flatten)]
+        context: ContextArgs,
 
         /// The task, as one or more words.
         #[arg(required = true, value_name = "TASK")]
@@ -436,7 +463,12 @@ pub async fn prepare() -> Result<Ready, String> {
         ));
     }
     match command {
-        Command::Run { task, resume, name } => prepare_run(&options, &task, resume, name).await,
+        Command::Run {
+            task,
+            resume,
+            name,
+            context,
+        } => prepare_run(&options, &task, (resume, name), context).await,
         // Showing the configuration prints and is finished.
         Command::Config => show_config(&options).await.map(|()| Ready::Done),
         Command::Auth { action } => prepare_auth(action).await,
@@ -473,6 +505,8 @@ pub enum Ready {
         resume: Option<String>,
         /// The name to record a new session under.
         name: Option<String>,
+        /// The context flags the run was given.
+        context: ContextArgs,
     },
     /// The session store is open and its contents are ready to read.
     List {
@@ -558,13 +592,14 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             verbose,
             resume,
             name,
+            context,
         } => run_turn(
             *pending,
             &workspace,
             &prompt,
             verbose,
-            resume.as_deref(),
-            name.as_deref(),
+            (resume.as_deref(), name.as_deref()),
+            &context,
         ),
         Ready::List { store } => print_sessions(&store),
         Ready::Name {
@@ -624,11 +659,27 @@ fn load(args: &Options) -> Result<NanusConfig, String> {
 async fn prepare_run(
     args: &Options,
     task: &[String],
-    resume: Option<String>,
-    name: Option<String>,
+    conversation: (Option<String>, Option<String>),
+    context: ContextArgs,
 ) -> Result<Ready, String> {
+    let (resume, name) = conversation;
     let config = load(args)?;
     let prompt = task.join(" ");
+    // A new session starts legacy, so a flag that only means something in managed mode has
+    // nothing to apply to unless managed mode is asked for too. Capture in particular is never
+    // a way to turn managed context on: it is refused rather than inferred.
+    if resume.is_none() && context.context_mode.as_deref() != Some("managed") {
+        if context.capture_shell_evidence {
+            return Err(String::from(
+                "--capture-shell-evidence needs --context-mode managed for a new session",
+            ));
+        }
+        if context.context_output_reserve.is_some() {
+            return Err(String::from(
+                "--context-output-reserve needs --context-mode managed for a new session",
+            ));
+        }
+    }
     if prompt.trim().is_empty() {
         return Err(String::from(
             "the task is empty; pass the work to do, for example: nanus run \"summarize this repository\"",
@@ -662,6 +713,7 @@ async fn prepare_run(
         verbose: args.verbose,
         resume,
         name,
+        context,
     })
 }
 
@@ -870,9 +922,10 @@ fn run_turn(
     workspace: &Path,
     prompt: &str,
     verbose: bool,
-    resume: Option<&str>,
-    name: Option<&str>,
+    conversation: (Option<&str>, Option<&str>),
+    context: &ContextArgs,
 ) -> Result<(), String> {
+    let (resume, name) = conversation;
     let harness = pending.start().map_err(|error| error.to_string())?;
     // The session is resolved here rather than in `prepare`, because resolving it needs
     // the store the composition has just opened and loading it is a blocking call.
@@ -887,6 +940,17 @@ fn run_turn(
     let id = session.id().clone();
     kernel_block_on(harness.store.lock(&id, RUN_CLAIM))
         .map_err(|error| format!("{error}; attach to it with `nanus tui --connect`"))?;
+    let bound = match bind_context(&harness, &mut session, context) {
+        Ok(bound) => bound,
+        Err(error) => {
+            harness.store.release_lock(&id);
+            finish_harness(&harness)?;
+            return Err(error);
+        }
+    };
+    if let Some(bound) = bound {
+        return run_managed(&harness, session, &bound, (prompt, verbose, name));
+    }
     // A headless run is the one mode with no interface to press a key in, so the interrupt is
     // watched for here and handed to the turn through its reporter: it stops at the next
     // checkpoint, the session is recorded, and the exit code says the turn did not complete.
@@ -924,8 +988,12 @@ fn run_turn(
     finish_harness(&harness)?;
     recorded?;
 
-    let outcome = outcome.map_err(|error| error.to_string())?;
+    report_answer(outcome.map_err(|error| error.to_string())?, verbose)
+}
 
+/// Prints a finished run's answer on stdout and its totals on stderr, and says whether it
+/// completed.
+fn report_answer(outcome: nanus_bundle::RunOutcome, verbose: bool) -> Result<(), String> {
     // A trailing newline is the only decoration stdout gets, and it is there so the
     // answer is a line.
     print!("{}", outcome.answer);
@@ -947,6 +1015,134 @@ fn run_turn(
     // A run that did not complete is a failed run, and the reason goes to stderr so
     // stdout stays exactly the answer.
     Err(format!("the run did not complete: {:?}", outcome.reason))
+}
+
+/// Applies a run's context flags, binding the session's checkpoint when it is or becomes managed.
+///
+/// `None` is a session that never managed its context and is not asked to now: it runs, and is
+/// saved, exactly as it always was. Anything else is bound to a checkpoint under the claim this
+/// process already holds, and a policy change is recorded through it before the turn.
+fn bind_context(
+    harness: &Harness,
+    session: &mut nanus_domain::Session,
+    flags: &ContextArgs,
+) -> Result<Option<ManagedBinding>, String> {
+    use nanus_domain::context::managed::{ContextMode, ModeActor};
+    let current = nanus_bundle::AgentRunner::context_policy(session);
+    let mut wanted = current;
+    match flags.context_mode.as_deref() {
+        Some("managed") => wanted.mode = ContextMode::Managed,
+        Some(_) => wanted = wanted.disabled(),
+        None => {}
+    }
+    if let Some(reserve) = flags.context_output_reserve {
+        wanted.output_reserve_tokens = reserve;
+    }
+    if flags.capture_shell_evidence {
+        if wanted.mode != ContextMode::Managed {
+            return Err(String::from(
+                "--capture-shell-evidence needs managed context; add --context-mode managed",
+            ));
+        }
+        wanted.capture_shell = true;
+    }
+    if !session.is_managed_body() && wanted == current {
+        return Ok(None);
+    }
+    let checkpoint = kernel_block_on(nanus_bundle::StoreCheckpoint::bind(
+        harness.store.clone(),
+        session.id().clone(),
+    ))
+    .map_err(|error| error.to_string())?;
+    let context = nanus_bundle::SessionContext::new(Some(harness.store.clone()))
+        .map_err(|error| error.to_string())?;
+    let runtime = nanus_ports::TurnRuntime {
+        context: Some(&context),
+        checkpoint: Some(&checkpoint),
+    };
+    kernel_block_on(
+        harness
+            .runner
+            .set_context_policy(session, wanted, ModeActor::Human, runtime),
+    )
+    .map_err(|error| format!("the context policy could not be applied: {error}"))?;
+    if !session.is_managed_body() {
+        return Ok(None);
+    }
+    Ok(Some(ManagedBinding {
+        checkpoint,
+        context,
+    }))
+}
+
+/// What a version-3 session's turn saves through.
+struct ManagedBinding {
+    checkpoint: nanus_bundle::StoreCheckpoint,
+    context: nanus_bundle::SessionContext,
+}
+
+/// Runs one turn of a version-3 session: every save is a checkpoint, and nothing is saved after.
+///
+/// The bypass is the point. A managed turn commits as it runs, and an unconditional save at the
+/// end would overwrite a commit whose outcome is uncertain — exactly what the persistence state
+/// exists to forbid. So this path saves nothing itself and reports what the runner says.
+fn run_managed(
+    harness: &Harness,
+    mut session: nanus_domain::Session,
+    bound: &ManagedBinding,
+    run: (&str, bool, Option<&str>),
+) -> Result<(), String> {
+    let (prompt, verbose, name) = run;
+    let id = session.id().clone();
+    let stop = Rc::new(Stop::default());
+    let mut reporter = StderrProgress::new(verbose, verbose).stopping_when(Rc::clone(&stop.raised));
+    let approver =
+        crate::approve::TerminalApprover::standard().abandoned_when(Rc::clone(&stop.woken));
+    let host = nanus_bundle::TurnHost {
+        approver: Some(&approver),
+        control: None,
+        runtime: nanus_ports::TurnRuntime {
+            context: Some(&bound.context),
+            checkpoint: Some(&bound.checkpoint),
+        },
+    };
+    let ran = crate::block_on_local(async {
+        tokio::task::spawn_local(watch_for_interrupt(Rc::clone(&stop)));
+        harness
+            .runner
+            .run_turn_with_runtime(&mut session, prompt, &mut reporter, host)
+            .await
+    });
+    let saved = persistence_line(ran.persistence.as_ref());
+    if let Some(line) = &saved {
+        eprintln!("nanus: {line}");
+    }
+    // Named only once the session exists on disk; a name for nothing would dangle.
+    let named = match (name, &ran.persistence) {
+        (Some(name), Some(nanus_ports::PersistenceState::Acknowledged(_))) => {
+            kernel_block_on(harness.store.name(&id, name))
+                .map_err(|error| format!("the session could not be named: {error}"))
+        }
+        _ => Ok(()),
+    };
+    harness.store.release_lock(&id);
+    finish_harness(harness)?;
+    named?;
+    report_answer(ran.outcome.map_err(|error| error.to_string())?, verbose)
+}
+
+/// The sentence a managed run's persistence state warrants, when it warrants one.
+fn persistence_line(state: Option<&nanus_ports::PersistenceState>) -> Option<String> {
+    match state {
+        Some(nanus_ports::PersistenceState::Unsaved { .. }) => Some(String::from(
+            "the session could not be saved; the copy saved before this turn is intact",
+        )),
+        Some(nanus_ports::PersistenceState::Unknown { .. }) => Some(String::from(
+            "whether the session was saved is unknown; it was not overwritten, and continuing it \
+             needs the saved copy checked first",
+        )),
+        Some(nanus_ports::PersistenceState::Acknowledged(_)) | None => None,
+    }
 }
 
 /// Saves the session, and records its name when one was asked for.
