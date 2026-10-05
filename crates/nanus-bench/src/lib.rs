@@ -107,6 +107,21 @@ impl Metric for AllocatedBytes {
     const NAME: &'static str = "bytes";
 }
 
+/// Bytes still held when the routine returns: allocated during it and not freed by it.
+///
+/// Residency rather than traffic — what a structure costs to *keep*, which is the other half of
+/// memory use. Meaningful only for a routine that returns what it built: criterion drops the
+/// output after the measurement ends, so the reading is exactly what the output holds, less
+/// anything the routine freed of its input. A routine that consumes an input it moves into its
+/// output frees nothing, and then the reading is what the output added. Net releases read as
+/// zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetainedBytes;
+
+impl Metric for RetainedBytes {
+    const NAME: &'static str = "retained";
+}
+
 fn snapshot() -> Stats {
     GLOBAL.stats()
 }
@@ -184,6 +199,38 @@ impl Measurement for AllocatedBytes {
 
     fn end(&self, before: Stats) -> u64 {
         reading(moved(before.bytes_allocated, snapshot().bytes_allocated))
+    }
+
+    fn add(&self, first: &u64, second: &u64) -> u64 {
+        first.saturating_add(*second)
+    }
+
+    fn zero(&self) -> u64 {
+        0
+    }
+
+    fn to_f64(&self, value: &u64) -> f64 {
+        to_f64(*value) / to_f64(PARTS)
+    }
+
+    fn formatter(&self) -> &dyn ValueFormatter {
+        &Units::BYTES
+    }
+}
+
+impl Measurement for RetainedBytes {
+    type Intermediate = Stats;
+    type Value = u64;
+
+    fn start(&self) -> Stats {
+        snapshot()
+    }
+
+    fn end(&self, before: Stats) -> u64 {
+        let after = snapshot();
+        let allocated = moved(before.bytes_allocated, after.bytes_allocated);
+        let freed = moved(before.bytes_deallocated, after.bytes_deallocated);
+        reading(allocated.saturating_sub(freed))
     }
 
     fn add(&self, first: &u64, second: &u64) -> u64 {
@@ -318,11 +365,24 @@ impl ValueFormatter for Units {
 /// fn encode<M: nanus_bench::Metric>(c: &mut criterion::Criterion<M>) { /* ... */ }
 /// nanus_bench::benches!(encode);
 /// ```
+///
+/// Targets after `; retained:` are run under [`RetainedBytes`] alone: residency is a question
+/// only a routine that returns what it built can answer, so it is asked only of those.
+///
+/// ```ignore
+/// nanus_bench::benches!(encode, decode; retained: resident);
+/// ```
 #[macro_export]
 macro_rules! benches {
     ($($target:ident),+ $(,)?) => {
+        $crate::benches!(@emit [$($target),+] []);
+    };
+    ($($target:ident),+ ; retained: $($kept:ident),+ $(,)?) => {
+        $crate::benches!(@emit [$($target),+] [$($kept),+]);
+    };
+    (@emit [$($target:ident),+] [$($kept:ident),*]) => {
         // A module of its own, so a benchmark file is free to name its own functions `time`
-        // or `bytes` without colliding with the three runners.
+        // or `bytes` without colliding with the runners.
         mod __measured {
             pub(super) fn time() {
                 let mut criterion =
@@ -339,9 +399,20 @@ macro_rules! benches {
                 let mut criterion = $crate::counting($crate::AllocatedBytes);
                 $( super::$target::<$crate::AllocatedBytes>(&mut criterion); )+
             }
+
+            pub(super) fn retained() {
+                #[allow(unused_mut, unused_variables, reason = "a file may keep nothing")]
+                let mut criterion = $crate::counting($crate::RetainedBytes);
+                $( super::$kept::<$crate::RetainedBytes>(&mut criterion); )*
+            }
         }
 
-        $crate::criterion::criterion_main!(__measured::time, __measured::allocs, __measured::bytes);
+        $crate::criterion::criterion_main!(
+            __measured::time,
+            __measured::allocs,
+            __measured::bytes,
+            __measured::retained
+        );
     };
 }
 
@@ -455,6 +526,19 @@ mod tests {
         let mut values = [7.0];
         let _ = Units::COUNT.scale_throughputs(7.0, &Throughput::Elements(0), &mut values);
         assert!(values[0].is_finite());
+    }
+
+    #[test]
+    fn what_a_routine_keeps_is_retained_and_what_it_frees_is_not() {
+        let kept = std::cell::RefCell::new(Vec::new());
+        let held = quietest(&RetainedBytes, || {
+            kept.borrow_mut().push(Vec::<u8>::with_capacity(4096));
+        });
+        assert!(held >= 4096, "a kept buffer is held: {held}");
+        let freed = quietest(&RetainedBytes, || {
+            black_box(Vec::<u8>::with_capacity(4096));
+        });
+        assert_eq!(freed, 0, "a buffer dropped inside the routine is not");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! `TestBackend`, which is the same configuration the view's own tests use.
 
 use criterion::measurement::Measurement;
-use criterion::{BenchmarkGroup, BenchmarkId, Criterion, SamplingMode, Throughput};
+use criterion::{BatchSize, BenchmarkGroup, BenchmarkId, Criterion, SamplingMode, Throughput};
 use nanus_bench::{Metric, fixtures};
 use nanus_tui::{Detail, InputBuffer, Role, Transcript, ViewState, transcript_of};
 use ratatui::Terminal;
@@ -193,6 +193,33 @@ fn frame<M: Metric>(c: &mut Criterion<M>) {
     group.bench_function(BenchmarkId::new("large", 100), |b| {
         b.iter(|| draw(&mut terminal, &mut state));
     });
+    // The first frame of a replayed session, with nothing measured yet: every block is rendered
+    // once. It is what opening a session costs, and what a resize or a change of display
+    // setting costs, since either re-renders everything at the new conditions.
+    for turns in TURNS {
+        group.bench_function(BenchmarkId::new("first", turns), |b| {
+            b.iter_batched(
+                || {
+                    let mut state = ViewState::new();
+                    state.transcript = transcript_of(&fixtures::session(turns));
+                    let terminal = Terminal::new(TestBackend::new(COMPACT.width, COMPACT.height))
+                        .unwrap_or_else(|error| unreachable!("a terminal always builds: {error}"));
+                    (state, terminal)
+                },
+                |(mut state, mut terminal)| {
+                    draw(&mut terminal, &mut state);
+                    (state, terminal)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    // No conversation at all: the floor every frame pays for the title, the composer, the
+    // status line and the terminal itself, which the cases above are read against.
+    let (mut state, mut terminal) = view(0, COMPACT);
+    group.bench_function(BenchmarkId::new("empty", 0), |b| {
+        b.iter(|| draw(&mut terminal, &mut state));
+    });
     group.finish();
 }
 
@@ -245,6 +272,94 @@ fn delta<M: Metric>(c: &mut Criterion<M>) {
     group.finish();
 }
 
+/// Answer lengths for [`answer`], in deltas: about 3 KB and about 24 KB of markdown.
+const LONG_ANSWERS: [usize; 2] = [500, 4_000];
+
+/// How many deltas arrive between two redraws in [`answer`].
+const BURST: usize = 32;
+
+/// A whole answer streamed as the runtime receives it: every delta appended and followed, and
+/// the frame redrawn once per burst, since the runtime drains the frames that queued up before
+/// it draws.
+///
+/// The question is how the cost of a delta grows with the answer it lands in. Measured per delta
+/// over answers of two lengths, a cost that rose with the answer would make the longer answer
+/// dearer per delta, not merely longer; a flat one makes the two the same.
+fn answer<M: Metric>(c: &mut Criterion<M>) {
+    let mut group = c.benchmark_group(M::group("tui/answer"));
+    group.sampling_mode(SamplingMode::Flat).sample_size(10);
+    for count in LONG_ANSWERS {
+        let deltas = deltas(count);
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_function(BenchmarkId::from_parameter(count), |b| {
+            b.iter_batched(
+                || view(10, COMPACT),
+                |(mut state, mut terminal)| {
+                    for (index, fragment) in deltas.iter().enumerate() {
+                        state
+                            .transcript
+                            .append_stream(Role::Assistant, fragment, false);
+                        state.follow();
+                        if index % BURST == BURST.saturating_sub(1) {
+                            draw(&mut terminal, &mut state);
+                        }
+                    }
+                    draw(&mut terminal, &mut state);
+                    (state, terminal)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// What the interface holds for a session of a hundred turns, measured as residency rather than
+/// traffic: the transcript a replay builds, and what a view adds to it by drawing.
+///
+/// The view is given a transcript built outside the measurement and draws one frame into a
+/// terminal also built outside it, so the second figure is exactly what the view keeps between
+/// frames — its layout, the lines it holds for the screen, and the screen it captured — and not
+/// the conversation itself, which the first figure is.
+fn resident<M: Metric>(c: &mut Criterion<M>) {
+    let mut group = c.benchmark_group(M::group("tui/resident"));
+    let session = fixtures::session(100);
+    group.bench_function(BenchmarkId::new("transcript", 100), |b| {
+        b.iter_batched(|| (), |()| transcript_of(&session), BatchSize::PerIteration);
+    });
+    group.bench_function(BenchmarkId::new("view", 100), |b| {
+        b.iter_batched(
+            || {
+                let terminal = Terminal::new(TestBackend::new(COMPACT.width, COMPACT.height))
+                    .unwrap_or_else(|error| unreachable!("a test terminal always builds: {error}"));
+                (transcript_of(&session), terminal)
+            },
+            |(transcript, mut terminal)| {
+                let mut state = ViewState::new();
+                state.transcript = transcript;
+                draw(&mut terminal, &mut state);
+                state.scroll_to_bottom();
+                draw(&mut terminal, &mut state);
+                (state, terminal)
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    // Every line the conversation renders to, held at once: what drawing a frame used to build
+    // and hold before the layout kept measurements instead, so the figure the view's own
+    // residency is read against.
+    let mut state = ViewState::new();
+    state.transcript = transcript_of(&session);
+    group.bench_function(BenchmarkId::new("lines", 100), |b| {
+        b.iter_batched(
+            || (),
+            |()| state.transcript_lines(COMPACT.width),
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
 /// A keystroke in the middle of a long prompt: one character typed and taken back, so the
 /// buffer is the same before every iteration. The composer holds characters, so an edit in
 /// the middle moves everything after it.
@@ -263,4 +378,4 @@ fn input<M: Metric>(c: &mut Criterion<M>) {
     group.finish();
 }
 
-nanus_bench::benches!(replay, stream, frame, scrolled, delta, input);
+nanus_bench::benches!(replay, stream, frame, scrolled, delta, answer, input; retained: resident);

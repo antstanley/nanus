@@ -1122,6 +1122,56 @@ The markdown styles are derived from the interface's role styles, so the answer 
 answer's colour and `NO_COLOR` works without a second palette: `Theme::monochrome` is the
 colour theme with the colours removed, and the markdown theme inherits that.
 
+## What a frame costs
+
+A frame is drawn after every keystroke and every burst of streamed tokens, so what one costs
+decides whether a long session stays responsive. It used to cost the whole conversation:
+every entry was rendered — every answer's markdown parsed and wrapped — to find the scroll
+bounds, rendered again to draw, and once more for every token to find the bottom. A frame of a
+100-turn session took 7.4 ms and 135,000 allocations, and a token there about 12.6 ms, which
+capped a long session at roughly 80 tokens a second however fast the model wrote.
+
+Now a frame costs what is on screen. The view keeps a **layout** between frames
+(`crates/nanus-tui/src/layout.rs`): the transcript as the blocks it is drawn in, each with the
+display rows of its lines, and the rendered lines of only the blocks last on screen. A frame
+compares each block with its entries, re-renders the blocks that changed, and draws the lines
+that reach the viewport; the scroll arithmetic is done on the measured rows. A frame of a
+10-turn and of a 100-turn session make the same 116 allocations and take about 0.2 ms, and a
+token on a 100-turn session — appended, followed, redrawn — about the same, where it took
+12.6 ms.
+
+**A streaming answer is cut where its markdown has settled.** An answer arrives a few
+characters at a time, and re-rendering all of it per token made a token's cost grow with the
+answer. Everything before a blank line outside a fence renders the same however the answer goes
+on, so the answer is drawn as a head, a run of settled chunks, and a tail, and a token
+re-renders only the tail. The cuts are found by the parser itself, only the text after the
+latest is parsed again, and a property test holds the cut rendering to the whole one at every
+prefix of a set of awkward answers. Streaming a 4,000-token answer went from 68 million
+allocations and 3.9 GiB to about 400,000 and 28 MiB.
+
+The trade is residency for traffic. The view holds about 1.4 KiB per turn of measurements —
+146 KiB for a 100-turn session, where it used to hold nothing between frames — and in exchange
+no longer builds and holds every rendered line of the conversation, 1.6 MiB at 100 turns, on
+every frame. The numbers, and how they are measured, are in [benchmarks](benchmarks.md).
+
+Two rules keep the kept layout honest, and a change to the view has to respect both:
+
+- **Every change to an entry gives it a new stamp.** A block is matched to its entries by
+  stamp (`Entry::stamp`), so an entry changed without one would be drawn as it was. The
+  entry's fields are private and its only mutators — `push_str`, `settle`, `identified` — take
+  a fresh stamp; a new mutator must too. A streaming answer's settled parts are matched by the
+  entry's identity (`Entry::id`) instead, which is sound only because an entry's text only
+  ever grows at its end.
+- **Every input to rendering is in the layout key.** The width, the detail, the markdown and
+  diagram settings, the collapse toggles, and the theme decide how an entry is drawn, and
+  changing any of them discards the layout (`LayoutKey`). A new setting that changes what a
+  line looks like belongs there, or the view will keep drawing the old look.
+
+`a_kept_layout_draws_what_a_fresh_one_does_through_a_whole_turn` is the test that catches a
+break of either: it drives a turn — reasoning, calls answered out of order, an answer streamed
+seven characters at a time, a settle, a resize, a toggle, scrolling — and after every step
+asserts that the view with its kept layout draws exactly the cells a view with none draws.
+
 ## Why the interface is testable
 
 The view is a pure function of a `Transcript` and an `InputBuffer`, neither of which knows

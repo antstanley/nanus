@@ -4,7 +4,8 @@
 benchmarks in `crates/nanus-bench`: the session log, the provider wire, the link, the
 interface's view, the kernel, the session store, the tools, and the agent loop. Every
 benchmark is measured three ways — wall time, heap allocations, and bytes allocated — and
-this page records how, what the current baseline is, and what it shows.
+this page records how, what the current baseline is, and what it shows. The benchmarks that
+ask for it also measure a fourth thing: the bytes a structure still holds once it is built.
 
 Benchmarks are not a quality gate: nothing fails because a number moved. They exist so that
 a change to a hot path is *measured* against a baseline rather than argued about, and so that
@@ -12,22 +13,25 @@ a claim like "this is faster" or "this allocates less" comes with the two number
 
 ## At a glance
 
-From the [current baseline](#current-baseline), on an Apple M2:
+From the [current baseline](#current-baseline), on an Apple M2. That run's times are about
+28% pessimistic, because the machine was busy with other work while it ran; its counts are
+exact either way.
 
 | Path | Time | Allocations | Bytes |
 |---|---:|---:|---:|
-| A whole turn through the agent loop, scripted model, fresh session | 37.8 µs | 974 | 146 KiB |
-| The same turn on 100 turns of history | 784 µs | 12,809 | 3.05 MiB |
-| A DeepSeek request body for 100 turns of history | 536 µs | 7,131 | 1.85 MiB |
-| A ~460 KB streamed response through the DeepSeek adapter | 20.9 ms | 52,793 | 6.97 MiB |
-| Saving a 500-turn session | 18.1 ms | 23,549 | 9.58 MiB |
-| A grep over 500 files with few hits | 13.0 ms | 85,514 | 5.27 MiB |
-| One interface frame of a 100-turn conversation | 7.4 ms | 134,941 | 8.05 MiB |
-| One streamed token in the interface at 100 turns (append, follow, redraw) | 12.6 ms | 202,908 | 12.10 MiB |
+| A whole turn through the agent loop, scripted model, fresh session | 50.1 µs | 974 | 146 KiB |
+| The same turn on 100 turns of history | 904 µs | 12,809 | 3.05 MiB |
+| A DeepSeek request body for 100 turns of history | 588 µs | 7,131 | 1.85 MiB |
+| A ~460 KB streamed response through the DeepSeek adapter | 21.0 ms | 52,791 | 7.19 MiB |
+| Saving a 500-turn session | 12.7 ms | 23,549 | 9.58 MiB |
+| A grep over 500 files with few hits | 16.4 ms | 85,514 | 5.27 MiB |
+| One interface frame of a 100-turn conversation | 216 µs | 116 | 26.8 KiB |
+| One streamed token in the interface at 100 turns (append, follow, redraw) | 197 µs | 212 | 35.5 KiB |
+| Opening a 100-turn session in the interface (the first frame) | 2.96 ms | 43,871 | 2.83 MiB |
 
-The harness's own overhead is microseconds against a model's seconds. The interface's
-redraw is the first thing that will not keep up with a fast stream on a long session; the
-[findings](#what-the-baseline-shows) say why.
+The harness's own overhead is microseconds against a model's seconds, and so, now, is the
+interface's: a frame costs what is on screen rather than what the conversation holds. The
+[findings](#what-the-baseline-shows) say which paths are still the expensive ones.
 
 ## Methodology
 
@@ -38,6 +42,7 @@ redraw is the first thing that will not keep up with a fast stream on a long ses
 | Wall time | `time/` | Criterion's default: elapsed time per iteration. |
 | Allocations | `allocs/` | Calls to `alloc` plus calls to `realloc`, per iteration. |
 | Bytes allocated | `bytes/` | Bytes requested from the allocator per iteration, counting a `realloc`'s growth. |
+| Held | `retained/` | Bytes allocated and not freed by the time the routine returns: what the structure it built still holds. |
 
 Wall time on a laptop moves with the thermal state, the other processes, and the power
 source; an allocation count does not. A change that adds a clone to a per-token path shows
@@ -51,10 +56,17 @@ A `realloc` counts as an allocation because it is a trip to the allocator like a
 `Vec` that grows by doubling makes one `alloc` and then a `realloc` per doubling, and both
 are what pre-sizing it would save.
 
+**Held** is the other half of memory use: residency rather than traffic, what a structure
+costs to *keep*. It means something only for a routine that returns what it built — criterion
+drops the output after the measurement ends, so the reading is exactly what the output holds —
+so it is measured only for the benchmarks that are written that way, which name themselves
+after `; retained:` in the file's `benches!` call. Two numbers have to be read together for
+memory: what a frame or a token allocates, and what is held in between.
+
 Each benchmark is written once, generic over the measurement, and the `benches!` macro in
-`nanus-bench` runs it under all three. The measurement's name is the first segment of the
-benchmark id, so the three runs of one benchmark are stored separately and a saved baseline
-holds all of them.
+`nanus-bench` runs it under the measurements it is listed for. The measurement's name is the
+first segment of the benchmark id, so the runs of one benchmark are stored separately and a
+saved baseline holds all of them.
 
 ### The instruments
 
@@ -90,7 +102,7 @@ dominant in a long one.
 | `session` | `build`, `derive_messages`, `encode/{to_jsonl,try_to_jsonl}`, `decode`, `append`, over 10, 100, and 500 turns | `derive_messages` runs before every model step and `try_to_jsonl` before every save, each over the *whole* log. |
 | `wire` | `sse/*`: SSE framing of a ~460 KB response (500 reasoning deltas, 2,000 content deltas, a fragmented tool call), in 1,460-byte segments and one frame per chunk; `encode/{value,body}/*`: each adapter's request for 10 and 100 turns of history with a 4 KB system prompt and the twelve offered tool schemas; `stream/*`: a whole `stream_chat` decode through the real DeepSeek, OpenAI and Anthropic adapters against a loopback server | Framing and decoding run per token; encoding runs per step over the whole history. |
 | `link` | `frame/*` and `request/*` round trips, `turn/*` (a turn's 2,506 frames, line by line), `backlog/*` (the same turn as one frame) | Every streamed token crosses the link once in each direction. |
-| `tui` | `replay`, `stream` (2,000 six-byte deltas into a transcript), `draw/*` (one frame at 120x40 or 200x60, markdown on and off, compact and full detail, scrolled to the middle), `delta` (append, follow, redraw: the runtime's per-token cycle), `input` | What opening a session, receiving a token, and pressing a key cost the interface. |
+| `tui` | `replay`, `stream` (2,000 six-byte deltas into a transcript), `draw/*` (one frame at 120x40 or 200x60, markdown on and off, compact and full detail, scrolled to the middle; `first`, the frame that renders everything; `empty`, the floor with no conversation), `delta` (append, follow, redraw: the runtime's per-token cycle), `answer` (a whole 500- or 4,000-delta answer, redrawn every 32 deltas as the runtime does), `input`, and held: `resident/*` (a 100-turn transcript, what the view holds beside it, and every rendered line at once) | What opening a session, receiving a token, and pressing a key cost the interface, and what it keeps. |
 | `kernel` | `start_chain` and `unload_root` over chains of 1, 8, and 64 dependent plugins, `get` (service lookup), `emit` to 1, 16, and 128 listeners | Composition and teardown, and the per-call cost of the kernel's indirection. |
 | `store` | `save` and `load` of 10-, 100-, and 500-turn sessions, `list` of a store of 50 sessions, on a tempdir | Every turn ends in a save; every resume and every listing starts with a read. |
 | `tools` | `read` of a 5,000-line file, `grep` and `glob` over a 500-file tree, `edit` and `write` of a 2,000-line file, `bash` running `true` and `echo`, through `ToolDefinition::execute` on a real tempdir | The calls a model makes most often. |
@@ -123,14 +135,15 @@ command line, so `--sample-size` and `--measurement-time` do not shorten these:
 | Groups | Override | Applies to |
 |---|---|---|
 | `tui/draw/*`, `tui/delta/*` | flat sampling, 20 samples | all three measurements |
+| `tui/answer/*` | flat sampling, 10 samples | all three measurements |
 | `wire/sse/*`, `wire/encode/*` | 50 samples, 1 s warm-up, 2 s window | time |
 | `wire/stream/*` | 10 samples, 1 s warm-up, 3 s window | time |
 | `store/*/10` | 50 samples, 2 s window | time |
 | `store/*/100`, `store/*/500` | 20 samples, 3 s window | time |
 | `tools/bash/*` | 20 samples | all three measurements |
 
-**Counting runs** use 10 samples, a 100 ms warm-up, a 500 ms window, and a noise threshold of
-zero. A count repeats exactly for the routines here, so a hundred samples of the same number
+**Counting runs** — allocations, bytes, and held — use 10 samples, a 100 ms warm-up, a 500 ms
+window, and a noise threshold of zero. A count repeats exactly for the routines here, so a hundred samples of the same number
 would only make the suite slower, and the noise band that hides timing jitter would only hide
 a real change: a count that moves at all has moved for a reason.
 
@@ -227,176 +240,224 @@ minutes. The workspace lints apply to benchmarks as to everything else.
 
 ## Current baseline
 
-Recorded on 2026-10-04 at `ee1e595`, on an Apple M2 (8 cores, 8 GB) on AC power, macOS 27.0,
-Rust 1.98.0, with nothing else running. Times are criterion's point estimate with the
-half-width of its 95% interval; counts are per iteration.
+Recorded on 2026-10-05 with the interface's layout cache (the `tui-performance` change, on
+`2662f77`), on an Apple M2 (8 cores, 8 GB) on AC power, macOS 27.0, Rust 1.98.0.
+
+**The machine was not quiet.** Other work kept the one-minute load between 7 and 9 on eight
+cores for the whole run, and the times of code this change did not touch came out a median
+28% slower than in the quiet recording of 2026-10-04 (`ee1e595`, in this page's history). Read
+every time here as pessimistic by about that much, and re-record on a quiet machine before
+comparing a timing against it. The counts and held bytes are exact regardless of load, and
+match the quiet recording wherever the code is unchanged.
+
+Times are criterion's point estimate with the half-width of its 95% interval; counts are per
+iteration; held bytes are per structure built.
 
 ### `agent_loop`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |
 |---|---:|---:|---:|---:|
-| `stream/2000` | 75.91 µs | 2.9% | 2,145 | 246.14 KiB |
-| `stream/500` | 23.45 µs | 3.6% | 643 | 76.87 KiB |
-| `turn/fresh` | 37.82 µs | 4.2% | 974 | 146.29 KiB |
-| `turn/history/10` | 91.55 µs | 4.2% | 2,171 | 442.47 KiB |
-| `turn/history/100` | 783.59 µs | 9.4% | 12,809 | 3.05 MiB |
+| `stream/2000` | 133.89 µs | 17.1% | 2,145 | 246.14 KiB |
+| `stream/500` | 26.40 µs | 10.4% | 643 | 76.87 KiB |
+| `turn/fresh` | 50.10 µs | 8.9% | 974 | 146.29 KiB |
+| `turn/history/10` | 110.89 µs | 6.0% | 2,171 | 442.47 KiB |
+| `turn/history/100` | 904.14 µs | 7.7% | 12,809 | 3.05 MiB |
 
 ### `kernel`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |
 |---|---:|---:|---:|---:|
-| `emit/1` | 32.41 ns | 3.3% | 1.00 | 8.00 B |
-| `emit/128` | 449.87 ns | 1.9% | 1.00 | 1.00 KiB |
-| `emit/16` | 79.16 ns | 2.4% | 1.00 | 128.00 B |
-| `get/1` | 21.03 ns | 2.9% | 0.00 | 0.00 B |
-| `get/64` | 17.87 ns | 2.6% | 0.00 | 0.00 B |
-| `get/8` | 21.08 ns | 4.4% | 0.00 | 0.00 B |
-| `start_chain/1` | 723.97 ns | 3.5% | 13 | 2.14 KiB |
-| `start_chain/64` | 110.84 µs | 2.1% | 660 | 77.56 KiB |
-| `start_chain/8` | 6.15 µs | 3.3% | 88 | 9.45 KiB |
-| `unload_root/1` | 261.95 ns | 3.3% | 1.00 | 1.00 B |
-| `unload_root/64` | 134.88 µs | 1.5% | 268 | 21.88 KiB |
-| `unload_root/8` | 4.62 µs | 2.6% | 35 | 2.57 KiB |
+| `emit/1` | 73.65 ns | 11.6% | 1.00 | 8.00 B |
+| `emit/128` | 910.19 ns | 11.4% | 1.00 | 1.00 KiB |
+| `emit/16` | 188.48 ns | 11.5% | 1.00 | 128.00 B |
+| `get/1` | 40.26 ns | 15.5% | 0.00 | 0.00 B |
+| `get/64` | 42.10 ns | 10.3% | 0.00 | 0.00 B |
+| `get/8` | 43.24 ns | 12.9% | 0.00 | 0.00 B |
+| `start_chain/1` | 802.91 ns | 7.2% | 13 | 2.14 KiB |
+| `start_chain/64` | 160.31 µs | 10.5% | 660 | 77.56 KiB |
+| `start_chain/8` | 7.35 µs | 4.7% | 88 | 9.45 KiB |
+| `unload_root/1` | 394.25 ns | 9.6% | 1.00 | 1.00 B |
+| `unload_root/64` | 255.37 µs | 12.1% | 268 | 21.88 KiB |
+| `unload_root/8` | 10.14 µs | 12.2% | 35 | 2.57 KiB |
 
 ### `link`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |
 |---|---:|---:|---:|---:|
-| `backlog/decode` | 432.82 µs | 1.6% | 7,550 | 1.53 MiB |
-| `backlog/encode` | 89.76 µs | 1.2% | 11 | 128.00 KiB |
-| `frame/decode/done` | 1.20 µs | 1.7% | 11 | 4.71 KiB |
-| `frame/decode/text` | 134.34 ns | 4.6% | 2.00 | 264.00 B |
-| `frame/decode/tool` | 511.21 ns | 3.2% | 9.00 | 1.18 KiB |
-| `frame/decode/tool_done` | 201.58 ns | 1.7% | 3.00 | 271.00 B |
-| `frame/encode/done` | 1.07 µs | 2.7% | 5.00 | 2.96 KiB |
-| `frame/encode/text` | 49.21 ns | 2.7% | 1.00 | 128.00 B |
-| `frame/encode/tool` | 179.93 ns | 2.3% | 2.00 | 256.00 B |
-| `frame/encode/tool_done` | 79.18 ns | 1.8% | 1.00 | 128.00 B |
-| `request/decode/approve` | 160.29 ns | 2.3% | 2.00 | 267.00 B |
-| `request/decode/prompt` | 374.63 ns | 1.2% | 2.00 | 2.21 KiB |
-| `request/encode/approve` | 73.95 ns | 1.1% | 1.00 | 128.00 B |
-| `request/encode/prompt` | 899.43 ns | 3.2% | 3.00 | 3.97 KiB |
-| `turn/decode` | 345.98 µs | 1.4% | 5,041 | 1.39 MiB |
-| `turn/encode` | 138.56 µs | 0.9% | 2,524 | 412.46 KiB |
+| `backlog/decode` | 666.10 µs | 11.3% | 7,550 | 1.53 MiB |
+| `backlog/encode` | 126.33 µs | 8.5% | 11 | 128.00 KiB |
+| `frame/decode/done` | 1.86 µs | 9.7% | 11 | 4.71 KiB |
+| `frame/decode/text` | 160.84 ns | 7.3% | 2.00 | 264.00 B |
+| `frame/decode/tool` | 739.19 ns | 9.2% | 9.00 | 1.18 KiB |
+| `frame/decode/tool_done` | 360.15 ns | 14.8% | 3.00 | 271.00 B |
+| `frame/encode/done` | 1.90 µs | 13.8% | 5.00 | 2.96 KiB |
+| `frame/encode/text` | 54.98 ns | 3.1% | 1.00 | 128.00 B |
+| `frame/encode/tool` | 377.22 ns | 15.1% | 2.00 | 256.00 B |
+| `frame/encode/tool_done` | 134.35 ns | 9.5% | 1.00 | 128.00 B |
+| `request/decode/approve` | 311.72 ns | 10.2% | 2.00 | 267.00 B |
+| `request/decode/prompt` | 644.06 ns | 12.2% | 2.00 | 2.21 KiB |
+| `request/encode/approve` | 108.39 ns | 6.6% | 1.00 | 128.00 B |
+| `request/encode/prompt` | 1.35 µs | 8.0% | 3.00 | 3.97 KiB |
+| `turn/decode` | 464.94 µs | 5.8% | 5,041 | 1.39 MiB |
+| `turn/encode` | 202.98 µs | 5.9% | 2,524 | 412.46 KiB |
 
 ### `session`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |
 |---|---:|---:|---:|---:|
-| `append/10` | 41.45 ns | 3.5% | 0.00 | 0.00 B |
-| `append/100` | 33.53 ns | 4.2% | 0.00 | 0.00 B |
-| `append/500` | 41.13 ns | 8.4% | 0.00 | 0.00 B |
-| `build/10` | 41.21 µs | 2.6% | 649 | 157.94 KiB |
-| `build/100` | 382.00 µs | 1.9% | 6,412 | 1.43 MiB |
-| `build/500` | 1.94 ms | 2.3% | 32,014 | 6.73 MiB |
-| `decode/10` | 104.68 µs | 3.6% | 981 | 239.70 KiB |
-| `decode/100` | 1.00 ms | 1.5% | 9,714 | 2.23 MiB |
-| `decode/500` | 5.27 ms | 1.9% | 48,516 | 10.72 MiB |
-| `derive_messages/10` | 9.19 µs | 2.2% | 259 | 65.73 KiB |
-| `derive_messages/100` | 124.44 µs | 2.7% | 2,515 | 639.28 KiB |
-| `derive_messages/500` | 1.37 ms | 4.2% | 12,520 | 3.33 MiB |
-| `encode/to_jsonl/10` | 71.81 µs | 5.8% | 383 | 189.51 KiB |
-| `encode/to_jsonl/100` | 654.49 µs | 3.4% | 3,716 | 1.66 MiB |
-| `encode/to_jsonl/500` | 3.04 ms | 2.4% | 18,518 | 7.50 MiB |
-| `encode/try_to_jsonl/10` | 101.74 µs | 3.3% | 486 | 191.19 KiB |
-| `encode/try_to_jsonl/100` | 1.11 ms | 6.5% | 4,719 | 1.67 MiB |
-| `encode/try_to_jsonl/500` | 5.08 ms | 2.5% | 23,521 | 7.58 MiB |
+| `append/10` | 62.28 ns | 8.9% | 0.00 | 0.00 B |
+| `append/100` | 51.74 ns | 17.8% | 0.00 | 0.00 B |
+| `append/500` | 60.64 ns | 6.8% | 0.00 | 0.00 B |
+| `build/10` | 51.33 µs | 6.5% | 649 | 157.94 KiB |
+| `build/100` | 541.50 µs | 9.2% | 6,412 | 1.43 MiB |
+| `build/500` | 2.44 ms | 3.7% | 32,014 | 6.73 MiB |
+| `decode/10` | 193.93 µs | 9.5% | 981 | 239.70 KiB |
+| `decode/100` | 1.81 ms | 8.5% | 9,714 | 2.23 MiB |
+| `decode/500` | 9.26 ms | 9.3% | 48,516 | 10.72 MiB |
+| `derive_messages/10` | 12.49 µs | 6.3% | 259 | 65.73 KiB |
+| `derive_messages/100` | 169.92 µs | 8.1% | 2,515 | 639.28 KiB |
+| `derive_messages/500` | 1.71 ms | 5.8% | 12,520 | 3.33 MiB |
+| `encode/to_jsonl/10` | 75.82 µs | 5.7% | 383 | 189.51 KiB |
+| `encode/to_jsonl/100` | 921.36 µs | 7.3% | 3,716 | 1.66 MiB |
+| `encode/to_jsonl/500` | 5.20 ms | 8.8% | 18,518 | 7.50 MiB |
+| `encode/try_to_jsonl/10` | 126.14 µs | 5.6% | 486 | 191.19 KiB |
+| `encode/try_to_jsonl/100` | 1.18 ms | 7.6% | 4,719 | 1.67 MiB |
+| `encode/try_to_jsonl/500` | 7.50 ms | 10.2% | 23,521 | 7.58 MiB |
 
 ### `store`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |
 |---|---:|---:|---:|---:|
-| `list/50` | 5.17 ms | 8.7% | 2,765 | 1.26 MiB |
-| `load/10` | 296.25 µs | 10.0% | 1,028 | 340.05 KiB |
-| `load/100` | 1.39 ms | 12.0% | 9,773 | 3.74 MiB |
-| `load/500` | 6.16 ms | 5.8% | 48,581 | 16.73 MiB |
-| `save/10` | 2.85 ms | 2.6% | 512 | 254.05 KiB |
-| `save/100` | 4.58 ms | 5.1% | 4,745 | 2.26 MiB |
-| `save/500` | 18.12 ms | 7.1% | 23,548 | 9.58 MiB |
+| `list/50` | 7.54 ms | 8.1% | 2,765 | 1.26 MiB |
+| `load/10` | 423.78 µs | 15.1% | 1,028 | 340.05 KiB |
+| `load/100` | 1.98 ms | 11.7% | 9,773 | 3.74 MiB |
+| `load/500` | 8.83 ms | 12.8% | 48,581 | 16.73 MiB |
+| `save/10` | 5.07 ms | 4.7% | 513 | 254.08 KiB |
+| `save/100` | 5.24 ms | 6.4% | 4,746 | 2.26 MiB |
+| `save/500` | 12.70 ms | 6.7% | 23,549 | 9.58 MiB |
 
 ### `tools`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |
 |---|---:|---:|---:|---:|
-| `bash/echo` | 7.62 ms | 10.2% | 54 | 20.99 KiB |
-| `bash/true` | 7.60 ms | 15.1% | 52 | 20.98 KiB |
-| `modify/edit` | 286.64 µs | 5.1% | 79 | 229.59 KiB |
-| `modify/write_overwrite` | 93.08 µs | 12.5% | 37 | 110.67 KiB |
-| `read/default_window` | 274.66 µs | 3.5% | 70 | 344.86 KiB |
-| `read/whole_file` | 303.12 µs | 1.4% | 73 | 578.87 KiB |
-| `read/window_100` | 201.24 µs | 6.9% | 68 | 271.25 KiB |
-| `search/glob/all_rs` | 1.70 ms | 2.4% | 1,613 | 187.62 KiB |
-| `search/glob/narrow` | 1.79 ms | 2.8% | 1,777 | 183.81 KiB |
-| `search/grep/common_capped` | 1.80 ms | 1.9% | 3,529 | 312.73 KiB |
-| `search/grep/include_rs` | 13.47 ms | 2.2% | 85,683 | 5.29 MiB |
-| `search/grep/rare` | 12.95 ms | 2.0% | 85,514 | 5.27 MiB |
+| `bash/echo` | 9.03 ms | 17.7% | 54 | 20.99 KiB |
+| `bash/true` | 9.27 ms | 13.3% | 52 | 20.98 KiB |
+| `modify/edit` | 445.80 µs | 12.3% | 79 | 229.59 KiB |
+| `modify/write_overwrite` | 209.96 µs | 17.7% | 37 | 110.67 KiB |
+| `read/default_window` | 278.23 µs | 5.9% | 70 | 344.86 KiB |
+| `read/whole_file` | 384.29 µs | 4.1% | 73 | 578.87 KiB |
+| `read/window_100` | 210.57 µs | 4.8% | 68 | 271.25 KiB |
+| `search/glob/all_rs` | 2.18 ms | 3.7% | 1,613 | 187.62 KiB |
+| `search/glob/narrow` | 2.21 ms | 5.5% | 1,777 | 183.81 KiB |
+| `search/grep/common_capped` | 3.13 ms | 11.3% | 3,529 | 312.73 KiB |
+| `search/grep/include_rs` | 16.61 ms | 3.3% | 85,683 | 5.29 MiB |
+| `search/grep/rare` | 16.44 ms | 4.0% | 85,514 | 5.27 MiB |
 
 ### `tui`
 
-| Benchmark | Time | ± | Allocations | Bytes allocated |
-|---|---:|---:|---:|---:|
-| `delta/10` | 3.58 ms | 8.0% | 23,542 | 1.33 MiB |
-| `delta/100` | 12.59 ms | 6.2% | 202,781 | 12.08 MiB |
-| `draw/compact/10` | 859.83 µs | 6.5% | 13,787 | 821.36 KiB |
-| `draw/compact/100` | 7.36 ms | 7.6% | 134,941 | 8.05 MiB |
-| `draw/full/10` | 817.70 µs | 2.5% | 13,696 | 923.89 KiB |
-| `draw/full/100` | 6.73 ms | 3.0% | 133,948 | 8.47 MiB |
-| `draw/large/100` | 6.90 ms | 4.7% | 135,099 | 8.41 MiB |
-| `draw/plain/10` | 297.63 µs | 3.2% | 3,152 | 258.10 KiB |
-| `draw/plain/100` | 1.74 ms | 4.1% | 28,546 | 2.45 MiB |
-| `draw/scrolled/100` | 8.12 ms | 6.9% | 134,939 | 8.14 MiB |
-| `input/insert_backspace/2000` | 143.04 ns | 5.4% | 0.00 | 0.00 B |
-| `replay/10` | 29.36 µs | 1.8% | 510 | 72.91 KiB |
-| `replay/100` | 381.04 µs | 2.2% | 5,043 | 698.04 KiB |
-| `stream/answer` | 12.13 µs | 1.3% | 13 | 16.44 KiB |
-| `stream/interleaved` | 12.45 µs | 1.4% | 23 | 16.44 KiB |
-| `stream/reasoning` | 12.41 µs | 2.4% | 13 | 16.44 KiB |
+| Benchmark | Time | ± | Allocations | Bytes allocated | Held |
+|---|---:|---:|---:|---:|---:|
+| `answer/4000` | 51.71 ms | 4.9% | 407,400 | 27.58 MiB | — |
+| `answer/500` | 6.38 ms | 4.8% | 50,699 | 3.43 MiB | — |
+| `delta/10` | 180.64 µs | 5.4% | 212 | 35.55 KiB | — |
+| `delta/100` | 196.84 µs | 4.3% | 212 | 35.52 KiB | — |
+| `draw/compact/10` | 195.77 µs | 7.4% | 116 | 26.75 KiB | — |
+| `draw/compact/100` | 215.74 µs | 5.3% | 116 | 26.75 KiB | — |
+| `draw/empty/0` | 112.60 µs | 5.8% | 69 | 10.69 KiB | — |
+| `draw/first/10` | 462.48 µs | 4.2% | 4,705 | 321.68 KiB | — |
+| `draw/first/100` | 2.96 ms | 4.9% | 43,871 | 2.83 MiB | — |
+| `draw/full/10` | 189.75 µs | 8.1% | 121 | 39.23 KiB | — |
+| `draw/full/100` | 204.86 µs | 6.4% | 121 | 39.23 KiB | — |
+| `draw/large/100` | 325.74 µs | 3.6% | 133 | 34.09 KiB | — |
+| `draw/plain/10` | 190.81 µs | 7.5% | 125 | 36.12 KiB | — |
+| `draw/plain/100` | 198.59 µs | 5.2% | 125 | 36.12 KiB | — |
+| `draw/scrolled/100` | 163.25 µs | 3.4% | 116 | 24.17 KiB | — |
+| `input/insert_backspace/2000` | 114.26 ns | 2.3% | 0.00 | 0.00 B | — |
+| `replay/10` | 36.16 µs | 5.2% | 490 | 70.63 KiB | — |
+| `replay/100` | 490.32 µs | 5.8% | 4,843 | 671.27 KiB | — |
+| `resident/lines/100` | — | — | — | — | 954.79 KiB |
+| `resident/transcript/100` | — | — | — | — | 358.03 KiB |
+| `resident/view/100` | — | — | — | — | 146.47 KiB |
+| `stream/answer` | 18.64 µs | 4.3% | 13 | 16.50 KiB | — |
+| `stream/interleaved` | 19.60 µs | 4.5% | 23 | 16.50 KiB | — |
+| `stream/reasoning` | 18.36 µs | 7.9% | 13 | 16.50 KiB | — |
 
 ### `wire`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |
 |---|---:|---:|---:|---:|
-| `encode/body/anthropic/10` | 108.05 µs | 7.0% | 2,121 | 395.80 KiB |
-| `encode/body/anthropic/100` | 758.01 µs | 3.1% | 14,727 | 2.83 MiB |
-| `encode/body/deepseek/10` | 76.62 µs | 3.2% | 1,095 | 255.85 KiB |
-| `encode/body/deepseek/100` | 535.59 µs | 3.7% | 7,131 | 1.85 MiB |
-| `encode/body/openai_chat/10` | 69.21 µs | 3.2% | 1,052 | 246.27 KiB |
-| `encode/body/openai_chat/100` | 532.21 µs | 3.9% | 6,728 | 1.76 MiB |
-| `encode/body/openai_responses/10` | 65.98 µs | 2.8% | 1,020 | 229.62 KiB |
-| `encode/body/openai_responses/100` | 482.51 µs | 3.9% | 6,607 | 1.65 MiB |
-| `encode/value/anthropic/10` | 66.78 µs | 5.7% | 2,111 | 331.80 KiB |
-| `encode/value/anthropic/100` | 547.50 µs | 5.0% | 14,714 | 2.33 MiB |
-| `encode/value/deepseek/10` | 37.95 µs | 3.8% | 1,089 | 192.63 KiB |
-| `encode/value/deepseek/100` | 246.35 µs | 2.7% | 7,122 | 1.36 MiB |
-| `encode/value/openai_chat/10` | 34.62 µs | 2.3% | 1,046 | 182.88 KiB |
-| `encode/value/openai_chat/100` | 248.52 µs | 3.9% | 6,719 | 1.27 MiB |
-| `encode/value/openai_responses/10` | 35.35 µs | 2.6% | 1,010 | 165.62 KiB |
-| `encode/value/openai_responses/100` | 235.66 µs | 3.6% | 6,594 | 1.15 MiB |
-| `sse/legacy/frames` | 675.24 µs | 2.8% | 10,025 | 1.11 MiB |
-| `sse/legacy/segments` | 711.74 µs | 2.0% | 8,167 | 966.49 KiB |
-| `sse/limited/frames` | 367.75 µs | 3.1% | 5,013 | 676.86 KiB |
-| `sse/limited/segments` | 327.87 µs | 1.4% | 3,155 | 502.67 KiB |
-| `sse/sse_frames/frames` | 652.29 µs | 2.2% | 10,025 | 1.11 MiB |
-| `sse/sse_frames/segments` | 752.88 µs | 3.2% | 8,167 | 966.49 KiB |
-| `stream/anthropic` | 13.82 ms | 12.5% | 36,344 | 34.15 MiB |
-| `stream/deepseek` | 20.94 ms | 11.7% | 52,791 | 7.03 MiB |
-| `stream/openai_chat` | 19.94 ms | 13.8% | 52,790 | 7.13 MiB |
+| `encode/body/anthropic/10` | 101.59 µs | 3.5% | 2,121 | 395.80 KiB |
+| `encode/body/anthropic/100` | 757.62 µs | 4.4% | 14,727 | 2.83 MiB |
+| `encode/body/deepseek/10` | 77.40 µs | 4.1% | 1,095 | 255.85 KiB |
+| `encode/body/deepseek/100` | 587.95 µs | 4.3% | 7,131 | 1.85 MiB |
+| `encode/body/openai_chat/10` | 72.11 µs | 4.4% | 1,052 | 246.27 KiB |
+| `encode/body/openai_chat/100` | 515.63 µs | 3.3% | 6,728 | 1.76 MiB |
+| `encode/body/openai_responses/10` | 68.02 µs | 2.4% | 1,020 | 229.62 KiB |
+| `encode/body/openai_responses/100` | 494.40 µs | 4.0% | 6,607 | 1.65 MiB |
+| `encode/value/anthropic/10` | 66.63 µs | 2.9% | 2,111 | 331.80 KiB |
+| `encode/value/anthropic/100` | 482.22 µs | 3.3% | 14,714 | 2.33 MiB |
+| `encode/value/deepseek/10` | 39.05 µs | 4.4% | 1,089 | 192.63 KiB |
+| `encode/value/deepseek/100` | 295.78 µs | 4.1% | 7,122 | 1.36 MiB |
+| `encode/value/openai_chat/10` | 41.64 µs | 7.6% | 1,046 | 182.88 KiB |
+| `encode/value/openai_chat/100` | 317.92 µs | 7.3% | 6,719 | 1.27 MiB |
+| `encode/value/openai_responses/10` | 35.56 µs | 5.3% | 1,010 | 165.62 KiB |
+| `encode/value/openai_responses/100` | 243.38 µs | 3.7% | 6,594 | 1.15 MiB |
+| `sse/legacy/frames` | 731.32 µs | 5.9% | 10,025 | 1.11 MiB |
+| `sse/legacy/segments` | 750.17 µs | 3.6% | 8,167 | 966.49 KiB |
+| `sse/limited/frames` | 355.82 µs | 1.8% | 5,013 | 676.86 KiB |
+| `sse/limited/segments` | 352.22 µs | 5.6% | 3,155 | 502.67 KiB |
+| `sse/sse_frames/frames` | 707.63 µs | 5.0% | 10,025 | 1.11 MiB |
+| `sse/sse_frames/segments` | 746.88 µs | 3.6% | 8,167 | 966.49 KiB |
+| `stream/anthropic` | 12.42 ms | 10.0% | 36,346 | 34.14 MiB |
+| `stream/deepseek` | 21.04 ms | 11.2% | 52,791 | 7.19 MiB |
+| `stream/openai_chat` | 23.75 ms | 5.4% | 52,790 | 7.11 MiB |
+
+### What the layout cache changed
+
+The interface's figures before the change are the quiet recording at `ee1e595`; the new
+benchmarks were run against the old code from the same commit for the counts below. Times from
+the loaded run above, which makes the improvements in time understated rather than overstated.
+
+| Benchmark | Before | After |
+|---|---:|---:|
+| `draw/compact/100`: time | 7.36 ms | 216 µs |
+| `draw/compact/100`: allocations / bytes | 134,941 / 8.05 MiB | 116 / 26.8 KiB |
+| `draw/compact/10`: allocations | 13,787 | 116 |
+| `delta/100`: time | 12.59 ms | 197 µs |
+| `delta/100`: allocations / bytes | 202,781 / 12.1 MiB | 212 / 35.5 KiB |
+| `answer/4000`: allocations / bytes | 68.07 M / 3.89 GiB | 407,400 / 27.6 MiB |
+| `answer/500`: allocations / bytes | 4.22 M / 243.6 MiB | 50,699 / 3.43 MiB |
+| `draw/first/100`: allocations / bytes | 134,950 / 8.25 MiB | 43,871 / 2.83 MiB |
+| `draw/empty/0`: allocations / bytes | 274 / 16.6 KiB | 69 / 10.7 KiB |
+| `resident/transcript/100`: held | 384.8 KiB | 358.0 KiB |
+| `resident/view/100`: held | 7.5 KiB | 146.5 KiB |
+| `resident/lines/100`: held | 1.61 MiB | 955 KiB |
+
+The view now holds about 1.4 KiB per turn between frames, where it held nothing, and in return
+no longer builds and holds every rendered line of the conversation on every frame — 1.61 MiB at
+100 turns before the change, and once for each of the two passes a frame made. Peak use while
+drawing a 100-turn session fell from about 2 MiB to about 0.5 MiB.
 
 ## What the baseline shows
 
 These are observations from the numbers above, recorded so that a fix can be measured
-against them. None has been changed.
+against them. The first two were found by the first baseline and are fixed; the rest have not
+been changed.
 
-- **The interface redraws the whole conversation on every frame.** A frame of a 100-turn
-  transcript costs nine to ten times one of a 10-turn transcript in time, allocations, and
-  bytes, and being scrolled to the middle makes no difference (`draw/scrolled/100` makes the
-  same allocations as the bottom). The per-token cycle is worse than one frame, because
-  `follow()` rebuilds every line to find the bottom and the redraw then rebuilds them again:
-  `tui/delta/100` is about 12.6 ms, 203 K allocations, and 12 MiB per token, a ceiling of
-  roughly 80 tokens a second on a long session.
-- **Markdown is most of a frame.** At 100 turns, turning it off takes a frame from 7.4 ms and
-  135 K allocations to 1.7 ms and 29 K. Answers are re-rendered on every frame; nothing caches
-  them.
+- **Fixed: the interface redrew the whole conversation on every frame.** A frame of a 100-turn
+  transcript cost ten times one of 10 turns, and a token at 100 turns about 12.6 ms — a ceiling
+  of roughly 80 tokens a second. The view now keeps its layout between frames and renders only
+  what changed ([the interface](tui.md#what-a-frame-costs)): a frame is 116 allocations at 10
+  turns and at 100, and a token about 0.2 ms at either.
+- **Fixed: markdown was most of a frame, and a streaming answer re-rendered all of itself per
+  token.** Answers are rendered once, and a streaming one is cut where its markdown has
+  settled, so a token re-renders only the tail; a 4,000-token answer costs eight times a
+  500-token one, as it should, where it cost sixteen. The renderer also stopped making a span
+  for every word and every space, which roughly halved what rendering an answer allocates.
+- **The first frame of a long session still renders everything.** Opening a 100-turn session,
+  resizing, or toggling a display setting renders every block once at the new conditions:
+  `draw/first/100` is about 3 ms and 44 K allocations. That is once per act rather than once
+  per frame, and the next thing to make incremental if sessions grow much longer.
 - **Anthropic streaming copies its accumulated reply on every delta.** `absorb_replay_delta`
   (`crates/nanus-adapter-anthropic/src/wire.rs`) clones the block's text so far, appends the
   fragment, and stores it back, so the cost is quadratic in the reply's length:

@@ -67,6 +67,9 @@ mod copy;
 // `Line`s every other entry is drawn from, and nothing outside this crate needs to name
 // it. Keeping it private is what stops it becoming a second public rendering surface.
 mod markdown;
+// The transcript's layout, kept between frames so a frame renders what changed and draws what is on
+// screen. Private because it is how the view draws, not something the view shows.
+mod layout;
 pub mod notice;
 pub mod queue;
 pub mod replay;

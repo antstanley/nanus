@@ -36,12 +36,28 @@ pub(crate) fn blocks(
     theme: &MarkdownTheme,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+    blocks_into(&mut out, blocks, width, mermaid, theme);
+    finish(out)
+}
+
+/// Renders `blocks` onto the end of `out`, continuing from whatever `out` already holds.
+///
+/// The spacing rules look back one line — a run of blank rows collapses, a heading opens with
+/// one — so a rendering that resumes part way through a message gives the same rows as one
+/// that ran from the start, provided `out` ends the way the earlier part left it.
+pub(crate) fn blocks_into(
+    out: &mut Vec<Line<'static>>,
+    blocks: &[Block],
+    width: usize,
+    mermaid: bool,
+    theme: &MarkdownTheme,
+) {
     for block in blocks {
         match block {
-            Block::Blank => push_blank(&mut out),
+            Block::Blank => push_blank(out),
             Block::Heading { level, text } => {
                 if !out.is_empty() {
-                    push_blank(&mut out);
+                    push_blank(out);
                 }
                 out.extend(heading(*level, text, width, theme));
             }
@@ -64,13 +80,22 @@ pub(crate) fn blocks(
             Block::Image { alt, path } => out.extend(image(alt, path, width, theme)),
         }
     }
-    while out.last().is_some_and(|line| line.width() == 0) {
-        out.pop();
-    }
+}
+
+/// Finishes a rendering: no trailing blank rows, and at least one row.
+pub(crate) fn finish(mut out: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    trim_trailing_blanks(&mut out);
     if out.is_empty() {
         out.push(Line::from(""));
     }
     out
+}
+
+/// Drops the blank rows at the end of a rendering.
+pub(crate) fn trim_trailing_blanks(out: &mut Vec<Line<'static>>) {
+    while out.last().is_some_and(|line| line.width() == 0) {
+        out.pop();
+    }
 }
 
 /// Draws a `mermaid` fence as a diagram, or returns `None` to fall back to code.

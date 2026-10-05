@@ -11,10 +11,10 @@ use ratatui::text::{Line, Span};
 
 use super::text::{char_width, str_width};
 
-/// One unit of a span's text.
-enum Token {
+/// One unit of a span's text, borrowed from it.
+enum Token<'a> {
     /// A run with no spaces in it.
-    Word(String),
+    Word(&'a str),
     /// A single space.
     Space,
     /// A hard line break.
@@ -35,13 +35,11 @@ pub(crate) fn wrap(
 ) -> Vec<Line<'static>> {
     let mut builder = Builder::new(width, first_prefix, continuation, prefix_style);
     for span in spans {
-        for token in tokens(&span.content) {
-            match token {
-                Token::Word(word) => builder.word(&word, span.style),
-                Token::Space => builder.pending = true,
-                Token::Newline => builder.newline(),
-            }
-        }
+        each_token(&span.content, |token| match token {
+            Token::Word(word) => builder.word(word, span.style),
+            Token::Space => builder.pending = true,
+            Token::Newline => builder.newline(),
+        });
     }
     builder.finish()
 }
@@ -65,33 +63,82 @@ pub(crate) fn hard_wrap_spans(
     let prefix = clamp(prefix, width.saturating_sub(1));
     let room = width.saturating_sub(str_width(&prefix)).max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut line: Vec<Span<'static>> = vec![Span::styled(prefix.clone(), prefix_style)];
+    let mut line = Run::new(&prefix, prefix_style);
     let mut used = 0_usize;
     for span in spans {
         for character in span.content.chars() {
             let current = char_width(character);
             if used.saturating_add(current) > room && used > 0 {
-                out.push(Line::from(std::mem::take(&mut line)));
-                line.push(Span::styled(prefix.clone(), prefix_style));
+                out.push(line.finish());
+                line = Run::new(&prefix, prefix_style);
                 used = 0;
             }
             let mut buffer = [0_u8; 4];
-            let text = character.encode_utf8(&mut buffer);
-            // Runs are merged as they are laid down, so a wrapped line holds one span per
-            // colour rather than one per character. An empty span — the prefix of a line
-            // that has none — is replaced rather than kept beside the text it would precede.
-            match line.last_mut() {
-                Some(last) if last.style == span.style => last.content.to_mut().push_str(text),
-                Some(last) if last.content.is_empty() => {
-                    *last = Span::styled(text.to_owned(), span.style);
-                }
-                _ => line.push(Span::styled(text.to_owned(), span.style)),
-            }
+            line.push(character.encode_utf8(&mut buffer), span.style);
             used = used.saturating_add(current);
         }
     }
-    out.push(Line::from(line));
+    out.push(line.finish());
     out
+}
+
+/// A line being laid down: its finished spans, and the run of one style still growing.
+///
+/// Runs are merged as they are laid down, so a line holds one span per colour rather than one
+/// per character or per word. The growing run is kept in a buffer of its own and copied out once,
+/// at its exact length, when the style changes or the line ends: growing each span in place
+/// reallocated it every time it doubled, and left the slack in every line the view keeps.
+struct Run {
+    spans: Vec<Span<'static>>,
+    text: String,
+    style: Option<Style>,
+}
+
+impl Run {
+    /// A line that opens with `prefix`, unless the prefix is empty.
+    fn new(prefix: &str, prefix_style: Style) -> Self {
+        let mut spans = Vec::new();
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix.to_owned(), prefix_style));
+        }
+        Self {
+            spans,
+            text: String::new(),
+            style: None,
+        }
+    }
+
+    /// Lays `text` down in `style`, joining the run when it is the run's style.
+    fn push(&mut self, text: &str, style: Style) {
+        if self.style != Some(style) {
+            self.close();
+            self.style = Some(style);
+        }
+        self.text.push_str(text);
+    }
+
+    /// Turns the growing run into a span.
+    fn close(&mut self) {
+        if let Some(style) = self.style.take()
+            && !self.text.is_empty()
+        {
+            self.spans
+                .push(Span::styled(self.text.as_str().to_owned(), style));
+            self.text.clear();
+        }
+    }
+
+    /// The finished line.
+    fn finish(mut self) -> Line<'static> {
+        self.close();
+        Line::from(self.spans)
+    }
+
+    /// The finished line, leaving this one empty and its buffer ready for the next.
+    fn take(&mut self) -> Line<'static> {
+        self.close();
+        Line::from(std::mem::take(&mut self.spans))
+    }
 }
 
 /// Truncates `text` to at most `width` columns, for a prefix that will not fit.
@@ -112,44 +159,42 @@ fn clamp(text: &str, width: usize) -> String {
     out
 }
 
-/// Splits one span's text into tokens, keeping wide characters breakable.
-fn tokens(text: &str) -> Vec<Token> {
-    let mut out = Vec::new();
-    let mut word = String::new();
-    for character in text.chars() {
+/// Walks one span's text as tokens, keeping wide characters breakable.
+///
+/// The words are slices of the text rather than copies of it: the builder copies what it keeps
+/// into the line it is building, and a copy made only to be handed over was an allocation for
+/// every word of every answer.
+fn each_token<'a>(text: &'a str, mut visit: impl FnMut(Token<'a>)) {
+    let mut word_start: Option<usize> = None;
+    for (index, character) in text.char_indices() {
+        let wide = char_width(character) >= 2;
+        if character != '\n' && character != ' ' && !wide {
+            word_start.get_or_insert(index);
+            continue;
+        }
+        if let Some(from) = word_start.take() {
+            visit(Token::Word(text.get(from..index).unwrap_or_default()));
+        }
         match character {
-            '\n' => {
-                push_word(&mut out, &mut word);
-                out.push(Token::Newline);
+            '\n' => visit(Token::Newline),
+            ' ' => visit(Token::Space),
+            // A wide glyph is its own token so that a run of CJK can break between any two
+            // characters, which is what a reader of it expects.
+            _ => {
+                let end = index.saturating_add(character.len_utf8());
+                visit(Token::Word(text.get(index..end).unwrap_or_default()));
             }
-            ' ' => {
-                push_word(&mut out, &mut word);
-                out.push(Token::Space);
-            }
-            _ if char_width(character) >= 2 => {
-                // A wide glyph is its own token so that a run of CJK can break between
-                // any two characters, which is what a reader of it expects.
-                push_word(&mut out, &mut word);
-                out.push(Token::Word(character.to_string()));
-            }
-            _ => word.push(character),
         }
     }
-    push_word(&mut out, &mut word);
-    out
-}
-
-/// Flushes the in-progress word, if any.
-fn push_word(out: &mut Vec<Token>, word: &mut String) {
-    if !word.is_empty() {
-        out.push(Token::Word(std::mem::take(word)));
+    if let Some(from) = word_start {
+        visit(Token::Word(text.get(from..).unwrap_or_default()));
     }
 }
 
 /// Accumulates wrapped lines, tracking the current row's width.
 struct Builder {
     out: Vec<Line<'static>>,
-    line: Vec<Span<'static>>,
+    line: Run,
     used: usize,
     /// The width of the current line's prefix, so the wrap compares content to content.
     prefix: usize,
@@ -166,7 +211,7 @@ impl Builder {
     fn new(budget: usize, first: &str, continuation: &str, prefix_style: Style) -> Self {
         let mut builder = Self {
             out: Vec::new(),
-            line: Vec::new(),
+            line: Run::new("", prefix_style),
             used: 0,
             prefix: 0,
             content: false,
@@ -189,15 +234,21 @@ impl Builder {
         self.content = false;
         self.pending = false;
         if !prefix.is_empty() {
-            self.line.push(Span::styled(prefix, self.prefix_style));
+            self.line.close();
+            self.line
+                .spans
+                .push(Span::styled(prefix, self.prefix_style));
         }
     }
 
     /// Ends the current line and starts the next on the continuation prefix.
     fn newline(&mut self) {
-        self.out.push(Line::from(std::mem::take(&mut self.line)));
-        let continuation = self.continuation.clone();
+        let line = self.line.take();
+        self.out.push(line);
+        // Taken and put back rather than cloned: the prefix is read, not kept, by `open`.
+        let continuation = std::mem::take(&mut self.continuation);
         self.open(&continuation);
+        self.continuation = continuation;
     }
 
     /// Places one word, wrapping first if it would not fit.
@@ -245,18 +296,24 @@ impl Builder {
     }
 
     /// Appends styled text to the current line and records its width.
+    ///
+    /// Text in the style of the run before it joins that run, so a line of prose is one span
+    /// rather than a span for every word and another for every space between them — which was
+    /// a string per word to build, to keep, and to draw. The prefix is never joined: it is the
+    /// line's own furniture, and stays the first span whatever its style.
     fn push(&mut self, text: &str, style: Style) {
-        if !text.is_empty() {
-            self.line.push(Span::styled(text.to_owned(), style));
-            self.used = self.used.saturating_add(str_width(text));
-            self.content = true;
+        if text.is_empty() {
+            return;
         }
+        self.line.push(text, style);
+        self.used = self.used.saturating_add(str_width(text));
+        self.content = true;
     }
 
     /// Returns the wrapped lines.
     fn finish(mut self) -> Vec<Line<'static>> {
         if self.content || self.out.is_empty() {
-            self.out.push(Line::from(self.line));
+            self.out.push(self.line.finish());
         }
         self.out
     }
@@ -317,6 +374,26 @@ mod tests {
         // Three two-column glyphs are six columns, so only two fit in five.
         let lines = wrap(&plain("日本語"), 5, "", "", Style::new());
         assert_eq!(texts(&lines), ["日本", "語"]);
+    }
+
+    #[test]
+    fn a_run_of_one_style_is_one_span_and_a_change_of_style_starts_another() {
+        let bold = Style::new().add_modifier(ratatui::style::Modifier::BOLD);
+        let spans = vec![
+            Span::styled(String::from("plain words here "), Style::new()),
+            Span::styled(String::from("bold"), bold),
+        ];
+        let lines = wrap(&spans, 40, "• ", "  ", Style::new());
+        assert_eq!(texts(&lines), ["• plain words here bold"]);
+        let styles: Vec<Style> = lines[0].spans.iter().map(|span| span.style).collect();
+        assert_eq!(
+            styles,
+            [Style::new(), Style::new(), bold],
+            "prefix, the run, the bold"
+        );
+        // A space takes the style of the word after it, so it opens the bold run.
+        assert_eq!(lines[0].spans[1].content, "plain words here");
+        assert_eq!(lines[0].spans[2].content, " bold");
     }
 
     #[test]

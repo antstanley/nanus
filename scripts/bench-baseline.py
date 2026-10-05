@@ -4,8 +4,9 @@
 Criterion keeps its results under `target/criterion/`, which is not committed, so a
 baseline recorded on one machine is gone on the next clone. This reads a named baseline
 (`cargo bench -p nanus-bench -- --save-baseline <name>`) and prints one row per benchmark
-with its three measurements side by side — wall time, allocations, and bytes allocated —
-which is the form `docs/benchmarks.md` records.
+with its measurements side by side — wall time, allocations, bytes allocated, and, for the
+benchmarks that measure it, the bytes still held afterwards — which is the form
+`docs/benchmarks.md` records.
 
     scripts/bench-baseline.py main            # the baseline saved as `main`
     scripts/bench-baseline.py new             # whatever the last run produced
@@ -25,7 +26,7 @@ import json
 import sys
 from pathlib import Path
 
-MEASUREMENTS = ("time", "allocs", "bytes")
+MEASUREMENTS = ("time", "allocs", "bytes", "retained")
 
 
 def estimate(path: Path) -> tuple[float, float]:
@@ -54,7 +55,7 @@ def fmt(measurement: str, value: float | None) -> str:
         return scaled(value, 1000.0, ("ns", "µs", "ms", "s"))
     if measurement == "allocs":
         return f"{value:,.0f}" if value >= 10 else f"{value:.2f}"
-    return scaled(value, 1024.0, ("B", "KiB", "MiB", "GiB"))
+    return scaled(value, 1024.0, ("B", "KiB", "MiB", "GiB"))  # bytes and retained
 
 
 def collect(root: Path, baseline: str) -> dict[str, dict[str, tuple[float, float]]]:
@@ -70,8 +71,11 @@ def collect(root: Path, baseline: str) -> dict[str, dict[str, tuple[float, float
 
 
 def table(rows: dict[str, dict[str, tuple[float, float]]], names: list[str], strip: str) -> None:
-    print("| Benchmark | Time | ± | Allocations | Bytes allocated |")
-    print("|---|---:|---:|---:|---:|")
+    # Residency is measured only for the benchmarks that ask for it, so its column appears only
+    # in a table that has some.
+    held = any("retained" in rows[name] for name in names)
+    print("| Benchmark | Time | ± | Allocations | Bytes allocated |" + (" Held |" if held else ""))
+    print("|---|---:|---:|---:|---:|" + ("---:|" if held else ""))
     for name in names:
         row = rows[name]
         time = row.get("time")
@@ -81,6 +85,8 @@ def table(rows: dict[str, dict[str, tuple[float, float]]], names: list[str], str
             fmt("allocs", row["allocs"][0] if "allocs" in row else None),
             fmt("bytes", row["bytes"][0] if "bytes" in row else None),
         ]
+        if held:
+            cells.append(fmt("retained", row["retained"][0] if "retained" in row else None))
         print(f"| `{name.removeprefix(strip)}` | " + " | ".join(cells) + " |")
 
 

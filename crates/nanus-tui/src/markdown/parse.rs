@@ -14,63 +14,111 @@ pub(crate) fn parse(source: &str) -> Vec<Block> {
     let cleaned = inline::sanitize(source);
     let mut lines: Vec<&str> = cleaned.lines().collect();
     strip_frontmatter(&mut lines);
+    blocks_of(&lines)
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect()
+}
+
+/// Parses the rest of a message from a point where a previous parse stopped cleanly.
+///
+/// The same parse as [`parse`] but for the frontmatter, which can only open a message: the
+/// text here is a continuation, and a `+++` line in the middle of an answer is prose.
+pub(crate) fn parse_continued(source: &str) -> Vec<Block> {
+    let cleaned = inline::sanitize(source);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    blocks_of(&lines)
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect()
+}
+
+/// The lines a streaming message could be cut at, in order, with the block each one starts.
+///
+/// A cut is at the start of a block that follows a blank line at the top level — outside every
+/// fence, quote, table and paragraph — because that is the one place the parser holds no state:
+/// everything before it parses the same however the message continues, and everything after it
+/// parses the same as if it were a message of its own. Whether the block after a cut draws
+/// anything is the renderer's question, not the parser's: `**` is a paragraph that draws
+/// nothing, and only rendering it can say so.
+///
+/// `continued` says the text resumes a message at an earlier cut, which is where its first line
+/// is: no frontmatter can open it, and its first block is itself a candidate, since a blank line
+/// precedes it in the message. A message that opens with frontmatter has no cuts, because its
+/// stripping would shift every line a cut is counted in.
+///
+/// Found by the parser itself rather than by a second scan for fences, so the two cannot
+/// disagree about where a fence is.
+pub(crate) fn cut_points(source: &str, continued: bool) -> Vec<(usize, Block)> {
+    let cleaned = inline::sanitize(source);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    if !continued && lines.first().map(|line| line.trim()) == Some("+++") {
+        return Vec::new();
+    }
+    let blocks = blocks_of(&lines);
+    let opening = blocks
+        .first()
+        .filter(|(_, block)| continued && !matches!(block, Block::Blank))
+        .cloned();
+    let after_blanks = blocks
+        .windows(2)
+        .filter(|pair| matches!(pair[0].1, Block::Blank) && !matches!(pair[1].1, Block::Blank))
+        .map(|pair| pair[1].clone());
+    opening.into_iter().chain(after_blanks).collect()
+}
+
+/// Parses lines into blocks, each with the index of the line it starts on.
+fn blocks_of(lines: &[&str]) -> Vec<(usize, Block)> {
     let mut blocks = Vec::new();
     let mut index = 0_usize;
     while index < lines.len() {
-        let line = lines[index];
-        let trimmed = line.trim();
-        if let Some((marker, lang)) = fence_open(trimmed) {
-            let (code, next) = read_code(&lines, index.saturating_add(1), marker);
-            blocks.push(Block::Code { lang, code });
-            index = next;
-            continue;
-        }
-        if trimmed.is_empty() {
-            blocks.push(Block::Blank);
-            index = index.saturating_add(1);
-            continue;
-        }
-        if is_rule(trimmed) {
-            blocks.push(Block::Rule);
-            index = index.saturating_add(1);
-            continue;
-        }
-        if let Some((level, text)) = heading(trimmed) {
-            blocks.push(Block::Heading { level, text });
-            index = index.saturating_add(1);
-            continue;
-        }
-        if quote_line(line).is_some() {
-            let (quoted, next) = read_quote(&lines, index);
-            blocks.push(Block::Quote { lines: quoted });
-            index = next;
-            continue;
-        }
-        if is_table_start(&lines, index) {
-            let (table, next) = read_table(&lines, index);
-            blocks.push(table);
-            index = next;
-            continue;
-        }
-        if let Some((marker, indent, text)) = list_item(line) {
-            blocks.push(Block::Item {
-                marker,
-                indent,
-                text,
-            });
-            index = index.saturating_add(1);
-            continue;
-        }
-        if let Some((alt, path)) = image_line(trimmed) {
-            blocks.push(Block::Image { alt, path });
-            index = index.saturating_add(1);
-            continue;
-        }
-        let (paragraph, next) = read_paragraph(&lines, index);
-        blocks.push(Block::Paragraph(paragraph));
+        let (block, next) = block_at(lines, index);
+        // Every block consumes at least the line it starts on, so the walk always ends.
+        assert!(next > index, "a block consumes its first line");
+        blocks.push((index, block));
         index = next;
     }
     blocks
+}
+
+/// Parses the block that starts at line `index`, returning it and the line after it.
+fn block_at(lines: &[&str], index: usize) -> (Block, usize) {
+    let line = lines[index];
+    let trimmed = line.trim();
+    let next = index.saturating_add(1);
+    if let Some((marker, lang)) = fence_open(trimmed) {
+        let (code, after) = read_code(lines, next, marker);
+        return (Block::Code { lang, code }, after);
+    }
+    if trimmed.is_empty() {
+        return (Block::Blank, next);
+    }
+    if is_rule(trimmed) {
+        return (Block::Rule, next);
+    }
+    if let Some((level, text)) = heading(trimmed) {
+        return (Block::Heading { level, text }, next);
+    }
+    if quote_line(line).is_some() {
+        let (quoted, after) = read_quote(lines, index);
+        return (Block::Quote { lines: quoted }, after);
+    }
+    if is_table_start(lines, index) {
+        return read_table(lines, index);
+    }
+    if let Some((marker, indent, text)) = list_item(line) {
+        let item = Block::Item {
+            marker,
+            indent,
+            text,
+        };
+        return (item, next);
+    }
+    if let Some((alt, path)) = image_line(trimmed) {
+        return (Block::Image { alt, path }, next);
+    }
+    let (paragraph, after) = read_paragraph(lines, index);
+    (Block::Paragraph(paragraph), after)
 }
 
 /// Removes a leading `+++`-delimited TOML frontmatter block, if there is one.

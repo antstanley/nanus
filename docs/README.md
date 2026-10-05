@@ -69,9 +69,10 @@ Start here if you want to know whether any of this is true.
 
 How the hot paths are measured — wall time, heap allocations, and bytes allocated, with the
 instruments, workloads, statistics, and limits behind each number — the current baseline for
-all 111 benchmarks, how to compare a change against it and record a new one, and what the
-baseline shows: the interface's redraw, Anthropic streaming, and a near-miss grep are the
-expensive paths.
+all 119 benchmarks — time, allocations, bytes, and what the interface holds — how to compare a
+change against it and record a new one, and what the baseline shows: Anthropic streaming and a
+near-miss grep are the expensive paths, and the interface's redraw, the first baseline's worst,
+is fixed.
 
 Start here if you want to know what something costs, or whether a change made it cost more.
 

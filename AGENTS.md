@@ -460,6 +460,14 @@ where a live conversation sits — clamped and did nothing. Everything that appe
 conversation calls `ViewState::follow`, not `scroll_to_bottom`, so a reader who has
 scrolled away is not dragged back by the next streamed token.
 
+The view keeps its layout between frames (`crates/nanus-tui/src/layout.rs`), so a frame
+renders only the blocks that changed and draws only what is on screen. Two rules keep that
+honest: **every change to an `Entry` takes a fresh stamp** (its mutators do; a new one must),
+and **every input to how a line is drawn is in `LayoutKey`** (width, detail, markdown,
+mermaid, collapse toggles, theme). Break either and the interface draws stale content without
+failing; `a_kept_layout_draws_what_a_fresh_one_does_through_a_whole_turn` is the test that
+notices. See `docs/tui.md#what-a-frame-costs`.
+
 **Change how a session is opened.** `nanus_link::server::Registry` resolves a
 reference — live by name, live by id, then the store — and `Held` is what an agent
 holds open. Everything a listing or an attachment shows is cached beside the

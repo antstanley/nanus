@@ -12,7 +12,7 @@ the handles they publish.
 
 [![tests](https://img.shields.io/badge/tests-1403%20passing-brightgreen)](docs/testing.md)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen)](docs/testing.md)
-[![benchmarks](https://img.shields.io/badge/benchmarks-111%20baselined-blueviolet)](docs/benchmarks.md)
+[![benchmarks](https://img.shields.io/badge/benchmarks-119%20baselined-blueviolet)](docs/benchmarks.md)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-blue)](docs/design.md)
 [![rust](https://img.shields.io/badge/rust-1.98-orange)](rust-toolchain.toml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -272,15 +272,18 @@ a timing would bury in noise. From the current baseline, on an Apple M2:
 
 | Path | Time | Allocations |
 |---|---:|---:|
-| A whole turn through the agent loop, fresh session | 37.8 µs | 974 |
-| The same turn on 100 turns of history | 784 µs | 12,809 |
-| A request body for 100 turns of history (DeepSeek) | 536 µs | 7,131 |
-| Saving a 500-turn session | 18.1 ms | 23,549 |
-| One interface frame of a 100-turn conversation | 7.4 ms | 134,941 |
+| A whole turn through the agent loop, fresh session | 50.1 µs | 974 |
+| The same turn on 100 turns of history | 904 µs | 12,809 |
+| A request body for 100 turns of history (DeepSeek) | 588 µs | 7,131 |
+| Saving a 500-turn session | 12.7 ms | 23,549 |
+| One interface frame of a 100-turn conversation | 216 µs | 116 |
+| One streamed token in the interface at 100 turns | 197 µs | 212 |
 
-The harness's own overhead is microseconds against a model's seconds; the interface's redraw
-on a long session is the first thing that will not keep up. The methodology, all 111
-benchmarks, and what the numbers show are in [**docs/benchmarks.md**](docs/benchmarks.md).
+The harness's own overhead is microseconds against a model's seconds, and so is the
+interface's: it keeps its layout between frames, so a frame costs what is on screen rather than
+what the conversation holds. (The times are from a run on a busy machine and about 28%
+pessimistic; the counts are exact.) The methodology, all 119 benchmarks, and what the numbers
+show are in [**docs/benchmarks.md**](docs/benchmarks.md).
 
 ## Acknowledgements
 

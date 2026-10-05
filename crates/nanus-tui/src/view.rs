@@ -3,6 +3,7 @@
 //! The view is a pure function of [`ViewState`], which is what makes it testable
 //! against ratatui's `TestBackend` without a terminal. Nothing here performs I/O.
 
+use core::cell::RefCell;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -15,6 +16,7 @@ use unicode_width::UnicodeWidthChar as _;
 
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
+use crate::layout::{LayoutBlock, LayoutKey, Piece, TranscriptLayout};
 use crate::markdown::{self, MarkdownTheme};
 use crate::queue::Queue;
 use crate::stats::{Throughput, share, show, show_duration};
@@ -670,6 +672,48 @@ pub struct ViewState {
     /// above it. Recorded here so a click can be turned back into a caret position
     /// without the runtime re-deriving the layout.
     last_composer: Option<Rect>,
+    /// The transcript's layout, kept between frames: every block's measured rows, and the
+    /// lines of the blocks last on screen.
+    ///
+    /// Behind a `RefCell` because the questions that refresh it — how many rows the transcript
+    /// takes, where the bottom is — are asked through `&self`, and answering them from the cache
+    /// is the point. Nothing outside the layout's own methods borrows it, and none of them calls
+    /// another while holding it.
+    layout: RefCell<TranscriptLayout>,
+    /// Where the streaming answer is cut, and for which answer and version of it.
+    ///
+    /// Kept so that a token costs what it added: the cuts before the latest are settled for
+    /// good, so only the text after the latest is parsed for new ones, and the layout — refreshed
+    /// more than once per token, to follow the bottom and then to draw — asks again for free.
+    stream_cuts: RefCell<Option<StreamCuts>>,
+    /// The pairing of calls with results, and the tool entries it was worked out from.
+    ///
+    /// Pairing reads only the tool entries, and a token changes none of them, so it is worked
+    /// out again only when one of them has changed or moved — rather than on every refresh,
+    /// where it was the one part of a frame that still grew with the conversation.
+    pairing: RefCell<Option<KnownPairing>>,
+}
+
+/// A pairing of calls with results, and the tool entries it was worked out from: each one's
+/// index and stamp.
+struct KnownPairing {
+    tools: Vec<(usize, u64)>,
+    pairing: Pairing,
+}
+
+/// The cuts of a streaming answer, and what they were found for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct StreamCuts {
+    /// Which answer.
+    id: u64,
+    /// Which version of it the cuts are up to date with.
+    stamp: u64,
+    /// The width it was drawn at, which decides whether a block draws anything.
+    width: u16,
+    /// Whether diagrams were drawn, which decides the same for a `mermaid` fence.
+    mermaid: bool,
+    /// The byte offsets of the cuts, in order.
+    cuts: Vec<usize>,
 }
 
 impl Default for ViewState {
@@ -739,6 +783,9 @@ impl Default for ViewState {
             auth_code: String::new(),
             last_viewport: None,
             last_composer: None,
+            layout: RefCell::new(TranscriptLayout::default()),
+            stream_cuts: RefCell::new(None),
+            pairing: RefCell::new(None),
         }
     }
 }
@@ -913,9 +960,12 @@ fn line_text(line: &Line<'static>) -> String {
 }
 
 /// Marks the selected characters of every line with reverse video.
-fn mark_selection(lines: &mut [Line<'static>], selection: Selection) {
-    for (index, line) in lines.iter_mut().enumerate() {
-        let Some((from, to)) = selection.columns(index) else {
+///
+/// `first` is the transcript index of `lines[0]`: a frame holds only the lines it draws, and a
+/// selection is written in the coordinates of the whole transcript.
+fn mark_selection(lines: &mut [Line<'_>], first: usize, selection: Selection) {
+    for (offset, line) in lines.iter_mut().enumerate() {
+        let Some((from, to)) = selection.columns(first.saturating_add(offset)) else {
             continue;
         };
         *line = marked_line(line, from, to);
@@ -927,7 +977,7 @@ fn mark_selection(lines: &mut [Line<'static>], selection: Selection) {
 /// The spans are cut rather than restyled whole, because a line holds several: a highlighted run that
 /// took the whole line would reverse a heading's marker and the prose after it along with the
 /// characters a reader actually drew a box around.
-fn marked_line(line: &Line<'static>, from: usize, to: usize) -> Line<'static> {
+fn marked_line(line: &Line<'_>, from: usize, to: usize) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut offset = 0_usize;
     for span in &line.spans {
@@ -1566,7 +1616,7 @@ impl ViewState {
     pub(crate) fn extend_selection(&mut self, rows: i32) {
         let width = self.drawn_width();
         self.screen_selection = None;
-        let last = self.transcript_lines(width).len().saturating_sub(1);
+        let last = self.transcript_line_count(width).saturating_sub(1);
         let Some(mut selection) = self.selection.filter(|it| it.width == width) else {
             // The first press takes the line the reader is looking at, and stops there: a highlight
             // appears where they pressed, and each press after that takes one more line in the
@@ -1593,7 +1643,7 @@ impl ViewState {
     pub(crate) fn select_line_edge(&mut self, to_end: bool) {
         let width = self.drawn_width();
         self.screen_selection = None;
-        let last = self.transcript_lines(width).len().saturating_sub(1);
+        let last = self.transcript_line_count(width).saturating_sub(1);
         let mut selection = self
             .selection
             .filter(|it| it.width == width)
@@ -1629,9 +1679,9 @@ impl ViewState {
 
     /// The line at the bottom of what is drawn, for a key that starts a selection.
     fn bottom_line(&self, width: u16) -> usize {
-        let lines = self.transcript_lines(width);
-        let last = lines.len().saturating_sub(1);
-        if lines.is_empty() {
+        let count = self.transcript_line_count(width);
+        let last = count.saturating_sub(1);
+        if count == 0 {
             return 0;
         }
         let line = self.last_transcript.map_or(last, |area| {
@@ -1643,9 +1693,9 @@ impl ViewState {
         // rather than looking like nothing happened.
         let mut line = line.min(last);
         while line > 0
-            && lines
-                .get(line)
-                .is_some_and(|it| line_text(it).trim().is_empty())
+            && self
+                .layout_line(width, line)
+                .is_some_and(|it| line_text(&it).trim().is_empty())
         {
             line = line.saturating_sub(1);
         }
@@ -1665,17 +1715,21 @@ impl ViewState {
             return None;
         }
         let width = area.width;
-        let lines = self.transcript_lines(width);
-        if lines.is_empty() {
+        let heights = {
+            let mut layout = self.layout.borrow_mut();
+            self.refresh_layout(&mut layout, width);
+            layout.heights().to_vec()
+        };
+        if heights.is_empty() {
             return None;
         }
-        let heights = Self::line_heights(&lines, width);
+        let count = heights.len();
         let (start, padding) = Self::window(&heights, self.scroll_offset, area.height);
         let from_top = row.saturating_sub(area.y);
         let padding = u16::try_from(padding).unwrap_or(u16::MAX);
         if from_top < padding {
             // Above the content: the filler rows mean "the top of what is shown".
-            return Some(Place::start(start.min(lines.len().saturating_sub(1))));
+            return Some(Place::start(start.min(count.saturating_sub(1))));
         }
         let mut remaining = usize::from(from_top.saturating_sub(padding));
         let mut index = start;
@@ -1690,10 +1744,11 @@ impl ViewState {
             remaining = remaining.saturating_sub(rows);
             index = index.saturating_add(1);
         }
-        let index = index.min(lines.len().saturating_sub(1));
+        let index = index.min(count.saturating_sub(1));
         let drawn = usize::try_from(heights.get(index).copied().unwrap_or(1)).unwrap_or(1);
+        let line = self.layout_line(width, index)?;
         let column = column_in_line(
-            &lines[index],
+            &line,
             usize::from(column.saturating_sub(area.x)),
             drawn.max(1),
             within,
@@ -2694,19 +2749,24 @@ impl ViewState {
     ///
     /// The row of a cell is its row on the terminal: every widget here is drawn into a full-screen
     /// area, so row zero is the top of the screen and the two agree.
+    ///
+    /// The previous frame's strings are written over rather than replaced: a frame is drawn for
+    /// every keystroke and every burst of tokens, and building a string per row each time was a
+    /// third of what a frame allocated, for rows that are almost always the same length.
     fn capture_screen(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         let buffer = frame.buffer_mut();
-        self.screen.clear();
         self.screen_size = (area.width, area.height);
-        for row in 0..area.height {
-            let mut line = String::new();
+        let rows = usize::from(area.height);
+        self.screen.truncate(rows);
+        self.screen.resize_with(rows, String::new);
+        for (row, line) in (0..area.height).zip(self.screen.iter_mut()) {
+            line.clear();
             for column in 0..area.width {
                 if let Some(cell) = buffer.cell((column, row)) {
                     line.push_str(cell.symbol());
                 }
             }
-            self.screen.push(line);
         }
     }
 
@@ -3548,74 +3608,196 @@ impl ViewState {
         // for the whole transcript rather than asked of the entry above: a step's calls and its
         // results do not interleave, so adjacency cannot pair them.
         let pairing = Pairing::of(entries);
+        self.pieces(entries, &pairing, width, |piece, range| {
+            lines.extend(self.render_piece(piece, &entries[range], width));
+        });
+        lines
+    }
+
+    /// Walks the transcript as the blocks it is drawn in, oldest first.
+    ///
+    /// Each block is one entry, or a run of entries drawn as one line, together with what it is
+    /// drawn as. Rendering is a separate step ([`ViewState::render_piece`]) so that a block whose
+    /// entries have not changed can be measured once and then only placed: the walk itself reads
+    /// roles and kinds and renders nothing.
+    ///
+    /// An answer that is still streaming is two blocks, cut where its markdown has settled: the
+    /// head renders the same however the answer goes on, so a token re-renders only the tail.
+    fn pieces(
+        &self,
+        entries: &[Entry],
+        pairing: &Pairing,
+        width: u16,
+        mut visit: impl FnMut(Piece, core::ops::Range<usize>),
+    ) {
         let mut index = 0;
         while let Some(entry) = entries.get(index) {
-            // A *run* is what gets summarised, not each entry: six tool calls in a row
-            // are one thought the model had, and six collapsed lines would be as noisy
-            // as the six lines they replaced.
-            if self.collapse_tools && entry.role() == Role::Tool {
-                let run = Self::run_length(entries, index, Role::Tool);
-                lines.push(self.tool_summary(&entries[index..index.saturating_add(run)]));
-                lines.push(Line::from(""));
-                index = index.saturating_add(run);
-                continue;
+            let (piece, length) = self.piece_at(entries, pairing, index, entry);
+            let end = index.saturating_add(length).min(entries.len());
+            if piece == Piece::Whole && self.refresh_stream_cuts(entry, width) {
+                let memo = self.stream_cuts.borrow();
+                let cuts = memo.as_ref().map_or(&[][..], |memo| memo.cuts.as_slice());
+                if let (Some(first), Some(last)) = (cuts.first(), cuts.last()) {
+                    visit(Piece::StreamHead(*first), index..end);
+                    for pair in cuts.windows(2) {
+                        visit(Piece::StreamChunk(pair[0], pair[1]), index..end);
+                    }
+                    visit(Piece::StreamTail(*last), index..end);
+                }
+            } else {
+                visit(piece, index..end);
             }
-            if self.collapse_reasoning && entry.role() == Role::Reasoning {
-                let run = Self::run_length(entries, index, Role::Reasoning);
-                lines.push(self.reasoning_summary(&entries[index..index.saturating_add(run)]));
-                lines.push(Line::from(""));
-                index = index.saturating_add(run);
-                continue;
+            index = end;
+        }
+    }
+
+    /// Brings the cuts of a streaming answer up to date, returning whether `entry` is one and
+    /// has any.
+    ///
+    /// Only the text after the latest cut is parsed ([`markdown::extend_cuts`]): the cuts before
+    /// it are settled, and so is every complete block between them.
+    fn refresh_stream_cuts(&self, entry: &Entry, width: u16) -> bool {
+        let drawn_as_markdown = self.markdown
+            && entry.role() == Role::Assistant
+            && matches!(entry.kind(), EntryKind::Text);
+        if !drawn_as_markdown || !entry.is_streaming() {
+            return false;
+        }
+        let mut memo = self.stream_cuts.borrow_mut();
+        let same_answer = memo.as_ref().is_some_and(|known| {
+            known.id == entry.id() && known.width == width && known.mermaid == self.mermaid
+        });
+        if !same_answer {
+            *memo = Some(StreamCuts {
+                id: entry.id(),
+                stamp: 0,
+                width,
+                mermaid: self.mermaid,
+                cuts: Vec::new(),
+            });
+        }
+        let Some(known) = memo.as_mut() else {
+            return false;
+        };
+        if known.stamp != entry.stamp() {
+            let theme = MarkdownTheme::from_view(&self.theme);
+            markdown::extend_cuts(entry.text(), &mut known.cuts, width, self.mermaid, &theme);
+            known.stamp = entry.stamp();
+        }
+        !known.cuts.is_empty()
+    }
+
+    /// What the block starting at `index` is drawn as, and how many entries it covers.
+    fn piece_at(
+        &self,
+        entries: &[Entry],
+        pairing: &Pairing,
+        index: usize,
+        entry: &Entry,
+    ) -> (Piece, usize) {
+        // A *run* is what gets summarised, not each entry: six tool calls in a row
+        // are one thought the model had, and six collapsed lines would be as noisy
+        // as the six lines they replaced.
+        if self.collapse_tools && entry.role() == Role::Tool {
+            return (Piece::ToolRun, Self::run_length(entries, index, Role::Tool));
+        }
+        if self.collapse_reasoning && entry.role() == Role::Reasoning {
+            let run = Self::run_length(entries, index, Role::Reasoning);
+            return (Piece::ReasoningRun, run);
+        }
+        // The compact form draws the two things that are *about* the work as one row
+        // each, with no heading and no blank row of their own: that is what "no space
+        // above or below" comes to, and it is what makes a turn's machinery read as a
+        // block rather than as a wall of paragraphs with gaps in it. A reader who wants
+        // the argument blocks and the whole of the reasoning asks for
+        // [`Detail::Full`].
+        if self.detail == Detail::Compact {
+            if matches!(entry.kind(), EntryKind::ToolCall { .. }) {
+                let state = pairing.state_of_call(entries, index);
+                return (Piece::CompactCall(state), 1);
             }
-            // The compact form draws the two things that are *about* the work as one row
-            // each, with no heading and no blank row of their own: that is what "no space
-            // above or below" comes to, and it is what makes a turn's machinery read as a
-            // block rather than as a wall of paragraphs with gaps in it. A reader who wants
-            // the argument blocks and the whole of the reasoning asks for
-            // [`Detail::Full`].
-            if self.detail == Detail::Compact {
-                if let EntryKind::ToolCall {
+            // The call's line carries the outcome, so a result that answers one
+            // contributes only what the tool *said*.
+            if pairing.answers_a_call(index) {
+                return (Piece::CompactResult, 1);
+            }
+            if entry.role() == Role::Reasoning {
+                return (Piece::CompactThinking, 1);
+            }
+        }
+        (Piece::Whole, 1)
+    }
+
+    /// Renders one block: the entries `run`, drawn as `piece`.
+    fn render_piece(&self, piece: Piece, run: &[Entry], width: u16) -> Vec<Line<'static>> {
+        let Some(entry) = run.first() else {
+            return Vec::new();
+        };
+        match piece {
+            Piece::ToolRun => vec![self.tool_summary(run), Line::from("")],
+            Piece::ReasoningRun => vec![self.reasoning_summary(run), Line::from("")],
+            Piece::CompactCall(state) => {
+                let EntryKind::ToolCall {
                     name, arguments, ..
                 } = entry.kind()
-                {
-                    let state = pairing.state_of_call(entries, index);
-                    lines.push(self.compact_tool_line(state, name, arguments, width));
-                    index = index.saturating_add(1);
-                    continue;
-                }
-                // The call's line carries the outcome, so a result that answers one
-                // contributes only what the tool *said*. In the live view it says nothing
-                // — the frame has no room for output — and the call is then exactly the one
-                // line the compact form promises.
-                if pairing.answers_a_call(index) {
-                    let EntryKind::ToolResult { content, .. } = entry.kind() else {
-                        unreachable!("only a result answers a call")
-                    };
-                    if !content.is_empty() {
-                        lines.extend(indented(content, 2, self.theme.style_for_entry(entry)));
-                        lines.push(Line::from(""));
-                    }
-                    index = index.saturating_add(1);
-                    continue;
-                }
-                if entry.role() == Role::Reasoning {
-                    lines.push(self.compact_thinking_line(entry, width));
-                    index = index.saturating_add(1);
-                    continue;
-                }
+                else {
+                    return Vec::new();
+                };
+                vec![self.compact_tool_line(state, name, arguments, width)]
             }
-            // A tool's heading is dropped in the compact form: the call's own line already
-            // names the tool, and the heading only answers a question nobody asked.
-            if self.detail != Detail::Compact || entry.role() != Role::Tool {
-                lines.push(self.header_for(entry));
+            // In the live view a result says nothing — the frame has no room for output — and
+            // the call is then exactly the one line the compact form promises.
+            Piece::CompactResult => {
+                let EntryKind::ToolResult { content, .. } = entry.kind() else {
+                    return Vec::new();
+                };
+                if content.is_empty() {
+                    return Vec::new();
+                }
+                let mut lines = indented(content, 2, self.theme.style_for_entry(entry));
+                lines.push(Line::from(""));
+                lines
             }
-            lines.extend(self.lines_for(entry, width));
-            // A blank row between entries, so two consecutive messages do not read
-            // as one paragraph.
-            lines.push(Line::from(""));
-            index = index.saturating_add(1);
+            Piece::CompactThinking => vec![self.compact_thinking_line(entry, width)],
+            Piece::Whole => {
+                let mut lines = Vec::new();
+                // A tool's heading is dropped in the compact form: the call's own line already
+                // names the tool, and the heading only answers a question nobody asked.
+                if self.detail != Detail::Compact || entry.role() != Role::Tool {
+                    lines.push(self.header_for(entry));
+                }
+                lines.extend(self.lines_for(entry, width));
+                // A blank row between entries, so two consecutive messages do not read
+                // as one paragraph.
+                lines.push(Line::from(""));
+                lines
+            }
+            // The two halves of [`Piece::Whole`] for a streaming answer, which together are
+            // exactly its lines: the heading and the settled markdown, then the rest, the
+            // cursor, and the separating row.
+            Piece::StreamHead(cut) => {
+                let theme = MarkdownTheme::from_view(&self.theme);
+                let head = entry.text().get(..cut).unwrap_or_default();
+                let mut lines = vec![self.header_for(entry)];
+                lines.extend(markdown::render_head(head, width, self.mermaid, &theme));
+                lines
+            }
+            Piece::StreamChunk(from, to) => {
+                let theme = MarkdownTheme::from_view(&self.theme);
+                let middle = entry.text().get(from..to).unwrap_or_default();
+                markdown::render_middle(middle, width, self.mermaid, &theme)
+            }
+            Piece::StreamTail(cut) => {
+                let theme = MarkdownTheme::from_view(&self.theme);
+                let tail = entry.text().get(cut..).unwrap_or_default();
+                let mut lines = markdown::render_tail(tail, width, self.mermaid, &theme);
+                if let Some(last) = lines.last_mut() {
+                    last.spans.push(Span::styled("▌", self.theme.assistant));
+                }
+                lines.push(Line::from(""));
+                lines
+            }
         }
-        lines
     }
 
     /// Counts the entries from `start` that carry `role`, consecutively.
@@ -3709,17 +3891,22 @@ impl ViewState {
         if self.selection.is_some_and(|it| it.width != area.width) {
             self.selection = None;
         }
-        let mut lines = self.transcript_lines(area.width);
+        // Only the lines that reach the screen are taken from the layout: the window is found
+        // from the measured rows, so the rest of the conversation is never rendered or copied.
+        let mut layout = self.layout.borrow_mut();
+        self.refresh_layout(&mut layout, area.width);
+        let (start, padding) = Self::window(layout.heights(), self.scroll_offset, area.height);
+        let rows = u32::from(area.height).saturating_sub(padding);
+        let end = self.hold_visible(&mut layout, start, rows, area.width);
+        let mut lines = Self::borrowed_lines(&layout, start..end);
         if let Some(selection) = self.selection {
-            mark_selection(&mut lines, selection);
+            mark_selection(&mut lines, start, selection);
         }
-        let heights = Self::line_heights(&lines, area.width);
-        let (start, padding) = Self::window(&heights, self.scroll_offset, area.height);
         // Blank rows above the tail, so the newest line sits at the bottom of the
         // viewport rather than floating in the middle of it.
         let blanks = core::iter::repeat_with(|| Line::from(""))
             .take(usize::try_from(padding).unwrap_or(usize::MAX));
-        let visible = blanks.chain(lines.into_iter().skip(start));
+        let visible = blanks.chain(lines);
         let paragraph = Paragraph::new(Text::from_iter(visible))
             .block(Block::default().borders(Borders::NONE))
             .wrap(Wrap { trim: false });
@@ -3813,11 +4000,203 @@ impl ViewState {
         let Some((width, _)) = self.last_viewport else {
             return 0;
         };
-        let lines = self.transcript_lines(width);
-        Self::line_heights(&lines, width)
-            .iter()
-            .copied()
-            .fold(0_u32, u32::saturating_add)
+        let mut layout = self.layout.borrow_mut();
+        self.refresh_layout(&mut layout, width);
+        layout.rows()
+    }
+
+    /// Works the pairing out again if a tool entry has changed or moved since it last was.
+    fn refresh_pairing(&self, entries: &[Entry]) {
+        let tools = || {
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    matches!(
+                        entry.kind(),
+                        EntryKind::ToolCall { .. } | EntryKind::ToolResult { .. }
+                    )
+                })
+                .map(|(index, entry)| (index, entry.stamp()))
+        };
+        let mut held = self.pairing.borrow_mut();
+        let current = held
+            .as_ref()
+            .is_some_and(|known| known.tools.iter().copied().eq(tools()));
+        if !current {
+            *held = Some(KnownPairing {
+                tools: tools().collect(),
+                pairing: Pairing::of(entries),
+            });
+        }
+    }
+
+    /// The conditions outside the entries that decide how they are drawn at `width`.
+    const fn layout_key(&self, width: u16) -> LayoutKey {
+        LayoutKey {
+            width,
+            detail: self.detail,
+            markdown: self.markdown,
+            mermaid: self.mermaid,
+            collapse_tools: self.collapse_tools,
+            collapse_reasoning: self.collapse_reasoning,
+            theme: self.theme,
+        }
+    }
+
+    /// Brings the layout up to date with the transcript, rendering only the blocks that changed.
+    ///
+    /// Blocks are matched by position. The transcript only grows at its tail and changes there —
+    /// a token, a result arriving for the newest calls — so the blocks before the first change
+    /// are the same blocks in the same places, and each one costs a comparison of stamps. A
+    /// transcript replaced wholesale carries new stamps throughout and is rendered again, as it
+    /// must be.
+    fn refresh_layout(&self, layout: &mut TranscriptLayout, width: u16) {
+        layout.key(self.layout_key(width));
+        let entries = self.transcript.entries();
+        self.refresh_pairing(entries);
+        let held = self.pairing.borrow();
+        let Some(KnownPairing { pairing, .. }) = held.as_ref() else {
+            return;
+        };
+        let mut position = 0_usize;
+        let mut first_changed: Option<usize> = None;
+        self.pieces(entries, pairing, width, |piece, range| {
+            let run = &entries[range.clone()];
+            let current = layout
+                .blocks
+                .get(position)
+                .is_some_and(|block| block.matches(piece, range.start, run));
+            if !current {
+                let lines = self.render_piece(piece, run, width);
+                let heights = Self::line_heights(&lines, width);
+                let block = LayoutBlock::new(piece, range.start, run, lines);
+                layout.place(position, block, &heights);
+                first_changed.get_or_insert(position);
+            }
+            position = position.saturating_add(1);
+        });
+        if position < layout.blocks.len() {
+            layout.truncate(position);
+            first_changed.get_or_insert(position);
+        }
+        if let Some(from) = first_changed {
+            layout.reflow(from);
+        }
+        // Postcondition: the blocks cover the transcript, in order, with nothing left over.
+        assert!(
+            layout
+                .blocks
+                .last()
+                .is_none_or(|block| block.end() == entries.len())
+        );
+    }
+
+    /// Makes sure the lines from `first` that fill `rows` display rows are held, returning the
+    /// index one past the last of them.
+    ///
+    /// Blocks that let go of their lines are rendered again here; afterwards only the blocks
+    /// these lines come from keep theirs, so what stays resident is what is on screen.
+    fn hold_visible(
+        &self,
+        layout: &mut TranscriptLayout,
+        first: usize,
+        rows: u32,
+        width: u16,
+    ) -> usize {
+        let mut used = 0_u32;
+        let mut index = first;
+        // The first and one past the last block the lines come from.
+        let mut first_block: Option<usize> = None;
+        let mut end_block = 0_usize;
+        while used < rows {
+            let Some(block) = layout.block_of(index) else {
+                break;
+            };
+            self.ensure_lines(layout, block, width);
+            let end = layout
+                .start_of(block)
+                .saturating_add(layout.blocks.get(block).map_or(0, LayoutBlock::len));
+            while index < end && used < rows {
+                used = used.saturating_add(layout.heights().get(index).copied().unwrap_or(1));
+                index = index.saturating_add(1);
+            }
+            first_block.get_or_insert(block);
+            end_block = block.saturating_add(1);
+        }
+        layout.release_outside(first_block.unwrap_or(end_block)..end_block);
+        index
+    }
+
+    /// The held lines in `lines`, a range of transcript line indices, borrowed from the layout.
+    ///
+    /// Borrowed rather than cloned because a frame only reads them: a line's spans are pointed
+    /// at, not copied, which is one allocation per line drawn instead of one per span.
+    fn borrowed_lines(layout: &TranscriptLayout, lines: core::ops::Range<usize>) -> Vec<Line<'_>> {
+        let mut out = Vec::with_capacity(lines.len());
+        for index in lines {
+            let Some(block) = layout.block_of(index) else {
+                break;
+            };
+            let within = index.saturating_sub(layout.start_of(block));
+            let Some(line) = layout
+                .blocks
+                .get(block)
+                .and_then(LayoutBlock::lines)
+                .and_then(|held| held.get(within))
+            else {
+                break;
+            };
+            out.push(Line {
+                spans: line
+                    .spans
+                    .iter()
+                    .map(|span| Span::styled(span.content.as_ref(), span.style))
+                    .collect(),
+                style: line.style,
+                alignment: line.alignment,
+            });
+        }
+        out
+    }
+
+    /// Renders block `block` again, at the layout's `width`, if it let go of its lines.
+    fn ensure_lines(&self, layout: &mut TranscriptLayout, block: usize, width: u16) {
+        let Some(held) = layout.blocks.get_mut(block) else {
+            return;
+        };
+        if held.lines().is_some() {
+            return;
+        }
+        let entries = self.transcript.entries();
+        let run = entries.get(held.start..held.end()).unwrap_or_default();
+        held.restore(self.render_piece(held.piece, run, width));
+    }
+
+    /// One line of the transcript as it is drawn at `width`, or `None` past the last.
+    fn layout_line(&self, width: u16, index: usize) -> Option<Line<'static>> {
+        let mut layout = self.layout.borrow_mut();
+        self.refresh_layout(&mut layout, width);
+        let block = layout.block_of(index)?;
+        let entries = self.transcript.entries();
+        let held = layout.blocks.get(block)?;
+        let within = index.saturating_sub(layout.start_of(block));
+        if let Some(lines) = held.lines() {
+            return lines.get(within).cloned();
+        }
+        // Off screen and released: rendered for the question and not kept, since a line asked
+        // about by a key or a click is not a line that is about to be drawn.
+        let run = entries.get(held.start..held.end()).unwrap_or_default();
+        self.render_piece(held.piece, run, width)
+            .into_iter()
+            .nth(within)
+    }
+
+    /// How many lines the transcript renders to at `width`.
+    fn transcript_line_count(&self, width: u16) -> usize {
+        let mut layout = self.layout.borrow_mut();
+        self.refresh_layout(&mut layout, width);
+        layout.line_count()
     }
 
     /// Renders the composer.
@@ -4379,6 +4758,53 @@ mod tests {
     /// Renders `state` into a test terminal and returns the buffer as text.
     fn rendered(state: &mut ViewState, width: u16, height: u16) -> String {
         draw_with_caret(state, width, height).0
+    }
+
+    /// Draws `state` and returns the whole buffer, styles included.
+    fn buffer_of(state: &mut ViewState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("a test terminal always builds");
+        let drawn = terminal.draw(|frame| state.render(frame));
+        assert!(drawn.is_ok(), "rendering must not fail");
+        terminal.backend().buffer().clone()
+    }
+
+    /// A view of the same transcript, display settings and scroll position as `warm`, with
+    /// nothing drawn yet: what `warm` would draw if it had kept nothing between frames.
+    fn cold_copy(warm: &ViewState) -> ViewState {
+        let mut cold = ViewState::new();
+        cold.transcript = Transcript::of(warm.transcript.entries().to_vec());
+        cold.detail = warm.detail;
+        cold.markdown = warm.markdown;
+        cold.mermaid = warm.mermaid;
+        cold.collapse_tools = warm.collapse_tools;
+        cold.collapse_reasoning = warm.collapse_reasoning;
+        cold.theme = warm.theme;
+        cold.scroll_offset = warm.scroll_offset;
+        cold.following = warm.following;
+        cold.last_viewport = warm.last_viewport;
+        cold
+    }
+
+    /// Asserts that `warm`, with whatever it kept from earlier frames, draws what a view that
+    /// kept nothing draws.
+    fn assert_coherent(warm: &mut ViewState, width: u16, height: u16, step: &str) {
+        let mut cold = cold_copy(warm);
+        assert_eq!(
+            cold.transcript.entries(),
+            warm.transcript.entries(),
+            "{step}: same entries"
+        );
+        let expected = buffer_of(&mut cold, width, height);
+        let actual = buffer_of(warm, width, height);
+        assert_eq!(
+            actual, expected,
+            "{step}: the kept layout draws what a fresh one does"
+        );
+        assert_eq!(
+            warm.scroll_offset, cold.scroll_offset,
+            "{step}: and scrolls the same"
+        );
     }
 
     /// The cells drawn in reverse video, as `(column, row)` pairs.
@@ -5928,6 +6354,111 @@ mod tests {
             state.max_scroll(),
             "stepping forward reaches the newest content"
         );
+    }
+
+    /// The answer a coherence test streams: blank lines to cut at, a fence that holds blank
+    /// lines, a list, and a table, so the cut moves while the answer arrives.
+    const STREAMED: &str = "## Findings\n\nThe log is append-only, and every event carries its \
+        sequence number.\n\n- `append` asserts the sequence\n- `from_jsonl` refuses a hole\n\n\
+        ```rust\nfn append(&mut self) {\n\n    self.events.push(event);\n}\n```\n\n\
+        | Crate | Tests |\n|---|---:|\n| domain | 212 |\n\nThat is the whole of it.";
+
+    #[test]
+    fn a_kept_layout_draws_what_a_fresh_one_does_through_a_whole_turn() {
+        let mut warm = ViewState::new();
+        warm.transcript.push(Entry::prose(
+            Role::User,
+            "how does the log stay contiguous?",
+        ));
+        warm.follow();
+        assert_coherent(&mut warm, 70, 24, "a prompt");
+        for fragment in ["I should ", "read the ", "session file.\nThen grep."] {
+            warm.transcript
+                .append_stream(Role::Reasoning, fragment, false);
+            warm.follow();
+            assert_coherent(&mut warm, 70, 24, "reasoning");
+        }
+        warm.transcript
+            .push(Entry::tool_call("read", r#"{"file_path":"session.rs"}"#).identified("c1"));
+        warm.transcript
+            .push(Entry::tool_call("grep", r#"{"pattern":"fn append"}"#).identified("c2"));
+        warm.follow();
+        assert_coherent(&mut warm, 70, 24, "two calls running");
+        warm.transcript
+            .push(Entry::tool_result("grep", false, "session.rs:334").identified("c2"));
+        warm.follow();
+        assert_coherent(&mut warm, 70, 24, "the second call answered first");
+        warm.transcript
+            .push(Entry::tool_result("read", true, "no such file").identified("c1"));
+        warm.follow();
+        assert_coherent(&mut warm, 70, 24, "both answered");
+        let characters: Vec<char> = STREAMED.chars().collect();
+        for chunk in characters.chunks(7) {
+            let fragment: String = chunk.iter().collect();
+            warm.transcript
+                .append_stream(Role::Assistant, &fragment, false);
+            warm.follow();
+            assert_coherent(&mut warm, 70, 24, &format!("streaming {fragment:?}"));
+        }
+        warm.transcript.settle_with(Role::Assistant, STREAMED);
+        warm.follow();
+        assert_coherent(&mut warm, 70, 24, "settled");
+        assert_coherent(&mut warm, 50, 20, "resized");
+        warm.toggle_detail();
+        assert_coherent(&mut warm, 50, 20, "full detail");
+        warm.collapse_tools = true;
+        assert_coherent(&mut warm, 50, 20, "tools collapsed");
+        warm.scroll_to_top();
+        assert_coherent(&mut warm, 50, 20, "scrolled to the top");
+        warm.scroll(5);
+        assert_coherent(&mut warm, 50, 20, "scrolled into the middle");
+    }
+
+    #[test]
+    fn a_streaming_answer_cut_where_it_settled_draws_as_it_would_whole() {
+        let mut state = ViewState::new();
+        state
+            .transcript
+            .append_stream(Role::Assistant, STREAMED, false);
+        let Some(entry) = state.transcript.entries().first().cloned() else {
+            unreachable!("an answer was appended")
+        };
+        assert!(
+            state.refresh_stream_cuts(&entry, 60),
+            "the answer has settled parts"
+        );
+        let mut whole = vec![state.header_for(&entry)];
+        whole.extend(state.lines_for(&entry, 60));
+        whole.push(Line::from(""));
+        assert_eq!(state.transcript_lines(60), whole);
+    }
+
+    #[test]
+    fn only_the_blocks_on_screen_keep_their_lines() {
+        let mut state = ViewState::new();
+        for turn in 0..40 {
+            state
+                .transcript
+                .push(Entry::prose(Role::User, format!("question {turn}")));
+            state
+                .transcript
+                .push(Entry::prose(Role::Assistant, format!("answer {turn}")));
+        }
+        state.scroll_to_bottom();
+        let _ = rendered(&mut state, 60, 12);
+        let layout = state.layout.borrow();
+        let held = layout
+            .blocks
+            .iter()
+            .filter(|block| block.lines().is_some())
+            .count();
+        assert!(held > 0, "what is on screen is kept");
+        assert!(
+            held < 10,
+            "and little else: {held} of {} blocks",
+            layout.blocks.len()
+        );
+        assert_eq!(layout.blocks.len(), 80, "every block is still measured");
     }
 
     #[test]

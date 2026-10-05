@@ -9,6 +9,22 @@
 //! without inventing a session event for a fact that is not yet settled.
 
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// The source of entry stamps: every value it hands out is handed out once, for the life of
+/// the process.
+static STAMPS: AtomicU64 = AtomicU64::new(1);
+
+/// A stamp no entry has carried before.
+///
+/// Process-wide rather than per transcript, because a transcript is replaced wholesale — on
+/// attach, on reload — and a per-transcript counter would start again and hand a new entry the
+/// stamp an old one at the same position had, which is exactly the collision a cache keyed by
+/// stamp must never see. `Relaxed` is enough: the only property used is that two calls never
+/// return the same value.
+fn fresh_stamp() -> u64 {
+    STAMPS.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Who produced an entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,14 +104,60 @@ pub enum EntryKind {
 }
 
 /// One rendered line of the conversation.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Debug)]
 pub struct Entry {
     role: Role,
     kind: EntryKind,
+    /// The entry's prose. Empty for a tool result, whose text is its content and is kept once,
+    /// in the kind: a result is usually a file, and two copies of every file a turn read was
+    /// the largest thing a long transcript held.
     text: String,
     /// `true` while the entry is still being appended to.
     streaming: bool,
+    /// Which version of the entry this is: fresh at construction and at every change, and
+    /// never shared with another entry.
+    ///
+    /// It is what lets the view keep an entry's rendering between frames. Comparing stamps is
+    /// how a layout tells an entry it has drawn from one that has changed or been replaced,
+    /// without comparing — or hashing — the text, which is the cost the cache exists to avoid.
+    /// A clone keeps the stamp, because a clone is the same content.
+    stamp: u64,
+    /// Which entry this is: fresh at construction and kept through every change.
+    ///
+    /// An entry's text only ever grows at its end, so what an entry said up to some point is
+    /// fixed for good once it has said it. That is what lets the view keep the settled part of
+    /// an answer that is still streaming — keyed by this and by how far it reaches — while the
+    /// stamp moves on with every token. A clone is given an identity of its own, because two
+    /// copies may go on to grow differently, and then "the same entry up to here" would no
+    /// longer be one text.
+    id: u64,
 }
+
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        Self {
+            role: self.role,
+            kind: self.kind.clone(),
+            text: self.text.clone(),
+            streaming: self.streaming,
+            stamp: self.stamp,
+            id: fresh_stamp(),
+        }
+    }
+}
+
+/// Equality is the content: two entries that read the same are the same entry to anything
+/// that compares them, whichever version of the process made them.
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.kind == other.kind
+            && self.text == other.text
+            && self.streaming == other.streaming
+    }
+}
+
+impl Eq for Entry {}
 
 impl Entry {
     /// Builds a settled prose entry.
@@ -109,6 +171,8 @@ impl Entry {
             kind: EntryKind::Text,
             text: text.into(),
             streaming: false,
+            stamp: fresh_stamp(),
+            id: fresh_stamp(),
         }
     }
 
@@ -120,6 +184,8 @@ impl Entry {
             kind: EntryKind::Text,
             text: String::new(),
             streaming: true,
+            stamp: fresh_stamp(),
+            id: fresh_stamp(),
         }
     }
 
@@ -136,6 +202,8 @@ impl Entry {
             },
             text: name,
             streaming: true,
+            stamp: fresh_stamp(),
+            id: fresh_stamp(),
         }
     }
 
@@ -152,6 +220,7 @@ impl Entry {
             | EntryKind::ToolResult { call_id: slot, .. } => *slot = Some(call_id),
             EntryKind::Text | EntryKind::Notice => {}
         }
+        self.stamp = fresh_stamp();
         self
     }
 
@@ -175,25 +244,20 @@ impl Entry {
     ) -> Self {
         let name = name.into();
         let content = content.into();
-        // The content is both the entry's rendered text and part of its kind, so it
-        // is cloned exactly once; the name is only ever used inside the kind.
-        // Build the kind first, moving the content in, then clone it back out for
-        // the entry's rendered text. That is one clone rather than two.
-        let kind = EntryKind::ToolResult {
-            call_id: None,
-            name,
-            is_error,
-            content,
-        };
-        let text = match &kind {
-            EntryKind::ToolResult { content, .. } => content.clone(),
-            _ => String::new(),
-        };
+        // The content is the entry's rendered text as well as part of its kind, and it is
+        // kept once, in the kind: [`Entry::text`] reads it from there.
         Self {
             role: Role::Tool,
-            kind,
-            text,
+            kind: EntryKind::ToolResult {
+                call_id: None,
+                name,
+                is_error,
+                content,
+            },
+            text: String::new(),
             streaming: false,
+            stamp: fresh_stamp(),
+            id: fresh_stamp(),
         }
     }
 
@@ -205,13 +269,32 @@ impl Entry {
             kind: EntryKind::Notice,
             text: text.into(),
             streaming: false,
+            stamp: fresh_stamp(),
+            id: fresh_stamp(),
         }
     }
 
     /// Returns the entry's rendered text.
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.text
+        match &self.kind {
+            EntryKind::ToolResult { content, .. } => content,
+            EntryKind::Text | EntryKind::ToolCall { .. } | EntryKind::Notice => &self.text,
+        }
+    }
+
+    /// Returns the entry's stamp: a value no other entry, and no other version of this one,
+    /// has carried.
+    #[must_use]
+    pub const fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// Returns the entry's identity: kept through every change, and given to no other entry —
+    /// not even a clone.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
     }
 
     /// Returns the entry's role.
@@ -244,11 +327,18 @@ impl Entry {
         if final_chunk {
             self.streaming = false;
         }
+        self.stamp = fresh_stamp();
     }
 
     /// Marks the entry settled without appending anything.
+    ///
+    /// Settling a settled entry changes nothing, so it keeps its stamp: every push settles the
+    /// tail first, and a new stamp on each would throw away the tail's drawing for no change.
     pub fn settle(&mut self) {
-        self.streaming = false;
+        if self.streaming {
+            self.streaming = false;
+            self.stamp = fresh_stamp();
+        }
     }
 
     /// Returns the number of lines the entry occupies at `width` columns in the **full**
@@ -384,6 +474,16 @@ impl Transcript {
         Self {
             entries: Vec::new(),
         }
+    }
+
+    /// A transcript holding exactly `entries`, streaming tail and all.
+    ///
+    /// For tests that need a second view of the same conversation: [`Transcript::push`] settles
+    /// the tail it lands after, so building one entry at a time cannot reproduce a transcript
+    /// that is mid-stream.
+    #[cfg(test)]
+    pub(crate) const fn of(entries: Vec<Entry>) -> Self {
+        Self { entries }
     }
 
     /// Returns the entries.
