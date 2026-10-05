@@ -1,5 +1,99 @@
 # Testing and verification
 
+## Responses image costs and pure measurement — 2026-10-05
+
+The local correction passes fourteen scoped gates and retains all 251 frozen runtime inputs.
+Two regressions fail on the parent and pass with the fix: Responses image payloads no longer count
+as text as well as pixels, and a valid oversized prospective result can be measured without being
+admitted for dispatch. Real original-item PNG/JPEG request preparation and image-like metadata
+negative cases are included. The
+[cost certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#responses-image-cost-and-prospective-measurement-certificate--5-october-2026)
+records suite counts, fixed lint findings and limitations. Windows evidence is cross-compilation;
+stock credential-aware and paid/live acceptance remain unrun. Host prompt revision and complete
+native workflow adoption are not implied by this local fix.
+
+## Original record admission reconciled with Responses — 2026-10-05
+
+The combined local candidate passes all 14 scoped gates: 539 affected domain/ports/provider/
+store tests, 183 minimal-runner cases, 53 all-feature admission/embedding cases, two minimal
+runner doctests, embedded default/providers 29/35 and runtime-free TUI 342; formatting,
+workspace/minimal/TUI/downstream Clippy and Windows-target minimal-library Clippy pass.
+All 249 frozen runtime/config/test inputs remain unchanged. Six actual HTTP fixtures include
+original record/batch ownership, strict Responses transport, reload and whole-turn fitting,
+and refusal before any executor. Twenty-two added runner cases include the prior record
+fixtures and three reconciliation regressions. Ninety-four reviewed functions are at most
+60 lines. Suites overlap. The downstream host's separate capacity consumer passes five cases
+and locked Clippy, and the downstream host's own full verifier also passes.
+
+The [combined certificate](../.specs/changes/2026-10-05-record_responses_reconciliation.review.md)
+records fixed old-turn cancellation answers, runner-side Responses parsing before host
+counting, duplicate merge methods and fixture/dependency lifetime findings. Evidence was kept
+locally, outside this repository. The candidate is local/unpublished; original production
+host authority/adoption and live/native/platform acceptance remain open. No paid provider,
+real credential store or personal Chrome was used.
+
+## Explicit Responses transport and prospective estimation — 2026-10-05
+
+The extension passes 537 affected tests, minimal-runner/TUI nextest 161/342 and embedded default/
+providers 7/13; all 13 scoped formatting, Clippy, doctest and Windows-target minimal-library gates
+pass. No drift exists in 232 frozen runtime inputs; 188 new-file functions are at most 59 lines.
+Four actual socket/runner fixtures cover admitted POST/SSE, complete-batch estimates/results,
+v2 reload and lower-budget fitting; truncated completion with zero executors; opaque-only reload
+and next-user replay; and HTTP redirect refusal with no connection to a second origin. Two pure
+request/config and two projection cases cover narrow final-batch value substitution and its strict
+separation from dispatch. These fixtures use fictional keys and a private transport socket override;
+production still derives the fixed public endpoint and opts in only when explicitly configured.
+
+The [transport certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#explicit-transportprospective-estimation-certificate--5-october-2026)
+records fixed redirect, accepted-socket mode, actual context-budget selection and minimal dev-
+dependency findings. Logs/source receipts were kept locally, outside this repository. No
+publication, downstream dependency pin/readiness change, paid model, real credential store or
+native execution is claimed. Windows compilation covers the minimal library, not the OpenAI
+transport's native runtime. All previously required host/platform/live acceptance remains
+separate.
+
+## Original/fitted Responses request preparation — 2026-10-04
+
+The extension passes 529 affected domain/ports/provider/store tests, 161 minimal-runner and
+342 runtime-free TUI nextest cases, minimal runner doctests and standalone embedded default/
+providers (7/13). Workspace/minimal/TUI/downstream warning-denying Clippy, both formatting
+checks and Windows MSVC-target minimal-library Clippy pass. All 231 frozen runtime inputs
+remain unchanged through these final gates. The added receipt/projection/history/request cases
+include a concrete-cap image fitting regression and a downstream pure-preparer → real decoder
+→ minimal runner → sibling tools → v2 reload → admitted continuation fixture.
+
+The [request certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#originalfitted-request-patch-certificate--4-october-2026)
+records corrected encrypted-content inclusion, aggregate image-cap timing, opaque-only source
+folding, controls-before-clone bounds and internal receipt boxing. Four request cases exercise
+exact original items and body/source hashes, fitting and changed controls/source/batch refusals;
+three projection, two history and two additional domain cases cover the adjacent contracts.
+Logs and source receipts were kept locally, outside this repository; 153 new-file functions
+are at most 59 lines. The candidate is local/unpublished. Stock transport and prospective
+final-batch integration are incomplete; credential-aware stock composition, native Windows
+execution and exact-model live acceptance remain unrun. No real credentials or API were used.
+
+## Local Responses decoder and function policy preparation — 2026-10-04
+
+The isolated ee1-based candidate passes 519 domain/ports/provider/store tests, including
+six function-policy, six domain-replay, seven accumulator and two real fragmented HTTP/SSE
+cases. It also passes 159 minimal-runner nextest cases, 342 runtime-free TUI cases, minimal
+runner doctests, standalone embedded default/providers (7/12 tests), workspace/minimal/TUI
+and downstream warning-denying Clippy, and formatting. Two new downstream cases drive the
+real decoder into the minimal runner and v2 serialization/reload; malformed/incomplete replay
+does not execute its fictional tool. The supplied decoder digest is trusted fixture input,
+so these cases do not prove request-prefix admission or actual continuation encoding.
+Windows MSVC-target domain/ports/minimal-library Clippy passes; native execution remains unrun.
+
+Runtime/source/config inputs were frozen; only OpenAI-local files changed after the earlier
+minimal/TUI gates, and the final affected gates were repeated with no frozen-input drift.
+Evidence was kept locally, outside this repository; the
+[certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#local-decoderpolicy-patch-certificate--4-october-2026)
+records the corrected phase/usage, envelope-before-clone, provider ceilings and stock-default
+findings. The candidate is unpublished. No downstream dependency pin change, paid request,
+real credential lookup, personal Chrome, native Windows execution or complete stateless replay
+is claimed.
+Credential-aware stock composition and exact-model live gates remain unrun.
+
 ## Optional complete-batch admission — 2026-10-03
 
 Final domain/ports/minimal runner nextest passes 419 tests, no skips; all-feature
@@ -15,9 +109,9 @@ also compile in final workspace Clippy.
 
 The [certificate](../.specs/changes/2026-10-03-tool_batch_admission.md#semi-formal-proposal-review)
 records fixed incomplete-call projection and private-value normalization findings.
-Failed and final logs remain under `/private/tmp/hype-tool-admission`. Credential-aware
+Failed and final logs were kept locally, outside this repository. Credential-aware
 stock workspace tests/doctests and native Windows execution remain unrun. This seam
-is local and unpublished; no Hype immutable adoption or consumer complete-budget
+is local and unpublished; no immutable downstream adoption or consumer complete-budget
 implementation, secret store, personal Chrome or paid model use is inferred.
 
 ## Declared image file-byte enforcement — 2026-10-03
@@ -34,10 +128,10 @@ Formatting, whole-workspace all-target/all-feature warning-denying Clippy, minim
 bundle Clippy, three domain/minimal-bundle doctests, standalone embedded default
 (7 tests) and providers (10 tests), and Windows-target domain/minimal-bundle library
 Clippy pass. The [certificate](../.specs/changes/2026-10-03-enforce_image_envelope_bytes.md#semi-formal-proposal-review)
-and `/private/tmp/hype-image-envelope` logs record scope. Credential-aware stock
+and logs kept locally, outside this repository, record scope. Credential-aware stock
 workspace tests/doctests and native Windows execution remain unrun. No actual secret
-or personal browser is used. The app's immutable pin is not changed by this fix;
-full-request/token/analysis admission and original video acceptance remain separate.
+or personal browser is used. The downstream host's immutable pin is not changed by this
+fix; full-request/token/analysis admission and original video acceptance remain separate.
 
 ## Caller-owned video snapshot checks — 2026-10-03
 
@@ -52,12 +146,12 @@ Existing FFmpeg tests confirm stock source cleanup and pixels/codec/container be
 Initial fixture compilation used the private executor field and wrong outcome shape;
 the public ToolDefinition::execute/ToolResult.outcome API corrects it. Initial lint
 findings in the newly used owner field and its initializer were corrected without
-suppression. All source/doc baselines, failures and final logs are retained under
-`/private/tmp/hype-video-snapshot`; the [certificate](../.specs/changes/2026-10-03-video_snapshot.review.md)
+suppression. All source/doc baselines, failures and final logs were kept locally, outside
+this repository; the [certificate](../.specs/changes/2026-10-03-video_snapshot.review.md)
 traces lifetime and admission scope. No secret store, personal Chrome or paid model is
-used. Windows compile evidence does not establish execution. Hype's production pin,
-tool registration and original acceptance remain unchanged; credential-aware stock
-workspace tests/doctests remain explicitly unrun.
+used. Windows compile evidence does not establish execution. The downstream host's
+production pin, tool registration and original acceptance remain unchanged; credential-aware
+stock workspace tests/doctests remain explicitly unrun.
 
 ## Local z.ai API admission checks — 2026-10-03
 
@@ -77,8 +171,8 @@ The initial full workspace Clippy found an unqualified bundle port type; the cor
 run exits 0 with no suppression. Full stock composition/workspace doctests are deliberately
 unrun because they can read the real credential store; changing Nanus home is insufficient
 Keychain isolation. No live provider acceptance, image promotion, native Windows execution
-or immutable Hype adoption is inferred. The [certificate](../.specs/changes/2026-10-03-zai_api_admission.review.md)
-and retained `/private/tmp/hype-zai-admission` logs/baselines record the exact scope.
+or immutable downstream adoption is inferred. The [certificate](../.specs/changes/2026-10-03-zai_api_admission.review.md)
+and logs/baselines kept locally, outside this repository, record the exact scope.
 
 ## Earlier whole-repository baseline
 

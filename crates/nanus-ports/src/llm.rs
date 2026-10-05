@@ -230,6 +230,9 @@ pub struct ChatRequest {
     pub model: String,
     /// The conversation so far, in order.
     pub messages: Vec<Message>,
+    /// Immutable unelided source for replay/fitting admission. Never encoded into the HTTP body.
+    /// Absence means `messages` itself is the original source, preserving stock callers.
+    pub source_history: Option<std::sync::Arc<[Message]>>,
     /// The tools the model may call. This is the wire allowlist: a
     /// [`ToolSchema`] has no field an executor could hide in.
     pub tools: Vec<ToolSchema>,
@@ -252,6 +255,7 @@ impl ChatRequest {
         Self {
             model: model.into(),
             messages,
+            source_history: None,
             tools: Vec::new(),
             max_tokens: None,
             separate_reasoning_tokens: 0,

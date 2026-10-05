@@ -15,7 +15,7 @@ provider contact. A bounded decoded response may expand beyond a host's complete
 line cap through escaping, signed replay or copied call audits. Checking only on save
 can discover this after a native effect.
 
-The Hype caller has pure turn/opening/closing counters, but the runner provides no callback
+The embedding host has pure turn/opening/closing counters, but the runner provides no callback
 before TurnStart/UserMessage or StepStart. Those counters alone are not production admission.
 This proposal fills that generic lifecycle gap; complete tool/result authority remains in
 the existing batch seam and physical ownership remains with the caller.
@@ -130,7 +130,7 @@ Internal goal tools remain covered by complete-batch admission and closing reser
   usage validity, image support, account authority or payment permission.
 - Credential-free minimal domain/ports/runner, embedding consumers, formatting and
   all-target/all-feature warning-denying Clippy pass. Native Windows execution, stock
-  credential-aware gates, live providers and Hype adoption remain separately recorded.
+  credential-aware gates, live providers and host adoption remain separately recorded.
 
 ## Semi-formal proposal review
 
@@ -180,26 +180,26 @@ exits and capacity handoff still require the listed real-runner acceptance fixtu
 ## Isolated implementation evidence — 4 October 2026
 
 This owner checkout still treats the API as proposed: its current source has no
-`RecordAdmission` implementation. A separate `hype-record-admission` jj workspace merges
+`RecordAdmission` implementation. A separate isolated candidate jj workspace merges
 public `d03f8958bd0144f938a4c3330954a6886bddeee4` and prepared
 `4d24df7d093f3d1912d3047eef33c61e51e81242` without rewriting either parent or owner source.
 Its local bookmark `codex/record-admission` points at
 `efee35247a1c3fc1b101f03efb71b3049cddc0b3`, including documentation-only updates after
 verified inputs `ee5ed890cb4d90ad3538a23c3d99c5eb7e4b2b6a`.
 
-The [isolated implementation certificate](../../../hype-studio/src-tauri/target/nanus-record-admission/.specs/changes/2026-10-04-model_record_admission.md#semi-formal-implementation-certificate--4-october-2026)
-records actual port ordering, owned logical leases, original observation moves, replay-join
-ordering fixes and nineteen new actual-runner cases. Final scoped minimal tests pass 443
+The isolated implementation certificate is preserved in commit `efee352` (tag
+`archive/record-admission-efee352`). It records actual port ordering, owned logical leases,
+original observation moves, replay-join ordering fixes and nineteen new actual-runner cases. Final scoped minimal tests pass 443
 including four doctests; admission/embedding passes 50; provider/video passes 217; embedded
 default/providers pass 26/29; runtime-free TUI passes 342. Suites overlap. No case fails or
 is ignored. Workspace warning-denying Clippy, formatting and Windows MSVC-target library
 Clippy pass. All 297 tracked inputs stayed unchanged during the final gates. Windows
-cross-compilation is not native execution. Logs remain under `/private/tmp/hype-record-admission`.
+cross-compilation is not native execution. Logs were kept locally outside the repository.
 
-No publication or Hype dependency adoption occurred. Hype's original authority/ledger
-consumer and live/native platform acceptance remain unbuilt. The prepared publication
-bookmark remains at `4d24df7d`; its pending approval does not authorize publishing this
-new candidate. No paid model, OS secret store or personal Chrome was used.
+No publication or downstream dependency adoption occurred. The embedding host's original
+authority/ledger consumer and live/native platform acceptance remain unbuilt. The prepared
+publication bookmark remains at `4d24df7d`; its pending approval does not authorize publishing
+this new candidate. No paid model, OS secret store or personal Chrome was used.
 
 ## Reconciled record and Responses candidate — 5 October 2026
 
@@ -213,7 +213,7 @@ old-turn answers, and opt-in host counting precedes runner-side Responses replay
 Fourteen scoped gates pass with 249 frozen inputs unchanged: affected tests 539, minimal
 runner 183, all-feature admission/embedding 53, embedded default/providers 29/35, runtime-
 free TUI 342, two minimal doctests, formatting, warning-denying Clippy and Windows-target
-minimal-library Clippy. Five actual Hype capacity-consumer tests also pass separately.
-Counts overlap; no native Windows, credential-aware stock, paid/live API or complete Hype
-production authority is inferred. The local evidence directory is `/private/tmp/hype-record-responses`.
+minimal-library Clippy. Five actual embedding-host capacity-consumer tests also pass separately.
+Counts overlap; no native Windows, credential-aware stock, paid/live API or complete host
+production authority is inferred. The local evidence was kept outside the repository.
 This owner's proposal remains Proposed pending publication and actual production adoption.

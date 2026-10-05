@@ -13,9 +13,9 @@
 //!
 //! - [`SessionEvent::UserMessage`] becomes a user message, verbatim.
 //! - [`SessionEvent::AssistantMessage`] becomes an assistant message when it has
-//!   non-empty text or at least one tool call. An assistant turn with neither is
-//!   skipped: it carries no model-visible content, and replaying it would spend
-//!   tokens on nothing.
+//!   non-empty text, at least one tool call, or opaque Responses replay. Opaque reasoning
+//!   remains model-visible even without display text. An assistant turn without any of
+//!   these is skipped because it carries no model-visible content.
 //! - [`SessionEvent::ToolResult`] becomes a tool message, verbatim.
 //! - Everything else — turn and step boundaries, the tool-call audit record, and
 //!   the goal change — is harness bookkeeping and never reaches a model.
@@ -440,7 +440,14 @@ impl SessionLog {
                         .filter(|call| answered.contains(&&call.id))
                         .cloned()
                         .collect();
-                    if has_text || !calls.is_empty() {
+                    // Completed opaque Responses reasoning can be empty display text; it still
+                    // belongs in the original source. Unanswered calls cannot carry that replay.
+                    // Such a turn is one only stateless Responses can send: every other encoder
+                    // skips it (`Message::is_replay_only`), so a resume elsewhere still works.
+                    let has_opaque = replay.as_ref().is_some_and(|replay| {
+                        replay.protocol == "openai.responses" && calls.len() == tool_calls.len()
+                    });
+                    if has_text || !calls.is_empty() || has_opaque {
                         let replay = if calls.len() == tool_calls.len() {
                             replay.clone()
                         } else {

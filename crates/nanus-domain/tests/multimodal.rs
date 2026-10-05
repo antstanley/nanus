@@ -113,6 +113,7 @@ fn signed_replay_cannot_smuggle_pixels_or_change_the_executable_response() {
     let good = AssistantReplay {
         protocol: "anthropic.messages".into(),
         prefix_digest: "a".repeat(64),
+        context_receipt: None,
         blocks: vec![
             serde_json::json!({
                 "type": "thinking", "thinking": "", "signature": "opaque"
@@ -157,6 +158,7 @@ fn a_tool_call_naming_its_caller_replays_and_a_malformed_caller_does_not() {
             "type": "tool_use", "id": "toolu_01", "name": "read",
             "input": {"file_path": "src/lib.rs"}, "caller": caller
         })],
+        context_receipt: None,
     };
     for caller in [
         serde_json::json!({"type": "direct"}),

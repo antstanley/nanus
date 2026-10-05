@@ -1,6 +1,6 @@
 # Semi-formal review: Original record admission with stateless Responses
 
-**Date:** 2026-10-05 · **Scope:** isolated `hype-responses` candidate, child of sealed
+**Date:** 2026-10-05 · **Scope:** an isolated candidate workspace, child of sealed
 `dc9cb6104e5aea9c2544b9d164af4d6b1e2e9a4e`, itself based on public
 `ee1e59554b8d52a2ccc2bb3565f6b0dbc68914e2`. No publication or production adoption.
 
@@ -27,7 +27,7 @@ usage, earlier completed effects and the previous turn's answer remain retained 
 ## Function resolution
 
 - `nanus_ports::RecordAdmission` and reservation traits resolve to the new pure local
-  `record_admission` module, not stock composition, secret ports or copied Hype counters.
+  `record_admission` module, not stock composition, secret ports or copied consumer counters.
 - `AgentRunner::run_controlled` calls `records::reserve_turn_records` before original
   TurnStart/UserMessage; its local `drive_turn` closes through `end_turn_records`.
 - `run_step` calls the single `selection::hold_selection`, active for either port.
@@ -48,8 +48,8 @@ usage, earlier completed effects and the previous turn's answer remain retained 
 - The HTTP fixture's `FixtureModel` resolves to real `OpenAiLlm::prepare_dispatch/transmit`
   and the actual bounded decoder, changing only the private fixture socket URL. The record
   and batch fixtures implement real ports; they do not reimplement the runner.
-- Hype's isolated consumer uses actual `studio_agent::checkpoint::TurnCapacity`, StepCapacity,
-  and RecordLedger through real callbacks. Fictional model/tools and permissive fixture checks
+- The downstream consumer's isolated build uses its own actual turn and step capacity types
+  and record ledger through real callbacks. Fictional model/tools and permissive fixture checks
   do not establish original production key, source, request, audit, payment or worker authority.
 
 ## Execution traces
@@ -109,11 +109,11 @@ summed. Ninety-four functions in the eight reviewed record/transport fixture fil
 60 lines. The six actual HTTP fixtures include stock and hosted paths, opaque-only continuation,
 truncated completion, redirect refusal and host refusal of a valid completed response.
 
-Five actual Hype record-capacity consumer cases pass against this combined candidate,
-including near-limit retained history and dropped pending model work. Locked consumer Clippy passes. Hype's full `pnpm verify` also exits 0: 1083 Rust and
-132 frontend tests pass, zero fail; 17 explicit Rust native/manual acceptance tests remain ignored.
-Logs, exact gate commands, frozen hashes, merge inputs, isolated manifest/lockfile and function
-review are under `/private/tmp/hype-record-responses`.
+Five actual downstream record-capacity consumer cases pass against this combined candidate,
+including near-limit retained history and dropped pending model work. Locked consumer Clippy
+passes. The consumer's full verification suite also exits 0 with zero failures; 17 explicit
+native/manual acceptance tests remain ignored. Logs, exact gate commands, frozen hashes, merge
+inputs, isolated manifest/lockfile and function review were kept locally outside the repository.
 
 Stock credential-aware composition tests and live provider calls are deliberately unrun;
 no real Keychain, personal Chrome or paid API is used. Windows compilation is not native
@@ -124,5 +124,5 @@ adoption, read_video/paid analysis and platform/package/recovery acceptance rema
 
 **LIKELY_CORRECT for the reconciled local mechanism; high confidence.** Both reproduced
 behavioral findings are fixed and covered through actual runner paths. This certificate does
-not establish immutable publication, original Hype production admission, live/native acceptance
-or completion of the app migration.
+not establish immutable publication, original downstream production admission, live/native
+acceptance or completion of the app migration.

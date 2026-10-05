@@ -46,7 +46,7 @@ one serialized byte per token after translation. Base64 contributes to bytes, no
 
 `with_request_budget(output, separate_reasoning)` names the actual output ceiling and any
 reasoning outside that ceiling. Hosts that include reasoning in output use zero separately;
-Hype Studio should reserve at most 8192 total. The metadata and caller ceiling are checked
+the downstream consumer should reserve at most 8192 total. The metadata and caller ceiling are checked
 before HTTP. Unknown capabilities never infer image support from an alias, vendor or plan.
 Profiles apply only to their exact recorded vendor, model, Responses/Messages wire and endpoint.
 OpenAI Chat and custom gateways remain Unknown and refuse pixels; raw encoding fixtures do not

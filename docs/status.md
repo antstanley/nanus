@@ -114,7 +114,8 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 - **Exact protocol preference is available to hosts.** Automatic remains the stock model/plan
   route. Exact selects one wire or refuses before HTTP; capability queries no longer inherit
   Responses image evidence on Chat or an arbitrary proxy. The nine new fixtures establish local
-  routing/refusal behavior; they do not promote a new protocol or prove Hype selected the API.
+  routing/refusal behavior; they do not promote a new protocol or prove a downstream host
+  selected the API.
 - **Pre-event response limits are opt-in library policy.** All three API adapters accept the
   same caller-selected budgets, including OpenAI's Chat and Responses decoders. Local HTTP
   fixtures cover termination, oversized bodies and cancellation without a live provider call.
@@ -131,7 +132,7 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   request/durable-event projections plus owned callbacks cover every goal/registered tool, raw and
   normalized results, and held model selection. Final credential-free tests/lint pass;
   the [unpublished scope](../.specs/changes/2026-10-03-tool_batch_admission.md) grants no
-  source/worker/payment authority or consumer budget implementation. Hype adoption,
+  source/worker/payment authority or consumer budget implementation. Downstream adoption,
   credential-aware stock tests and native Windows execution remain separate.
 - **Vision is promoted for nine exact models.** Opus 5.5, Sonnet 5.5, GPT-6 Astra, GPT-6.1 Sol,
   GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed live image and call-reference follow-ups; other models refuse image HTTP
