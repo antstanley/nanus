@@ -586,3 +586,6 @@ async fn assembled_fit_drops_whole_image_turns_and_refuses_the_current_turn_befo
             .count()
     );
 }
+
+#[path = "embedding/records.rs"]
+mod records;

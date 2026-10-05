@@ -70,6 +70,7 @@ pub mod control;
 pub mod error;
 pub mod fs;
 pub mod llm;
+pub mod record_admission;
 pub mod response_frames;
 pub mod response_limits;
 pub mod secret;
@@ -98,6 +99,10 @@ pub use llm::{
     ReasoningEffort, ToolCallAssembler, error_body_snippet, truncate_chars,
 };
 pub use nanus_domain::{ApprovalOutcome, ApprovalPolicy, SandboxMode, ToolAccess};
+pub use record_admission::{
+    ModelRecordProjection, RecordAdmission, RecordEndProjection, StepRecordProjection,
+    StepRecordReservation, TurnRecordProjection, TurnRecordReservation,
+};
 pub use secret::{Secret, SecretError, SecretHandle, SecretPort, SecretResult};
 pub use shell::{
     Captured, DEFAULT_MAX_OUTPUT_BYTES, PLATFORM_SHELL, PLATFORM_SHELL_FLAG, SandboxPolicy,

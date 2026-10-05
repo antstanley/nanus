@@ -16,12 +16,22 @@ use serde_json::{Map, Value, json};
 
 use crate::config::OpenAiConfig;
 
+mod replay;
+mod request;
+
+pub use request::PreparedResponses;
+pub(crate) use request::{estimate as estimate_request, prepare as prepare_request};
+
 /// The most tool calls one response may carry.
 const MAX_TOOL_CALLS: usize = 256;
 
 /// Builds the JSON body for a Responses request.
 #[must_use]
 pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
+    build_with_input(config, request, encode_input(&request.messages))
+}
+
+fn build_with_input(config: &OpenAiConfig, request: &ChatRequest, input: Value) -> Value {
     assert!(
         !request.messages.is_empty(),
         "a request carries at least one message"
@@ -38,7 +48,7 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
     if let Some(instructions) = instructions(&request.messages) {
         body.insert("instructions".to_owned(), json!(instructions));
     }
-    body.insert("input".to_owned(), encode_input(&request.messages));
+    body.insert("input".to_owned(), input);
     // The provider's ceiling, not the configured budget: a request above it is refused rather than
     // truncated, so sending it would fail every step. The `ChatGPT` backend — the endpoint whose own
     // shape this is — answers `Unsupported parameter: max_output_tokens`, so it is left to its own
@@ -64,7 +74,9 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
         body.insert("temperature".to_owned(), json!(temperature));
     }
     if !request.tools.is_empty() {
-        body.insert("tools".to_owned(), encode_tools(&request.tools));
+        let mut tools = encode_tools(&request.tools);
+        crate::function_policy::apply(config.function_strictness(), &mut tools, false);
+        body.insert("tools".to_owned(), tools);
     }
     let encoded = Value::Object(body);
     assert!(encoded.get("model").is_some());
@@ -100,6 +112,14 @@ fn instructions(messages: &[Message]) -> Option<String> {
 /// result that answers it.
 #[must_use]
 pub fn encode_input(messages: &[Message]) -> Value {
+    encode_items(messages, false)
+}
+
+fn encode_replay_input(messages: &[Message]) -> Value {
+    encode_items(messages, true)
+}
+
+fn encode_items(messages: &[Message], original: bool) -> Value {
     let mut items: Vec<Value> = Vec::new();
     // Pixels are not a tool output on this wire: a result that carries an image is answered with
     // a label, and the original ordered text and pixels follow as a user item once the whole group
@@ -117,22 +137,15 @@ pub fn encode_input(messages: &[Message]) -> Value {
                 "content": [{ "type": "input_text", "text": text }],
             })),
             Message::Assistant {
+                replay: Some(replay),
+                ..
+            } if original => {
+                items.extend(replay.blocks.iter().cloned());
+            }
+            Message::Assistant {
                 text, tool_calls, ..
             } => {
-                if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
-                    items.push(json!({
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }],
-                    }));
-                }
-                for call in tool_calls {
-                    items.push(json!({
-                        "type": "function_call",
-                        "call_id": call.id.as_str(),
-                        "name": call.name.as_str(),
-                        "arguments": call.arguments.to_string(),
-                    }));
-                }
+                encode_assistant(&mut items, text.as_deref(), tool_calls);
             }
             Message::Tool {
                 call_id,
@@ -143,27 +156,7 @@ pub fn encode_input(messages: &[Message]) -> Value {
                 .iter()
                 .any(|block| matches!(block, nanus_domain::ContentBlock::Image { .. })) =>
             {
-                let label = nanus_ports::capabilities::attachment_label(call_id, *is_error);
-                items.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id.as_str(),
-                    "output": label,
-                }));
-                let mut content = vec![json!({ "type": "input_text", "text": label })];
-                content.extend(blocks.iter().map(|block| match block {
-                    nanus_domain::ContentBlock::Text(text) => {
-                        json!({ "type": "input_text", "text": text })
-                    }
-                    nanus_domain::ContentBlock::Image {
-                        media_type,
-                        data_base64,
-                    } => json!({
-                        "type": "input_image",
-                        "image_url": format!("data:{media_type};base64,{data_base64}"),
-                        "detail": "high",
-                    }),
-                }));
-                attachments.push(json!({ "role": "user", "content": content }));
+                encode_attachment(&mut items, &mut attachments, call_id, blocks, *is_error);
             }
             Message::Tool { call_id, .. } => items.push(json!({
                 "type": "function_call_output",
@@ -174,6 +167,38 @@ pub fn encode_input(messages: &[Message]) -> Value {
     }
     items.append(&mut attachments);
     Value::Array(items)
+}
+
+fn encode_assistant(items: &mut Vec<Value>, text: Option<&str>, calls: &[nanus_domain::ToolCall]) {
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        items.push(json!({"role":"assistant","content":[{"type":"output_text","text":text}]}));
+    }
+    for call in calls {
+        items.push(json!({"type":"function_call","call_id":call.id.as_str(),
+            "name":call.name.as_str(),"arguments":call.arguments.to_string()}));
+    }
+}
+
+fn encode_attachment(
+    items: &mut Vec<Value>,
+    attachments: &mut Vec<Value>,
+    call: &nanus_domain::ToolCallId,
+    blocks: &[nanus_domain::ContentBlock],
+    is_error: bool,
+) {
+    let label = nanus_ports::capabilities::attachment_label(call, is_error);
+    items.push(json!({"type":"function_call_output","call_id":call.as_str(),"output":label}));
+    let mut content = vec![json!({"type":"input_text","text":label})];
+    content.extend(blocks.iter().map(|block| match block {
+        nanus_domain::ContentBlock::Text(text) => json!({"type":"input_text","text":text}),
+        nanus_domain::ContentBlock::Image {
+            media_type,
+            data_base64,
+        } => json!({
+            "type":"input_image","image_url":format!("data:{media_type};base64,{data_base64}"),
+            "detail":"high"}),
+    }));
+    attachments.push(json!({"role":"user","content":content}));
 }
 
 /// Encodes the tool catalogue.
@@ -218,12 +243,45 @@ pub struct StreamAccumulator {
     usage: Option<Usage>,
     finish: Option<FinishReason>,
     closed: bool,
+    replay: Option<replay::Replay>,
 }
 
 impl StreamAccumulator {
-    /// Sets response budgets before observation begins.
+    /// Retains completed stateless API items bound to the caller's already-admitted prefix.
+    /// This decoder does not validate request provenance or authenticate provider ciphertext.
+    /// # Errors
+    /// Refuses a malformed digest. All replay observations require explicit response budgets.
+    pub fn with_prefix(
+        prefix_digest: String,
+        limits: nanus_ports::ResponseLimits,
+    ) -> nanus_ports::LlmResult<Self> {
+        Ok(Self {
+            limits: Some(limits),
+            replay: Some(replay::Replay::new(prefix_digest, limits, None)?),
+            ..Self::default()
+        })
+    }
+
+    /// Retains original items with already-admitted source/wire fitting receipts.
+    /// Receipt consistency and request provenance are the admitting caller's responsibility.
+    /// # Errors
+    /// Refuses malformed digests or impossible fitting receipt counts.
+    pub fn with_context(
+        prefix_digest: String,
+        context: nanus_domain::message::ReplayContext,
+        limits: nanus_ports::ResponseLimits,
+    ) -> nanus_ports::LlmResult<Self> {
+        Ok(Self {
+            limits: Some(limits),
+            replay: Some(replay::Replay::new(prefix_digest, limits, Some(context))?),
+            ..Self::default()
+        })
+    }
+    /// Sets response budgets before observation begins. Replay keeps its admitted budgets.
     pub fn set_response_limits(&mut self, limits: Option<nanus_ports::ResponseLimits>) {
-        self.limits = limits;
+        if self.replay.is_none() {
+            self.limits = limits;
+        }
     }
     /// Responses has its own terminal payload and need not send a transport sentinel.
     #[must_use]
@@ -251,6 +309,7 @@ impl StreamAccumulator {
             self.calls.clear();
             self.usage = None;
             self.finish = None;
+            self.replay = None;
         }
         self.ready.push(LlmEvent::Error(message));
         self.closed = true;
@@ -287,6 +346,12 @@ impl StreamAccumulator {
                 return;
             }
         }
+        if let Some(replay) = &mut self.replay
+            && let Err(error) = replay.observe(frame)
+        {
+            self.fail(error.to_string());
+            return;
+        }
         // A failure can arrive as an `error` event or as a `response.failed` one, and either way it
         // is the reason the turn stopped.
         if let Some(message) = error_message(frame) {
@@ -297,7 +362,9 @@ impl StreamAccumulator {
             return;
         };
         match kind {
-            "response.output_text.delta" => {
+            "response.output_text.delta" | "response.refusal.delta"
+                if kind == "response.output_text.delta" || self.replay.is_some() =>
+            {
                 if let Some(text) = non_empty_str(frame, "delta") {
                     self.ready.push(LlmEvent::TextDelta(text.to_owned()));
                 }
@@ -451,6 +518,18 @@ impl StreamAccumulator {
         if self.closed {
             return;
         }
+        if let Some(replay) = self.replay.take() {
+            let checked = self
+                .completed_calls()
+                .and_then(|calls| replay.finish(&calls));
+            match checked {
+                Ok(replay) => self.ready.push(LlmEvent::AssistantReplay(replay)),
+                Err(error) => {
+                    self.fail(error.to_string());
+                    return;
+                }
+            }
+        }
         if self.limits.is_some()
             && self.calls.iter().any(|call| {
                 call.call_id.is_empty() || nanus_domain::ToolName::new(call.name.clone()).is_err()
@@ -483,6 +562,22 @@ impl StreamAccumulator {
         }
         let reason = self.finish.take().unwrap_or(FinishReason::Stop);
         self.ready.push(LlmEvent::Finished { reason });
+    }
+
+    fn completed_calls(&self) -> nanus_ports::LlmResult<Vec<nanus_domain::ToolCall>> {
+        let mut calls = Vec::with_capacity(self.calls.len());
+        for call in &self.calls {
+            let malformed = || nanus_ports::LlmError::Unsupported {
+                feature: "malformed completed Responses function call".into(),
+            };
+            let arguments = serde_json::from_str(&call.arguments).map_err(|_| malformed())?;
+            calls.push(nanus_domain::ToolCall {
+                id: nanus_domain::ToolCallId::new(call.call_id.clone()),
+                name: nanus_domain::ToolName::new(call.name.clone()).map_err(|_| malformed())?,
+                arguments,
+            });
+        }
+        Ok(calls)
     }
 }
 

@@ -74,7 +74,7 @@ impl Selection {
 
 impl AgentRunner {
     pub(super) fn hold_selection(&self) -> Result<Option<Hold<'_>>, BundleError> {
-        if self.admission.is_none() {
+        if self.admission.is_none() && self.records.is_none() {
             return Ok(None);
         }
         self.selection.epoch()?;

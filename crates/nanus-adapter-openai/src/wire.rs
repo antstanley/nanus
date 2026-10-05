@@ -84,7 +84,9 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
         body.insert("temperature".to_owned(), json!(temperature));
     }
     if !request.tools.is_empty() {
-        body.insert("tools".to_owned(), encode_tools(&request.tools));
+        let mut tools = encode_tools(&request.tools);
+        crate::function_policy::apply(config.function_strictness(), &mut tools, true);
+        body.insert("tools".to_owned(), tools);
     }
     let encoded = Value::Object(body);
     // Postcondition: the mandatory fields are present, so a later edit cannot

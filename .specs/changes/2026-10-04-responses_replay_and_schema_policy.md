@@ -389,6 +389,21 @@ replay succeeds. Verdict: **PARTIAL** integration; the guard prevents premature 
 these three generic seams and their consumer proofs remain implementation work. No protocol/source
 checks are relaxed, and no additional public boundary is claimed implemented by this prose.
 
+### Local cost correction — 5 October 2026
+
+A child of the sealed reconciliation candidate corrects Responses image accounting and prospective
+measurement. The shared estimator subtracts inline `input_image` payload strings only from actual
+Responses user-message content, while preserving full wire bytes and visual-profile charges.
+Image-shaped schemas/calls/text remain charged. The actual original-item preparer and PNG/JPEG
+fixtures verify the formula. Pure estimates can report an over-budget valid candidate; actual
+preparation/transport still require the unchanged fit check. Source/control/replay and complete
+final-batch substitution validation remain mandatory. No public boundary type changes.
+
+All fourteen scoped gates pass with 251 frozen inputs unchanged; see the
+[cost certificate](2026-10-04-responses_replay_and_schema_policy.review.md#responses-image-cost-and-prospective-measurement-certificate--5-october-2026).
+This fixes generic measurement only. Trusted prompt revisions, consumer native result capacity,
+genuine multimodal analysis input, immutable adoption and original acceptance remain required.
+
 ## Assumptions / Decisions / Open questions
 
 **Assumptions:** the published immutable baseline above is authoritative, independently of

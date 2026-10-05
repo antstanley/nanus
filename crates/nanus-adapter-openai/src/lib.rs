@@ -43,8 +43,11 @@
 
 mod config;
 mod error;
+mod function_policy;
 pub mod oauth;
 mod response;
+#[cfg(test)]
+mod stateless_tests;
 mod tool_support;
 
 pub mod responses;
@@ -159,7 +162,23 @@ impl OpenAiLlm {
         config
             .resolve_protocol(config.model())
             .map_err(|_| OpenAiError::UnsupportedProtocol)?;
-        let client = reqwest::Client::builder()
+        if config.stateless_responses()
+            && (config.vendor() != Vendor::OpenAi
+                || config.base_url().trim_end_matches('/') != OPENAI_BASE_URL
+                || config.account_id().is_some()
+                || config.response_limits().is_none()
+                || config.protocol_preference() != ProtocolPreference::Exact(Protocol::Responses))
+        {
+            return Err(OpenAiError::UnsupportedProtocol);
+        }
+        let builder = reqwest::Client::builder();
+        // A receipt names one exact endpoint. Redirects cannot silently select a different one.
+        let builder = if config.stateless_responses() {
+            builder.redirect(reqwest::redirect::Policy::none())
+        } else {
+            builder
+        };
+        let client = builder
             .build()
             .map_err(|source| OpenAiError::client(&source))?;
         Ok(Self { client, config })
@@ -211,6 +230,7 @@ impl OpenAiLlm {
 
     fn checked_protocol(&self, request: &ChatRequest) -> nanus_ports::LlmResult<Protocol> {
         let protocol = self.config.resolve_protocol(&request.model)?;
+        function_policy::validate(&self.config, request)?;
         if matches!(
             self.config.protocol_preference(),
             ProtocolPreference::Exact(_)
@@ -233,6 +253,46 @@ impl OpenAiLlm {
         format!("{base}{}", protocol.path())
     }
 
+    /// Prepares a bounded, stateless public Responses body with original replay items.
+    ///
+    /// This pure inspection API performs no HTTP; stock dispatch keeps its existing encoder.
+    /// The adapter supplies its own exact-model capabilities and tool support evidence.
+    ///
+    /// # Errors
+    ///
+    /// Refuses incompatible endpoints, unknown models, changed controls, incomplete history,
+    /// legacy assistant turns and requests outside the explicit byte or token ceilings.
+    pub fn prepare_responses(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<responses::PreparedResponses> {
+        self.checked_protocol(request)?;
+        responses::prepare_request(
+            &self.config,
+            request,
+            self.capabilities(&request.model),
+            self.tool_call_support(&request.model, request.reasoning_effort),
+        )
+    }
+
+    /// Estimates original Responses items, allowing only final complete-batch result substitution.
+    ///
+    /// Pure estimation never dispatches the candidate or mutates its immutable source.
+    /// # Errors
+    /// Refuses invalid history/controls, substitutions outside the final batch, or exceeded limits.
+    pub fn estimate_responses(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        self.checked_protocol(request)?;
+        responses::estimate_request(
+            &self.config,
+            request,
+            self.capabilities(&request.model),
+            self.tool_call_support(&request.model, request.reasoning_effort),
+        )
+    }
+
     /// Encodes a request as the JSON body the vendor expects.
     ///
     /// Raw encoding for wire inspection, without capability or endpoint validation.
@@ -243,6 +303,109 @@ impl OpenAiLlm {
             Protocol::ChatCompletions => wire::build_request(&self.config, request),
             Protocol::Responses => responses::build_request(&self.config, request),
         }
+    }
+}
+
+impl OpenAiLlm {
+    fn prepare_dispatch(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<(Protocol, serde_json::Value, Decoder)> {
+        let protocol = self.checked_protocol(request)?;
+        if self.config.stateless_responses() {
+            let prepared = self.prepare_responses(request)?;
+            let limits = self.config.response_limits().ok_or_else(|| {
+                nanus_ports::LlmError::Unsupported {
+                    feature: "stateless Responses requires response limits".into(),
+                }
+            })?;
+            let decoder = responses::StreamAccumulator::with_context(
+                prepared.prefix_digest,
+                prepared.context_receipt,
+                limits,
+            )?;
+            return Ok((
+                protocol,
+                prepared.body,
+                Decoder::Responses(Box::new(decoder)),
+            ));
+        }
+        nanus_ports::capabilities::validate_image_input(
+            self.capabilities(&request.model),
+            request,
+        )?;
+        nanus_ports::tool_support::validate_input(
+            self.tool_call_support(&request.model, request.reasoning_effort),
+            request,
+        )?;
+        if zai::requires_preflight(&self.config, request) {
+            let checked = self.estimate_request(request).and_then(|estimate| {
+                nanus_ports::capabilities::validate_estimate(
+                    self.capabilities(&request.model),
+                    request,
+                    estimate,
+                )
+            });
+            checked?;
+        }
+        let decoder = match protocol {
+            Protocol::ChatCompletions => Decoder::Chat(Box::default()),
+            Protocol::Responses => Decoder::Responses(Box::default()),
+        };
+        Ok((protocol, self.encode(request), decoder))
+    }
+
+    fn transmit(
+        &self,
+        request: &ChatRequest,
+        payload: &serde_json::Value,
+        decoder: Decoder,
+        endpoint: &str,
+    ) -> LlmStream {
+        let Ok(body) = serde_json::to_string(payload) else {
+            return error_stream("could not encode the request as JSON");
+        };
+        tracing::debug!(vendor=%self.config.vendor(),model=%request.model,endpoint=%endpoint,
+            messages=request.messages.len(),tools=request.tools.len(),"dispatching a chat completion");
+        let mut sent = self
+            .client
+            .post(endpoint)
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .bearer_auth(self.config.api_key())
+            .body(body);
+        if let Some(account) = self.config.account_id() {
+            sent = sent.header("chatgpt-account-id", account);
+        }
+        let host = self.config.base_url().to_owned();
+        let transport_host = host.clone();
+        let response = async move {
+            sent.send()
+                .await
+                .map_err(|source| OpenAiError::transport(&source, &transport_host).to_string())
+        };
+        let vendor = self.config.vendor();
+        let limits = self.config.response_limits();
+        let mut decoder = Some(decoder);
+        Box::pin(
+            futures::stream::once(response).flat_map(move |outcome| match outcome {
+                Ok(response) => {
+                    let Some(decoder) = decoder.take() else {
+                        return error_stream_owned("response decoder was already consumed".into());
+                    };
+                    let head = futures::stream::iter([LlmEvent::ResponseHead]);
+                    let announced: EventStream = Box::pin(head.chain(response::decode(
+                        response,
+                        host.clone(),
+                        vendor,
+                        decoder,
+                        limits,
+                    )));
+                    announced
+                }
+                Err(message) => error_stream_owned(message),
+            }),
+        )
     }
 }
 
@@ -299,6 +462,9 @@ impl LlmPort for OpenAiLlm {
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        if self.config.stateless_responses() {
+            return self.estimate_responses(request);
+        }
         self.checked_protocol(request)?;
         zai::validate(&self.config, request)?;
         let capabilities = self.capabilities(&request.model);
@@ -311,105 +477,12 @@ impl LlmPort for OpenAiLlm {
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
-        let protocol = match self.checked_protocol(&request) {
-            Ok(protocol) => protocol,
-            Err(error) => return error_stream(&error.to_string()),
-        };
-        if let Err(error) = nanus_ports::capabilities::validate_image_input(
-            self.capabilities(&request.model),
-            &request,
-        ) {
-            return error_stream(&error.to_string());
+        match self.prepare_dispatch(&request) {
+            Ok((protocol, payload, decoder)) => {
+                self.transmit(&request, &payload, decoder, &self.url(protocol))
+            }
+            Err(error) => error_stream(&error.to_string()),
         }
-        if let Err(error) = nanus_ports::tool_support::validate_input(
-            self.tool_call_support(&request.model, request.reasoning_effort),
-            &request,
-        ) {
-            return error_stream(&error.to_string());
-        }
-        if zai::requires_preflight(&self.config, &request) {
-            let checked = self.estimate_request(&request).and_then(|estimate| {
-                nanus_ports::capabilities::validate_estimate(
-                    self.capabilities(&request.model),
-                    &request,
-                    estimate,
-                )
-            });
-            if let Err(error) = checked {
-                return error_stream(&error.to_string());
-            }
-        }
-        let payload = self.encode(&request);
-
-        let Ok(body) = serde_json::to_string(&payload) else {
-            return error_stream("could not encode the request as JSON");
-        };
-        tracing::debug!(
-            vendor = %self.config.vendor(),
-            model = %request.model,
-            endpoint = %self.url(protocol),
-            messages = request.messages.len(),
-            tools = request.tools.len(),
-            "dispatching a chat completion"
-        );
-
-        let client = self.client.clone();
-        let endpoint = self.url(protocol);
-        let api_key = self.config.api_key().to_owned();
-        let vendor = self.config.vendor();
-        // A subscription names the account in its own header; the API does not.
-        let account_id = self.config.account_id().map(str::to_owned);
-        // The host survives as an owned value inside the stream: the transport
-        // failure is reported after `&self` has gone out of scope.
-        let host = self.config.base_url().to_owned();
-        let stream_host = host.clone();
-        let limits = self.config.response_limits();
-
-        let response = async move {
-            let mut sent = client
-                .post(&endpoint)
-                .header("accept", "text/event-stream")
-                .header("content-type", "application/json")
-                .bearer_auth(api_key);
-            if let Some(account_id) = account_id {
-                sent = sent.header("chatgpt-account-id", account_id);
-            }
-            match sent.body(body).send().await {
-                Ok(response) => Ok(response),
-                Err(source) => Err(OpenAiError::transport(&source, &host).to_string()),
-            }
-        };
-
-        // The stream resolves the request, then decodes the body it produced. A
-        // transport failure becomes a single terminal `Error` event rather than a
-        // stream that ends silently, so the agent loop always learns why.
-        let stream = futures::stream::once(response).flat_map(move |outcome| match outcome {
-            Ok(response) => {
-                // The head is in hand, so the server is answering and everything
-                // from here is its body. Reported before the body is read, because
-                // this is the earliest moment the fact is true.
-                let head = futures::stream::iter([LlmEvent::ResponseHead]);
-                let announced: EventStream = match protocol {
-                    Protocol::ChatCompletions => Box::pin(head.chain(response::decode(
-                        response,
-                        stream_host.clone(),
-                        vendor,
-                        Decoder::Chat(Box::default()),
-                        limits,
-                    ))),
-                    Protocol::Responses => Box::pin(head.chain(response::decode(
-                        response,
-                        stream_host.clone(),
-                        vendor,
-                        Decoder::Responses(Box::default()),
-                        limits,
-                    ))),
-                };
-                announced
-            }
-            Err(message) => error_stream_owned(message),
-        });
-        Box::pin(stream)
     }
 }
 

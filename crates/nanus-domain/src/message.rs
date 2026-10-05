@@ -17,6 +17,11 @@
 
 use core::fmt;
 
+mod replay_context;
+mod responses_replay;
+
+pub use replay_context::ReplayContext;
+
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -251,6 +256,9 @@ pub struct AssistantReplay {
     pub protocol: String,
     /// SHA-256 of that request's system, tools and preceding encoded messages.
     pub prefix_digest: String,
+    /// Original/fitted request receipts. Absent for legacy Messages and decoder-only fixtures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_receipt: Option<Box<ReplayContext>>,
     /// Original ordered provider blocks, including signed empty thinking.
     pub blocks: Vec<Value>,
 }
@@ -263,6 +271,9 @@ impl AssistantReplay {
         calls: &[ToolCall],
     ) -> Result<(), crate::content::ContentError> {
         self.validate()?;
+        if self.protocol == "openai.responses" {
+            return responses_replay::response(&self.blocks, text, calls);
+        }
         let original_text: String = self
             .blocks
             .iter()
@@ -289,11 +300,13 @@ impl AssistantReplay {
         Ok(())
     }
 
-    /// Validates the limited signed Messages replay contract. Images belong only in typed results.
+    /// Validates bounded protocol-specific replay. Images belong only in typed results.
     pub fn validate(&self) -> Result<(), crate::content::ContentError> {
         use crate::content::{ContentError, RECORD_BYTES_MAX, serialized_size};
-        if self.protocol != "anthropic.messages"
-            || self.prefix_digest.len() != 64
+        if !matches!(
+            self.protocol.as_str(),
+            "anthropic.messages" | "openai.responses"
+        ) || self.prefix_digest.len() != 64
             || !self
                 .prefix_digest
                 .bytes()
@@ -303,11 +316,35 @@ impl AssistantReplay {
         {
             return Err(ContentError::new("invalid assistant replay envelope"));
         }
-        for block in &self.blocks {
-            validate_replay_block(block)?;
-        }
         serialized_size(self, RECORD_BYTES_MAX)?;
+        if let Some(context) = &self.context_receipt {
+            if self.protocol != "openai.responses" {
+                return Err(ContentError::new(
+                    "context receipt on another replay protocol",
+                ));
+            }
+            context.validate()?;
+        }
+        for block in &self.blocks {
+            Self::validate_item(&self.protocol, block)?;
+        }
+        if self.protocol == "openai.responses" {
+            responses_replay::identities(&self.blocks)?;
+        }
         Ok(())
+    }
+
+    /// Checks a borrowed original item before an adapter copies it into retained replay.
+    /// Ciphertext is opaque; this checks shape and bounds, not cryptographic validity.
+    pub fn validate_item(protocol: &str, item: &Value) -> Result<(), crate::content::ContentError> {
+        crate::content::serialized_size(item, crate::content::RECORD_BYTES_MAX)?;
+        match protocol {
+            "anthropic.messages" => validate_replay_block(item),
+            "openai.responses" => responses_replay::item(item),
+            _ => Err(crate::content::ContentError::new(
+                "unsupported replay protocol",
+            )),
+        }
     }
 }
 
@@ -403,12 +440,15 @@ impl<'de> Deserialize<'de> for AssistantReplay {
         struct Wire {
             protocol: String,
             prefix_digest: String,
+            #[serde(default)]
+            context_receipt: Option<Box<ReplayContext>>,
             blocks: Vec<Value>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let replay = Self {
             protocol: wire.protocol,
             prefix_digest: wire.prefix_digest,
+            context_receipt: wire.context_receipt,
             blocks: wire.blocks,
         };
         replay.validate().map_err(de::Error::custom)?;
@@ -573,8 +613,17 @@ impl Message {
         match self {
             Self::System { text } | Self::User { text } => text.is_empty(),
             Self::Assistant {
-                text, tool_calls, ..
-            } => text.as_ref().is_none_or(String::is_empty) && tool_calls.is_empty(),
+                text,
+                tool_calls,
+                replay,
+                ..
+            } => {
+                text.as_ref().is_none_or(String::is_empty)
+                    && tool_calls.is_empty()
+                    && replay
+                        .as_ref()
+                        .is_none_or(|replay| replay.protocol != "openai.responses")
+            }
             Self::Tool { content, .. } => content.is_empty(),
         }
     }

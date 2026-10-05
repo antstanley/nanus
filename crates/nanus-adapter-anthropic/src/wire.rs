@@ -696,6 +696,7 @@ impl StreamAccumulator {
             let replay = nanus_domain::message::AssistantReplay {
                 protocol: "anthropic.messages".into(),
                 prefix_digest: self.prefix_digest.clone(),
+                context_receipt: None,
                 blocks,
             };
             if let Some(limits) = self.limits

@@ -5,6 +5,10 @@ use nanus_ports::{LlmEvent, LlmResult, ResponseFrames, ResponseLimits};
 
 const BODY_SNIPPET_MAX: usize = 2_000;
 
+#[cfg(test)]
+#[path = "response_replay_tests.rs"]
+mod replay_tests;
+
 /// Decodes an HTTP body with the caller-selected policy.
 pub fn decode(
     response: reqwest::Response,
