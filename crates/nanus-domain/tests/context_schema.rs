@@ -116,7 +116,6 @@ fn attempt() -> RequestAttemptRecord {
 }
 
 fn samples() -> Vec<(&'static str, Value)> {
-    let to = |value: Value| value;
     vec![
         (
             "ContextPolicy",
@@ -209,6 +208,16 @@ fn samples() -> Vec<(&'static str, Value)> {
             })
             .unwrap(),
         ),
+    ]
+    .into_iter()
+    .chain(results())
+    .collect()
+}
+
+/// Samples of the tool and status payloads.
+fn results() -> Vec<(&'static str, Value)> {
+    let to = |value: Value| value;
+    vec![
         ("ContextStatus", serde_json::to_value(status()).unwrap()),
         (
             "FragmentDescriptor",
