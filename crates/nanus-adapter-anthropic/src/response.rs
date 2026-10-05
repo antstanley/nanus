@@ -9,7 +9,7 @@ const BODY_SNIPPET_MAX: usize = 2_000;
 pub fn decode(
     response: reqwest::Response,
     host: String,
-    prefix_digest: String,
+    mut accumulator: wire::StreamAccumulator,
     limits: Option<ResponseLimits>,
 ) -> EventStream {
     let status = response.status();
@@ -22,7 +22,6 @@ pub fn decode(
         });
         return Box::pin(stream);
     }
-    let mut accumulator = wire::StreamAccumulator::with_prefix(prefix_digest);
     accumulator.set_response_limits(limits);
     let mut bytes = Some(response.bytes_stream());
     let mut decoder = ResponseFrames::new(limits);

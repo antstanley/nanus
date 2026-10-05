@@ -35,6 +35,17 @@ use crate::config::AnthropicConfig;
 /// Builds the JSON body for a message request.
 #[must_use]
 pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
+    build_counted(config, request).0
+}
+
+/// Builds the JSON body, and counts the assistant turns it had no way to say.
+///
+/// A turn that carries only signed or opaque replay — no text, no calls — is sent as its
+/// original blocks when they are admitted for this exact prefix, and otherwise skipped, because
+/// it has no neutral form. The ordinary path accepts the skip; a managed preparation refuses it,
+/// because a message the projection kept must not vanish from the request.
+#[must_use]
+pub fn build_counted(config: &AnthropicConfig, request: &ChatRequest) -> (Value, usize) {
     // Precondition: a request without messages is meaningless, so it is asserted
     // here rather than sent and rejected upstream.
     assert!(
@@ -73,7 +84,7 @@ pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
         encode_tools(&request.tools)
     };
     let system = body.get("system").cloned().unwrap_or(Value::Null);
-    let messages = encode_messages_with_prefix(&request.messages, &system, &tools);
+    let (messages, skipped) = encode_messages_with_prefix(&request.messages, &system, &tools);
     // Postcondition: a conversation is required. A request carrying only a system
     // prompt has nothing to answer, and the API refuses it.
     assert!(
@@ -95,7 +106,7 @@ pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
     if !request.tools.is_empty() {
         body.insert("tools".to_owned(), encode_tools(&request.tools));
     }
-    Value::Object(body)
+    (Value::Object(body), skipped)
 }
 
 /// Lifts the system instructions out of the conversation.
@@ -150,8 +161,13 @@ fn encode_content(blocks: &[nanus_domain::ContentBlock]) -> Value {
     }).collect())
 }
 
-fn encode_messages_with_prefix(messages: &[Message], system: &Value, tools: &Value) -> Value {
+fn encode_messages_with_prefix(
+    messages: &[Message],
+    system: &Value,
+    tools: &Value,
+) -> (Value, usize) {
     let mut turns: Vec<Value> = Vec::new();
+    let mut skipped = 0_usize;
     // Tool results are gathered so that a step's several results become one user
     // turn rather than several; the API pairs them with the assistant turn that
     // asked, and one turn is the shape its own documentation uses.
@@ -204,8 +220,10 @@ fn encode_messages_with_prefix(messages: &[Message], system: &Value, tools: &Val
                     turns.push(json!({ "role": "assistant", "content": replay.blocks }));
                     continue;
                 }
-                // Another protocol's opaque turn: nothing in it can be said here.
+                // Another protocol's opaque turn, or signed blocks whose prefix changed: nothing
+                // in it can be said here.
                 if message.is_replay_only() {
+                    skipped = skipped.saturating_add(1);
                     continue;
                 }
                 let mut blocks: Vec<Value> = Vec::new();
@@ -242,7 +260,7 @@ fn encode_messages_with_prefix(messages: &[Message], system: &Value, tools: &Val
         }
     }
     flush_results(&mut turns, &mut results);
-    Value::Array(turns)
+    (Value::Array(turns), skipped)
 }
 
 /// Emits any gathered tool results as one user turn.
@@ -294,6 +312,22 @@ pub struct StreamAccumulator {
     replay_blocks: std::collections::BTreeMap<u32, Value>,
     replay_arguments: std::collections::BTreeMap<u32, String>,
     replay_bytes: usize,
+    /// Raw per-tool argument limits; empty on the ordinary path, so nothing below changes there.
+    argument_limits: nanus_ports::ToolArgumentLimits,
+    /// Tool-use blocks opened so far, by block index; kept only under argument limits.
+    opened: std::collections::BTreeSet<u32>,
+    /// Limited calls whose arguments are held until their block stops.
+    limited: std::collections::BTreeMap<u32, LimitedCall>,
+    /// Whether an oversized call left this response with no admissible signed replay.
+    replay_void: bool,
+}
+
+/// One limited call's arguments, held back from the stream until its block stops.
+#[derive(Debug)]
+struct LimitedCall {
+    limit: usize,
+    raw: String,
+    oversized: bool,
 }
 
 impl StreamAccumulator {
@@ -308,6 +342,17 @@ impl StreamAccumulator {
             prefix_digest,
             ..Self::default()
         }
+    }
+
+    /// Installs the raw argument limits a managed call is decoded under.
+    ///
+    /// A limited call's argument fragments are held rather than streamed, and released whole
+    /// when its block stops — or as [`nanus_ports::OVERSIZED_ARGUMENTS`] once they pass the
+    /// limit, so the oversized text never reaches a JSON parser here or in the loop.
+    #[must_use]
+    pub fn with_argument_limits(mut self, limits: nanus_ports::ToolArgumentLimits) -> Self {
+        self.argument_limits = limits;
+        self
     }
 
     /// Takes the next ready event, if any.
@@ -377,6 +422,12 @@ impl StreamAccumulator {
             self.fail(error.to_string());
             return;
         }
+        if !self.argument_limits.is_empty() {
+            self.limit_frame(frame);
+            if self.closed {
+                return;
+            }
+        }
         self.observe_replay(frame);
         if self.closed {
             return;
@@ -386,6 +437,7 @@ impl StreamAccumulator {
             Some("content_block_start") => self.observe_block_start(frame),
             Some("content_block_delta") => self.observe_block_delta(frame),
             Some("message_delta") => self.observe_message_delta(frame),
+            Some("content_block_stop") => self.release_limited(block_index(frame)),
             Some("message_stop") => self.close(),
             Some("error") => {
                 let message = frame
@@ -537,6 +589,9 @@ impl StreamAccumulator {
             self.fail("assistant replay exceeds record byte limit".into());
             return;
         }
+        if field == "partial_json" && self.is_oversized(index) {
+            return;
+        }
         if field == "partial_json" {
             self.replay_arguments
                 .entry(index)
@@ -550,6 +605,83 @@ impl StreamAccumulator {
                 _ => block[field] = Value::String(fragment.to_owned()),
             }
         }
+    }
+
+    /// Applies the managed argument limits to one frame, before any replay or event sees it.
+    ///
+    /// A call's name arrives with its block's opening, so the limit is known before the first
+    /// fragment. A fragment for a block that was never opened as a tool call is a protocol
+    /// violation: it is what a late name would look like, and accepting it would let arguments
+    /// accumulate with no limit to judge them by.
+    fn limit_frame(&mut self, frame: &Value) {
+        let index = block_index(frame);
+        match frame.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let Some(block) = frame
+                    .get("content_block")
+                    .filter(|block| block["type"] == "tool_use")
+                else {
+                    return;
+                };
+                self.opened.insert(index);
+                let limit = block["name"]
+                    .as_str()
+                    .and_then(|name| self.argument_limits.limit_for(name));
+                if let Some(limit) = limit {
+                    self.limited.insert(
+                        index,
+                        LimitedCall {
+                            limit,
+                            raw: String::new(),
+                            oversized: false,
+                        },
+                    );
+                }
+            }
+            Some("content_block_delta") if frame["delta"]["type"] == "input_json_delta" => {
+                if !self.opened.contains(&index) {
+                    self.fail("malformed stream: tool arguments arrived before their call".into());
+                    return;
+                }
+                let fragment = frame["delta"]["partial_json"].as_str().unwrap_or_default();
+                let Some(call) = self.limited.get_mut(&index) else {
+                    return;
+                };
+                if call.oversized {
+                    return;
+                }
+                call.raw.push_str(fragment);
+                if call.raw.len() > call.limit {
+                    call.oversized = true;
+                    call.raw = String::new();
+                    self.replay_arguments.remove(&index);
+                    self.replay_void = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the limited call at `index` has passed its limit.
+    fn is_oversized(&self, index: u32) -> bool {
+        self.limited.get(&index).is_some_and(|call| call.oversized)
+    }
+
+    /// Releases a held call's arguments as one fragment, or the oversized marker.
+    fn release_limited(&mut self, index: u32) {
+        let Some(call) = self.limited.remove(&index) else {
+            return;
+        };
+        self.ready.push(LlmEvent::ToolCallDelta {
+            index,
+            id: None,
+            name: None,
+            arguments_delta: if call.oversized {
+                nanus_ports::OVERSIZED_ARGUMENTS.to_owned()
+            } else {
+                call.raw
+            },
+        });
     }
 
     /// Reads the prompt accounting, which arrives once with the message head.
@@ -649,7 +781,11 @@ impl StreamAccumulator {
                 }
             }
             Some("input_json_delta") => {
-                // A fragment of a tool call's arguments, joined by the assembler.
+                // A fragment of a tool call's arguments, joined by the assembler. A limited
+                // call's fragments are held and released whole when its block stops.
+                if self.limited.contains_key(&index) {
+                    return;
+                }
                 if let Some(fragment) = delta.get("partial_json").and_then(Value::as_str) {
                     self.ready.push(LlmEvent::ToolCallDelta {
                         index,
@@ -682,16 +818,26 @@ impl StreamAccumulator {
         if self.closed {
             return;
         }
+        // A limited call whose block never stopped is released before the terminal events, so
+        // a truncated stream still reports it rather than leaving its arguments behind.
+        let held: Vec<u32> = self.limited.keys().copied().collect();
+        for index in held {
+            self.release_limited(index);
+        }
         self.closed = true;
         let blocks: Vec<_> = core::mem::take(&mut self.replay_blocks)
             .into_values()
             .collect();
-        if blocks.iter().any(|block| {
-            matches!(
-                block["type"].as_str(),
-                Some("thinking" | "redacted_thinking")
-            )
-        }) {
+        // An oversized call's input is not an object, so no signed replay can carry it: the
+        // response is recorded neutrally, which is the documented path for unsigned history.
+        if !self.replay_void
+            && blocks.iter().any(|block| {
+                matches!(
+                    block["type"].as_str(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        {
             if blocks.iter().any(|block| {
                 block["type"] == "thinking" && block["signature"].as_str().is_none_or(str::is_empty)
             }) {

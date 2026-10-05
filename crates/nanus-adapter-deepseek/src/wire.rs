@@ -238,6 +238,8 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+    /// Whether the arguments passed their tool's managed limit and were dropped unparsed.
+    oversized: bool,
 }
 
 /// Accumulates decoded frames into the events the agent loop consumes.
@@ -248,6 +250,8 @@ struct PartialToolCall {
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
     limits: Option<nanus_ports::ResponseLimits>,
+    /// Raw per-tool argument limits; empty on the ordinary path, so nothing changes there.
+    argument_limits: nanus_ports::ToolArgumentLimits,
     ready: Vec<LlmEvent>,
     calls: Vec<PartialToolCall>,
     usage: Option<Usage>,
@@ -259,6 +263,15 @@ impl StreamAccumulator {
     /// Installs immutable caller budgets before observing any frame.
     pub fn set_response_limits(&mut self, limits: Option<nanus_ports::ResponseLimits>) {
         self.limits = limits;
+    }
+
+    /// Installs the raw argument limits a managed call is decoded under.
+    ///
+    /// A call whose final name has a limit and whose buffered arguments pass it is reported
+    /// with [`nanus_ports::OVERSIZED_ARGUMENTS`] instead of its arguments, so the oversized
+    /// text never reaches a JSON parser.
+    pub fn set_argument_limits(&mut self, limits: nanus_ports::ToolArgumentLimits) {
+        self.argument_limits = limits;
     }
 
     /// Takes the next ready event, if any.
@@ -392,8 +405,20 @@ impl StreamAccumulator {
         if let Some(name) = non_empty_str(function, "name") {
             name.clone_into(&mut slot.name);
         }
-        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+        if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
+            && !slot.oversized
+        {
             slot.arguments.push_str(arguments);
+        }
+        // Judged whenever the name is known, so a name that arrives after its arguments is
+        // checked against everything already buffered; and the buffer is released at once.
+        if self
+            .argument_limits
+            .limit_for(&slot.name)
+            .is_some_and(|limit| slot.arguments.len() > limit)
+        {
+            slot.oversized = true;
+            slot.arguments = String::new();
         }
     }
 
@@ -468,7 +493,11 @@ impl StreamAccumulator {
                 index,
                 id: Some(nanus_domain::ToolCallId::new(call.id)),
                 name: Some(name),
-                arguments_delta: call.arguments,
+                arguments_delta: if call.oversized {
+                    nanus_ports::OVERSIZED_ARGUMENTS.to_owned()
+                } else {
+                    call.arguments
+                },
             });
         }
         if let Some(usage) = self.usage.take() {
