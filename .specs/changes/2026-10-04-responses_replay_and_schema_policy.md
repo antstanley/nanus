@@ -328,6 +328,82 @@ feature or of local cryptographic validation. Exact-model live acceptance remain
    runtime-free/minimal embedding gates remain green. Native Windows and exact-model live
    follow-ups remain explicit acceptance; fixture success cannot promote them.
 
+### Host integration findings and additional acceptance — 5 October 2026
+
+The isolated Hype consumer of sealed Nanus
+`eeba343848e614c7cd74dbb19c35062f5c87aff4` now constructs explicit non-strict stateless
+Responses and proves actual decoder → app worker → completed checkpoint → same-prompt resume
+with original reasoning/message items. These fictional streams establish local continuity only.
+Production app startup remains unavailable before credential access. Native tool effects and
+changing trusted instructions are additional requirements, not consequences of adapter admission.
+
+1. **Trusted instruction revisions.** A host's ordinary prompt may legitimately change between
+   completed turns. Hype reproduces rejection after publishing a brief that selects its music
+   prompt module: `source_prefixes` compares old receipts against the current System message and
+   controls. Add an explicit host-owned revision mechanism that retains each historical instruction
+   version and validates each original receipt against the version actually dispatched. Keep the
+   current instructions in the new request. Version the durable evidence as needed; reject missing,
+   crossed, reordered or model-invented revision evidence. Changes to prior user/tool/assistant
+   records, model/effort/endpoint/schema/strictness controls still refuse. Do not recompute stored
+   receipts over altered history, freeze old instructions, silently start a fresh session or discard
+   history. Nanus receives ordinary text and opaque host revision identity, never brief/skill/plugin
+   concepts. The exact versioned representation must be reviewed before implementation; the existing
+   `ReplayContext` schema above is unchanged until that representation is specified and implemented.
+2. **Pure prospective estimates.** Return checked complete costs for valid bounded prospective
+   candidates even when the cost exceeds the selected request budget. Such estimates convey no
+   permission or dispatch receipt. Actual preparation/transport still rejects oversized requests.
+   Preserve original-source and complete final-batch substitution checks. Hype's native image batch
+   currently reaches the real estimator but its worst bounded failure alternative does not fit:
+   39,524 estimated input tokens before the alternative plus the 8,192-token output reservation
+   leaves insufficient room for the complete escaped failure. Separating measurement from dispatch
+   is necessary for consistent caller budgeting, but alone does not make this batch fit. Require
+   consumer evidence of a sound complete envelope and actual image/text tool execution under its
+   original limits; no lowered result allowance or silent context-budget increase counts as a fix.
+   Also repair and test Responses image accounting: the sealed shared estimator subtracts encoded
+   pixels only under `messages`, while Responses uses `input`/`input_image`. Its current request
+   cost therefore includes base64 as text in addition to the visual profile. A consumer envelope
+   that adds only visual-token growth and wire-byte growth cannot assume that subtraction occurred.
+   Require actual varied-size PNG/JPEG payloads to prove complete estimated token/wire growth, and
+   preserve full cost for lookalike image fields inside tool arguments or schemas.
+3. **Real multimodal input.** The current analysis composer uses a synthetic assistant function call
+   and tool result to carry images. Strict Responses correctly refuses that unobserved assistant
+   replay. Add a bounded generic multimodal request-message seam, with exact provider encoding,
+   image/record/request estimation and history/persistence semantics, before admitting this route.
+   Never manufacture provider output items or replay receipts. This does not move video workflows,
+   dependency installation, skill discovery or plugin behavior into Nanus.
+
+Required regressions include unchanged-prompt continuation, an authorized instruction revision
+through completed-history reload and whole-turn fitting, every adjacent unauthorized mutation,
+complete prospective cost beyond the budget with refused dispatch, native consumer tool execution,
+and actual multimodal input with rejected oversized/unsupported images. Malformed/truncated
+Responses streams must execute no pending calls. Immutable publication/adoption and original live,
+Windows and packaged acceptance remain separate gates.
+
+**Scoped semi-formal review.** Premises: caller prompts may change, historical provider items stay
+original, and capacity must be admitted before effects. Resolution: app `turns::snapshot` selects
+ordinary prompt modules; Nanus `responses/request.rs::controls` and `source_prefixes` bind current
+instructions to every old receipt; `prepare_mode` invokes `validate_estimate` even for prospective
+measurement. Trace: completed original response → new music prompt → refusal before HTTP; original
+image/text calls → worst failure cost → refusal before tool-action audit. Same-prompt completed
+replay succeeds. Verdict: **PARTIAL** integration; the guard prevents premature readiness, while
+these three generic seams and their consumer proofs remain implementation work. No protocol/source
+checks are relaxed, and no additional public boundary is claimed implemented by this prose.
+
+### Local cost correction — 5 October 2026
+
+A child of the sealed reconciliation candidate corrects Responses image accounting and prospective
+measurement. The shared estimator subtracts inline `input_image` payload strings only from actual
+Responses user-message content, while preserving full wire bytes and visual-profile charges.
+Image-shaped schemas/calls/text remain charged. The actual original-item preparer and PNG/JPEG
+fixtures verify the formula. Pure estimates can report an over-budget valid candidate; actual
+preparation/transport still require the unchanged fit check. Source/control/replay and complete
+final-batch substitution validation remain mandatory. No public boundary type changes.
+
+All fourteen scoped gates pass with 251 frozen inputs unchanged; see the
+[cost certificate](2026-10-04-responses_replay_and_schema_policy.review.md#responses-image-cost-and-prospective-measurement-certificate--5-october-2026).
+This fixes generic measurement only. Trusted prompt revisions, consumer native result capacity,
+genuine multimodal analysis input, immutable adoption and original acceptance remain required.
+
 ## Assumptions / Decisions / Open questions
 
 **Assumptions:** the published immutable baseline above is authoritative, independently of
@@ -337,6 +413,8 @@ an owner's dirty checkout or earlier local prepared branches.
 Preserve stock omitted strictness and text paths until callers opt in. Keep generic persistence
 and ordering in the minimal harness; hosts retain their own source/key/payment/setup authority.
 
-**Open questions:** complete request-prefix evidence and whole-turn fitting admission before
-enabling the prepared decoder in the public API adapter; exact-model live acceptance has not
-been run. The supported item-schema evidence is pinned above.
+**Open questions:** review the durable representation for trusted instruction revisions and generic
+multimodal request input; implement pure prospective cost measurement and prove the consumer
+workflow under its unchanged capacity contract. Original-prefix/fitting and opt-in transport are
+locally implemented in the sealed candidate above, but immutable adoption and exact-model live
+acceptance remain unrun. The supported item-schema evidence is pinned above.

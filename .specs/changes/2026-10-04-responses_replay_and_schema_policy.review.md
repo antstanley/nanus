@@ -377,3 +377,47 @@ definitions while adding original-record admission. Actual stock and hosted HTTP
 reload/fitting fixtures pass. It fixes cross-turn cancellation answers and defers runner-side
 Responses argument parsing until after host record admission. Neither the sealed parent nor
 production Hype pins are rewritten. Publication/adoption and original acceptance remain open.
+
+## Responses image-cost and prospective-measurement certificate — 5 October 2026
+
+**Premises.** The consumer needs exact assembled wire bytes and conservative input charges,
+with encoded images replaced by profile costs. Pure estimation must expose an oversized valid
+candidate's complete cost; only actual preparation/transport grants dispatch admission. Source,
+replay, function policy, output reservation and complete final-batch projection remain unchanged.
+
+**Resolution.** `capabilities::estimate_payload` calls `encoded_image_bytes`, now also traversing
+Responses user message `input` content. `responses_image_bytes` accepts only the emitted inline
+`input_image` position; function items, assistant messages, arbitrary schemas and JSON inside text
+retain their complete byte charge. The same `visual_cost` still validates/counts retained pixels.
+`responses::request::prepare_mode` always validates shape, source history, original receipts and
+final-batch projection. It skips only the final `validate_estimate` for the private prospective
+branch; the public estimator returns a cost, never `PreparedResponses`. Preparation and actual
+transport retain the fit check.
+
+**Traces.** Actual valid PNG/JPEG -> exact body -> wire-byte charge including base64 -> input
+charge excluding encoded image strings plus the same visual profile. Different compressible/noisy
+files with identical dimensions change wire bytes but not visual input charges. Image-shaped fields
+in tools, calls, call outputs, assistant messages and text retain all growth. Original completed
+Responses items and paired pixel results pass the actual encoder/preparer. An oversized final
+result produces a conservative estimate; strict preparation and stream dispatch still refuse.
+
+**Regression and edges.** The image regression failed on the parent (684 versus 222 tokens for
+its smallest fixture); the prospective regression failed because measurement prematurely applied
+context admission. Both pass after the fix. Original-source substitutions outside the last complete
+batch and incompatible replay/controls remain rejected by the existing suite. The first broad pass
+found test-only unnecessary qualifications and clones; these were corrected without suppressions.
+The first sandboxed focused run could not bind twelve loopback listeners; the authorized fixture
+rerun passed without any real credential or provider endpoint.
+
+**Verdict: CORRECT for the scoped cost/measurement correction; integration remains PARTIAL.**
+The actual Hype native result envelope, trusted prompt revisions and real multimodal analysis
+input remain separate consumer work. No app budget/result bound is changed, no effect authority
+is inferred from a number, and no live provider or native Windows execution is established.
+
+**Verification.** All 14 scoped gates pass, with 251 runtime/config/test inputs unchanged:
+affected domain/ports/provider/store tests, minimal runner, all-feature admission/embedding,
+minimal/downstream/runtime-free TUI lint and tests, doctests, formatting and Windows-target minimal
+library lint. Exact per-suite counts are in `/private/tmp/nanus-responses-cost/verification.json`;
+logs and the two red regressions are retained beside it. The suites overlap. Forty-eight functions
+in the changed files are within 70 lines (maximum 59). Credential-aware stock runtime tests and
+paid acceptance remain unrun. This candidate is unpublished and does not change the public pin.

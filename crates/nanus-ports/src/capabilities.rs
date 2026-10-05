@@ -280,7 +280,7 @@ fn visual_cost(messages: &[Message], profile: Option<ImageProfile>) -> LlmResult
 // Inspect only message content arrays, never arbitrary tool arguments or schemas. A
 // JSON argument that happens to say `type=image` still costs its full serialized bytes.
 fn encoded_image_bytes(payload: &serde_json::Value) -> LlmResult<usize> {
-    let mut total = 0_usize;
+    let mut total = responses_image_bytes(payload)?;
     if let Some(messages) = payload["messages"].as_array() {
         for message in messages {
             for key in ["content", "content_blocks"] {
@@ -290,6 +290,44 @@ fn encoded_image_bytes(payload: &serde_json::Value) -> LlmResult<usize> {
                         .ok_or_else(|| invalid("encoded image estimate overflow"))?;
                 }
             }
+        }
+    }
+    Ok(total)
+}
+
+// Responses attachments are user input items, not Chat messages. Restrict traversal to that
+// exact wire position: tools, function items and text containing image-shaped JSON are text.
+fn responses_image_bytes(payload: &serde_json::Value) -> LlmResult<usize> {
+    let Some(items) = payload["input"].as_array() else {
+        return Ok(0);
+    };
+    let mut total = 0_usize;
+    for item in items {
+        if item["role"] != "user" || item.get("type").is_some_and(|kind| kind != "message") {
+            continue;
+        }
+        let Some(blocks) = item["content"].as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if block["type"] != "input_image" {
+                continue;
+            }
+            let Some(url) = block["image_url"].as_str() else {
+                continue;
+            };
+            // The actual encoders validate media and emit inline images. Non-inline references
+            // receive no discount from this local counting helper.
+            if !url.starts_with("data:image/") || !url.contains(";base64,") {
+                continue;
+            }
+            let bytes = nanus_domain::content::serialized_size(&block["image_url"], usize::MAX)
+                .map_err(|error| invalid(error.to_string()))?
+                .checked_sub(2)
+                .ok_or_else(|| invalid("encoded image string has no quotes"))?;
+            total = total
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("encoded image estimate overflow"))?;
         }
     }
     Ok(total)
@@ -340,13 +378,17 @@ pub fn validate_estimate(
 }
 
 #[cfg(test)]
+#[path = "capabilities_responses_tests.rs"]
+mod responses_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine as _;
     use nanus_domain::{ContentBlock, ToolCallId};
     use serde_json::json;
 
-    fn caps(profile: ImageProfile) -> ModelCapabilities {
+    pub(super) fn caps(profile: ImageProfile) -> ModelCapabilities {
         ModelCapabilities {
             image_input: ImageInputSupport::Supported,
             image_profile: Some(profile),
@@ -368,7 +410,11 @@ mod tests {
         }
     }
 
-    fn request(profile: ImageProfile, block: &ContentBlock, count: usize) -> ChatRequest {
+    pub(super) fn request(
+        profile: ImageProfile,
+        block: &ContentBlock,
+        count: usize,
+    ) -> ChatRequest {
         let mut messages = vec![Message::user("inspect")];
         for index in 0..count {
             messages.push(Message::Tool {

@@ -88,7 +88,11 @@ fn prepare_mode(
     };
     let prefix_digest = binding(&controls, &context_receipt)?;
     let estimate = nanus_ports::capabilities::estimate_payload(caps, request, &body)?;
-    nanus_ports::capabilities::validate_estimate(caps, request, estimate)?;
+    // Pure measurement must return the complete cost so callers can reserve or refuse it.
+    // It grants no receipt to the caller; actual preparation/dispatch still requires a fit.
+    if !prospective {
+        nanus_ports::capabilities::validate_estimate(caps, request, estimate)?;
+    }
     Ok((
         PreparedResponses {
             body,

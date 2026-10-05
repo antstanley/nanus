@@ -10,6 +10,9 @@ use nanus_ports::{ChatRequest, LlmEvent, ReasoningEffort, ResponseLimits};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+#[path = "responses_request/cost.rs"]
+mod cost;
+
 fn config() -> OpenAiConfig {
     let mut config = OpenAiConfig::new(Vendor::OpenAi, "gpt-6-astra", "fictional-key");
     config
@@ -356,4 +359,28 @@ fn opt_in_requires_explicit_public_endpoint_limits_and_preserves_default() {
         }
         assert!(OpenAiLlm::new(changed).is_err());
     }
+}
+
+#[test]
+fn oversized_prospective_cost_is_measured_but_never_admitted_for_dispatch() {
+    let mut config = config();
+    config.set_stateless_responses(true);
+    let adapter = OpenAiLlm::new(config).unwrap();
+    let mut candidate = continuation(&adapter);
+    candidate.source_history = Some(candidate.messages.clone().into());
+    candidate.messages[3] = Message::tool(ToolCallId::new("call_1"), "\0".repeat(12_000), false);
+    let measured = adapter.estimate_request(&candidate).unwrap();
+    assert!(measured.input_tokens > 64_000);
+    assert!(!measured.fits(adapter.capabilities(&candidate.model), &candidate));
+    assert!(adapter.prepare_responses(&candidate).is_err());
+    candidate.source_history = None;
+    assert_eq!(adapter.estimate_request(&candidate).unwrap(), measured);
+    assert!(adapter.prepare_responses(&candidate).is_err());
+    assert!(matches!(
+        futures::executor::block_on(async {
+            use futures::StreamExt as _;
+            adapter.stream_chat(candidate).next().await
+        }),
+        Some(LlmEvent::Error(_))
+    ));
 }

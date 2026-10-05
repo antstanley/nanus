@@ -1,5 +1,17 @@
 # Testing and verification
 
+## Responses image costs and pure measurement — 2026-10-05
+
+The local correction passes fourteen scoped gates and retains all 251 frozen runtime inputs.
+Two regressions fail on the parent and pass with the fix: Responses image payloads no longer count
+as text as well as pixels, and a valid oversized prospective result can be measured without being
+admitted for dispatch. Real original-item PNG/JPEG request preparation and image-like metadata
+negative cases are included. The
+[cost certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#responses-image-cost-and-prospective-measurement-certificate--5-october-2026)
+records suite counts, fixed lint findings and limitations. Windows evidence is cross-compilation;
+stock credential-aware and paid/live acceptance remain unrun. Host prompt revision and complete
+native workflow adoption are not implied by this local fix.
+
 ## Original record admission reconciled with Responses — 2026-10-05
 
 The combined local candidate passes all 14 scoped gates: 539 affected domain/ports/provider/
