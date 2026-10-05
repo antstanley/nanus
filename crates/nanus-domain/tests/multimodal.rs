@@ -60,7 +60,9 @@ fn version_two_retains_pixel_order_call_id_and_error_through_folding_and_reload(
     ];
     let original = session(Some(blocks.clone()));
     let raw = original.try_to_jsonl().unwrap();
-    assert!(raw.contains("\"version\":2"));
+    assert!(raw.contains("\"version\":3"));
+    let older = raw.replacen("\"version\":3", "\"version\":2", 1);
+    assert_eq!(Session::from_jsonl(&older).unwrap(), original);
     let loaded = Session::from_jsonl(&raw).unwrap();
     assert_eq!(loaded, original);
     let messages = loaded.derive_messages();
@@ -77,10 +79,10 @@ fn version_one_remains_legacy_text_and_cannot_smuggle_typed_results() {
     let legacy = session(None);
     let raw = legacy
         .to_jsonl()
-        .replacen("\"version\":2", "\"version\":1", 1);
+        .replacen("\"version\":3", "\"version\":1", 1);
     assert_eq!(Session::from_jsonl(&raw).unwrap(), legacy);
     let pixels = session(Some(vec![image("image/png")])).to_jsonl().replacen(
-        "\"version\":2",
+        "\"version\":3",
         "\"version\":1",
         1,
     );

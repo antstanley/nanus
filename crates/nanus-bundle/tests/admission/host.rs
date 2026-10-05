@@ -652,7 +652,7 @@ impl ToolAdmission for FullHistory {
             "ordinary whole-turn fitting still removes an old group"
         );
         assert!(projection.events.iter().any(|event| matches!(event,
-            SessionEvent::UserMessage { text } if text.len() > 100_000)));
+            SessionEvent::UserMessage { text, .. } if text.len() > 100_000)));
         assert!(projection.events.iter().all(|event| !matches!(event,
             SessionEvent::ToolResult { call_id, .. } if projection.calls.iter()
                 .any(|call| &call.id == call_id))));
@@ -687,6 +687,7 @@ async fn projection_keeps_full_history_and_the_separately_fitted_failure_base() 
     .with_tool_admission(Rc::new(FullHistory(plan.clone())));
     let mut session = session();
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: format!("old:{}", "a".repeat(128 * 1024)),
     });
     session.append(SessionEvent::AssistantMessage {

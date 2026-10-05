@@ -1,16 +1,15 @@
-//! The analysis route: one tools-free-in-effect request to a same-provider vision model.
+//! The analysis route: one tools-free request to a same-provider vision model.
 
 use std::time::Duration;
 
 use base64::Engine as _;
 use futures::StreamExt as _;
 use nanus_domain::content::ImageDimensions;
-use nanus_domain::{ContentBlock, Message, ToolCall, ToolCallId, ToolName, ToolSchema};
+use nanus_domain::{ContentBlock, Message};
 use nanus_ports::{
     ChatRequest, FinishReason, ImageInputSupport, ImageProfile, LlmEvent, LlmHandle,
     LocalBoxFuture, ReasoningEffort,
 };
-use serde_json::json;
 
 use crate::VideoError;
 use crate::media::{Analysis, AnalysisRequest, AnalysisUsage, Provenance, VideoAnalyzer, Window};
@@ -21,8 +20,6 @@ pub const ANSWER_BYTES_MAX: usize = 24 * 1024;
 pub const ANSWER_TOKENS: u32 = 2048;
 /// The longest the request may take from send to last token.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
-/// The name of the declaration that lets a provider accept an image-bearing tool result.
-const CARRIER: &str = "sample_frames";
 /// What admission allows per still beyond its pixels: the label and the wire's image framing,
 /// charged at a token a byte as the estimate charges text. Both are well under this.
 const STILL_TEXT_TOKENS: u64 = 256;
@@ -177,18 +174,18 @@ impl LlmAnalyzer {
         Ok(self)
     }
 
-    /// The synthetic transcript: a question, then a result carrying the labelled stills.
+    /// One human input carries the question and ordered, labelled sampled stills.
     fn request(&self, request: &AnalysisRequest) -> Result<ChatRequest, VideoError> {
-        let call_id = ToolCallId::new("video_frames");
-        let name =
-            ToolName::new(CARRIER).map_err(|error| VideoError::Analysis(error.to_string()))?;
-        let mut blocks = vec![ContentBlock::Text(format!(
-            "{} stills sampled from the source interval {}-{} ms, in time order. Each is \
+        let mut blocks = vec![
+            ContentBlock::Text(request.question.clone()),
+            ContentBlock::Text(format!(
+                "{} stills sampled from the source interval {}-{} ms, in time order. Each is \
              labelled with its source timestamp.",
-            request.frames.len(),
-            request.window.start_ms,
-            request.window.end_ms
-        ))];
+                request.frames.len(),
+                request.window.start_ms,
+                request.window.end_ms
+            )),
+        ];
         for (position, frame) in request.frames.iter().enumerate() {
             blocks.push(ContentBlock::Text(format!(
                 "frame {} at {} ms",
@@ -202,32 +199,13 @@ impl LlmAnalyzer {
         }
         nanus_domain::content::validate_blocks(&blocks)
             .map_err(|error| VideoError::Analysis(format!("read_video: {error}")))?;
-        let call = ToolCall::new(call_id.clone(), name.clone(), json!({}));
-        let messages = vec![
-            Message::system(SYSTEM),
-            Message::user(request.question.clone()),
-            Message::assistant(None, None, vec![call]),
-            Message::Tool {
-                call_id,
-                content: blocks
-                    .iter()
-                    .map(ContentBlock::render_text)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                content_blocks: Some(blocks),
-                is_error: false,
-            },
-        ];
-        // The declaration exists because providers require it beside an image-bearing result;
-        // the stream below treats any call to it as a failure, so it is a tool in name only.
-        let carrier = ToolSchema {
-            name,
-            description: "Carries sampled video frames; never call it.".to_owned(),
-            parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        };
-        let mut chat = ChatRequest::new(self.model.clone(), messages)
-            .with_tools(vec![carrier])
-            .with_max_tokens(self.request_tokens);
+        let user = Message::user_with_content(blocks)
+            .map_err(|error| VideoError::Analysis(format!("read_video: {error}")))?;
+        assert!(!user.is_empty());
+        assert!(user.content_blocks().is_some());
+        let messages = vec![Message::system(SYSTEM), user];
+        let mut chat =
+            ChatRequest::new(self.model.clone(), messages).with_max_tokens(self.request_tokens);
         if let Some(effort) = self.cheapest_effort() {
             chat = chat.with_reasoning_effort(effort);
         }

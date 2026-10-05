@@ -23,7 +23,7 @@ fn fitted(source: &[Message]) -> Vec<Message> {
     fit_with_source(source, 100, |messages| {
         if messages
             .iter()
-            .any(|message| matches!(message,Message::User { text } if text=="older question"))
+            .any(|message| matches!(message,Message::User { text, .. } if text=="older question"))
         {
             101
         } else {

@@ -215,6 +215,7 @@ fn the_fold_skips_empty_assistant_turns_and_keeps_tool_results() {
     session.append(SessionEvent::TurnStart { turn: 0 });
     session.append(SessionEvent::StepStart { turn: 0, step: 0 });
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "hello".to_owned(),
     });
     // Nothing a model can read: skipped.
@@ -272,6 +273,7 @@ fn populated_session() -> Session {
     session.append(SessionEvent::TurnStart { turn: 0 });
     session.append(SessionEvent::StepStart { turn: 0, step: 0 });
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "line one\nline \"two\"\ttabbed".to_owned(),
     });
     session.append(SessionEvent::AssistantMessage {
@@ -337,7 +339,7 @@ fn an_unsupported_version_is_rejected() {
         Session::from_jsonl(raw),
         Err(SessionError::UnsupportedVersion {
             found: 99,
-            expected: 2
+            expected: 3
         })
     ));
 }
@@ -637,7 +639,10 @@ fn event() -> impl Strategy<Value = SessionEvent> {
         (any::<u32>(), any::<u32>())
             .prop_map(|(turn, step)| SessionEvent::StepStart { turn, step }),
         (any::<u32>(), any::<u32>()).prop_map(|(turn, step)| SessionEvent::StepEnd { turn, step }),
-        text().prop_map(|text| SessionEvent::UserMessage { text }),
+        text().prop_map(|text| SessionEvent::UserMessage {
+            text,
+            content_blocks: None
+        }),
         (
             prop::option::of(text()),
             prop::option::of(text()),

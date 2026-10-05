@@ -148,24 +148,19 @@ fn exactly_the_sampled_jpegs_and_their_labels_are_sent_once() {
     let chat = &sent[0];
     assert_eq!(chat.model, "gpt-6-luna");
     assert_eq!(chat.max_tokens, Some(2048));
-    let names: Vec<_> = chat.tools.iter().map(|tool| tool.name.as_str()).collect();
-    assert_eq!(
-        names,
-        ["sample_frames"],
-        "only the carrier declaration, no other tool"
-    );
-    assert!(matches!(&chat.messages[1], Message::User { text } if text == "what changed?"));
-    let Some(Message::Tool {
+    assert!(chat.tools.is_empty());
+    assert_eq!(chat.messages.len(), 2);
+    let Some(Message::User {
         content_blocks: Some(blocks),
-        is_error: false,
         ..
     }) = chat.messages.last()
     else {
-        panic!(
-            "the last message is the frames result: {:?}",
-            chat.messages.last()
-        );
+        panic!("the final message must be typed human input");
     };
+    assert_eq!(
+        blocks.first(),
+        Some(&ContentBlock::Text("what changed?".into()))
+    );
     let sent_images: Vec<Vec<u8>> = blocks
         .iter()
         .filter_map(|block| match block {

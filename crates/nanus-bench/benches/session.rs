@@ -85,6 +85,7 @@ fn append<M: Metric>(c: &mut Criterion<M>) {
     let mut group = c.benchmark_group(M::group("session/append"));
     let event = nanus_domain::SessionEvent::UserMessage {
         text: fixtures::prose(200),
+        content_blocks: None,
     };
     for turns in TURNS {
         group.bench_with_input(BenchmarkId::from_parameter(turns), &turns, |b, &turns| {

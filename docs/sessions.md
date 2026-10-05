@@ -40,7 +40,7 @@ separate file beside the log, and that is deliberate:
 - **A name is content, never a path.** It lives inside the session's own directory under a
   fixed file name, so no name can climb out of the store.
 
-Writers now emit body version 2. Readers accept versions 1 and 2; old text logs keep their
+Writers now emit body version 3. Readers accept versions 1, 2 and 3; old text logs keep their
 sequence, usage and optional provenance without inferred pixels. Version 1 cannot introduce
 typed content or signed replay via extra fields. Version 2 stores ordered image blocks inline
 beside display summaries, so resuming does not need the original image file. Signed Messages
@@ -69,6 +69,12 @@ histories and missing/altered evidence refuse. Legacy default mode and its seria
 unchanged; opting in never manufactures snapshots for existing responses. Complete snapshots count
 against decoder/record/session limits. These consistency receipts authenticate no external file or
 ciphertext. Downstream consumer and live acceptance are separate from the local adapter tests.
+
+Direct user input retains the same ordered typed blocks as tool results. `Message::user_with_content`
+validates before deriving a display summary; provider adapters send the blocks themselves. Text-only
+constructors preserve their original JSON. Version 3 prevents older readers silently dropping user
+images; versions 1 and 2 refuse typed user fields even when null. No CLI or link image upload surface
+is introduced. Library hosts may compose direct multimodal requests and store typed user events.
 
 `try_to_jsonl` validates content and 4 MiB records/64 MiB total logs. The store uses it before
 atomic replacement and bounds reads before parsing, leaving the existing log intact on failed

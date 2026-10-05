@@ -7241,6 +7241,7 @@ mod tests {
         let recorded = SessionId::new("recorded");
         let mut saved = Session::new(recorded, 1, "/work");
         saved.append(nanus_domain::SessionEvent::UserMessage {
+            content_blocks: None,
             text: "hello".to_owned(),
         });
         block_on(store.save(&saved)).expect("save");
@@ -7292,6 +7293,7 @@ mod tests {
         let id = SessionId::new("live");
         let mut saved = Session::new(id.clone(), 1_700_000_000_000, "/work");
         saved.append(nanus_domain::SessionEvent::UserMessage {
+            content_blocks: None,
             text: "read the file".to_owned(),
         });
         block_on(store.save(&saved)).expect("save");

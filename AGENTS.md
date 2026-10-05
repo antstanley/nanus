@@ -363,8 +363,9 @@ design docs too.
 - **A name is an alias for a store key, and one session has one name.** Naming is
   refused rather than moved when the name is held, and the alias lives in the
   session's own directory (`name`), so it cannot be lost with a shared table.
-- **Bodies are version 2; readers accept 1 and 2.** Typed tool blocks and signed Messages
-  replay are bounded. Version 1 cannot smuggle these fields. Store saves use `try_to_jsonl`;
+- **Bodies are version 3; readers accept 1, 2 and 3.** Typed tool blocks and signed Messages
+  replay are bounded. Version 1 cannot smuggle these fields; versions 1/2 cannot smuggle typed user content.
+  Store saves use `try_to_jsonl`;
   failed saves must leave the original intact. Image capability defaults Unknown until exact
   profile wire/reload and live-follow-up evidence pass. Do not guess support from a model label.
 - **For OpenAI, Automatic routing follows the model.** `gpt-5.6` and later (read from the id's version) go

@@ -279,7 +279,7 @@ fn session_reload_retains_original_items_phase_function_ids_and_refuses_legacy_s
     assert!(
         matches!(&messages[0], Message::Assistant { replay:Some(original), .. } if original==&replay)
     );
-    let old = raw.replacen("\"version\":2", "\"version\":1", 1);
+    let old = raw.replacen("\"version\":3", "\"version\":1", 1);
     assert!(Session::from_jsonl(&old).is_err());
     let bad = raw.replace("original text", "changed text");
     assert!(Session::from_jsonl(&bad).is_ok()); // Both neutral and original text changed consistently.

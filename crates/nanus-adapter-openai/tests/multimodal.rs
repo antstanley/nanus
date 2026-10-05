@@ -14,6 +14,7 @@ const JPEG: &[u8] = include_bytes!("../../nanus-domain/tests/data/tiny-green-tri
 fn fixture(model: &str) -> Session {
     let mut session = Session::new(SessionId::new("wire-pixels"), 123, "/caller");
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "Inspect the fictional images".into(),
     });
     let calls: Vec<_> = ["first", "sibling", "last"]
@@ -275,4 +276,63 @@ async fn the_chatgpt_backend_supports_every_profiled_model_and_refuses_the_rest_
         if reason.contains("Unknown")),
         "{events:?}"
     );
+}
+
+fn direct_user_session() -> Session {
+    let mut session = Session::new(SessionId::new("human-pixels"), 123, "/fictional");
+    let mut blocks = vec![ContentBlock::Text("question".into())];
+    for (media, bytes) in [("image/png", PNG), ("image/jpeg", JPEG)] {
+        blocks.push(ContentBlock::Image {
+            media_type: media.into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        blocks.push(ContentBlock::Text(format!("after {media}")));
+    }
+    session.append(SessionEvent::UserMessage {
+        text: "DISPLAY SUMMARY ONLY".into(),
+        content_blocks: Some(blocks),
+    });
+    session
+}
+
+#[tokio::test]
+async fn direct_user_images_preserve_order_and_pixels_after_store_reload_without_invented_calls() {
+    for model in ["gpt-5", "gpt-6-astra"] {
+        let adapter =
+            nanus_adapter_openai::OpenAiLlm::new(nanus_adapter_openai::OpenAiConfig::new(
+                nanus_adapter_openai::Vendor::OpenAi,
+                model,
+                "fixture-key",
+            ))
+            .unwrap();
+        let original = direct_user_session();
+        for session in [original.clone(), reload(&original).await] {
+            let request = ChatRequest::new(model, session.derive_messages()).with_max_tokens(2048);
+            let body = adapter.encode(&request);
+            let content = if model == "gpt-5" {
+                assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+                &body["messages"][0]["content"]
+            } else {
+                assert_eq!(body["input"].as_array().unwrap().len(), 1);
+                &body["input"][0]["content"]
+            };
+            assert_eq!(content.as_array().unwrap().len(), 5);
+            assert_eq!(content[0]["text"], "question");
+            assert_eq!(content[2]["text"], "after image/png");
+            assert_eq!(content[4]["text"], "after image/jpeg");
+            for (index, media, bytes) in [(1, "image/png", PNG), (3, "image/jpeg", JPEG)] {
+                let url = if model == "gpt-5" {
+                    content[index]["image_url"]["url"].as_str().unwrap()
+                } else {
+                    content[index]["image_url"].as_str().unwrap()
+                };
+                let prefix = format!("data:{media};base64,");
+                assert_eq!(decoded(url.strip_prefix(&prefix).unwrap()), bytes);
+            }
+            assert!(request.tools.is_empty());
+            assert!(!body.to_string().contains("DISPLAY SUMMARY ONLY"));
+            assert!(!body.to_string().contains("function_call"));
+            assert!(!body.to_string().contains("tool_use_id"));
+        }
+    }
 }

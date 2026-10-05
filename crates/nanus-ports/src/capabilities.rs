@@ -51,12 +51,15 @@ impl ModelCapabilities {
     }
 }
 
-/// Whether any retained tool message contains pixels.
+/// Whether any retained user or tool message contains pixels.
 #[must_use]
 pub fn has_images(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
-        matches!(message, Message::Tool { content_blocks: Some(blocks), .. }
-        if blocks.iter().any(|block| matches!(block, ContentBlock::Image { .. })))
+        message.content_blocks().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. }))
+        })
     })
 }
 
@@ -87,17 +90,14 @@ fn validate_images(
     messages: &[Message],
     request_count: bool,
 ) -> LlmResult<()> {
-    if !has_images(messages) {
-        return Ok(());
-    }
-    let profile = capabilities.require_image_profile(model)?;
+    let profile = if has_images(messages) {
+        Some(capabilities.require_image_profile(model)?)
+    } else {
+        None
+    };
     let mut images = 0_usize;
     for message in messages {
-        if let Message::Tool {
-            content_blocks: Some(blocks),
-            ..
-        } = message
-        {
+        if let Some(blocks) = message.content_blocks() {
             nanus_domain::content::validate_blocks(blocks).map_err(|error| {
                 LlmError::Unsupported {
                     feature: error.to_string(),
@@ -109,6 +109,7 @@ fn validate_images(
                     data_base64,
                 } = block
                 {
+                    let profile = profile.ok_or_else(|| invalid("image profile missing"))?;
                     images = images.saturating_add(1);
                     if request_count && images > profile.max_request_images() {
                         return Err(LlmError::Unsupported {
@@ -239,11 +240,7 @@ fn visual_cost(messages: &[Message], profile: Option<ImageProfile>) -> LlmResult
     let mut images = 0_usize;
     let mut visual = 0_u32;
     for message in messages {
-        if let Message::Tool {
-            content_blocks: Some(blocks),
-            ..
-        } = message
-        {
+        if let Some(blocks) = message.content_blocks() {
             nanus_domain::content::validate_blocks(blocks).map_err(|e| invalid(e.to_string()))?;
             for block in blocks {
                 if let ContentBlock::Image {

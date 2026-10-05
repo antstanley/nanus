@@ -17,6 +17,7 @@ fn session(id: &str, created_at_ms: u64, messages: &[&str]) -> Session {
     session.append(SessionEvent::TurnStart { turn: 0 });
     for text in messages {
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: (*text).to_owned(),
         });
     }
@@ -176,7 +177,7 @@ async fn a_newer_header_version_is_refused_outright() {
     store.save(&written).await.expect("save");
     let body = written
         .to_jsonl()
-        .replacen("\"version\":2", "\"version\":99", 1);
+        .replacen("\"version\":3", "\"version\":99", 1);
     assert!(body.contains("\"version\":99"), "the header was rewritten");
     overwrite_log(&store, written.id(), &body);
     let error = store.load(written.id()).await.expect_err("must fail");
@@ -973,6 +974,7 @@ async fn rejected_content_never_replaces_the_previous_session() {
     assert_eq!(store.load(original.id()).await.unwrap(), original);
     let mut oversized = original.clone();
     oversized.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "x".repeat(nanus_domain::content::RECORD_BYTES_MAX),
     });
     assert!(store.save(&oversized).await.is_err());

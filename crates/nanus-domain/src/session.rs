@@ -56,7 +56,7 @@ use crate::tool::{ToolCall, ToolName};
 pub const SESSION_FORMAT_TAG: &str = "nanus.session";
 
 /// The session file format version this crate writes and accepts.
-pub const SESSION_FORMAT_VERSION: u32 = 2;
+pub const SESSION_FORMAT_VERSION: u32 = 3;
 
 /// Maximum number of characters in a derived session title.
 const TITLE_MAX_CHARS: usize = 72;
@@ -229,8 +229,15 @@ pub enum SessionEvent {
     },
     /// A human turn.
     UserMessage {
-        /// The text the human wrote.
+        /// Display text for the human turn.
         text: String,
+        /// Authoritative ordered content; absence preserves legacy text.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::content::deserialize_blocks"
+        )]
+        content_blocks: Option<Vec<crate::ContentBlock>>,
     },
     /// A model turn.
     AssistantMessage {
@@ -409,56 +416,18 @@ impl SessionLog {
         let mut messages: Vec<Message> = Vec::new();
         for event in &self.events {
             match event {
-                SessionEvent::UserMessage { text } => {
-                    messages.push(Message::user(text.clone()));
-                }
-                SessionEvent::AssistantMessage {
+                SessionEvent::UserMessage {
                     text,
-                    reasoning,
-                    tool_calls,
-                    replay,
-                    ..
+                    content_blocks,
                 } => {
-                    let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
-                    // A call that no result answers cannot travel: the provider refuses a request
-                    // whose assistant message names a call with nothing answering it. A log can
-                    // hold one — a step records its calls and runs them, so anything that stopped
-                    // the process between the two left the call behind — and a resumed session
-                    // would then send a request no provider accepts, failing every turn from a log
-                    // it can never repair. So the unanswered calls are dropped.
-                    //
-                    // The *message* stays when it has something to say: its text, or a call that
-                    // survived. The reasoning of a tool-using turn travels with the calls it was
-                    // kept for, which is why the condition is not "text only": the provider wants
-                    // that reasoning replayed beside the calls. A turn whose calls *all* went
-                    // unanswered has no such calls, so its reasoning is skipped with them — a
-                    // message carrying nothing but reasoning is one no adapter can encode, and
-                    // keeping it would turn a damaged log into a request that panics the encoder
-                    // rather than into a conversation that resumes.
-                    let calls: Vec<ToolCall> = tool_calls
-                        .iter()
-                        .filter(|call| answered.contains(&&call.id))
-                        .cloned()
-                        .collect();
-                    // Completed opaque Responses reasoning can be empty display text; it still
-                    // belongs in the original source. Unanswered calls cannot carry that replay.
-                    // Such a turn is one only stateless Responses can send: every other encoder
-                    // skips it (`Message::is_replay_only`), so a resume elsewhere still works.
-                    let has_opaque = replay.as_ref().is_some_and(|replay| {
-                        replay.protocol == "openai.responses" && calls.len() == tool_calls.len()
+                    messages.push(Message::User {
+                        text: text.clone(),
+                        content_blocks: content_blocks.clone(),
                     });
-                    if has_text || !calls.is_empty() || has_opaque {
-                        let replay = if calls.len() == tool_calls.len() {
-                            replay.clone()
-                        } else {
-                            None
-                        };
-                        messages.push(Message::Assistant {
-                            text: text.clone(),
-                            reasoning: reasoning.clone(),
-                            tool_calls: calls,
-                            replay,
-                        });
+                }
+                SessionEvent::AssistantMessage { .. } => {
+                    if let Some(message) = fold_assistant(event, &answered) {
+                        messages.push(message);
                     }
                 }
                 SessionEvent::ToolResult {
@@ -944,7 +913,7 @@ impl Session {
     #[must_use]
     pub fn title(&self) -> Option<String> {
         let first = self.log.events().iter().find_map(|event| match event {
-            SessionEvent::UserMessage { text } => Some(text.as_str()),
+            SessionEvent::UserMessage { text, .. } => Some(text.as_str()),
             _ => None,
         })?;
         let line = first.lines().next().unwrap_or_default().trim();
@@ -988,7 +957,7 @@ impl Session {
         out
     }
 
-    /// Encodes a bounded version-2 session, validating content before any store write.
+    /// Encodes a bounded version-3 session, validating content before any store write.
     ///
     /// # Errors
     ///
@@ -997,6 +966,10 @@ impl Session {
         let mut total = 0_usize;
         for (index, event) in self.log.events().iter().enumerate() {
             if let SessionEvent::ToolResult {
+                content_blocks: Some(blocks),
+                ..
+            }
+            | SessionEvent::UserMessage {
                 content_blocks: Some(blocks),
                 ..
             } = event
@@ -1008,20 +981,10 @@ impl Session {
                     }
                 })?;
             }
-            if let SessionEvent::AssistantMessage {
-                replay: Some(replay),
-                text,
-                tool_calls,
-                ..
-            } = event
-            {
-                replay
-                    .validate_response(text.as_deref(), tool_calls)
-                    .map_err(|error| SessionError::MalformedEvent {
-                        line: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
-                        detail: error.to_string(),
-                    })?;
-            }
+            validate_event_replay(
+                event,
+                u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
+            )?;
             let seq = SessionSeq::new(u64::try_from(index).unwrap_or(u64::MAX));
             let size = crate::content::serialized_size(
                 &SessionLineRef { seq, event },
@@ -1103,40 +1066,15 @@ impl Session {
                 header = Some(parse_header(line, number)?);
                 continue;
             }
-            if header.as_ref().is_some_and(|header| header.version == 1) {
-                let value: Value =
-                    serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
-                        line: number,
-                        detail: error.to_string(),
-                    })?;
-                if value.get("event").is_some_and(|event| {
-                    event.get("content_blocks").is_some() || event.get("replay").is_some()
-                }) {
-                    return Err(SessionError::MalformedEvent {
-                        line: number,
-                        detail: "version-1 records cannot contain typed content".into(),
-                    });
-                }
+            if let Some(header) = &header {
+                validate_body_version(header.version, line, number)?;
             }
             let parsed: SessionLine =
                 serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
                     line: number,
                     detail: error.to_string(),
                 })?;
-            if let SessionEvent::AssistantMessage {
-                replay: Some(replay),
-                text,
-                tool_calls,
-                ..
-            } = &parsed.event
-            {
-                replay
-                    .validate_response(text.as_deref(), tool_calls)
-                    .map_err(|error| SessionError::MalformedEvent {
-                        line: number,
-                        detail: error.to_string(),
-                    })?;
-            }
+            validate_event_replay(&parsed.event, number)?;
             if parsed.seq.value() != expected {
                 return Err(SessionError::NonContiguousSequence {
                     line: number,
@@ -1181,7 +1119,7 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
             ),
         });
     }
-    if !matches!(header.version, 1 | SESSION_FORMAT_VERSION) {
+    if !matches!(header.version, 1 | 2 | SESSION_FORMAT_VERSION) {
         return Err(SessionError::UnsupportedVersion {
             found: header.version,
             expected: SESSION_FORMAT_VERSION,
@@ -1196,6 +1134,103 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
         });
     }
     Ok(header)
+}
+
+fn fold_assistant(event: &SessionEvent, answered: &[&ToolCallId]) -> Option<Message> {
+    let SessionEvent::AssistantMessage {
+        text,
+        reasoning,
+        tool_calls,
+        replay,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
+    // A call that no result answers cannot travel: the provider refuses a request
+    // whose assistant message names a call with nothing answering it. A log can
+    // hold one — a step records its calls and runs them, so anything that stopped
+    // the process between the two left the call behind — and a resumed session
+    // would then send a request no provider accepts, failing every turn from a log
+    // it can never repair. So the unanswered calls are dropped.
+    //
+    // The *message* stays when it has something to say: its text, or a call that
+    // survived. The reasoning of a tool-using turn travels with the calls it was
+    // kept for, which is why the condition is not "text only": the provider wants
+    // that reasoning replayed beside the calls. A turn whose calls *all* went
+    // unanswered has no such calls, so its reasoning is skipped with them — a
+    // message carrying nothing but reasoning is one no adapter can encode, and
+    // keeping it would turn a damaged log into a request that panics the encoder
+    // rather than into a conversation that resumes.
+    let calls: Vec<ToolCall> = tool_calls
+        .iter()
+        .filter(|call| answered.contains(&&call.id))
+        .cloned()
+        .collect();
+    // Completed opaque Responses reasoning can be empty display text; it still
+    // belongs in the original source. Unanswered calls cannot carry that replay.
+    // Such a turn is one only stateless Responses can send: every other encoder
+    // skips it (`Message::is_replay_only`), so a resume elsewhere still works.
+    let has_opaque = replay.as_ref().is_some_and(|replay| {
+        replay.protocol == "openai.responses" && calls.len() == tool_calls.len()
+    });
+    if has_text || !calls.is_empty() || has_opaque {
+        let replay = if calls.len() == tool_calls.len() {
+            replay.clone()
+        } else {
+            None
+        };
+        return Some(Message::Assistant {
+            text: text.clone(),
+            reasoning: reasoning.clone(),
+            tool_calls: calls,
+            replay,
+        });
+    }
+    None
+}
+
+fn validate_event_replay(event: &SessionEvent, line: u64) -> Result<(), SessionError> {
+    if let SessionEvent::AssistantMessage {
+        replay: Some(replay),
+        text,
+        tool_calls,
+        ..
+    } = event
+    {
+        replay
+            .validate_response(text.as_deref(), tool_calls)
+            .map_err(|error| SessionError::MalformedEvent {
+                line,
+                detail: error.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
+// Old readers ignore unknown user fields. Refuse even null rather than permit a downgrade
+// to erase the authoritative blocks; v1 retains its stronger tool/replay restriction.
+fn validate_body_version(version: u32, line: &str, number: u64) -> Result<(), SessionError> {
+    if version >= 3 {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
+            line: number,
+            detail: error.to_string(),
+        })?;
+    let invalid = value.get("event").is_some_and(|event| {
+        (version == 1 && (event.get("content_blocks").is_some() || event.get("replay").is_some()))
+            || (event["type"] == "user_message" && event.get("content_blocks").is_some())
+    });
+    if invalid {
+        return Err(SessionError::MalformedEvent {
+            line: number,
+            detail: format!("version-{version} records cannot contain this typed content"),
+        });
+    }
+    Ok(())
 }
 
 /// Encodes a value as compact JSON.
@@ -1223,6 +1258,7 @@ mod tests {
         session.append(SessionEvent::TurnStart { turn: 0 });
         session.append(SessionEvent::StepStart { turn: 0, step: 0 });
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "read the file".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {
@@ -1394,6 +1430,7 @@ mod tests {
         let answered = call("c2");
         let mut log = SessionLog::new();
         log.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: String::from("hi"),
         });
         log.append(SessionEvent::AssistantMessage {
@@ -1461,6 +1498,7 @@ mod tests {
     fn a_reasoning_only_turn_with_no_surviving_call_is_skipped() {
         let mut log = SessionLog::new();
         log.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: String::from("hi"),
         });
         log.append(SessionEvent::AssistantMessage {
@@ -1654,6 +1692,7 @@ mod tests {
         let mut original = session();
         record_read_turn(&mut original);
         original.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "multi\nline \"quoted\" text".to_owned(),
         });
         let encoded = original.to_jsonl();
@@ -1700,8 +1739,8 @@ mod tests {
             "nothing recorded is reported as nothing, not as a default"
         );
         assert_eq!(
-            SESSION_FORMAT_VERSION, 2,
-            "typed content requires body version 2; old headers still load"
+            SESSION_FORMAT_VERSION, 3,
+            "typed user content requires body version 3; old headers still load"
         );
     }
 
@@ -1898,6 +1937,7 @@ mod tests {
         let mut session = session();
         assert_eq!(session.title(), None, "no human turn yet");
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "first line\nsecond line".to_owned(),
         });
         assert_eq!(session.title().as_deref(), Some("first line"));
@@ -1907,6 +1947,7 @@ mod tests {
     fn a_long_title_is_truncated_on_a_character_boundary() {
         let mut session = session();
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "é".repeat(200),
         });
         let title = session.title();
@@ -1920,6 +1961,7 @@ mod tests {
     fn a_blank_first_turn_produces_no_title() {
         let mut session = session();
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "   \n  ".to_owned(),
         });
         assert_eq!(session.title(), None);

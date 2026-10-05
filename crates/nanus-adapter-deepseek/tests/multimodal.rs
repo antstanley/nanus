@@ -19,6 +19,7 @@ const JPEG: &[u8] = include_bytes!("../../nanus-domain/tests/data/tiny-green-tri
 fn fixture() -> Session {
     let mut session = Session::new(SessionId::new("wire-pixels"), 123, "/caller");
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "Inspect the fictional images".into(),
     });
     let calls: Vec<_> = ["first", "sibling", "last"]
@@ -162,4 +163,56 @@ async fn pixels_are_refused_before_http_for_everything_without_evidence() {
     .unwrap();
     let proxied = refusal(&proxy, MODEL_FLASH).await;
     assert!(proxied.to_lowercase().contains("image"), "{proxied}");
+}
+
+fn direct_user_session() -> Session {
+    let mut session = Session::new(SessionId::new("human-pixels"), 123, "/fictional");
+    let mut blocks = vec![ContentBlock::Text("question".into())];
+    for (media, bytes) in [("image/png", PNG), ("image/jpeg", JPEG)] {
+        blocks.push(ContentBlock::Image {
+            media_type: media.into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        blocks.push(ContentBlock::Text(format!("after {media}")));
+    }
+    session.append(SessionEvent::UserMessage {
+        text: "DISPLAY SUMMARY ONLY".into(),
+        content_blocks: Some(blocks),
+    });
+    session
+}
+
+#[tokio::test]
+async fn direct_user_images_preserve_order_and_pixels_after_store_reload_without_invented_calls() {
+    for model in [MODEL_FLASH] {
+        let adapter = DeepSeekLlm::new(DeepSeekConfig::new(model, "fixture-key")).unwrap();
+        let original = direct_user_session();
+        for session in [original.clone(), reload(&original).await] {
+            let request = ChatRequest::new(model, session.derive_messages()).with_max_tokens(2048);
+            let body = adapter.encode(&request);
+            assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+            let content = &body["messages"][0]["content"];
+            assert_eq!(content.as_array().unwrap().len(), 5);
+            assert_eq!(content[0]["text"], "question");
+            assert_eq!(content[2]["text"], "after image/png");
+            assert_eq!(content[4]["text"], "after image/jpeg");
+            for (index, media, bytes) in [(1, "image/png", PNG), (3, "image/jpeg", JPEG)] {
+                let prefix = format!("data:{media};base64,");
+                assert_eq!(
+                    decoded(
+                        content[index]["image_url"]["url"]
+                            .as_str()
+                            .unwrap()
+                            .strip_prefix(&prefix)
+                            .unwrap()
+                    ),
+                    bytes
+                );
+            }
+            assert!(request.tools.is_empty());
+            assert!(!body.to_string().contains("DISPLAY SUMMARY ONLY"));
+            assert!(!body.to_string().contains("function_call"));
+            assert!(!body.to_string().contains("tool_use_id"));
+        }
+    }
 }

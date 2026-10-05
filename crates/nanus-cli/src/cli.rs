@@ -1818,6 +1818,7 @@ mod tests {
         session.append(SessionEvent::TurnStart { turn: 0 });
         session.append(SessionEvent::StepStart { turn: 0, step: 0 });
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "read the file".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {

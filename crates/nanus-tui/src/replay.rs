@@ -103,7 +103,7 @@ fn apply(
     calls: &mut BTreeMap<ToolCallId, String>,
 ) {
     match event {
-        SessionEvent::UserMessage { text } => {
+        SessionEvent::UserMessage { text, .. } => {
             transcript.push(Entry::prose(Role::User, text.clone()));
         }
         SessionEvent::AssistantMessage {

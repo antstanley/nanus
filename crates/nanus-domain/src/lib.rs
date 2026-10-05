@@ -31,6 +31,7 @@
 //! let mut session = Session::new(SessionId::new("demo"), 0, "/work");
 //! session.append(SessionEvent::TurnStart { turn: 0 });
 //! session.append(SessionEvent::UserMessage {
+//!     content_blocks: None,
 //!     text: "what is in src/lib.rs?".to_owned(),
 //! });
 //! session.append(SessionEvent::TurnEnd {

@@ -1,0 +1,161 @@
+//! Typed human input is never reduced to its display projection.
+#![allow(clippy::unwrap_used)]
+use base64::Engine as _;
+use nanus_domain::{ContentBlock, Message, Session, SessionEvent, SessionId};
+use serde_json::{Value, json};
+
+fn pixels() -> ContentBlock {
+    ContentBlock::Image {
+        media_type: "image/png".into(),
+        data_base64: base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("data/tiny-green-triangle.png")),
+    }
+}
+fn session(blocks: Option<Vec<ContentBlock>>) -> Session {
+    let mut session = Session::new(SessionId::new("direct-input"), 123, "/fictional");
+    session.append(SessionEvent::UserMessage {
+        text: "display only".into(),
+        content_blocks: blocks,
+    });
+    session
+}
+fn version(raw: &str, version: u32) -> String {
+    let mut lines: Vec<Value> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines[0]["version"] = json!(version);
+    lines
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+#[test]
+fn user_pixels_survive_message_json_and_session_reload_in_order() {
+    let blocks = vec![
+        ContentBlock::Text("before".into()),
+        pixels(),
+        ContentBlock::Text("after".into()),
+    ];
+    let message = Message::user_with_content(blocks.clone()).unwrap();
+    assert!(!message.is_empty());
+    let wire = serde_json::to_string(&message).unwrap();
+    assert_eq!(serde_json::from_str::<Message>(&wire).unwrap(), message);
+    let original = session(Some(blocks.clone()));
+    let raw = original.try_to_jsonl().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(raw.lines().next().unwrap()).unwrap()["version"],
+        3
+    );
+    let restored = Session::from_jsonl(&raw).unwrap();
+    assert_eq!(restored, original);
+    let messages = restored.derive_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content_blocks(), Some(blocks.as_slice()));
+}
+#[test]
+fn old_text_bodies_still_load_but_typed_user_content_cannot_be_downgraded() {
+    let typed = session(Some(vec![pixels()])).try_to_jsonl().unwrap();
+    let plain = session(None).try_to_jsonl().unwrap();
+    for old in [1, 2] {
+        assert!(Session::from_jsonl(&version(&plain, old)).is_ok());
+        assert!(Session::from_jsonl(&version(&typed, old)).is_err());
+        let mut lines: Vec<Value> = plain
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        lines[1]["event"]["content_blocks"] = Value::Null;
+        let raw = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Session::from_jsonl(&version(&raw, old)).is_err());
+    }
+}
+#[test]
+fn plaintext_json_stays_exact_and_image_only_input_is_visible() {
+    assert_eq!(
+        serde_json::to_string(&Message::user("plain")).unwrap(),
+        r#"{"role":"user","content":"plain"}"#
+    );
+    let image_only = Message::User {
+        text: String::new(),
+        content_blocks: Some(vec![pixels()]),
+    };
+    assert!(!image_only.is_empty());
+    assert!(
+        Message::user_with_content(vec![ContentBlock::Text(String::new())])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(session(Some(vec![pixels()])).derive_messages().len(), 1);
+}
+#[test]
+fn invalid_and_oversized_user_blocks_refuse_at_construction_and_persistence() {
+    let invalid = ContentBlock::Image {
+        media_type: "image/png".into(),
+        data_base64: "broken".into(),
+    };
+    for blocks in [
+        vec![],
+        vec![pixels(); 5],
+        vec![ContentBlock::Text("x".into()); 33],
+        vec![invalid],
+        vec![ContentBlock::Text(
+            "x".repeat(nanus_domain::content::RECORD_BYTES_MAX),
+        )],
+    ] {
+        assert!(Message::user_with_content(blocks.clone()).is_err());
+        assert!(session(Some(blocks.clone())).try_to_jsonl().is_err());
+        let raw = json!({"role":"user", "content":"display", "content_blocks":blocks});
+        assert!(serde_json::from_value::<Message>(raw).is_err());
+    }
+}
+#[test]
+fn foreign_media_arrays_refuse_instead_of_silently_losing_images() {
+    for block in [
+        json!({"type":"image_url", "image_url":{"url":"https://invalid.test/a.png"}}),
+        json!({"type":"image", "text":"misleading"}),
+        json!({"other":"ignored"}),
+    ] {
+        let raw = json!({"role":"user", "content":[{"type":"text","text":"question"},block]});
+        assert!(serde_json::from_value::<Message>(raw).is_err());
+    }
+    assert_eq!(
+        serde_json::from_value::<Message>(
+            json!({"role":"user", "content":[{"type":"text", "text":"ok"}]})
+        )
+        .unwrap(),
+        Message::user("ok")
+    );
+}
+#[test]
+fn context_projection_cannot_change_pixels_or_split_a_human_turn() {
+    let input = Message::user_with_content(vec![pixels()]).unwrap();
+    let source = vec![
+        Message::system("trusted"),
+        Message::user("old"),
+        Message::assistant(Some("old answer".into()), None, vec![]),
+        input.clone(),
+    ];
+    let fitted = nanus_domain::context::fit_with(source.clone(), 4, |messages| {
+        u32::try_from(messages.len().saturating_mul(2)).unwrap()
+    })
+    .unwrap_err();
+    assert!(matches!(
+        fitted,
+        nanus_domain::context::FitError::TooLarge { .. }
+    ));
+    let kept = nanus_domain::context::fit_with(source.clone(), 6, |messages| {
+        u32::try_from(messages.len().saturating_mul(2)).unwrap()
+    })
+    .unwrap();
+    assert_eq!(kept.messages.last(), Some(&input));
+    assert!(nanus_domain::context::identify_projection(&source, &kept.messages, 6).is_ok());
+    let mut changed = source.clone();
+    changed[3] = Message::user("image omitted");
+    assert!(nanus_domain::context::identify_projection(&source, &changed, 100).is_err());
+    assert!(nanus_domain::context::identify_projection(&source, &source, 100).is_ok());
+}
