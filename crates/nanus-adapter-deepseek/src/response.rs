@@ -10,6 +10,7 @@ pub fn decode(
     response: reqwest::Response,
     host: String,
     limits: Option<ResponseLimits>,
+    arguments: nanus_ports::ToolArgumentLimits,
 ) -> EventStream {
     let status = response.status();
     if !status.is_success() {
@@ -23,6 +24,7 @@ pub fn decode(
     }
     let mut accumulator = wire::StreamAccumulator::default();
     accumulator.set_response_limits(limits);
+    accumulator.set_argument_limits(arguments);
     let mut bytes = Some(response.bytes_stream());
     let mut decoder = ResponseFrames::new(limits);
     Box::pin(futures::stream::poll_fn(move |cx| {

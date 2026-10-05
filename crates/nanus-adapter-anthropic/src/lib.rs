@@ -21,6 +21,10 @@
 //! from the derived request; the durable log remains unchanged. Other encoders use the
 //! neutral text/tool calls. Earlier model behavior is preserved.
 //!
+//! A managed-context request applies exactly the same per-turn check to the body it
+//! prepares, and refuses a kept turn that only its signed blocks could express rather than
+//! skipping it; the reasoning is in the `managed` module.
+//!
 //! ## What the adapter owns
 //!
 //! HTTP and stream decoding, exactly as the other adapters do. Everything it
@@ -35,6 +39,9 @@
 
 mod config;
 mod error;
+mod managed;
+#[cfg(test)]
+mod managed_tests;
 
 mod response;
 #[cfg(test)]
@@ -260,49 +267,100 @@ impl LlmPort for AnthropicLlm {
             "dispatching a message request"
         );
 
-        let client = self.client.clone();
-        let endpoint = self.endpoint();
-        let api_key = self.config.api_key().to_owned();
-        // The host survives as an owned value inside the stream: the transport
-        // failure is reported after `&self` has gone out of scope.
-        let host = self.config.base_url().to_owned();
-        let stream_host = host.clone();
-        let limits = self.config.response_limits();
-
-        let response = async move {
-            let sent = client
-                .post(&endpoint)
-                // The credential is a header of its own rather than a bearer token,
-                // and the version is declared on every request: there is no
-                // "latest", which is what makes this client's expectations explicit.
-                .header("x-api-key", api_key)
-                .header("anthropic-version", API_VERSION)
-                .header("accept", "text/event-stream")
-                .header("content-type", "application/json")
-                .body(body)
-                .send()
-                .await;
-            match sent {
-                Ok(response) => Ok(response),
-                Err(source) => Err(AnthropicError::transport(&source, &host).to_string()),
-            }
-        };
-
-        let stream = futures::stream::once(response).flat_map(move |outcome| match outcome {
-            Ok(response) => {
-                let head = futures::stream::iter([LlmEvent::ResponseHead]);
-                let announced: EventStream = Box::pin(head.chain(response::decode(
-                    response,
-                    stream_host.clone(),
-                    prefix_digest.clone(),
-                    limits,
-                )));
-                announced
-            }
-            Err(message) => error_stream_owned(message),
-        });
-        Box::pin(stream)
+        let accumulator = wire::StreamAccumulator::with_prefix(prefix_digest);
+        send(self.transport(), body, accumulator)
     }
+
+    fn managed_support(&self, model: &str) -> nanus_ports::ManagedSupport {
+        managed::support(&self.config, model)
+    }
+
+    fn prepare_managed(
+        &self,
+        request: nanus_ports::ManagedRequest,
+    ) -> nanus_ports::LlmResult<Box<dyn nanus_ports::PreparedModelCall>> {
+        Ok(Box::new(managed::prepare(self, request)?))
+    }
+}
+
+impl AnthropicLlm {
+    /// Everything a dispatch needs beyond its body, resolved now and owned from here on.
+    fn transport(&self) -> Transport {
+        Transport {
+            client: self.client.clone(),
+            endpoint: self.endpoint(),
+            api_key: self.config.api_key().to_owned(),
+            // The host survives as an owned value inside the stream: the transport failure is
+            // reported after `&self` has gone out of scope.
+            host: self.config.base_url().to_owned(),
+            limits: self.config.response_limits(),
+        }
+    }
+}
+
+/// The resolved route and credential of one dispatch.
+///
+/// Built once, before the body is sent, so a prepared call cannot change where it goes or
+/// which key it carries between the moment it is admitted and the moment it is sent.
+#[derive(Clone)]
+struct Transport {
+    client: reqwest::Client,
+    endpoint: String,
+    api_key: String,
+    host: String,
+    limits: Option<nanus_ports::ResponseLimits>,
+}
+
+/// Sends exactly `body` over `transport` and decodes the answer with `accumulator`.
+///
+/// Nothing touches the network until the returned stream is polled: the request is built
+/// inside the future the stream resolves first.
+fn send(transport: Transport, body: String, accumulator: wire::StreamAccumulator) -> LlmStream {
+    let Transport {
+        client,
+        endpoint,
+        api_key,
+        host,
+        limits,
+    } = transport;
+    let stream_host = host.clone();
+    let response = async move {
+        let sent = client
+            .post(&endpoint)
+            // The credential is a header of its own rather than a bearer token, and the
+            // version is declared on every request: there is no "latest", which is what makes
+            // this client's expectations explicit.
+            .header("x-api-key", api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await;
+        match sent {
+            Ok(response) => Ok(response),
+            Err(source) => Err(AnthropicError::transport(&source, &host).to_string()),
+        }
+    };
+
+    let mut accumulator = Some(accumulator);
+    let stream = futures::stream::once(response).flat_map(move |outcome| match outcome {
+        Ok(response) => {
+            let Some(accumulator) = accumulator.take() else {
+                return error_stream_owned("response decoder was already consumed".into());
+            };
+            let head = futures::stream::iter([LlmEvent::ResponseHead]);
+            let announced: EventStream = Box::pin(head.chain(response::decode(
+                response,
+                stream_host.clone(),
+                accumulator,
+                limits,
+            )));
+            announced
+        }
+        Err(message) => error_stream_owned(message),
+    });
+    Box::pin(stream)
 }
 
 /// A one-event stream carrying an error.
