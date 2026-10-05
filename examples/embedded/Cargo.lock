@@ -1005,7 +1005,9 @@ dependencies = [
 name = "nanus-bundle"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "futures",
+ "getrandom 0.4.3",
  "globset",
  "nanus-domain",
  "nanus-kernel",
@@ -1025,6 +1027,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
  "tracing",
