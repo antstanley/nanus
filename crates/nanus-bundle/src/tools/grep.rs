@@ -8,14 +8,20 @@
 //!
 //! `include` narrows by file name and takes exactly one positive glob. Comma lists
 //! and negations are rejected up front with a message that says what to do instead,
-//! because a silently-ignored filter produces a wrong answer rather than an error.
+//! because a silently-ignored filter produces a wrong answer rather than an error. The
+//! glob is part of the port's query, so it narrows the files searched *before* the match
+//! cap rather than the matches returned after it.
+//!
+//! Files over the size cap, binary files and unreadable files are passed over, counted,
+//! and reported as partial coverage: a search that skipped a file cannot say a match is
+//! absent from it, and the large ones can still be read in byte windows.
 
 use core::fmt::Write as _;
 use nanus_domain::{
     ContentBlock, ToolAccess, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
     ToolOutcome, ToolResult, ToolSchema,
 };
-use nanus_ports::{FsHandle, SearchQuery};
+use nanus_ports::{FsHandle, SearchOutcome, SearchQuery};
 use serde_json::json;
 
 use crate::args::Arguments;
@@ -121,66 +127,83 @@ async fn grep_outcome(fs: FsHandle, call: ToolCall) -> ToolResult {
         );
     }
 
-    // The search runs unfiltered and the `include` glob is applied to the returned
-    // paths. That is deliberate for this port shape: the port's query carries no
-    // file filter, so filtering here keeps the tool honest about what it asked for
-    // rather than pretending a filter was pushed down.
+    // The `include` glob travels in the query, so the port applies it before its match cap.
+    // It used to be applied here, to the capped result, and then matches in excluded files
+    // could fill the cap and leave the one included match unreturned — an empty answer to a
+    // question that had one.
     let search_limit = usize::try_from(limit).unwrap_or(SearchQuery::DEFAULT_MAX_RESULTS);
-    let query = SearchQuery::literal(&root, &pattern).with_max_results(search_limit);
+    let mut query = SearchQuery::literal(&root, &pattern).with_max_results(search_limit);
+    if let Some(include) = include.as_deref() {
+        query = query.with_include(include.trim());
+    }
     let found = fs.search(&query).await;
     let outcome = match found {
         Ok(outcome) => outcome,
         Err(error) => return port_error_result(id, "grep", &error),
     };
 
-    let hits = filter_by_include(outcome.matches, include.as_deref());
     // The port's flag alone, and not "the result filled the cap": a search that found exactly
     // its cap and then ran out of text is complete, and calling it truncated would send the
     // model hunting for matches that do not exist.
-    let truncated = outcome.truncated;
     let value = json!({
         "pattern": pattern,
         "root": root,
-        "count": hits.len(),
-        "truncated": truncated,
+        "count": outcome.matches.len(),
+        "truncated": outcome.truncated,
         "files_scanned": outcome.files_scanned,
+        "skipped_large": outcome.skipped_large,
+        "skipped_binary": outcome.skipped_binary,
+        "skipped_unreadable": outcome.skipped_unreadable,
+        "coverage": outcome.coverage().as_str(),
     });
-    let text = render_matches(&hits, truncated, limit);
+    let text = render_outcome(&outcome, limit, query.max_file_bytes);
     ToolResult::new(
         id,
         ToolOutcome::success_with(value, vec![ContentBlock::Text(text)]),
     )
 }
 
-/// Keeps only the matches whose path matches `include`.
+/// Renders a search's matches and, when it passed files over, what it did not search.
 ///
-/// A malformed glob cannot reach here: [`validate_include`] runs first and reports
-/// the problem to the model. Should one arrive anyway, the filter keeps everything
-/// rather than silently discarding matches, because a filter that hides evidence is
-/// worse than one that lets it through.
-pub fn filter_by_include(
-    hits: Vec<nanus_ports::SearchMatch>,
-    include: Option<&str>,
-) -> Vec<nanus_ports::SearchMatch> {
-    let Some(include) = include else {
-        return hits;
+/// With nothing skipped this is exactly [`render_matches`]. With a file skipped, an empty
+/// result says "in the files searched" rather than "found", because a file over the size
+/// cap can hold the match, and the note says how to look there.
+pub fn render_outcome(outcome: &SearchOutcome, limit: u32, max_file_bytes: u64) -> String {
+    let mut text = if outcome.matches.is_empty() && !outcome.truncated && outcome.skipped() > 0 {
+        "No matches in the files searched.\n".to_owned()
+    } else {
+        render_matches(&outcome.matches, outcome.truncated, limit)
     };
-    let Ok(glob) = globset::Glob::new(include) else {
-        tracing::warn!(include, "grep: an unparseable include glob was ignored");
-        return hits;
-    };
-    let matcher = glob.compile_matcher();
-    hits.into_iter()
-        .filter(|found| {
-            // The pattern is matched against the path text and against the file
-            // name, so `*.rs` works whether or not the search root was prefixed.
-            matcher.is_match(&found.path)
-                || found
-                    .path
-                    .file_name()
-                    .is_some_and(|name| matcher.is_match(std::path::Path::new(name)))
-        })
-        .collect()
+    if let Some(note) = render_skipped(outcome, max_file_bytes) {
+        text.push_str(&note);
+    }
+    text
+}
+
+/// Describes the files a search passed over, or nothing when it passed over none.
+fn render_skipped(outcome: &SearchOutcome, max_file_bytes: u64) -> Option<String> {
+    if outcome.skipped() == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if outcome.skipped_large > 0 {
+        parts.push(format!(
+            "{} over the {max_file_bytes}-byte size cap (read those in byte windows with \
+             read's byte_offset and max_bytes)",
+            outcome.skipped_large
+        ));
+    }
+    if outcome.skipped_binary > 0 {
+        parts.push(format!("{} binary or not UTF-8", outcome.skipped_binary));
+    }
+    if outcome.skipped_unreadable > 0 {
+        parts.push(format!("{} unreadable", outcome.skipped_unreadable));
+    }
+    Some(format!(
+        "(coverage partial: {} files not searched: {})\n",
+        outcome.skipped(),
+        parts.join("; ")
+    ))
 }
 
 /// Checks that an `include` filter is one positive glob.
@@ -344,33 +367,97 @@ mod tests {
         assert_eq!(truncate_line("12345", 5), "12345");
     }
 
-    #[test]
-    fn the_include_filter_keeps_only_matching_paths() {
-        let matches = vec![
-            found("src/a.rs", 1, "hit"),
-            found("src/b.toml", 1, "hit"),
-            found("src/c.rs", 1, "hit"),
-        ];
-        let kept = filter_by_include(matches, Some("*.rs"));
-        assert_eq!(kept.len(), 2);
+    /// Runs `grep` with `arguments` over `fs`.
+    async fn grep(fs: &crate::tests_support::MemoryFs, arguments: serde_json::Value) -> ToolResult {
+        grep_tool(fs.handle())
+            .execute(ToolCall::new(
+                ToolCallId::new("c-grep"),
+                ToolName::new("grep").unwrap_or_else(|_| unreachable!("grep is valid")),
+                arguments,
+            ))
+            .await
+    }
+
+    /// The filter travels in the query, so the port applies it before its cap — and every
+    /// match the port returns is shown, with none dropped afterwards by a second filter.
+    #[tokio::test]
+    async fn the_include_glob_is_sent_to_the_port_rather_than_applied_to_its_answer() {
+        let answer = SearchOutcome {
+            matches: vec![found("/w/src/deep/a.rs", 3, "hit")],
+            files_scanned: 1,
+            ..SearchOutcome::default()
+        };
+        let fs = crate::tests_support::MemoryFs::new("").answer_searches_with(answer);
+        let result = grep(&fs, json!({ "pattern": "hit", "include": " src/**/*.rs " })).await;
+        let queries = fs.queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].include.as_deref(), Some("src/**/*.rs"));
+        let text = result.outcome.render_text();
+        assert!(text.contains("3: hit"), "the port's match is shown: {text}");
+
+        // The other direction: no include, no filter in the query.
+        let _ = grep(&fs, json!({ "pattern": "hit" })).await;
+        assert_eq!(fs.queries()[1].include, None);
+    }
+
+    #[tokio::test]
+    async fn a_search_that_skipped_files_reports_partial_coverage_and_one_that_did_not_is_complete()
+    {
+        let complete = crate::tests_support::MemoryFs::new("");
+        let result = grep(&complete, json!({ "pattern": "hit" })).await;
+        let value = result.outcome.value().cloned().unwrap_or_default();
+        assert_eq!(value["coverage"], "complete");
+        assert_eq!(result.outcome.render_text(), "No matches found.\n");
+
+        let skipped = SearchOutcome {
+            skipped_large: 2,
+            skipped_binary: 1,
+            ..SearchOutcome::default()
+        };
+        let partial = crate::tests_support::MemoryFs::new("").answer_searches_with(skipped);
+        let result = grep(&partial, json!({ "pattern": "hit" })).await;
+        let value = result.outcome.value().cloned().unwrap_or_default();
+        assert_eq!(value["coverage"], "partial");
+        assert_eq!(value["skipped_large"], 2);
+        assert_eq!(value["skipped_binary"], 1);
+        assert_eq!(value["skipped_unreadable"], 0);
+        let text = result.outcome.render_text();
         assert!(
-            kept.iter()
-                .all(|found| found.path.extension().is_some_and(|ext| ext == "rs"))
+            !text.contains("No matches found."),
+            "a search that skipped files cannot claim there are none: {text}"
         );
+        assert!(
+            text.contains("coverage partial: 3 files not searched"),
+            "{text}"
+        );
+        assert!(
+            text.contains("byte_offset"),
+            "the diagnostic names byte windows: {text}"
+        );
+        assert!(text.contains("1 binary"), "{text}");
     }
 
     #[test]
-    fn no_include_keeps_everything() {
-        let matches = vec![found("a.rs", 1, "x"), found("b.toml", 1, "x")];
-        assert_eq!(filter_by_include(matches, None).len(), 2);
-    }
-
-    #[test]
-    fn a_directory_scoped_glob_matches_the_whole_path() {
-        let matches = vec![found("src/deep/a.rs", 1, "x"), found("tests/b.rs", 1, "x")];
-        let kept = filter_by_include(matches, Some("src/**/*.rs"));
-        assert_eq!(kept.len(), 1);
-        assert!(kept[0].path.starts_with("src"));
+    fn an_outcome_with_nothing_skipped_renders_as_the_matches_alone() {
+        let outcome = SearchOutcome {
+            matches: vec![found("a.rs", 1, "one")],
+            ..SearchOutcome::default()
+        };
+        assert_eq!(
+            render_outcome(&outcome, 100, 10),
+            render_matches(&outcome.matches, false, 100)
+        );
+        let skipped = SearchOutcome {
+            skipped_unreadable: 1,
+            ..outcome
+        };
+        let rendered = render_outcome(&skipped, 100, 10);
+        assert!(rendered.contains("one"), "{rendered}");
+        assert!(rendered.contains("1 unreadable"), "{rendered}");
+        assert!(
+            !rendered.contains("size cap"),
+            "only the reasons that apply: {rendered}"
+        );
     }
 
     #[test]
