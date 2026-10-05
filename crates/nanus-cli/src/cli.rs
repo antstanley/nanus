@@ -655,6 +655,28 @@ fn load(args: &Options) -> Result<NanusConfig, String> {
     Ok(config)
 }
 
+/// Refuses context flags a new session has nothing to apply to.
+///
+/// A new session starts legacy, so a flag that only means something in managed mode has
+/// nothing to apply to unless managed mode is asked for too. Capture in particular is never a
+/// way to turn managed context on: it is refused rather than inferred.
+fn check_new_session_flags(resume: Option<&str>, context: &ContextArgs) -> Result<(), String> {
+    if resume.is_some() || context.context_mode.as_deref() == Some("managed") {
+        return Ok(());
+    }
+    if context.capture_shell_evidence {
+        return Err(String::from(
+            "--capture-shell-evidence needs --context-mode managed for a new session",
+        ));
+    }
+    if context.context_output_reserve.is_some() {
+        return Err(String::from(
+            "--context-output-reserve needs --context-mode managed for a new session",
+        ));
+    }
+    Ok(())
+}
+
 /// Awaits the adapters one task needs.
 async fn prepare_run(
     args: &Options,
@@ -665,21 +687,7 @@ async fn prepare_run(
     let (resume, name) = conversation;
     let config = load(args)?;
     let prompt = task.join(" ");
-    // A new session starts legacy, so a flag that only means something in managed mode has
-    // nothing to apply to unless managed mode is asked for too. Capture in particular is never
-    // a way to turn managed context on: it is refused rather than inferred.
-    if resume.is_none() && context.context_mode.as_deref() != Some("managed") {
-        if context.capture_shell_evidence {
-            return Err(String::from(
-                "--capture-shell-evidence needs --context-mode managed for a new session",
-            ));
-        }
-        if context.context_output_reserve.is_some() {
-            return Err(String::from(
-                "--context-output-reserve needs --context-mode managed for a new session",
-            ));
-        }
-    }
+    check_new_session_flags(resume.as_deref(), &context)?;
     if prompt.trim().is_empty() {
         return Err(String::from(
             "the task is empty; pass the work to do, for example: nanus run \"summarize this repository\"",
@@ -1917,6 +1925,51 @@ mod tests {
         // Reading a transcript starts no session, so there is nothing to name or resume.
         assert!(Args::try_parse_from(["nanus", "tui", "--session", "--name", "a"]).is_err());
         assert!(Args::try_parse_from(["nanus", "tui", "--session", "--resume", "a"]).is_err());
+    }
+
+    #[test]
+    fn the_context_flags_parse_and_capture_never_turns_managed_context_on() {
+        let parsed = Args::try_parse_from([
+            "nanus",
+            "run",
+            "--context-mode",
+            "managed",
+            "--context-output-reserve",
+            "8000",
+            "--capture-shell-evidence",
+            "do it",
+        ]);
+        let Ok(Args {
+            command: Some(Command::Run { context, .. }),
+            ..
+        }) = parsed
+        else {
+            panic!("the flags parse: {parsed:?}");
+        };
+        assert_eq!(context.context_mode.as_deref(), Some("managed"));
+        assert_eq!(context.context_output_reserve, Some(8_000));
+        assert!(context.capture_shell_evidence);
+        assert!(check_new_session_flags(None, &context).is_ok());
+
+        let unknown = ["nanus", "run", "--context-mode", "smart", "x"];
+        assert!(Args::try_parse_from(unknown).is_err());
+        let zero = ["nanus", "run", "--context-output-reserve", "0", "x"];
+        assert!(Args::try_parse_from(zero).is_err());
+
+        let capture_alone = ContextArgs {
+            capture_shell_evidence: true,
+            ..ContextArgs::default()
+        };
+        let refused = check_new_session_flags(None, &capture_alone);
+        assert!(refused.is_err_and(|error| error.contains("--context-mode managed")));
+        let reserve_alone = ContextArgs {
+            context_output_reserve: Some(10),
+            ..ContextArgs::default()
+        };
+        assert!(check_new_session_flags(None, &reserve_alone).is_err());
+        // On resume the session's recorded policy decides, so the check is deferred to it.
+        assert!(check_new_session_flags(Some("nightly"), &capture_alone).is_ok());
+        assert!(check_new_session_flags(None, &ContextArgs::default()).is_ok());
     }
 
     #[test]
