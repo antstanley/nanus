@@ -195,7 +195,34 @@ selection or resets the session's context.
 
 ### Provider matrix
 
-Filled in from the adapters' own `managed_support` once their preparation and wire fixtures land.
+Each supported path splits its dispatch into one encode and a separate send, so the ordinary
+path's bytes are unchanged and the prepared call sends exactly what it estimated and digested.
+Support requires the official endpoint and a known model; anything else is unsupported.
+
+| Provider | Endpoint and plan | Protocol label | Models | Support |
+|---|---|---|---|---|
+| DeepSeek | `https://api.deepseek.com` | `deepseek.chat` | `deepseek-flash`, `deepseek-v4-pro` | Supported |
+| OpenAI | API plan, `https://api.openai.com/v1`, routed to Chat Completions | `openai.chat` | Ids before `gpt-5.6`, or an exact chat preference whose tool support is not refused | Supported |
+| OpenAI | Anything routed to Responses: automatic `gpt-5.6`+, the `subscription` plan, exact Responses, stateless Responses | — | All | Unsupported; refused before HTTP |
+| z.ai | API plan, `https://api.z.ai/api/paas/v4` | `openai.chat` | The known API models | Supported |
+| z.ai | Coding Plan, gateways | — | — | Unsupported |
+| Anthropic | `https://api.anthropic.com/v1` | `anthropic.messages` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Supported |
+
+The output reservation must be present and within the model's declared ceiling; it is refused,
+never clamped. Every adapter validates the managed role grammar — leading system messages only,
+one labelled generated message directly after the first user message and never last, and every
+surviving call paired with exactly one result.
+
+Anthropic signed replay is sent only when the adapter's existing check accepts it: the original
+blocks under the encoded prefix that produced them. When hiding changes a turn's prefix, that turn
+is sent in its neutral form — its text and tool uses, without the thinking blocks — which the
+Messages API accepts as an edited history; signatures and digests are never rewritten. A turn that
+carries only signed replay and has no neutral form refuses preparation. Because the notice changes
+every request, managed Anthropic sessions usually send their history neutrally: that costs the
+earlier reasoning and the prompt cache, never correctness.
+
+These rest on wire and reload fixtures — a local server receives exactly the prepared bytes — not
+on live provider evidence; see [what is verified](#what-is-and-is-not-verified).
 
 ## Checkpoints and recovery
 
@@ -250,11 +277,37 @@ cap and reports skipped-large, binary and unreadable counts with partial coverag
 
 ### Shell archives
 
-Filled in with the capture and archive work.
+`ShellPort::run_with_capture` runs a command exactly as `run` does — the same process groups, Job
+Objects, timeouts and cleanup — while each pipe pump forwards the exact bytes it reads to that
+stream's sink before the preview cap. Each sink lives in its own task; the pumps share at most
+128 KiB of staged bytes, wait at most a second for room, and then stop capturing that stream while
+they keep draining for the preview, so capture can never block a pipe or change an outcome. A
+write that misses its five-second deadline is never abandoned mid-write: the task keeps the sink
+until it is quiescent and finalizes with the truthful reason.
+
+The store's archive (`JsonlStore` implements `ArtifactStore`) reserves quota before a call runs —
+8 MiB per stream, 128 MiB per session and 1 GiB per store, counting live reservations, partial
+files and orphans — under a cross-process quota lock that is only ever taken after the session
+claim. A finalized object is flushed, synced and renamed before its receipt says it exists; its
+receipt records its length, its SHA-256 and one per 64 KiB chunk, so a range read verifies only
+the chunks it touches. A reservation that fails becomes an `unavailable` receipt and changes
+nothing about how the command runs. A checkpoint that newly references an object verifies it on
+disk first. Objects referenced by a receipt are never evicted; garbage collection claims an idle
+session, validates its log, and removes only unreferenced objects with no live lease.
+
+The `bash` tool names each archived stream to the model on one bounded line after its preview, for
+example `[stdout archived as a:… — 70000 of 70000 bytes, complete; read it with context_recall]`.
+With no lease — every legacy session, and every managed one without capture — its output is
+byte-for-byte what it was.
 
 ### Deletion and retirement
 
-Filled in with the store work.
+Deletion takes exclusive ownership of the session, refusing one another writer holds. It writes
+a retirement marker for the id, moves the whole session directory into the store's trash, then
+removes the bytes and reclaims their archive quota. Afterwards a save, checkpoint, claim or name
+for that id is refused as retired, so a stale writer cannot resurrect the conversation; a deletion
+a crash interrupted is finished the next time the store opens and never reversed. This is the one
+deliberate change to legacy behaviour, and it applies to every session.
 
 ## Goals and the manual policy
 
