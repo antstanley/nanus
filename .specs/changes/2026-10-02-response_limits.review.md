@@ -1,7 +1,7 @@
 # Nanus response-limit implementation review — 2026-10-02
 
 **Scope:** the pre-event transport seam in the [embedding change](2026-09-30-library_embedding_and_multimodal_results.md). This is local unpublished work; text-model ceilings remain open. Later exact-protocol progress is recorded in
-[its certificate](2026-10-02-exact_protocol.review.md). No Hype runtime, skill/plugin loader, deadline policy or credential fallback is introduced.
+[its certificate](2026-10-02-exact_protocol.review.md). No downstream host runtime, skill/plugin loader, deadline policy or credential fallback is introduced.
 
 ## Premises
 
@@ -65,4 +65,4 @@ substituted for the final run. No live-provider requests were made.
 
 ## Verdict
 
-**CORRECT for the tested opt-in local transport contract; high confidence.** Native Windows and live-provider acceptance remain untested. Hype's immutable dependency pin and provider factory have not adopted this unpublished API. Text-model ceilings and the rest of Hype's production migration remain incomplete. Exact-protocol selection was implemented afterward; see [its separate certificate](2026-10-02-exact_protocol.review.md).
+**CORRECT for the tested opt-in local transport contract; high confidence.** Native Windows and live-provider acceptance remain untested. The downstream host's immutable dependency pin and provider factory have not adopted this unpublished API. Text-model ceilings and the rest of the host's production migration remain incomplete. Exact-protocol selection was implemented afterward; see [its separate certificate](2026-10-02-exact_protocol.review.md).

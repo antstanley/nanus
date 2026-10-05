@@ -1,10 +1,10 @@
 # Caller-owned video snapshots — semi-formal certificate
 
-**Date:** 2026-10-03 · **Scope:** Local Nanus seam; not published or adopted by Hype
+**Date:** 2026-10-03 · **Scope:** Local Nanus seam; not published or adopted by the downstream host
 
 ## Premises
 
-P1. Hype must implement the optional extension's VideoSource through its own bounded,
+P1. The host must implement the optional extension's VideoSource through its own bounded,
 rooted snapshot authority rather than raising the small authoring-file cap or invoking
 stock composition. P2. The published 80a revision has a public Snapshot return type
 with a private TempDir field and no public constructor; an external direct source
@@ -68,7 +68,7 @@ Initial external fixture compilation tried a private executor field and a tuple-
 Success; public execution and the actual struct outcome correct those assumptions. Initial
 Clippy identifies an underscore-prefixed field now used by retain_owner and a redundant
 initializer; the final field and public method names are corrected without suppression.
-Initial and final logs and guarded owner baselines reside under /private/tmp/hype-video-snapshot.
+Initial and final logs and guarded owner baselines were kept locally, outside the repository.
 
 ## Edges and verdict
 
@@ -77,6 +77,6 @@ semantics proven by the public downstream fixture and explicit physical worker j
 The host must still verify rooted authority, regular-file identity, actual bytes/digest,
 immutable storage, approvals and publication. Arc retention is not process cancellation,
 hard deadline or crash cleanup; the decoder must retain the owner before spawning physical
-work and release it only after teardown. Hype integration, result/request/image limits,
+work and release it only after teardown. Host integration, result/request/image limits,
 analysis approvals/usage, immutable adoption, native execution and original acceptance
 remain open. No source cap, tool registry, provider route, release flag or push changes.

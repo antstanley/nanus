@@ -14,7 +14,8 @@ function encoder omits `strict`. Its accumulator handles function calls and disp
 but does not retain encrypted reasoning output items. The domain's `AssistantReplay` accepts
 only `anthropic.messages`. Exact Responses routing therefore does not yet establish complete
 stateless reasoning continuity or preservation of a caller's optional function parameters.
-Hype's immutable adoption deliberately refuses OpenAI configuration until both gaps are closed.
+The downstream consumer's immutable adoption deliberately refuses OpenAI configuration until
+both gaps are closed.
 
 The current [function-calling contract](https://developers.openai.com/api/docs/guides/function-calling)
 says omitted strictness allows Responses schema normalization; explicit `strict: false`
@@ -85,7 +86,8 @@ For explicit strict, emit `strict: true` and reject incompatible schemas before 
 never silently rewrite required fields or insert nullable alternatives. Keep Chat's existing
 shape/default unchanged unless the caller explicitly selects the equivalent Chat policy.
 The encoder used for estimation and dispatch must be the same implementation.
-Hype will select non-strict for its existing schemas and retain native argument validation.
+The downstream consumer will select non-strict for its existing schemas and retain native
+argument validation.
 
 The strict inlined subset also applies the current documented aggregate property, nesting,
 enum and identifier/value-string ceilings; unsupported references/keywords refuse without
@@ -245,7 +247,7 @@ Preservation checks compare original observed bytes and bound replay receipts; p
 remains authoritative for cryptographic validity. Do not claim local ciphertext verification.
 
 The existing 4 MiB complete serialized Nanus record bound and protocol-specific closed item validation
-remain mandatory beyond this shape. Hosts may impose stricter bounds, including Hype's 1 MiB complete event-line cap. Actual deserialization, estimation and replay admission
+remain mandatory beyond this shape. Hosts may impose stricter bounds, such as a 1 MiB complete event-line cap. Actual deserialization, estimation and replay admission
 must enforce these constraints; this fragment alone does not establish their implementation.
 
 ## Implementation pointers and acceptance
@@ -290,9 +292,10 @@ URL from checked configuration. Truncated completion executes no pending calls; 
 completed output survives reload and is replayed after the next human turn. Redirect refusal
 is observed with a second listening origin receiving no connection.
 
-This candidate remains unpublished. Hype still pins public ee1 and refuses OpenAI readiness;
-immutable publication/adoption, host original-record/batch authority and live/native acceptance
-remain required. Stock composition does not automatically opt in or access new credentials.
+This candidate remains unpublished. The downstream consumer still pins public ee1 and refuses
+OpenAI readiness; immutable publication/adoption, host original-record/batch authority and
+live/native acceptance remain required. Stock composition does not automatically opt in or
+access new credentials.
 
 ### Supported item-schema evidence
 
@@ -303,8 +306,8 @@ schema explicitly distinguishes incomplete added ciphertext from completed done 
 The [`ResponseOutputMessage`](https://raw.githubusercontent.com/openai/openai-python/becc1d20eed83c1b8d85e15dc131a372d9dc7813/src/openai/types/responses/response_output_message.py)
 schema records assistant phase, and
 [`ResponseOutputText`](https://raw.githubusercontent.com/openai/openai-python/becc1d20eed83c1b8d85e15dc131a372d9dc7813/src/openai/types/responses/response_output_text.py)
-defines the four retained annotation variants. Original file SHA-256 receipts are captured
-in `/private/tmp/hype-responses-resume/primary-schema/evidence.json`.
+defines the four retained annotation variants. Original file SHA-256 receipts were captured
+locally, outside the repository.
 
 This preparation accepts completed ordinary function calls, assistant output/refusal text,
 empty reasoning with nonempty opaque ciphertext and the documented annotation metadata.
@@ -330,7 +333,7 @@ feature or of local cryptographic validation. Exact-model live acceptance remain
 
 ### Host integration findings and additional acceptance — 5 October 2026
 
-The isolated Hype consumer of sealed Nanus
+The isolated downstream consumer of sealed Nanus
 `eeba343848e614c7cd74dbb19c35062f5c87aff4` now constructs explicit non-strict stateless
 Responses and proves actual decoder → app worker → completed checkpoint → same-prompt resume
 with original reasoning/message items. These fictional streams establish local continuity only.
@@ -338,25 +341,27 @@ Production app startup remains unavailable before credential access. Native tool
 changing trusted instructions are additional requirements, not consequences of adapter admission.
 
 1. **Trusted instruction revisions.** A host's ordinary prompt may legitimately change between
-   completed turns. Hype reproduces rejection after publishing a brief that selects its music
-   prompt module: `source_prefixes` compares old receipts against the current System message and
-   controls. Add an explicit host-owned revision mechanism that retains each historical instruction
-   version and validates each original receipt against the version actually dispatched. Keep the
-   current instructions in the new request. Version the durable evidence as needed; reject missing,
-   crossed, reordered or model-invented revision evidence. Changes to prior user/tool/assistant
-   records, model/effort/endpoint/schema/strictness controls still refuse. Do not recompute stored
-   receipts over altered history, freeze old instructions, silently start a fresh session or discard
-   history. Nanus receives ordinary text and opaque host revision identity, never brief/skill/plugin
-   concepts. The exact versioned representation must be reviewed before implementation; the existing
-   `ReplayContext` schema above is unchanged until that representation is specified and implemented.
+   completed turns. The downstream consumer reproduces rejection after publishing a brief that
+   selects a different prompt module: `source_prefixes` compares old receipts against the current
+   System message and controls. Add an explicit host-owned revision mechanism that retains each
+   historical instruction version and validates each original receipt against the version actually
+   dispatched. Keep the current instructions in the new request. Version the durable evidence as
+   needed; reject missing, crossed, reordered or model-invented revision evidence. Changes to prior
+   user/tool/assistant records, model/effort/endpoint/schema/strictness controls still refuse. Do
+   not recompute stored receipts over altered history, freeze old instructions, silently start a
+   fresh session or discard history. Nanus receives ordinary text and opaque host revision
+   identity, never brief/skill/plugin concepts. The exact versioned representation must be
+   reviewed before implementation; the existing `ReplayContext` schema above is unchanged until
+   that representation is specified and implemented.
 2. **Pure prospective estimates.** Return checked complete costs for valid bounded prospective
    candidates even when the cost exceeds the selected request budget. Such estimates convey no
    permission or dispatch receipt. Actual preparation/transport still rejects oversized requests.
-   Preserve original-source and complete final-batch substitution checks. Hype's native image batch
-   currently reaches the real estimator but its worst bounded failure alternative does not fit:
-   39,524 estimated input tokens before the alternative plus the 8,192-token output reservation
-   leaves insufficient room for the complete escaped failure. Separating measurement from dispatch
-   is necessary for consistent caller budgeting, but alone does not make this batch fit. Require
+   Preserve original-source and complete final-batch substitution checks. The downstream
+   consumer's native image batch currently reaches the real estimator but its worst bounded
+   failure alternative does not fit: 39,524 estimated input tokens before the alternative plus
+   the 8,192-token output reservation leaves insufficient room for the complete escaped failure.
+   Separating measurement from dispatch is necessary for consistent caller budgeting, but alone
+   does not make this batch fit. Require
    consumer evidence of a sound complete envelope and actual image/text tool execution under its
    original limits; no lowered result allowance or silent context-budget increase counts as a fix.
    Also repair and test Responses image accounting: the sealed shared estimator subtracts encoded
@@ -383,7 +388,7 @@ Windows and packaged acceptance remain separate gates.
 original, and capacity must be admitted before effects. Resolution: app `turns::snapshot` selects
 ordinary prompt modules; Nanus `responses/request.rs::controls` and `source_prefixes` bind current
 instructions to every old receipt; `prepare_mode` invokes `validate_estimate` even for prospective
-measurement. Trace: completed original response → new music prompt → refusal before HTTP; original
+measurement. Trace: completed original response → newly selected prompt → refusal before HTTP; original
 image/text calls → worst failure cost → refusal before tool-action audit. Same-prompt completed
 replay succeeds. Verdict: **PARTIAL** integration; the guard prevents premature readiness, while
 these three generic seams and their consumer proofs remain implementation work. No protocol/source

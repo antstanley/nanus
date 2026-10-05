@@ -2,11 +2,11 @@
 
 **Status:** Proposed · **Date:** 2026-10-01 · **Owner:** Ant Stanley · **Target:** Nanus library crates
 
-Make the existing Nanus runner usable inside a desktop Rust application with caller-owned adapters, per-call policy and wakeable cancellation, and preserve image tool results through persistence and provider requests. Hype Studio is the first consumer. This proposal changes library seams; it adds no Claude plugin loading, skill discovery, desktop UI, web tools or studio-specific tools.
+Make the existing Nanus runner usable inside a desktop Rust application with caller-owned adapters, per-call policy and wakeable cancellation, and preserve image tool results through persistence and provider requests. A downstream desktop host embedding the runner is the first consumer. This proposal changes library seams; it adds no Claude plugin loading, skill discovery, desktop UI, web tools or app-specific tools.
 
 ## Motivation
 
-Hype Studio is replacing its Claude SDK/Node agent sidecar with an embedded Rust library. Nanus already exposes its runner and ports, but `nanus-bundle` pulls concrete Unix adapters into every consumer, the default approval gate skips argument-aware checks for reads, cancellation can wait on an idle stream, and images are reduced to text before reaching a model.
+The embedding host is replacing its Claude SDK/Node agent sidecar with an embedded Rust library. Nanus already exposes its runner and ports, but `nanus-bundle` pulls concrete Unix adapters into every consumer, the default approval gate skips argument-aware checks for reads, cancellation can wait on an idle stream, and images are reduced to text before reaching a model.
 
 Keep one agent loop and the existing CLI/TUI/service behavior. Add reusable library contracts at their actual boundaries so a caller supplies its own keychain, process supervision, prompts, tools and policy. A skill is ordinary trusted system-prompt text supplied to `AgentRunner::new`; it needs no new loader or plugin protocol.
 
@@ -62,15 +62,15 @@ Nanus currently documents its canonical architecture and behavior in `docs/`, no
 >
 > The separate OpenAI Responses encoder returns `unsupported-image-protocol` before HTTP for image-bearing requests in this change. Its existing subscription/OAuth text flow and the z.ai/DeepSeek text encoders retain their behavior. No arbitrary model ID, endpoint alias, provider label or stored session header enables an image profile automatically.
 >
-> Validate PNG/JPEG media type against decoded magic bytes; reject malformed base64, empty images, conflicting type, more than four image blocks per result, image file bytes over 512 KiB each, and tool-result serialized records over 4 MiB before retaining them. Hype Studio imposes its own stricter 1 MiB record cap. Library limit failures are typed/model-visible failures, not panics. Memory validation checks encoded size before base64 decoding, reads bounded dimensions from verified PNG/JPEG data before pixel allocation, and rejects dimensions outside the enabled profile. No profile may allocate an unbounded decompression buffer. Transcript renderers show summaries and never print base64.
+> Validate PNG/JPEG media type against decoded magic bytes; reject malformed base64, empty images, conflicting type, more than four image blocks per result, image file bytes over 512 KiB each, and tool-result serialized records over 4 MiB before retaining them. The embedding host imposes its own stricter 1 MiB record cap. Library limit failures are typed/model-visible failures, not panics. Memory validation checks encoded size before base64 decoding, reads bounded dimensions from verified PNG/JPEG data before pixel allocation, and rejects dimensions outside the enabled profile. No profile may allocate an unbounded decompression buffer. Transcript renderers show summaries and never print base64.
 >
 > Extend context estimation with the dimension-based profile charges below, plus text/system/tool-schema/framing costs and the actual configured output/reasoning reservation. Use checked integer arithmetic with upward rounding; overflow and missing profile/ceiling metadata are pre-HTTP failures. Estimate against the assembled request after encoder translation, counting replayed images every time and charging attachment labels once. Bound serialised model requests to 4 MiB and eight images, in addition to the existing result/session caps; count encoded bytes separately from image tokens. Keep whole-turn drop-oldest behavior, preserve call/result/attachment groups and report elision; if the current turn alone cannot fit, return a typed context-limit failure without HTTP. Estimates are safety reservations, not provider billing or a promise that an endpoint cannot reject a request. No price catalogue or dollar-cost estimator is added.
 
 #### Embedding audit: exact protocol, text-model ceilings and pre-event bounds
 
-The Hype integration audit of pinned revision `479f6de5fcab18899e5eb0e3268d4316ee8efe08` found three remaining generic seams. This evidence supplements the historical implementation section below; it does not claim the remaining work shipped.
+A downstream integration audit of pinned Nanus revision `479f6de5fcab18899e5eb0e3268d4316ee8efe08` found three remaining generic seams. This evidence supplements the historical implementation section below; it does not claim the remaining work shipped.
 
-- **Exact protocol selection.** `OpenAiConfig::set_protocol(ChatCompletions)` is overridden by `protocol_for` for current OpenAI model ids. Add a caller-selected exact protocol preference alongside the existing automatic routing. Automatic remains the stock default; Exact either uses that protocol or returns a typed unsupported error before HTTP. Never silently redirect an exact Chat Completions request to Responses. Capability/image-profile queries must use the actual configured vendor, endpoint and protocol, and tests must cover automatic routing, both exact preferences and protocol-mismatched images. Hype's current proposal still requires Chat Completions; upstream Responses evidence does not satisfy that gate. Whether Hype adopts Responses is an explicit consumer decision.
+- **Exact protocol selection.** `OpenAiConfig::set_protocol(ChatCompletions)` is overridden by `protocol_for` for current OpenAI model ids. Add a caller-selected exact protocol preference alongside the existing automatic routing. Automatic remains the stock default; Exact either uses that protocol or returns a typed unsupported error before HTTP. Never silently redirect an exact Chat Completions request to Responses. Capability/image-profile queries must use the actual configured vendor, endpoint and protocol, and tests must cover automatic routing, both exact preferences and protocol-mismatched images. The host's current proposal still requires Chat Completions; upstream Responses evidence does not satisfy that gate. Whether the host adopts Responses is an explicit consumer decision.
 - **Text-model ceilings.** The pinned DeepSeek adapter inherits unknown capabilities and z.ai receives the OpenAI adapter's unknown metadata. Populate optional input/context/output ceilings for each offered API model from independently checked provider documentation, with exact-model entries and source/evidence references. No provider-wide guess, alias fallback or custom-model inheritance is permitted. Preserve Unsupported/Unknown image input for text-only combinations. Tests prove valid output reservations fit each entry, invalid ceilings refuse before HTTP, and custom ids stay unknown. Stock text behavior is preserved when no embedding ceiling requirement is selected; an embedding consumer may refuse incomplete metadata.
 - **Bounds before events.** The pinned `SseFrames::push` extends an unbounded pending byte vector before producing events, so a consumer's event-byte limit cannot bound an unterminated SSE line. Add opt-in adapter transport/decoder limits selected by callers before streaming: partial line and decoded-event bytes, total response bytes, event count and tool-call slots. Check remaining capacity before extending buffers or allocating decoded values; a large chunk cannot be buffered first and checked later. Bound non-success response bodies before decoding rather than calling unbounded `Response::text`. On overflow return one ordinary typed/model error, close/drop the response, and preserve no partial assistant replay as a completed response. Fragmented UTF-8, exact-bound and one-over-bound lines/chunks, many small events, excessive indexed calls, oversized error bodies and quiet cancellation must have fixtures. The consumer still owns its request/turn deadlines and cancellation policy; no desktop/setup/prompt concepts enter Nanus.
 
@@ -95,8 +95,8 @@ subscription endpoints. Chat and custom endpoints remain Unknown; no Chat image 
 Exact Responses output controls follow the actual endpoint, while Automatic retains stock plan
 handling. An explicit ceiling that the exact endpoint cannot honor is refused before HTTP.
 See [the exact-protocol review](2026-10-02-exact_protocol.review.md) for nine fixtures and all required
-verification gates. This is unpublished local work and does not adopt a new Hype dependency pin or
-change Hype's proposed Chat contract; text-model ceiling metadata remains open.
+verification gates. This is unpublished local work and does not adopt a new downstream dependency pin or
+change the host's proposed Chat contract; text-model ceiling metadata remains open.
 
 #### Provider admission evidence and tool-support seam — 2026-10-03
 
@@ -147,14 +147,14 @@ Verification: 48 DeepSeek tests pass; warning-denying all-target/all-feature wor
 Clippy and rustfmt pass. Minimal embedding passes 139 tests and two doctests; standalone
 consumers pass seven tests without providers and ten with explicit synthetic providers;
 the runtime-free TUI passes 342 tests and warning-denying Clippy. An isolated copy of the
-actual Hype provider wrapper passes three local-path metadata/budget/identity fixtures.
+actual host provider wrapper passes three local-path metadata/budget/identity fixtures.
 The complete stock-feature Nanus suite and workspace doctests were not run in this audit:
 stock composition and the shipped secret-chain fixture can consult the user's native
 credential stores, which a temporary `NANUS_HOME` does not isolate. These safe gates do not
 substitute for that remaining hermetic full-workspace gate, immutable publication/adoption,
-generic tool-support metadata, z.ai ceilings or live/platform acceptance. Hype's published
+generic tool-support metadata, z.ai ceilings or live/platform acceptance. The host's published
 pin, tool registry and production files remain unchanged. Source hashes and actual failed,
-corrected and final logs are retained under `/private/tmp/hype-provider-admission`.
+corrected and final logs were kept locally, outside the repository.
 
 **Additional generic seam, proposed:** add a defaulted local
 `LlmPort::tool_call_support(model, request_effort)` query returning
@@ -214,14 +214,14 @@ No protocol, selected model, default effort or seven-tool registry change is mad
 Fourteen new fixtures pass within 262 affected-crate tests and one port doctest. Final rustfmt,
 warning-denying workspace Clippy, minimal-bundle lint/139 tests/two doctests, runtime-free TUI
 lint/342 tests and locked standalone consumers (seven without providers, ten with synthetic
-providers) pass. The isolated Hype wrapper spike passes three prior metadata fixtures and one
+providers) pass. The isolated host wrapper spike passes three prior metadata fixtures and one
 new four-model forwarding/replay/selection fixture after explicit temporary admission and
 query-delegation changes. It is a prototype, not a production-source or immutable-pin update;
-Hype's current wrapper would otherwise retain the legacy Unknown trait default.
+the host's current wrapper would otherwise retain the legacy Unknown trait default.
 
 Initial lifetime/constructor-order lint failures were corrected without suppression, and the
 Anthropic no-contact fixture now has a timeout. Actual failed and final logs, guarded source
-baselines and the isolated host copy are retained under `/private/tmp/hype-tool-support`.
+baselines and the isolated host copy were kept locally, outside the repository.
 The complete stock-feature suite and workspace doctests remain explicitly unrun because their
 native credential lookups are not isolated by `NANUS_HOME`. Native Windows, exact live-wire
 acceptance, z.ai ceilings, published immutable adoption and app `read_video` ports remain gates.
@@ -241,11 +241,11 @@ For both models, the [Anthropic vision contract](https://platform.claude.com/doc
 | `gpt-6-astra` / OpenAI / Chat Completions                    | `openai-astra-high-patch32-v1`: PNG/JPEG, both dimensions 1–1024, file bytes ≤512 KiB; fixed `detail=high`              | `ceil(6 × ceil(width/32) × ceil(height/32) / 5)`              | Captured grouped tool-results then labelled user attachments, no duplicated/orphaned results, PNG/JPEG decode equality, v2 reload and one recorded live tool/image follow-up accepted by this exact model |
 | OpenAI Responses; DeepSeek; z.ai; every other model/protocol | No profile in this change                                                                                               | No guessed fallback                                           | Unknown/Unsupported; image input fails before HTTP, text regressions still pass                                                                                                                           |
 
-The selected bounded sizes fit the documented patch regimes without relying on provider resizing. Charge each image `ceil(5 × (base_charge + 32) / 4)`: 32 tokens for image framing and 25% safety headroom are library policy, not billed image tokens. At 1024×1024, the reserved charges remain 1752 for either Anthropic model and 1577 for OpenAI. At the Anthropic native maximum of 4784 visual patches (for example, 2576×1456), reserve 6020 tokens. Reject an overlong edge or excessive patch count before HTTP even if compressed bytes fit; Hype Studio still supplies inspection images within its separate 1024×1024 app bound. Image header dimensions must agree with successfully decoded media; small compressed files with excessive dimensions are refused. The library does not resize or crop; callers must provide a bounded inspection image, retaining original full-resolution files separately. These formulas are based on the current [Anthropic vision contract](https://platform.claude.com/docs/en/build-with-claude/vision) and [OpenAI image-input contract](https://developers.openai.com/api/docs/guides/images-vision), retrieved 2026-10-01; the per-profile restrictions, byte/count caps and safety margin are library policy. Native-size and padding interpretation follows [Anthropic’s coordinate/resizing guide](https://platform.claude.com/docs/en/build-with-claude/vision-coordinates); the caller supplies an image already inside both native bounds, so neither encoder nor provider resizing is needed for a supported request.
+The selected bounded sizes fit the documented patch regimes without relying on provider resizing. Charge each image `ceil(5 × (base_charge + 32) / 4)`: 32 tokens for image framing and 25% safety headroom are library policy, not billed image tokens. At 1024×1024, the reserved charges remain 1752 for either Anthropic model and 1577 for OpenAI. At the Anthropic native maximum of 4784 visual patches (for example, 2576×1456), reserve 6020 tokens. Reject an overlong edge or excessive patch count before HTTP even if compressed bytes fit; the embedding host still supplies inspection images within its separate 1024×1024 app bound. Image header dimensions must agree with successfully decoded media; small compressed files with excessive dimensions are refused. The library does not resize or crop; callers must provide a bounded inspection image, retaining original full-resolution files separately. These formulas are based on the current [Anthropic vision contract](https://platform.claude.com/docs/en/build-with-claude/vision) and [OpenAI image-input contract](https://developers.openai.com/api/docs/guides/images-vision), retrieved 2026-10-01; the per-profile restrictions, byte/count caps and safety margin are library policy. Native-size and padding interpretation follows [Anthropic’s coordinate/resizing guide](https://platform.claude.com/docs/en/build-with-claude/vision-coordinates); the caller supplies an image already inside both native bounds, so neither encoder nor provider resizing is needed for a supported request.
 
 For each claimed profile, check in evidence naming the exact model/protocol, Nanus revision, profile version, primary contract/date, request-fixture digest and successful live verification date. Fixture tests decode captured pixels and compare call/result/attachment order both fresh and after store reload. Live verification uses a fictional tiny image with an objective expected feature and a second turn that references the same call; do not infer acceptance from HTTP status alone. Missing credentials leaves the profile Unknown and its live gate unpassed. A contract/profile change invalidates prior evidence; a model/protocol switch rechecks every retained image against the new profile before request assembly. Store bodies remain model-neutral typed content; attachment messages are derived on each request and are never appended as extra user turns to the durable log.
 
-`ModelCapabilities` carries optional `image_profile`, `context_window_tokens`, `max_input_tokens` and `max_output_tokens` beside `image_input`. `ImageProfile` is local validated metadata (profile/version, pixel/byte/count/request limits and checked dimension-to-token estimator), not a serialised tool schema. The configured request’s maximum output plus any separately bounded reasoning must fit the metadata; for Hype Studio the combined reservation is explicitly set to at most 8192 tokens. Preflight requires estimated input ≤model input ceiling and input + reservation ≤min(caller context budget, model context ceiling); no automatically substituted output budget may bypass this check. Existing fake adapters default to unknown capabilities; stock text-only behavior does not acquire new mandatory metadata by accident.
+`ModelCapabilities` carries optional `image_profile`, `context_window_tokens`, `max_input_tokens` and `max_output_tokens` beside `image_input`. `ImageProfile` is local validated metadata (profile/version, pixel/byte/count/request limits and checked dimension-to-token estimator), not a serialised tool schema. The configured request’s maximum output plus any separately bounded reasoning must fit the metadata; for the embedding host the combined reservation is explicitly set to at most 8192 tokens. Preflight requires estimated input ≤model input ceiling and input + reservation ≤min(caller context budget, model context ceiling); no automatically substituted output budget may bypass this check. Existing fake adapters default to unknown capabilities; stock text-only behavior does not acquire new mandatory metadata by accident.
 
 ### N5. Sessions → What a session is; What a session says about itself; Resuming (Modify)
 
@@ -372,7 +372,7 @@ Baseline: local working copy was clean, parent `d1ee7deb80f6c82f2d2d67d0f4c6cf8e
 | `crates/nanus-adapter-store/src/store.rs`; `nanus-tui/src/`; `nanus-link/src/server.rs`                                                    | Read/save bounds, log compatibility, text-only display projection, persist-before-Done regression checks  |
 | `crates/nanus-bundle/tests/composition.rs`, `end_to_end.rs`, `live_wire.rs`; adapter live-wire tests                                       | Feature-specific helpers and controlled/multimodal integration fixtures                                   |
 
-The Hype Studio consumer proposal is [Embed Nanus in a Rust agent host](../../../hype-studio/.specs/changes/2026-09-30-embed_nanus_rust_agent.md). Nanus owns reusable runner/policy/cancellation/content capability; Hype Studio owns the skill prompt template, questions, fetch/search, studio tool executors, keychain, lifecycle, recovery and Tauri channels.
+The consumer's own proposal, to embed Nanus in a Rust agent host, lives outside this repository. Nanus owns reusable runner/policy/cancellation/content capability; the host owns the skill prompt template, questions, fetch/search, app-specific tool executors, keychain, lifecycle, recovery and its UI channels.
 
 Implementation order: feature isolation and a Windows minimal compile fixture; ToolPolicy/TurnControl with fake ports; typed content + dual-version session reader; exact-profile image encoders/context preflight/capability refusal; renderer/projection regressions and docs. The app consumes the resulting immutable tested Nanus revision. Local path dependencies are only for the development spike.
 
@@ -388,11 +388,11 @@ and retains an opaque thread-safe owner; `retain_owner` lets physical decoder wo
 retain it through teardown. The constructor performs no I/O and does not authenticate
 the file or its scope. Stock TempDir cleanup now uses the same final-reference lifetime,
 with existing source copy/hash/bounds unchanged. This closes the private cleanup-field
-barrier to caller `VideoSource` implementations; it does not supply Hype's actual
+barrier to caller `VideoSource` implementations; it does not supply the host's actual
 bounded media adapter, decoder, routing, approvals or image/result accounting.
 See the [video proposal](2026-10-01-read_video_extension.md#caller-owned-snapshot-seam--2026-10-03)
 and [certificate](2026-10-03-video_snapshot.review.md) for demonstrated checks and limits.
-The seam remains local unpublished work; no skill/plugin knowledge or Hype pin change.
+The seam remains local unpublished work; no skill/plugin knowledge or downstream pin change.
 
 ### Local z.ai API admission implementation — 2026-10-03
 
@@ -424,7 +424,7 @@ model pages provide contract evidence; local fixtures use fictional keys and loo
 transport only. The [semi-formal certificate](2026-10-03-zai_api_admission.review.md)
 records source resolution, corrected findings, tests and remaining limitations.
 
-This is local unpublished functionality. Hype still consumes its earlier immutable
+This is local unpublished functionality. The host still consumes its earlier immutable
 revision and has not adopted these metadata/admission APIs. Live provider wire/tool
 follow-ups, image profiles, native Windows evidence and original embedding acceptance
 remain open. No skill/plugin/template concept, toolset count or stock video authority
@@ -456,13 +456,13 @@ the recorded acceptance criteria are satisfied.
 2. Apply N1–N7 to the named existing docs headings, remove superseded image-placeholder-only/model-limit claims where changed and retain limits still true for CLI/link/service. Preserve unrelated known documentation drift.
 3. Align Rust serializers/contracts with the inline fragment and acceptance fixtures. There is no global canonical-schema file to regenerate; do not create one merely to copy these Rust types.
 4. Update public API examples and AGENTS.md where feature/build or body-version instructions change; report the downgrade limit. Keep normal prompt-template text as the whole skill contract.
-5. Set status Merged and date, move to `changes/merged/`, fix relative links and update `.specs/README.md`, `docs/README.md` and the Hype Studio dependency/review links together. Record the tested revision for the app.
+5. Set status Merged and date, move to `changes/merged/`, fix relative links and update `.specs/README.md`, `docs/README.md` and any downstream dependency/review links together. Record the tested revision for the app.
 
 ## Assumptions and open questions
 
 **Assumptions**
 
-- Hype Studio supplies platform filesystem/process/secret ports; Windows support is required for that embedded subset, not the existing Unix link/service.
+- The embedding host supplies platform filesystem/process/secret ports; Windows support is required for that embedded subset, not the existing Unix link/service.
 - The same owner controls both repositories and requested an upstream proposal here on 30 September 2026.
 - Model capabilities and image/tool endpoint shapes require wire fixtures plus live verification; provider labels alone do not prove them.
 
@@ -476,7 +476,7 @@ the recorded acceptance criteria are satisfied.
 - _Vision profiles._ **Exact model/protocol profiles with recorded accepted-wire/reload evidence.** Chosen on 1 October 2026 to close the review’s capability ambiguity; unknown mappings stay disabled.
 - _Image budget._ **Dimension-based patch charges, explicit output/reasoning reservation and bounded image requests.** Replaces the uncalibrated universal 8192-token image estimate while retaining explicit safety headroom.
 - _Skills._ **Ordinary system-prompt templates supplied by callers.** Explicit user instruction: add no Claude plugin support.
-- _App tools._ **Questions, web fetching/search and studio operations stay in Hype Studio.** They use the existing generic ToolExecutor seam and do not enlarge Nanus's seven-tool default set.
+- _App tools._ **Questions, web fetching/search and app-specific operations stay in the host.** They use the existing generic ToolExecutor seam and do not enlarge Nanus's seven-tool default set.
 
 **Open questions**
 

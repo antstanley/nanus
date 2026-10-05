@@ -103,7 +103,7 @@ Physical decoder workers clone `retain_owner()` and keep that lease through proc
 reader join, so call cancellation cannot remove a still-owned copy. Stock FsSource's
 existing TempDir/copy behavior is preserved. This local unpublished seam and its
 [certificate](../.specs/changes/2026-10-03-video_snapshot.review.md) do not establish
-Hype integration, image budget acceptance or native Windows execution.
+downstream host integration, image budget acceptance or native Windows execution.
 
 Off unless `read_video = true`. Needs `ffmpeg` and `ffprobe` (on `PATH`, or in `ffmpeg_dir`); the
 agent refuses to start without them, or with a build that lacks the WebM/Matroska, MP4/MOV, AVI
@@ -299,7 +299,7 @@ remembered selection, wins over that default.
   selects omitted/default, explicit false or explicit true. The two actual OpenAI encoders retain
   the caller's schema; false preserves optional parameters, while true refuses schemas outside
   the bounded supported strict subset before estimation/HTTP. Non-OpenAI vendors refuse an explicit
-  policy. This local candidate is unpublished and is not Hype's pinned dependency.
+  policy. This local candidate is unpublished and is not a downstream host's pinned dependency.
 - **Responses replay decoder (local preparation).** `responses::StreamAccumulator::with_prefix`
   retains ordered completed encrypted reasoning/message/function items under fixed response bounds.
   Deltas, identities, phase and terminal output must agree before replay/calls/completion release.

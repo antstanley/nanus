@@ -22,14 +22,13 @@ All 249 frozen runtime/config/test inputs remain unchanged. Six actual HTTP fixt
 original record/batch ownership, strict Responses transport, reload and whole-turn fitting,
 and refusal before any executor. Twenty-two added runner cases include the prior record
 fixtures and three reconciliation regressions. Ninety-four reviewed functions are at most
-60 lines. Suites overlap. The separate actual Hype capacity consumer passes five cases and
-locked Clippy; Hype's full verifier passes 1083 Rust and 132 frontend tests with 17 explicit
-native/manual acceptance ignores.
+60 lines. Suites overlap. The downstream host's separate capacity consumer passes five cases
+and locked Clippy, and the downstream host's own full verifier also passes.
 
 The [combined certificate](../.specs/changes/2026-10-05-record_responses_reconciliation.review.md)
 records fixed old-turn cancellation answers, runner-side Responses parsing before host
-counting, duplicate merge methods and fixture/dependency lifetime findings. Evidence is in
-`/private/tmp/hype-record-responses`. The candidate is local/unpublished; original production
+counting, duplicate merge methods and fixture/dependency lifetime findings. Evidence was kept
+locally, outside this repository. The candidate is local/unpublished; original production
 host authority/adoption and live/native/platform acceptance remain open. No paid provider,
 real credential store or personal Chrome was used.
 
@@ -47,10 +46,11 @@ production still derives the fixed public endpoint and opts in only when explici
 
 The [transport certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#explicit-transportprospective-estimation-certificate--5-october-2026)
 records fixed redirect, accepted-socket mode, actual context-budget selection and minimal dev-
-dependency findings. Logs/source receipts are in `/private/tmp/hype-responses-transport`.
-No publication, Hype pin/readiness change, paid model, real credential store or native execution
-is claimed. Windows compilation covers the minimal library, not the OpenAI transport's native
-runtime. All previously required host/platform/live acceptance remains separate.
+dependency findings. Logs/source receipts were kept locally, outside this repository. No
+publication, downstream dependency pin/readiness change, paid model, real credential store or
+native execution is claimed. Windows compilation covers the minimal library, not the OpenAI
+transport's native runtime. All previously required host/platform/live acceptance remains
+separate.
 
 ## Original/fitted Responses request preparation — 2026-10-04
 
@@ -67,7 +67,7 @@ records corrected encrypted-content inclusion, aggregate image-cap timing, opaqu
 folding, controls-before-clone bounds and internal receipt boxing. Four request cases exercise
 exact original items and body/source hashes, fitting and changed controls/source/batch refusals;
 three projection, two history and two additional domain cases cover the adjacent contracts.
-Logs and source receipts are in `/private/tmp/hype-responses-context`; 153 new-file functions
+Logs and source receipts were kept locally, outside this repository; 153 new-file functions
 are at most 59 lines. The candidate is local/unpublished. Stock transport and prospective
 final-batch integration are incomplete; credential-aware stock composition, native Windows
 execution and exact-model live acceptance remain unrun. No real credentials or API were used.
@@ -86,11 +86,12 @@ Windows MSVC-target domain/ports/minimal-library Clippy passes; native execution
 
 Runtime/source/config inputs were frozen; only OpenAI-local files changed after the earlier
 minimal/TUI gates, and the final affected gates were repeated with no frozen-input drift.
-Evidence is in `/private/tmp/hype-responses-resume`; the
+Evidence was kept locally, outside this repository; the
 [certificate](../.specs/changes/2026-10-04-responses_replay_and_schema_policy.review.md#local-decoderpolicy-patch-certificate--4-october-2026)
 records the corrected phase/usage, envelope-before-clone, provider ceilings and stock-default
-findings. The candidate is unpublished. No Hype pin change, paid request, real credential
-lookup, personal Chrome, native Windows execution or complete stateless replay is claimed.
+findings. The candidate is unpublished. No downstream dependency pin change, paid request,
+real credential lookup, personal Chrome, native Windows execution or complete stateless replay
+is claimed.
 Credential-aware stock composition and exact-model live gates remain unrun.
 
 ## Optional complete-batch admission — 2026-10-03
@@ -108,9 +109,9 @@ also compile in final workspace Clippy.
 
 The [certificate](../.specs/changes/2026-10-03-tool_batch_admission.md#semi-formal-proposal-review)
 records fixed incomplete-call projection and private-value normalization findings.
-Failed and final logs remain under `/private/tmp/hype-tool-admission`. Credential-aware
+Failed and final logs were kept locally, outside this repository. Credential-aware
 stock workspace tests/doctests and native Windows execution remain unrun. This seam
-is local and unpublished; no Hype immutable adoption or consumer complete-budget
+is local and unpublished; no immutable downstream adoption or consumer complete-budget
 implementation, secret store, personal Chrome or paid model use is inferred.
 
 ## Declared image file-byte enforcement — 2026-10-03
@@ -127,10 +128,10 @@ Formatting, whole-workspace all-target/all-feature warning-denying Clippy, minim
 bundle Clippy, three domain/minimal-bundle doctests, standalone embedded default
 (7 tests) and providers (10 tests), and Windows-target domain/minimal-bundle library
 Clippy pass. The [certificate](../.specs/changes/2026-10-03-enforce_image_envelope_bytes.md#semi-formal-proposal-review)
-and `/private/tmp/hype-image-envelope` logs record scope. Credential-aware stock
+and logs kept locally, outside this repository, record scope. Credential-aware stock
 workspace tests/doctests and native Windows execution remain unrun. No actual secret
-or personal browser is used. The app's immutable pin is not changed by this fix;
-full-request/token/analysis admission and original video acceptance remain separate.
+or personal browser is used. The downstream host's immutable pin is not changed by this
+fix; full-request/token/analysis admission and original video acceptance remain separate.
 
 ## Caller-owned video snapshot checks — 2026-10-03
 
@@ -145,12 +146,12 @@ Existing FFmpeg tests confirm stock source cleanup and pixels/codec/container be
 Initial fixture compilation used the private executor field and wrong outcome shape;
 the public ToolDefinition::execute/ToolResult.outcome API corrects it. Initial lint
 findings in the newly used owner field and its initializer were corrected without
-suppression. All source/doc baselines, failures and final logs are retained under
-`/private/tmp/hype-video-snapshot`; the [certificate](../.specs/changes/2026-10-03-video_snapshot.review.md)
+suppression. All source/doc baselines, failures and final logs were kept locally, outside
+this repository; the [certificate](../.specs/changes/2026-10-03-video_snapshot.review.md)
 traces lifetime and admission scope. No secret store, personal Chrome or paid model is
-used. Windows compile evidence does not establish execution. Hype's production pin,
-tool registration and original acceptance remain unchanged; credential-aware stock
-workspace tests/doctests remain explicitly unrun.
+used. Windows compile evidence does not establish execution. The downstream host's
+production pin, tool registration and original acceptance remain unchanged; credential-aware
+stock workspace tests/doctests remain explicitly unrun.
 
 ## Local z.ai API admission checks — 2026-10-03
 
@@ -170,8 +171,8 @@ The initial full workspace Clippy found an unqualified bundle port type; the cor
 run exits 0 with no suppression. Full stock composition/workspace doctests are deliberately
 unrun because they can read the real credential store; changing Nanus home is insufficient
 Keychain isolation. No live provider acceptance, image promotion, native Windows execution
-or immutable Hype adoption is inferred. The [certificate](../.specs/changes/2026-10-03-zai_api_admission.review.md)
-and retained `/private/tmp/hype-zai-admission` logs/baselines record the exact scope.
+or immutable downstream adoption is inferred. The [certificate](../.specs/changes/2026-10-03-zai_api_admission.review.md)
+and logs/baselines kept locally, outside this repository, record the exact scope.
 
 ## Earlier whole-repository baseline
 

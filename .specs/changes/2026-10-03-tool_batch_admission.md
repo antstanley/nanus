@@ -147,7 +147,7 @@ Provider messages omit durable call/step/goal records, so the projection now als
 exposes the actual event slice for full checkpoint admission. The complete-history
 fixture confirms old records remain and fabricated results are absent.
 Initial helper/fixture lint and render-newline expectations were corrected without
-suppression. Failed runs and final logs are retained under `/private/tmp/hype-tool-admission`.
+suppression. Failed runs and final logs were kept locally, outside the repository.
 
 **Regression/evidence.** Final credential-free domain/ports/minimal runner nextest
 passes 419 tests, no skips. Fifteen new actual-runner cases and one epoch unit cover
@@ -165,14 +165,14 @@ provider, native Windows execution or upstream publication is used or inferred.
 **Verdict.** LIKELY_CORRECT for the scoped local generic lifecycle. The consumer must
 still implement real complete request/token/audit/checkpoint envelopes, provider and
 authority epochs, failure slots and physical-worker ownership. Logical Drop and
-result refusal cannot stand for process join or rollback. Hype's published pin has
+result refusal cannot stand for process join or rollback. The consumer's published pin has
 not adopted this work; original video/provider/native acceptance remains open.
 
 ## Merge plan
 
 Canonical design/safety/testing/features/status pages and the spec index now record
 the scoped local implementation. Keep the broader video proposal partial until its host, provider and native gates pass.
-Do not publish the sibling repository or change Hype's immutable pin implicitly.
+Do not publish the consumer's repository or change its immutable pin implicitly.
 
 ## Assumptions and open questions
 

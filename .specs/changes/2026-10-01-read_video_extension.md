@@ -40,7 +40,7 @@ receipt bounds. Eleven library/snapshot tests and ten existing real FFmpeg regre
 pass; workspace warning-denying Clippy, formatting and Windows-target library Clippy
 pass. The package doctest command passes with zero examples. The
 [semi-formal certificate](2026-10-03-video_snapshot.review.md) records initial fixture/lint
-corrections and scope. This seam is unpublished and Hype has not adopted or registered
+corrections and scope. This seam is unpublished and the host has not adopted or registered
 the extension. Native Windows execution and original video/provider acceptance remain open.
 
 ## Generic returned-image byte enforcement — 2026-10-03
@@ -61,7 +61,7 @@ reservation callbacks and raw/normalized validation before progress. It passes 4
 credential-free domain/ports/minimal tests and 24 all-feature admission cases. This
 implements the generic lifecycle seam only; the host still owes complete result/wire/
 token/checkpoint budgets, source/worker/selection authority and analysis charges.
-Published 80a0f79b and Hype's pin lack it. Original native/provider/video gates remain open.
+Published 80a0f79b and the host's pin lack it. Original native/provider/video gates remain open.
 
 ## Implementation status, 2026-10-02
 

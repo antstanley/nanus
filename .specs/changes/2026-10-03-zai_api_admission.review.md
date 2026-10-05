@@ -1,10 +1,10 @@
 # Exact z.ai API admission — semi-formal certificate
 
-**Date:** 2026-10-03 · **Scope:** Local companion delta, not published or adopted by Hype
+**Date:** 2026-10-03 · **Scope:** Local companion delta, not published or adopted by the downstream host
 
 ## Premises
 
-P1. Hype requires independent exact-model text/output and ordinary tool evidence at
+P1. The host requires independent exact-model text/output and ordinary tool evidence at
 the actual configured API endpoint; a provider name or multimodal advertisement is
 insufficient. P2. Primary contracts distinguish API effort validation from Coding Plan
 server mappings. P3. Existing OpenAI routing/Responses metadata, Coding Plan/gateway
@@ -98,15 +98,15 @@ whole-workspace formatting passes.
 Minimal bundle nextest passes 139 tests; runtime-free TUI nextest passes 342 tests.
 The adapter doctest command passes with zero examples. Fixtures use fictional keys, local sockets
 and fake/caller-owned ports; no OS credential store or personal Chrome profile runs.
-Evidence and baseline/source hashes are retained under `/private/tmp/hype-zai-admission`.
+Evidence and baseline/source hashes were kept locally, outside the repository.
 
 Workspace stock composition tests and workspace doctests remain unrun because they
 can invoke the real credential store; a temporary Nanus home does not isolate macOS
 Keychain. New metadata reports documented ordinary tools, not a captured live model
 follow-up or image promotion. The stock Coding Plan currently selects FlashX while
 its model page says that variant is not yet available there; this pre-existing
-stock-plan issue is outside Hype's API-only seam and remains unresolved. Native
-Windows execution, immutable publication/adoption, Hype read_video ports and original
+stock-plan issue is outside the host's API-only seam and remains unresolved. Native
+Windows execution, immutable publication/adoption, host read_video ports and original
 live/platform/package/recovery gates remain separate. No branch is pushed.
 
 ## Verdict

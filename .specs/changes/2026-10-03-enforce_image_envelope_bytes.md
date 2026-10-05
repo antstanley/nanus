@@ -142,7 +142,7 @@ The mixed-batch fixture refuses an oversized second image in the first call whil
 retaining the valid next call's pixels and identities. No new envelope is activated
 on undeclared tools. This does not prove whole-request/token admission, host audit
 ordering or physical effect rollback. The immutable consumer fixture proves the
-published gap only; Hype's production pin remains unchanged by this local fix.
+published gap only; the consumer's production pin remains unchanged by this local fix.
 
 ## Local implementation and verification — 2026-10-03
 
@@ -159,7 +159,7 @@ actual-runner admission suite passes nine cases with no skips. Workspace
 all-target/all-feature warning-denying Clippy, minimal-bundle Clippy, formatting,
 three domain/minimal-bundle doctests, standalone embedded default (7 tests) and
 providers (10 tests), and Windows-target domain/minimal-bundle library Clippy pass.
-Logs and source evidence are retained under `/private/tmp/hype-image-envelope`.
+Logs and source evidence were kept locally, outside the repository.
 Credential-aware stock workspace tests/doctests and native Windows execution remain
 unrun. No secret, personal browser profile or paid request is used. The fix remains
 unpublished; original video/provider/platform acceptance is not closed by it.

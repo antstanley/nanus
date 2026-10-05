@@ -1,12 +1,12 @@
 # Semi-formal review: Responses policy and replay proposal
 
-**Date:** 2026-10-04 · **Scope:** the [proposed generic change](2026-10-04-responses_replay_and_schema_policy.md), against public Nanus ee1 and Hype B7. This file retains the initial specification review and subsequent scoped patch certificates; none establishes live-model acceptance.
+**Date:** 2026-10-04 · **Scope:** the [proposed generic change](2026-10-04-responses_replay_and_schema_policy.md), against public Nanus ee1 and the downstream consumer's revision under review. This file retains the initial specification review and subsequent scoped patch certificates; none establishes live-model acceptance.
 
 ## Premises
 
 P1. Public ee1 supplies exact routing/tool metadata/response budgets but omits Responses strictness and retains only display reasoning. Existing AssistantReplay validates Anthropic Messages exclusively.
 
-P2. Hype retains optional native tool parameters, manually persists completed sessions and requires encrypted reasoning and call/output continuity. It cannot compensate by dropping tools or changing the selected model.
+P2. The downstream consumer retains optional native tool parameters, manually persists completed sessions and requires encrypted reasoning and call/output continuity. It cannot compensate by dropping tools or changing the selected model.
 
 P3. Nanus remains a minimal provider-neutral harness. App prompts, installers, source authority and paid-analysis decisions remain outside it. Existing stock wire defaults and Anthropic replay must remain valid.
 
@@ -68,7 +68,7 @@ INTERNAL: envelope fields, protocol discriminator, opt-in defaults, bounds and f
 
 ### Step 5 — Edge cases and fixed findings
 
-The review found missing named canonical additions and a loose root schema fragment; explicit per-target Add blocks and an AssistantReplay $def now resolve both. It also caught an incorrect 1 MiB claim for Nanus's existing record limit: the actual limit is 4 MiB; Hype's stricter 1 MiB line limit is now stated separately. Opaque cryptographic validity and hex-case compatibility were corrected above. Supported item-schema evidence and original/live acceptance remain explicit implementation requirements.
+The review found missing named canonical additions and a loose root schema fragment; explicit per-target Add blocks and an AssistantReplay $def now resolve both. It also caught an incorrect 1 MiB claim for Nanus's existing record limit: the actual limit is 4 MiB; a host's stricter 1 MiB line limit is now stated separately. Opaque cryptographic validity and hex-case compatibility were corrected above. Supported item-schema evidence and original/live acceptance remain explicit implementation requirements.
 
 This pass read every named target section end to end, not every unrelated section of the four whole canonical pages. The verdict reflects that context limit; it does not certify repo-wide canonical accuracy.
 
@@ -86,7 +86,8 @@ SUGGESTIONS:
 
 P1: The isolated ee1-based candidate changes OpenAI configuration/function encoders,
 adds a separately constructed replay decoder and extends domain validation for Responses.
-It does not enable replay in stock `stream_chat`, publish a revision or change Hype's pin.
+It does not enable replay in stock `stream_chat`, publish a revision or change a downstream
+dependency pin.
 
 P2: The implemented scope must preserve exact optional parameters, original completed opaque
 items and neutral text/calls; reject invalid/incomplete/over-budget observations before tools;
@@ -179,7 +180,7 @@ inputs: their final changes are confined to the optional OpenAI adapter and its 
 The first local test invocation failed because sandboxed localhost bind was denied; the
 fictional fixture rerun passed. Intermediate lint findings and one ambiguous fixture integer
 were corrected; no lint suppression or weakened production approval was added. Logs and
-source/file receipts remain in `/private/tmp/hype-responses-resume`.
+source/file receipts were kept locally outside the repository.
 
 Windows MSVC-target domain/ports/minimal-library Clippy also passes; this is compilation,
 not native Windows execution or OpenAI transport acceptance. Review of 100 new-file functions
@@ -277,8 +278,7 @@ doctests; embedded default/providers (7/13), Clippy and formatting; runtime-free
 (342) and Clippy; Windows MSVC-target domain/ports/minimal-library Clippy. No drift exists
 in 231 frozen runtime/config/test inputs. Review of 153 new-file functions finds a maximum
 of 59 lines and none over 70. All 86 scoped local links resolve and the JSON fragment
-parses. Logs and source/count receipts are retained under
-`/private/tmp/hype-responses-context`.
+parses. Logs and source/count receipts were kept locally outside the repository.
 
 Intermediate new fixtures had constructor/closure type mistakes and initially omitted required
 added/delta observations; these were corrected to exercise the actual complete decoder lifecycle.
@@ -296,7 +296,8 @@ logic with a narrowly defined result comparison. The preceding immutable-source 
 P2: Actual HTTP must send the exact admitted original-item body and decode using its captured
 receipt. Pure estimates may substitute final complete-batch values but authorize no dispatch.
 P3: Default automatic/Chat/subscription/gateway behavior, existing providers and stock composition
-remain unchanged. Hype's published pin/readiness are not changed by this local preparation.
+remain unchanged. The downstream consumer's published pin/readiness are not changed by this
+local preparation.
 
 ### Function resolution
 
@@ -362,12 +363,12 @@ nextest 161, Clippy/doctests; embedded default/providers 7/13, Clippy/formatting
 nextest 342 and Clippy; workspace formatting/all-target/all-feature Clippy; Windows MSVC-target
 minimal-library Clippy. All 232 frozen runtime/config/test inputs remain unchanged. Eight new
 cases cover four actual socket/runner paths, two estimator/config and two projection paths.
-188 new-file functions are at most 59 lines. Evidence: `/private/tmp/hype-responses-transport`.
+188 new-file functions are at most 59 lines. Evidence was kept locally outside the repository.
 
 **LIKELY_CORRECT for explicit local transport and prospective estimation; high confidence.**
 Publication/adoption, host record/batch authority, native Windows execution and exact-model live
 acceptance remain open. Credential-aware stock composition was not run. This certificate grants
-no ciphertext authentication and no Hype production readiness or full migration completion.
+no ciphertext authentication and no downstream production readiness or full migration completion.
 
 ## Original-record reconciliation — 5 October 2026
 
@@ -376,7 +377,7 @@ isolated child of sealed `dc9cb610`, retaining current Responses source/receipt/
 definitions while adding original-record admission. Actual stock and hosted HTTP/runner/
 reload/fitting fixtures pass. It fixes cross-turn cancellation answers and defers runner-side
 Responses argument parsing until after host record admission. Neither the sealed parent nor
-production Hype pins are rewritten. Publication/adoption and original acceptance remain open.
+production downstream pins are rewritten. Publication/adoption and original acceptance remain open.
 
 ## Responses image-cost and prospective-measurement certificate — 5 October 2026
 
@@ -410,7 +411,7 @@ The first sandboxed focused run could not bind twelve loopback listeners; the au
 rerun passed without any real credential or provider endpoint.
 
 **Verdict: CORRECT for the scoped cost/measurement correction; integration remains PARTIAL.**
-The actual Hype native result envelope, trusted prompt revisions and real multimodal analysis
+The consumer's actual native result envelope, trusted prompt revisions and real multimodal analysis
 input remain separate consumer work. No app budget/result bound is changed, no effect authority
 is inferred from a number, and no live provider or native Windows execution is established.
 

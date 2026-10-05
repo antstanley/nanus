@@ -1,6 +1,6 @@
 # Exact protocol and capability review — 2026-10-02
 
-**Scope:** the exact-protocol prerequisite in the [embedding proposal](2026-09-30-library_embedding_and_multimodal_results.md). This is unpublished local work; no Hype dependency-pin update, Chat image promotion, live acceptance or production Nanus integration is claimed.
+**Scope:** the exact-protocol prerequisite in the [embedding proposal](2026-09-30-library_embedding_and_multimodal_results.md). This is unpublished local work; no downstream dependency-pin update, Chat image promotion, live acceptance or production Nanus integration is claimed.
 
 ## Premises
 
@@ -46,4 +46,4 @@ launch was made. Native Windows and changed-policy live acceptance were not run.
 
 ## Verdict
 
-**CORRECT for exact routing and the tested capability/refusal contract; high confidence.** The two supported Responses endpoints retain their previously recorded profiles; this change adds no Chat image support or text-only model ceiling table. Hype still needs an adopted immutable revision, explicit factory policy and its production/release integration. Its current Chat contract is not silently changed.
+**CORRECT for exact routing and the tested capability/refusal contract; high confidence.** The two supported Responses endpoints retain their previously recorded profiles; this change adds no Chat image support or text-only model ceiling table. The downstream consumer still needs an adopted immutable revision, explicit factory policy and its production/release integration. Its current Chat contract is not silently changed.
