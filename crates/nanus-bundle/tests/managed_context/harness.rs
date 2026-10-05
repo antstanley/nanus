@@ -224,6 +224,11 @@ pub fn runner(model: &Model, budget: u32) -> AgentRunner {
     registry
         .register(ToolDefinition::new(schema, Echo(Rc::clone(model))))
         .unwrap();
+    runner_with(model, ToolRegistryHandle::new(registry), budget)
+}
+
+/// A runner over the scripted model and the given tools.
+pub fn runner_with(model: &Model, tools: ToolRegistryHandle, budget: u32) -> AgentRunner {
     let config = AgentConfig::new(32, 1, "m", 32_768)
         .unwrap()
         .with_context_budget(budget)
@@ -231,7 +236,7 @@ pub fn runner(model: &Model, budget: u32) -> AgentRunner {
         .with_sandbox(SandboxMode::DangerFullAccess);
     AgentRunner::new(
         Rc::new(Box::new(Port(Rc::clone(model)))),
-        ToolRegistryHandle::new(registry),
+        tools,
         "you are a test",
         config,
         Rc::new(Box::new(Clock)),

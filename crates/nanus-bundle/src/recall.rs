@@ -232,7 +232,41 @@ async fn scan(
     wanted: (&str, usize),
     hunt: &mut Hunt,
 ) -> Result<(), ErrorCode> {
-    let (source, index) = source;
+    let mut position = from;
+    loop {
+        match scan_window(scope, source.0, position, wanted, hunt).await? {
+            Window::Done => return Ok(()),
+            // An archive is read a chunk at a time; keep going while the work bound allows.
+            Window::Resume(byte) if hunt.examined < limits::RECALL_WORK_BYTES => position = byte,
+            Window::Stopped(byte) | Window::Resume(byte) => {
+                hunt.next = Some(Position {
+                    source: source.1,
+                    byte,
+                });
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// How one scanned window ended.
+enum Window {
+    /// The source is exhausted.
+    Done,
+    /// The hit limit stopped the scan at this byte.
+    Stopped(u64),
+    /// More of the source remains from this byte.
+    Resume(u64),
+}
+
+/// Scans one window of a source: the rest of an event's text, or one archive chunk.
+async fn scan_window(
+    scope: &Scope<'_>,
+    source: &Source<'_>,
+    from: u64,
+    wanted: (&str, usize),
+    hunt: &mut Hunt,
+) -> Result<Window, ErrorCode> {
     let (query, limit) = wanted;
     let needle = query.as_bytes();
     let budget = limits::RECALL_WORK_BYTES.saturating_sub(hunt.examined);
@@ -255,29 +289,23 @@ async fn scan(
     hunt.examined = hunt.examined.saturating_add(bytes.len());
     for offset in find_all(&bytes, needle) {
         if hunt.hits.len() >= limit {
-            let byte = from.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
-            hunt.next = Some(Position {
-                source: index,
-                byte,
-            });
-            return Ok(());
+            return Ok(Window::Stopped(
+                from.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
+            ));
         }
         hunt.hits
             .push(hit(scope, source, &bytes, from, offset, needle.len()));
     }
     let end = start.saturating_add(bytes.len());
-    if end < total {
-        // Stopped by the work bound: resume so a match straddling the cut is found next time,
-        // and never at or before where this scan started.
-        let overlap = end
-            .saturating_sub(needle.len().saturating_sub(1))
-            .max(start.saturating_add(1));
-        hunt.next = Some(Position {
-            source: index,
-            byte: u64::try_from(overlap).unwrap_or(u64::MAX),
-        });
+    if end >= total {
+        return Ok(Window::Done);
     }
-    Ok(())
+    // Resume so a match straddling the cut is found by the next window, and never at or
+    // before where this one started.
+    let overlap = end
+        .saturating_sub(needle.len().saturating_sub(1))
+        .max(start.saturating_add(1));
+    Ok(Window::Resume(u64::try_from(overlap).unwrap_or(u64::MAX)))
 }
 
 /// Builds one hit from a match at `offset` within `bytes`, which begin at `from`.

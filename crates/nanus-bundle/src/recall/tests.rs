@@ -279,3 +279,31 @@ fn a_read_is_bounded_by_its_encoded_size() {
         Some(u64::try_from(data.len()).unwrap_or(0))
     );
 }
+
+/// An archive is searched a chunk at a time within one call's work bound, so a marker past the
+/// first chunk is found without a cursor round trip — and a match straddling a chunk edge too.
+#[test]
+fn an_archive_search_reads_past_its_first_chunk_and_across_chunk_edges() {
+    let mut bytes = vec![b'x'; limits::RECALL_CHUNK_BYTES.saturating_sub(3)];
+    bytes.extend_from_slice(b"EDGE");
+    bytes.extend(vec![b'y'; 10_000]);
+    bytes.extend_from_slice(b"LATER");
+    let session = session("go", Some(&bytes));
+    let archive = Archive {
+        bytes: bytes.clone(),
+        corrupt: false,
+    };
+    let scope = scope(&session, Some(&archive), b"key");
+    for (query, offset) in [
+        ("EDGE", limits::RECALL_CHUNK_BYTES.saturating_sub(3)),
+        ("LATER", bytes.len().saturating_sub(5)),
+    ] {
+        let found = futures::executor::block_on(recall(&scope, &search(query, None, 5)));
+        assert_eq!(found.hits.len(), 1, "{query}: {found:?}");
+        assert_eq!(
+            found.hits[0].source.offset,
+            u64::try_from(offset).unwrap_or(0)
+        );
+        assert_eq!(found.coverage, Coverage::Complete);
+    }
+}
