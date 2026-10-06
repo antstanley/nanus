@@ -272,17 +272,17 @@ a timing would bury in noise. From the current baseline, on an Apple M2:
 
 | Path | Time | Allocations |
 |---|---:|---:|
-| A whole turn through the agent loop, fresh session | 50.1 µs | 974 |
-| The same turn on 100 turns of history | 904 µs | 12,809 |
-| A request body for 100 turns of history (DeepSeek) | 588 µs | 7,131 |
-| Saving a 500-turn session | 12.7 ms | 23,549 |
-| One interface frame of a 100-turn conversation | 216 µs | 116 |
-| One streamed token in the interface at 100 turns | 197 µs | 212 |
+| A whole turn through the agent loop, fresh session | 42.5 µs | 981 |
+| The same turn on 100 turns of history | 605 µs | 12,816 |
+| A request body for 100 turns of history (DeepSeek) | 745 µs | 7,249 |
+| Saving a 500-turn session | 21.2 ms | 23,559 |
+| One interface frame of a 100-turn conversation | 153 µs | 116 |
+| One streamed token in the interface at 100 turns | 293 µs | 212 |
 
 The harness's own overhead is microseconds against a model's seconds, and so is the
 interface's: it keeps its layout between frames, so a frame costs what is on screen rather than
-what the conversation holds. (The times are from a run on a busy machine and about 28%
-pessimistic; the counts are exact.) The methodology, all 119 benchmarks, and what the numbers
+what the conversation holds. (The times are from a run on a busy machine, so read them as
+pessimistic; the counts are exact.) The methodology, all 147 benchmarks, and what the numbers
 show are in [**docs/benchmarks.md**](docs/benchmarks.md).
 
 ## Acknowledgements
