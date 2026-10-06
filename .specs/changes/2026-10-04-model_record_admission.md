@@ -99,6 +99,22 @@ No newly constructed event vector, numeric header length or equal call values ma
 for the original pending state, audit baseline, header identity or held caller authority.
 Internal goal tools remain covered by complete-batch admission and closing reservations.
 
+### Managed context coordination (Add)
+
+From [bounded, recoverable context management](../../docs/context-management.md); a coordination
+note for when this candidate is adopted, not a claim that its API is shipped:
+
+> Managed turns reserve exact context, artifact, attempt-intent, attempt-outcome and
+> recovery-closing records alongside original conversation records. The selection hold activates
+> for either admission port or managed context. Request preparation precedes the durable intent
+> checkpoint; all original record authority remains with the caller. Synchronous admission performs
+> no saving. Hosts use the independent checkpoint receipt and persistence state to decide whether
+> any further save or dispatch is permitted.
+
+As implemented, `StepRecordProjection.fitted_request` is the managed effective request, and
+`ToolBatchProjection.managed` carries the accepted revision, the effective request and its pure
+estimator beside the unchanged original projection.
+
 ## Implementation notes
 
 1. Add local Rust contracts in `nanus-ports`; export them without stock dependencies.

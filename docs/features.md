@@ -742,6 +742,17 @@ The Cordis-style kernel is the framework underneath. See
   tests that matter most and the bugs verification found in
   [testing and verification](testing.md).
 
+## Managed context
+
+Opt in per session with `nanus run --context-mode managed` (and optionally
+`--context-output-reserve <tokens>` and `--capture-shell-evidence`), or from the interface with
+`/context`. Every user message stays in every request; completed old tool work is hidden to fit
+the budget — automatically, or by the model through `context_manage` — and stays recallable
+through `context_recall`, including shell output past the preview when capture is on. Every step
+is checkpointed before its request is sent. Supported on DeepSeek, OpenAI and z.ai Chat
+Completions and Anthropic Messages at their official endpoints; Responses paths refuse. Legacy
+sessions are unchanged. See [managed context](context-management.md).
+
 ## Not supported yet
 
 The honest list lives in [status](status.md#known-limits); the headline items:

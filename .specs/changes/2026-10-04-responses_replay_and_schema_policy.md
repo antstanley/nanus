@@ -151,7 +151,19 @@ that omit history and Responses replay policy retain their existing request enco
 Count encrypted strings, full replay items, neutral display/call copies and the complete
 request/checkpoint JSON framing. Apply opt-in response byte/item/tool-slot budgets before
 buffer extension or cloning. A transport or capacity refusal must not yield partial executable
-calls, invent successful usage/completion, or save an unfinished turn.
+calls or invent successful usage/completion.
+
+This stateless mode does not admit managed fragment projections
+([managed context](../../docs/context-management.md)). Enabling managed context with it refuses
+before HTTP until a separately validated projection grammar is implemented. Original ciphertext,
+source receipts, protocol and selected controls cannot be rewritten or discarded to force
+compatibility.
+
+A failed, incomplete or capacity-refused provider observation never becomes an executable or
+successful response. A host with version-3 checkpoint support can durably save a settled prefix
+containing an open turn and request intent; this does not acknowledge completed history or permit
+automatic effect replay. Unsupported older checkpoint hosts retain their existing terminal-only
+save behavior.
 
 ### Boundary schema delta
 
