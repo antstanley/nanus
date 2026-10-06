@@ -32,8 +32,8 @@ pub enum ExpectedCheckpoint {
     Stored {
         /// The body version its header declares.
         body_version: u32,
-        /// SHA-256 of the whole stored file.
-        file_sha256: Digest,
+        /// BLAKE3 of the whole stored file.
+        file_blake3: Digest,
         /// How many events it holds.
         event_count: u64,
     },
@@ -48,7 +48,7 @@ impl ExpectedCheckpoint {
     pub fn after(receipt: &CheckpointReceipt, body_version: u32) -> Self {
         Self::Stored {
             body_version,
-            file_sha256: receipt.frontier.prefix_sha256.clone(),
+            file_blake3: receipt.frontier.prefix_blake3.clone(),
             event_count: receipt.frontier.event_count,
         }
     }
@@ -154,10 +154,10 @@ pub trait SessionCheckpoint {
 
     /// Reads the disk under the same claim after an unknown outcome.
     ///
-    /// `candidate_sha256` is the digest of the file the uncertain commit would have written.
+    /// `candidate_blake3` is the digest of the file the uncertain commit would have written.
     fn reconcile<'a>(
         &'a self,
-        candidate_sha256: &'a Digest,
+        candidate_blake3: &'a Digest,
     ) -> LocalBoxFuture<'a, Result<Reconciled, CheckpointError>>;
 }
 
@@ -180,7 +180,7 @@ pub enum PersistenceState {
         /// The identity before it.
         previous: ExpectedCheckpoint,
         /// The digest of the file it would have written.
-        candidate_sha256: Digest,
+        candidate_blake3: Digest,
     },
 }
 
@@ -232,7 +232,7 @@ mod tests {
             frontier: ContextFrontier {
                 session_id: "s".into(),
                 event_count: 7,
-                prefix_sha256: Digest::of(b"file"),
+                prefix_blake3: Digest::of(b"file"),
                 projection_revision: 2,
             },
             body_digest: Digest::of(b"body"),
@@ -242,7 +242,7 @@ mod tests {
             ExpectedCheckpoint::after(&receipt, 3),
             ExpectedCheckpoint::Stored {
                 body_version: 3,
-                file_sha256: Digest::of(b"file"),
+                file_blake3: Digest::of(b"file"),
                 event_count: 7,
             }
         );

@@ -40,7 +40,7 @@ async fn a_file_over_four_mebibytes_is_read_in_windows() {
         .expect("the first window");
     assert_eq!(first.offset, 0);
     assert_eq!(first.bytes, contents[..4_096]);
-    assert_eq!(first.range_sha256, Digest::of(&contents[..4_096]));
+    assert_eq!(first.range_blake3, Digest::of(&contents[..4_096]));
     assert_eq!(first.identity.len, u64::try_from(FIVE_MIB).expect("fits"));
     assert!(
         !first.eof,
@@ -58,7 +58,7 @@ async fn a_file_over_four_mebibytes_is_read_in_windows() {
         .await
         .expect("the last window");
     assert_eq!(tail.bytes, contents[tail_start..]);
-    assert_eq!(tail.range_sha256, Digest::of(&contents[tail_start..]));
+    assert_eq!(tail.range_blake3, Digest::of(&contents[tail_start..]));
     assert!(tail.eof, "the window reached the end of the file");
     assert_eq!(
         first.identity, tail.identity,
@@ -116,7 +116,7 @@ async fn an_offset_past_the_end_is_an_empty_window_at_the_end() {
     assert!(past.bytes.is_empty());
     assert!(past.eof);
     assert_eq!(past.offset, 50);
-    assert_eq!(past.range_sha256, Digest::empty());
+    assert_eq!(past.range_blake3, Digest::empty());
 
     // The boundary from the other side: the last byte is still a byte.
     let last = fs
@@ -151,7 +151,7 @@ async fn an_untouched_file_keeps_its_identity_and_a_rewritten_one_does_not() {
         before.identity, after.identity,
         "a rewrite changes the identity"
     );
-    assert_ne!(before.range_sha256, after.range_sha256);
+    assert_ne!(before.range_blake3, after.range_blake3);
 }
 
 /// A same-length replacement by rename is the case a length check alone misses: the file id

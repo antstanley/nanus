@@ -3128,7 +3128,7 @@ mod tests {
         let digest = prefix
             .prefix_digest(mark.frontier.event_count)
             .map_err(|error| error.to_string())?;
-        if digest.as_str() == mark.frontier.prefix_sha256 {
+        if digest.as_str() == mark.frontier.prefix_blake3 {
             Ok(prefix)
         } else {
             Err(String::from("the stored prefix is not the advertised one"))
@@ -3353,7 +3353,7 @@ mod tests {
         let frontier = |count: u64| ContextFrontier {
             session_id: String::from("retire"),
             event_count: count,
-            prefix_sha256: nanus_domain::context::managed::Digest::of(&count.to_le_bytes()),
+            prefix_blake3: nanus_domain::context::managed::Digest::of(&count.to_le_bytes()),
             projection_revision: 0,
         };
         let receipt = |count: u64| CheckpointReceipt {

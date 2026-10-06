@@ -829,7 +829,7 @@ fn read_through(
     };
     let verified = prefix
         .prefix_digest(wanted)
-        .is_ok_and(|digest| digest.as_str() == frontier.prefix_sha256);
+        .is_ok_and(|digest| digest.as_str() == frontier.prefix_blake3);
     if verified {
         (prefix, None)
     } else {
@@ -7457,7 +7457,7 @@ mod tests {
             frontier: FrontierInfo {
                 session_id: "s".to_owned(),
                 event_count: events,
-                prefix_sha256: "00".repeat(32),
+                prefix_blake3: "00".repeat(32),
                 projection_revision: 0,
             },
         }
@@ -8054,7 +8054,7 @@ mod tests {
         FrontierInfo {
             session_id: session.id().as_str().to_owned(),
             event_count: count,
-            prefix_sha256: session
+            prefix_blake3: session
                 .prefix_digest(count)
                 .map(|digest| digest.as_str().to_owned())
                 .unwrap_or_default(),

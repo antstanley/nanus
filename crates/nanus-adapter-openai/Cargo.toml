@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
-sha2 = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 nanus-bundle = { path = "../nanus-bundle", default-features = false }

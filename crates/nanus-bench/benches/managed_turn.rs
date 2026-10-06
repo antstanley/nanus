@@ -149,8 +149,8 @@ fn encode(request: &ChatRequest) -> Vec<u8> {
 }
 
 /// A model that encodes every body it is given, answers from the script, and prepares
-/// managed calls the way the stock adapters do: one byte of body is one estimated token, and a
-/// candidate that does not fit is refused.
+/// managed calls the way the stock adapters do: `MANAGED_BYTES_PER_TOKEN` bytes of body are one
+/// estimated token, and a candidate that does not fit is refused.
 struct Model {
     script: Rc<Script>,
 }
@@ -176,7 +176,11 @@ impl LlmPort for Model {
     fn prepare_managed(&self, request: ManagedRequest) -> LlmResult<Box<dyn PreparedModelCall>> {
         let body = encode(&request.request);
         let estimate = RequestEstimate {
-            input_tokens: u32::try_from(body.len()).unwrap_or(u32::MAX),
+            input_tokens: u32::try_from(
+                body.len()
+                    .div_ceil(nanus_ports::capabilities::MANAGED_BYTES_PER_TOKEN),
+            )
+            .unwrap_or(u32::MAX),
             request_bytes: body.len(),
             images: 0,
             reservation: request.request.max_tokens.unwrap_or(0),
@@ -288,8 +292,9 @@ fn runner(budget: u32) -> AgentRunner {
     .unwrap_or_else(|error| unreachable!("the benchmark runner: {error}"))
 }
 
-/// A checkpoint that does a store's CPU work for each commit — the bounded encoding and the
-/// whole-file digest — without the disk.
+/// A checkpoint that does a store's CPU work for each commit — encoding what it would write,
+/// checking the candidate extends what is stored, folding the revision and digesting the
+/// receipt — without the disk.
 struct Memory {
     expected: RefCell<ExpectedCheckpoint>,
 }
@@ -311,14 +316,37 @@ impl SessionCheckpoint for Memory {
         view: CheckpointView<'a>,
     ) -> LocalBoxFuture<'a, Result<CheckpointReceipt, CheckpointError>> {
         Box::pin(async move {
-            let body = view.candidate.try_to_jsonl().unwrap_or_default();
-            let revision = ManagedState::fold(view.candidate.log()).map_or(0, |s| s.revision());
-            let count = u64::try_from(view.candidate.event_count()).unwrap_or(0);
+            let candidate = view.candidate;
+            // What the store writes: the whole file the first time, then only the new lines,
+            // after checking that the candidate extends the stored prefix.
+            let written = match &*self.expected.borrow() {
+                ExpectedCheckpoint::Stored {
+                    event_count,
+                    file_blake3,
+                    ..
+                } => {
+                    let stored = candidate
+                        .prefix_digest(*event_count)
+                        .unwrap_or_else(|error| unreachable!("a stored prefix: {error}"));
+                    assert_eq!(&stored, file_blake3, "the candidate extends what is stored");
+                    candidate
+                        .encoded_lines_from(*event_count)
+                        .unwrap_or_else(|error| unreachable!("new lines encode: {error}"))
+                }
+                ExpectedCheckpoint::Absent => candidate
+                    .try_to_jsonl()
+                    .unwrap_or_else(|error| unreachable!("a session encodes: {error}")),
+            };
+            assert!(!written.is_empty(), "a checkpoint writes something");
+            let revision = ManagedState::fold(candidate.log()).map_or(0, |s| s.revision());
+            let count = u64::try_from(candidate.event_count()).unwrap_or(0);
             let receipt = CheckpointReceipt {
                 frontier: nanus_domain::context::managed::ContextFrontier {
-                    session_id: view.candidate.id().as_str().to_owned(),
+                    session_id: candidate.id().as_str().to_owned(),
                     event_count: count,
-                    prefix_sha256: Digest::of(body.as_bytes()),
+                    prefix_blake3: candidate
+                        .prefix_digest(count)
+                        .unwrap_or_else(|error| unreachable!("a whole prefix: {error}")),
                     projection_revision: revision,
                 },
                 body_digest: view.candidate.body_digest(),

@@ -68,11 +68,11 @@ fn frontier() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["session_id", "event_count", "prefix_sha256", "projection_revision"],
+        "required": ["session_id", "event_count", "prefix_blake3", "projection_revision"],
         "properties": {
             "session_id": {"type": "string"},
             "event_count": {"type": "integer", "minimum": 0},
-            "prefix_sha256": {"type": "string"},
+            "prefix_blake3": {"type": "string"},
             "projection_revision": {"type": "integer", "minimum": 0}
         }
     })

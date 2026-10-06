@@ -23,9 +23,6 @@
 //! than on a sentinel. Deltas name what they are: `text_delta`, `thinking_delta`,
 //! and `input_json_delta`, the last carrying the fragment of a tool call's arguments.
 
-use core::fmt::Write as _;
-use sha2::{Digest as _, Sha256};
-
 use nanus_domain::{Message, ToolCallId, ToolName, ToolSchema, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent};
 use serde_json::{Map, Value, json};
@@ -143,12 +140,7 @@ pub fn request_prefix(payload: &Value) -> String {
 fn prefix_fingerprint(system: &Value, tools: &Value, messages: &[Value]) -> String {
     let prefix = json!({ "system": system, "tools": tools, "messages": messages });
     let raw = prefix.to_string();
-    let digest = Sha256::digest(raw.as_bytes());
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
+    blake3::hash(raw.as_bytes()).to_hex().as_str().to_owned()
 }
 
 /// Preserves typed result order inside the matching tool-result block.

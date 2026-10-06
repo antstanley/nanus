@@ -493,7 +493,7 @@ mod tests {
                     frontier: crate::protocol::FrontierInfo {
                         session_id: "01a09558".to_owned(),
                         event_count: 0,
-                        prefix_sha256: "00".repeat(32),
+                        prefix_blake3: "00".repeat(32),
                         projection_revision: 0,
                     },
                 },

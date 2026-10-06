@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nanus_ports::{FsHandle, LocalBoxFuture};
-use sha2::{Digest as _, Sha256};
 
 use crate::VideoError;
 use crate::media::{Snapshot, VideoSource};
@@ -72,7 +71,7 @@ impl VideoSource for FsSource {
                     "read_video: the file grew past its ceiling while it was read".to_owned(),
                 ));
             }
-            let sha256 = hex(&Sha256::digest(&bytes));
+            let digest = hex(blake3::hash(&bytes).as_bytes());
             let mut builder = tempfile::Builder::new();
             builder.prefix("nanus-video-");
             let directory = self
@@ -88,7 +87,7 @@ impl VideoSource for FsSource {
                 .map_err(|error| source(&error))?;
             Ok(Snapshot {
                 path: copy,
-                sha256,
+                blake3: digest,
                 byte_len,
                 owner: Arc::new(directory),
             })

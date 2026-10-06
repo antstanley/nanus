@@ -125,11 +125,11 @@ impl RawCaptureSink for ScriptedSink {
                 stream: self.stream,
                 retained_bytes: retained,
                 observed_bytes: observed,
-                retained_sha256: None,
+                retained_blake3: None,
                 status,
                 reason,
                 encoding: RawEncoding::Raw,
-                chunk_sha256: Vec::new(),
+                chunk_blake3: Vec::new(),
             };
             CaptureFinalization {
                 receipt,

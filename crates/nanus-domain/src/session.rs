@@ -57,6 +57,8 @@ use crate::goal::Goal;
 use crate::message::{Message, ToolCallId, Usage};
 use crate::tool::{ToolCall, ToolName};
 
+mod encoding;
+
 /// The format tag every session header carries.
 pub const SESSION_FORMAT_TAG: &str = "nanus.session";
 
@@ -941,6 +943,8 @@ pub struct Session {
     body_version: u32,
     /// The event log.
     log: SessionLog,
+    /// How much of the log has been encoded and digested, carried forward as it grows.
+    encoding: encoding::Encoding,
 }
 
 impl Session {
@@ -954,6 +958,7 @@ impl Session {
             origin: None,
             body_version: SESSION_FORMAT_VERSION,
             log: SessionLog::new(),
+            encoding: encoding::Encoding::default(),
         }
     }
 
@@ -1183,48 +1188,55 @@ impl Session {
         Ok(encoded)
     }
 
+    /// Refuses an event this session cannot write: a managed record in an older body or one that
+    /// breaks its own invariants, malformed media, and replay that does not match its response.
+    fn check_event(&self, index: usize, event: &SessionEvent) -> Result<(), SessionError> {
+        let line = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2);
+        if event.is_managed_record() {
+            if !self.is_managed_body() {
+                return Err(SessionError::ManagedRecordInLegacyBody {
+                    line,
+                    version: self.body_version,
+                });
+            }
+            event
+                .validate_managed()
+                .map_err(|code| SessionError::InvalidManagedRecord { line, code })?;
+        }
+        if let SessionEvent::ToolResult {
+            content_blocks: Some(blocks),
+            ..
+        } = event
+        {
+            crate::content::validate_blocks(blocks).map_err(|error| {
+                SessionError::MalformedEvent {
+                    line,
+                    detail: error.to_string(),
+                }
+            })?;
+        }
+        if let SessionEvent::AssistantMessage {
+            replay: Some(replay),
+            text,
+            tool_calls,
+            ..
+        } = event
+        {
+            replay
+                .validate_response(text.as_deref(), tool_calls)
+                .map_err(|error| SessionError::MalformedEvent {
+                    line,
+                    detail: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Validates and measures the encoding; the body of [`Session::try_to_jsonl`].
     fn checked_len(&self) -> Result<usize, SessionError> {
         let mut total = 0_usize;
         for (index, event) in self.log.events().iter().enumerate() {
-            let line = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2);
-            if event.is_managed_record() {
-                if !self.is_managed_body() {
-                    return Err(SessionError::ManagedRecordInLegacyBody {
-                        line,
-                        version: self.body_version,
-                    });
-                }
-                event
-                    .validate_managed()
-                    .map_err(|code| SessionError::InvalidManagedRecord { line, code })?;
-            }
-            if let SessionEvent::ToolResult {
-                content_blocks: Some(blocks),
-                ..
-            } = event
-            {
-                crate::content::validate_blocks(blocks).map_err(|error| {
-                    SessionError::MalformedEvent {
-                        line: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
-                        detail: error.to_string(),
-                    }
-                })?;
-            }
-            if let SessionEvent::AssistantMessage {
-                replay: Some(replay),
-                text,
-                tool_calls,
-                ..
-            } = event
-            {
-                replay
-                    .validate_response(text.as_deref(), tool_calls)
-                    .map_err(|error| SessionError::MalformedEvent {
-                        line: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
-                        detail: error.to_string(),
-                    })?;
-            }
+            self.check_event(index, event)?;
             let seq = SessionSeq::new(u64::try_from(index).unwrap_or(u64::MAX));
             let size = crate::content::serialized_size(
                 &SessionLineRef { seq, event },
@@ -1292,6 +1304,9 @@ impl Session {
                 expected: u64::try_from(self.log.len()).unwrap_or(u64::MAX),
                 found: count,
             })?;
+        if let Some(digest) = self.cached_prefix_digest(events.len()) {
+            return Ok(digest);
+        }
         let mut hasher = Hasher::new();
         hasher.update(encode(&self.header()).as_bytes());
         hasher.update(b"\n");
@@ -1327,6 +1342,7 @@ impl Session {
             origin: self.origin.clone(),
             body_version: self.body_version,
             log: SessionLog::new(),
+            encoding: encoding::Encoding::default(),
         };
         for event in events {
             clipped.append(event.clone());
@@ -1347,6 +1363,9 @@ impl Session {
     /// Returns the digest of every event line, header excluded.
     #[must_use]
     pub fn body_digest(&self) -> Digest {
+        if let Some(digest) = self.cached_body_digest() {
+            return digest;
+        }
         let mut hasher = Hasher::new();
         hash_lines(&mut hasher, self.log.events());
         hasher.finish()
@@ -1448,6 +1467,7 @@ impl Session {
             origin: header.origin,
             body_version,
             log,
+            encoding: encoding::Encoding::default(),
         };
         // Postcondition: the decoded log has exactly the events the file numbered.
         assert_eq!(
@@ -2417,6 +2437,110 @@ mod tests {
         assert!(
             matches!(decoded, Err(SessionError::MalformedEvent { line: 2, .. })),
             "an unknown event type is malformed at line 2, got {decoded:?}"
+        );
+    }
+
+    /// The digests a slow, from-the-first-event encoding gives: the whole file and its body.
+    fn digests_from_scratch(session: &Session) -> (Digest, Digest) {
+        let encoded = session.to_jsonl();
+        let body = encoded.split_once('\n').map_or("", |(_, body)| body);
+        (Digest::of(encoded.as_bytes()), Digest::of(body.as_bytes()))
+    }
+
+    #[test]
+    fn a_carried_encoding_digests_what_a_fresh_one_does_as_the_log_grows() {
+        let mut grown = session();
+        for _ in 0..3 {
+            record_read_turn(&mut grown);
+            let count = u64::try_from(grown.event_count()).unwrap_or(u64::MAX);
+            let (file, body) = digests_from_scratch(&grown);
+            assert_eq!(grown.prefix_digest(count).unwrap(), file);
+            assert_eq!(grown.body_digest(), body);
+            // A clone carries the progress and keeps answering correctly as it grows apart.
+            let mut ahead = grown.clone();
+            ahead.append(SessionEvent::TurnStart { turn: 9 });
+            assert_eq!(ahead.body_digest(), digests_from_scratch(&ahead).1);
+            assert_eq!(
+                grown.body_digest(),
+                body,
+                "the original is not moved by its clone"
+            );
+        }
+        // A count behind the cache is answered the slow way, and the same.
+        let earlier = grown.prefix(8).unwrap();
+        assert_eq!(
+            grown.prefix_digest(8).unwrap(),
+            digests_from_scratch(&earlier).0
+        );
+        // A count asked about before is remembered after the cache has moved past it.
+        let mut moved = grown.clone();
+        let asked = u64::try_from(moved.event_count()).unwrap_or(u64::MAX);
+        let at_asked = moved.prefix_digest(asked).unwrap();
+        record_read_turn(&mut moved);
+        let _ahead = moved.body_digest();
+        assert_eq!(moved.prefix_digest(asked).unwrap(), at_asked);
+    }
+
+    #[test]
+    fn the_lines_after_a_count_are_the_tail_the_whole_encoding_writes() {
+        let mut grown = session();
+        record_read_turn(&mut grown);
+        record_read_turn(&mut grown);
+        let encoded = grown.try_to_jsonl().unwrap();
+        let tail_after = |count: usize| -> String {
+            encoded
+                .split_inclusive('\n')
+                .skip(count.saturating_add(1))
+                .collect()
+        };
+        // Ahead of the cache, at it, and behind it (answered the slow way).
+        for from in [4_u64, 16, 16, 9, 0] {
+            let count = usize::try_from(from).unwrap();
+            assert_eq!(grown.encoded_lines_from(from).unwrap(), tail_after(count));
+        }
+        assert_eq!(grown.encoded_lines_from(16).unwrap(), "");
+        assert!(matches!(
+            grown.encoded_lines_from(17),
+            Err(SessionError::NonContiguousSequence { found: 17, .. })
+        ));
+    }
+
+    #[test]
+    fn a_new_header_starts_the_encoding_over_and_a_refusal_is_the_whole_encodings() {
+        let mut legacy = session();
+        record_read_turn(&mut legacy);
+        let before = legacy.body_digest();
+        legacy.append(decision());
+        // The same refusal as the whole encoding, from either path, and the digests still answer.
+        assert!(matches!(
+            legacy.encoded_lines_from(0),
+            Err(SessionError::ManagedRecordInLegacyBody { version: 2, .. })
+        ));
+        assert!(matches!(
+            legacy.encoded_lines_from(8),
+            Err(SessionError::ManagedRecordInLegacyBody { version: 2, .. })
+        ));
+        assert_eq!(legacy.body_digest(), digests_from_scratch(&legacy).1);
+        assert_ne!(legacy.body_digest(), before);
+
+        let mut managed = legacy.clone();
+        managed.upgrade_to_managed_body();
+        let count = u64::try_from(managed.event_count()).unwrap_or(u64::MAX);
+        let (file, _) = digests_from_scratch(&managed);
+        assert_eq!(managed.prefix_digest(count).unwrap(), file);
+        assert_ne!(
+            legacy.prefix_digest(count).unwrap(),
+            file,
+            "the header is in the digest"
+        );
+        assert_eq!(
+            managed.encoded_lines_from(8).unwrap(),
+            managed
+                .try_to_jsonl()
+                .unwrap()
+                .split_inclusive('\n')
+                .skip(9)
+                .collect::<String>()
         );
     }
 }

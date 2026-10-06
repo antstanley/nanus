@@ -81,7 +81,7 @@ or its turn has ended. Calls and results are atomic: sibling calls are never spl
 never shown without its result. Derivation refuses a log whose call identity is ambiguous — an id
 carried twice, answered twice, or answered with no call — rather than inventing a grouping.
 
-A **frontier** is a session id, an exclusive event count, the accepted revision, and the SHA-256
+A **frontier** is a session id, an exclusive event count, the accepted revision, and the BLAKE3
 of the stored header and the first `event_count` event lines, byte for byte as the session
 serializer writes them (`Session::prefix_digest`). At the full count it is the digest of the
 whole stored file, which is what lets a store recompute it from disk without re-encoding.
@@ -162,10 +162,18 @@ checkpoint settled prefix + automatic revision + RequestAttempt(started)
 append StepStart -> dispatch the frozen call -> append the assembled observation
 classify mixed proposals -> policy/approval -> admission -> execute -> ordered append
 append StepEnd -> evaluate a staged proposal
-checkpoint the candidate revision or the unchanged one + RequestAttempt(finished)
+a proposal: checkpoint the candidate revision or the unchanged one + RequestAttempt(finished)
+none: append RequestAttempt(finished) for the next checkpoint to carry
 install what was acknowledged -> honour cancellation -> release the selection
 next step, or append and checkpoint TurnEnd before the answer is reported
 ```
+
+A step that staged no proposal is not checkpointed on its own. Nothing leaves the process between
+its settlement and the next checkpoint — the next step's intent, or the turn's end — so one commit
+carries both, and a turn of `n` steps takes `n + 1` checkpoints rather than `2n + 1`. A refused
+commit leaves the session holding exactly what a refused settlement would: the finished attempt,
+which both outcomes record. A step that staged a proposal still settles in a checkpoint of its own,
+because its revision must be acknowledged before the next request is prepared under it.
 
 The selection is held whenever managed mode or either admission port is active; setters queue
 and apply after the step. The adapter-owned prepared call is frozen once: its body digest is
@@ -183,7 +191,13 @@ was stopped is recorded `cancelled`. Executed effects and failed calls are never
 Managed support is an explicit adapter capability (`LlmPort::managed_support`), unsupported by
 default. `LlmPort::prepare_managed` returns a `PreparedModelCall` that owns the admitted body and
 its endpoint and credential privately, exposes its estimate, digest and selection identity, and
-performs no I/O until `stream` is polled. The runner's own call assembler and the adapters'
+performs no I/O until `stream` is polled. A managed estimate charges the serialized body at
+three bytes per token (`MANAGED_BYTES_PER_TOKEN`, estimator `adapter-serialized-body/3`) where
+an ordinary request is charged one: still above what the providers' tokenizers count, but not
+the fourfold overestimate that hid history the model had room for and made the protected floor
+— every user message — run out at a quarter of the budget. Ordinary requests are measured
+exactly as before. Each step prepares twice: once as the fitter's probe, whose cost the frozen
+request's notice reports, and once to freeze it. The runner's own call assembler and the adapters'
 decoders apply the context tools' raw argument limits once a call's name is known — including a
 name that arrives after its arguments — and before anything is parsed.
 
@@ -236,6 +250,14 @@ A managed turn saves through a `SessionCheckpoint` the host binds to its writer 
 session (`StoreCheckpoint` in the stock composition). A commit names the stored identity it
 replaces — the actual file's body version, digest and event count, never a re-encoding — and
 returns a receipt whose frontier covers the whole written file.
+
+A commit costs what the step added rather than what the conversation has grown to. The session
+carries its encoding forward (`Session::encoded_lines_from`, and the running BLAKE3 states behind
+`prefix_digest` and `body_digest`), so only events appended since the last commit are encoded.
+The stock store remembers the identity it last wrote with the file's length, time and inode, and
+reads the file back only when those have changed. It writes the new file as a clone of the stored
+one — copy-on-write where the filesystem has it — with the new lines appended, synced and then
+renamed, so a crash still leaves the old file or the new one and never a torn tail.
 
 | Outcome | Meaning | What the turn does |
 |---|---|---|
@@ -295,7 +317,7 @@ The store's archive (`JsonlStore` implements `ArtifactStore`) reserves quota bef
 8 MiB per stream, 128 MiB per session and 1 GiB per store, counting live reservations, partial
 files and orphans — under a cross-process quota lock that is only ever taken after the session
 claim. A finalized object is flushed, synced and renamed before its receipt says it exists; its
-receipt records its length, its SHA-256 and one per 64 KiB chunk, so a range read verifies only
+receipt records its length, its BLAKE3 and one per 64 KiB chunk, so a range read verifies only
 the chunks it touches. A reservation that fails becomes an `unavailable` receipt and changes
 nothing about how the command runs. A checkpoint that newly references an object verifies it on
 disk first. Objects referenced by a receipt are never evicted; garbage collection claims an idle
@@ -355,8 +377,8 @@ reconciliation could not be settled, is held but takes no turn until it is reset
 
 ## Accounting
 
-Every managed request records a `request/attempt` intent before HTTP and a finished record at its
-settled checkpoint: the exact selection identity, the projection revision, the digest of the body
+Every managed request records a `request/attempt` intent before HTTP and a finished record when it
+settles, durable by the next checkpoint: the exact selection identity, the projection revision, the digest of the body
 actually dispatched, the outcome (`completed`, `failed`, `cancelled`, `refused`,
 `unknown_dispatch`), the management fragment it carried, and nullable usage. Missing is never
 zero; a usage report followed by a stream error survives as the failed attempt's usage; repeated

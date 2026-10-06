@@ -108,8 +108,8 @@ pub fn event_text(
 pub struct ArtifactFacts {
     /// Bytes the object retains.
     pub retained_bytes: u64,
-    /// SHA-256 of those bytes.
-    pub retained_sha256: Digest,
+    /// BLAKE3 of those bytes.
+    pub retained_blake3: Digest,
 }
 
 /// Resolves one reference against the bound session, below `below` events.
@@ -148,7 +148,7 @@ pub fn resolve_source(
                 .as_ref()
                 .ok_or(ErrorCode::InvalidReference)?;
             let facts = artifact(id).ok_or(ErrorCode::InvalidReference)?;
-            (facts.retained_bytes, facts.retained_sha256)
+            (facts.retained_bytes, facts.retained_blake3)
         }
     };
     if end > size || digest != source.source_digest {

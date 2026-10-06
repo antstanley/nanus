@@ -3664,9 +3664,10 @@ fn a_managed_turn_over_the_link_is_checkpointed_before_it_is_done() {
         .iter()
         .filter(|frame| matches!(frame, Frame::Checkpoint { .. }))
         .count();
-    assert!(
-        checkpoints >= 3,
-        "intent, settled step and turn end: {checkpoints}"
+    // A step with nothing to decide is carried by the next checkpoint, here the turn's end.
+    assert_eq!(
+        checkpoints, 2,
+        "the intent, then the turn's end with the settled step"
     );
     let stored = nanus_kernel::runtime::block_on(store.load(&id)).expect("readable");
     assert!(stored.is_managed_body());

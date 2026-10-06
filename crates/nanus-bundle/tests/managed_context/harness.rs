@@ -17,10 +17,10 @@ use nanus_domain::{
     ToolDefinition, ToolName, ToolOutcome, ToolRegistry, ToolResult, ToolSchema,
 };
 use nanus_ports::{
-    ChatRequest, CheckpointError, CheckpointView, ExpectedCheckpoint, FinishReason, LlmEvent,
-    LlmPort, LlmResult, LlmStream, LocalBoxFuture, ManagedRequest, ManagedSupport,
-    ModelCapabilities, PreparedModelCall, Reconciled, RequestEstimate, SessionCheckpoint,
-    TurnRuntime,
+    ChatRequest, CheckpointError, CheckpointReason, CheckpointView, ExpectedCheckpoint,
+    FinishReason, LlmEvent, LlmPort, LlmResult, LlmStream, LocalBoxFuture, ManagedRequest,
+    ManagedSupport, ModelCapabilities, PreparedModelCall, Reconciled, RequestEstimate,
+    SessionCheckpoint, TurnRuntime,
 };
 use serde_json::{Value, json};
 
@@ -313,6 +313,8 @@ pub struct Disk {
     stored: RefCell<Option<Session>>,
     expected: RefCell<ExpectedCheckpoint>,
     commits: Cell<usize>,
+    /// Why each commit was attempted, in order, refused ones included.
+    reasons: RefCell<Vec<CheckpointReason>>,
     fail_at: Cell<Option<(usize, Failure)>>,
     /// Whether a lost commit actually reached the disk.
     lost_landed: Cell<bool>,
@@ -324,6 +326,7 @@ impl Disk {
             stored: RefCell::new(None),
             expected: RefCell::new(ExpectedCheckpoint::Absent),
             commits: Cell::new(0),
+            reasons: RefCell::new(Vec::new()),
             fail_at: Cell::new(None),
             lost_landed: Cell::new(false),
         }
@@ -336,6 +339,10 @@ impl Disk {
     }
     pub fn commits(&self) -> usize {
         self.commits.get()
+    }
+    /// The reasons of the commits attempted since the first `skip`.
+    pub fn reasons_since(&self, skip: usize) -> Vec<CheckpointReason> {
+        self.reasons.borrow().iter().skip(skip).copied().collect()
     }
     pub fn last(&self) -> Session {
         self.stored.borrow().clone().unwrap()
@@ -369,6 +376,7 @@ impl SessionCheckpoint for Disk {
             );
             let index = self.commits.get();
             self.commits.set(index.saturating_add(1));
+            self.reasons.borrow_mut().push(view.reason);
             if let Some((at, failure)) = self.fail_at.get()
                 && at == index
             {
@@ -392,7 +400,7 @@ impl SessionCheckpoint for Disk {
     }
     fn reconcile<'a>(
         &'a self,
-        candidate_sha256: &'a Digest,
+        candidate_blake3: &'a Digest,
     ) -> LocalBoxFuture<'a, Result<Reconciled, CheckpointError>> {
         Box::pin(async move {
             let stored = self.stored.borrow().clone();
@@ -401,7 +409,7 @@ impl SessionCheckpoint for Disk {
                     .prefix_digest(u64::try_from(session.event_count()).unwrap())
                     .unwrap()
             });
-            if digest.as_ref() == Some(candidate_sha256) {
+            if digest.as_ref() == Some(candidate_blake3) {
                 let session = stored.unwrap();
                 self.write(&session);
                 return Ok(Reconciled::Installed(self.expected.borrow().clone()));

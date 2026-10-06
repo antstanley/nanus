@@ -515,7 +515,7 @@ fn verify_whole(mut file: std::fs::File, receipt: &ArtifactReceipt) -> Result<()
     let mut whole = Hasher::new();
     let mut buffer = vec![0_u8; limits::ARTIFACT_CHUNK_BYTES];
     let mut remaining = receipt.retained_bytes;
-    for expected in &receipt.chunk_sha256 {
+    for expected in &receipt.chunk_blake3 {
         let size = remaining.min(limits::ARTIFACT_CHUNK_BYTES_U64);
         let chunk = read_chunk(&mut file, &mut buffer, size)?;
         whole.update(chunk);
@@ -524,7 +524,7 @@ fn verify_whole(mut file: std::fs::File, receipt: &ArtifactReceipt) -> Result<()
         }
         remaining = remaining.saturating_sub(size);
     }
-    if remaining != 0 || receipt.retained_sha256.as_ref() != Some(&whole.finish()) {
+    if remaining != 0 || receipt.retained_blake3.as_ref() != Some(&whole.finish()) {
         return Err(ArtifactError::Corrupt);
     }
     Ok(())
@@ -565,7 +565,7 @@ fn read_range(
         let chunk = read_chunk(&mut file, &mut buffer, chunk_size)?;
         let expected = usize::try_from(index)
             .ok()
-            .and_then(|index| receipt.chunk_sha256.get(index))
+            .and_then(|index| receipt.chunk_blake3.get(index))
             .ok_or(ArtifactError::Corrupt)?;
         if Digest::of(chunk) != *expected {
             return Err(ArtifactError::Corrupt);

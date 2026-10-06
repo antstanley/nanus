@@ -87,7 +87,7 @@ impl MemoryFs {
         RangeRead {
             path: path.to_path_buf(),
             offset,
-            range_sha256: nanus_domain::context::managed::Digest::of(&window),
+            range_blake3: nanus_domain::context::managed::Digest::of(&window),
             eof: end == bytes.len(),
             bytes: window,
             identity: FileIdentity {

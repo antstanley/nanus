@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn propose_takes_its_bases_and_disjoint_unique_edits() {
         let frontier = json!({"session_id": "s", "event_count": 3,
-            "prefix_sha256": Digest::empty().as_str(), "projection_revision": 0});
+            "prefix_blake3": Digest::empty().as_str(), "projection_revision": 0});
         let propose = json!({"action": "propose", "base_revision": 0, "base_frontier": frontier,
             "hide": ["f:1"], "restore": [], "notes": [], "cursor": null,
             "base_profile_digest": Digest::empty().as_str()});

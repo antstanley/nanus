@@ -313,59 +313,111 @@ few times (validation, status, receipt). These are first measurements, not a rec
 
 ### `managed_turn`
 
-Recorded on 2026-10-06 on `1647980`, same machine, **not quiet** (one-minute load 6.5–8.6 on
-eight cores), so read times as pessimistic; counts are exact. One turn is the `agent_loop`
-shape: a tool step that calls two in-memory tools, then a 500-delta answer. The model encodes and
-digests its body as the stock adapters do, charging one token per byte. `overhead` has no
-budget pressure and an in-memory checkpoint that encodes, digests and folds the session as the
-store does, but does not write it. `persisted` writes to a real `JsonlStore` in a tempdir.
-`fitted` runs under the stock 64,000-token budget: `managed_first` is the first managed turn
-on a history that does not fit, and `managed_steady` is the turn after it.
+One turn is the `agent_loop` shape: a tool step that calls two in-memory tools, then a 500-delta
+answer. The model encodes and digests its body as the stock adapters do and charges what they
+charge. `overhead` has no budget pressure and an in-memory checkpoint that does a store's CPU
+work but writes nothing. `persisted` writes to a real `JsonlStore` in a tempdir. `fitted` runs
+under the stock 64,000-token budget: `managed_first` is the first managed turn on a history that
+does not fit, and `managed_steady` is the turn after it. Every iteration starts from a history
+cloned cold, so each turn pays one whole encoding of it, as `nanus run` does on a session read
+from disk. A session the link server holds stays warm from one turn to the next.
 
-| Benchmark | Time | ± | Allocations | Bytes allocated |
-|---|---:|---:|---:|---:|
-| `overhead/legacy/0` | 74.82 µs | 1.4% | 1,443 | 268.44 KiB |
-| `overhead/managed/0` | 1.28 ms | 0.3% | 11,319 | 1.89 MiB |
-| `overhead/legacy/10` | 340.96 µs | 0.4% | 4,403 | 1.08 MiB |
-| `overhead/managed/10` | 5.98 ms | 0.4% | 27,187 | 6.13 MiB |
-| `overhead/legacy/100` | 2.69 ms | 0.4% | 30,800 | 8.32 MiB |
-| `overhead/managed/100` | 49.40 ms | 0.4% | 168,442 | 43.76 MiB |
-| `persisted/legacy/10` | 3.75 ms | 3.1% | 4,437 | 1.16 MiB |
-| `persisted/managed/10` | 26.80 ms | 1.5% | 31,820 | 8.34 MiB |
-| `persisted/legacy/100` | 6.97 ms | 4.6% | 30,837 | 8.92 MiB |
-| `persisted/managed/100` | 95.85 ms | 0.9% | 206,474 | 63.22 MiB |
-| `fitted/legacy/100` | 11.05 ms | 1.0% | 239,081 | 47.37 MiB |
-| `fitted/managed_first/100` | 47.97 ms | 0.9% | 248,230 | 56.50 MiB |
-| `fitted/managed_steady/100` | 41.93 ms | 0.5% | 136,818 | 33.86 MiB |
-| `fitted/legacy/300` | 126.15 ms | 0.7% | 2,913,498 | 558.75 MiB |
-| `fitted/managed_first/300` | 121.02 ms | 0.2% | 557,024 | 142.68 MiB |
-| `fitted/managed_steady/300` | 124.37 ms | 0.2% | 436,141 | 112.08 MiB |
+Recorded on 2026-10-06, same machine, **not quiet** (one-minute load 4–15 on eight cores), so
+read times as pessimistic. Unchanged legacy rows moved by up to ±30% between the two recordings
+while their counts stayed identical, which is the load. "Before" is `0a4c7a6`: SHA-256, a whole
+re-encoding per checkpoint, three preparations per step, and one token charged per byte. "After"
+is BLAKE3, incremental checkpoints, two preparations per step, and three bytes per token.
 
-A managed turn costs 10–18 times the harness CPU of a legacy turn, and the cost is linear in the
-session's bytes. A sampling profile of `overhead/managed/100` puts it here:
+| Benchmark | Before | After | Change | Allocations before → after | Bytes allocated before → after |
+|---|---:|---:|---:|---:|---:|
+| `overhead/legacy/0` | 74.82 µs | 97.41 µs | +30% | 1,443 → 1,443 | 268.44 KiB → 268.44 KiB |
+| `overhead/managed/0` | 1.28 ms | 447.08 µs | −65% | 11,319 → 8,899 | 1.89 MiB → 1.32 MiB |
+| `overhead/legacy/10` | 340.96 µs | 323.34 µs | −5% | 4,403 → 4,403 | 1.08 MiB → 1.08 MiB |
+| `overhead/managed/10` | 5.98 ms | 1.25 ms | −79% | 27,187 → 18,331 | 6.13 MiB → 3.86 MiB |
+| `overhead/legacy/100` | 2.69 ms | 2.39 ms | −11% | 30,800 → 30,800 | 8.32 MiB → 8.32 MiB |
+| `overhead/managed/100` | 49.40 ms | 8.78 ms | −82% | 168,442 → 102,127 | 43.76 MiB → 26.10 MiB |
+| `persisted/legacy/10` | 3.75 ms | 4.33 ms | +15% | 4,437 → 4,436 | 1.16 MiB → 1.16 MiB |
+| `persisted/managed/10` | 26.80 ms | 22.78 ms | −15% | 31,820 → 18,744 | 8.34 MiB → 3.92 MiB |
+| `persisted/legacy/100` | 6.97 ms | 5.60 ms | −20% | 30,837 → 30,836 | 8.92 MiB → 8.92 MiB |
+| `persisted/managed/100` | 95.85 ms | 30.60 ms | −68% | 206,474 → 102,552 | 63.22 MiB → 26.88 MiB |
+| `fitted/legacy/100` | 11.05 ms | 10.77 ms | −3% | 239,081 → 239,081 | 47.37 MiB → 47.37 MiB |
+| `fitted/managed_first/100` | 47.97 ms | 15.87 ms | −67% | 248,230 → 206,353 | 56.50 MiB → 47.73 MiB |
+| `fitted/managed_steady/100` | 41.93 ms | 10.23 ms | −76% | 136,818 → 83,097 | 33.86 MiB → 19.73 MiB |
+| `fitted/legacy/300` | 126.15 ms | 148.15 ms | +17% | 2,913,498 → 2,913,498 | 558.75 MiB → 558.75 MiB |
+| `fitted/managed_first/300` | 121.02 ms | 55.26 ms | −54% | 557,024 → 527,141 | 142.68 MiB → 131.64 MiB |
+| `fitted/managed_steady/300` | 124.37 ms | 28.82 ms | −77% | 436,141 → 210,671 | 112.08 MiB → 52.43 MiB |
 
-- **54%** in checkpoints: five per turn (an intent and a settled step for each model step, then
-  the turn's end). Each one encodes the whole session and digests it twice. The store also
-  reads the stored file back and digests it, and re-encodes and digests the candidate twice
-  more: once to check that it extends the file, and once for its postcondition.
-- **25%** in preparing requests: every step prepares its request twice, once as the fitter's
-  first probe and once to freeze it, even when nothing needs fitting. Each preparation encodes
-  and digests the whole body.
-- **10%** in the frontier: a digest of the stored prefix on every step.
-- **Under 5%** in what the design is about: the fold, fragment derivation, protection and
-  compiling the effective conversation.
+**Before**, a managed turn cost 10–18 times a legacy turn's harness CPU. A sampling profile of
+`overhead/managed/100` put 54% of it in checkpoints and 25% in preparing requests. Each of the
+five checkpoints in a turn re-encoded the whole session and digested it twice, and the store
+read the file back and re-encoded the candidate twice more. The runner prepared every request
+three times. SHA-256 alone was 64% of samples: `sha2` 0.10 runs its portable code on `aarch64`
+unless its `asm` feature is on.
 
-SHA-256 alone is 64% of samples, because `sha2` 0.10 runs its portable implementation on
-`aarch64` unless its `asm` feature is enabled. Enabling that feature, as an experiment that was
-not kept, cut `overhead/managed` by 43–54% and `persisted/managed` by 18–43%, and left legacy
-unchanged. It was not kept because the feature builds `sha2-asm` with a C toolchain, which the
-native Windows gate would have to carry. `sha2` 0.11 uses the instructions without it.
+**After**, a managed turn costs 3.7–4.6 times a legacy one in memory, and about 5 times on disk.
+What changed:
 
-Legacy fitting is the expensive path past about 300 turns: at 300 it allocates five times what
-managed does. The limit that matters first is the floor. Under the stock budget and one token per
-byte, this turn shape is refused with `protected_floor_too_large` on its second managed turn at
-400 turns. `context_footprint`, an example in the same crate, shows the same floor with the real
-DeepSeek encoder and realistic 1 KB prompts at 40–50 turns.
+- **BLAKE3** replaces SHA-256 everywhere, with SIMD on every target.
+- **Checkpoints are incremental.** The session carries its encoding forward, so a checkpoint
+  encodes only the new events. The store trusts the identity it last wrote while the file's
+  length, time and inode are unchanged. It clones the stored file copy-on-write, appends the
+  new lines, syncs and renames it.
+- **One preparation per step is gone.** The fitter's first probe is the freeze's draft.
+
+The profile now puts 33% in request preparation (two encodes and digests of the body per step),
+13% in the one cold encoding of the history, 10% in checkpoints, and under 6% in the fold,
+derivation and compilation. The ordinary turn's own work is 23%. On disk the rest was five
+synced writes per turn where legacy makes one: about 21 ms of `persisted/managed/10`'s 23 ms was
+time the CPU profile does not see. On macOS `File::sync_all` is `fcntl(F_FULLFSYNC)`, which
+flushes the drive's cache: about 3.4 ms each on this machine's internal SSD and about 56 ms on
+an external volume. A plain `fsync`, which does not flush the drive, takes 0.03 ms.
+
+The digest feed matters too. A digest fed one line at a time goes through BLAKE3's single-block
+compressor, because the parallel path needs one update to span several 1 KiB chunks. Feeding the
+lines a call encodes as one input took `overhead/managed/100` from 11.06 ms to 8.78 ms.
+
+Legacy fitting is still the expensive path past about 300 turns, allocating 5.5 times what
+managed does there. The limit that matters first is the floor. `context_footprint`, an example
+in the same crate, runs the real DeepSeek encoder:
+
+| History | Managed body before → after | Legacy body | Refused before | Refused after |
+|---|---:|---:|---|---|
+| 100 turns | 33 KB → 108 KB | 288 KB, 40 turns dropped | — | — |
+| 500 turns | 57 KB → 105 KB | 289 KB | — | — |
+| 1,000 turns | refused → 105 KB | 289 KB | refused | — |
+| 2,000 turns | refused | 284 KB | refused | refused |
+| 40 turns, 1 KB prompts | 57 KB → 105 KB | 233 KB | — | — |
+| 100 turns, 1 KB prompts | refused → 123 KB | 279 KB, 52 turns dropped | refused (from 40–50) | — |
+| 200 turns, 1 KB prompts | refused | 280 KB | refused | refused |
+
+Managed keeps every user message, so the floor still exists. It now arrives at about four times
+the history it did.
+
+#### Coalesced checkpoints
+
+A step that stages no context proposal is no longer checkpointed on its own: its finished
+attempt rides with the next step's intent, or with the turn's end. A two-step turn takes three
+synced writes instead of five, and a turn of `n` steps takes `n + 1` instead of `2n + 1`.
+
+The machine's load swung between 3 and 18 during this change, so the two builds were run
+alternately, three rounds each, and the table gives each median. The "before" build is the same
+tree with the deferral disabled.
+
+| Benchmark | Before | After | Change |
+|---|---:|---:|---:|
+| `overhead/legacy/10` | 0.31 ms | 0.32 ms | +2% |
+| `overhead/legacy/100` | 2.42 ms | 2.47 ms | +2% |
+| `overhead/managed/10` | 1.28 ms | 1.30 ms | +2% |
+| `overhead/managed/100` | 8.95 ms | 8.93 ms | −0% |
+| `persisted/legacy/10` | 3.14 ms | 3.77 ms | +20% |
+| `persisted/legacy/100` | 5.82 ms | 5.72 ms | −2% |
+| `persisted/managed/10` | 20.61 ms | 13.83 ms | −33% |
+| `persisted/managed/100` | 29.71 ms | 22.21 ms | −25% |
+
+The saving is two drive flushes, about 7 ms per turn, and nothing else: CPU is unchanged, and the
+legacy rows are within their own spread (`persisted/legacy/10` ran 3.1–4.2 ms in both builds).
+Allocation counts, which are exact, fell 4–11% for managed turns, from the two candidate copies
+no longer made.
 
 ### `session`
 

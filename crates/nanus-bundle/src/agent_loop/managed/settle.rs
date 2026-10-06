@@ -34,11 +34,11 @@ pub(in crate::agent_loop) fn artifact_facts(
                     && payload.status != CaptureStatus::Unavailable =>
             {
                 payload
-                    .retained_sha256
+                    .retained_blake3
                     .clone()
-                    .map(|retained_sha256| notes::ArtifactFacts {
+                    .map(|retained_blake3| notes::ArtifactFacts {
                         retained_bytes: payload.retained_bytes,
-                        retained_sha256,
+                        retained_blake3,
                     })
             }
             _ => None,
@@ -47,7 +47,9 @@ pub(in crate::agent_loop) fn artifact_facts(
 }
 
 impl AgentRunner {
-    /// Settles a step: the attempt's outcome, any staged proposal, and one checkpoint.
+    /// Settles a step: the attempt's outcome, any staged proposal, and — when a proposal was
+    /// staged — one checkpoint. A step with nothing to decide is settled into the session and
+    /// made durable by the next checkpoint the turn takes.
     pub(in crate::agent_loop) async fn settle(
         &self,
         session: &mut Session,
@@ -63,6 +65,18 @@ impl AgentRunner {
         let (attempt, facts, result) = step;
         let finished = self.finished_attempt(attempt, &facts, result);
         let staged = turn.step.borrow_mut().staged.take();
+        if staged.is_none() && !turn.stopped() {
+            // Nothing to decide, so the step's one record is the attempt's outcome — the same
+            // record whether its checkpoint would have landed or not. It rides with the next
+            // checkpoint: the next step's intent or the turn's end. Nothing leaves the process
+            // in between, so the disk is never behind anything the world has seen, and the
+            // turn pays one flush where it paid two.
+            session.append(SessionEvent::RequestAttempt {
+                payload: Box::new(finished),
+            });
+            turn.settled.set(turn.settled.get().saturating_add(1));
+            return Ok(());
+        }
         let mut candidate = session.clone();
         let mut reason = CheckpointReason::SettledStep;
         let decision = staged.map(|staged| {
@@ -140,7 +154,8 @@ impl AgentRunner {
         }
     }
 
-    fn count_step(turn: &ManagedTurn<'_>) {
+    /// Advances the reminder's step count for one step whose settlement is on disk.
+    pub(super) fn count_step(turn: &ManagedTurn<'_>) {
         let mut reminder = turn.reminder();
         reminder.step_completed();
         turn.set_reminder(reminder);

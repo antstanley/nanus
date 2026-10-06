@@ -10,7 +10,6 @@ use nanus_domain::{
     ToolOutcome, ToolResult, ToolSchema,
 };
 use serde_json::{Value, json};
-use sha2::Digest as _;
 
 use crate::VideoError;
 use crate::args::{FRAMES_MAX, RequestedMode, VideoReadArguments, WINDOW_MS_MAX};
@@ -212,7 +211,7 @@ async fn read(
         .await?;
     sample.warnings.extend(clamped);
     // Nothing below reads the source again; dropping the snapshot removes the copy.
-    let digest = snapshot.sha256.clone();
+    let digest = snapshot.blake3.clone();
     drop(snapshot);
     stage.set(match delivery {
         Delivery::Frames => Stage::Delivering,
@@ -261,7 +260,7 @@ fn manifest(
 ) -> Value {
     json!({
         "file_path": request.file_path,
-        "source_sha256": digest,
+        "source_blake3": digest,
         "duration_ms": info.duration_ms,
         "start_ms": window.start_ms,
         "end_ms": window.end_ms,
@@ -277,7 +276,7 @@ fn manifest(
             "timestamp_ms": frame.timestamp_ms,
             "width": frame.width,
             "height": frame.height,
-            "sha256": crate::source::hex(&sha2::Sha256::digest(&frame.jpeg)),
+            "blake3": crate::source::hex(blake3::hash(&frame.jpeg).as_bytes()),
         })).collect::<Vec<_>>(),
         "warnings": sample.warnings,
     })

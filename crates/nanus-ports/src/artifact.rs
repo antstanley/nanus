@@ -241,11 +241,11 @@ mod tests {
                         stream: nanus_domain::context::managed::CaptureStream::Stdout,
                         retained_bytes: 0,
                         observed_bytes: 0,
-                        retained_sha256: None,
+                        retained_blake3: None,
                         status: nanus_domain::context::managed::CaptureStatus::Unavailable,
                         reason: CaptureReason::Unsupported,
                         encoding: nanus_domain::context::managed::RawEncoding::Raw,
-                        chunk_sha256: Vec::new(),
+                        chunk_blake3: Vec::new(),
                     },
                     artifact: None,
                 }

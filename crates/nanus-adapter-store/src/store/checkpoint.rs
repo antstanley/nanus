@@ -30,12 +30,33 @@
 //! still land, which would turn every slow disk into an unknown outcome. A started commit runs to
 //! its end, and its caller awaits it.
 //!
+//! ## What a checkpoint costs
+//!
+//! A managed turn checkpoints several times, so a checkpoint costs what the step *added*, not what
+//! the conversation has grown to, wherever it can:
+//!
+//! - **The stored identity is remembered, not re-read.** After a commit this process records the
+//!   identity it wrote and the file's length, modification time and (on Unix) inode. The next
+//!   checkpoint compares only those; any difference — another writer, an edit, a deletion — and
+//!   the file is read back and digested exactly as before. A writer that replaced the file in
+//!   place, at the same length, within the clock's resolution, would go unseen; the session claim
+//!   is what rules such a writer out, and this is a check behind it rather than instead of it.
+//! - **Only the new events are encoded.** At an unchanged body version the candidate must extend
+//!   the stored file, and the session's carried encoding answers that and the receipt's digests
+//!   without re-encoding what is stored. The new file is the stored one cloned — copy-on-write
+//!   where the filesystem has it, an in-kernel copy where it does not — with the new lines
+//!   appended, then synced and renamed exactly as a whole write is. Across the version upgrade,
+//!   or with nothing stored, the whole session is encoded and written.
+//!
 //! ## Durability
 //!
 //! A receipt claims [`Durability::ProcessCrash`]: the file is synced and then renamed over the old
 //! one, so a process crash leaves either the old file or the new one. It does not claim
 //! [`Durability::PowerLoss`], which would need the parent directory synced after the rename and,
 //! on macOS, `F_FULLFSYNC` rather than `fsync` — neither of which this store does for a session.
+
+use std::path::Path;
+use std::time::SystemTime;
 
 use nanus_domain::context::managed::{
     CheckpointReceipt, ContextFrontier, Digest, Durability, ErrorCode, ManagedState,
@@ -88,7 +109,7 @@ impl JsonlStore {
         let id = candidate.id();
         self.admit(id).await?;
         let stored = self
-            .stored_identity_blocking(id)
+            .checkpoint_identity(id)
             .await
             .map_err(|_| refused(ErrorCode::CheckpointNotCommitted))?;
         if stored != *view.expected {
@@ -96,33 +117,83 @@ impl JsonlStore {
         }
         self.check_extends(candidate, &stored).await?;
         let revision = accepted_revision(candidate)?;
-        let body = candidate
-            .try_to_jsonl()
-            .map_err(|error| refused(encoding_refusal(&error)))?;
+        let write = Write::of(candidate, &stored)?;
         let count = u64::try_from(candidate.event_count())
             .map_err(|_| refused(ErrorCode::StorageCapacity))?;
         self.check_artifacts(candidate, &stored, view.artifacts)
             .await?;
-        self.replace(id, &body, view.expected).await?;
+        self.commit_write(id, &write, view.expected).await?;
         let receipt = CheckpointReceipt {
             frontier: ContextFrontier {
                 session_id: id.as_str().to_owned(),
                 event_count: count,
-                prefix_sha256: Digest::of(body.as_bytes()),
+                prefix_blake3: candidate.prefix_digest(count).map_err(|_| unknown())?,
                 projection_revision: revision,
             },
             body_digest: candidate.body_digest(),
             durability: Durability::ProcessCrash,
         };
-        // Postcondition: the frontier the receipt names is the candidate's own prefix at its full
-        // count, which is what lets the host derive the next expected identity from it.
-        assert!(
-            candidate
-                .prefix_digest(count)
-                .is_ok_and(|digest| digest == receipt.frontier.prefix_sha256),
-            "a checkpoint's frontier digest is the candidate's whole-file digest"
-        );
+        // Postcondition: a whole write's bytes are the candidate's own prefix at its full count,
+        // which is what lets the host derive the next expected identity from the receipt.
+        if let Write::Whole(body) = &write {
+            assert!(
+                Digest::of(body.as_bytes()) == receipt.frontier.prefix_blake3,
+                "a checkpoint's frontier digest is the candidate's whole-file digest"
+            );
+        }
+        self.remember(id, &receipt, candidate.body_version()).await;
         Ok(receipt)
+    }
+
+    /// The stored identity a checkpoint compares against: the one this process wrote, while the
+    /// file still looks as it did after that write, and otherwise the one read from disk.
+    async fn checkpoint_identity(&self, id: &SessionId) -> StoreResult<ExpectedCheckpoint> {
+        let path = self.session_file(id)?;
+        let remembered = self.written_entry(id);
+        if let (Some(written), Ok(metadata)) = (remembered, fs::metadata(&path).await)
+            && written.stamp == Stamp::of(&metadata)
+        {
+            return Ok(written.identity);
+        }
+        self.forget_written(id);
+        self.stored_identity_blocking(id).await
+    }
+
+    /// Records what a commit left on disk, or forgets it when the file cannot be described.
+    async fn remember(&self, id: &SessionId, receipt: &CheckpointReceipt, body_version: u32) {
+        let Ok(path) = self.session_file(id) else {
+            self.forget_written(id);
+            return;
+        };
+        let Ok(metadata) = fs::metadata(&path).await else {
+            self.forget_written(id);
+            return;
+        };
+        let written = Written {
+            identity: ExpectedCheckpoint::after(receipt, body_version),
+            stamp: Stamp::of(&metadata),
+        };
+        self.written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), written);
+    }
+
+    /// The identity remembered for `id`, if any.
+    fn written_entry(&self, id: &SessionId) -> Option<Written> {
+        self.written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    /// Forgets the identity remembered for `id`: something other than a checkpoint touched it.
+    pub(super) fn forget_written(&self, id: &SessionId) {
+        self.written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
     }
 
     /// Refuses a candidate that does not extend what is stored: the log is append-only, so a
@@ -138,7 +209,7 @@ impl JsonlStore {
     ) -> Result<(), CheckpointError> {
         let ExpectedCheckpoint::Stored {
             body_version,
-            file_sha256,
+            file_blake3,
             event_count,
         } = stored
         else {
@@ -152,7 +223,7 @@ impl JsonlStore {
             let prefix = candidate
                 .prefix_digest(*event_count)
                 .map_err(|_| refused(ErrorCode::StaleBase))?;
-            return if prefix == *file_sha256 {
+            return if prefix == *file_blake3 {
                 Ok(())
             } else {
                 Err(refused(ErrorCode::StaleBase))
@@ -229,11 +300,11 @@ impl JsonlStore {
         Ok(())
     }
 
-    /// Writes `body` beside the session file, syncs it, and renames it over the real name.
-    async fn replace(
+    /// Writes the new file beside the session file, syncs it, and renames it over the real name.
+    async fn commit_write(
         &self,
         id: &SessionId,
-        body: &str,
+        write: &Write,
         expected: &ExpectedCheckpoint,
     ) -> Result<(), CheckpointError> {
         let not_committed = refused(ErrorCode::CheckpointNotCommitted);
@@ -241,13 +312,18 @@ impl JsonlStore {
         let dir = self.session_dir(id).map_err(|_| not_committed)?;
         fs::create_dir_all(&dir).await.map_err(|_| not_committed)?;
         let temp = temp_path(&path);
-        if let Err(error) = write_synced(&temp, body).await {
+        let staged = match write {
+            Write::Whole(body) => write_synced(&temp, body).await,
+            Write::Tail(tail) => extend_synced(&path, &temp, tail).await,
+        };
+        if let Err(error) = staged {
             tracing::warn!(%error, "a checkpoint's temporary file could not be written");
             discard(&temp).await;
             return Err(not_committed);
         }
         if let Err(source) = fs::rename(&temp, &path).await {
             discard(&temp).await;
+            self.forget_written(id);
             // A rename is atomic, so an error means it did not happen — but that is said only
             // when the disk agrees: the expected identity, read back under the same claim.
             let intact = self
@@ -260,10 +336,73 @@ impl JsonlStore {
         // The claim is this process's, so only this process can have retired the id meanwhile;
         // the file it just wrote is removed rather than left to resurrect the conversation.
         if self.retired(id).unwrap_or(true) {
+            self.forget_written(id);
             self.undo_resurrection(id);
             return Err(unknown());
         }
         Ok(())
+    }
+}
+
+/// What a checkpoint writes: the whole session, or the lines after what is stored.
+enum Write {
+    /// Every line, header first: nothing is stored, or the header changes.
+    Whole(String),
+    /// The event lines after the stored ones, added to a clone of the stored file.
+    Tail(String),
+}
+
+impl Write {
+    /// Encodes what `candidate` adds to `stored`, refusing what the store may not write.
+    fn of(candidate: &Session, stored: &ExpectedCheckpoint) -> Result<Self, CheckpointError> {
+        let encoded = match stored {
+            ExpectedCheckpoint::Stored {
+                body_version,
+                event_count,
+                ..
+            } if *body_version == candidate.body_version() => {
+                candidate.encoded_lines_from(*event_count).map(Self::Tail)
+            }
+            _ => candidate.try_to_jsonl().map(Self::Whole),
+        };
+        encoded.map_err(|error| refused(encoding_refusal(&error)))
+    }
+}
+
+/// The identity this process last committed for a session, and how its file looked after.
+#[derive(Clone, Debug)]
+pub(super) struct Written {
+    /// What the next checkpoint expects to replace.
+    identity: ExpectedCheckpoint,
+    /// The file's description right after the commit.
+    stamp: Stamp,
+}
+
+/// What a file looks like from outside: enough to tell that it is no longer the one written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Stamp {
+    /// Its length in bytes.
+    len: u64,
+    /// Its last modification, where the platform reports one.
+    modified: Option<SystemTime>,
+    /// Its inode and device on Unix, which a rename over it always changes.
+    inode: Option<(u64, u64)>,
+}
+
+impl Stamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((metadata.ino(), metadata.dev()))
+        };
+        #[cfg(not(unix))]
+        let inode = None;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            inode,
+        }
     }
 }
 
@@ -292,7 +431,7 @@ fn identity_of(id: &SessionId, raw: &[u8]) -> StoreResult<ExpectedCheckpoint> {
     })?;
     Ok(ExpectedCheckpoint::Stored {
         body_version: header_version(&header),
-        file_sha256: Digest::of(raw),
+        file_blake3: Digest::of(raw),
         event_count: events,
     })
 }
@@ -340,15 +479,25 @@ const fn artifact_refusal(error: ArtifactError) -> ErrorCode {
 /// returns; only `flush` waits for that write and reports its error. Without it a full disk on
 /// the final chunk is never seen, `sync_all` succeeds on the short file, and the rename installs
 /// a truncated session that a receipt then calls committed.
-async fn write_synced(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+async fn write_synced(path: &Path, body: &str) -> std::io::Result<()> {
     let mut file = fs::File::create(path).await?;
     file.write_all(body.as_bytes()).await?;
     file.flush().await?;
     file.sync_all().await
 }
 
+/// Clones the stored file to `temp` — copy-on-write where the filesystem can — then appends
+/// `tail` and syncs the result.
+async fn extend_synced(stored: &Path, temp: &Path, tail: &str) -> std::io::Result<()> {
+    fs::copy(stored, temp).await?;
+    let mut file = fs::OpenOptions::new().append(true).open(temp).await?;
+    file.write_all(tail.as_bytes()).await?;
+    file.flush().await?;
+    file.sync_all().await
+}
+
 /// Removes a temporary file, quietly: it was never under the real name.
-async fn discard(path: &std::path::Path) {
+async fn discard(path: &Path) {
     if fs::remove_file(path).await.is_ok() {
         tracing::debug!(temp = %path.display(), "discarded a checkpoint's temporary file");
     }

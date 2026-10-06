@@ -745,7 +745,7 @@ async fn overlapping_steps_keep_selection_held_until_both_reservations_drop() {
 
 #[tokio::test]
 async fn validation_sees_private_raw_values_and_the_exact_normalized_model_observation() {
-    let value = json!({"source_sha256":"fixture","frames":1});
+    let value = json!({"source_blake3":"fixture","frames":1});
     let outcome = ToolOutcome::success_with(
         value.clone(),
         vec![ContentBlock::Text("frame manifest".into())],

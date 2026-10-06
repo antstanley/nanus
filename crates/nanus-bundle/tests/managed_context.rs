@@ -12,13 +12,13 @@
 mod harness;
 
 use harness::*;
-use nanus_bundle::TurnHost;
+use nanus_bundle::{Silent, TurnHost};
 use nanus_domain::context::managed::{
     AttemptOutcome, AttemptPhase, ContextMode, ContextPolicy, DecisionOutcome, ErrorCode,
     MEMORY_LABEL, ModeActor, RevisionAuthor,
 };
 use nanus_domain::{Message, SessionEvent};
-use nanus_ports::PersistenceState;
+use nanus_ports::{CheckpointReason, PersistenceState};
 
 /// T01: a session that never enabled managed context runs, encodes and saves exactly as before.
 #[test]
@@ -33,7 +33,7 @@ fn a_legacy_session_is_untouched_by_the_managed_entry_point() {
             let outcome = block(runner.run_turn_with_runtime(
                 &mut session,
                 "hi",
-                &mut nanus_bundle::Silent,
+                &mut Silent,
                 host(&disk, &context),
             ));
             assert!(outcome.outcome.is_ok());
@@ -42,7 +42,7 @@ fn a_legacy_session_is_untouched_by_the_managed_entry_point() {
                 "a legacy session is the host's to save"
             );
         } else {
-            block(runner.run_turn(&mut session, "hi", &mut nanus_bundle::Silent, None)).unwrap();
+            block(runner.run_turn(&mut session, "hi", &mut Silent, None)).unwrap();
         }
         assert_eq!(disk.commits(), 0);
         (model.sent(), session.to_jsonl())
@@ -117,7 +117,7 @@ fn automatic_fitting_hides_old_fragments_and_keeps_every_user_message() {
     let outcome = block(runner.run_turn_with_runtime(
         &mut session,
         "constraint: keep the API stable. Now do the long task.",
-        &mut nanus_bundle::Silent,
+        &mut Silent,
         host(&disk, &context),
     ));
     assert!(outcome.outcome.is_ok(), "{:?}", outcome.outcome);
@@ -184,7 +184,7 @@ fn a_protected_floor_over_the_budget_refuses_before_any_request() {
     let outcome = block(runner.run_turn_with_runtime(
         &mut session,
         &huge,
-        &mut nanus_bundle::Silent,
+        &mut Silent,
         host(&disk, &context),
     ));
     assert_eq!(
@@ -199,6 +199,91 @@ fn a_protected_floor_over_the_budget_refuses_before_any_request() {
             .iter()
             .any(|event| matches!(event, SessionEvent::ContextRevision { .. }))
     );
+}
+
+/// The phases of every request attempt in a session, in log order.
+fn attempt_phases(session: &nanus_domain::Session) -> Vec<AttemptPhase> {
+    session
+        .log()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::RequestAttempt { payload } => Some(payload.phase),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A step with nothing to decide is not checkpointed on its own: its finished attempt rides with
+/// the next step's intent, and the last step's with the turn's end — `n + 1` commits, not `2n + 1`.
+#[test]
+fn a_step_with_nothing_to_decide_rides_with_the_next_checkpoint() {
+    let model = <Model as ModelExt>::new(vec![call("e1", "echo", r#"{"size": 10}"#)]);
+    model.push(text("done"));
+    let runner = runner(&model, 64_000);
+    let (mut session, disk, context) = managed(&runner);
+    let before = disk.commits();
+    let run =
+        block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)));
+    assert!(run.outcome.is_ok(), "{:?}", run.outcome);
+    assert_eq!(
+        disk.reasons_since(before),
+        vec![
+            CheckpointReason::RequestIntent,
+            CheckpointReason::RequestIntent,
+            CheckpointReason::TurnEnd,
+        ]
+    );
+    // Every outcome is on disk, each before the next intent.
+    assert_eq!(&disk.last(), &session);
+    assert_eq!(
+        attempt_phases(&session),
+        vec![
+            AttemptPhase::Started,
+            AttemptPhase::Finished,
+            AttemptPhase::Started,
+            AttemptPhase::Finished,
+        ]
+    );
+}
+
+/// Pair: the commit that carries a settled step is refused. Nothing more is sent, and the one
+/// terminal attempt saves the step's outcome — what a refused settlement of its own would leave.
+#[test]
+fn a_refused_commit_carrying_a_settled_step_sends_nothing_and_keeps_its_outcome() {
+    let model = <Model as ModelExt>::new(vec![call("e1", "echo", r#"{"size": 10}"#)]);
+    model.push(text("never"));
+    let runner = runner(&model, 64_000);
+    let (mut session, disk, context) = managed(&runner);
+    let before = disk.commits();
+    // The first intent lands; the second, carrying the first step's settlement, is refused.
+    disk.fail(1, Failure::Refuse, false);
+    let run =
+        block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)));
+    assert_eq!(
+        run.outcome.err().and_then(|error| error.managed_code()),
+        Some(ErrorCode::CheckpointNotCommitted)
+    );
+    assert_eq!(model.sent().len(), 1, "the second request was never sent");
+    assert_eq!(
+        disk.reasons_since(before),
+        vec![
+            CheckpointReason::RequestIntent,
+            CheckpointReason::RequestIntent,
+            CheckpointReason::TurnEnd,
+        ],
+        "the refused intent, then one terminal attempt"
+    );
+    let stored = disk.last();
+    assert_eq!(
+        attempt_phases(&stored),
+        vec![AttemptPhase::Started, AttemptPhase::Finished],
+        "the first step's outcome is saved and the refused intent is not"
+    );
+    assert!(matches!(
+        stored.log().last_turn_end(),
+        Some(nanus_domain::TurnEndReason::Error { .. })
+    ));
 }
 
 /// T16: inspect, then a proposal alone in its step: staged, the step settles, then accepted.
@@ -217,10 +302,26 @@ fn a_valid_proposal_is_staged_then_accepted_after_its_step_settles() {
     let outcome = block(runner.run_turn_with_runtime(
         &mut session,
         "work, then tidy up",
-        &mut nanus_bundle::Silent,
+        &mut Silent,
         host(&disk, &context),
     ));
     assert!(outcome.outcome.is_ok(), "{:?}", outcome.outcome);
+    // A step that staged a proposal is still settled by a checkpoint of its own, because its
+    // revision has to be acknowledged before the next request is prepared under it. Every other
+    // step rides with the next intent.
+    let reasons = disk.reasons_since(0);
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|reason| **reason == CheckpointReason::ContextRevision)
+            .count(),
+        1,
+        "{reasons:?}"
+    );
+    assert!(
+        !reasons.contains(&CheckpointReason::SettledStep),
+        "{reasons:?}"
+    );
     let proposal = tool_result_json(&session, "i2");
     assert_eq!(proposal["status"], "staged", "{proposal}");
     let accepted = session.log().events().iter().find_map(|event| match event {
@@ -271,12 +372,8 @@ fn a_mixed_proposal_batch_refuses_every_call_before_any_effect() {
         ("e", "echo", r#"{"size": 1}"#),
     ]));
     model.push(text("ok"));
-    let outcome = block(runner.run_turn_with_runtime(
-        &mut session,
-        "go",
-        &mut nanus_bundle::Silent,
-        host(&disk, &context),
-    ));
+    let outcome =
+        block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)));
     assert!(outcome.outcome.is_ok());
     assert!(session.goal().is_none(), "the goal tool did not run");
     assert_eq!(model.echoes(), 0, "the registered tool did not run");
@@ -304,14 +401,9 @@ fn reset_selects_legacy_and_a_re_enable_starts_from_an_empty_selection() {
     model.push(call("i1", "context_manage", INSPECT));
     model.push_with(propose_oldest("i2"));
     model.push(text("tidied"));
-    block(runner.run_turn_with_runtime(
-        &mut session,
-        "go",
-        &mut nanus_bundle::Silent,
-        host(&disk, &context),
-    ))
-    .outcome
-    .unwrap();
+    block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)))
+        .outcome
+        .unwrap();
     let status = runner
         .context_status(&session, host(&disk, &context).runtime)
         .unwrap();

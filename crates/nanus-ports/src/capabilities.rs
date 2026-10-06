@@ -176,6 +176,20 @@ fn invalid(message: impl Into<String>) -> LlmError {
     }
 }
 
+/// Serialized body bytes a managed request is charged as one input token.
+///
+/// The providers' tokenizers average roughly three and a half to four and a half bytes per token
+/// on prose and code, and JSON framing — quoted keys, escaped newlines and quotes — adds bytes
+/// that cost almost no tokens, so three bytes per token still overestimates a real request.
+/// One byte per token, which ordinary requests keep, overestimates it about fourfold: a managed
+/// session then hides history the model had room for, and refuses once its protected floor —
+/// every user message — passes a quarter of the budget.
+pub const MANAGED_BYTES_PER_TOKEN: usize = 3;
+
+/// The estimator a managed status names: the adapter's serialized body, at
+/// [`MANAGED_BYTES_PER_TOKEN`] bytes per token.
+pub const MANAGED_ESTIMATOR: &str = "adapter-serialized-body/3";
+
 /// Counts the provider's assembled body; encoded pixels are replaced by dimension charges.
 ///
 /// Text and JSON are conservatively charged at one serialized byte per token. Image payload
@@ -186,6 +200,30 @@ pub fn estimate_payload(
     request: &ChatRequest,
     payload: &serde_json::Value,
 ) -> LlmResult<RequestEstimate> {
+    estimate_at(caps, request, payload, 1)
+}
+
+/// Counts a managed request's assembled body, charging text at [`MANAGED_BYTES_PER_TOKEN`].
+///
+/// The same measurement as [`estimate_payload`] in everything but the rate: images, the
+/// reservation, the byte bound and the rounding are the same. Only managed preparation uses it,
+/// so an ordinary request is measured — and fitted — exactly as before.
+pub fn estimate_managed_payload(
+    caps: ModelCapabilities,
+    request: &ChatRequest,
+    payload: &serde_json::Value,
+) -> LlmResult<RequestEstimate> {
+    estimate_at(caps, request, payload, MANAGED_BYTES_PER_TOKEN)
+}
+
+/// The body of both estimators: text charged at `bytes_per_token`, rounded up.
+fn estimate_at(
+    caps: ModelCapabilities,
+    request: &ChatRequest,
+    payload: &serde_json::Value,
+    bytes_per_token: usize,
+) -> LlmResult<RequestEstimate> {
+    assert!(bytes_per_token > 0, "a token is at least one byte");
     let image_request = has_images(&request.messages);
     let profile = if image_request {
         Some(caps.require_image_profile(&request.model)?)
@@ -223,7 +261,7 @@ pub fn estimate_payload(
     let text = request_bytes
         .checked_sub(encoded_pixels)
         .ok_or_else(|| invalid("image byte estimate exceeds body"))?;
-    let input_tokens = u32::try_from(text)
+    let input_tokens = u32::try_from(text.div_ceil(bytes_per_token))
         .ok()
         .and_then(|n| n.checked_add(visual))
         .ok_or_else(|| invalid("input estimate overflow"))?;
@@ -454,6 +492,34 @@ mod tests {
         );
         let bad = request(profile, &pixels(1025, 1), 1);
         assert!(estimate_payload(caps(profile), &bad, &json!({})).is_err());
+    }
+
+    #[test]
+    fn a_managed_estimate_charges_text_at_its_rate_and_everything_else_alike() {
+        let profile = ImageProfile::OpenAiAstraHighPatch32V1;
+        let text = ChatRequest::new(profile.model(), vec![Message::user("x")]).with_max_tokens(64);
+        for length in [0_usize, 1, 2, 3, 4, 299, 300, 301] {
+            let payload = json!({ "t": "y".repeat(length) });
+            let ordinary = estimate_payload(caps(profile), &text, &payload).unwrap();
+            let managed = estimate_managed_payload(caps(profile), &text, &payload).unwrap();
+            let bytes = u32::try_from(ordinary.request_bytes).unwrap();
+            // The ordinary rate is untouched: one token per byte.
+            assert_eq!(ordinary.input_tokens, bytes);
+            // The managed rate rounds up, so a partial token is still charged.
+            assert_eq!(managed.input_tokens, bytes.div_ceil(3));
+            assert_eq!(managed.request_bytes, ordinary.request_bytes);
+            assert_eq!(managed.reservation, ordinary.reservation);
+        }
+        // Images are charged by their dimensions under either rate, never by their bytes: the
+        // 1,577 visual tokens, then the two-byte body at each rate.
+        let image = request(profile, &pixels(1024, 1024), 1);
+        let empty = json!({});
+        let ordinary = estimate_payload(caps(profile), &image, &empty).unwrap();
+        let managed = estimate_managed_payload(caps(profile), &image, &empty).unwrap();
+        assert_eq!(ordinary.input_tokens, 1577 + 2);
+        assert_eq!(managed.input_tokens, 1577 + 1);
+        let bad = request(profile, &pixels(1025, 1), 1);
+        assert!(estimate_managed_payload(caps(profile), &bad, &json!({})).is_err());
     }
 
     #[test]

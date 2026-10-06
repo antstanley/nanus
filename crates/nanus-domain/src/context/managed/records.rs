@@ -120,8 +120,8 @@ pub struct ContextFrontier {
     pub session_id: String,
     /// The exclusive event count.
     pub event_count: u64,
-    /// SHA-256 of the stored header and the first `event_count` event lines.
-    pub prefix_sha256: Digest,
+    /// BLAKE3 of the stored header and the first `event_count` event lines.
+    pub prefix_blake3: Digest,
     /// The context revision accepted at this point.
     pub projection_revision: u64,
 }
@@ -188,7 +188,7 @@ pub struct SourceRef {
     pub offset: u64,
     /// The range's length in bytes.
     pub length: u64,
-    /// SHA-256 of the *entire* selected source, independent of the range.
+    /// BLAKE3 of the *entire* selected source, independent of the range.
     pub source_digest: Digest,
     /// The addressed field.
     pub field: SourceField,
@@ -336,7 +336,7 @@ pub struct ProjectionRevision {
     pub decision_id: String,
     /// The goal revision its notes are bound to.
     pub goal_revision: Option<u64>,
-    /// SHA-256 of the canonical note array with the policy and renderer version.
+    /// BLAKE3 of the canonical note array with the policy and renderer version.
     pub notes_digest: Digest,
     /// The snapshot profile it was made against.
     pub base_profile_digest: Digest,
@@ -514,16 +514,16 @@ pub struct ArtifactReceipt {
     pub retained_bytes: u64,
     /// Bytes the pump actually read.
     pub observed_bytes: u64,
-    /// SHA-256 of the retained bytes.
-    pub retained_sha256: Option<Digest>,
+    /// BLAKE3 of the retained bytes.
+    pub retained_blake3: Option<Digest>,
     /// How much was retained.
     pub status: CaptureStatus,
     /// Why it ended.
     pub reason: CaptureReason,
     /// Always `raw`.
     pub encoding: RawEncoding,
-    /// SHA-256 of each 64 KiB chunk, including a shorter final one.
-    pub chunk_sha256: Vec<Digest>,
+    /// BLAKE3 of each 64 KiB chunk, including a shorter final one.
+    pub chunk_blake3: Vec<Digest>,
 }
 
 /// The only artifact encoding version 1 writes: the bytes exactly as the pipe gave them.
@@ -554,26 +554,26 @@ impl ArtifactReceipt {
         let consistent = match self.status {
             CaptureStatus::Complete => {
                 self.artifact_id.is_some()
-                    && self.retained_sha256.is_some()
+                    && self.retained_blake3.is_some()
                     && self.retained_bytes == self.observed_bytes
                     && self.reason == CaptureReason::Eof
             }
             CaptureStatus::Partial => {
                 self.artifact_id.is_some()
-                    && self.retained_sha256.is_some()
+                    && self.retained_blake3.is_some()
                     && self.retained_bytes <= self.observed_bytes
                     && self.reason != CaptureReason::Eof
             }
             CaptureStatus::Unavailable => {
                 self.artifact_id.is_none()
-                    && self.retained_sha256.is_none()
+                    && self.retained_blake3.is_none()
                     && self.retained_bytes == 0
-                    && self.chunk_sha256.is_empty()
+                    && self.chunk_blake3.is_empty()
             }
         };
         let chunked = self.status == CaptureStatus::Unavailable
-            || u64::try_from(self.chunk_sha256.len()).is_ok_and(|count| count == chunks);
-        if consistent && chunked && self.chunk_sha256.len() <= limits::ARTIFACT_CHUNKS_MAX {
+            || u64::try_from(self.chunk_blake3.len()).is_ok_and(|count| count == chunks);
+        if consistent && chunked && self.chunk_blake3.len() <= limits::ARTIFACT_CHUNKS_MAX {
             Ok(())
         } else {
             bad
@@ -587,7 +587,7 @@ impl ArtifactReceipt {
 pub struct SelectionIdentity {
     /// The provider name.
     pub provider: String,
-    /// SHA-256 of the canonical endpoint.
+    /// BLAKE3 of the canonical endpoint.
     pub endpoint_digest: Digest,
     /// The wire protocol.
     pub protocol: String,
@@ -712,7 +712,7 @@ pub struct RequestAttemptRecord {
     pub selection: SelectionIdentity,
     /// The context revision the request was built from.
     pub projection_revision: u64,
-    /// SHA-256 of the body actually prepared for dispatch.
+    /// BLAKE3 of the body actually prepared for dispatch.
     pub request_digest: Digest,
     /// Intent or outcome.
     pub phase: AttemptPhase,
@@ -804,7 +804,7 @@ pub enum Durability {
 pub struct CheckpointReceipt {
     /// The frontier now on disk; its digest covers the whole stored file.
     pub frontier: ContextFrontier,
-    /// SHA-256 of the event lines alone.
+    /// BLAKE3 of the event lines alone.
     pub body_digest: Digest,
     /// The durability grade.
     pub durability: Durability,
@@ -816,9 +816,9 @@ pub struct CheckpointReceipt {
 pub struct SnapshotProfile {
     /// The route.
     pub selection: SelectionIdentity,
-    /// SHA-256 of the system prompt.
+    /// BLAKE3 of the system prompt.
     pub system_prompt_digest: Digest,
-    /// SHA-256 of the offered schemas.
+    /// BLAKE3 of the offered schemas.
     pub tool_schema_digest: Digest,
     /// The policy.
     pub policy: ContextPolicy,
@@ -906,7 +906,7 @@ mod tests {
             stream: CaptureStream::Stdout,
             retained_bytes: retained,
             observed_bytes: observed,
-            retained_sha256: available.then(digest),
+            retained_blake3: available.then(digest),
             status,
             reason: match status {
                 CaptureStatus::Complete => CaptureReason::Eof,
@@ -914,7 +914,7 @@ mod tests {
                 CaptureStatus::Unavailable => CaptureReason::Unsupported,
             },
             encoding: RawEncoding::Raw,
-            chunk_sha256: if available {
+            chunk_blake3: if available {
                 vec![digest(); chunks]
             } else {
                 Vec::new()
@@ -938,7 +938,7 @@ mod tests {
         );
         assert!(receipt(CaptureStatus::Complete, 10, 11).validate().is_err());
         let mut short = receipt(CaptureStatus::Complete, 65_537, 65_537);
-        short.chunk_sha256.pop();
+        short.chunk_blake3.pop();
         assert!(short.validate().is_err());
         let mut partial_eof = receipt(CaptureStatus::Partial, 1, 2);
         partial_eof.reason = CaptureReason::Eof;

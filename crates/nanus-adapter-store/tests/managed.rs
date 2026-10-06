@@ -132,11 +132,11 @@ fn fabricated_receipt() -> ArtifactReceipt {
         stream: CaptureStream::Stdout,
         retained_bytes: 3,
         observed_bytes: 3,
-        retained_sha256: Some(Digest::of(b"abc")),
+        retained_blake3: Some(Digest::of(b"abc")),
         status: CaptureStatus::Complete,
         reason: CaptureReason::Eof,
         encoding: RawEncoding::Raw,
-        chunk_sha256: vec![Digest::of(b"abc")],
+        chunk_blake3: vec![Digest::of(b"abc")],
     }
 }
 
@@ -179,7 +179,7 @@ async fn a_stored_identity_is_the_files_own_bytes_and_version() {
         identity,
         ExpectedCheckpoint::Stored {
             body_version: 1,
-            file_sha256: Digest::of(body.as_bytes()),
+            file_blake3: Digest::of(body.as_bytes()),
             event_count: 4,
         }
     );
@@ -220,7 +220,7 @@ async fn a_checkpoint_round_trips_from_absent_to_stored_and_on() {
         .await
         .expect("committed");
     let bytes = file_bytes(&store, candidate.id());
-    assert_eq!(receipt.frontier.prefix_sha256, Digest::of(&bytes));
+    assert_eq!(receipt.frontier.prefix_blake3, Digest::of(&bytes));
     assert_eq!(receipt.frontier.event_count, 3);
     assert_eq!(receipt.frontier.projection_revision, 0);
     assert_eq!(receipt.body_digest, candidate.body_digest());
@@ -240,8 +240,99 @@ async fn a_checkpoint_round_trips_from_absent_to_stored_and_on() {
         .expect("committed");
     assert_eq!(second.frontier.event_count, 4);
     assert_eq!(
-        second.frontier.prefix_sha256,
+        second.frontier.prefix_blake3,
         Digest::of(&file_bytes(&store, candidate.id()))
+    );
+    store.release_lock(candidate.id());
+}
+
+/// A checkpoint over this process's own last one adds only the new lines, and the file it leaves
+/// is byte for byte what a whole write would have left — also for a session read back from disk,
+/// which carries no encoding of its own.
+#[tokio::test]
+async fn successive_checkpoints_leave_exactly_what_a_whole_write_would() {
+    let (_dir, store) = store().await;
+    let mut candidate = managed("growing", &["hello"]);
+    store
+        .lock(candidate.id(), "a writer")
+        .await
+        .expect("claimed");
+    let mut expected = ExpectedCheckpoint::Absent;
+    for round in 0..3 {
+        candidate.append(SessionEvent::UserMessage {
+            text: format!("round {round}"),
+        });
+        let receipt = commit(&store, &candidate, &expected, &[])
+            .await
+            .expect("committed");
+        let bytes = file_bytes(&store, candidate.id());
+        assert_eq!(
+            bytes,
+            candidate.try_to_jsonl().expect("encodes").into_bytes()
+        );
+        assert_eq!(receipt.frontier.prefix_blake3, Digest::of(&bytes));
+        expected = ExpectedCheckpoint::after(&receipt, candidate.body_version());
+    }
+
+    let mut reread = store.load(candidate.id()).await.expect("load");
+    assert_eq!(reread, candidate);
+    reread.append(SessionEvent::UserMessage {
+        text: String::from("after a restart"),
+    });
+    let receipt = commit(&store, &reread, &expected, &[])
+        .await
+        .expect("committed");
+    let bytes = file_bytes(&store, reread.id());
+    assert_eq!(bytes, reread.try_to_jsonl().expect("encodes").into_bytes());
+    assert_eq!(receipt.frontier.prefix_blake3, Digest::of(&bytes));
+    store.release_lock(candidate.id());
+}
+
+/// The identity a checkpoint remembers is trusted only while the file looks as it was left: a
+/// file changed in place afterwards — same inode, so only its size and time say so — is read back,
+/// and the commit is refused rather than appended to bytes it has not seen.
+#[tokio::test]
+async fn a_file_changed_in_place_after_a_checkpoint_is_read_back_rather_than_trusted() {
+    let (_dir, store) = store().await;
+    let candidate = managed("edited", &["mine"]);
+    store
+        .lock(candidate.id(), "a writer")
+        .await
+        .expect("claimed");
+    let receipt = commit(&store, &candidate, &ExpectedCheckpoint::Absent, &[])
+        .await
+        .expect("committed");
+    let expected = ExpectedCheckpoint::after(&receipt, candidate.body_version());
+
+    let path = store.session_file(candidate.id()).expect("path");
+    let original = std::fs::read(&path).expect("reads");
+    let mut edited = original.clone();
+    edited.extend_from_slice(b"\n");
+    std::fs::write(&path, &edited).expect("an in-place edit");
+
+    let mut next = candidate.clone();
+    next.append(SessionEvent::UserMessage {
+        text: String::from("more"),
+    });
+    assert_eq!(
+        commit(&store, &next, &expected, &[]).await,
+        Err(CheckpointError::NotCommitted(ErrorCode::StaleBase))
+    );
+    assert_eq!(
+        file_bytes(&store, candidate.id()),
+        edited,
+        "the edit survives"
+    );
+
+    // Pair: put back in place exactly as it was, the file is the expected one again, and the
+    // same commit goes through.
+    std::fs::write(&path, &original).expect("restored in place");
+    commit(&store, &next, &expected, &[])
+        .await
+        .expect("committed over the restored file");
+    assert_eq!(
+        file_bytes(&store, candidate.id()),
+        next.try_to_jsonl().expect("encodes").into_bytes()
     );
     store.release_lock(candidate.id());
 }
@@ -547,8 +638,8 @@ async fn a_capture_finalizes_complete_and_reads_back_verified() {
     let receipt = artifact.receipt();
     assert!(receipt.validate().is_ok());
     assert_eq!(receipt.retained_bytes, 200_000);
-    assert_eq!(receipt.chunk_sha256.len(), 4);
-    assert_eq!(receipt.retained_sha256, Some(Digest::of(&bytes)));
+    assert_eq!(receipt.chunk_blake3.len(), 4);
+    assert_eq!(receipt.retained_blake3, Some(Digest::of(&bytes)));
     assert_eq!(store.verify(&artifact).await, Ok(()));
     assert_eq!(
         archive_files(&store, &id, "partial"),
@@ -618,8 +709,8 @@ async fn nothing_retained_is_complete_only_when_nothing_was_observed() {
         .finalize(0, CaptureReason::Eof)
         .await;
     assert_eq!(done.receipt.status, CaptureStatus::Complete);
-    assert_eq!(done.receipt.retained_sha256, Some(Digest::empty()));
-    assert!(done.receipt.chunk_sha256.is_empty());
+    assert_eq!(done.receipt.retained_blake3, Some(Digest::empty()));
+    assert!(done.receipt.chunk_blake3.is_empty());
 
     let done = lease
         .take_stderr()

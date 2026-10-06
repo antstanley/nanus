@@ -244,7 +244,7 @@ async fn a_managed_request_sends_exactly_the_bytes_it_prepared() {
     assert_eq!(Digest::of(&received), digest);
     let sent: Value = serde_json::from_slice(&received).unwrap();
     let caps = llm.capabilities(MODEL_FLASH);
-    let again = nanus_ports::capabilities::estimate_payload(caps, &request, &sent).unwrap();
+    let again = nanus_ports::capabilities::estimate_managed_payload(caps, &request, &sent).unwrap();
     assert_eq!(again, estimate, "the estimate is of the body that was sent");
     assert!(
         events

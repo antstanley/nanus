@@ -363,13 +363,13 @@ impl LocalFs {
             );
             let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             let eof = offset.saturating_add(read_len) >= after.len;
-            let range_sha256 = Digest::of(&bytes);
+            let range_blake3 = Digest::of(&bytes);
             return Ok(RangeRead {
                 path: resolved,
                 offset,
                 bytes,
                 identity: after,
-                range_sha256,
+                range_blake3,
                 eof,
             });
         }

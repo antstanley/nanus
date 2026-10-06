@@ -9,9 +9,8 @@
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
-use sha2::Digest as _;
 
-/// A lowercase hex SHA-256 digest.
+/// A lowercase hex BLAKE3 digest (the default 32-byte output).
 ///
 /// A digest here detects inconsistency and stale input. It is not an authenticity claim: the
 /// same operating-system user that runs the harness can rewrite a file and its digest together.
@@ -77,9 +76,12 @@ impl From<Digest> for String {
     }
 }
 
-/// An incremental SHA-256, for digests over bytes that arrive in pieces.
+/// An incremental BLAKE3, for digests over bytes that arrive in pieces.
+///
+/// It is `Clone`, and a clone continues from the same state: a digest over a growing prefix can be
+/// carried forward and extended instead of recomputed from the first byte.
 #[derive(Clone, Default)]
-pub struct Hasher(sha2::Sha256);
+pub struct Hasher(blake3::Hasher);
 
 impl fmt::Debug for Hasher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -91,7 +93,7 @@ impl Hasher {
     /// Starts an empty digest.
     #[must_use]
     pub fn new() -> Self {
-        Self(sha2::Sha256::new())
+        Self(blake3::Hasher::new())
     }
 
     /// Feeds more bytes.
@@ -102,20 +104,16 @@ impl Hasher {
     /// Finishes the digest.
     #[must_use]
     pub fn finish(self) -> Digest {
-        let bytes = self.0.finalize();
-        let mut hex = String::with_capacity(64);
-        for byte in bytes {
-            hex.push(nibble(byte >> 4));
-            hex.push(nibble(byte & 0x0f));
-        }
-        assert_eq!(hex.len(), 64, "a SHA-256 digest is 64 hex digits");
-        Digest(hex)
+        self.digest()
     }
-}
 
-/// Renders one nibble as a lowercase hex digit.
-fn nibble(value: u8) -> char {
-    char::from_digit(u32::from(value), 16).unwrap_or('0')
+    /// The digest of everything fed so far, leaving the state to be fed more.
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        let hex = self.0.finalize().to_hex();
+        assert_eq!(hex.len(), 64, "a BLAKE3 digest is 64 hex digits");
+        Digest(hex.as_str().to_owned())
+    }
 }
 
 /// The id of one fragment: `f:<sequence of its assistant event>`.
@@ -372,7 +370,7 @@ mod tests {
     fn a_digest_is_lowercase_hex_and_the_empty_digest_is_the_known_value() {
         assert_eq!(
             Digest::empty().as_str(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
         assert!(Digest::parse(Digest::empty().as_str()).is_some());
         assert!(Digest::parse(&Digest::empty().as_str().to_uppercase()).is_none());
@@ -381,6 +379,16 @@ mod tests {
         pieces.update(b"ab");
         pieces.update(b"c");
         assert_eq!(pieces.finish(), Digest::of(b"abc"));
+    }
+
+    #[test]
+    fn a_digest_taken_midway_does_not_end_the_hasher() {
+        let mut running = Hasher::new();
+        running.update(b"ab");
+        assert_eq!(running.digest(), Digest::of(b"ab"));
+        running.update(b"c");
+        assert_eq!(running.digest(), Digest::of(b"abc"));
+        assert_ne!(running.digest(), Digest::of(b"ab"));
     }
 
     #[test]

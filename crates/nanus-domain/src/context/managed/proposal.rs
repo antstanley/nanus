@@ -353,10 +353,11 @@ fn fragment_tool(events: &[SessionEvent], seq: u64, id: &crate::ToolCallId) -> S
 
 /// Keyed, opaque cursors: a position the model can hand back but cannot forge or reuse stale.
 pub mod cursor {
-    use super::super::ids::Hasher;
+    /// Separates the key a cursor is tagged under from any other use of the same secret.
+    const CONTEXT: &str = "nanus 2026-10 managed-context recall cursor";
 
-    /// The HMAC-SHA-256 block size.
-    const BLOCK: usize = 64;
+    /// The tag's length in hex digits: 128 bits, enough that a guess is not a strategy.
+    const TAG_HEX: usize = 32;
 
     /// Seals `payload` under `key` as `payload.tag`.
     #[must_use]
@@ -365,38 +366,28 @@ pub mod cursor {
     }
 
     /// Opens a sealed cursor, returning its payload when the tag verifies.
+    ///
+    /// The comparison takes the same time wherever the tags first differ, so how long a refusal
+    /// takes says nothing about how much of a forged tag was right.
     #[must_use]
     pub fn open<'a>(key: &[u8], token: &'a str) -> Option<&'a str> {
         let (payload, given) = token.rsplit_once('.')?;
-        (tag(key, payload) == given).then_some(payload)
+        let expected = tag(key, payload);
+        let differs = expected
+            .bytes()
+            .zip(given.bytes())
+            .fold(0_u8, |acc, (left, right)| acc | (left ^ right));
+        (given.len() == expected.len() && differs == 0).then_some(payload)
     }
 
-    /// HMAC-SHA-256 of `payload`, truncated to 32 hex digits.
+    /// Keyed BLAKE3 of `payload`, truncated to [`TAG_HEX`] hex digits.
+    ///
+    /// The host's key may be any length, so the 32-byte MAC key is derived from it rather than
+    /// taken from it.
     fn tag(key: &[u8], payload: &str) -> String {
-        let mut block = [0_u8; BLOCK];
-        if key.len() > BLOCK {
-            let digest = super::Digest::of(key);
-            for (slot, byte) in block.iter_mut().zip(digest.as_str().bytes()) {
-                *slot = byte;
-            }
-        } else {
-            for (slot, byte) in block.iter_mut().zip(key) {
-                *slot = *byte;
-            }
-        }
-        let mut inner = Hasher::new();
-        inner.update(&block.map(|byte| byte ^ 0x36));
-        inner.update(payload.as_bytes());
-        let inner = inner.finish();
-        let mut outer = Hasher::new();
-        outer.update(&block.map(|byte| byte ^ 0x5c));
-        outer.update(inner.as_str().as_bytes());
-        outer
-            .finish()
-            .as_str()
-            .get(..32)
-            .unwrap_or_default()
-            .to_owned()
+        let mac_key = blake3::derive_key(CONTEXT, key);
+        let hex = blake3::keyed_hash(&mac_key, payload.as_bytes()).to_hex();
+        hex.as_str().get(..TAG_HEX).unwrap_or_default().to_owned()
     }
 }
 

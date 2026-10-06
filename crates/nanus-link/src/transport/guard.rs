@@ -13,7 +13,7 @@
 //! The pipe's owner could be checked instead, but no call that reads it has a safe binding this
 //! workspace can use, and it forbids `unsafe`. So each end proves itself with something only the
 //! user can read: a random key the agent writes, after it owns the pipe name, into the user's
-//! private local application data. Both ends answer a challenge with an HMAC over two fresh
+//! private local application data. Both ends answer a challenge with a keyed BLAKE3 over two fresh
 //! nonces, so the key itself never crosses the pipe and a recorded answer is worthless.
 //!
 //! - The **client** speaks first and sends nothing else until the agent has answered with a
@@ -27,8 +27,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hmac::{Hmac, Mac as _};
-use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 /// Every local nanus pipe name starts with this.
@@ -41,9 +39,9 @@ pub const PIPE_PREFIX: &str = r"\\.\pipe\nanus-";
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The bytes a client opens with, so an agent can tell a nanus client from anything else.
-const MAGIC: &[u8; 16] = b"nanus-link-auth1";
+const MAGIC: &[u8; 16] = b"nanus-link-auth2";
 
-/// The length of the key, of each nonce, and of each proof: one SHA-256 output.
+/// The length of the key, of each nonce, and of each proof: one BLAKE3 key and output.
 const LEN: usize = 32;
 
 /// Whether `name` is a local nanus pipe: the local prefix, then one component of ASCII letters,
@@ -130,20 +128,20 @@ impl Key {
     }
 
     /// The proof one `role` gives for a pair of nonces.
-    fn proof(
-        &self,
-        role: &[u8],
-        client: &[u8; LEN],
-        server: &[u8; LEN],
-    ) -> Result<Hmac<Sha256>, AuthError> {
-        // HMAC takes a key of any length, so this refusal cannot happen; it is still an error
-        // rather than a panic, and an end that cannot make a proof is one that cannot be trusted.
-        let mut mac = <Hmac<Sha256>>::new_from_slice(&self.0)
-            .map_err(|error| AuthError::Key(std::io::Error::other(error.to_string())))?;
+    fn proof(&self, role: &[u8], client: &[u8; LEN], server: &[u8; LEN]) -> blake3::Hash {
+        let mut mac = blake3::Hasher::new_keyed(&self.0);
         mac.update(role);
         mac.update(client);
         mac.update(server);
-        Ok(mac)
+        mac.finalize()
+    }
+
+    /// Whether `given` is the proof `role` gives for a pair of nonces.
+    ///
+    /// `blake3::Hash` compares in constant time, so a refusal does not time how much was right.
+    fn verify(&self, role: &[u8], client: &[u8; LEN], server: &[u8; LEN], given: &[u8]) -> bool {
+        <[u8; LEN]>::try_from(given)
+            .is_ok_and(|given| self.proof(role, client, server) == blake3::Hash::from_bytes(given))
     }
 }
 
@@ -185,20 +183,19 @@ where
         }
         let client = <[u8; LEN]>::try_from(nonce).map_err(|_| AuthError::NotNanus)?;
         let server = random()?;
-        let proof = key
-            .proof(b"server", &client, &server)?
-            .finalize()
-            .into_bytes();
+        let proof = key.proof(b"server", &client, &server);
         let mut answer = [0u8; LEN + LEN];
         answer[..LEN].copy_from_slice(&server);
-        answer[LEN..].copy_from_slice(&proof);
+        answer[LEN..].copy_from_slice(proof.as_bytes());
         stream.write_all(&answer).await?;
         stream.flush().await?;
         let mut theirs = [0u8; LEN];
         stream.read_exact(&mut theirs).await?;
-        key.proof(b"client", &client, &server)?
-            .verify_slice(&theirs)
-            .map_err(|_| AuthError::Mismatch)
+        if key.verify(b"client", &client, &server, &theirs) {
+            Ok(())
+        } else {
+            Err(AuthError::Mismatch)
+        }
     })
     .await
     .map_err(|_elapsed| AuthError::TimedOut)?
@@ -230,14 +227,11 @@ where
         let (nonce, proof) = answer.split_at(LEN);
         let server = <[u8; LEN]>::try_from(nonce).map_err(|_| AuthError::Mismatch)?;
         let key = load().map_err(AuthError::Key)?;
-        key.proof(b"server", &client, &server)?
-            .verify_slice(proof)
-            .map_err(|_| AuthError::Mismatch)?;
-        let mine = key
-            .proof(b"client", &client, &server)?
-            .finalize()
-            .into_bytes();
-        stream.write_all(&mine).await?;
+        if !key.verify(b"server", &client, &server, proof) {
+            return Err(AuthError::Mismatch);
+        }
+        let mine = key.proof(b"client", &client, &server);
+        stream.write_all(mine.as_bytes()).await?;
         stream.flush().await?;
         Ok(())
     })
@@ -372,10 +366,10 @@ mod tests {
             agent.read_exact(&mut opening).await.unwrap();
             let client_nonce = <[u8; LEN]>::try_from(&opening[MAGIC.len()..]).unwrap();
             let server = [1u8; LEN];
-            let proof = agent_key.proof(b"server", &client_nonce, &server).unwrap();
+            let proof = agent_key.proof(b"server", &client_nonce, &server);
             let mut answer = [0u8; LEN + LEN];
             answer[..LEN].copy_from_slice(&server);
-            answer[LEN..].copy_from_slice(&proof.finalize().into_bytes());
+            answer[LEN..].copy_from_slice(proof.as_bytes());
             agent.write_all(&answer).await.unwrap();
             // Whatever the client sends now, a squatter must not get a proof made with its key.
             let mut rest = Vec::new();

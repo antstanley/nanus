@@ -8,7 +8,6 @@ use nanus_domain::{Message, ToolCall, ToolCallId, ToolName, ToolSchema};
 use nanus_ports::LlmPort as _;
 use nanus_ports::{ChatRequest, LlmEvent, ReasoningEffort, ResponseLimits};
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 
 #[path = "responses_request/cost.rs"]
 mod cost;
@@ -173,11 +172,13 @@ fn original_items_and_exact_receipts_survive_completed_stream_and_json_reload() 
     assert_eq!(body["input"][6]["call_id"], "call_2");
     assert_eq!(
         prepared.context_receipt.wire_digest,
-        format!("{:x}", Sha256::digest(serde_json::to_vec(body).unwrap()))
+        blake3::hash(&serde_json::to_vec(body).unwrap())
+            .to_hex()
+            .to_string()
     );
     assert_eq!(
         prepared.context_receipt.source_digest,
-        format!("{:x}", Sha256::digest(bytes))
+        blake3::hash(&bytes).to_hex().to_string()
     );
     // The raw stock encoder still has its existing neutral reconstruction semantics.
     assert_ne!(adapter.encode(&request)["input"], body["input"]);

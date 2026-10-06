@@ -233,8 +233,8 @@ pub struct FrontierInfo {
     pub session_id: String,
     /// How many events are durable.
     pub event_count: u64,
-    /// SHA-256 of the stored header and the first `event_count` event lines, lowercase hex.
-    pub prefix_sha256: String,
+    /// BLAKE3 of the stored header and the first `event_count` event lines, lowercase hex.
+    pub prefix_blake3: String,
     /// The context revision accepted at this point; zero for a session that has none.
     pub projection_revision: u64,
 }
@@ -393,7 +393,7 @@ pub struct ContextStatusInfo {
 pub struct CheckpointInfo {
     /// The frontier now on disk; its digest covers the whole stored file.
     pub frontier: FrontierInfo,
-    /// SHA-256 of the event lines alone.
+    /// BLAKE3 of the event lines alone.
     pub body_digest: String,
     /// The durability grade.
     pub durability: DurabilityState,
@@ -1269,7 +1269,7 @@ mod tests {
         FrontierInfo {
             session_id: "01a09558".to_owned(),
             event_count: 12,
-            prefix_sha256: "ab".repeat(32),
+            prefix_blake3: "ab".repeat(32),
             projection_revision: 3,
         }
     }

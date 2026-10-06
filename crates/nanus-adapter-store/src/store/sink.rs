@@ -314,11 +314,11 @@ impl FileSink {
             stream: self.plan.stream,
             retained_bytes: self.retained,
             observed_bytes: observed.max(self.retained),
-            retained_sha256: Some(std::mem::take(&mut self.whole).finish()),
+            retained_blake3: Some(std::mem::take(&mut self.whole).finish()),
             status,
             reason,
             encoding: RawEncoding::Raw,
-            chunk_sha256: std::mem::take(&mut self.chunks),
+            chunk_blake3: std::mem::take(&mut self.chunks),
         };
         assert!(
             receipt.validate().is_ok(),
@@ -335,11 +335,11 @@ impl FileSink {
             stream: self.plan.stream,
             retained_bytes: 0,
             observed_bytes: observed,
-            retained_sha256: None,
+            retained_blake3: None,
             status: CaptureStatus::Unavailable,
             reason,
             encoding: RawEncoding::Raw,
-            chunk_sha256: Vec::new(),
+            chunk_blake3: Vec::new(),
         };
         assert!(
             receipt.validate().is_ok(),
