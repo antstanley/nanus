@@ -46,8 +46,11 @@ pub fn in_scope<T>(session: &str, work: impl FnOnce() -> T) -> T {
     SESSION.sync_scope(session.to_owned(), work)
 }
 
+/// A call, qualified by the session it belongs to.
+type Key = (String, ToolCallId);
+
 /// The key of `call` in the current scope.
-fn key(call: &ToolCallId) -> (String, ToolCallId) {
+fn key(call: &ToolCallId) -> Key {
     let session = SESSION.try_with(Clone::clone).unwrap_or_default();
     (session, call.clone())
 }
@@ -68,7 +71,7 @@ struct Slot {
 /// under.
 #[derive(Clone, Default)]
 pub struct CaptureBroker {
-    slots: Rc<RefCell<BTreeMap<(String, ToolCallId), Slot>>>,
+    slots: Rc<RefCell<BTreeMap<Key, Slot>>>,
 }
 
 impl core::fmt::Debug for CaptureBroker {

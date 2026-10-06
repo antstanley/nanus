@@ -1254,7 +1254,9 @@ async fn a_checkpoint_that_rewrites_stored_history_is_refused() {
     upgraded.append(SessionEvent::UserMessage {
         text: String::from("more"),
     });
-    let receipt = commit(&store, &upgraded, &stored, &[]).await.expect("an upgrade appends");
+    let receipt = commit(&store, &upgraded, &stored, &[])
+        .await
+        .expect("an upgrade appends");
     let next = ExpectedCheckpoint::after(&receipt, upgraded.body_version());
 
     let mut shortened = Session::new(upgraded.id().clone(), 1_700_000_000_000, "/work");
