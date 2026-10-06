@@ -409,6 +409,7 @@ than sending it to the model.
 | `/effort [step]` | open the effort chooser, or switch to the step named |
 | `/provider [name]` | open the provider chooser, or switch to the provider named |
 | `/goal [objective\|status\|pause\|resume\|done[: reason]\|abandon[: reason]\|clear]` | read, set, or move the session's goal |
+| `/context [reset]` | show the session's context status, or reset its managed context to legacy replay |
 | `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
@@ -454,6 +455,14 @@ the point in the turn it was made — between the call that made it and that cal
 which is where a replay of the log draws it too. Two things the model may not do: clear
 the goal (that is `/goal clear`), and complete one without saying what it checked — the
 `evidence` argument is required. See [the toolset](features.md#the-goal-tools).
+
+`/context` also reaches the agent: it asks for the held session's context status and draws it as
+a `context:` notice — the mode, the revision, the hidden and protected counts, and whether
+managed requests can be prepared, with the reason when they cannot. `/context reset` asks the
+agent to reset a [managed](context-management.md) session to legacy replay; the agent refuses it
+while a turn runs, persists it before acknowledging, and every viewer's watermark moves with the
+checkpoint. A managed turn also sends its own status when a step's request is prepared, drawn
+only when something in it changed, and each accepted or rejected proposal in the replay's words.
 
 Nothing else is a command yet, and an unrecognised one is not sent to the model: it is
 named in the transcript along with the commands that do exist, because a typo should say so
