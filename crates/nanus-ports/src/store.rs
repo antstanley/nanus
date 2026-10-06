@@ -159,6 +159,22 @@ pub trait StorePort {
     fn artifacts(&self) -> Option<&dyn crate::artifact::ArtifactStore> {
         None
     }
+
+    /// Removes a session's archived objects that no receipt references and no live capture
+    /// holds, returning the bytes reclaimed.
+    ///
+    /// Takes the session's claim first, so a session another writer holds — or this process
+    /// does — is refused: an object finalized but not yet published belongs to a running turn.
+    /// A session whose log does not validate is refused too. Referenced objects are never
+    /// removed.
+    fn collect_artifacts<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<u64>> {
+        let _ = id;
+        Box::pin(async {
+            Err(StoreError::Unsupported {
+                operation: "archive collection",
+            })
+        })
+    }
 }
 
 /// The result type of every store operation.

@@ -639,6 +639,14 @@ impl StorePort for JsonlStore {
     fn artifacts(&self) -> Option<&dyn ArtifactStore> {
         Some(self)
     }
+
+    fn collect_artifacts<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<u64>> {
+        Box::pin(async move {
+            self.collect_garbage(id)
+                .await
+                .map(|report| report.reclaimed_bytes)
+        })
+    }
 }
 
 /// Reads at most the session limit plus one byte, as bytes, including files growing during a read.

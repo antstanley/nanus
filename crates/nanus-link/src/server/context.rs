@@ -547,8 +547,14 @@ fn fresh(registry: &Registry, held: &Held) -> Result<Frame, String> {
             .map_or_else(TurnRuntime::default, Binding::runtime);
         registry.agent.runner().context_status(&session, runtime)
     };
-    let status =
+    let mut status =
         computed.map_err(|error| format!("the context status is not available: {error}"))?;
+    // A quarantined session takes no turn, whatever its selection could prepare: say so.
+    if held.quarantine.borrow().is_some() {
+        status.managed_ready = false;
+        status.unavailable_reason =
+            Some(nanus_domain::context::managed::ErrorCode::CheckpointUnknown);
+    }
     let id = held.next_frame_id();
     let frame = Frame::ContextStatus {
         envelope: held.envelope(None, None, id),
@@ -597,12 +603,28 @@ async fn reset(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, held: &Rc<
 /// all of it — the rule a goal change follows — so a reset that was not saved changes nothing.
 async fn reset_reserved(registry: &Registry, held: &Held) -> Result<CheckpointReceipt, String> {
     assert!(held.busy.get(), "a reset runs in a reserved session");
-    let bound = held.managed.borrow().clone();
+    // A quarantined session's held copy and its binding's expected identity are what could not
+    // be reconciled with the disk, so a reset there starts from what the store holds, through a
+    // fresh binding: the explicit recovery resets the durable session, never a copy that may
+    // never have been saved.
+    let quarantined = held.quarantine.borrow().is_some();
+    let bound = if quarantined {
+        None
+    } else {
+        held.managed.borrow().clone()
+    };
     let binding = match bound {
         Some(binding) => binding,
         None => Rc::new(Binding::bind(&registry.agent.store, &held.id).await?),
     };
-    let mut candidate = held.session.borrow().clone();
+    let mut candidate =
+        if quarantined {
+            registry.agent.store.load(&held.id).await.map_err(|error| {
+                format!("the stored session could not be read to reset: {error}")
+            })?
+        } else {
+            held.session.borrow().clone()
+        };
     let state = registry
         .agent
         .runner()

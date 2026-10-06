@@ -648,8 +648,7 @@ mod tests {
             projection_revision: 0,
             request_digest: Digest::empty(),
             phase,
-            outcome: (phase == AttemptPhase::Finished)
-                .then_some(crate::context::managed::records::AttemptOutcome::Failed),
+            outcome: (phase == AttemptPhase::Finished).then_some(AttemptOutcome::Failed),
             usage: None,
             assistant_seq: None,
             included_management_fragments: Vec::new(),

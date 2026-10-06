@@ -3477,6 +3477,35 @@ mod tests {
         });
     }
 
+    /// F20: a quarantined session reports that it cannot run, whatever its selection could do.
+    #[test]
+    fn a_quarantined_session_reports_itself_unready() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        nanus_kernel::runtime::block_on_local(async move {
+            let registry = registry_over(dir.path()).await;
+            let session = held("quarantined");
+            session.quarantine(String::from("an uncertain commit could not be reconciled"));
+            let (asker, mut answers) = mpsc::channel(FRAME_BUFFER);
+            context::answer(
+                &registry,
+                &asker,
+                &session,
+                crate::protocol::ContextAction::Status,
+            )
+            .await;
+            match answers.try_recv() {
+                Ok(Frame::ContextStatus { payload, .. }) => {
+                    assert!(!payload.managed_ready);
+                    assert_eq!(
+                        payload.unavailable_reason.as_deref(),
+                        Some("checkpoint_unknown")
+                    );
+                }
+                other => panic!("expected a status, got {other:?}"),
+            }
+        });
+    }
+
     /// A context status built by hand, as a managed step would publish it.
     fn hand_built_status(held: &Held) -> ContextStatus {
         ContextStatus {

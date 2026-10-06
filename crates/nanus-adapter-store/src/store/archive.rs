@@ -194,10 +194,13 @@ impl JsonlStore {
         let reserved = tokio::task::spawn_blocking(move || reservation.grant())
             .await
             .map_err(|error| CaptureFailure::Io(error.to_string()))??;
+        // A quarter of the call's staging budget per sink: the capturing shell queues up to half
+        // of it in front of the sinks, so the two sinks' buffers take the other half and the
+        // call as a whole stays within one budget.
         let staging = limits
             .staging_bytes
             .min(limits::CAPTURE_STAGING_BYTES_MAX)
-            .checked_div(2)
+            .checked_div(4)
             .unwrap_or(0)
             .max(1);
         let [stdout, stderr] = reserved.sinks;

@@ -956,8 +956,8 @@ impl LocalShell {
     #[must_use]
     pub fn with_capture_limits(mut self, limits: CaptureLimits) -> Self {
         assert!(
-            limits.staging_bytes >= READ_CHUNK,
-            "the staging budget holds at least one pipe read"
+            limits.staging_bytes >= READ_CHUNK.saturating_mul(2),
+            "the staging budget holds a pipe read in its queued half"
         );
         assert!(
             limits.staging_bytes <= Semaphore::MAX_PERMITS,
@@ -1096,7 +1096,15 @@ impl ShellPort for LocalShell {
             let request = self.resolve(request)?;
             let request = self.confine_cwd(request)?;
             let limits = self.capture_limits;
-            let staging = Arc::new(Semaphore::new(limits.staging_bytes));
+            // One staging budget per call covers every buffer the bytes pass through: half for
+            // what is queued between the pumps and their sink tasks, the other half left to the
+            // sinks' own write buffers (an archive sizes each to a quarter of the budget).
+            let queued = limits
+                .staging_bytes
+                .checked_div(2)
+                .unwrap_or(0)
+                .max(READ_CHUNK);
+            let staging = Arc::new(Semaphore::new(queued));
             let start = |sink| start_archive(sink, &staging, limits);
             let (out_feed, out_control) = capture.stdout.map(start).unzip();
             let (err_feed, err_control) = capture.stderr.map(start).unzip();

@@ -254,6 +254,16 @@ pub enum SessionsAction {
         session: String,
     },
 
+    /// Remove a session's archived shell output that nothing references any more.
+    ///
+    /// Archived objects are kept for as long as a receipt in the log names them, and an object
+    /// a crash left unpublished stays charged against the archive's quota until this removes
+    /// it. The session must be idle: one an agent is holding is refused.
+    Collect {
+        /// The session to sweep: an id, or a name it already answers to.
+        session: String,
+    },
+
     /// Report what a session did and what it spent.
     ///
     /// Read from the log rather than from an agent, so it needs no model and no key: the
@@ -529,6 +539,13 @@ pub enum Ready {
         /// The session to remove: an id, or a name it answers to.
         session: String,
     },
+    /// A session's archive is ready to be swept.
+    Collect {
+        /// The store that holds it.
+        store: nanus_ports::StoreHandle,
+        /// The session to sweep: an id, or a name it answers to.
+        session: String,
+    },
     /// A session is ready to be reported on.
     Show {
         /// The store that holds it.
@@ -608,6 +625,7 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             session,
         } => record_name(&store, &name, &session),
         Ready::Delete { store, session } => delete_session(&store, &session),
+        Ready::Collect { store, session } => collect_session(&store, &session),
         Ready::Show {
             store,
             session,
@@ -1242,6 +1260,18 @@ fn delete_session(store: &nanus_ports::StoreHandle, reference: &str) -> Result<(
     Ok(())
 }
 
+/// Sweeps a session's archive of objects nothing references, and says how much it reclaimed.
+fn collect_session(store: &nanus_ports::StoreHandle, reference: &str) -> Result<(), String> {
+    let id = resolve_id(store, reference)?;
+    let reclaimed = kernel_block_on(store.collect_artifacts(&id))
+        .map_err(|error| format!("the archive could not be swept: {error}"))?;
+    println!(
+        "nanus: reclaimed {reclaimed} archived bytes from session {}",
+        id.as_str()
+    );
+    Ok(())
+}
+
 /// The one-line totals a watched run ends with.
 ///
 /// The same figures `nanus sessions show` reports afterwards, laid out for somebody
@@ -1834,6 +1864,7 @@ async fn prepare_sessions(action: Option<SessionsAction>) -> Result<Ready, Strin
             session,
         }),
         Some(SessionsAction::Delete { session }) => Ok(Ready::Delete { store, session }),
+        Some(SessionsAction::Collect { session }) => Ok(Ready::Collect { store, session }),
         Some(SessionsAction::Show { session, json }) => Ok(Ready::Show {
             store,
             session,
@@ -2461,6 +2492,24 @@ mod tests {
             delete_session(&store, id.as_str()).is_err(),
             "the id is gone too"
         );
+    }
+
+    /// F19: an idle session's archive can be swept from the command line; one that is not
+    /// stored, or that a writer holds, is refused.
+    #[test]
+    fn sweeping_an_idle_sessions_archive_reports_what_it_reclaimed() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let store = store_under(dir.path());
+        let id = saved_session(&store, "01a09559", Some("swept"));
+        let swept = collect_session(&store, "swept");
+        assert!(swept.is_ok(), "an idle session is swept: {swept:?}");
+        assert!(collect_session(&store, "nothing-here").is_err());
+        kernel_block_on(store.lock(&id, "a writer")).unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            collect_session(&store, "swept").is_err(),
+            "a held session is refused"
+        );
+        store.release_lock(&id);
     }
 
     #[test]
