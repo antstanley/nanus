@@ -191,7 +191,29 @@ fn turn_frames<M: Metric>(c: &mut Criterion<M>) {
 /// decoder that copies the line would show first.
 fn backlog<M: Metric>(c: &mut Criterion<M>) {
     let mut group = c.benchmark_group(M::group("link/backlog"));
-    let frame = Frame::Backlog { frames: turn() };
+    let segments = turn()
+        .into_iter()
+        .zip(1_u64..)
+        .map(|(frame, frame_id)| nanus_link::protocol::BacklogSegment {
+            frame_id,
+            turn: Some(0),
+            step: Some(1),
+            frame,
+        })
+        .collect();
+    let frame = Frame::Backlog {
+        stream: nanus_link::protocol::StreamMark {
+            stream_epoch: String::from("p1-t0-h0"),
+            stream_watermark: 1,
+            frontier: nanus_link::protocol::FrontierInfo {
+                session_id: String::from("s"),
+                event_count: 0,
+                prefix_sha256: "0".repeat(64),
+                projection_revision: 0,
+            },
+        },
+        segments,
+    };
     let line = encode(&frame).unwrap_or_else(|error| unreachable!("fixture backlog: {error}"));
     group.throughput(Throughput::Bytes(line.len() as u64));
     group.bench_function("encode", |b| b.iter(|| encode(black_box(&frame))));
