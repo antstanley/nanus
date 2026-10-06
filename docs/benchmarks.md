@@ -106,6 +106,7 @@ dominant in a long one.
 | `kernel` | `start_chain` and `unload_root` over chains of 1, 8, and 64 dependent plugins, `get` (service lookup), `emit` to 1, 16, and 128 listeners | Composition and teardown, and the per-call cost of the kernel's indirection. |
 | `store` | `save` and `load` of 10-, 100-, and 500-turn sessions, `list` of a store of 50 sessions, on a tempdir | Every turn ends in a save; every resume and every listing starts with a read. |
 | `tools` | `read` of a 5,000-line file, `grep` and `glob` over a 500-file tree, `edit` and `write` of a 2,000-line file, `bash` running `true` and `echo`, through `ToolDefinition::execute` on a real tempdir | The calls a model makes most often. |
+| `managed` and `managed_turn` | Fragment derivation, the fold, frontier and compile over 10, 100 and 500 turns; whole turns through `run_turn` and `run_turn_with_runtime` with no disk (`overhead`), on a real store (`persisted`), and under the stock budget (`fitted`) | What turning managed context on costs per turn, and where the cost goes. |
 | `agent_loop` | `turn/fresh`, `turn/history/{10,100}`, `stream/{500,2000}`: whole turns through `AgentRunner` with a scripted model and in-memory tools, under the default approval policy | The harness's own overhead per turn and per streamed token, with no network and no disk. |
 
 Each workload is checked before it is measured — a tool must return success, a stream must
@@ -309,6 +310,62 @@ Measured on the same 10/100/500-turn sessions as `session`, on an Apple-silicon 
 14 µs / 168 µs / about 1 ms; hashing the whole stored prefix for a frontier 0.22 ms / 2.2 ms /
 10.9 ms. The prefix hash dominates and is linear in the session's bytes; a managed step pays it a
 few times (validation, status, receipt). These are first measurements, not a recorded baseline.
+
+### `managed_turn`
+
+Recorded on 2026-10-06 on `1647980`, same machine, **not quiet** (one-minute load 6.5–8.6 on
+eight cores), so read times as pessimistic; counts are exact. One turn is the `agent_loop`
+shape: a tool step that calls two in-memory tools, then a 500-delta answer. The model encodes and
+digests its body as the stock adapters do, charging one token per byte. `overhead` has no
+budget pressure and an in-memory checkpoint that encodes, digests and folds the session as the
+store does, but does not write it. `persisted` writes to a real `JsonlStore` in a tempdir.
+`fitted` runs under the stock 64,000-token budget: `managed_first` is the first managed turn
+on a history that does not fit, and `managed_steady` is the turn after it.
+
+| Benchmark | Time | ± | Allocations | Bytes allocated |
+|---|---:|---:|---:|---:|
+| `overhead/legacy/0` | 74.82 µs | 1.4% | 1,443 | 268.44 KiB |
+| `overhead/managed/0` | 1.28 ms | 0.3% | 11,319 | 1.89 MiB |
+| `overhead/legacy/10` | 340.96 µs | 0.4% | 4,403 | 1.08 MiB |
+| `overhead/managed/10` | 5.98 ms | 0.4% | 27,187 | 6.13 MiB |
+| `overhead/legacy/100` | 2.69 ms | 0.4% | 30,800 | 8.32 MiB |
+| `overhead/managed/100` | 49.40 ms | 0.4% | 168,442 | 43.76 MiB |
+| `persisted/legacy/10` | 3.75 ms | 3.1% | 4,437 | 1.16 MiB |
+| `persisted/managed/10` | 26.80 ms | 1.5% | 31,820 | 8.34 MiB |
+| `persisted/legacy/100` | 6.97 ms | 4.6% | 30,837 | 8.92 MiB |
+| `persisted/managed/100` | 95.85 ms | 0.9% | 206,474 | 63.22 MiB |
+| `fitted/legacy/100` | 11.05 ms | 1.0% | 239,081 | 47.37 MiB |
+| `fitted/managed_first/100` | 47.97 ms | 0.9% | 248,230 | 56.50 MiB |
+| `fitted/managed_steady/100` | 41.93 ms | 0.5% | 136,818 | 33.86 MiB |
+| `fitted/legacy/300` | 126.15 ms | 0.7% | 2,913,498 | 558.75 MiB |
+| `fitted/managed_first/300` | 121.02 ms | 0.2% | 557,024 | 142.68 MiB |
+| `fitted/managed_steady/300` | 124.37 ms | 0.2% | 436,141 | 112.08 MiB |
+
+A managed turn costs 10–18 times the harness CPU of a legacy turn, and the cost is linear in the
+session's bytes. A sampling profile of `overhead/managed/100` puts it here:
+
+- **54%** in checkpoints: five per turn (an intent and a settled step for each model step, then
+  the turn's end). Each one encodes the whole session and digests it twice. The store also
+  reads the stored file back and digests it, and re-encodes and digests the candidate twice
+  more: once to check that it extends the file, and once for its postcondition.
+- **25%** in preparing requests: every step prepares its request twice, once as the fitter's
+  first probe and once to freeze it, even when nothing needs fitting. Each preparation encodes
+  and digests the whole body.
+- **10%** in the frontier: a digest of the stored prefix on every step.
+- **Under 5%** in what the design is about: the fold, fragment derivation, protection and
+  compiling the effective conversation.
+
+SHA-256 alone is 64% of samples, because `sha2` 0.10 runs its portable implementation on
+`aarch64` unless its `asm` feature is enabled. Enabling that feature, as an experiment that was
+not kept, cut `overhead/managed` by 43–54% and `persisted/managed` by 18–43%, and left legacy
+unchanged. It was not kept because the feature builds `sha2-asm` with a C toolchain, which the
+native Windows gate would have to carry. `sha2` 0.11 uses the instructions without it.
+
+Legacy fitting is the expensive path past about 300 turns: at 300 it allocates five times what
+managed does. The limit that matters first is the floor. Under the stock budget and one token per
+byte, this turn shape is refused with `protected_floor_too_large` on its second managed turn at
+400 turns. `context_footprint`, an example in the same crate, shows the same floor with the real
+DeepSeek encoder and realistic 1 KB prompts at 40–50 turns.
 
 ### `session`
 

@@ -82,3 +82,7 @@ harness = false
 [[bench]]
 name = "managed"
 harness = false
+
+[[bench]]
+name = "managed_turn"
+harness = false
