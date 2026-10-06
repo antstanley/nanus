@@ -46,6 +46,39 @@ pub(in crate::agent_loop) struct Snapshot {
     pub(in crate::agent_loop) goal: Option<Goal>,
 }
 
+/// The managed code an adapter's refusal carries, as the stable prefix of its message.
+///
+/// Adapters report through the ordinary `LlmError`, which has no code of its own, so the code
+/// travels as the first word of an unsupported-feature message. Anything without one is a
+/// path that cannot carry the projection.
+fn code_of(error: &nanus_ports::LlmError) -> ErrorCode {
+    let nanus_ports::LlmError::Unsupported { feature } = error else {
+        return ErrorCode::ProtocolIncompatible;
+    };
+    let word = feature.split(':').next().unwrap_or_default();
+    [
+        ErrorCode::CandidateTooLarge,
+        ErrorCode::UnsupportedMode,
+        ErrorCode::ProtocolIncompatible,
+        ErrorCode::StorageCapacity,
+    ]
+    .into_iter()
+    .find(|code| code.as_str() == word)
+    .unwrap_or(ErrorCode::ProtocolIncompatible)
+}
+
+/// Notice facts for the fitter's probes: every field at least as long as the final notice's, so
+/// a probe never measures a candidate as cheaper than the request that is finally sent.
+pub(in crate::agent_loop) fn probe_facts(allowance: u32) -> NoticeFacts {
+    NoticeFacts {
+        estimate_input_tokens: Some(u32::MAX),
+        estimator: String::from("adapter-serialized-body"),
+        input_allowance: allowance,
+        budget_hint: true,
+        recovery_available: true,
+    }
+}
+
 /// Maps a managed refusal into the bundle error.
 pub(in crate::agent_loop) fn refusal(code: ErrorCode) -> BundleError {
     let message = match code {
@@ -223,6 +256,19 @@ impl AgentRunner {
         self.prepare_call(request)
     }
 
+    /// Prepares a candidate and reads only its cost, for the fitter's probes.
+    ///
+    /// An adapter refuses a candidate that does not fit — that is its admission, and it is right
+    /// to — so a probe reads that refusal as "does not fit" rather than as a failure: the fitter
+    /// is asking exactly that question. Any other refusal stops the fit with its own code.
+    fn probe_cost(&self, request: ChatRequest) -> Result<u32, ErrorCode> {
+        match self.prepare_call(request) {
+            Ok(call) => Ok(call.estimate().input_tokens),
+            Err(ErrorCode::CandidateTooLarge) => Ok(u32::MAX),
+            Err(code) => Err(code),
+        }
+    }
+
     /// Prepares a candidate with the selected adapter, refusing what it cannot carry.
     fn prepare_call(&self, request: ChatRequest) -> Result<Box<dyn PreparedModelCall>, ErrorCode> {
         let epoch = self
@@ -234,7 +280,7 @@ impl AgentRunner {
                 request,
                 selection_epoch: epoch,
             })
-            .map_err(|_| ErrorCode::ProtocolIncompatible)
+            .map_err(|error| code_of(&error))
     }
 
     /// Prepares this step's request: fit, freeze, describe.
@@ -253,11 +299,7 @@ impl AgentRunner {
         let base = self.base_request(session, policy);
         let notes = snapshot.state.notes().to_vec();
         let bound = snapshot.state.notes_goal_revision();
-        let probe = NoticeFacts {
-            input_allowance: allowance,
-            recovery_available: true,
-            ..NoticeFacts::default()
-        };
+        let probe = probe_facts(allowance);
         let cost = |hidden: &[FragmentId], revision: u64| -> Result<u32, ErrorCode> {
             let selection = Selection {
                 revision,
@@ -266,7 +308,7 @@ impl AgentRunner {
                 notes_goal_revision: bound,
             };
             let request = self.compose(session, &snapshot, selection, &probe, &base)?;
-            Ok(self.prepare_call(request)?.estimate().input_tokens)
+            self.probe_cost(request)
         };
         let next = snapshot
             .state
@@ -311,20 +353,18 @@ impl AgentRunner {
     ) -> Result<Prepared, BundleError> {
         let (selection, automatic) = chosen;
         let (base, allowance) = shared;
-        let probe = NoticeFacts {
-            input_allowance: allowance,
-            recovery_available: true,
-            ..NoticeFacts::default()
-        };
+        let probe = probe_facts(allowance);
         let draft = self
             .compose(session, snapshot, selection, &probe, base)
             .map_err(refusal)?;
-        let pre = self.prepare_call(draft).map_err(refusal)?.estimate();
+        let pre = self.probe_cost(draft).map_err(refusal)?;
+        if pre > allowance {
+            return Err(refusal(ErrorCode::CandidateTooLarge));
+        }
         let mut reminder = turn.reminder();
-        let percent =
-            nanus_domain::context::managed::compile::pressure_percent(pre.input_tokens, allowance);
+        let percent = nanus_domain::context::managed::compile::pressure_percent(pre, allowance);
         let facts = NoticeFacts {
-            estimate_input_tokens: Some(pre.input_tokens),
+            estimate_input_tokens: Some(pre),
             estimator: String::from("adapter-serialized-body"),
             input_allowance: allowance,
             budget_hint: reminder.observe(percent),
@@ -538,6 +578,9 @@ impl AgentRunner {
                 status.profile_digest = self.profile(call.selection().clone(), policy, snapshot);
                 status.managed_ready = true;
             }
+            // Over the budget as it stands: the next request fits it first, so the session is
+            // ready, and the estimate is the one thing it cannot report yet.
+            Err(ErrorCode::CandidateTooLarge) => status.managed_ready = true,
             Err(code) => status.unavailable_reason = Some(code),
         }
     }

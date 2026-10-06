@@ -3,8 +3,8 @@
 use nanus_domain::context::managed::{
     ArtifactId, AttemptOutcome, AttemptPhase, CaptureStatus, ContextDecision, ContextMode,
     ContextModeRecord, ContextPolicy, DecisionOutcome, Digest, ErrorCode, ManagedState, ModeActor,
-    ModeReason, NoticeFacts, ProjectionRevision, RequestAttemptRecord, Selection, UsageObservation,
-    limits, notes, proposal, state,
+    ModeReason, ProjectionRevision, RequestAttemptRecord, Selection, UsageObservation, limits,
+    notes, proposal, state,
 };
 use nanus_domain::{Session, SessionEvent, StepOutcome};
 use nanus_ports::{CheckpointReason, PersistenceState, TurnControl, TurnRuntime};
@@ -214,11 +214,7 @@ impl AgentRunner {
     ) -> Result<(), ErrorCode> {
         let caps = self.llm().capabilities(&self.model());
         let allowance = self.input_allowance(caps, turn.policy());
-        let facts = NoticeFacts {
-            input_allowance: allowance,
-            recovery_available: true,
-            ..NoticeFacts::default()
-        };
+        let facts = super::prepare::probe_facts(allowance);
         let selection = Selection {
             revision: revision.revision,
             hidden: &revision.hidden,

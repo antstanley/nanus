@@ -284,9 +284,15 @@ const fn artifact_refusal(error: ArtifactError) -> ErrorCode {
 }
 
 /// Writes and syncs a fresh file.
+///
+/// `flush` is not optional. Tokio's `write_all` hands the last buffer to a background write and
+/// returns; only `flush` waits for that write and reports its error. Without it a full disk on
+/// the final chunk is never seen, `sync_all` succeeds on the short file, and the rename installs
+/// a truncated session that a receipt then calls committed.
 async fn write_synced(path: &std::path::Path, body: &str) -> std::io::Result<()> {
     let mut file = fs::File::create(path).await?;
     file.write_all(body.as_bytes()).await?;
+    file.flush().await?;
     file.sync_all().await
 }
 

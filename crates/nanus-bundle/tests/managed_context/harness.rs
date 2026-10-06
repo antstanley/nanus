@@ -146,6 +146,12 @@ impl LlmPort for Port {
             images: 0,
             reservation: request.request.max_tokens.unwrap_or(0),
         };
+        // Refuse exactly as the real adapters do: a candidate that does not fit is not prepared.
+        if !estimate.fits(self.capabilities(&request.request.model), &request.request) {
+            return Err(nanus_ports::LlmError::Unsupported {
+                feature: "candidate_too_large: the prepared request exceeds its limits".into(),
+            });
+        }
         Ok(Box::new(Call {
             model: Rc::clone(&self.0),
             digest: Digest::of(&body),
@@ -215,6 +221,11 @@ impl nanus_domain::ToolExecutor for Echo {
 
 /// A runner over the scripted model with one registered tool, `echo`.
 pub fn runner(model: &Model, budget: u32) -> AgentRunner {
+    runner_steps(model, budget, 32)
+}
+
+/// As [`runner`], with a step budget of `steps`.
+pub fn runner_steps(model: &Model, budget: u32, steps: u32) -> AgentRunner {
     let mut registry = ToolRegistry::new();
     let schema = ToolSchema {
         name: ToolName::new("echo").unwrap(),
@@ -224,12 +235,21 @@ pub fn runner(model: &Model, budget: u32) -> AgentRunner {
     registry
         .register(ToolDefinition::new(schema, Echo(Rc::clone(model))))
         .unwrap();
-    runner_with(model, ToolRegistryHandle::new(registry), budget)
+    runner_configured(model, ToolRegistryHandle::new(registry), budget, steps)
 }
 
 /// A runner over the scripted model and the given tools.
 pub fn runner_with(model: &Model, tools: ToolRegistryHandle, budget: u32) -> AgentRunner {
-    let config = AgentConfig::new(32, 1, "m", 32_768)
+    runner_configured(model, tools, budget, 32)
+}
+
+fn runner_configured(
+    model: &Model,
+    tools: ToolRegistryHandle,
+    budget: u32,
+    steps: u32,
+) -> AgentRunner {
+    let config = AgentConfig::new(steps, 1, "m", 32_768)
         .unwrap()
         .with_context_budget(budget)
         .unwrap()

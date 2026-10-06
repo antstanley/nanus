@@ -307,3 +307,63 @@ fn an_archive_search_reads_past_its_first_chunk_and_across_chunk_edges() {
         assert_eq!(found.coverage, Coverage::Complete);
     }
 }
+
+/// F3: pages of a search keep reading the snapshot the first page read, even after the session
+/// grows, and finish.
+#[test]
+fn paging_a_search_reads_its_own_snapshot_after_the_session_grows() {
+    let mut bytes = Vec::new();
+    for _ in 0..6 {
+        bytes.extend(vec![b'z'; 100_000]);
+        bytes.extend_from_slice(b"HIT");
+    }
+    let mut session = session("go", Some(&bytes));
+    let archive = Archive {
+        bytes: bytes.clone(),
+        corrupt: false,
+    };
+    let mut cursor = None;
+    let mut found = Vec::new();
+    for _ in 0..20 {
+        let page = futures::executor::block_on(recall(
+            &scope(&session, Some(&archive), b"key"),
+            &search("HIT", cursor.clone(), 40),
+        ));
+        found.extend(page.hits.iter().map(|hit| hit.source.offset));
+        // The turn appends between pages.
+        session.append(SessionEvent::UserMessage {
+            text: "more".into(),
+        });
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(found.len(), 6, "{found:?}");
+    found.dedup();
+    assert_eq!(found.len(), 6, "no hit repeats");
+}
+
+/// F9: a work bound that leaves less than a needle's length never skips past a match.
+#[test]
+fn a_window_shorter_than_the_needle_resumes_where_it_started() {
+    // The first source uses all but three bytes of the budget, so the second — which starts
+    // with the needle — is first read in a three-byte window.
+    let mut session = session(
+        &"a".repeat(limits::RECALL_WORK_BYTES.saturating_sub(3)),
+        None,
+    );
+    session.append(SessionEvent::UserMessage {
+        text: "NEEDLE then more".into(),
+    });
+    let scope = scope(&session, None, b"key");
+    let first = futures::executor::block_on(recall(&scope, &search("NEEDLE", None, 5)));
+    assert!(first.hits.is_empty());
+    let second = futures::executor::block_on(recall(
+        &scope,
+        &search("NEEDLE", first.next_cursor.clone(), 5),
+    ));
+    assert_eq!(second.hits.len(), 1, "{first:?} {second:?}");
+    assert_eq!(second.hits[0].source.offset, 0);
+    assert_eq!(second.coverage, Coverage::Complete);
+}

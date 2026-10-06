@@ -1018,7 +1018,7 @@ impl AgentRunner {
         .await;
         Self::append_results(session, calls, results);
         if let Some(managed) = managed {
-            self.publish_captures(session, calls, managed);
+            self.publish_captures(session, calls, managed).await;
         }
         if let Some(lease) = lease {
             let request = match managed {

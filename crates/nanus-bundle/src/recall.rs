@@ -204,6 +204,29 @@ async fn search(scope: &Scope<'_>, input: &ContextRecallInput) -> RecallResult {
             None => return refused(scope, RecallEncoding::Text, ErrorCode::CursorExpired),
         },
     };
+    // A search is bound to the snapshot its first page read. Later pages read, and seal their
+    // cursors at, that snapshot's count — not the session's current one, which has grown by
+    // the turn's own records and would renumber the sources the cursor's position indexes.
+    let pinned;
+    let scope = if count == scope.frontier.event_count {
+        scope
+    } else {
+        let Ok(frontier) = nanus_domain::context::managed::state::frontier_at(
+            scope.session,
+            count,
+            scope.frontier.projection_revision,
+        ) else {
+            return refused(scope, RecallEncoding::Text, ErrorCode::CursorExpired);
+        };
+        pinned = Scope {
+            session: scope.session,
+            frontier,
+            durable: scope.durable,
+            archive: scope.archive,
+            key: scope.key,
+        };
+        &pinned
+    };
     let all = sources(scope.session, count);
     let limit = usize::try_from(input.limit).unwrap_or(limits::RECALL_HITS_DEFAULT);
     let mut hunt = Hunt {
@@ -300,11 +323,16 @@ async fn scan_window(
     if end >= total {
         return Ok(Window::Done);
     }
-    // Resume so a match straddling the cut is found by the next window, and never at or
-    // before where this one started.
-    let overlap = end
-        .saturating_sub(needle.len().saturating_sub(1))
-        .max(start.saturating_add(1));
+    // Resume so a match straddling the cut is found by the next window. A window shorter than
+    // the needle has examined no complete candidate, so it resumes where it started: the next
+    // window, with more of the budget, reads past it. Never moving forward past an unexamined
+    // start is what keeps a match from being skipped and coverage from being called complete.
+    let overlap = if bytes.len() < needle.len() {
+        start
+    } else {
+        end.saturating_sub(needle.len().saturating_sub(1))
+            .max(start.saturating_add(1))
+    };
     Ok(Window::Resume(u64::try_from(overlap).unwrap_or(u64::MAX)))
 }
 

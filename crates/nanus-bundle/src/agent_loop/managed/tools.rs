@@ -177,19 +177,23 @@ impl AgentRunner {
         let key = turn
             .context
             .map_or(&[][..], nanus_ports::ContextRuntime::cursor_key);
+        // Bound to what the catalog means — the accepted revision and the snapshot profile — and
+        // positioned by the last fragment listed rather than by an index or the event count: a
+        // step appends records between inspections, which must not expire the cursor, and a
+        // fragment whose results arrive later appears in the middle of the list, which must not
+        // shift a page. A new revision or selection does expire it.
         let binding = format!(
-            "c1:{}:{}:{}",
+            "c2:{}:{}",
             status.revision,
-            status.frontier.event_count,
             status.profile_digest.as_str().get(..16).unwrap_or_default()
         );
-        let start = match input.cursor.as_deref() {
-            None => 0,
+        let after = match input.cursor.as_deref() {
+            None => None,
             Some(token) => match cursor::open(key, token)
                 .and_then(|payload| payload.strip_prefix(&format!("{binding}:")))
-                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|seq| seq.parse::<u64>().ok())
             {
-                Some(index) => index,
+                Some(seq) => Some(seq),
                 None => return refused_manage(status, ErrorCode::CursorExpired),
             },
         };
@@ -197,8 +201,13 @@ impl AgentRunner {
             Ok(all) => all,
             Err(code) => return refused_manage(status, code),
         };
-        page(&all, start, &status, |next| {
-            cursor::seal(key, &format!("{binding}:{next}"))
+        let start = after.map_or(0, |after| {
+            all.iter()
+                .position(|descriptor| descriptor.assistant_seq > after)
+                .unwrap_or(all.len())
+        });
+        page(&all, start, &status, |last| {
+            cursor::seal(key, &format!("{binding}:{last}"))
         })
     }
 
@@ -362,7 +371,12 @@ impl AgentRunner {
 
     /// Publishes the receipts of a batch's captures after its results, and queues every
     /// finalized object for the next checkpoint to verify.
-    pub(in crate::agent_loop) fn publish_captures(
+    ///
+    /// Each object is verified against its receipt first. One that does not verify — a short
+    /// write the sink did not see, a file that went missing — is published as `unavailable`
+    /// rather than as what its receipt claims: a reference the checkpoint would refuse would
+    /// leave every later checkpoint of the turn refused with it.
+    pub(in crate::agent_loop) async fn publish_captures(
         &self,
         session: &mut Session,
         calls: &[ToolCall],
@@ -377,13 +391,25 @@ impl AgentRunner {
         let Some(broker) = &self.capture else {
             return;
         };
+        let archive = turn.context.and_then(nanus_ports::ContextRuntime::archive);
         for call in calls {
             for finalization in broker.take_finalizations(&call.id) {
+                let mut receipt = finalization.receipt;
                 if let Some(artifact) = finalization.artifact {
-                    turn.artifacts.borrow_mut().push(artifact);
+                    let verified = match archive {
+                        Some(archive) => archive.verify(&artifact).await.is_ok(),
+                        None => false,
+                    };
+                    if verified {
+                        turn.artifacts.borrow_mut().push(artifact);
+                    } else {
+                        let observed = receipt.observed_bytes;
+                        receipt = unavailable(call, receipt.stream, CaptureReason::WriteError);
+                        receipt.observed_bytes = observed;
+                    }
                 }
                 session.append(SessionEvent::ArtifactPublished {
-                    payload: Box::new(finalization.receipt),
+                    payload: Box::new(receipt),
                 });
             }
             broker.discard(&call.id);
@@ -438,7 +464,7 @@ fn page(
     all: &[FragmentDescriptor],
     start: usize,
     context: &ContextStatus,
-    seal: impl Fn(usize) -> String,
+    seal: impl Fn(u64) -> String,
 ) -> ManageResult {
     let mut count = all
         .len()
@@ -451,7 +477,10 @@ fn page(
             context: context.clone(),
             decision: None,
             fragments: all.get(start..end).unwrap_or_default().to_vec(),
-            next_cursor: (end < all.len()).then(|| seal(end)),
+            next_cursor: (end < all.len())
+                .then(|| end.checked_sub(1).and_then(|last| all.get(last)))
+                .flatten()
+                .map(|last| seal(last.assistant_seq)),
             error_code: None,
         };
         let fits =

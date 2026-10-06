@@ -210,7 +210,13 @@ impl FileSink {
             return self.fail(CaptureFailure::Io(String::from("the sink has no file")));
         };
         self.disposable = false;
-        match tokio::time::timeout(self.plan.deadline, file.write_all(&self.staging)).await {
+        // The flush is part of the write: tokio reports the last chunk's error only there, and a
+        // write error swallowed here would seal a short object under a "complete" receipt.
+        let write = async {
+            file.write_all(&self.staging).await?;
+            file.flush().await
+        };
+        match tokio::time::timeout(self.plan.deadline, write).await {
             Ok(Ok(())) => {
                 self.staging.clear();
                 Ok(())

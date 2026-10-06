@@ -1166,6 +1166,11 @@ async fn write_atomic(path: &Path, body: &str) -> StoreResult<()> {
         file.write_all(body.as_bytes())
             .await
             .map_err(|source| io_error(&temp, &source))?;
+        // Tokio's last write runs in the background until it is flushed, and only the flush
+        // reports its error: without it a full disk leaves a short file that syncs cleanly.
+        file.flush()
+            .await
+            .map_err(|source| io_error(&temp, &source))?;
         // fsync before the rename is what makes the rename a commit rather than a
         // hope: without it a crash can leave a zero-length file under the real name.
         file.sync_all()

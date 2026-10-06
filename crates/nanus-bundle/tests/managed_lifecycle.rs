@@ -506,3 +506,49 @@ fn admission_sees_the_original_and_the_effective_request_side_by_side() {
     );
     assert!(original >= 10);
 }
+
+/// F5: an inspect cursor from one step still pages the catalog in the next, though the step
+/// appended records in between, and every fragment is listed exactly once.
+#[test]
+fn an_inspect_cursor_pages_the_whole_catalog_across_steps() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = runner_steps(&model, 256_000, 64);
+    let (mut session, disk, context) = managed(&runner);
+    for index in 0..45 {
+        model.push(call(&format!("w{index}"), "echo", r#"{"size": 1}"#));
+    }
+    model.push(call("i1", "context_manage", INSPECT));
+    model.push_with(|request| {
+        let first = last_tool_json(request);
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let arguments = serde_json::json!({"action": "inspect", "base_revision": null,
+            "base_frontier": null, "hide": [], "restore": [], "notes": [], "cursor": cursor,
+            "base_profile_digest": null});
+        call("i2", "context_manage", &arguments.to_string())
+    });
+    model.push(text("listed"));
+    block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)))
+        .outcome
+        .unwrap();
+    let first = tool_result_json(&session, "i1");
+    let second = tool_result_json(&session, "i2");
+    assert_eq!(second["status"], "inspected", "{second}");
+    let ids = |page: &serde_json::Value| -> Vec<String> {
+        page["fragments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fragment| fragment["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let mut all = ids(&first);
+    all.extend(ids(&second));
+    let total = all.len();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), total, "no fragment is listed twice");
+    assert!(
+        total >= 46,
+        "every fragment, the first inspect's own included: {total}"
+    );
+}
