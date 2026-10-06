@@ -40,11 +40,13 @@ separate file beside the log, and that is deliberate:
 - **A name is content, never a path.** It lives inside the session's own directory under a
   fixed file name, so no name can climb out of the store.
 
-Writers now emit body version 3. Readers accept versions 1, 2 and 3; old text logs keep their
-sequence, usage and optional provenance without inferred pixels. Version 1 cannot introduce
-typed content or signed replay via extra fields. Version 2 stores ordered image blocks inline
-beside display summaries, so resuming does not need the original image file. Signed Messages
-assistant blocks are retained for unchanged-prefix replay. Older binaries cannot read v2
+A session is written at the lowest body version that holds it: version 3 when a user message
+carries typed content, and version 2 otherwise, so an older build can still open a text-only
+session. Readers — the store's listing as well as a load — accept versions 1, 2 and 3; old
+text logs keep their sequence, usage and optional provenance without inferred pixels. Version 1
+cannot introduce typed content or signed replay via extra fields. Version 2 stores ordered image
+blocks inline beside display summaries, so resuming does not need the original image file. Signed
+Messages assistant blocks are retained for unchanged-prefix replay. Older binaries cannot read v2
 bodies; there is no destructive bulk migration or automatic downgrade.
 
 The local Responses preparation additionally validates `openai.responses` replay in v2
@@ -73,7 +75,8 @@ ciphertext. Downstream consumer and live acceptance are separate from the local 
 Direct user input retains the same ordered typed blocks as tool results. `Message::user_with_content`
 validates before deriving a display summary; provider adapters send the blocks themselves. Text-only
 constructors preserve their original JSON. Version 3 prevents older readers silently dropping user
-images; versions 1 and 2 refuse typed user fields even when null. No CLI or link image upload surface
+images, and is written only when a session holds some; versions 1 and 2 refuse typed user fields
+even when null. No CLI or link image upload surface
 is introduced. Library hosts may compose direct multimodal requests and store typed user events.
 
 `try_to_jsonl` validates content and 4 MiB records/64 MiB total logs. The store uses it before

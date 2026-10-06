@@ -97,8 +97,9 @@ pub use goal::{GOAL_NOTE_MAX_CHARS, GOAL_OBJECTIVE_MAX_CHARS, Goal, GoalPhase};
 pub use message::{Message, Role, ToolCallId, Usage};
 pub use prompt::{PromptBuilder, PromptError, PromptSection, runtime_context};
 pub use session::{
-    Origin, SESSION_FORMAT_TAG, SESSION_FORMAT_VERSION, Session, SessionError, SessionEvent,
-    SessionId, SessionLog, SessionSeq, TurnEndReason,
+    OLDEST_SESSION_FORMAT_VERSION, Origin, SESSION_FORMAT_TAG, SESSION_FORMAT_VERSION, Session,
+    SessionError, SessionEvent, SessionId, SessionLog, SessionSeq, TurnEndReason,
+    reads_session_version,
 };
 pub use tool::{
     ContentBlock, ImageEnvelope, TOOL_NAME_MAX_LEN, ToolCall, ToolDefinition, ToolError,

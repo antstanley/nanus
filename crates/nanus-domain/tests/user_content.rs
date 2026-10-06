@@ -75,6 +75,38 @@ fn old_text_bodies_still_load_but_typed_user_content_cannot_be_downgraded() {
     }
 }
 #[test]
+fn a_session_is_written_at_the_lowest_version_that_holds_it() {
+    let header = |raw: &str| {
+        serde_json::from_str::<Value>(raw.lines().next().unwrap()).unwrap()["version"].clone()
+    };
+    // Typed *tool* content is a version-2 body already, so it does not move the version.
+    let mut plain = session(None);
+    plain.append(SessionEvent::ToolResult {
+        call_id: nanus_domain::ToolCallId::new("call-1"),
+        content: "a still".into(),
+        content_blocks: Some(vec![pixels()]),
+        is_error: false,
+    });
+    assert_eq!(plain.body_version(), 2);
+    for raw in [plain.to_jsonl(), plain.try_to_jsonl().unwrap()] {
+        assert_eq!(header(&raw), 2, "an older build can still open it");
+        assert_eq!(Session::from_jsonl(&raw).unwrap(), plain);
+    }
+    // One typed user message anywhere moves the whole session to version 3, which an older
+    // build refuses rather than reading with the pixels dropped.
+    let mut typed = plain;
+    typed.append(SessionEvent::UserMessage {
+        text: "look".into(),
+        content_blocks: Some(vec![pixels()]),
+    });
+    assert_eq!(typed.body_version(), 3);
+    for raw in [typed.to_jsonl(), typed.try_to_jsonl().unwrap()] {
+        assert_eq!(header(&raw), 3);
+        assert_eq!(Session::from_jsonl(&raw).unwrap(), typed);
+        assert!(Session::from_jsonl(&version(&raw, 2)).is_err());
+    }
+}
+#[test]
 fn plaintext_json_stays_exact_and_image_only_input_is_visible() {
     assert_eq!(
         serde_json::to_string(&Message::user("plain")).unwrap(),

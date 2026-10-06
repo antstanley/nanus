@@ -363,7 +363,10 @@ design docs too.
 - **A name is an alias for a store key, and one session has one name.** Naming is
   refused rather than moved when the name is held, and the alias lives in the
   session's own directory (`name`), so it cannot be lost with a shared table.
-- **Bodies are version 3; readers accept 1, 2 and 3.** Typed tool blocks and signed Messages
+- **A body is written at the lowest version that holds it; readers accept 1, 2 and 3.** Version 3
+  only when a user message carries typed content, version 2 otherwise, so an older build can still
+  open a text-only session. Anything that checks a header — the store's listing included — asks
+  `reads_session_version`, never "is it the newest". Typed tool blocks and signed Messages
   replay are bounded. Version 1 cannot smuggle these fields; versions 1/2 cannot smuggle typed user content.
   Store saves use `try_to_jsonl`;
   failed saves must leave the original intact. Image capability defaults Unknown until exact

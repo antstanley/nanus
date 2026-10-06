@@ -63,7 +63,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use etcetera::BaseStrategy as _;
-use nanus_domain::{SESSION_FORMAT_TAG, SESSION_FORMAT_VERSION, Session, SessionError, SessionId};
+use nanus_domain::{
+    SESSION_FORMAT_TAG, SESSION_FORMAT_VERSION, Session, SessionError, SessionId,
+    reads_session_version,
+};
 use nanus_ports::{LocalBoxFuture, SessionSummary, StoreError, StorePort, StoreResult};
 use serde_json::Value;
 use tokio::fs;
@@ -880,12 +883,18 @@ fn parse_header(line: &str, id: &SessionId, number: u64) -> StoreResult<Value> {
     }
     let version = header.get("version").and_then(Value::as_u64).unwrap_or(0);
     let version = u32::try_from(version).unwrap_or(u32::MAX);
-    if version != SESSION_FORMAT_VERSION {
+    // Every version the domain reads, not only the newest: a session is written at the lowest
+    // version that holds it, so most of a store is older than the newest version, and a listing
+    // that refused them would hide sessions a load can open.
+    if !reads_session_version(version) {
+        let message = if version > SESSION_FORMAT_VERSION {
+            format!("format version {version} is newer than this build's {SESSION_FORMAT_VERSION}")
+        } else {
+            format!("format version {version} is not one this build reads")
+        };
         return Err(StoreError::Corrupt {
             id: id.as_str().to_owned(),
-            message: format!(
-                "format version {version} is newer than this build's {SESSION_FORMAT_VERSION}"
-            ),
+            message,
         });
     }
     Ok(header)

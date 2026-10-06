@@ -55,8 +55,31 @@ use crate::tool::{ToolCall, ToolName};
 /// The format tag every session header carries.
 pub const SESSION_FORMAT_TAG: &str = "nanus.session";
 
-/// The session file format version this crate writes and accepts.
+/// The newest session file format version this crate writes and accepts.
+///
+/// A session is written at the lowest version that can hold it: version 3 only when a user
+/// message carries typed content, and version 2 otherwise. See `Session::body_version`.
 pub const SESSION_FORMAT_VERSION: u32 = 3;
+
+/// The oldest session file format version this crate still reads.
+pub const OLDEST_SESSION_FORMAT_VERSION: u32 = 1;
+
+/// Whether this crate reads a session whose header names `version`.
+///
+/// Every version from [`OLDEST_SESSION_FORMAT_VERSION`] to [`SESSION_FORMAT_VERSION`] is read:
+/// a writer picks the lowest version that holds a session, so a reader that accepted only the
+/// newest would refuse most of what is on disk. Anything that checks a header — the store's
+/// listing as much as a load — asks this rather than comparing against the newest version.
+#[must_use]
+pub const fn reads_session_version(version: u32) -> bool {
+    version >= OLDEST_SESSION_FORMAT_VERSION && version <= SESSION_FORMAT_VERSION
+}
+
+/// The body version a session without typed user content is written at.
+///
+/// Version 3 differs from it only in admitting a user message's content blocks, and a user
+/// message without them serialises identically under both.
+const UNTYPED_USER_BODY_VERSION: u32 = 2;
 
 /// Maximum number of characters in a derived session title.
 const TITLE_MAX_CHARS: usize = 72;
@@ -927,6 +950,32 @@ impl Session {
         Some(title)
     }
 
+    /// The lowest body version a reader must understand to read this session faithfully.
+    ///
+    /// Version 3 exists because a version-2 reader ignores a user message's content blocks
+    /// rather than refusing them, so opening a session in an older build would silently erase
+    /// the images a person sent. That is the only thing version 3 guards. A session that carries
+    /// no typed user content is the same bytes under version 2, and is written as version 2 so
+    /// that an older build can still open it; one that carries any is written as version 3, which
+    /// an older build refuses rather than misreads.
+    #[must_use]
+    pub fn body_version(&self) -> u32 {
+        let typed_user = self.log.events().iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::UserMessage {
+                    content_blocks: Some(_),
+                    ..
+                }
+            )
+        });
+        if typed_user {
+            SESSION_FORMAT_VERSION
+        } else {
+            UNTYPED_USER_BODY_VERSION
+        }
+    }
+
     /// Encodes the session as JSONL: a header line, then one envelope per event.
     ///
     /// The function is infallible by construction. Every type this crate stores
@@ -938,7 +987,7 @@ impl Session {
     pub fn to_jsonl(&self) -> String {
         let header = SessionHeader {
             format: SESSION_FORMAT_TAG.to_owned(),
-            version: SESSION_FORMAT_VERSION,
+            version: self.body_version(),
             id: self.id.as_str().to_owned(),
             created_at_ms: self.created_at_ms,
             cwd: self.cwd.clone(),
@@ -957,7 +1006,10 @@ impl Session {
         out
     }
 
-    /// Encodes a bounded version-3 session, validating content before any store write.
+    /// Encodes a bounded session, validating content before any store write.
+    ///
+    /// The header names the lowest body version that can hold the session; see
+    /// [`Session::body_version`].
     ///
     /// # Errors
     ///
@@ -1007,7 +1059,7 @@ impl Session {
         // session before allocating it; this also counts the header's newline.
         let header = SessionHeader {
             format: SESSION_FORMAT_TAG.to_owned(),
-            version: SESSION_FORMAT_VERSION,
+            version: self.body_version(),
             id: self.id.as_str().to_owned(),
             created_at_ms: self.created_at_ms,
             cwd: self.cwd.clone(),
@@ -1119,7 +1171,7 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
             ),
         });
     }
-    if !matches!(header.version, 1 | 2 | SESSION_FORMAT_VERSION) {
+    if !reads_session_version(header.version) {
         return Err(SessionError::UnsupportedVersion {
             found: header.version,
             expected: SESSION_FORMAT_VERSION,
