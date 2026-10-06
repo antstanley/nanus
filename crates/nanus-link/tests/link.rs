@@ -31,8 +31,8 @@ use nanus_domain::{
     ToolResult, ToolSchema, Usage,
 };
 use nanus_link::protocol::{
-    ApprovalState, EffortState, Frame, GoalAction, GoalInfo, GoalState, Request, SessionInfo,
-    TurnEnd,
+    ApprovalState, ContextAction, ContextModeState, EffortState, Frame, GoalAction, GoalInfo,
+    GoalState, Request, SessionInfo, TurnEnd,
 };
 use nanus_link::server::{Agent, Parts};
 use nanus_link::{Client, LinkError};
@@ -1420,13 +1420,28 @@ fn a_client_that_attaches_mid_turn_catches_up() {
         let mut joiner = Client::connect(&socket_for_client)
             .await
             .expect("the agent answers");
-        joiner.attach(&mine.session).await.expect("joins");
+        let attachment = joiner.attach_at(&mine.session).await.expect("joins");
 
         // The backlog is the first thing after the attachment, and it holds the turn so far.
         let first = joiner.next().await.expect("frames are readable");
-        let Some(Frame::Backlog { frames }) = first else {
+        let Some(Frame::Backlog { stream, segments }) = first else {
             panic!("expected the turn in flight, got {first:?}");
         };
+        // One snapshot: the attachment and the backlog name the same epoch, watermark and
+        // frontier, and the frontier is the log before this turn — a legacy turn is written
+        // when it ends, so none of it is durable yet.
+        assert_eq!(stream, attachment.stream);
+        assert_eq!(stream.frontier.event_count, 0);
+        assert_eq!(
+            segments.last().map(|segment| segment.frame_id),
+            Some(stream.stream_watermark),
+            "the backlog runs up to the watermark"
+        );
+        assert!(
+            segments.iter().all(|segment| segment.turn == Some(0)),
+            "every segment is tagged with the turn it came from: {segments:?}"
+        );
+        let frames: Vec<Frame> = segments.into_iter().map(|segment| segment.frame).collect();
         let mut asked = None;
         let mut stepped = None;
         let mut text = String::new();
@@ -3311,4 +3326,359 @@ fn a_goal_the_model_sets_reaches_the_client() {
         Some("watch the nightly benchmark"),
         "and it is durable, not only broadcast"
     );
+}
+
+/// Reads frames until one answers a context request: a status, a refusal, or a checkpoint.
+async fn context_answer(client: &mut Client) -> Frame {
+    loop {
+        match client.next().await.expect("frames are readable") {
+            Some(
+                frame @ (Frame::ContextStatus { .. }
+                | Frame::Refused { .. }
+                | Frame::Checkpoint { .. }),
+            ) => return frame,
+            Some(_) => {}
+            None => panic!("the agent closed the link before answering"),
+        }
+    }
+}
+
+/// A context reset is refused while a turn runs — over the socket, by the request the interface
+/// sends — and changes nothing; a status read during the same turn is answered rather than
+/// refused as busy, and a legacy turn, which publishes no managed status, says so.
+#[test]
+fn a_context_reset_during_a_turn_is_refused_and_a_status_read_is_answered() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (agent, store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(WaitingLlm {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })),
+        "waiting",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+
+        let mut owner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let mine = owner.start(None).await.expect("a session starts");
+        owner
+            .send(&Request::Prompt {
+                text: "do the thing".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let _permit = entered.acquire().await.expect("the turn reached the model");
+
+        let mut other = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        other.attach(&mine.session).await.expect("joins");
+        other
+            .send(&Request::Context {
+                action: ContextAction::Reset,
+            })
+            .await
+            .expect("the reset is sent");
+        let refused = context_answer(&mut other).await;
+        assert!(
+            matches!(&refused, Frame::Refused { message } if message.contains("turn is running")),
+            "a reset of a busy session is refused: {refused:?}"
+        );
+        other
+            .send(&Request::Context {
+                action: ContextAction::Status,
+            })
+            .await
+            .expect("the read is sent");
+        let read = context_answer(&mut other).await;
+        assert!(
+            matches!(&read, Frame::Refused { message } if message.contains("not published")),
+            "a legacy turn publishes no status, and the read says so: {read:?}"
+        );
+
+        release.add_permits(1);
+        let rest = turn_frames(&mut owner).await;
+        assert_eq!(
+            answer_of(&rest),
+            Some("the rest"),
+            "the turn was not disturbed"
+        );
+        let stored = store
+            .load(&SessionId::new(&mine.session))
+            .await
+            .expect("the turn is recorded");
+        assert!(
+            !stored
+                .log()
+                .events()
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ContextMode { .. })),
+            "the refused reset wrote nothing"
+        );
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
+/// An idle legacy session's status is read from the runner and reported as legacy — or, from a
+/// runner that cannot give one, refused with its reason; never a frame with a guess in it.
+#[test]
+fn a_context_status_on_an_idle_legacy_session_is_legacy_or_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let attachment = client.start_at(None).await.expect("a session starts");
+        assert_eq!(attachment.stream.frontier.event_count, 0);
+        assert_eq!(
+            attachment.stream.frontier.session_id,
+            attachment.session.session
+        );
+        client
+            .send(&Request::Context {
+                action: ContextAction::Status,
+            })
+            .await
+            .expect("the read is sent");
+        match context_answer(&mut client).await {
+            Frame::ContextStatus { envelope, payload } => {
+                assert_eq!(payload.mode, ContextModeState::Legacy);
+                assert_eq!(envelope.stream_epoch, attachment.stream.stream_epoch);
+                assert!(envelope.frame_id > attachment.stream.stream_watermark);
+                assert_eq!((envelope.turn, envelope.step), (None, None));
+            }
+            Frame::Refused { message } => {
+                assert!(message.contains("context status"), "{message}");
+            }
+            other => panic!("expected a status or its refusal, got {other:?}"),
+        }
+
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
+/// A managed session whose store cannot checkpoint takes no turn: it is never run on the
+/// legacy path and never saved by the host, because a managed body is saved through its bound
+/// checkpoint or not at all.
+#[test]
+fn a_managed_session_its_store_cannot_checkpoint_takes_no_turn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // The gated store forwards saves and loads but not the stored identity, which is what a
+    // store that cannot checkpoint looks like.
+    let (agent, store, _gate) = save_gated_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+    let id = SessionId::new("managed-unbound");
+    nanus_kernel::runtime::block_on(async {
+        let mut session = Session::new(id.clone(), 1, "/work");
+        session.upgrade_to_managed_body();
+        session.append(SessionEvent::UserMessage {
+            text: "an earlier question".to_owned(),
+        });
+        store.save(&session).await.expect("the history is recorded");
+    });
+
+    let refused = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let attachment = client.attach_at("managed-unbound").await.expect("attaches");
+        assert_eq!(attachment.stream.frontier.event_count, 1);
+        client
+            .send(&Request::Prompt {
+                text: "go on".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        frames
+    });
+    assert!(
+        refused.iter().any(
+            |frame| matches!(frame, Frame::Failed { message } if message.contains("managed context"))
+        ),
+        "the prompt is refused with the reason: {refused:?}"
+    );
+    assert!(
+        !refused
+            .iter()
+            .any(|frame| matches!(frame, Frame::Done { .. })),
+        "{refused:?}"
+    );
+    let stored = nanus_kernel::runtime::block_on(store.load(&id)).expect("still readable");
+    assert_eq!(
+        stored.event_count(),
+        1,
+        "nothing was run and nothing was saved"
+    );
+}
+
+/// A model with managed preparation: one encoded body, digested once and sent as prepared.
+struct ManagedLlm;
+
+/// The prepared call [`ManagedLlm`] hands back.
+struct ManagedCall {
+    digest: nanus_domain::context::managed::Digest,
+    selection: nanus_domain::context::managed::SelectionIdentity,
+    estimate: nanus_ports::RequestEstimate,
+}
+
+impl nanus_ports::PreparedModelCall for ManagedCall {
+    fn estimate(&self) -> nanus_ports::RequestEstimate {
+        self.estimate
+    }
+    fn request_digest(&self) -> &nanus_domain::context::managed::Digest {
+        &self.digest
+    }
+    fn selection(&self) -> &nanus_domain::context::managed::SelectionIdentity {
+        &self.selection
+    }
+    fn stream(self: Box<Self>) -> LlmStream {
+        ScriptedLlm.stream_chat(ChatRequest::new("scripted", Vec::new()))
+    }
+}
+
+impl LlmPort for ManagedLlm {
+    fn model(&self) -> &'static str {
+        "scripted"
+    }
+    fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        ScriptedLlm.stream_chat(request)
+    }
+    fn managed_support(&self, _: &str) -> nanus_ports::ManagedSupport {
+        nanus_ports::ManagedSupport::Supported { policy_version: 1 }
+    }
+    fn prepare_managed(
+        &self,
+        request: nanus_ports::ManagedRequest,
+    ) -> nanus_ports::LlmResult<Box<dyn nanus_ports::PreparedModelCall>> {
+        let body = serde_json::to_vec(&request.request.messages).expect("encodes");
+        Ok(Box::new(ManagedCall {
+            digest: nanus_domain::context::managed::Digest::of(&body),
+            selection: nanus_domain::context::managed::SelectionIdentity {
+                provider: "test".to_owned(),
+                endpoint_digest: nanus_domain::context::managed::Digest::of(b"local"),
+                protocol: "test.chat".to_owned(),
+                model: request.request.model.clone(),
+                effort: None,
+                epoch: request.selection_epoch,
+            },
+            estimate: nanus_ports::RequestEstimate {
+                input_tokens: u32::try_from(body.len().div_ceil(4)).expect("small"),
+                request_bytes: body.len(),
+                images: 0,
+                reservation: request.request.max_tokens.unwrap_or(0),
+            },
+        }))
+    }
+}
+
+/// A managed session runs over the link through the store's checkpoints: viewers see its
+/// context status and each checkpoint, `Done` comes only once the turn is durable, and the
+/// store holds exactly what the agent holds — attempt records included — with no second save.
+#[test]
+fn a_managed_turn_over_the_link_is_checkpointed_before_it_is_done() {
+    use nanus_domain::context::managed::{ContextModeRecord, ContextPolicy, ModeActor, ModeReason};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = agent_over(dir.path(), Rc::new(Box::new(ManagedLlm)), "scripted");
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+    let id = SessionId::new("managed-over-the-link");
+    nanus_kernel::runtime::block_on(async {
+        let mut session = Session::new(id.clone(), 1, "/work");
+        session.upgrade_to_managed_body();
+        session.append(SessionEvent::ContextMode {
+            payload: Box::new(ContextModeRecord {
+                policy: ContextPolicy::managed(),
+                actor: ModeActor::Human,
+                reason: ModeReason::Enable,
+                previous_revision: 0,
+            }),
+        });
+        store.save(&session).await.expect("the session is recorded");
+    });
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client
+            .attach_at("managed-over-the-link")
+            .await
+            .expect("attaches");
+        client
+            .send(&Request::Prompt {
+                text: "go".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        frames
+    });
+    assert_eq!(answer_of(&frames), Some("hello back"), "{frames:?}");
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ContextStatus { .. })),
+        "{frames:?}"
+    );
+    let checkpoints = frames
+        .iter()
+        .filter(|frame| matches!(frame, Frame::Checkpoint { .. }))
+        .count();
+    assert!(
+        checkpoints >= 3,
+        "intent, settled step and turn end: {checkpoints}"
+    );
+    let stored = nanus_kernel::runtime::block_on(store.load(&id)).expect("readable");
+    assert!(stored.is_managed_body());
+    assert!(matches!(
+        stored.log().last_turn_end(),
+        Some(nanus_domain::TurnEndReason::Completed)
+    ));
+    let attempts = stored
+        .log()
+        .events()
+        .iter()
+        .filter(|event| matches!(event, SessionEvent::RequestAttempt { .. }))
+        .count();
+    assert_eq!(attempts, 2, "one intent and one outcome");
 }

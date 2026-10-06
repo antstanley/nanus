@@ -16,6 +16,9 @@ base64 = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# SHA-256 over bytes already in memory: the managed-context frontier, source and note digests.
+# Pure computation, so the crate keeps its no-I/O rule.
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }

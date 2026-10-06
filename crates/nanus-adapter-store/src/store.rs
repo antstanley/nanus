@@ -6,9 +6,23 @@
 //! <home>/sessions/<encoded-session-id>/session.jsonl
 //! <home>/sessions/<encoded-session-id>/name           (optional)
 //! <home>/sessions/<encoded-session-id>/lock           (optional, while held for writing)
+//! <home>/sessions/<encoded-session-id>/artifacts/     (optional, the shell archive)
+//! <home>/retired/<encoded-session-id>                 (a deleted id, never written again)
+//! <home>/trash/<encoded-session-id>.<uuid>/           (a deleted session, being removed)
+//! <home>/archive.lock                                 (the archive's cross-process quota lock)
 //! ```
 //!
-//! `<home>` is `$NANUS_HOME` when set, and `<config dir>/nanus` otherwise.
+//! `<home>` is `$NANUS_HOME` when set, and `<config dir>/nanus` otherwise. The archive's own
+//! layout is described in `archive`, deletion's in `retire`, and checkpoints' in `checkpoint`.
+//!
+//! ## Lock ordering
+//!
+//! Two locks exist, and they are always taken in one order: a **session claim** first (the
+//! per-session `flock` that [`StorePort::lock`] takes), then the **archive quota lock**. Nothing
+//! acquires a session claim while holding the quota lock. Reserving capture requires the claim
+//! to be held already and takes only the quota lock; garbage collection takes the claim and then
+//! the quota lock; deletion takes the claim and never needs the quota lock, because removing
+//! bytes can only lower what a reservation counts.
 //!
 //! ## Why a name is a file beside the session rather than a field in it
 //!
@@ -56,6 +70,12 @@
 //! damaged still lists with correct identity fields, and one unreadable session
 //! never hides the others.
 
+mod archive;
+mod checkpoint;
+mod gc;
+mod retire;
+mod sink;
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -63,8 +83,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use etcetera::BaseStrategy as _;
+use nanus_domain::context::managed::CheckpointReceipt;
+use nanus_domain::session::SESSION_FORMAT_VERSION_MANAGED;
 use nanus_domain::{SESSION_FORMAT_TAG, SESSION_FORMAT_VERSION, Session, SessionError, SessionId};
-use nanus_ports::{LocalBoxFuture, SessionSummary, StoreError, StorePort, StoreResult};
+use nanus_ports::{
+    ArtifactStore, CheckpointError, CheckpointView, ExpectedCheckpoint, LocalBoxFuture,
+    SessionSummary, StoreError, StorePort, StoreResult,
+};
+
+pub use archive::ArchiveQuota;
+pub use gc::GcReport;
 use serde_json::Value;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -142,6 +170,8 @@ pub struct JsonlStore {
     /// release is synchronous and the caller is a `Drop`: the open file has to outlive the call
     /// that opened it, and this is the thing that outlives it.
     locks: Mutex<BTreeMap<SessionId, std::fs::File>>,
+    /// The archive's byte limits, never above the policy's.
+    quota: ArchiveQuota,
 }
 
 impl JsonlStore {
@@ -156,12 +186,26 @@ impl JsonlStore {
         let store = Self {
             home,
             locks: Mutex::new(BTreeMap::new()),
+            quota: ArchiveQuota::default(),
         };
         let root = store.sessions_root();
         fs::create_dir_all(&root)
             .await
             .map_err(|source| io_error(&root, &source))?;
+        // A deletion a crash interrupted is finished here, and only ever forwards: whatever is
+        // in the trash is removed, and nothing is moved back.
+        store.finish_interrupted_deletions().await;
         Ok(store)
+    }
+
+    /// Lowers the archive's byte limits, for an embedding host or a test.
+    ///
+    /// A limit can only be lowered: the policy's bounds are the ceiling, so a quota above
+    /// them is clamped to them.
+    #[must_use]
+    pub fn with_archive_quota(mut self, quota: ArchiveQuota) -> Self {
+        self.quota = quota.clamped();
+        self
     }
 
     /// Opens the store named by `$NANUS_HOME`, or the platform default.
@@ -263,6 +307,9 @@ impl JsonlStore {
     fn lock_blocking(&self, id: &SessionId, owner: &str) -> StoreResult<()> {
         let path = self.lock_file(id)?;
         let dir = self.session_dir(id)?;
+        // A deleted conversation cannot be claimed: a claim is the first step of writing it, and
+        // a retired id is never written again.
+        self.refuse_retired(id)?;
         std::fs::create_dir_all(&dir).map_err(|source| io_error(&dir, &source))?;
         let body = serde_json::to_string(&Claim {
             pid: std::process::id(),
@@ -285,23 +332,30 @@ impl JsonlStore {
             return write_claim(held, &body, &path);
         }
         let Some(file) = take_claim(&path)? else {
-            // The lock is what refuses; the label is only how the refusal is worded. A label that
-            // cannot be read is a holder that has not written it yet, which is a sentence about an
-            // unnamed process rather than a reason to proceed.
-            let claim = read_claim(&path);
-            return Err(StoreError::Locked {
-                id: id.as_str().to_owned(),
-                owner: claim.as_ref().map_or_else(
-                    || String::from("another process"),
-                    |claim| claim.owner.clone(),
-                ),
-                pid: claim.map_or(0, |claim| claim.pid),
-            });
+            return Err(locked(id, &path));
         };
+        // Checked again with the lock in hand: a deleter in another process may have retired the
+        // id and moved its directory away between the first check and the `create_dir_all`,
+        // which would make this a claim on a directory it just recreated. The deleter writes its
+        // marker before it moves anything, so a claim taken after the move sees the marker here.
+        if self.retired(id)? {
+            drop(file);
+            drop(locks);
+            self.undo_resurrection(id);
+            return Err(retired(id));
+        }
         write_claim(&file, &body, &path)?;
         locks.insert(id.clone(), file);
         drop(locks);
         Ok(())
+    }
+
+    /// Whether this process holds the write claim on `id`.
+    fn holds_claim(&self, id: &SessionId) -> bool {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
     }
 
     /// Releases the claim this process holds, without waiting.
@@ -324,8 +378,15 @@ impl JsonlStore {
     }
 
     /// Writes `session` atomically, replacing any existing log for its id.
+    ///
+    /// A retired id is refused before and *after* the write. Before, so a stale handle is told;
+    /// after, because a save that passed the first check can still race a deletion in another
+    /// process: the deleter writes its retirement marker before it moves the directory, so a
+    /// save whose rename landed after the move sees the marker here and removes what it
+    /// recreated. A crash between the two is what [`JsonlStore::new`] finishes.
     async fn save_blocking(&self, session: &Session) -> StoreResult<()> {
         let dir = self.session_dir(session.id())?;
+        self.refuse_retired(session.id())?;
         refuse_symlinked_dir(&dir).await?;
         fs::create_dir_all(&dir)
             .await
@@ -335,12 +396,23 @@ impl JsonlStore {
             .try_to_jsonl()
             .map_err(|error| corrupt(session.id(), &error))?;
         assert!(!body.is_empty(), "an encoded session is never empty");
-        write_atomic(&path, &body).await
+        write_atomic(&path, &body).await?;
+        if self.retired(session.id())? {
+            self.undo_resurrection(session.id());
+            return Err(retired(session.id()));
+        }
+        Ok(())
     }
 
     /// Reads one session, rejecting a damaged file.
+    ///
+    /// A retired id reads as not found, even in the instant before its directory has moved:
+    /// the conversation was deleted, and a reader is told so in the words a missing one gets.
     async fn load_blocking(&self, id: &SessionId) -> StoreResult<Session> {
         let path = self.session_file(id)?;
+        if self.retired(id)? {
+            return Err(not_found(id));
+        }
         let raw = match read_bounded_log(&path).await {
             Ok(raw) => raw,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -351,29 +423,6 @@ impl JsonlStore {
         Session::from_jsonl(&raw).map_err(|error| corrupt(id, &error))
     }
 
-    /// Removes a session directory.
-    ///
-    /// A session directory that is a symlink is unlinked, never followed, so a
-    /// link planted under the home cannot make this delete an outside tree.
-    async fn delete_blocking(&self, id: &SessionId) -> StoreResult<()> {
-        let dir = self.session_dir(id)?;
-        let metadata = match fs::symlink_metadata(&dir).await {
-            Ok(metadata) => metadata,
-            // The port is explicit: deleting something absent is not an error,
-            // because the caller asked for it to be gone and it is.
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(io_error(&dir, &source)),
-        };
-        if metadata.file_type().is_symlink() {
-            return fs::remove_file(&dir)
-                .await
-                .map_err(|source| io_error(&dir, &source));
-        }
-        fs::remove_dir_all(&dir)
-            .await
-            .map_err(|source| io_error(&dir, &source))
-    }
-
     /// Records `name` for `id`, refusing a name another session already holds.
     async fn name_blocking(&self, id: &SessionId, name: &str) -> StoreResult<()> {
         // Trimmed before it is validated and written: a name is a word a person types back, and
@@ -381,6 +430,7 @@ impl JsonlStore {
         let name = name.trim();
         validate_name(name)?;
         let dir = self.session_dir(id)?;
+        self.refuse_retired(id)?;
         refuse_symlinked_dir(&dir).await?;
         // The session has to exist before it can be named. An alias for a session
         // that is not there is a promise this store cannot keep, and the caller
@@ -503,6 +553,10 @@ impl JsonlStore {
                 tracing::warn!(dir = %dir.display(), "skipping a session with an undecodable name");
                 continue;
             };
+            // A session whose deletion a crash interrupted is not a session any more.
+            if self.retired(&id).unwrap_or(false) {
+                continue;
+            }
             match summarize(&dir, &id).await {
                 Ok(summary) => summaries.push(summary),
                 Err(error) => tracing::warn!(%error, "skipping an unreadable session"),
@@ -567,6 +621,50 @@ impl StorePort for JsonlStore {
     fn release_lock(&self, id: &SessionId) {
         self.release_lock_blocking(id);
     }
+
+    fn stored_identity<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> LocalBoxFuture<'a, StoreResult<ExpectedCheckpoint>> {
+        Box::pin(async move { self.stored_identity_blocking(id).await })
+    }
+
+    fn checkpoint<'a>(
+        &'a self,
+        view: CheckpointView<'a>,
+    ) -> LocalBoxFuture<'a, Result<CheckpointReceipt, CheckpointError>> {
+        Box::pin(async move { self.checkpoint_blocking(view).await })
+    }
+
+    fn artifacts(&self) -> Option<&dyn ArtifactStore> {
+        Some(self)
+    }
+
+    fn collect_artifacts<'a>(&'a self, id: &'a SessionId) -> LocalBoxFuture<'a, StoreResult<u64>> {
+        Box::pin(async move {
+            self.collect_garbage(id)
+                .await
+                .map(|report| report.reclaimed_bytes)
+        })
+    }
+}
+
+/// Reads at most the session limit plus one byte, as bytes, including files growing during a read.
+///
+/// Bytes rather than text, because an identity is a digest of what is on disk: a file that is
+/// not UTF-8 still has one, and deciding that it is corrupt is the loader's business.
+async fn read_bounded_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let file = fs::File::open(path).await?;
+    let cap = u64::try_from(nanus_domain::content::SESSION_BYTES_MAX)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut raw = Vec::new();
+    file.take(cap).read_to_end(&mut raw).await?;
+    if raw.len() > nanus_domain::content::SESSION_BYTES_MAX {
+        return Err(std::io::Error::other("session exceeds 64 MiB"));
+    }
+    Ok(raw)
 }
 
 /// Reads at most the session limit plus one byte, including files growing during a read.
@@ -693,6 +791,30 @@ fn read_claim(path: &Path) -> Option<Claim> {
             tracing::debug!(%source, path = %path.display(), "a session claim has no label");
             None
         }
+    }
+}
+
+/// Builds the refusal a held session gets, naming the holder from its label.
+///
+/// The lock is what refuses; the label is only how the refusal is worded. A label that cannot be
+/// read is a holder that has not written it yet, which is a sentence about an unnamed process
+/// rather than a reason to proceed.
+fn locked(id: &SessionId, path: &Path) -> StoreError {
+    let claim = read_claim(path);
+    StoreError::Locked {
+        id: id.as_str().to_owned(),
+        owner: claim.as_ref().map_or_else(
+            || String::from("another process"),
+            |claim| claim.owner.clone(),
+        ),
+        pid: claim.map_or(0, |claim| claim.pid),
+    }
+}
+
+/// Builds the port's error for a write to a deleted session.
+fn retired(id: &SessionId) -> StoreError {
+    StoreError::Retired {
+        id: id.as_str().to_owned(),
     }
 }
 
@@ -878,17 +1000,31 @@ fn parse_header(line: &str, id: &SessionId, number: u64) -> StoreResult<Value> {
             message: format!("expected format {SESSION_FORMAT_TAG:?}, found {format:?}"),
         });
     }
-    let version = header.get("version").and_then(Value::as_u64).unwrap_or(0);
-    let version = u32::try_from(version).unwrap_or(u32::MAX);
-    if version != SESSION_FORMAT_VERSION {
+    let version = header_version(&header);
+    // Every body version a reader accepts lists: a managed (version 3) session is a session,
+    // and a version 1 one is an old one rather than a damaged one.
+    if !matches!(
+        version,
+        1 | SESSION_FORMAT_VERSION | SESSION_FORMAT_VERSION_MANAGED
+    ) {
         return Err(StoreError::Corrupt {
             id: id.as_str().to_owned(),
             message: format!(
-                "format version {version} is newer than this build's {SESSION_FORMAT_VERSION}"
+                "format version {version} is newer than this build's \
+                 {SESSION_FORMAT_VERSION_MANAGED}"
             ),
         });
     }
     Ok(header)
+}
+
+/// Reads the body version a parsed header declares; an absent or absurd one is `u32::MAX`.
+fn header_version(header: &Value) -> u32 {
+    header
+        .get("version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(u32::MAX)
 }
 
 /// Derives a title from one body line, when it is the first human turn.
@@ -1036,6 +1172,11 @@ async fn write_atomic(path: &Path, body: &str) -> StoreResult<()> {
             .await
             .map_err(|source| io_error(&temp, &source))?;
         file.write_all(body.as_bytes())
+            .await
+            .map_err(|source| io_error(&temp, &source))?;
+        // Tokio's last write runs in the background until it is flushed, and only the flush
+        // reports its error: without it a full disk leaves a short file that syncs cleanly.
+        file.flush()
             .await
             .map_err(|source| io_error(&temp, &source))?;
         // fsync before the rename is what makes the rename a commit rather than a

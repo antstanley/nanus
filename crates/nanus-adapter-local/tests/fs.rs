@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use nanus_adapter_local::LocalFs;
-use nanus_ports::{FsError, FsPort, SearchKind, SearchQuery, WriteMode};
+use nanus_ports::{FsError, FsPort, SearchCoverage, SearchKind, SearchQuery, WriteMode};
 
 /// Creates a rooted adapter over a fresh temporary workspace.
 fn workspace() -> (tempfile::TempDir, LocalFs) {
@@ -421,6 +421,143 @@ async fn literal_search_skips_files_over_the_size_cap() {
     let outcome = fs.search(&query).await.expect("search");
     assert!(outcome.matches.is_empty(), "the file was over the cap");
     assert_eq!(outcome.files_scanned, 0);
+    // An empty result over a skipped file is not "nothing there", and the outcome says so.
+    assert_eq!(outcome.skipped_large, 1);
+    assert_eq!(outcome.coverage(), SearchCoverage::Partial);
+}
+
+#[tokio::test]
+async fn skipped_files_are_counted_by_reason_and_a_clean_search_is_complete() {
+    let (dir, fs) = workspace();
+    std::fs::write(dir.path().join("a.txt"), "needle\n").expect("seed");
+    let clean = fs
+        .search(&SearchQuery::literal(".", "needle"))
+        .await
+        .expect("search");
+    assert_eq!(clean.skipped(), 0);
+    assert_eq!(clean.coverage(), SearchCoverage::Complete);
+
+    std::fs::write(dir.path().join("big.txt"), "needle\n".repeat(100)).expect("seed");
+    std::fs::write(dir.path().join("nul.bin"), b"needle\0").expect("seed");
+    std::fs::write(dir.path().join("latin1.txt"), b"needle \xe9t\xe9\n").expect("seed");
+    let query = SearchQuery::literal(".", "needle").with_max_file_bytes(100);
+    let outcome = fs.search(&query).await.expect("search");
+    assert_eq!(outcome.matches.len(), 1, "{:?}", outcome.matches);
+    assert_eq!(outcome.skipped_large, 1);
+    assert_eq!(outcome.skipped_binary, 2, "a NUL and a non-UTF-8 file");
+    assert_eq!(outcome.skipped_unreadable, 0);
+    assert_eq!(outcome.coverage(), SearchCoverage::Partial);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_file_is_counted_rather_than_silently_passed_over() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (dir, fs) = workspace();
+    let locked = dir.path().join("locked.txt");
+    std::fs::write(&locked, "needle\n").expect("seed");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read(&locked).is_ok() {
+        // A superuser reads through the mode bits, so there is nothing unreadable to count.
+        return;
+    }
+    let outcome = fs
+        .search(&SearchQuery::literal(".", "needle"))
+        .await
+        .expect("an unreadable file is not a failed search");
+    assert!(outcome.matches.is_empty());
+    assert_eq!(outcome.skipped_unreadable, 1);
+    assert_eq!(outcome.coverage(), SearchCoverage::Partial);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+/// The defect this pins: the include filter used to run over the *capped* result, so matches
+/// in excluded files filled the cap and the one included match was never returned.
+#[tokio::test]
+async fn excluded_files_cannot_exhaust_the_match_cap() {
+    let (dir, fs) = workspace();
+    for index in 0..10 {
+        // Named to sort before the included file, so the walk reaches them first.
+        std::fs::write(
+            dir.path().join(format!("a{index}.txt")),
+            "needle\n".repeat(20),
+        )
+        .expect("seed");
+    }
+    std::fs::write(dir.path().join("z.rs"), "// needle\n").expect("seed");
+
+    let narrowed = SearchQuery::literal(".", "needle")
+        .with_max_results(5)
+        .with_include("*.rs");
+    let outcome = fs.search(&narrowed).await.expect("search");
+    assert_eq!(outcome.matches.len(), 1, "{:?}", outcome.matches);
+    assert!(
+        outcome
+            .matches
+            .first()
+            .expect("match")
+            .path
+            .ends_with("z.rs")
+    );
+    assert!(
+        !outcome.truncated,
+        "the excluded matches were never in scope"
+    );
+    assert_eq!(outcome.files_scanned, 1);
+
+    // The other direction: unfiltered, the same cap fills before the walk reaches `z.rs`,
+    // which is exactly what a filter applied afterwards would have been left with.
+    let unfiltered = SearchQuery::literal(".", "needle").with_max_results(5);
+    let outcome = fs.search(&unfiltered).await.expect("search");
+    assert!(outcome.truncated);
+    assert!(
+        outcome
+            .matches
+            .iter()
+            .all(|found| !found.path.ends_with("z.rs"))
+    );
+}
+
+#[tokio::test]
+async fn an_include_glob_matches_below_the_search_root_or_by_file_name() {
+    let (dir, fs) = workspace();
+    std::fs::create_dir_all(dir.path().join("src/deep")).expect("mkdir");
+    std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir");
+    std::fs::write(dir.path().join("src/deep/a.rs"), "needle\n").expect("seed");
+    std::fs::write(dir.path().join("tests/b.rs"), "needle\n").expect("seed");
+    std::fs::write(dir.path().join("tests/c.toml"), "needle\n").expect("seed");
+
+    let scoped = SearchQuery::literal(".", "needle").with_include("src/**/*.rs");
+    let outcome = fs.search(&scoped).await.expect("search");
+    assert_eq!(outcome.matches.len(), 1, "{:?}", outcome.matches);
+    assert!(
+        outcome
+            .matches
+            .first()
+            .expect("match")
+            .path
+            .ends_with("a.rs")
+    );
+
+    let by_name = SearchQuery::literal(".", "needle").with_include("*.rs");
+    let outcome = fs.search(&by_name).await.expect("search");
+    assert_eq!(outcome.matches.len(), 2, "every Rust file at any depth");
+    assert!(
+        outcome
+            .matches
+            .iter()
+            .all(|found| found.path.extension().is_some_and(|ext| ext == "rs"))
+    );
+}
+
+#[tokio::test]
+async fn a_bad_include_glob_is_a_typed_error() {
+    let (_dir, fs) = workspace();
+    let error = fs
+        .search(&SearchQuery::literal(".", "needle").with_include("["))
+        .await
+        .expect_err("a filter that cannot compile must not be ignored");
+    assert!(matches!(error, FsError::InvalidPattern { .. }), "{error}");
 }
 
 #[tokio::test]

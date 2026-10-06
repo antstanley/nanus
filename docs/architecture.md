@@ -54,7 +54,7 @@ is the only vocabulary the two share.
 |---|---|
 | [`nanus-kernel`](../crates/nanus-kernel) | The Cordis framework itself: a context of revertible effects and reactive coeffects, a typed service registry, five event dispatch modes, the plugin lifecycle. Depends on nothing in the tree but `tokio`, and is documented as a standalone library. |
 | [`nanus-domain`](../crates/nanus-domain) | Messages, the tool contract, the append-only session log, prompt assembly, approval policy, the turn machine. Pure. |
-| [`nanus-ports`](../crates/nanus-ports) | The boundary: the six port traits — model, filesystem, shell, store, clock, secrets — and the service keys that let a provider and a consumer agree without sharing a value. |
+| [`nanus-ports`](../crates/nanus-ports) | The boundary owns model, filesystem, shell, store, clock and secret services, optional admission contracts, and session-scoped context, checkpoint and archive interfaces. Pure borrowed projections and owned leases let a provider and consumer agree without introducing concrete I/O into the domain. |
 | [`nanus-adapter-deepseek`](../crates/nanus-adapter-deepseek) | Request encoding, SSE decoding, streaming, tool-call reassembly. |
 | [`nanus-adapter-openai`](../crates/nanus-adapter-openai) | The same protocol for the OpenAI-compatible vendors: OpenAI and z.ai, kept one crate because the differences are a table rather than a branch per line. |
 | [`nanus-adapter-anthropic`](../crates/nanus-adapter-anthropic) | The Messages API, which is not chat completions: a top-level system field, tool results as user turns, event-typed streaming. |
@@ -69,6 +69,14 @@ is the only vocabulary the two share.
 | [`nanus-cli`](../crates/nanus-cli) | The `nanus` binary: `run`, `service`, `config`, `sessions`, `auth`, and the shell-scoped agent behind `tui`. It does not depend on `nanus-tui`. |
 | [`nanus-tui`](../crates/nanus-tui) | The interface: the view, the input buffer, replay, and the terminal event loop. Its own binary (`nanus-tui`), a library for the parts that are testable without a terminal, and no dependency on the agent loop, a toolset, or a provider adapter — it links only the session store it reads recordings from and the configuration adapter it reads its own display preferences from. |
 | [`nanus-bench`](../crates/nanus-bench) | Criterion benchmarks, unpublished: wall time, heap allocations, and bytes allocated. A leaf off to one side of the graph — it depends on the crates it measures and nothing depends on it — because it installs an instrumented global allocator. See [benchmarks](benchmarks.md). |
+
+[Managed context](context-management.md) follows the same split. The domain owns pure fragment
+selection, bounded context types and their validation. The ports expose scoped recall, raw
+capture sinks and asynchronous checkpoint contracts. The bundle coordinates these with selection
+and admission. The store and local adapters own archive bytes and filesystem operations; model
+adapters own final protocol admission through their managed preparation. The link and the
+interface exchange frontier-aware views without a second mutable borrow of the running session.
+Minimal embedding gains no concrete-adapter dependency.
 
 The local Responses preparation keeps function strictness and original-item streaming in the
 OpenAI adapter, protocol-specific shape/neutral agreement in the pure domain and propagation in

@@ -30,6 +30,7 @@
 
 use crate::message::Message;
 
+pub mod managed;
 mod projection;
 pub use projection::{
     ContextProjection, identify as identify_projection,

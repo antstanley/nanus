@@ -35,6 +35,12 @@ for an interface to watch, rather than one for "the interface we linked" and ano
 
 ## Known limits
 
+- **Managed context is opt-in and unmeasured.** Its mechanics are covered by deterministic tests
+  against the real runner, store, shell and adapters' wire encoders, but no live provider has yet
+  been sent a managed request, and no held-out quality or cost evaluation has been run, so there
+  is no claim that it helps; the default stays legacy. See
+  [what is and is not verified](context-management.md#what-is-and-is-not-verified).
+
 - **`read_video` is verified on Anthropic, OpenAI and DeepSeek.** z.ai has no model with live image
   evidence and no stored credential, so there `analyze` and `auto` report that instead of guessing.
   DeepSeek's image price is undocumented, so its profile reserves about twice what was measured. FFmpeg decoding was

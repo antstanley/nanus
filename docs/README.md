@@ -39,6 +39,15 @@ trusts the user it runs as.
 
 Start here if you want an agent that is still there tomorrow.
 
+## [Managed context](context-management.md)
+
+The opt-in mode that keeps every user message and selects among the model's own completed work
+to fit a budget: fragments and revisions, the two context tools, the step transaction and its
+checkpoints, recall and shell archives, the provider matrix, and what is and is not verified.
+Its boundary payloads are in [`context-management.schema.json`](context-management.schema.json).
+
+Start here if a long session outgrows its context, or before depending on managed mode.
+
 ## [Design decisions](design.md)
 
 One section per deliberate choice — safe Rust as a hard constraint, the seven-tool

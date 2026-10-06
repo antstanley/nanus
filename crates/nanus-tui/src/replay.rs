@@ -180,6 +180,70 @@ fn apply(
         SessionEvent::GoalChange { goal } => {
             transcript.push(Entry::notice(goal_line(goal.as_ref())));
         }
+        // Managed-context records are bookkeeping, but the ones a person acted on or needs to
+        // know about — a mode change, an accepted revision, a refused proposal, a recovered turn
+        // — get the same line the live interface draws for them. Attempt records and archive
+        // receipts stay silent: they are accounting, and a transcript full of them would bury
+        // the conversation.
+        SessionEvent::ContextMode { .. }
+        | SessionEvent::ContextRevision { .. }
+        | SessionEvent::ContextDecision { .. }
+        | SessionEvent::ContextRecovery { .. }
+        | SessionEvent::ArtifactPublished { .. }
+        | SessionEvent::RequestAttempt { .. } => {
+            if let Some(line) = context_line(event) {
+                transcript.push(Entry::notice(line));
+            }
+        }
+    }
+}
+
+/// Renders a managed-context record as the interface's own notice, when it is worth one.
+#[must_use]
+pub fn context_line(event: &SessionEvent) -> Option<String> {
+    use nanus_domain::context::managed::{DecisionOutcome, ModeReason, RevisionAuthor};
+    match event {
+        SessionEvent::ContextMode { payload } => Some(match payload.reason {
+            ModeReason::Reset => String::from("context reset: legacy replay selected"),
+            _ => format!(
+                "context: {} (output reserve {}, shell capture {})",
+                payload.policy.mode.as_str(),
+                payload.policy.output_reserve_tokens,
+                if payload.policy.capture_shell {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+        }),
+        SessionEvent::ContextRevision { payload } => {
+            let author = match payload.author {
+                RevisionAuthor::Model => "proposed by the model",
+                RevisionAuthor::Automatic => "fitted automatically",
+                RevisionAuthor::Host => "set by the host",
+            };
+            Some(format!(
+                "context revision {}: {} hidden, {} notes ({author})",
+                payload.revision,
+                payload.hidden.len(),
+                payload.notes.len()
+            ))
+        }
+        SessionEvent::ContextDecision { payload } => match payload.outcome {
+            DecisionOutcome::Rejected => Some(format!(
+                "context proposal rejected: {}",
+                payload
+                    .error_code
+                    .map_or("unknown", nanus_domain::context::managed::ErrorCode::as_str)
+            )),
+            DecisionOutcome::Cancelled => Some(String::from("context proposal cancelled")),
+            DecisionOutcome::Staged | DecisionOutcome::Accepted => None,
+        },
+        SessionEvent::ContextRecovery { payload } => Some(format!(
+            "recovered turn {} left open by an earlier run; nothing was rerun",
+            payload.turn
+        )),
+        _ => None,
     }
 }
 

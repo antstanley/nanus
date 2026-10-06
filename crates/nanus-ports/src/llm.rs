@@ -123,6 +123,127 @@ pub trait LlmPort {
     /// Failure is delivered as [`LlmEvent::Error`]; a caller that has read the
     /// stream to the end has seen every failure that occurred.
     fn stream_chat(&self, request: ChatRequest) -> LlmStream;
+
+    /// Reports whether this exact model, on this adapter's configured protocol and endpoint,
+    /// can carry a managed-context projection.
+    ///
+    /// Unsupported by default, and an adapter turns it on only for combinations whose pure
+    /// preparation, wire and reload fixtures exist. A source digest is not provider evidence.
+    fn managed_support(&self, model: &str) -> ManagedSupport {
+        let _ = model;
+        ManagedSupport::Unsupported
+    }
+
+    /// Prepares one managed request without performing any I/O.
+    ///
+    /// The returned call owns the admitted body: its estimate and digest are of exactly the bytes
+    /// [`PreparedModelCall::stream`] sends, so a request is never re-encoded between the moment
+    /// it is measured and recorded and the moment it is dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Unsupported`] by default, and for a candidate this path cannot carry.
+    fn prepare_managed(&self, request: ManagedRequest) -> LlmResult<Box<dyn PreparedModelCall>> {
+        let _ = request;
+        Err(LlmError::Unsupported {
+            feature: "managed context".into(),
+        })
+    }
+}
+
+/// Whether a model path can carry a managed projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManagedSupport {
+    /// No pure preparation or fixtures exist for this path.
+    #[default]
+    Unsupported,
+    /// Preparation exists for this policy version.
+    Supported {
+        /// The context policy version the preparation implements.
+        policy_version: u32,
+    },
+}
+
+impl ManagedSupport {
+    /// Whether `policy_version` is supported.
+    #[must_use]
+    pub const fn supports(self, policy_version: u32) -> bool {
+        matches!(self, Self::Supported { policy_version: supported } if supported == policy_version)
+    }
+}
+
+/// One managed request to prepare.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct ManagedRequest {
+    /// The candidate, already compiled and fitted by the runner.
+    pub request: ChatRequest,
+    /// The runner's selection epoch, recorded in the identity.
+    pub selection_epoch: u64,
+}
+
+/// An adapter-owned, admitted, not-yet-sent model call.
+///
+/// It owns the body and the endpoint, account and credential it will use, privately; it exposes
+/// no mutation and no serializable handle, and nothing happens on the network until
+/// [`PreparedModelCall::stream`] is polled.
+pub trait PreparedModelCall {
+    /// The estimate of exactly the prepared body.
+    fn estimate(&self) -> crate::RequestEstimate;
+
+    /// SHA-256 of exactly the prepared body.
+    fn request_digest(&self) -> &nanus_domain::context::managed::Digest;
+
+    /// The route, without credentials.
+    fn selection(&self) -> &nanus_domain::context::managed::SelectionIdentity;
+
+    /// Sends the prepared body, consuming the call.
+    fn stream(self: Box<Self>) -> LlmStream;
+}
+
+/// Raw argument byte limits for named tools, applied while a call's arguments stream in.
+///
+/// Decoder metadata, never a schema field: a limit is checked once the call's final name is
+/// known and before the arguments are parsed, so a call that is too large never becomes a JSON
+/// value — and a name that arrives late is checked when it arrives, against everything already
+/// buffered. Tools with no limit here keep their existing bounds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolArgumentLimits {
+    limits: Vec<(String, usize)>,
+}
+
+/// The argument text a call over its limit is replaced with.
+///
+/// Not JSON, so the tool's parser refuses it as an ordinary bounded failure the model reads.
+pub const OVERSIZED_ARGUMENTS: &str = "<tool arguments exceeded their byte limit and were dropped>";
+
+impl ToolArgumentLimits {
+    /// The managed-context limits: 16 KiB for `context_manage`, 2 KiB for `context_recall`.
+    #[must_use]
+    pub fn managed() -> Self {
+        use nanus_domain::context::managed::{MANAGE_TOOL, RECALL_TOOL, limits};
+        Self {
+            limits: vec![
+                (MANAGE_TOOL.to_owned(), limits::MANAGE_ARGUMENT_BYTES_MAX),
+                (RECALL_TOOL.to_owned(), limits::RECALL_ARGUMENT_BYTES_MAX),
+            ],
+        }
+    }
+
+    /// The limit for a tool, when it has one.
+    #[must_use]
+    pub fn limit_for(&self, name: &str) -> Option<usize> {
+        self.limits
+            .iter()
+            .find(|(tool, _)| tool == name)
+            .map(|(_, limit)| *limit)
+    }
+
+    /// Whether any limit is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.limits.is_empty()
+    }
 }
 
 /// How much reasoning effort to ask the model to spend.
@@ -504,6 +625,8 @@ struct Slot {
     name: Option<ToolName>,
     /// The argument fragments, concatenated in arrival order.
     arguments: String,
+    /// Whether the arguments passed their tool's limit and were dropped.
+    oversized: bool,
 }
 
 /// Rebuilds whole tool calls from the deltas of one response.
@@ -517,6 +640,8 @@ struct Slot {
 pub struct ToolCallAssembler {
     /// One slot per tool-call index, ordered so `finish` restores provider order.
     slots: BTreeMap<u32, Slot>,
+    /// Raw argument limits by tool name.
+    limits: ToolArgumentLimits,
 }
 
 impl ToolCallAssembler {
@@ -525,6 +650,16 @@ impl ToolCallAssembler {
     pub fn new() -> Self {
         Self {
             slots: BTreeMap::new(),
+            limits: ToolArgumentLimits::default(),
+        }
+    }
+
+    /// Creates an assembler that enforces raw argument limits before parsing.
+    #[must_use]
+    pub fn with_limits(limits: ToolArgumentLimits) -> Self {
+        Self {
+            slots: BTreeMap::new(),
+            limits,
         }
     }
 
@@ -568,7 +703,19 @@ impl ToolCallAssembler {
         // chunk cannot see a value that was not recorded.
         assert_eq!(slot.id, merged_id);
         assert_eq!(slot.name, merged_name);
-        slot.arguments.push_str(arguments_delta);
+        if !slot.oversized {
+            slot.arguments.push_str(arguments_delta);
+        }
+        // Checked whenever the name is known, so a name that arrives after its arguments is
+        // judged against everything already buffered; and the buffer is released at once.
+        let limit = slot
+            .name
+            .as_ref()
+            .and_then(|name| self.limits.limit_for(name.as_str()));
+        if limit.is_some_and(|limit| slot.arguments.len() > limit) {
+            slot.oversized = true;
+            slot.arguments = String::new();
+        }
         Ok(())
     }
 
@@ -608,6 +755,14 @@ impl ToolCallAssembler {
             let name = slot.name.ok_or_else(|| LlmError::MalformedStream {
                 message: format!("tool call {index} never received a name"),
             })?;
+            if slot.oversized {
+                calls.push(ToolCall::new(
+                    id,
+                    name,
+                    Value::String(OVERSIZED_ARGUMENTS.to_owned()),
+                ));
+                continue;
+            }
             let call =
                 ToolCall::try_from_arguments_json(id, name, &slot.arguments).map_err(|error| {
                     LlmError::MalformedStream {
@@ -784,6 +939,62 @@ mod tests {
         assert!(matches!(no_id, Err(LlmError::MalformedStream { .. })));
         let no_name = assemble(&[(0, Some("call-1"), None, "{}")]);
         assert!(matches!(no_name, Err(LlmError::MalformedStream { .. })));
+    }
+
+    /// T16: the limit is applied once the name is known and before parsing; a name arriving
+    /// after its arguments is judged against everything buffered so far.
+    #[test]
+    fn an_argument_over_its_tools_limit_is_dropped_before_parsing() {
+        let manage = || Some(tool_name("context_manage"));
+        let at_limit = format!("\"{}\"", "x".repeat(16 * 1024 - 2));
+        let mut fits = ToolCallAssembler::with_limits(ToolArgumentLimits::managed());
+        assert!(
+            fits.apply(0, Some(ToolCallId::new("a")), manage(), &at_limit)
+                .is_ok()
+        );
+        let calls = fits.finish().unwrap_or_default();
+        assert_eq!(
+            calls.first().map(|call| call.arguments.is_string()),
+            Some(true)
+        );
+        assert_ne!(
+            calls.first().and_then(|call| call.arguments.as_str()),
+            Some(OVERSIZED_ARGUMENTS)
+        );
+
+        let over = format!("{at_limit} ");
+        let mut late = ToolCallAssembler::with_limits(ToolArgumentLimits::managed());
+        assert!(
+            late.apply(0, Some(ToolCallId::new("b")), None, &over)
+                .is_ok()
+        );
+        assert!(
+            late.apply(0, None, manage(), "").is_ok(),
+            "the name arrives last"
+        );
+        let calls = late.finish().unwrap_or_default();
+        assert_eq!(
+            calls.first().and_then(|call| call.arguments.as_str()),
+            Some(OVERSIZED_ARGUMENTS)
+        );
+
+        let mut other = ToolCallAssembler::with_limits(ToolArgumentLimits::managed());
+        let big = format!("{{\"text\":\"{}\"}}", "y".repeat(20_000));
+        assert!(
+            other
+                .apply(
+                    0,
+                    Some(ToolCallId::new("c")),
+                    Some(tool_name("write")),
+                    &big
+                )
+                .is_ok()
+        );
+        assert!(
+            other
+                .finish()
+                .is_ok_and(|calls| calls[0].arguments.is_object())
+        );
     }
 
     #[test]

@@ -301,6 +301,15 @@ iteration; held bytes are per structure built.
 | `turn/decode` | 464.94 µs | 5.8% | 5,041 | 1.39 MiB |
 | `turn/encode` | 202.98 µs | 5.9% | 2,524 | 412.46 KiB |
 
+### `managed`
+
+Measured on the same 10/100/500-turn sessions as `session`, on an Apple-silicon laptop, with
+`--quick`: fragment derivation and protection 4.3 µs / 66 µs / 464 µs; the state fold 160 ns /
+1.5 µs / 8.5 µs; compiling the effective conversation with half the eligible fragments hidden
+14 µs / 168 µs / about 1 ms; hashing the whole stored prefix for a frontier 0.22 ms / 2.2 ms /
+10.9 ms. The prefix hash dominates and is linear in the session's bytes; a managed step pays it a
+few times (validation, status, receipt). These are first measurements, not a recorded baseline.
+
 ### `session`
 
 | Benchmark | Time | ± | Allocations | Bytes allocated |

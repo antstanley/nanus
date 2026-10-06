@@ -222,6 +222,8 @@ pub struct Pending {
     /// where the runner it belongs to exists.
     remembered_effort: Option<ReasoningEffort>,
     /// The one tool registry this composition has: the runner's and the published service's.
+    /// The broker the runner hands archive leases to the `bash` tool through.
+    capture: crate::CaptureBroker,
     tools: ToolRegistryHandle,
 }
 
@@ -275,7 +277,8 @@ impl Pending {
             &self.selection,
             &self.workspace,
             &self.clock,
-        )?;
+        )?
+        .with_capture(self.capture.clone());
         // The effort a remembered selection asked for is put on the runner rather than into the
         // configuration, because it can name a step the configuration's field cannot. It goes on
         // before the origin is built, so the record says what the requests will carry rather
@@ -614,7 +617,8 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         .await
         .map_err(|error| BundleError::session(error.to_string()))?
         .handle();
-    let tools = build_tools(&fs, &shell)?;
+    let capture = crate::CaptureBroker::new();
+    let tools = build_tools(&fs, &shell, &capture)?;
 
     Ok(Pending {
         config,
@@ -628,6 +632,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         store,
         llm,
         remembered_effort,
+        capture,
         tools,
     })
 }
@@ -961,8 +966,15 @@ fn build_anthropic(
 /// Built once, here, and handed to both the runner and the plugin that publishes it: the
 /// registry the model is offered and the registry an agent advertises have to be one object
 /// or the two can disagree.
-fn build_tools(fs: &FsHandle, shell: &ShellHandle) -> Result<ToolRegistryHandle, BundleError> {
-    crate::build_toolset(fs, shell)
+///
+/// `bash` is built with the composition's capture broker. With no lease in it — every legacy
+/// session, and every managed one without capture — `bash` runs and renders exactly as before.
+fn build_tools(
+    fs: &FsHandle,
+    shell: &ShellHandle,
+    capture: &crate::CaptureBroker,
+) -> Result<ToolRegistryHandle, BundleError> {
+    crate::build_toolset_with_capture(fs, shell, capture)
         .map(ToolRegistryHandle::new)
         .map_err(|error| BundleError::config(format!("the toolset could not be built: {error}")))
 }

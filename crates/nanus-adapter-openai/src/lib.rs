@@ -44,6 +44,9 @@
 mod config;
 mod error;
 mod function_policy;
+mod managed;
+#[cfg(test)]
+mod managed_tests;
 pub mod oauth;
 mod response;
 #[cfg(test)]
@@ -367,46 +370,87 @@ impl OpenAiLlm {
         };
         tracing::debug!(vendor=%self.config.vendor(),model=%request.model,endpoint=%endpoint,
             messages=request.messages.len(),tools=request.tools.len(),"dispatching a chat completion");
-        let mut sent = self
-            .client
-            .post(endpoint)
-            .header("accept", "text/event-stream")
-            .header("content-type", "application/json")
-            .bearer_auth(self.config.api_key())
-            .body(body);
-        if let Some(account) = self.config.account_id() {
-            sent = sent.header("chatgpt-account-id", account);
-        }
-        let host = self.config.base_url().to_owned();
-        let transport_host = host.clone();
-        let response = async move {
-            sent.send()
-                .await
-                .map_err(|source| OpenAiError::transport(&source, &transport_host).to_string())
-        };
-        let vendor = self.config.vendor();
-        let limits = self.config.response_limits();
-        let mut decoder = Some(decoder);
-        Box::pin(
-            futures::stream::once(response).flat_map(move |outcome| match outcome {
-                Ok(response) => {
-                    let Some(decoder) = decoder.take() else {
-                        return error_stream_owned("response decoder was already consumed".into());
-                    };
-                    let head = futures::stream::iter([LlmEvent::ResponseHead]);
-                    let announced: EventStream = Box::pin(head.chain(response::decode(
-                        response,
-                        host.clone(),
-                        vendor,
-                        decoder,
-                        limits,
-                    )));
-                    announced
-                }
-                Err(message) => error_stream_owned(message),
-            }),
-        )
+        send(self.transport(endpoint), body, decoder)
     }
+
+    /// Everything a dispatch needs beyond its body, resolved now and owned from here on.
+    fn transport(&self, endpoint: &str) -> Transport {
+        Transport {
+            client: self.client.clone(),
+            endpoint: endpoint.to_owned(),
+            api_key: self.config.api_key().to_owned(),
+            account_id: self.config.account_id().map(str::to_owned),
+            host: self.config.base_url().to_owned(),
+            vendor: self.config.vendor(),
+            limits: self.config.response_limits(),
+        }
+    }
+}
+
+/// The resolved route and credential of one dispatch.
+///
+/// Built once, before the body is sent, so a prepared call cannot change where it goes or
+/// which key it carries between the moment it is admitted and the moment it is sent.
+#[derive(Clone)]
+struct Transport {
+    client: reqwest::Client,
+    endpoint: String,
+    api_key: String,
+    account_id: Option<String>,
+    host: String,
+    vendor: Vendor,
+    limits: Option<nanus_ports::ResponseLimits>,
+}
+
+/// Sends exactly `body` over `transport` and decodes the answer with `decoder`.
+///
+/// Building the request performs no I/O; nothing touches the network until the returned stream
+/// is polled.
+fn send(transport: Transport, body: String, decoder: Decoder) -> LlmStream {
+    let Transport {
+        client,
+        endpoint,
+        api_key,
+        account_id,
+        host,
+        vendor,
+        limits,
+    } = transport;
+    let mut sent = client
+        .post(&endpoint)
+        .header("accept", "text/event-stream")
+        .header("content-type", "application/json")
+        .bearer_auth(api_key)
+        .body(body);
+    if let Some(account) = account_id {
+        sent = sent.header("chatgpt-account-id", account);
+    }
+    let transport_host = host.clone();
+    let response = async move {
+        sent.send()
+            .await
+            .map_err(|source| OpenAiError::transport(&source, &transport_host).to_string())
+    };
+    let mut decoder = Some(decoder);
+    Box::pin(
+        futures::stream::once(response).flat_map(move |outcome| match outcome {
+            Ok(response) => {
+                let Some(decoder) = decoder.take() else {
+                    return error_stream_owned("response decoder was already consumed".into());
+                };
+                let head = futures::stream::iter([LlmEvent::ResponseHead]);
+                let announced: EventStream = Box::pin(head.chain(response::decode(
+                    response,
+                    host.clone(),
+                    vendor,
+                    decoder,
+                    limits,
+                )));
+                announced
+            }
+            Err(message) => error_stream_owned(message),
+        }),
+    )
 }
 
 impl LlmPort for OpenAiLlm {
@@ -483,6 +527,17 @@ impl LlmPort for OpenAiLlm {
             }
             Err(error) => error_stream(&error.to_string()),
         }
+    }
+
+    fn managed_support(&self, model: &str) -> nanus_ports::ManagedSupport {
+        managed::support(&self.config, model)
+    }
+
+    fn prepare_managed(
+        &self,
+        request: nanus_ports::ManagedRequest,
+    ) -> nanus_ports::LlmResult<Box<dyn nanus_ports::PreparedModelCall>> {
+        Ok(Box::new(managed::prepare(self, request)?))
     }
 }
 

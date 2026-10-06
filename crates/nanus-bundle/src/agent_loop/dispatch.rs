@@ -4,15 +4,19 @@ use nanus_ports::{ToolBatchReservation, TurnControl};
 
 use super::{AgentRunner, Approver, Progress, interrupted_result, is_cancelled, until_cancelled};
 
+#[derive(Clone, Copy)]
 pub(super) struct Phase<'a> {
     pub(super) position: (u32, u32),
     pub(super) approver: Option<&'a dyn Approver>,
     pub(super) control: Option<&'a dyn TurnControl>,
+    /// The managed turn this step belongs to; `None` is the legacy loop, unchanged.
+    pub(super) managed: Option<&'a super::managed::ManagedTurn<'a>>,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Dispatch<'a> {
     pub(super) control: Option<&'a dyn TurnControl>,
     pub(super) reservation: Option<&'a dyn ToolBatchReservation>,
+    pub(super) managed: Option<&'a super::managed::ManagedTurn<'a>>,
 }
 
 impl AgentRunner {
@@ -25,11 +29,27 @@ impl AgentRunner {
         context: Dispatch<'_>,
     ) {
         assert_eq!(calls.len(), results.len());
-        let (goals, registry): (Vec<usize>, Vec<usize>) = (0..calls.len())
+        let (goals, rest): (Vec<usize>, Vec<usize>) = (0..calls.len())
             .filter(|&i| results[i].is_none())
             .partition(|&i| crate::goal_tools::is_goal_tool(&calls[i].name));
+        // Context tools exist only in a managed turn; in a legacy one their names belong to the
+        // registry like any other, which is what keeps a legacy session's dispatch unchanged.
+        let (contexts, registry): (Vec<usize>, Vec<usize>) = rest.into_iter().partition(|&i| {
+            context.managed.is_some() && crate::context_tools::is_context_tool(&calls[i].name)
+        });
         self.execute_goals(session, calls, (&goals, results), progress, context);
-        self.execute_registry(calls, &registry, results, progress, context)
+        if let Some(managed) = context.managed {
+            self.execute_context(
+                session,
+                calls,
+                (&contexts, results),
+                progress,
+                (context, managed),
+            )
+            .await;
+        }
+        let scope = session.id().as_str().to_owned();
+        self.execute_registry(calls, (&registry, &scope), results, progress, context)
             .await;
         assert!(results.iter().all(Option::is_some));
     }
@@ -39,14 +59,15 @@ impl AgentRunner {
         calls: &[ToolCall],
         progress: &mut dyn Progress,
         approver: Option<&dyn Approver>,
-        control: Option<&dyn TurnControl>,
+        context: (Option<&dyn TurnControl>, bool),
     ) -> Vec<Option<ToolResult>> {
+        let (control, managed) = context;
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let denial = if is_cancelled(progress, control) {
                 Some(interrupted_result(call))
             } else {
-                self.gate(call, approver, control).await
+                self.gate(call, approver, control, managed).await
             };
             results.push(denial.map(|result| self.finish_result(call, result, progress)));
         }
@@ -66,6 +87,7 @@ impl AgentRunner {
         let Dispatch {
             control,
             reservation,
+            ..
         } = context;
         assert_eq!(calls.len(), results.len());
         for &index in indexes {
@@ -87,7 +109,7 @@ impl AgentRunner {
     pub(super) async fn execute_registry(
         &self,
         calls: &[ToolCall],
-        indexes: &[usize],
+        selected: (&[usize], &str),
         results: &mut [Option<ToolResult>],
         progress: &mut dyn Progress,
         context: Dispatch<'_>,
@@ -95,7 +117,9 @@ impl AgentRunner {
         let Dispatch {
             control,
             reservation,
+            ..
         } = context;
+        let (indexes, scope) = selected;
         assert_eq!(calls.len(), results.len());
         for batch in indexes.chunks(self.parallel_limit()) {
             // Static futures own their work. Never retain a registry borrow across an await.
@@ -110,7 +134,9 @@ impl AgentRunner {
                 if control.is_some_and(TurnControl::is_cancelled) {
                     return interrupted_result(call);
                 }
-                let work = self.tools.borrow().execute(call.clone());
+                // Scoped to the session, so a tool that takes a per-call hand-off — `bash` and
+                // its capture lease — can only take its own session's.
+                let work = crate::capture::scoped(scope, self.tools.borrow().execute(call.clone()));
                 until_cancelled(control, work)
                     .await
                     .unwrap_or_else(|| interrupted_result(call))

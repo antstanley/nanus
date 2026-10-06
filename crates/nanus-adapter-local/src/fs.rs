@@ -16,6 +16,19 @@
 //! resolved through the filesystem and re-checked against the root. Both checks
 //! must pass.
 //!
+//! ## A window is read through the handle that was checked
+//!
+//! Both checks above are about a *path*, and a path can be changed between the check and the
+//! open: a file swapped for a link, or a directory for a link to somewhere else. A ranged read
+//! therefore checks the handle it actually opened. The final component is opened without
+//! following a link (`O_NOFOLLOW` on Unix, the reparse point itself on Windows), the canonical
+//! path is resolved again *after* the open and must still be inside the root, and the handle
+//! must be the same file as that in-root path — the same device and inode on Unix. A handle
+//! that reached outside through a swapped directory fails the last two, because the file it
+//! holds is not the one the root names. On Windows, where the standard library exposes no
+//! stable file index, "the same file" is the strongest safe comparison it does expose: length,
+//! modification and creation time.
+//!
 //! ## Operations are synchronous
 //!
 //! The port's methods return futures; the work inside is synchronous. A local
@@ -23,18 +36,28 @@
 //! would be wrapping blocking syscalls in a future without making anything
 //! concurrent.
 
+use std::fs::{File, Metadata};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use nanus_domain::context::managed::Digest;
 use nanus_ports::{
-    DirEntry, EditOutcome, FileMeta, FileRead, FsError, FsPort, FsResult, LocalBoxFuture,
-    SearchKind, SearchMatch, SearchOutcome, SearchQuery, WriteMode, WriteOutcome, check_edit_count,
-    ensure_within, occurrence_count,
+    DirEntry, EditOutcome, FileIdentity, FileMeta, FileRead, FsError, FsPort, FsResult,
+    LocalBoxFuture, RANGE_READ_MAX_BYTES, RangeRead, SearchKind, SearchMatch, SearchOutcome,
+    SearchQuery, WriteMode, WriteOutcome, check_edit_count, ensure_within, occurrence_count,
 };
 
 /// How many leading bytes are sniffed for a NUL when classifying a file as binary.
 const BINARY_SNIFF: usize = 8 * 1024;
+
+/// How many times a ranged read is tried before a file that keeps changing is reported.
+///
+/// One retry absorbs a write that happened to land during the read; a file that changes
+/// under every attempt is being rewritten continuously, and saying so is more useful than a
+/// window whose identity names a version the bytes may not belong to.
+const RANGE_READ_ATTEMPTS: u8 = 2;
 
 /// Directory names that hold version-control metadata and are never searched.
 const VCS_DIRS: [&str; 4] = [".git", ".hg", ".svn", ".bzr"];
@@ -285,70 +308,77 @@ impl LocalFs {
             query.max_results > 0,
             "a search with a zero cap can never report anything"
         );
-        let set = match query.kind {
-            SearchKind::Glob => Some(compile_glob(&query.pattern)?),
-            SearchKind::Literal => None,
-        };
-        let needle = match query.kind {
-            SearchKind::Glob => None,
-            SearchKind::Literal => Some(prepare_literal(&query.pattern, query.case_sensitive)),
-        };
-        let matcher = match (set, needle) {
-            (Some(set), _) => Matcher::Glob { set },
-            (None, Some(needle)) => Matcher::Literal(needle),
-            (None, None) => {
-                return Err(FsError::InvalidPattern {
-                    pattern: query.pattern.clone(),
-                    reason: String::from("a search kind selects exactly one matcher"),
-                });
-            }
-        };
-        let mut outcome = SearchOutcome {
-            matches: Vec::new(),
-            truncated: false,
-            files_scanned: 0,
-        };
+        let matcher = Matcher::for_query(query)?;
+        let include = compile_include(query.include.as_deref())?;
+        let mut outcome = SearchOutcome::default();
         // `truncated` is a claim about what was *dropped*, so the cap is checked where a
         // match is about to be added rather than at the top of a loop. Stopping as soon as
         // the cap filled up said "more than {cap} matches" whenever any file remained to
         // walk — including when none of the rest matched at all, which is a confident
         // falsehood a model cannot check.
-        'files: for file in Self::walk(&root, query.include_hidden) {
-            match &matcher {
-                Matcher::Glob { set } => {
-                    // Matched against the path *relative to the search root*, so the
-                    // pattern anchors where the caller asked it to.
-                    let relative = file.strip_prefix(&root).unwrap_or(&file);
-                    if !matches_glob(set, relative) {
-                        continue;
-                    }
-                    if outcome.matches.len() >= query.max_results {
-                        outcome.truncated = true;
-                        break 'files;
-                    }
-                    outcome.matches.push(SearchMatch {
-                        path: file,
-                        line_number: 0,
-                        line: String::new(),
-                    });
-                }
-                Matcher::Literal(needle) => {
-                    if let Some(len) = metadata_len(&file)
-                        && len > query.max_file_bytes
-                    {
-                        continue;
-                    }
-                    let Some(text) = text_for_search(&file) else {
-                        continue;
-                    };
-                    outcome.files_scanned = outcome.files_scanned.saturating_add(1);
-                    if collect_literal(&file, &text, needle, query, &mut outcome) {
-                        break 'files;
-                    }
-                }
+        for file in Self::walk(&root, query.include_hidden) {
+            // The include filter runs before a file is read, counted or capped: a file the
+            // caller excluded is not in scope, so its matches must not be able to fill the
+            // cap and push out the one the caller asked for.
+            if !is_included(include.as_ref(), &root, &file) {
+                continue;
+            }
+            let stop = match &matcher {
+                Matcher::Glob { set } => collect_glob(set, &root, file, query, &mut outcome),
+                Matcher::Literal(needle) => scan_literal(&file, needle, query, &mut outcome),
+            };
+            if stop {
+                break;
             }
         }
         Ok(outcome)
+    }
+
+    /// Reads one bounded window of a file through a handle proven to be the confined file.
+    ///
+    /// The identity is taken from the handle on both sides of the read. When the two differ
+    /// the file changed while it was read, and the bytes may belong to neither version, so
+    /// the read is tried once more before the change is reported as an error.
+    fn read_range_blocking(
+        &self,
+        path: &Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> FsResult<RangeRead> {
+        let resolved = self.resolve(path)?;
+        let mut file = open_confined(&self.root, &resolved)?;
+        let take = max_bytes.min(RANGE_READ_MAX_BYTES);
+        let mut attempts = 0_u8;
+        while attempts < RANGE_READ_ATTEMPTS {
+            attempts = attempts.saturating_add(1);
+            let before = identity_of(&file, &resolved)?;
+            let bytes = read_window(&mut file, &resolved, offset, take)?;
+            let after = identity_of(&file, &resolved)?;
+            if before != after {
+                continue;
+            }
+            assert!(
+                bytes.len() <= take,
+                "a window never exceeds what it asked for"
+            );
+            let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let eof = offset.saturating_add(read_len) >= after.len;
+            let range_sha256 = Digest::of(&bytes);
+            return Ok(RangeRead {
+                path: resolved,
+                offset,
+                bytes,
+                identity: after,
+                range_sha256,
+                eof,
+            });
+        }
+        Err(FsError::Io {
+            path: resolved,
+            message: String::from(
+                "the file changed while it was being read; read the window again",
+            ),
+        })
     }
 }
 
@@ -361,6 +391,107 @@ enum Matcher {
     },
     /// Match file contents against a prepared literal.
     Literal(String),
+}
+
+impl Matcher {
+    /// Compiles the matcher a query's kind names.
+    fn for_query(query: &SearchQuery) -> FsResult<Self> {
+        match query.kind {
+            SearchKind::Glob => Ok(Self::Glob {
+                set: compile_glob(&query.pattern)?,
+            }),
+            SearchKind::Literal => Ok(Self::Literal(prepare_literal(
+                &query.pattern,
+                query.case_sensitive,
+            ))),
+        }
+    }
+}
+
+/// Records one file a glob search matched, returning whether the cap dropped it.
+fn collect_glob(
+    set: &GlobSet,
+    root: &Path,
+    file: PathBuf,
+    query: &SearchQuery,
+    outcome: &mut SearchOutcome,
+) -> bool {
+    // Matched against the path *relative to the search root*, so the pattern anchors
+    // where the caller asked it to.
+    let relative = file.strip_prefix(root).unwrap_or(&file);
+    if !matches_glob(set, relative) {
+        return false;
+    }
+    if outcome.matches.len() >= query.max_results {
+        outcome.truncated = true;
+        return true;
+    }
+    outcome.matches.push(SearchMatch {
+        path: file,
+        line_number: 0,
+        line: String::new(),
+    });
+    false
+}
+
+/// Searches one file's text, counting it as skipped when it cannot be searched.
+///
+/// Returns whether the cap dropped a match. A skip is counted by its reason rather than
+/// silently, because each skipped file is a place the result cannot speak for.
+fn scan_literal(
+    file: &Path,
+    needle: &str,
+    query: &SearchQuery,
+    outcome: &mut SearchOutcome,
+) -> bool {
+    if metadata_len(file).is_some_and(|len| len > query.max_file_bytes) {
+        outcome.skipped_large = outcome.skipped_large.saturating_add(1);
+        return false;
+    }
+    let text = match text_for_search(file) {
+        SearchText::Text(text) => text,
+        SearchText::Binary => {
+            outcome.skipped_binary = outcome.skipped_binary.saturating_add(1);
+            return false;
+        }
+        SearchText::Unreadable => {
+            outcome.skipped_unreadable = outcome.skipped_unreadable.saturating_add(1);
+            return false;
+        }
+    };
+    outcome.files_scanned = outcome.files_scanned.saturating_add(1);
+    collect_literal(file, &text, needle, query, outcome)
+}
+
+/// Compiles a search's `include` filter, when it has one.
+///
+/// Unlike the search glob this one is not separator-anchored: it is a file filter in the
+/// `grep --include` sense, where `*.rs` means every Rust file at any depth, and that is what
+/// the tool that offers it has always promised.
+fn compile_include(include: Option<&str>) -> FsResult<Option<GlobMatcher>> {
+    let Some(include) = include else {
+        return Ok(None);
+    };
+    let glob = GlobBuilder::new(include)
+        .build()
+        .map_err(|error| FsError::InvalidPattern {
+            pattern: include.to_owned(),
+            reason: error.to_string(),
+        })?;
+    Ok(Some(glob.compile_matcher()))
+}
+
+/// Whether `file` passes the include filter: by its path below the root, its full path, or
+/// its name.
+fn is_included(include: Option<&GlobMatcher>, root: &Path, file: &Path) -> bool {
+    include.is_none_or(|matcher| {
+        let relative = file.strip_prefix(root).unwrap_or(file);
+        matcher.is_match(relative)
+            || matcher.is_match(file)
+            || file
+                .file_name()
+                .is_some_and(|name| matcher.is_match(Path::new(name)))
+    })
 }
 
 /// Whether `relative` — a path relative to the search root — matches the glob.
@@ -412,14 +543,26 @@ fn metadata_len(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
-/// Reads a file for content search, returning `None` for binary files.
-fn text_for_search(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+/// What a content search made of one file.
+enum SearchText {
+    /// The file's text.
+    Text(String),
+    /// A NUL in the leading bytes, or bytes that are not UTF-8.
+    Binary,
+    /// The file could not be read at all.
+    Unreadable,
+}
+
+/// Reads a file for content search, classifying the ones that cannot be searched.
+fn text_for_search(path: &Path) -> SearchText {
+    let Ok(bytes) = std::fs::read(path) else {
+        return SearchText::Unreadable;
+    };
     let sniff = bytes.get(..BINARY_SNIFF).unwrap_or(&bytes);
     if sniff.contains(&0) {
-        return None;
+        return SearchText::Binary;
     }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(bytes).map_or(SearchText::Binary, SearchText::Text)
 }
 
 /// Appends the matching lines of one file, returning whether the cap dropped a match.
@@ -543,6 +686,178 @@ impl FsPort for LocalFs {
             read_checked(&resolved)
         })
     }
+
+    fn read_range<'a>(
+        &'a self,
+        path: &'a Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> LocalBoxFuture<'a, FsResult<RangeRead>> {
+        Box::pin(async move { self.read_range_blocking(path, offset, max_bytes) })
+    }
+}
+
+/// Opens a confined path for reading and proves the handle is the file the root names.
+///
+/// `resolved` has already passed [`LocalFs::resolve`], so it is canonical and inside `root`;
+/// what this adds is the check on the *handle*. The path is classified first so a directory
+/// or a device is refused the same way on every platform, the final component is opened
+/// without following a link, and then the path is canonicalized again and compared with the
+/// handle. A link swapped in for the file is refused by the open; a directory swapped for a
+/// link to elsewhere is refused because the re-resolved path leaves the root or names a
+/// different file from the one the handle holds.
+fn open_confined(root: &Path, resolved: &Path) -> FsResult<File> {
+    assert!(root.is_absolute(), "a confinement root is absolute");
+    let outside = || FsError::OutsideWorkspace {
+        root: root.to_path_buf(),
+        path: resolved.to_path_buf(),
+    };
+    let named =
+        std::fs::symlink_metadata(resolved).map_err(|source| io_error(resolved, &source))?;
+    if named.file_type().is_symlink() {
+        // A canonical path has no link in its last component, so one here was put there
+        // after the path was resolved.
+        return Err(outside());
+    }
+    classify_file(&named, resolved)?;
+    let file = open_no_follow(resolved).map_err(|source| {
+        let swapped = std::fs::symlink_metadata(resolved)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if swapped {
+            outside()
+        } else {
+            io_error(resolved, &source)
+        }
+    })?;
+    let handle = file
+        .metadata()
+        .map_err(|source| io_error(resolved, &source))?;
+    if handle.file_type().is_symlink() {
+        return Err(outside());
+    }
+    classify_file(&handle, resolved)?;
+    let again = resolved
+        .canonicalize()
+        .map_err(|source| io_error(resolved, &source))?;
+    if !again.starts_with(root) {
+        return Err(outside());
+    }
+    let in_root = std::fs::metadata(&again).map_err(|source| io_error(&again, &source))?;
+    if !same_file(&handle, &in_root) {
+        return Err(outside());
+    }
+    assert!(handle.is_file(), "a confined handle is a regular file");
+    Ok(file)
+}
+
+/// Refuses a directory and anything else that is not a regular file.
+fn classify_file(metadata: &Metadata, path: &Path) -> FsResult<()> {
+    if metadata.is_dir() {
+        return Err(FsError::IsADirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(FsError::NotAFile {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Opens the final component itself rather than whatever a link there points at.
+///
+/// `O_NONBLOCK` is there for a FIFO swapped in after the path was classified: opening one
+/// for reading would otherwise wait for a writer that may never come, and the handle check
+/// that follows refuses it as not a file. On a regular file the flag changes nothing.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use nix::fcntl::OFlag;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+        .open(path)
+}
+
+/// Opens the final component itself rather than whatever a link there points at.
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` makes a link the thing opened, so the handle reports it as
+/// a link and [`open_confined`] refuses it rather than reading through it.
+#[cfg(windows)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`, from the Win32 API.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Opens a path for reading, on a platform with no way to refuse a link at open time.
+#[cfg(not(any(unix, windows)))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+/// Whether two metadata records describe the same file.
+#[cfg(unix)]
+fn same_file(handle: &Metadata, named: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    handle.dev() == named.dev() && handle.ino() == named.ino()
+}
+
+/// Whether two metadata records describe the same file, as far as stable `std` can tell.
+///
+/// Without a stable file index the comparison is length, modification and creation time:
+/// enough to refuse a handle that reached a different file, not a proof of sameness.
+#[cfg(not(unix))]
+fn same_file(handle: &Metadata, named: &Metadata) -> bool {
+    handle.len() == named.len()
+        && handle.modified().ok() == named.modified().ok()
+        && handle.created().ok() == named.created().ok()
+}
+
+/// Reads up to `take` bytes from `offset`.
+fn read_window(file: &mut File, path: &Path, offset: u64, take: usize) -> FsResult<Vec<u8>> {
+    assert!(
+        take <= RANGE_READ_MAX_BYTES,
+        "a window is bounded before it is read"
+    );
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| io_error(path, &source))?;
+    let mut bytes = Vec::with_capacity(take);
+    let limit = u64::try_from(take).unwrap_or(u64::MAX);
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, &source))?;
+    assert!(bytes.len() <= take, "a bounded read stays bounded");
+    Ok(bytes)
+}
+
+/// The identity of the file a handle holds, read from the handle rather than the path.
+fn identity_of(file: &File, path: &Path) -> FsResult<FileIdentity> {
+    let metadata = file.metadata().map_err(|source| io_error(path, &source))?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos());
+    // The device and inode, which survive a rename and change when a file is replaced. No
+    // stable file id is exposed off Unix, and an absent one is reported as absent.
+    #[cfg(unix)]
+    let file_id = {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let file_id = None;
+    Ok(FileIdentity {
+        len: metadata.len(),
+        modified_ns,
+        file_id,
+    })
 }
 
 /// Reads a path the adapter has already confined, refusing anything that is not a file.
@@ -563,4 +878,89 @@ fn read_checked(resolved: &Path) -> FsResult<Vec<u8>> {
         });
     }
     std::fs::read(resolved).map_err(|source| io_error(resolved, &source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A canonical workspace root and a canonical directory outside it, holding `secret.txt`.
+    fn root_and_outside() -> (tempfile::TempDir, PathBuf, tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "secret").expect("seed");
+        let root_path = root.path().canonicalize().expect("canonical root");
+        let outside_path = outside.path().canonicalize().expect("canonical outside");
+        (root, root_path, outside, outside_path)
+    }
+
+    #[test]
+    fn a_handle_on_a_file_inside_the_root_is_accepted() {
+        let (_root, root_path, _outside, _outside_path) = root_and_outside();
+        let inside = root_path.join("inside.txt");
+        std::fs::write(&inside, "inside").expect("seed");
+        let mut file = open_confined(&root_path, &inside).expect("an in-root file opens");
+        let mut text = String::new();
+        file.read_to_string(&mut text).expect("read");
+        assert_eq!(text, "inside");
+        // The other direction: the same check refuses a directory, which is not a window.
+        let refused = open_confined(&root_path, &root_path);
+        assert!(
+            matches!(refused, Err(FsError::IsADirectory { .. })),
+            "{refused:?}"
+        );
+    }
+
+    /// The path passed in is what `resolve` would have produced *before* the swap: canonical
+    /// and inside. A link put in its place afterwards must not be followed out of the root.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_link_after_resolution_is_refused() {
+        let (_root, root_path, _outside, outside_path) = root_and_outside();
+        let swapped = root_path.join("swapped.txt");
+        std::os::unix::fs::symlink(outside_path.join("secret.txt"), &swapped).expect("link");
+        let refused = open_confined(&root_path, &swapped);
+        assert!(
+            matches!(refused, Err(FsError::OutsideWorkspace { .. })),
+            "{refused:?}"
+        );
+    }
+
+    /// A directory swapped for a link reaches past `O_NOFOLLOW`, which guards only the last
+    /// component; the re-resolution after the open is what refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_after_resolution_is_refused() {
+        let (_root, root_path, _outside, outside_path) = root_and_outside();
+        std::os::unix::fs::symlink(&outside_path, root_path.join("dir")).expect("link");
+        let through = root_path.join("dir").join("secret.txt");
+        assert!(
+            through.exists(),
+            "the swapped path does reach the outside file"
+        );
+        let refused = open_confined(&root_path, &through);
+        assert!(
+            matches!(refused, Err(FsError::OutsideWorkspace { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn two_handles_on_one_file_are_the_same_file_and_two_files_are_not() {
+        let (_root, root_path, _outside, outside_path) = root_and_outside();
+        let inside = root_path.join("inside.txt");
+        std::fs::write(&inside, "secret").expect("seed");
+        let first = File::open(&inside)
+            .expect("open")
+            .metadata()
+            .expect("metadata");
+        let second = std::fs::metadata(&inside).expect("metadata");
+        assert!(same_file(&first, &second));
+        // Same length and contents, different file: the case a handle check exists for.
+        let other = std::fs::metadata(outside_path.join("secret.txt")).expect("metadata");
+        #[cfg(unix)]
+        assert!(!same_file(&first, &other));
+        #[cfg(not(unix))]
+        let _ = other;
+    }
 }

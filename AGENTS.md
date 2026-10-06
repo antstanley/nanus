@@ -204,6 +204,10 @@ Contract to preserve:
   next start. It is never written on a start, so editing the configuration is not overridden
   by merely opening the interface; deleting it returns the configuration to being the whole
   answer. See `docs/features.md`.
+- `nanus run --context-mode legacy|managed`, `--context-output-reserve <tokens>`,
+  `--capture-shell-evidence` — a session's context policy, recorded in the session before the turn
+  that uses it. Absent flags keep a resumed session's policy; a new session is legacy, and capture
+  never turns managed mode on by itself. See `docs/context-management.md`.
 - `NO_COLOR` — when set to anything non-empty, the interface renders with no colour at all
   (keeping bold and italic) rather than letting the backend drop the colours: the command
   that would have carried a colour to a cell collapses into a reset when colour is
@@ -381,6 +385,19 @@ design docs too.
   concrete composition/provider/auth/selection together. Keep downstream/minimal gates clean;
   native Windows validates this subset independently. Stock shell/link/service have their own
   Linux/macOS/Windows matrix in `.github/workflows/local-transports.yml`.
+- **Managed context is opt-in, and a legacy session must not notice it exists.** A session that
+  never records a `context/mode` record keeps its version-2 body, request bytes, schemas, tool count
+  and terminal save; tests pin each adapter's ordinary body and compare a legacy run through both
+  runner entry points. A version-3 session is saved only through its `SessionCheckpoint`:
+  `nanus run` and the link never call `StorePort::save` for one, and act on the returned
+  `PersistenceState` (no duplicate save after `Acknowledged`, nothing after `Unsaved`, only
+  reconciliation after `Unknown`). Every original user message survives managed selection;
+  `context_manage`/`context_recall` go through host policy and admission with no goal-tool bypass;
+  a proposal must be alone in its batch; the model never changes policy, capture or permissions.
+  See `docs/context-management.md` and its schema, which `context_schema.rs` checks.
+- **Deletion retires the id.** `delete` takes exclusive ownership and refuses a held session; a
+  save, checkpoint, claim or name for a retired id is refused, so a stale writer cannot resurrect
+  a deleted conversation.
 - **A session records what produced it, and "absent" is not "default".** The header
   carries the configuration and each model turn carries the model and effort that
   produced it, both optional: a session recorded before a field existed reports the

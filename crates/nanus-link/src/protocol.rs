@@ -199,6 +199,206 @@ pub enum GoalAction {
     Clear,
 }
 
+/// What a client asks to do about a session's managed context.
+///
+/// One request with an action, for the reason [`GoalAction`] is one: the two actions are about
+/// one piece of session state, and the words are the ones a person types after `/context`. Both
+/// are *idle-session* operations in the sense that matters: a status read never borrows a
+/// running session — it is answered from the snapshot the turn last published — and a reset,
+/// which writes, is refused while a turn runs.
+///
+/// A bare word on the wire rather than a tagged object, because neither action carries anything:
+/// `{"request":"context","action":"reset"}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAction {
+    /// Report the context status without changing anything.
+    Status,
+    /// Empty the selection, select legacy replay, and persist that decision.
+    Reset,
+}
+
+/// A durable point in a session's log, in the link's vocabulary.
+///
+/// The link's own copy of the domain's frontier, for the reason [`TurnEnd`] is its own: a client
+/// that only draws links the protocol and not the domain. The fields and their spelling are the
+/// domain's, so the JSON is the same either way.
+///
+/// The event count is exclusive — sequence `N` is inside the frontier exactly when `N` is less
+/// than it — and the digest covers the stored header and those events byte for byte. A reader
+/// verifies a file it reads against both before it trusts any of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontierInfo {
+    /// The session the frontier belongs to.
+    pub session_id: String,
+    /// How many events are durable.
+    pub event_count: u64,
+    /// SHA-256 of the stored header and the first `event_count` event lines, lowercase hex.
+    pub prefix_sha256: String,
+    /// The context revision accepted at this point; zero for a session that has none.
+    pub projection_revision: u64,
+}
+
+/// Where a session's stream stood at an attachment barrier.
+///
+/// What [`Frame::Attached`] and [`Frame::Backlog`] both carry, from one snapshot, so a client can
+/// tell that the two describe the same instant: the durable prefix it reads from the store, and
+/// the last frame id that prefix and the backlog together account for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamMark {
+    /// The stream's identity: one per held session per process.
+    ///
+    /// A frame id is meaningful only inside its epoch. Ids are not kept across a restart or a
+    /// session being let go and held again, so a frame from another epoch is refused rather than
+    /// compared.
+    pub stream_epoch: String,
+    /// The last frame id the session assigned before the barrier.
+    pub stream_watermark: u64,
+    /// What the store held at the barrier.
+    pub frontier: FrontierInfo,
+}
+
+/// One frame of a running turn that the store does not hold yet, tagged with where it belongs.
+///
+/// The tag is the step identity the frame was produced in, which is what lets the agent retire
+/// exactly the segments a checkpoint covers, and the id is the frame's place in the session's
+/// stream. Adjacent deltas are folded into one segment, which takes the id of the last delta it
+/// holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BacklogSegment {
+    /// The stream id of the newest frame this segment holds.
+    pub frame_id: u64,
+    /// The turn it was produced in, counting from zero.
+    pub turn: Option<u64>,
+    /// The step it was produced in, counting from one; `None` before the first step.
+    pub step: Option<u64>,
+    /// The frame itself.
+    pub frame: Frame,
+}
+
+/// The envelope every context frame carries.
+///
+/// The ids are assigned by the session that owns the stream, not by the connection that sends
+/// them, so every viewer of one session sees the same id for the same frame and a client can
+/// drop a duplicate or an older id from its attachment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEnvelope {
+    /// The session the frame is about.
+    pub session_id: String,
+    /// The stream's identity; see [`StreamMark::stream_epoch`].
+    pub stream_epoch: String,
+    /// The turn it belongs to, or `None` when the session is idle.
+    pub turn: Option<u64>,
+    /// The step it belongs to, or `None` when the session is idle or between steps.
+    pub step: Option<u64>,
+    /// This frame's id in the stream.
+    pub frame_id: u64,
+    /// The session's stream watermark once this frame is sent: its own id.
+    pub stream_watermark: u64,
+    /// What the store holds as this frame goes out.
+    pub frontier: FrontierInfo,
+}
+
+/// Whether a session's requests replay the log or use the managed projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextModeState {
+    /// Whole-log replay; what every session did before managed context.
+    Legacy,
+    /// Fragment selection, working notes and checkpoints.
+    Managed,
+}
+
+/// What became of one context decision, in the link's vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionState {
+    /// Validated, waiting for its step to settle.
+    Staged,
+    /// A checkpoint acknowledged the revision.
+    Accepted,
+    /// Refused; the previous revision stays selected.
+    Rejected,
+    /// The turn stopped before validation began.
+    Cancelled,
+}
+
+/// How strong a checkpoint's durability claim is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityState {
+    /// Atomic replacement survives a process crash.
+    ProcessCrash,
+    /// File and parent directory are synchronized as well.
+    PowerLoss,
+}
+
+/// The outcome of one context decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextDecisionInfo {
+    /// The host-generated id, which is also the id of the record the decision is written as.
+    pub decision_id: String,
+    /// What happened.
+    pub outcome: DecisionState,
+    /// The revision accepted, when one was.
+    pub revision: Option<u64>,
+    /// The stable code it was refused with, when it was.
+    pub error_code: Option<String>,
+}
+
+/// A session's context status, in the link's vocabulary.
+///
+/// Counts, codes and digests only: no credential, no provider payload and no evidence crosses
+/// here, which is the same rule the record it is read from keeps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextStatusInfo {
+    /// Legacy or managed.
+    pub mode: ContextModeState,
+    /// The accepted revision.
+    pub revision: u64,
+    /// The frontier the status describes.
+    pub frontier: FrontierInfo,
+    /// The estimated input of the last prepared request.
+    pub estimate_input_tokens: Option<u64>,
+    /// The estimated input of the protected floor.
+    pub estimate_protected_tokens: Option<u64>,
+    /// The output reservation.
+    pub output_reserve_tokens: u64,
+    /// Which estimator produced the estimates, and over what.
+    pub estimator: String,
+    /// Fragments hidden.
+    pub hidden_fragments: u64,
+    /// Fragments protected.
+    pub protected_fragments: u64,
+    /// The goal revision.
+    pub goal_revision: Option<u64>,
+    /// Whether goal data is in the generated memory.
+    pub goal_data_available: bool,
+    /// Whether recall can be used.
+    pub recall_available: bool,
+    /// Whether archived evidence can be used.
+    pub archive_available: bool,
+    /// The most recent decision.
+    pub last_decision: Option<ContextDecisionInfo>,
+    /// The snapshot profile's digest.
+    pub profile_digest: String,
+    /// Whether the next managed request can be prepared.
+    pub managed_ready: bool,
+    /// The stable code saying why it cannot, when it cannot.
+    pub unavailable_reason: Option<String>,
+}
+
+/// What a successful checkpoint proved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointInfo {
+    /// The frontier now on disk; its digest covers the whole stored file.
+    pub frontier: FrontierInfo,
+    /// SHA-256 of the event lines alone.
+    pub body_digest: String,
+    /// The durability grade.
+    pub durability: DurabilityState,
+}
+
 /// What a client asks an agent to do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
@@ -354,6 +554,19 @@ pub enum Request {
         action: GoalAction,
     },
 
+    /// Report or reset the session's managed context.
+    ///
+    /// A request rather than something a client does for itself for the reason
+    /// [`Request::Goal`] is one: the context is session state, and the session is the agent's.
+    /// The agent answers a status read with [`Frame::ContextStatus`] — from the snapshot a running
+    /// turn last published, never by borrowing that turn's session — and a reset of a busy session
+    /// with [`Frame::Refused`]. A reset that is saved is told to every viewer as a
+    /// [`Frame::Checkpoint`] and the status that follows it.
+    Context {
+        /// What to do.
+        action: ContextAction,
+    },
+
     /// Describe the agent without changing anything.
     Status,
 
@@ -376,7 +589,19 @@ pub enum Frame {
     ///
     /// Sent in reply to `New` and `Attach`, and it is the point at which a client knows
     /// which conversation it is in.
-    Attached(SessionInfo),
+    ///
+    /// It also says *where* the client is joining it. The frontier is the prefix of the log the
+    /// store holds at the attachment barrier, and the client reads disk only through it: a file
+    /// that has grown since is clipped to that prefix and verified against its digest, because
+    /// what lies past it reaches the client as the [`Frame::Backlog`] and the frames after it.
+    /// The watermark is the last frame id the barrier accounts for.
+    Attached {
+        /// The session.
+        session: SessionInfo,
+        /// Where its stream stood at the barrier.
+        #[serde(flatten)]
+        stream: StreamMark,
+    },
 
     /// A reply to [`Request::Sessions`].
     ///
@@ -720,17 +945,59 @@ pub enum Frame {
     /// with adjacent deltas folded together — so the client replays them and its transcript
     /// is whole rather than beginning mid-turn.
     ///
-    /// It is *not* history. A turn that has ended is in the session log, which is where a
-    /// client reads it from; this carries only the part of a running turn that the log does
-    /// not have yet, because the log is written when the turn ends. Empty for an attachment
-    /// to an idle session, which needs nothing.
+    /// It is *not* history. What the store holds is in the session log, which is where a
+    /// client reads it from; this carries only the part of a running turn past the durable
+    /// frontier. A legacy session's log is written when the turn ends, so its backlog is the
+    /// whole turn; a managed session checkpoints as it runs, and each checkpoint retires the
+    /// segments it covers, so its backlog is only what the last checkpoint did not cover. Not
+    /// sent for an attachment that needs nothing.
     ///
     /// Nesting frames rather than repeating them as ordinary ones is what keeps the batch
     /// atomic: it is one item on the client's queue, so no live frame can slip between the
-    /// frames it carries and reorder the turn.
+    /// frames it carries and reorder the turn. It identifies the same frontier and watermark
+    /// as the [`Frame::Attached`] before it, from the same snapshot.
     Backlog {
-        /// The turn so far, oldest first.
-        frames: Vec<Self>,
+        /// Where the stream stood at the barrier.
+        #[serde(flatten)]
+        stream: StreamMark,
+        /// The turn past the frontier, oldest first.
+        segments: Vec<BacklogSegment>,
+    },
+
+    /// The session's context status.
+    ///
+    /// Sent in answer to a status read, after a reset, and once per managed step before its
+    /// request is sent, so a watcher sees the revision, the pressure and the hidden counts the
+    /// model is about to answer from. A frame of its own rather than text in a notice, so an
+    /// interface can tell it from the model's output and from a goal change.
+    ContextStatus {
+        /// Which session, which stream, which step and where the frame stands in it.
+        #[serde(flatten)]
+        envelope: ContextEnvelope,
+        /// The status.
+        payload: ContextStatusInfo,
+    },
+
+    /// A context decision settled: a proposal accepted, rejected or cancelled, or a fit made.
+    ContextDecision {
+        /// Which session, which stream, which step and where the frame stands in it.
+        #[serde(flatten)]
+        envelope: ContextEnvelope,
+        /// The decision.
+        payload: ContextDecisionInfo,
+    },
+
+    /// A checkpoint was acknowledged, and the durable frontier is now its receipt's.
+    ///
+    /// Not a turn's end, and not something to draw: a viewer already shows the records it
+    /// covers, so the frame moves its watermark and its idea of what the store holds, and a
+    /// client attaching later reads the newer prefix from disk and only the backlog that is left.
+    Checkpoint {
+        /// Which session, which stream, which step and where the frame stands in it.
+        #[serde(flatten)]
+        envelope: ContextEnvelope,
+        /// What the checkpoint proved.
+        payload: CheckpointInfo,
     },
 
     /// The prompt for the step that is starting had its oldest turns dropped.
@@ -784,7 +1051,16 @@ impl Frame {
 /// Version 9 added [`Frame::Refused`], and moved the refusals of non-prompt requests onto it:
 /// an older client would read it as a decode error, and an older agent sends those refusals as
 /// [`Frame::Failed`], which a newer client would read as a turn ending.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// Version 10 changed what an attachment *means*. [`Frame::Attached`] and [`Frame::Backlog`]
+/// now identify a durable frontier, a stream epoch and a watermark, and a backlog is only what
+/// lies past the frontier — which a managed session moves at every checkpoint, mid-turn. An older
+/// client reads the whole stored file and then applies the backlog, which is exactly the double
+/// copy the frontier exists to prevent, so it has to be refused by version rather than trusted
+/// to ignore fields it does not know. The same version added [`Request::Context`] and the three
+/// context frames, [`Frame::ContextStatus`], [`Frame::ContextDecision`] and
+/// [`Frame::Checkpoint`].
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -989,11 +1265,230 @@ mod tests {
         }
     }
 
+    fn frontier() -> FrontierInfo {
+        FrontierInfo {
+            session_id: "01a09558".to_owned(),
+            event_count: 12,
+            prefix_sha256: "ab".repeat(32),
+            projection_revision: 3,
+        }
+    }
+
+    fn mark() -> StreamMark {
+        StreamMark {
+            stream_epoch: "p1-t2-h3".to_owned(),
+            stream_watermark: 41,
+            frontier: frontier(),
+        }
+    }
+
+    fn envelope(turn: Option<u64>, step: Option<u64>, frame_id: u64) -> ContextEnvelope {
+        ContextEnvelope {
+            session_id: "01a09558".to_owned(),
+            stream_epoch: "p1-t2-h3".to_owned(),
+            turn,
+            step,
+            frame_id,
+            stream_watermark: frame_id,
+            frontier: frontier(),
+        }
+    }
+
+    fn status_info() -> ContextStatusInfo {
+        ContextStatusInfo {
+            mode: ContextModeState::Managed,
+            revision: 3,
+            frontier: frontier(),
+            estimate_input_tokens: Some(12_000),
+            estimate_protected_tokens: None,
+            output_reserve_tokens: 8_192,
+            estimator: "bytes/4 over the compiled request".to_owned(),
+            hidden_fragments: 2,
+            protected_fragments: 5,
+            goal_revision: Some(1),
+            goal_data_available: true,
+            recall_available: true,
+            archive_available: false,
+            last_decision: Some(ContextDecisionInfo {
+                decision_id: "d1".to_owned(),
+                outcome: DecisionState::Rejected,
+                revision: None,
+                error_code: Some("stale_base".to_owned()),
+            }),
+            profile_digest: "cd".repeat(32),
+            managed_ready: false,
+            unavailable_reason: Some("protocol_incompatible".to_owned()),
+        }
+    }
+
+    /// Every context frame, idle and mid-step, and the attachment pair that carries a frontier:
+    /// each crosses the wire with its envelope at the top level and its payload intact.
+    #[test]
+    fn the_context_and_attachment_frames_round_trip() {
+        let frames = [
+            Frame::Attached {
+                session: session_info(),
+                stream: mark(),
+            },
+            Frame::Backlog {
+                stream: mark(),
+                segments: Vec::new(),
+            },
+            Frame::Backlog {
+                stream: mark(),
+                segments: vec![
+                    BacklogSegment {
+                        frame_id: 39,
+                        turn: Some(4),
+                        step: None,
+                        frame: Frame::User {
+                            text: "what is this".to_owned(),
+                        },
+                    },
+                    BacklogSegment {
+                        frame_id: 41,
+                        turn: Some(4),
+                        step: Some(2),
+                        frame: Frame::Text {
+                            delta: "hello".to_owned(),
+                        },
+                    },
+                ],
+            },
+            Frame::ContextStatus {
+                envelope: envelope(None, None, 42),
+                payload: status_info(),
+            },
+            Frame::ContextStatus {
+                envelope: envelope(Some(4), Some(2), 43),
+                payload: ContextStatusInfo {
+                    mode: ContextModeState::Legacy,
+                    last_decision: None,
+                    unavailable_reason: None,
+                    ..status_info()
+                },
+            },
+            Frame::ContextDecision {
+                envelope: envelope(Some(4), Some(2), 44),
+                payload: ContextDecisionInfo {
+                    decision_id: "d2".to_owned(),
+                    outcome: DecisionState::Accepted,
+                    revision: Some(4),
+                    error_code: None,
+                },
+            },
+            Frame::ContextDecision {
+                envelope: envelope(Some(4), Some(3), 45),
+                payload: ContextDecisionInfo {
+                    decision_id: "d3".to_owned(),
+                    outcome: DecisionState::Cancelled,
+                    revision: None,
+                    error_code: Some("cancelled".to_owned()),
+                },
+            },
+            Frame::Checkpoint {
+                envelope: envelope(Some(4), Some(3), 46),
+                payload: CheckpointInfo {
+                    frontier: frontier(),
+                    body_digest: "ef".repeat(32),
+                    durability: DurabilityState::ProcessCrash,
+                },
+            },
+            Frame::Checkpoint {
+                envelope: envelope(None, None, 47),
+                payload: CheckpointInfo {
+                    frontier: frontier(),
+                    body_digest: "ef".repeat(32),
+                    durability: DurabilityState::PowerLoss,
+                },
+            },
+        ];
+        for frame in frames {
+            let encoded = encode(&frame);
+            assert!(encoded.is_ok(), "encodes: {encoded:?}");
+            let Ok(encoded) = encoded else { return };
+            let decoded = decode::<Frame>(&encoded);
+            assert_eq!(decoded.ok(), Some(frame.clone()), "round trip of {frame:?}");
+        }
+    }
+
+    /// The envelope is flat on the wire, as the contract writes it: a reader that does not know
+    /// this crate finds the session, the epoch and the ids beside the tag, not inside a wrapper.
+    #[test]
+    fn a_context_frame_carries_its_envelope_at_the_top_level() {
+        let frame = Frame::Checkpoint {
+            envelope: envelope(None, None, 7),
+            payload: CheckpointInfo {
+                frontier: frontier(),
+                body_digest: "ef".repeat(32),
+                durability: DurabilityState::ProcessCrash,
+            },
+        };
+        let encoded = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
+        let value: serde_json::Value =
+            serde_json::from_str(&encoded).unwrap_or_else(|error| panic!("{error}"));
+        let object = value.as_object().unwrap_or_else(|| panic!("an object"));
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "frame",
+                "frame_id",
+                "frontier",
+                "payload",
+                "session_id",
+                "step",
+                "stream_epoch",
+                "stream_watermark",
+                "turn"
+            ]
+        );
+        assert_eq!(object.get("frame"), Some(&serde_json::json!("checkpoint")));
+        assert_eq!(object.get("turn"), Some(&serde_json::Value::Null));
+        // A context frame ends no turn: a checkpoint mid-turn is not a `Done`.
+        assert!(!frame.is_end_of_turn());
+    }
+
+    /// Both context actions survive the wire, because `/context` and `/context reset` are what a
+    /// person types and each has to reach the agent unchanged.
+    #[test]
+    fn the_context_requests_round_trip() {
+        for action in [ContextAction::Status, ContextAction::Reset] {
+            let request = Request::Context { action };
+            let encoded = encode(&request).unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(decode::<Request>(&encoded).ok(), Some(request));
+        }
+        assert_eq!(
+            decode::<Request>(r#"{"request":"context","action":"reset"}"#).ok(),
+            Some(Request::Context {
+                action: ContextAction::Reset
+            })
+        );
+        assert!(
+            decode::<Request>(r#"{"request":"context","action":"enable"}"#).is_err(),
+            "an action this version does not offer is refused, not guessed"
+        );
+    }
+
+    /// An attachment from a build that predates the frontier is a decode error rather than an
+    /// attachment with an empty frontier: an older agent's attachment means "read the whole
+    /// file", and a client that read it as "read nothing" would show an empty conversation.
+    #[test]
+    fn an_attachment_without_a_frontier_is_refused() {
+        let old = r#"{"frame":"attached","session":"s","name":null,"title":null,"events":3,"busy":false,"viewers":1}"#;
+        assert!(
+            decode::<Frame>(old).is_err(),
+            "the old shape does not decode"
+        );
+        let old_backlog = r#"{"frame":"backlog","frames":[]}"#;
+        assert!(decode::<Frame>(old_backlog).is_err());
+    }
+
     #[test]
     fn a_round_trip_preserves_every_frame() {
         let frames = [
             Frame::Ready(info()),
-            Frame::Attached(session_info()),
             Frame::Sessions {
                 held: vec![session_info()],
             },
@@ -1191,17 +1686,35 @@ mod tests {
     /// which is what a late client is actually sent.
     #[test]
     fn a_backlog_round_trips_the_frames_it_carries() {
+        let segment = |frame_id: u64, step: Option<u64>, frame: Frame| BacklogSegment {
+            frame_id,
+            turn: Some(0),
+            step,
+            frame,
+        };
         for frame in [
-            Frame::Backlog { frames: Vec::new() },
             Frame::Backlog {
-                frames: vec![
-                    Frame::User {
-                        text: "what is this".to_owned(),
-                    },
-                    Frame::Step { step: 1 },
-                    Frame::Text {
-                        delta: "hello".to_owned(),
-                    },
+                stream: mark(),
+                segments: Vec::new(),
+            },
+            Frame::Backlog {
+                stream: mark(),
+                segments: vec![
+                    segment(
+                        1,
+                        None,
+                        Frame::User {
+                            text: "what is this".to_owned(),
+                        },
+                    ),
+                    segment(2, Some(1), Frame::Step { step: 1 }),
+                    segment(
+                        4,
+                        Some(1),
+                        Frame::Text {
+                            delta: "hello".to_owned(),
+                        },
+                    ),
                 ],
             },
         ] {
@@ -1267,6 +1780,12 @@ mod tests {
                 provider: "openai".to_owned(),
                 plan: None,
                 key: "sk-secret".to_owned(),
+            },
+            Request::Context {
+                action: ContextAction::Status,
+            },
+            Request::Context {
+                action: ContextAction::Reset,
             },
             Request::Sessions,
             Request::Status,

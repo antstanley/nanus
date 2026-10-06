@@ -49,6 +49,25 @@ pub struct ToolBatchProjection<'a> {
     pub capabilities: ModelCapabilities,
     /// Same held adapter's pure translated request estimator; no HTTP/secret access.
     pub estimate: &'a dyn Fn(&ChatRequest) -> LlmResult<RequestEstimate>,
+    /// The managed projection, when the session is in managed mode; `None` otherwise.
+    ///
+    /// `request` above stays the full original unelided prospective request and `events` the
+    /// actual retained records: a host's durable quotas count raw records, while a lease that
+    /// validates "the next request" validates this effective one.
+    pub managed: Option<ManagedProjection<'a>>,
+}
+
+/// The effective request a managed step would send, beside the original one.
+pub struct ManagedProjection<'a> {
+    /// The accepted context revision the effective request was compiled from.
+    pub revision: u64,
+    /// The effective request with the same failure slots: the base the next step would use.
+    pub effective: &'a ChatRequest,
+    /// The held adapter's pure estimate of exactly the effective candidate.
+    ///
+    /// Final-result estimation may substitute only permitted pending result slots; it never
+    /// changes the original history or the revision identity.
+    pub estimate_effective: &'a dyn Fn(&ChatRequest) -> LlmResult<RequestEstimate>,
 }
 
 /// Opt-in complete-batch admission. Callbacks are synchronous and perform no tool

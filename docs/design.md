@@ -75,6 +75,14 @@ and the two lists meet in exactly one place — the runner, which sends the sche
 advertises the count. What they may _not_ do is clear a goal: removing the objective is the
 person's decision, and `/goal clear` is where it lives.
 
+Managed context adds `context_manage` and `context_recall` beside the five goal tools when a
+session enables it and its model path supports it ([managed context](context-management.md)).
+These belong to the loop for the same reason the goal tools do: they reference the current
+session and its accepted projection. The registered stock set remains seven. Context calls pass
+explicit host policy, complete-batch admission and result retention; they do not inherit the goal
+tools' separate policy bypass. Tool counts and schemas reflect exactly what the selected session
+can dispatch, so a legacy session's request is unchanged.
+
 ### Only three fields of a tool can reach the model
 
 A tool's `name`, `description`, and `parameters` may be serialised into a request. Its
@@ -160,6 +168,13 @@ Two things came out of the first raise besides the number. The model is told its
 the system prompt, because a ceiling nobody mentioned is not one it can pace against. And
 the ending carries the reason it stopped, because a turn cut off at the budget used to
 reach the interface looking exactly like one that had finished.
+
+Managed requests use the selected adapter's own preparation of the exact body, with an explicit
+output reservation, to decide what fits. Original user messages and protected recent work survive
+fitting; completed assistant/tool fragments can be hidden, with the omission recorded and
+recallable. Every model call — context management included — consumes the same step budget and
+is accounted for. The adapter, model and effort a request was prepared under are held through its
+dispatch, its context validation and its checkpoint.
 
 ### The current model ids, and no aliases for the dead ones
 
