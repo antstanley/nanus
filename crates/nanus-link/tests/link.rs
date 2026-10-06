@@ -3543,3 +3543,142 @@ fn a_managed_session_its_store_cannot_checkpoint_takes_no_turn() {
         "nothing was run and nothing was saved"
     );
 }
+
+/// A model with managed preparation: one encoded body, digested once and sent as prepared.
+struct ManagedLlm;
+
+/// The prepared call [`ManagedLlm`] hands back.
+struct ManagedCall {
+    digest: nanus_domain::context::managed::Digest,
+    selection: nanus_domain::context::managed::SelectionIdentity,
+    estimate: nanus_ports::RequestEstimate,
+}
+
+impl nanus_ports::PreparedModelCall for ManagedCall {
+    fn estimate(&self) -> nanus_ports::RequestEstimate {
+        self.estimate
+    }
+    fn request_digest(&self) -> &nanus_domain::context::managed::Digest {
+        &self.digest
+    }
+    fn selection(&self) -> &nanus_domain::context::managed::SelectionIdentity {
+        &self.selection
+    }
+    fn stream(self: Box<Self>) -> LlmStream {
+        ScriptedLlm.stream_chat(ChatRequest::new("scripted", Vec::new()))
+    }
+}
+
+impl LlmPort for ManagedLlm {
+    fn model(&self) -> &'static str {
+        "scripted"
+    }
+    fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        ScriptedLlm.stream_chat(request)
+    }
+    fn managed_support(&self, _: &str) -> nanus_ports::ManagedSupport {
+        nanus_ports::ManagedSupport::Supported { policy_version: 1 }
+    }
+    fn prepare_managed(
+        &self,
+        request: nanus_ports::ManagedRequest,
+    ) -> nanus_ports::LlmResult<Box<dyn nanus_ports::PreparedModelCall>> {
+        let body = serde_json::to_vec(&request.request.messages).expect("encodes");
+        Ok(Box::new(ManagedCall {
+            digest: nanus_domain::context::managed::Digest::of(&body),
+            selection: nanus_domain::context::managed::SelectionIdentity {
+                provider: "test".to_owned(),
+                endpoint_digest: nanus_domain::context::managed::Digest::of(b"local"),
+                protocol: "test.chat".to_owned(),
+                model: request.request.model.clone(),
+                effort: None,
+                epoch: request.selection_epoch,
+            },
+            estimate: nanus_ports::RequestEstimate {
+                input_tokens: u32::try_from(body.len().div_ceil(4)).expect("small"),
+                request_bytes: body.len(),
+                images: 0,
+                reservation: request.request.max_tokens.unwrap_or(0),
+            },
+        }))
+    }
+}
+
+/// A managed session runs over the link through the store's checkpoints: viewers see its
+/// context status and each checkpoint, `Done` comes only once the turn is durable, and the
+/// store holds exactly what the agent holds — attempt records included — with no second save.
+#[test]
+fn a_managed_turn_over_the_link_is_checkpointed_before_it_is_done() {
+    use nanus_domain::context::managed::{ContextModeRecord, ContextPolicy, ModeActor, ModeReason};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = agent_over(dir.path(), Rc::new(Box::new(ManagedLlm)), "scripted");
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+    let id = SessionId::new("managed-over-the-link");
+    nanus_kernel::runtime::block_on(async {
+        let mut session = Session::new(id.clone(), 1, "/work");
+        session.upgrade_to_managed_body();
+        session.append(SessionEvent::ContextMode {
+            payload: Box::new(ContextModeRecord {
+                policy: ContextPolicy::managed(),
+                actor: ModeActor::Human,
+                reason: ModeReason::Enable,
+                previous_revision: 0,
+            }),
+        });
+        store.save(&session).await.expect("the session is recorded");
+    });
+
+    let frames = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        client
+            .attach_at("managed-over-the-link")
+            .await
+            .expect("attaches");
+        client
+            .send(&Request::Prompt {
+                text: "go".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        frames
+    });
+    assert_eq!(answer_of(&frames), Some("hello back"), "{frames:?}");
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ContextStatus { .. })),
+        "{frames:?}"
+    );
+    let checkpoints = frames
+        .iter()
+        .filter(|frame| matches!(frame, Frame::Checkpoint { .. }))
+        .count();
+    assert!(
+        checkpoints >= 3,
+        "intent, settled step and turn end: {checkpoints}"
+    );
+    let stored = nanus_kernel::runtime::block_on(store.load(&id)).expect("readable");
+    assert!(stored.is_managed_body());
+    assert!(matches!(
+        stored.log().last_turn_end(),
+        Some(nanus_domain::TurnEndReason::Completed)
+    ));
+    let attempts = stored
+        .log()
+        .events()
+        .iter()
+        .filter(|event| matches!(event, SessionEvent::RequestAttempt { .. }))
+        .count();
+    assert_eq!(attempts, 2, "one intent and one outcome");
+}
