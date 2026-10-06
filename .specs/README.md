@@ -6,6 +6,8 @@ Current behavior and architecture remain documented in [the documentation index]
 
 ## Change specs
 
+- [Bounded, recoverable context management](changes/2026-10-05-context_management.md) — Implemented locally, unpublished: opt-in managed context with fragment selection, context tools, checkpoints, recall, shell archives and retiring deletion; deterministic acceptance on macOS; live provider acceptance and the held-out evaluation (T34) not run. Contract in [`docs/context-management.md`](../docs/context-management.md).
+
 - [Stateless Responses replay and function policy](changes/2026-10-04-responses_replay_and_schema_policy.md) — Local sealed replay and image-cost/measurement corrections; native consumer image/read delivery and replay are locally verified; trusted instruction revisions and changed-brief reload are locally verified; genuine multimodal request input remains required before downstream readiness. Includes the scoped host and cost certificates.
 
 - [Optional admission before user and model records](changes/2026-10-04-model_record_admission.md) — Proposed in this checkout; isolated local candidate implemented and reviewed with final scoped tests/lint/Windows cross-compilation passing. Unpublished; no downstream consumer/adoption or live/native acceptance.
