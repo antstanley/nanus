@@ -426,10 +426,14 @@ fn notes_bound_to_an_older_goal_are_marked_stale() {
     assert!(memory.contains("a new direction"));
 }
 
+/// What one reservation was shown: the original request's length, and the managed revision and
+/// effective request's length.
+type Shown = (usize, Option<(u64, usize)>);
+
 /// A batch-admission host that admits everything and records what it was shown.
 #[derive(Default)]
 struct Watching {
-    seen: std::cell::RefCell<Vec<(usize, Option<(u64, usize)>)>>,
+    seen: std::cell::RefCell<Vec<Shown>>,
 }
 
 struct Lease;
