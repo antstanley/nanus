@@ -326,7 +326,26 @@ at run time.
 
 ## Human controls and clients
 
-Filled in with the link and interface work.
+The command line takes the three flags in [configuration](#configuration-activation-and-limits).
+A version-3 session run by `nanus run` is saved only through its checkpoints; the command reports
+an unsaved or uncertain outcome on stderr, keeps stdout for the answer, and exits non-zero.
+
+The link adds a `context` request with `status` and `reset` actions on a held session, and the
+interface `/context` and `/context reset`. A reset while a turn runs is refused; a status read
+during a turn is answered from the snapshot the turn last published, never by borrowing the
+running session. A reset selects legacy, appends an empty host revision and persists both before
+it is acknowledged. Status carries the mode, readiness and its reason, the revision and frontier,
+the profile digest, the last decision, the hidden and protected counts, the estimate and its
+estimator, the reservation and whether recall and the archive are available — never credentials,
+provider payloads or evidence.
+
+`ContextStatus`, `ContextDecision` and `Checkpoint` frames carry the session id, the stream epoch,
+the turn and step (null when idle), a frame id assigned by the session, the stream watermark and
+the durable frontier. Attachment and backlog semantics are described in
+[sessions](sessions.md#what-travels-over-the-link); the link protocol is version 10. The interface
+draws context notices with the replay's own wording, so a watched turn and the same turn read
+back say the same things. A managed session whose store cannot checkpoint, or whose recovery or
+reconciliation could not be settled, is held but takes no turn until it is reset.
 
 ## Accounting
 
@@ -352,4 +371,36 @@ result or retries a command.
 
 ## What is and is not verified
 
-Filled in when the gates have run.
+Verified by deterministic tests against the real runner, store, shell, link, interface and the
+three adapters' encoders and decoders, on macOS:
+
+- legacy sessions keep their request bytes, schemas, event trace and save path (each adapter pins
+  its ordinary body; the runner compares a legacy run through both entry points);
+- fragment derivation, protection, compilation, hard fitting, proposal staging and revalidation,
+  the reset barrier and the boundary schema (a test checks every payload against
+  `context-management.schema.json`);
+- the step transaction — intent before HTTP, frozen dispatch, settled checkpoints, refused and
+  uncertain commits and their reconciliation, recovery of an open turn without rerunning anything;
+- mixed-batch refusal, host-policy denial with no bypass, pre-parse argument limits including a
+  late name, admission's original and effective views, and the step budget charging management;
+- recall's bounds, cursors, encodings and refusal to substitute; shell capture past the preview
+  through the real shell and store, verified at checkpoint and found by recall;
+- checkpoint identity, bounds and atomicity in the store, the archive's quotas, chunk verification
+  and garbage collection, and deletion's retirement against a stale writer;
+- frontier-aware attachment racing checkpoints, protocol-version refusal, and a managed turn over
+  the real link and store.
+
+Not verified, and not claimed:
+
+- **No live provider has been sent a managed request.** The provider matrix rests on wire and
+  reload fixtures; in particular, nothing yet proves a provider accepts the generated assistant
+  message followed by an original one, or DeepSeek and z.ai a generated turn without
+  `reasoning_content`.
+- **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
+  suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
+  is no claim that managed context improves anything, and the default stays legacy.
+- **Durability is process-crash only.** Power-loss durability needs parent-directory
+  synchronization (and `F_FULLFSYNC` on macOS) and is not claimed.
+- **Native Windows** was checked by cross-target lint of the local and store adapters, not run.
+- **Child-session handoff**, which the contract specifies only for a future subagent feature, is
+  not implemented.

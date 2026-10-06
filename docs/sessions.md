@@ -266,7 +266,8 @@ session: 01a09a9d-8aa2-7736-86a6-7c6d3dedaa7a  shared-work  idle  2 attached  3 
 
 A client that attaches mid-turn **catches up with the turn it landed in**. The frames
 before it arrived went out to clients that were already there, and the store does not have
-the turn yet — the log is written when a turn ends — so the agent hands it the part of the
+the turn yet — a legacy log is written when a turn ends, and a managed one at each checkpoint —
+so the agent hands it the part of the
 running turn nothing else holds: the prompt, the steps, and the deltas so far, in order, as
 one `Backlog` frame immediately after the attachment. The turn is then already on screen,
 and the live frames continue from there rather than beginning in the middle of a sentence.
@@ -304,13 +305,29 @@ A session is the agent's; a client's view of it is a handful of frames.
 | `Text`, `Reasoning`, `Step`, `Tool`, `ToolDone`, `Usage` | The turn, as it happens. |
 | `Approval` | A call outside the sandbox needs a decision; the client answers with an `approve` request. |
 | `Goal` | The session's durable objective, or its absence: sent on attaching to a session that has one, on every change, and in answer to a `goal` request. |
+| `ContextStatus` | A managed session's context status: when a step's request is prepared, on a `context status` request, and after a reset. |
+| `ContextDecision` | A context proposal accepted, rejected or cancelled, or an automatic fit. |
+| `Checkpoint` | A managed session's checkpoint was acknowledged: the durable frontier moved. It ends nothing. |
 | `Done`, `Failed` | How it ended. |
 | `Refused` | A request that is not a prompt — a model, provider, credential, or goal change — was not carried out. It ends no turn, which is why it is not `Failed`. |
 
 Deliberately not a session log. A client that wants the conversation reads it from the
 store, where it is already durable, rather than receiving a second copy over a socket that
-would then be a second source of truth — which is why `Backlog` holds only the turn in
-flight and is emptied as soon as that turn is in the log.
+would then be a second source of truth — which is why `Backlog` holds only what the store does
+not yet have.
+
+Attachments identify an immutable durable event frontier. `Attached` and `Backlog` carry the same
+stream mark — the session's stream epoch, its frame watermark, and the frontier's event count and
+digest — taken in one step with the viewer's registration. A client replays the store only
+through that frontier, clipping a newer file to that prefix and refusing a shorter or mismatching
+one with a visible notice, then applies the backlog and the frames that follow. Checkpoint
+completion advances the frontier and retires only the backlog segments it covers, in the same
+step and before any new progress; existing viewers keep their visible stream, because a
+checkpoint does not send `Done` — the `Checkpoint` frame only moves their watermark. Context
+frames carry the session's own monotonically increasing frame id, so a duplicate or older one is
+ignored, and a frame from another stream epoch is refused. Context status and decisions have
+their own frames and stay distinguishable from assistant output and goal changes. The protocol
+is version 10; an older peer is refused before any request.
 
 ## Known limits
 
