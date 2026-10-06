@@ -157,11 +157,26 @@ pub fn encode_messages(messages: &[Message]) -> Value {
     Value::Array(turns)
 }
 
+fn encode_user(text: &str, blocks: Option<&[nanus_domain::ContentBlock]>) -> Value {
+    let content = blocks.map_or_else(|| json!(text), |blocks| {
+        Value::Array(blocks.iter().map(|block| match block {
+            nanus_domain::ContentBlock::Text(text) => json!({"type":"text", "text":text}),
+            nanus_domain::ContentBlock::Image { media_type, data_base64 } => json!({
+                "type":"image_url", "image_url": {"url":format!("data:{media_type};base64,{data_base64}"), "detail": "high"}
+            }),
+        }).collect())
+    });
+    json!({"role":"user", "content":content})
+}
+
 /// Encodes one message.
 fn encode_message(message: &Message) -> Value {
     match message {
         Message::System { text } => json!({ "role": "system", "content": text }),
-        Message::User { text } => json!({ "role": "user", "content": text }),
+        Message::User {
+            text,
+            content_blocks,
+        } => encode_user(text, content_blocks.as_deref()),
         Message::Assistant {
             text, tool_calls, ..
         } => {

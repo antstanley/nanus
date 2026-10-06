@@ -212,6 +212,7 @@ async fn a_conversation_longer_than_the_budget_is_trimmed_with_a_notice() {
     for turn in 0..5_u32 {
         session.append(SessionEvent::TurnStart { turn });
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: format!("question {turn} {}", "x".repeat(300)),
         });
         session.append(SessionEvent::AssistantMessage {

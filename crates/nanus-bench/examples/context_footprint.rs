@@ -295,8 +295,12 @@ fn with_prompts(session: &Session, chars: usize) -> Session {
     let mut copy = Session::new(session.id().clone(), session.created_at_ms(), session.cwd());
     for event in session.log().events() {
         let event = match event {
-            SessionEvent::UserMessage { text } => SessionEvent::UserMessage {
+            SessionEvent::UserMessage {
+                text,
+                content_blocks,
+            } => SessionEvent::UserMessage {
                 text: format!("{text} {}", "context ".repeat(chars.saturating_div(8))),
+                content_blocks: content_blocks.clone(),
             },
             other => other.clone(),
         };

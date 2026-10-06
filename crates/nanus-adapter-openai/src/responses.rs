@@ -132,10 +132,16 @@ fn encode_items(messages: &[Message], original: bool) -> Value {
         match message {
             // Lifted into `instructions`; not repeated here.
             Message::System { .. } => {}
-            Message::User { text } => items.push(json!({
-                "role": "user",
-                "content": [{ "type": "input_text", "text": text }],
-            })),
+            Message::User {
+                text,
+                content_blocks,
+            } => {
+                let content = content_blocks.as_deref().map_or_else(
+                    || vec![json!({"type":"input_text", "text":text})],
+                    |blocks| blocks.iter().map(encode_input_block).collect(),
+                );
+                items.push(json!({"role":"user", "content":content}));
+            }
             Message::Assistant {
                 replay: Some(replay),
                 ..
@@ -167,6 +173,19 @@ fn encode_items(messages: &[Message], original: bool) -> Value {
     }
     items.append(&mut attachments);
     Value::Array(items)
+}
+
+fn encode_input_block(block: &nanus_domain::ContentBlock) -> Value {
+    match block {
+        nanus_domain::ContentBlock::Text(text) => json!({"type":"input_text", "text":text}),
+        nanus_domain::ContentBlock::Image {
+            media_type,
+            data_base64,
+        } => json!({
+            "type":"input_image", "image_url":format!("data:{media_type};base64,{data_base64}"),
+            "detail":"high"
+        }),
+    }
 }
 
 fn encode_assistant(items: &mut Vec<Value>, text: Option<&str>, calls: &[nanus_domain::ToolCall]) {

@@ -130,7 +130,10 @@ mod tests {
     /// A log of `count` fragments, each one call and its result.
     fn log(count: usize) -> SessionLog {
         let mut log = SessionLog::new();
-        log.append(SessionEvent::UserMessage { text: "go".into() });
+        log.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         for index in 0..count {
             let id = format!("c{index}");
             log.append(SessionEvent::AssistantMessage {

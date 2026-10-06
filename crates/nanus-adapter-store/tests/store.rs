@@ -8,7 +8,7 @@
 use std::io::Write as _;
 
 use nanus_adapter_store::{JsonlStore, new_session_id};
-use nanus_domain::{Session, SessionEvent, SessionId, TurnEndReason};
+use nanus_domain::{Session, SessionEvent, SessionId, TurnEndReason, reads_session_version};
 use nanus_ports::{StoreError, StorePort};
 
 /// Builds a session with one completed turn containing `messages`.
@@ -17,6 +17,7 @@ fn session(id: &str, created_at_ms: u64, messages: &[&str]) -> Session {
     session.append(SessionEvent::TurnStart { turn: 0 });
     for text in messages {
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: (*text).to_owned(),
         });
     }
@@ -174,9 +175,11 @@ async fn a_newer_header_version_is_refused_outright() {
     let (_dir, store) = store().await;
     let written = session("future-1", 9, &["a"]);
     store.save(&written).await.expect("save");
-    let body = written
-        .to_jsonl()
-        .replacen("\"version\":2", "\"version\":99", 1);
+    let body = written.to_jsonl().replacen(
+        &format!("\"version\":{}", written.body_version()),
+        "\"version\":99",
+        1,
+    );
     assert!(body.contains("\"version\":99"), "the header was rewritten");
     overwrite_log(&store, written.id(), &body);
     let error = store.load(written.id()).await.expect_err("must fail");
@@ -259,6 +262,34 @@ async fn list_survives_a_damaged_body() {
         summary.title.is_none(),
         "garbage holds no human turn to title"
     );
+}
+
+#[tokio::test]
+async fn a_listing_shows_every_version_a_load_reads_and_no_other() {
+    // A session is written at the lowest version that holds it, so a store holds several at
+    // once; a listing that accepted only the newest would silently hide the rest.
+    let (_dir, store) = store().await;
+    for version in [0, 1, 2, 3, 4, 5, 99] {
+        let written = session(&format!("version-{version}"), 7, &["hello"]);
+        store.save(&written).await.expect("save");
+        let body = written.to_jsonl().replacen(
+            &format!("\"version\":{}", written.body_version()),
+            &format!("\"version\":{version}"),
+            1,
+        );
+        overwrite_log(&store, written.id(), &body);
+        let loaded = store.load(written.id()).await;
+        assert_eq!(loaded.is_ok(), reads_session_version(version), "{version}");
+    }
+    let mut listed: Vec<String> = store
+        .list()
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|summary| summary.id.as_str().to_owned())
+        .collect();
+    listed.sort();
+    assert_eq!(listed, ["version-1", "version-2", "version-3", "version-4"]);
 }
 
 #[tokio::test]
@@ -973,6 +1004,7 @@ async fn rejected_content_never_replaces_the_previous_session() {
     assert_eq!(store.load(original.id()).await.unwrap(), original);
     let mut oversized = original.clone();
     oversized.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "x".repeat(nanus_domain::content::RECORD_BYTES_MAX),
     });
     assert!(store.save(&oversized).await.is_err());

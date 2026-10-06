@@ -62,12 +62,38 @@ mod encoding;
 /// The format tag every session header carries.
 pub const SESSION_FORMAT_TAG: &str = "nanus.session";
 
-/// The session body version this crate writes for an ordinary session, and accepts.
+/// The session body version this crate writes for an ordinary session.
 ///
-/// A session that never enabled managed context is written as version 2 exactly as before, so
-/// legacy sessions keep their bytes. Readers accept versions 1, 2 and
-/// [`SESSION_FORMAT_VERSION_MANAGED`].
+/// A session that neither enabled managed context nor carries typed user content is written as
+/// version 2 exactly as before, so legacy sessions keep their bytes. See [`Session::body_version`]
+/// for how the version a session is written at is chosen, and [`reads_session_version`] for what
+/// is read.
 pub const SESSION_FORMAT_VERSION: u32 = 2;
+
+/// The body version of a session that carries typed user content: a user message's images.
+///
+/// Its own version because a reader that predates it ignores a user message's content blocks
+/// rather than refusing them, so opening such a session in an older build would silently erase
+/// the images a person sent. It can hold everything version 3 holds as well; whether a version-4
+/// session is managed is said by its header, because the version no longer implies it.
+pub const SESSION_FORMAT_VERSION_USER_CONTENT: u32 = 4;
+
+/// The oldest session file format version this crate still reads.
+pub const OLDEST_SESSION_FORMAT_VERSION: u32 = 1;
+
+/// The newest session file format version this crate writes and reads.
+pub const NEWEST_SESSION_FORMAT_VERSION: u32 = SESSION_FORMAT_VERSION_USER_CONTENT;
+
+/// Whether this crate reads a session whose header names `version`.
+///
+/// Every version from [`OLDEST_SESSION_FORMAT_VERSION`] to [`NEWEST_SESSION_FORMAT_VERSION`] is
+/// read: a writer picks the lowest version that holds a session, so a reader that accepted only
+/// the newest would refuse most of what is on disk. Anything that checks a header — the store's
+/// listing as much as a load — asks this rather than comparing against one version.
+#[must_use]
+pub const fn reads_session_version(version: u32) -> bool {
+    version >= OLDEST_SESSION_FORMAT_VERSION && version <= NEWEST_SESSION_FORMAT_VERSION
+}
 
 /// The body version of a session that has enabled managed context.
 ///
@@ -247,8 +273,15 @@ pub enum SessionEvent {
     },
     /// A human turn.
     UserMessage {
-        /// The text the human wrote.
+        /// Display text for the human turn.
         text: String,
+        /// Authoritative ordered content; absence preserves legacy text.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::content::deserialize_blocks"
+        )]
+        content_blocks: Option<Vec<crate::ContentBlock>>,
     },
     /// A model turn.
     AssistantMessage {
@@ -533,59 +566,21 @@ impl SessionLog {
                 continue;
             }
             match event {
-                SessionEvent::UserMessage { text } => {
-                    messages.push((seq, Message::user(text.clone())));
-                }
-                SessionEvent::AssistantMessage {
+                SessionEvent::UserMessage {
                     text,
-                    reasoning,
-                    tool_calls,
-                    replay,
-                    ..
+                    content_blocks,
                 } => {
-                    let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
-                    // A call that no result answers cannot travel: the provider refuses a request
-                    // whose assistant message names a call with nothing answering it. A log can
-                    // hold one — a step records its calls and runs them, so anything that stopped
-                    // the process between the two left the call behind — and a resumed session
-                    // would then send a request no provider accepts, failing every turn from a log
-                    // it can never repair. So the unanswered calls are dropped.
-                    //
-                    // The *message* stays when it has something to say: its text, or a call that
-                    // survived. The reasoning of a tool-using turn travels with the calls it was
-                    // kept for, which is why the condition is not "text only": the provider wants
-                    // that reasoning replayed beside the calls. A turn whose calls *all* went
-                    // unanswered has no such calls, so its reasoning is skipped with them — a
-                    // message carrying nothing but reasoning is one no adapter can encode, and
-                    // keeping it would turn a damaged log into a request that panics the encoder
-                    // rather than into a conversation that resumes.
-                    let calls: Vec<ToolCall> = tool_calls
-                        .iter()
-                        .filter(|call| answered.contains(&&call.id))
-                        .cloned()
-                        .collect();
-                    // Completed opaque Responses reasoning can be empty display text; it still
-                    // belongs in the original source. Unanswered calls cannot carry that replay.
-                    // Such a turn is one only stateless Responses can send: every other encoder
-                    // skips it (`Message::is_replay_only`), so a resume elsewhere still works.
-                    let has_opaque = replay.as_ref().is_some_and(|replay| {
-                        replay.protocol == "openai.responses" && calls.len() == tool_calls.len()
-                    });
-                    if has_text || !calls.is_empty() || has_opaque {
-                        let replay = if calls.len() == tool_calls.len() {
-                            replay.clone()
-                        } else {
-                            None
-                        };
-                        messages.push((
-                            seq,
-                            Message::Assistant {
-                                text: text.clone(),
-                                reasoning: reasoning.clone(),
-                                tool_calls: calls,
-                                replay,
-                            },
-                        ));
+                    messages.push((
+                        seq,
+                        Message::User {
+                            text: text.clone(),
+                            content_blocks: content_blocks.clone(),
+                        },
+                    ));
+                }
+                SessionEvent::AssistantMessage { .. } => {
+                    if let Some(message) = fold_assistant(event, &answered) {
+                        messages.push((seq, message));
                     }
                 }
                 SessionEvent::ToolResult {
@@ -795,6 +790,20 @@ struct SessionHeader {
     /// what `version` guards, so an old log is not a version this build cannot accept.
     #[serde(default)]
     origin: Option<Origin>,
+    /// Whether a version-4 session has enabled managed context.
+    ///
+    /// Version 3 implies it and version 2 excludes it, so it is written only at version 4, and
+    /// only when true: every other header keeps the bytes it had before the field existed.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    managed: bool,
+}
+
+impl SessionHeader {
+    /// Whether the session this header opens may hold managed-context records.
+    const fn is_managed(&self) -> bool {
+        self.version == SESSION_FORMAT_VERSION_MANAGED
+            || (self.version >= SESSION_FORMAT_VERSION_USER_CONTENT && self.managed)
+    }
 }
 
 /// One event line, borrowing its event.
@@ -939,8 +948,8 @@ pub struct Session {
     cwd: String,
     /// The harness configuration it was created under, when one was known.
     origin: Option<Origin>,
-    /// The body version this session is written as: 2, or 3 once managed context is enabled.
-    body_version: u32,
+    /// Whether managed context has been enabled; one-way, like the upgrade that sets it.
+    managed: bool,
     /// The event log.
     log: SessionLog,
     /// How much of the log has been encoded and digested, carried forward as it grows.
@@ -956,31 +965,61 @@ impl Session {
             created_at_ms,
             cwd: cwd.into(),
             origin: None,
-            body_version: SESSION_FORMAT_VERSION,
+            managed: false,
             log: SessionLog::new(),
             encoding: encoding::Encoding::default(),
         }
     }
 
-    /// Returns the body version this session is written as.
+    /// Returns the lowest body version a reader must understand to read this session faithfully,
+    /// which is the version it is written as.
+    ///
+    /// Version 4 when any user message carries typed content, because an older reader would drop
+    /// it silently; otherwise version 3 once managed context is enabled, because an older reader
+    /// would drop those records; otherwise version 2, the bytes every legacy session has always
+    /// had. A version is chosen by what the session holds, so an older build can open everything
+    /// it can read faithfully and refuses the rest.
     #[must_use]
-    pub const fn body_version(&self) -> u32 {
-        self.body_version
+    pub fn body_version(&self) -> u32 {
+        if self.has_typed_user_content() {
+            SESSION_FORMAT_VERSION_USER_CONTENT
+        } else if self.managed {
+            SESSION_FORMAT_VERSION_MANAGED
+        } else {
+            SESSION_FORMAT_VERSION
+        }
+    }
+
+    /// Whether any user message carries typed content.
+    fn has_typed_user_content(&self) -> bool {
+        self.log.events().iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::UserMessage {
+                    content_blocks: Some(_),
+                    ..
+                }
+            )
+        })
     }
 
     /// Returns `true` once the session may hold managed-context records.
+    ///
+    /// Independent of typed user content: a legacy session with images is written as version 4
+    /// and is still a legacy session, saved by its host as one.
     #[must_use]
     pub const fn is_managed_body(&self) -> bool {
-        self.body_version >= SESSION_FORMAT_VERSION_MANAGED
+        self.managed
     }
 
-    /// Upgrades the body to version 3, which is what lets it hold managed-context records.
+    /// Enables the managed-context records, which writes the body as version 3 or later.
     ///
-    /// Idempotent and one-way: nothing downgrades a body, because the records a v3 body holds
-    /// are facts a v2 reader would silently drop.
+    /// Idempotent and one-way: nothing downgrades a body, because the records a managed body
+    /// holds are facts an older reader would silently drop.
     pub fn upgrade_to_managed_body(&mut self) {
-        self.body_version = SESSION_FORMAT_VERSION_MANAGED;
+        self.managed = true;
         assert!(self.is_managed_body());
+        assert!(self.body_version() >= SESSION_FORMAT_VERSION_MANAGED);
     }
 
     /// Records the harness configuration this session is being run under.
@@ -1125,7 +1164,7 @@ impl Session {
     #[must_use]
     pub fn title(&self) -> Option<String> {
         let first = self.log.events().iter().find_map(|event| match event {
-            SessionEvent::UserMessage { text } => Some(text.as_str()),
+            SessionEvent::UserMessage { text, .. } => Some(text.as_str()),
             _ => None,
         })?;
         let line = first.lines().next().unwrap_or_default().trim();
@@ -1196,7 +1235,7 @@ impl Session {
             if !self.is_managed_body() {
                 return Err(SessionError::ManagedRecordInLegacyBody {
                     line,
-                    version: self.body_version,
+                    version: self.body_version(),
                 });
             }
             event
@@ -1204,6 +1243,10 @@ impl Session {
                 .map_err(|code| SessionError::InvalidManagedRecord { line, code })?;
         }
         if let SessionEvent::ToolResult {
+            content_blocks: Some(blocks),
+            ..
+        }
+        | SessionEvent::UserMessage {
             content_blocks: Some(blocks),
             ..
         } = event
@@ -1215,21 +1258,7 @@ impl Session {
                 }
             })?;
         }
-        if let SessionEvent::AssistantMessage {
-            replay: Some(replay),
-            text,
-            tool_calls,
-            ..
-        } = event
-        {
-            replay
-                .validate_response(text.as_deref(), tool_calls)
-                .map_err(|error| SessionError::MalformedEvent {
-                    line,
-                    detail: error.to_string(),
-                })?;
-        }
-        Ok(())
+        validate_event_replay(event, line)
     }
 
     /// Validates and measures the encoding; the body of [`Session::try_to_jsonl`].
@@ -1275,13 +1304,15 @@ impl Session {
 
     /// Builds the header line this session is written with.
     fn header(&self) -> SessionHeader {
+        let version = self.body_version();
         SessionHeader {
             format: SESSION_FORMAT_TAG.to_owned(),
-            version: self.body_version,
+            version,
             id: self.id.as_str().to_owned(),
             created_at_ms: self.created_at_ms,
             cwd: self.cwd.clone(),
             origin: self.origin.clone(),
+            managed: self.managed && version >= SESSION_FORMAT_VERSION_USER_CONTENT,
         }
     }
 
@@ -1340,7 +1371,7 @@ impl Session {
             created_at_ms: self.created_at_ms,
             cwd: self.cwd.clone(),
             origin: self.origin.clone(),
-            body_version: self.body_version,
+            managed: self.managed,
             log: SessionLog::new(),
             encoding: encoding::Encoding::default(),
         };
@@ -1353,10 +1384,7 @@ impl Session {
             events.len(),
             "a prefix holds its count"
         );
-        assert_eq!(
-            clipped.body_version, self.body_version,
-            "the body version is kept"
-        );
+        assert_eq!(clipped.managed, self.managed, "managed context is kept");
         Ok(clipped)
     }
 
@@ -1408,20 +1436,8 @@ impl Session {
                 header = Some(parse_header(line, number)?);
                 continue;
             }
-            if header.as_ref().is_some_and(|header| header.version == 1) {
-                let value: Value =
-                    serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
-                        line: number,
-                        detail: error.to_string(),
-                    })?;
-                if value.get("event").is_some_and(|event| {
-                    event.get("content_blocks").is_some() || event.get("replay").is_some()
-                }) {
-                    return Err(SessionError::MalformedEvent {
-                        line: number,
-                        detail: "version-1 records cannot contain typed content".into(),
-                    });
-                }
+            if let Some(header) = &header {
+                validate_body_version(header.version, line, number)?;
             }
             let parsed: SessionLine =
                 serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
@@ -1429,20 +1445,7 @@ impl Session {
                     detail: error.to_string(),
                 })?;
             check_managed_record(&parsed.event, header.as_ref(), number)?;
-            if let SessionEvent::AssistantMessage {
-                replay: Some(replay),
-                text,
-                tool_calls,
-                ..
-            } = &parsed.event
-            {
-                replay
-                    .validate_response(text.as_deref(), tool_calls)
-                    .map_err(|error| SessionError::MalformedEvent {
-                        line: number,
-                        detail: error.to_string(),
-                    })?;
-            }
+            validate_event_replay(&parsed.event, number)?;
             if parsed.seq.value() != expected {
                 return Err(SessionError::NonContiguousSequence {
                     line: number,
@@ -1455,17 +1458,13 @@ impl Session {
         }
         let header = header.ok_or(SessionError::MissingHeader)?;
         log.assert_contiguous();
-        let body_version = if header.version >= SESSION_FORMAT_VERSION_MANAGED {
-            SESSION_FORMAT_VERSION_MANAGED
-        } else {
-            SESSION_FORMAT_VERSION
-        };
+        let managed = header.is_managed();
         let session = Self {
             id: SessionId::new(header.id),
             created_at_ms: header.created_at_ms,
             cwd: header.cwd,
             origin: header.origin,
-            body_version,
+            managed,
             log,
             encoding: encoding::Encoding::default(),
         };
@@ -1494,13 +1493,20 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
             ),
         });
     }
-    if !matches!(
-        header.version,
-        1 | SESSION_FORMAT_VERSION | SESSION_FORMAT_VERSION_MANAGED
-    ) {
+    if !reads_session_version(header.version) {
         return Err(SessionError::UnsupportedVersion {
             found: header.version,
-            expected: SESSION_FORMAT_VERSION_MANAGED,
+            expected: NEWEST_SESSION_FORMAT_VERSION,
+        });
+    }
+    if header.managed && header.version < SESSION_FORMAT_VERSION_USER_CONTENT {
+        // Only a version-4 header says it; below that the version alone does.
+        return Err(SessionError::BadHeader {
+            line: number,
+            reason: format!(
+                "a version-{} header does not carry `managed`",
+                header.version
+            ),
         });
     }
     if header.id.is_empty() {
@@ -1532,13 +1538,116 @@ fn check_managed_record(
     if !event.is_managed_record() {
         return Ok(());
     }
-    let version = header.map_or(0, |header| header.version);
-    if version < SESSION_FORMAT_VERSION_MANAGED {
+    if !header.is_some_and(SessionHeader::is_managed) {
+        let version = header.map_or(0, |header| header.version);
         return Err(SessionError::ManagedRecordInLegacyBody { line, version });
     }
     event
         .validate_managed()
         .map_err(|code| SessionError::InvalidManagedRecord { line, code })
+}
+
+/// Folds one assistant event into the message a model is shown, or nothing when it has
+/// nothing a model can be sent.
+fn fold_assistant(event: &SessionEvent, answered: &[&ToolCallId]) -> Option<Message> {
+    let SessionEvent::AssistantMessage {
+        text,
+        reasoning,
+        tool_calls,
+        replay,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let has_text = text.as_ref().is_some_and(|value| !value.is_empty());
+    // A call that no result answers cannot travel: the provider refuses a request
+    // whose assistant message names a call with nothing answering it. A log can
+    // hold one — a step records its calls and runs them, so anything that stopped
+    // the process between the two left the call behind — and a resumed session
+    // would then send a request no provider accepts, failing every turn from a log
+    // it can never repair. So the unanswered calls are dropped.
+    //
+    // The *message* stays when it has something to say: its text, or a call that
+    // survived. The reasoning of a tool-using turn travels with the calls it was
+    // kept for, which is why the condition is not "text only": the provider wants
+    // that reasoning replayed beside the calls. A turn whose calls *all* went
+    // unanswered has no such calls, so its reasoning is skipped with them — a
+    // message carrying nothing but reasoning is one no adapter can encode, and
+    // keeping it would turn a damaged log into a request that panics the encoder
+    // rather than into a conversation that resumes.
+    let calls: Vec<ToolCall> = tool_calls
+        .iter()
+        .filter(|call| answered.contains(&&call.id))
+        .cloned()
+        .collect();
+    // Completed opaque Responses reasoning can be empty display text; it still
+    // belongs in the original source. Unanswered calls cannot carry that replay.
+    // Such a turn is one only stateless Responses can send: every other encoder
+    // skips it (`Message::is_replay_only`), so a resume elsewhere still works.
+    let has_opaque = replay.as_ref().is_some_and(|replay| {
+        replay.protocol == "openai.responses" && calls.len() == tool_calls.len()
+    });
+    if has_text || !calls.is_empty() || has_opaque {
+        let replay = if calls.len() == tool_calls.len() {
+            replay.clone()
+        } else {
+            None
+        };
+        return Some(Message::Assistant {
+            text: text.clone(),
+            reasoning: reasoning.clone(),
+            tool_calls: calls,
+            replay,
+        });
+    }
+    None
+}
+
+/// Refuses replay that does not match the response it was recorded with.
+fn validate_event_replay(event: &SessionEvent, line: u64) -> Result<(), SessionError> {
+    if let SessionEvent::AssistantMessage {
+        replay: Some(replay),
+        text,
+        tool_calls,
+        ..
+    } = event
+    {
+        replay
+            .validate_response(text.as_deref(), tool_calls)
+            .map_err(|error| SessionError::MalformedEvent {
+                line,
+                detail: error.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
+/// Refuses typed content a body's version cannot carry.
+///
+/// Old readers ignore unknown user fields, so typed user content below version 4 is refused —
+/// even a null, rather than permit a downgrade that erases the authoritative blocks. Version 1
+/// keeps its stronger restriction on tool blocks and replay.
+fn validate_body_version(version: u32, line: &str, number: u64) -> Result<(), SessionError> {
+    if version >= SESSION_FORMAT_VERSION_USER_CONTENT {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
+            line: number,
+            detail: error.to_string(),
+        })?;
+    let invalid = value.get("event").is_some_and(|event| {
+        (version == 1 && (event.get("content_blocks").is_some() || event.get("replay").is_some()))
+            || (event["type"] == "user_message" && event.get("content_blocks").is_some())
+    });
+    if invalid {
+        return Err(SessionError::MalformedEvent {
+            line: number,
+            detail: format!("version-{version} records cannot contain this typed content"),
+        });
+    }
+    Ok(())
 }
 
 /// Encodes a value as compact JSON.
@@ -1566,6 +1675,7 @@ mod tests {
         session.append(SessionEvent::TurnStart { turn: 0 });
         session.append(SessionEvent::StepStart { turn: 0, step: 0 });
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "read the file".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {
@@ -1737,6 +1847,7 @@ mod tests {
         let answered = call("c2");
         let mut log = SessionLog::new();
         log.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: String::from("hi"),
         });
         log.append(SessionEvent::AssistantMessage {
@@ -1804,6 +1915,7 @@ mod tests {
     fn a_reasoning_only_turn_with_no_surviving_call_is_skipped() {
         let mut log = SessionLog::new();
         log.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: String::from("hi"),
         });
         log.append(SessionEvent::AssistantMessage {
@@ -1997,6 +2109,7 @@ mod tests {
         let mut original = session();
         record_read_turn(&mut original);
         original.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "multi\nline \"quoted\" text".to_owned(),
         });
         let encoded = original.to_jsonl();
@@ -2044,7 +2157,7 @@ mod tests {
         );
         assert_eq!(
             SESSION_FORMAT_VERSION, 2,
-            "typed content requires body version 2; old headers still load"
+            "an ordinary session is body version 2; old headers still load"
         );
     }
 
@@ -2283,7 +2396,7 @@ mod tests {
             decoded,
             Err(SessionError::UnsupportedVersion {
                 found: 99,
-                expected: SESSION_FORMAT_VERSION_MANAGED
+                expected: NEWEST_SESSION_FORMAT_VERSION
             })
         );
     }
@@ -2368,6 +2481,7 @@ mod tests {
         let mut session = session();
         assert_eq!(session.title(), None, "no human turn yet");
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "first line\nsecond line".to_owned(),
         });
         assert_eq!(session.title().as_deref(), Some("first line"));
@@ -2377,6 +2491,7 @@ mod tests {
     fn a_long_title_is_truncated_on_a_character_boundary() {
         let mut session = session();
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "é".repeat(200),
         });
         let title = session.title();
@@ -2390,6 +2505,7 @@ mod tests {
     fn a_blank_first_turn_produces_no_title() {
         let mut session = session();
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "   \n  ".to_owned(),
         });
         assert_eq!(session.title(), None);

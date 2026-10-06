@@ -767,13 +767,16 @@ mod tests {
         before.upgrade_to_managed_body();
         before.append(SessionEvent::UserMessage {
             text: "an earlier question".to_owned(),
+            content_blocks: None,
         });
         before.append(SessionEvent::UserMessage {
             text: "and another".to_owned(),
+            content_blocks: None,
         });
         let mut after = before.clone();
         after.append(SessionEvent::UserMessage {
             text: "this turn".to_owned(),
+            content_blocks: None,
         });
         (before, after)
     }
@@ -1074,15 +1077,24 @@ mod tests {
     fn a_reconciled_file_must_be_a_prefix_of_the_held_session() {
         let mut held = Session::new(SessionId::new("s"), 0, "/w");
         held.upgrade_to_managed_body();
-        held.append(SessionEvent::UserMessage { text: "a".into() });
+        held.append(SessionEvent::UserMessage {
+            text: "a".into(),
+            content_blocks: None,
+        });
         held.append(SessionEvent::TurnEnd {
             turn: 1,
             reason: TurnEndReason::Interrupted,
         });
         let mut disk = Session::new(SessionId::new("s"), 0, "/w");
         disk.upgrade_to_managed_body();
-        disk.append(SessionEvent::UserMessage { text: "a".into() });
-        disk.append(SessionEvent::UserMessage { text: "b".into() });
+        disk.append(SessionEvent::UserMessage {
+            text: "a".into(),
+            content_blocks: None,
+        });
+        disk.append(SessionEvent::UserMessage {
+            text: "b".into(),
+            content_blocks: None,
+        });
         let stored = |session: &Session| ExpectedCheckpoint::Stored {
             body_version: 3,
             file_blake3: session.prefix_digest(2).expect("encodes"),

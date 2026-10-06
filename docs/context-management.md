@@ -38,9 +38,9 @@ encoded-byte, role, reference, quota and provider rule below is checked in code.
 valid only in managed mode, and nothing turns managed mode on implicitly.
 
 A policy change is a human or host action taken while the session is idle. It is recorded as a
-`context/mode` record and checkpointed before it is acknowledged. Enabling upgrades the session
-body to version 3 through the checkpoint; disabling never downgrades it and never deletes past
-records. Activation refuses — without changing the session — when the selected model path has no
+`context/mode` record and checkpointed before it is acknowledged. Enabling makes the body managed
+through the checkpoint — version 3, or version 4 marked managed when it holds typed user content;
+disabling never downgrades it and never deletes past records. Activation refuses — without changing the session — when the selected model path has no
 managed preparation, when its declared output ceiling is below the reservation, when a
 registered tool already uses a context tool's name, or, for capture, when there is no archive or
 the shell cannot capture.
@@ -266,7 +266,7 @@ renamed, so a crash still leaves the old file or the new one and never a torn ta
 | `CommitOutcomeUnknown` | Replacement may have happened | Reads the disk back under the same claim: the candidate installs, the previous file keeps the old projection, anything else freezes the session |
 
 `run_turn_with_runtime` returns the ordinary result **and** a `PersistenceState`, on failure too.
-Hosts never save a version-3 session themselves: `Acknowledged` permits no duplicate save,
+Hosts never save a managed session themselves: `Acknowledged` permits no duplicate save,
 `Unsaved` permits nothing beyond the runner's one terminal attempt, and `Unknown` permits only
 reconciliation. Checkpoint success guarantees process-crash atomic replacement; the stronger
 power-loss grade is not claimed.
@@ -279,8 +279,9 @@ design does not promise exactly-once external effects.
 
 Version 3 adds six records — `context/mode`, `context/revision`, `context/decision`,
 `artifact/published`, `request/attempt`, `context/recovery` — each validated on write and on read.
-Readers accept versions 1, 2 and 3; a version-1 or version-2 body that carries one of them is
-refused, and a future version is refused before anything is mutated.
+A managed session is version 3, or version 4 with `"managed":true` in its header when it also
+holds typed user content. Readers accept versions 1 to 4; a body that is not managed and carries
+one of these records is refused, and a future version is refused before anything is mutated.
 
 ## Evidence, recall and file windows
 
@@ -355,7 +356,7 @@ at run time.
 ## Human controls and clients
 
 The command line takes the three flags in [configuration](#configuration-activation-and-limits).
-A version-3 session run by `nanus run` is saved only through its checkpoints; the command reports
+A managed session run by `nanus run` is saved only through its checkpoints; the command reports
 an unsaved or uncertain outcome on stderr, keeps stdout for the answer, and exits non-zero.
 
 The link adds a `context` request with `status` and `reset` actions on a held session, and the

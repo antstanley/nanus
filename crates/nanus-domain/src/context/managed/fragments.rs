@@ -246,7 +246,10 @@ mod tests {
     #[test]
     fn sibling_calls_finishing_out_of_order_stay_one_fragment() {
         let mut log = SessionLog::new();
-        log.append(SessionEvent::UserMessage { text: "go".into() });
+        log.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         log.append(assistant(None, vec![call("a", "read"), call("b", "grep")]));
         log.append(result("b"));
         log.append(result("a"));
@@ -272,7 +275,10 @@ mod tests {
     #[test]
     fn an_unanswered_call_is_unsettled_until_its_turn_ends() {
         let mut log = SessionLog::new();
-        log.append(SessionEvent::UserMessage { text: "go".into() });
+        log.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         log.append(assistant(
             Some("looking"),
             vec![call("a", "read"), call("b", "read")],

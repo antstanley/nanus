@@ -367,8 +367,15 @@ design docs too.
 - **A name is an alias for a store key, and one session has one name.** Naming is
   refused rather than moved when the name is held, and the alias lives in the
   session's own directory (`name`), so it cannot be lost with a shared table.
-- **Bodies are version 2; readers accept 1 and 2.** Typed tool blocks and signed Messages
-  replay are bounded. Version 1 cannot smuggle these fields. Store saves use `try_to_jsonl`;
+- **A body is written at the lowest version that holds it; readers accept 1 to 4.** Version 4 when
+  a user message carries typed content, version 3 when managed context is enabled, version 2
+  otherwise, so an older build can still open what it can read faithfully. Managed and typed user
+  content are independent: version 3 implies managed, and a version-4 header says
+  `"managed":true` when it is. Anything that checks a header — the store's listing included —
+  asks `reads_session_version`, never "is it the newest". Typed tool blocks and signed Messages
+  replay are bounded. Version 1 cannot smuggle these fields; versions 1 to 3 cannot smuggle typed
+  user content.
+  Store saves use `try_to_jsonl`;
   failed saves must leave the original intact. Image capability defaults Unknown until exact
   profile wire/reload and live-follow-up evidence pass. Do not guess support from a model label.
 - **For OpenAI, Automatic routing follows the model.** `gpt-5.6` and later (read from the id's version) go
@@ -388,7 +395,8 @@ design docs too.
 - **Managed context is opt-in, and a legacy session must not notice it exists.** A session that
   never records a `context/mode` record keeps its version-2 body, request bytes, schemas, tool count
   and terminal save; tests pin each adapter's ordinary body and compare a legacy run through both
-  runner entry points. A version-3 session is saved only through its `SessionCheckpoint`:
+  runner entry points. A managed session (version 3, or version 4 marked managed) is saved only
+  through its `SessionCheckpoint`:
   `nanus run` and the link never call `StorePort::save` for one, and act on the returned
   `PersistenceState` (no duplicate save after `Acknowledged`, nothing after `Unsaved`, only
   reconciliation after `Unknown`). Every original user message survives managed selection;

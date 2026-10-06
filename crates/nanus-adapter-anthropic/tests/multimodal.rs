@@ -14,6 +14,7 @@ const JPEG: &[u8] = include_bytes!("../../nanus-domain/tests/data/tiny-green-tri
 fn fixture(model: &str) -> Session {
     let mut session = Session::new(SessionId::new("wire-pixels"), 123, "/caller");
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "Inspect the fictional images".into(),
     });
     let calls: Vec<_> = ["first", "sibling", "last"]
@@ -146,5 +147,105 @@ async fn unpromoted_images_are_refused_before_trying_the_configured_http_endpoin
             matches!(events.as_slice(), [nanus_ports::LlmEvent::Error(message)] if message.contains("Unknown")),
             "{model}: {events:?}"
         );
+    }
+}
+
+fn direct_user_session() -> Session {
+    let mut session = Session::new(SessionId::new("human-pixels"), 123, "/fictional");
+    let mut blocks = vec![ContentBlock::Text("question".into())];
+    for (media, bytes) in [("image/png", PNG), ("image/jpeg", JPEG)] {
+        blocks.push(ContentBlock::Image {
+            media_type: media.into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        blocks.push(ContentBlock::Text(format!("after {media}")));
+    }
+    session.append(SessionEvent::UserMessage {
+        text: "DISPLAY SUMMARY ONLY".into(),
+        content_blocks: Some(blocks),
+    });
+    session
+}
+
+#[tokio::test]
+async fn direct_user_images_preserve_order_and_pixels_after_store_reload_without_invented_calls() {
+    for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+        let adapter = nanus_adapter_anthropic::AnthropicLlm::new(
+            nanus_adapter_anthropic::AnthropicConfig::new(model, "fixture-key"),
+        )
+        .unwrap();
+        let original = direct_user_session();
+        for session in [original.clone(), reload(&original).await] {
+            let request = ChatRequest::new(model, session.derive_messages()).with_max_tokens(2048);
+            let body = adapter.encode(&request);
+            assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+            let content = &body["messages"][0]["content"];
+            assert_eq!(content.as_array().unwrap().len(), 5);
+            assert_eq!(content[0]["text"], "question");
+            assert_eq!(content[2]["text"], "after image/png");
+            assert_eq!(content[4]["text"], "after image/jpeg");
+            for (index, media, bytes) in [(1, "image/png", PNG), (3, "image/jpeg", JPEG)] {
+                assert_eq!(content[index]["source"]["media_type"], media);
+                assert_eq!(
+                    decoded(content[index]["source"]["data"].as_str().unwrap()),
+                    bytes
+                );
+            }
+            assert!(request.tools.is_empty());
+            assert!(!body.to_string().contains("DISPLAY SUMMARY ONLY"));
+            assert!(!body.to_string().contains("function_call"));
+            assert!(!body.to_string().contains("tool_use_id"));
+        }
+    }
+}
+
+#[test]
+fn shared_admission_counts_user_and_tool_pixels_and_validates_typed_text() {
+    use nanus_domain::Message;
+    use nanus_ports::capabilities::{validate_history_image_input, validate_image_input};
+    let model = "claude-opus-5-5";
+    let adapter = nanus_adapter_anthropic::AnthropicLlm::new(
+        nanus_adapter_anthropic::AnthropicConfig::new(model, "fixture-key"),
+    )
+    .unwrap();
+    let caps = adapter.capabilities(model);
+    let mut request =
+        ChatRequest::new(model, direct_user_session().derive_messages()).with_max_tokens(2048);
+    assert!(validate_image_input(caps, &request).is_ok());
+    let estimate = adapter.estimate_request(&request).unwrap();
+    assert_eq!(estimate.images, 2);
+    assert!(estimate.input_tokens > 0);
+    assert!(validate_image_input(nanus_ports::ModelCapabilities::default(), &request).is_err());
+    request.model = "unknown-model".into();
+    assert!(validate_image_input(caps, &request).is_err());
+    request.model = model.into();
+    let blocks = request.messages[0].content_blocks().unwrap().to_vec();
+    for _ in 0..3 {
+        request.messages.push(Message::Tool {
+            call_id: ToolCallId::new("fixture"),
+            content: "summary".into(),
+            content_blocks: Some(blocks.clone()),
+            is_error: false,
+        });
+    }
+    assert!(validate_image_input(caps, &request).is_ok());
+    assert_eq!(adapter.estimate_request(&request).unwrap().images, 8);
+    request.messages.push(request.messages[0].clone());
+    assert!(validate_image_input(caps, &request).is_err());
+    assert!(validate_history_image_input(caps, model, &request.messages).is_ok());
+    for invalid in [
+        vec![],
+        vec![ContentBlock::Text("x".into()); 33],
+        vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data_base64: "broken".into(),
+        }],
+    ] {
+        request.messages = vec![Message::User {
+            text: "summary".into(),
+            content_blocks: Some(invalid),
+        }];
+        assert!(validate_image_input(caps, &request).is_err());
+        assert!(adapter.estimate_request(&request).is_err());
     }
 }

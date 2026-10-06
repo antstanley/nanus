@@ -698,6 +698,7 @@ impl AgentRunner {
         let reservation = self.reserve_turn_records(session, turn, message, progress, control)?;
         session.append(SessionEvent::TurnStart { turn });
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: message.to_owned(),
         });
         let steps = self

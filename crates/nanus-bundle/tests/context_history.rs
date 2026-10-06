@@ -62,6 +62,7 @@ fn history() -> Session {
     for index in 0..9 {
         let id = ToolCallId::new(format!("call-{index}"));
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: format!("old question {index}"),
         });
         session.append(SessionEvent::AssistantMessage {
@@ -171,6 +172,7 @@ async fn an_invalid_original_image_is_not_hidden_by_fitting_and_does_not_reach_d
     // Keep a malformed original observation in memory: boundary validation must reject it even
     // if the oldest image turn could otherwise be dropped. No serialized fixture can encode it.
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "another old question".into(),
     });
     let id = ToolCallId::new("malformed");

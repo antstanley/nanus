@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Nanus context-management policy version 1 boundary payloads; session body v3. Schema validity is necessary, never sufficient: semantic, encoded-byte, role, reference, quota and provider checks in docs/context-management.md are mandatory.",
+  "$comment": "Nanus context-management policy version 1 boundary payloads; managed session bodies (v3, or v4 marked managed). Schema validity is necessary, never sufficient: semantic, encoded-byte, role, reference, quota and provider checks in docs/context-management.md are mandatory.",
   "$ref": "#/$defs/ContextEvent",
   "$defs": {
     "Digest": {

@@ -100,7 +100,7 @@ fn sources<'a>(session: &'a Session, count: u64) -> Vec<Source<'a>> {
             }
         };
         match event {
-            SessionEvent::UserMessage { text } => push(SourceField::UserText, Some(text)),
+            SessionEvent::UserMessage { text, .. } => push(SourceField::UserText, Some(text)),
             SessionEvent::AssistantMessage {
                 text, reasoning, ..
             } => {

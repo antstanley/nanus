@@ -81,7 +81,7 @@ pub fn event_text(
 ) -> Option<&str> {
     let event = log.events().get(usize::try_from(seq).ok()?)?;
     match (event, field) {
-        (SessionEvent::UserMessage { text }, SourceField::UserText) => Some(text),
+        (SessionEvent::UserMessage { text, .. }, SourceField::UserText) => Some(text),
         (SessionEvent::AssistantMessage { text, .. }, SourceField::AssistantText) => {
             text.as_deref()
         }
@@ -167,6 +167,7 @@ mod tests {
         let mut log = SessionLog::new();
         log.append(SessionEvent::UserMessage {
             text: "keep the API stable".to_owned(),
+            content_blocks: None,
         });
         log
     }

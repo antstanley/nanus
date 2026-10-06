@@ -46,6 +46,7 @@ fn gif() -> Vec<u8> {
 fn session(media: &str, bytes: &[u8], model: &str) -> Session {
     let mut session = Session::new(SessionId::new("live-vision"), 1, "/live");
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "Two inspect calls ran; one returned an image. Look at that image. What shape is it and what colour? \
                Answer in one short sentence."
             .into(),
@@ -100,6 +101,7 @@ fn follow_up(mut session: Session, answer: &str, model: &str) -> Session {
         effort: None,
     });
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "Which of the two inspect calls returned that image? Reply with only the value of its `label` argument."
             .into(),
     });

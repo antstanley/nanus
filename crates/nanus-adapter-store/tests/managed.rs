@@ -10,7 +10,7 @@ use nanus_domain::context::managed::{
     ArtifactId, ArtifactReceipt, CaptureReason, CaptureStatus, CaptureStream, Digest, Durability,
     ErrorCode, RawEncoding, limits,
 };
-use nanus_domain::{Session, SessionEvent, SessionId, ToolCallId, TurnEndReason};
+use nanus_domain::{ContentBlock, Session, SessionEvent, SessionId, ToolCallId, TurnEndReason};
 use nanus_ports::{
     ArtifactError, ArtifactStore, CaptureFailure, CaptureLease, CaptureLimits, CheckpointError,
     CheckpointReason, CheckpointView, ExpectedCheckpoint, FinalizedArtifact, StoreError, StorePort,
@@ -27,6 +27,7 @@ fn session(id: &str, messages: &[&str]) -> Session {
     for text in messages {
         session.append(SessionEvent::UserMessage {
             text: (*text).to_owned(),
+            content_blocks: None,
         });
     }
     session.append(SessionEvent::TurnEnd {
@@ -234,6 +235,7 @@ async fn a_checkpoint_round_trips_from_absent_to_stored_and_on() {
 
     candidate.append(SessionEvent::UserMessage {
         text: String::from("again"),
+        content_blocks: None,
     });
     let second = commit(&store, &candidate, &next, &[])
         .await
@@ -261,6 +263,7 @@ async fn successive_checkpoints_leave_exactly_what_a_whole_write_would() {
     for round in 0..3 {
         candidate.append(SessionEvent::UserMessage {
             text: format!("round {round}"),
+            content_blocks: None,
         });
         let receipt = commit(&store, &candidate, &expected, &[])
             .await
@@ -278,6 +281,7 @@ async fn successive_checkpoints_leave_exactly_what_a_whole_write_would() {
     assert_eq!(reread, candidate);
     reread.append(SessionEvent::UserMessage {
         text: String::from("after a restart"),
+        content_blocks: None,
     });
     let receipt = commit(&store, &reread, &expected, &[])
         .await
@@ -285,6 +289,66 @@ async fn successive_checkpoints_leave_exactly_what_a_whole_write_would() {
     let bytes = file_bytes(&store, reread.id());
     assert_eq!(bytes, reread.try_to_jsonl().expect("encodes").into_bytes());
     assert_eq!(receipt.frontier.prefix_blake3, Digest::of(&bytes));
+    store.release_lock(candidate.id());
+}
+
+/// A header can change without its version moving: a version-4 session (it holds a typed user
+/// message) that then enables managed context gains `"managed":true` and stays version 4. The
+/// commit cannot append to the old header, so it checks the stored events and writes it whole.
+#[tokio::test]
+async fn a_header_that_changes_at_the_same_version_is_written_whole() {
+    let (_dir, store) = store().await;
+    let mut candidate = session("pictured", &["hello"]);
+    candidate.append(SessionEvent::UserMessage {
+        text: String::from("look"),
+        content_blocks: Some(vec![ContentBlock::Text(String::from("a typed block"))]),
+    });
+    assert_eq!(candidate.body_version(), 4);
+    assert!(!candidate.is_managed_body());
+    store
+        .lock(candidate.id(), "a writer")
+        .await
+        .expect("claimed");
+    let receipt = commit(&store, &candidate, &ExpectedCheckpoint::Absent, &[])
+        .await
+        .expect("committed");
+    let expected = ExpectedCheckpoint::after(&receipt, candidate.body_version());
+
+    candidate.upgrade_to_managed_body();
+    candidate.append(SessionEvent::UserMessage {
+        text: String::from("now managed"),
+        content_blocks: None,
+    });
+    assert_eq!(candidate.body_version(), 4, "the version does not move");
+    let receipt = commit(&store, &candidate, &expected, &[])
+        .await
+        .expect("committed whole");
+    let bytes = file_bytes(&store, candidate.id());
+    assert_eq!(
+        bytes,
+        candidate.try_to_jsonl().expect("encodes").into_bytes()
+    );
+    assert_eq!(receipt.frontier.prefix_blake3, Digest::of(&bytes));
+    let reread = store.load(candidate.id()).await.expect("load");
+    assert!(reread.is_managed_body(), "the header says so now");
+    assert_eq!(reread, candidate);
+
+    // Pair: a candidate that does not extend what is stored is still refused, header or not.
+    let mut rewritten = session("pictured", &["something else"]);
+    rewritten.upgrade_to_managed_body();
+    let next = ExpectedCheckpoint::after(&receipt, candidate.body_version());
+    for _ in 0..candidate.event_count() {
+        rewritten.append(SessionEvent::TurnStart { turn: 9 });
+    }
+    assert_eq!(
+        commit(&store, &rewritten, &next, &[]).await,
+        Err(CheckpointError::NotCommitted(ErrorCode::StaleBase))
+    );
+    assert_eq!(
+        file_bytes(&store, candidate.id()),
+        bytes,
+        "the file is untouched"
+    );
     store.release_lock(candidate.id());
 }
 
@@ -313,6 +377,7 @@ async fn a_file_changed_in_place_after_a_checkpoint_is_read_back_rather_than_tru
     let mut next = candidate.clone();
     next.append(SessionEvent::UserMessage {
         text: String::from("more"),
+        content_blocks: None,
     });
     assert_eq!(
         commit(&store, &next, &expected, &[]).await,
@@ -361,6 +426,7 @@ async fn a_checkpoint_over_a_stale_identity_is_not_committed_and_changes_nothing
     let mut next = candidate.clone();
     next.append(SessionEvent::UserMessage {
         text: String::from("more"),
+        content_blocks: None,
     });
     assert_eq!(
         commit(&store, &next, &expected, &[]).await,
@@ -459,6 +525,7 @@ fn with_escaped_record(base: &Session, bound: usize, extra: usize) -> Session {
     let mut probe = base.clone();
     probe.append(SessionEvent::UserMessage {
         text: String::new(),
+        content_blocks: None,
     });
     let framing = probe
         .to_jsonl()
@@ -474,7 +541,10 @@ fn with_escaped_record(base: &Session, bound: usize, extra: usize) -> Session {
     let plain = wanted.checked_rem(6).expect("six");
     let text = "\u{1}".repeat(escapes) + &"a".repeat(plain);
     let mut session = base.clone();
-    session.append(SessionEvent::UserMessage { text });
+    session.append(SessionEvent::UserMessage {
+        text,
+        content_blocks: None,
+    });
     let line = session
         .to_jsonl()
         .len()
@@ -516,6 +586,7 @@ async fn a_session_one_byte_over_its_bound_is_not_committed_and_the_original_sur
     {
         big.append(SessionEvent::UserMessage {
             text: "a".repeat(filler),
+            content_blocks: None,
         });
         estimate = estimate.checked_add(record).expect("a length");
     }
@@ -1331,6 +1402,7 @@ async fn a_checkpoint_that_rewrites_stored_history_is_refused() {
     let mut rewritten = managed("history", &["a different question"]);
     rewritten.append(SessionEvent::UserMessage {
         text: String::from("more"),
+        content_blocks: None,
     });
     let refused = commit(&store, &rewritten, &stored, &[]).await;
     assert_eq!(
@@ -1344,6 +1416,7 @@ async fn a_checkpoint_that_rewrites_stored_history_is_refused() {
     upgraded.upgrade_to_managed_body();
     upgraded.append(SessionEvent::UserMessage {
         text: String::from("more"),
+        content_blocks: None,
     });
     let receipt = commit(&store, &upgraded, &stored, &[])
         .await

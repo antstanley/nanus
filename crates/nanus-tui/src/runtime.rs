@@ -8003,6 +8003,7 @@ mod tests {
         let recorded = SessionId::new("recorded");
         let mut saved = Session::new(recorded, 1, "/work");
         saved.append(nanus_domain::SessionEvent::UserMessage {
+            content_blocks: None,
             text: "hello".to_owned(),
         });
         block_on(store.save(&saved)).expect("save");
@@ -8072,6 +8073,7 @@ mod tests {
         for text in ["first", "second", "third", "fourth"] {
             stored.append(nanus_domain::SessionEvent::UserMessage {
                 text: text.to_owned(),
+                content_blocks: None,
             });
         }
         let at_two = frontier_of(&stored, 2);
@@ -8093,6 +8095,7 @@ mod tests {
         for text in ["someone", "else"] {
             other.append(nanus_domain::SessionEvent::UserMessage {
                 text: text.to_owned(),
+                content_blocks: None,
             });
         }
         let (shown, notice) = read_through(Ok(other), &id, &at_two, "/work");
@@ -8150,6 +8153,7 @@ mod tests {
         let id = SessionId::new("live");
         let mut saved = Session::new(id.clone(), 1_700_000_000_000, "/work");
         saved.append(nanus_domain::SessionEvent::UserMessage {
+            content_blocks: None,
             text: "read the file".to_owned(),
         });
         block_on(store.save(&saved)).expect("save");

@@ -530,7 +530,10 @@ mod tests {
     #[test]
     fn the_latest_two_substantive_fragments_and_unsettled_work_are_protected() {
         let mut session = session();
-        session.append(SessionEvent::UserMessage { text: "go".into() });
+        session.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         for id in ["a", "b", "c"] {
             work(&mut session, id, "read");
         }
@@ -546,7 +549,10 @@ mod tests {
     #[test]
     fn revisions_must_chain_and_a_decision_cannot_be_accepted_twice() {
         let mut session = session();
-        session.append(SessionEvent::UserMessage { text: "go".into() });
+        session.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         work(&mut session, "a", "read");
         let first = revision(&session, 1, 0, vec![FragmentId::new(1)]);
         session.append(SessionEvent::ContextRevision { payload: first });
@@ -574,7 +580,10 @@ mod tests {
     #[test]
     fn a_reset_recovers_an_invalid_projection_and_keeps_numbers_monotonic() {
         let mut session = session();
-        session.append(SessionEvent::UserMessage { text: "go".into() });
+        session.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         work(&mut session, "a", "read");
         let first = revision(&session, 1, 0, Vec::new());
         session.append(SessionEvent::ContextRevision { payload: first });
@@ -613,7 +622,10 @@ mod tests {
             AttemptPhase, ContextDecision, DecisionOutcome, RequestAttemptRecord, SelectionIdentity,
         };
         let mut session = session();
-        session.append(SessionEvent::UserMessage { text: "go".into() });
+        session.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         let first = revision(&session, 1, 0, Vec::new());
         session.append(SessionEvent::ContextRevision { payload: first });
         let accepted = ContextDecision {
@@ -676,10 +688,14 @@ mod tests {
     #[test]
     fn a_frontier_detects_a_changed_prefix() {
         let mut session = session();
-        session.append(SessionEvent::UserMessage { text: "go".into() });
+        session.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         let at_one = frontier(&session, 0).unwrap_or_else(|_| unreachable!());
         session.append(SessionEvent::UserMessage {
             text: "more".into(),
+            content_blocks: None,
         });
         assert!(
             check_frontier(&session, &at_one).is_ok(),
@@ -687,7 +703,10 @@ mod tests {
         );
         let mut other = Session::new(SessionId::new("s"), 0, "/w");
         other.upgrade_to_managed_body();
-        other.append(SessionEvent::UserMessage { text: "GO".into() });
+        other.append(SessionEvent::UserMessage {
+            text: "GO".into(),
+            content_blocks: None,
+        });
         assert_eq!(check_frontier(&other, &at_one), Err(ErrorCode::StaleBase));
         let mut future = at_one;
         future.event_count = 9;
@@ -698,7 +717,10 @@ mod tests {
     fn recovery_closes_an_open_turn_and_marks_unmatched_intents_unknown() {
         let mut session = session();
         session.append(SessionEvent::TurnStart { turn: 1 });
-        session.append(SessionEvent::UserMessage { text: "go".into() });
+        session.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
         let plan = recovery_plan(&session, &ManagedState::default(), 5);
         let Ok(Some(plan)) = plan else {
             panic!("an open turn needs recovery: {plan:?}");

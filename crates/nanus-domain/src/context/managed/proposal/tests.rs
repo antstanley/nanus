@@ -12,7 +12,10 @@ use crate::{SessionId, ToolCall, ToolCallId, ToolName};
 fn session() -> Session {
     let mut session = Session::new(SessionId::new("s"), 0, "/w");
     session.upgrade_to_managed_body();
-    session.append(SessionEvent::UserMessage { text: "go".into() });
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
     for id in ["a", "b", "c", "d"] {
         session.append(SessionEvent::AssistantMessage {
             replay: None,
@@ -141,6 +144,7 @@ fn stale_or_invalid_proposals_are_refused() {
     let mut later = session.clone();
     later.append(SessionEvent::UserMessage {
         text: "a new constraint".into(),
+        content_blocks: None,
     });
     assert_eq!(
         staged(&later, &input),

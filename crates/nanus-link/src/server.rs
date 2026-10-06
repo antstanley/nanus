@@ -3053,6 +3053,7 @@ mod tests {
         let mut written = session.session.borrow().clone();
         written.append(SessionEvent::UserMessage {
             text: "do it".to_owned(),
+            content_blocks: None,
         });
         session.saved(context::frontier_of(&written));
         assert!(session.turn_frames().is_empty());
@@ -3091,7 +3092,7 @@ mod tests {
         let mut shown: Vec<String> = Vec::new();
         for event in prefix.log().events() {
             match event {
-                SessionEvent::UserMessage { text } => shown.push(format!("user:{text}")),
+                SessionEvent::UserMessage { text, .. } => shown.push(format!("user:{text}")),
                 SessionEvent::AssistantMessage {
                     text: Some(text), ..
                 } => shown.push(format!("answer:{text}")),
@@ -3229,6 +3230,7 @@ mod tests {
             session.upgrade_to_managed_body();
             session.append(SessionEvent::UserMessage {
                 text: "earlier".to_owned(),
+                content_blocks: None,
             });
             session.append(assistant("before"));
             let saved = registry.agent.store.save(&session).await;
@@ -3246,6 +3248,7 @@ mod tests {
             session.append(SessionEvent::TurnStart { turn: 0 });
             session.append(SessionEvent::UserMessage {
                 text: "go".to_owned(),
+                content_blocks: None,
             });
             checkpoint(&registry, &mut progress, &session).await;
             progress.text("Hel");
@@ -3318,6 +3321,7 @@ mod tests {
             }
             forged.append(SessionEvent::UserMessage {
                 text: "padding".to_owned(),
+                content_blocks: None,
             });
             assert!(
                 read_through(&forged, late).is_err(),

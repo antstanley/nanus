@@ -79,6 +79,7 @@ fn session(text: &str, artifact: Option<&[u8]>) -> Session {
     session.upgrade_to_managed_body();
     session.append(SessionEvent::UserMessage {
         text: text.to_owned(),
+        content_blocks: None,
     });
     if let Some(bytes) = artifact {
         session.append(SessionEvent::ArtifactPublished {
@@ -333,6 +334,7 @@ fn paging_a_search_reads_its_own_snapshot_after_the_session_grows() {
         // The turn appends between pages.
         session.append(SessionEvent::UserMessage {
             text: "more".into(),
+            content_blocks: None,
         });
         match page.next_cursor {
             Some(next) => cursor = Some(next),
@@ -355,6 +357,7 @@ fn a_window_shorter_than_the_needle_resumes_where_it_started() {
     );
     session.append(SessionEvent::UserMessage {
         text: "NEEDLE then more".into(),
+        content_blocks: None,
     });
     let scope = scope(&session, None, b"key");
     let first = futures::executor::block_on(recall(&scope, &search("NEEDLE", None, 5)));

@@ -312,6 +312,7 @@ impl AgentRunner {
         session.append(SessionEvent::TurnStart { turn: index });
         session.append(SessionEvent::UserMessage {
             text: message.to_owned(),
+            content_blocks: None,
         });
         let phase = dispatch::Phase {
             position: (index, 0),

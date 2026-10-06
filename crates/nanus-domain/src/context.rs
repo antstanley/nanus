@@ -106,9 +106,21 @@ pub fn estimate(messages: &[Message]) -> u32 {
 /// Estimates the tokens one message costs.
 #[must_use]
 pub fn estimate_message(message: &Message) -> u32 {
+    // This fallback has no provider image profile. Count full typed bytes conservatively;
+    // real adapters replace it with their exact wire/visual estimator before dispatch.
+    if let Message::User {
+        content_blocks: Some(blocks),
+        ..
+    } = message
+    {
+        return crate::content::serialized_size(blocks, crate::content::RECORD_BYTES_MAX)
+            .ok()
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .map_or(u32::MAX, |bytes| bytes.saturating_add(TOKENS_PER_MESSAGE));
+    }
     let mut chars = 0_usize;
     match message {
-        Message::System { text } | Message::User { text } => {
+        Message::System { text } | Message::User { text, .. } => {
             chars = chars.saturating_add(text.chars().count());
         }
         Message::Assistant {

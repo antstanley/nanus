@@ -20,7 +20,7 @@ use core::fmt;
 mod replay_context;
 mod responses_replay;
 
-pub use replay_context::ReplayContext;
+pub use replay_context::{ReplayContext, ReplayInstructions};
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
@@ -466,8 +466,10 @@ pub enum Message {
     },
     /// A human turn.
     User {
-        /// The turn text.
+        /// Display text; typed blocks, when present, are the authoritative model input.
         text: String,
+        /// Ordered text and inline images; absence preserves legacy text semantics.
+        content_blocks: Option<Vec<crate::ContentBlock>>,
     },
     /// A model turn.
     Assistant {
@@ -505,7 +507,41 @@ impl Message {
     /// Builds a user message.
     #[must_use]
     pub fn user(text: impl Into<String>) -> Self {
-        Self::User { text: text.into() }
+        Self::User {
+            text: text.into(),
+            content_blocks: None,
+        }
+    }
+
+    /// Builds a human turn from validated ordered text and inline images.
+    /// # Errors
+    /// Refuses malformed media, empty blocks and content exceeding library bounds.
+    pub fn user_with_content(
+        blocks: Vec<crate::ContentBlock>,
+    ) -> Result<Self, crate::content::ContentError> {
+        crate::content::validate_blocks(&blocks)?;
+        assert!(!blocks.is_empty());
+        assert!(blocks.len() <= crate::content::CONTENT_BLOCKS_MAX);
+        let text = blocks
+            .iter()
+            .map(crate::ContentBlock::render_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(Self::User {
+            text,
+            content_blocks: Some(blocks),
+        })
+    }
+
+    /// Borrows authoritative typed user or tool content without inferring media from text.
+    #[must_use]
+    pub fn content_blocks(&self) -> Option<&[crate::ContentBlock]> {
+        match self {
+            Self::User { content_blocks, .. } | Self::Tool { content_blocks, .. } => {
+                content_blocks.as_deref()
+            }
+            Self::System { .. } | Self::Assistant { .. } => None,
+        }
     }
 
     /// Builds an assistant message.
@@ -580,7 +616,7 @@ impl Message {
     #[must_use]
     pub fn text(&self) -> Option<&str> {
         match self {
-            Self::System { text } | Self::User { text } => Some(text),
+            Self::System { text } | Self::User { text, .. } => Some(text),
             Self::Assistant { text, .. } => text.as_deref(),
             Self::Tool { content, .. } => Some(content),
         }
@@ -611,7 +647,18 @@ impl Message {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::System { text } | Self::User { text } => text.is_empty(),
+            Self::System { text } => text.is_empty(),
+            Self::User {
+                text,
+                content_blocks,
+            } => content_blocks.as_ref().map_or_else(
+                || text.is_empty(),
+                |blocks| {
+                    blocks.iter().all(
+                        |block| matches!(block, crate::ContentBlock::Text(text) if text.is_empty()),
+                    )
+                },
+            ),
             Self::Assistant {
                 text,
                 tool_calls,
@@ -749,18 +796,11 @@ fn decode_arguments(value: Option<Value>) -> Result<Value, String> {
 impl Serialize for Message {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Self::System { text } => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry("role", Role::System.as_str())?;
-                map.serialize_entry("content", text)?;
-                map.end()
-            }
-            Self::User { text } => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry("role", Role::User.as_str())?;
-                map.serialize_entry("content", text)?;
-                map.end()
-            }
+            Self::System { text } => serialize_input(serializer, Role::System, text, None),
+            Self::User {
+                text,
+                content_blocks,
+            } => serialize_input(serializer, Role::User, text, content_blocks.as_deref()),
             Self::Assistant {
                 text,
                 reasoning,
@@ -810,6 +850,24 @@ impl Serialize for Message {
     }
 }
 
+fn serialize_input<S: Serializer>(
+    serializer: S,
+    role: Role,
+    text: &str,
+    blocks: Option<&[crate::ContentBlock]>,
+) -> Result<S::Ok, S::Error> {
+    assert!(matches!(role, Role::System | Role::User));
+    assert!(blocks.is_none() || role == Role::User);
+    let mut map = serializer.serialize_map(None)?;
+    map.serialize_entry("role", role.as_str())?;
+    map.serialize_entry("content", text)?;
+    if let Some(blocks) = blocks {
+        crate::content::validate_blocks(blocks).map_err(serde::ser::Error::custom)?;
+        map.serialize_entry("content_blocks", blocks)?;
+    }
+    map.end()
+}
+
 /// The field state accumulated while visiting one message object.
 #[derive(Default)]
 struct MessageFields {
@@ -829,10 +887,21 @@ impl MessageFields {
         let role = self
             .role
             .ok_or_else(|| String::from("a message has no role"))?;
+        if self.content_blocks.is_some() && !matches!(role.as_str(), "user" | "tool") {
+            return Err("typed input is only valid for user or tool messages".into());
+        }
         let text = text_of(self.content)?;
         match role.as_str() {
             "system" => Ok(Message::system(text.unwrap_or_default())),
-            "user" => Ok(Message::user(text.unwrap_or_default())),
+            "user" => {
+                if let Some(blocks) = &self.content_blocks {
+                    crate::content::validate_blocks(blocks).map_err(|error| error.to_string())?;
+                }
+                Ok(Message::User {
+                    text: text.unwrap_or_default(),
+                    content_blocks: self.content_blocks,
+                })
+            }
             "assistant" => {
                 if let Some(replay) = &self.replay {
                     replay
@@ -871,8 +940,7 @@ impl MessageFields {
 /// Projects a wire `content` field onto text.
 ///
 /// A string is taken as-is, `null` means absent, and an array of content parts
-/// is flattened by concatenating its `text` parts so a multimodal user turn
-/// degrades to its readable half instead of failing.
+/// is flattened only for text parts. Foreign media shapes fail rather than losing pixels.
 fn text_of(value: Option<Value>) -> Result<Option<String>, String> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -882,9 +950,13 @@ fn text_of(value: Option<Value>) -> Result<Option<String>, String> {
             for part in parts {
                 match part {
                     Value::Object(map) => {
-                        if let Some(Value::String(text)) = map.get("text") {
-                            out.push_str(text);
+                        if map.get("type").is_some_and(|kind| kind != "text") {
+                            return Err("unsupported content part; use typed content_blocks".into());
                         }
+                        let Some(Value::String(text)) = map.get("text") else {
+                            return Err("content part has no text".into());
+                        };
+                        out.push_str(text);
                     }
                     Value::String(text) => out.push_str(&text),
                     other => {

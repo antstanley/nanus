@@ -69,10 +69,12 @@ fn hiding_removes_whole_fragments_and_keeps_every_user_message() {
     let mut session = session();
     session.append(SessionEvent::UserMessage {
         text: "constraint: never touch main.rs".into(),
+        content_blocks: None,
     });
     work(&mut session, "a", "obsolete early output");
     session.append(SessionEvent::UserMessage {
         text: "now do the second part".into(),
+        content_blocks: None,
     });
     work(&mut session, "b", "recent one");
     work(&mut session, "c", "recent two");
@@ -115,7 +117,10 @@ fn hiding_removes_whole_fragments_and_keeps_every_user_message() {
 #[test]
 fn sibling_results_stay_paired_in_their_original_order() {
     let mut session = session();
-    session.append(SessionEvent::UserMessage { text: "go".into() });
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
     session.append(SessionEvent::AssistantMessage {
         replay: None,
         text: None,
@@ -172,7 +177,10 @@ fn a_protected_or_unknown_fragment_is_refused() {
     const RECENT: &[FragmentId] = &[FragmentId::new(1)];
     const UNKNOWN: &[FragmentId] = &[FragmentId::new(0)];
     let mut session = session();
-    session.append(SessionEvent::UserMessage { text: "go".into() });
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
     work(&mut session, "a", "only");
     let fragments = derive(session.log()).unwrap_or_default();
     let protected = protected(session.log(), &fragments);
@@ -205,6 +213,7 @@ fn a_fresh_request_has_no_prefill_and_points_at_get_goal() {
     });
     session.append(SessionEvent::UserMessage {
         text: "start".into(),
+        content_blocks: None,
     });
     let fragments = derive(session.log()).unwrap_or_default();
     let goal = session.goal();
@@ -237,10 +246,12 @@ fn generated_data_is_a_labelled_assistant_message_after_the_first_user_message()
     let mut session = session();
     session.append(SessionEvent::UserMessage {
         text: "first".into(),
+        content_blocks: None,
     });
     work(&mut session, "a", "evidence");
     session.append(SessionEvent::UserMessage {
         text: "second".into(),
+        content_blocks: None,
     });
     let note = WorkingNote {
         id: NoteId::parse("n:fake").unwrap_or_else(|| unreachable!("valid")),
@@ -306,7 +317,10 @@ fn generated_data_is_a_labelled_assistant_message_after_the_first_user_message()
 #[test]
 fn the_catalog_is_bounded() {
     let mut session = session();
-    session.append(SessionEvent::UserMessage { text: "go".into() });
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
     for index in 0..600 {
         work(&mut session, &format!("c{index}"), "x");
     }
@@ -375,10 +389,12 @@ fn model_written_text_cannot_forge_a_line_of_generated_data() {
     });
     session.append(SessionEvent::UserMessage {
         text: "first".into(),
+        content_blocks: None,
     });
     work(&mut session, "a", "evidence");
     session.append(SessionEvent::UserMessage {
         text: "second".into(),
+        content_blocks: None,
     });
     let note = WorkingNote {
         id: NoteId::parse("n:real").unwrap_or_else(|| unreachable!("valid")),

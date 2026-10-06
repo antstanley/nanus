@@ -505,6 +505,7 @@ async fn assembled_fit_drops_whole_image_turns_and_refuses_the_current_turn_befo
     .with_request_budget(8192, 0);
     let mut session = session();
     session.append(SessionEvent::UserMessage {
+        content_blocks: None,
         text: "old inspection".into(),
     });
     let calls: Vec<_> = (0..3)

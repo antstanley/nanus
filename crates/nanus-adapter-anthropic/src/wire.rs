@@ -188,12 +188,15 @@ fn encode_messages_with_prefix(
                     "is_error": is_error,
                 }));
             }
-            Message::User { text } => {
+            Message::User {
+                text,
+                content_blocks,
+            } => {
                 flush_results(&mut turns, &mut results);
-                turns.push(json!({
-                    "role": "user",
-                    "content": [{ "type": "text", "text": text }],
-                }));
+                let content = content_blocks
+                    .as_deref()
+                    .map_or_else(|| json!([{ "type": "text", "text": text }]), encode_content);
+                turns.push(json!({ "role": "user", "content": content }));
             }
             Message::Assistant {
                 text,
@@ -218,41 +221,46 @@ fn encode_messages_with_prefix(
                     skipped = skipped.saturating_add(1);
                     continue;
                 }
-                let mut blocks: Vec<Value> = Vec::new();
-                if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
-                    blocks.push(json!({ "type": "text", "text": text }));
-                }
-                for call in tool_calls {
-                    // The arguments are an object here, not a JSON string. A call whose
-                    // arguments never parsed is logged as the raw string so the registry
-                    // can say why it was refused; the API refuses a non-object `input`
-                    // and would refuse every later request in the session, so the
-                    // replay carries an empty object instead.
-                    let input = if call.arguments.is_object() {
-                        call.arguments.clone()
-                    } else {
-                        json!({})
-                    };
-                    blocks.push(json!({
-                        "type": "tool_use",
-                        "id": call.id.as_str(),
-                        "name": call.name.as_str(),
-                        "input": input,
-                    }));
-                }
-                // Precondition: the domain's fold drops an empty assistant turn, a
-                // replay-only one was skipped above, and the API refuses a content
-                // array with no blocks.
-                assert!(
-                    !blocks.is_empty(),
-                    "an assistant turn carries text or tool calls"
-                );
-                turns.push(json!({ "role": "assistant", "content": blocks }));
+                turns.push(encode_assistant(text.as_deref(), tool_calls));
             }
         }
     }
     flush_results(&mut turns, &mut results);
     (Value::Array(turns), skipped)
+}
+
+/// Encodes an assistant turn from its text and calls, for a turn with no admitted signed replay.
+fn encode_assistant(text: Option<&str>, tool_calls: &[nanus_domain::ToolCall]) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+    for call in tool_calls {
+        // The arguments are an object here, not a JSON string. A call whose
+        // arguments never parsed is logged as the raw string so the registry
+        // can say why it was refused; the API refuses a non-object `input`
+        // and would refuse every later request in the session, so the
+        // replay carries an empty object instead.
+        let input = if call.arguments.is_object() {
+            call.arguments.clone()
+        } else {
+            json!({})
+        };
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": call.id.as_str(),
+            "name": call.name.as_str(),
+            "input": input,
+        }));
+    }
+    // Precondition: the domain's fold drops an empty assistant turn, the caller
+    // skips another protocol's replay-only one, and the API refuses a content
+    // array with no blocks.
+    assert!(
+        !blocks.is_empty(),
+        "an assistant turn carries text or tool calls"
+    );
+    json!({ "role": "assistant", "content": blocks })
 }
 
 /// Emits any gathered tool results as one user turn.
@@ -1441,6 +1449,7 @@ mod tests {
             let mut session =
                 nanus_domain::Session::new(nanus_domain::SessionId::new("signed"), 123, "/caller");
             session.append(nanus_domain::SessionEvent::UserMessage {
+                content_blocks: None,
                 text: "Inspect".into(),
             });
             let call = ToolCall::new(

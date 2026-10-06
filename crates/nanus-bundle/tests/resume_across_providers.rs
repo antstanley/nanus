@@ -35,6 +35,7 @@ fn session(text: Option<&str>) -> Vec<Message> {
     let mut session = Session::new(SessionId::new("resumed"), 123, "/fictional");
     session.append(SessionEvent::UserMessage {
         text: "first".into(),
+        content_blocks: None,
     });
     session.append(SessionEvent::AssistantMessage {
         replay: Some(replay),
@@ -48,6 +49,7 @@ fn session(text: Option<&str>) -> Vec<Message> {
     });
     session.append(SessionEvent::UserMessage {
         text: "second".into(),
+        content_blocks: None,
     });
     let loaded = Session::from_jsonl(&session.try_to_jsonl().unwrap()).unwrap();
     loaded.derive_messages()

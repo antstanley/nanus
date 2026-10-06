@@ -119,6 +119,7 @@ fn turn(session: &mut Session, index: u32) {
     session.append(SessionEvent::TurnStart { turn: index });
     session.append(SessionEvent::UserMessage {
         text: format!("Turn {index}: explain how the session log stays contiguous."),
+        content_blocks: None,
     });
     session.append(SessionEvent::StepStart {
         turn: index,

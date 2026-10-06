@@ -1552,6 +1552,7 @@ fn an_attachment_reports_the_log_position_the_backlog_continues_from() {
     let held_turn = nanus_kernel::runtime::block_on(async {
         let mut session = Session::new(saved.clone(), 1, "/work");
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "an earlier question".to_owned(),
         });
         session.append(SessionEvent::AssistantMessage {
@@ -1906,6 +1907,7 @@ fn a_session_that_was_never_held_is_loaded_from_the_store() {
     let saved = nanus_kernel::runtime::block_on(async {
         let mut session = Session::new(SessionId::new("earlier"), 1, "/work");
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "from a previous life".to_owned(),
         });
         store.save(&session).await.expect("save");
@@ -1954,6 +1956,7 @@ fn a_session_another_agent_is_writing_is_refused() {
     let saved = nanus_kernel::runtime::block_on(async {
         let mut session = Session::new(SessionId::new("contested"), 1, "/work");
         session.append(SessionEvent::UserMessage {
+            content_blocks: None,
             text: "nobody has this open yet".to_owned(),
         });
         store.save(&session).await.expect("save");
@@ -3498,6 +3501,7 @@ fn a_managed_session_its_store_cannot_checkpoint_takes_no_turn() {
         session.upgrade_to_managed_body();
         session.append(SessionEvent::UserMessage {
             text: "an earlier question".to_owned(),
+            content_blocks: None,
         });
         store.save(&session).await.expect("the history is recorded");
     });

@@ -9,6 +9,9 @@ use nanus_ports::LlmPort as _;
 use nanus_ports::{ChatRequest, LlmEvent, ReasoningEffort, ResponseLimits};
 use serde_json::{Value, json};
 
+#[path = "responses_request/instructions.rs"]
+mod instructions;
+
 #[path = "responses_request/cost.rs"]
 mod cost;
 

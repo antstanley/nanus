@@ -56,11 +56,13 @@ fn session() -> Session {
     session.upgrade_to_managed_body();
     session.append(SessionEvent::UserMessage {
         text: "constraint: never touch main.rs".into(),
+        content_blocks: None,
     });
     work(&mut session, "a", "OBSOLETE EARLY OUTPUT");
     work(&mut session, "b", "kept output b");
     session.append(SessionEvent::UserMessage {
         text: "now the second part".into(),
+        content_blocks: None,
     });
     work(&mut session, "c", "kept output c");
     work(&mut session, "d", "kept output d");

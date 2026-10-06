@@ -41,12 +41,13 @@
 //!   the file is read back and digested exactly as before. A writer that replaced the file in
 //!   place, at the same length, within the clock's resolution, would go unseen; the session claim
 //!   is what rules such a writer out, and this is a check behind it rather than instead of it.
-//! - **Only the new events are encoded.** At an unchanged body version the candidate must extend
-//!   the stored file, and the session's carried encoding answers that and the receipt's digests
-//!   without re-encoding what is stored. The new file is the stored one cloned — copy-on-write
-//!   where the filesystem has it, an in-kernel copy where it does not — with the new lines
-//!   appended, then synced and renamed exactly as a whole write is. Across the version upgrade,
-//!   or with nothing stored, the whole session is encoded and written.
+//! - **Only the new events are encoded.** When the stored file is the candidate's own first
+//!   lines, header included, the session's carried encoding says so and gives the receipt's
+//!   digests without re-encoding what is stored. The new file is the stored one cloned —
+//!   copy-on-write where the filesystem has it, an in-kernel copy where it does not — with the
+//!   new lines appended, then synced and renamed exactly as a whole write is. When the header
+//!   changes (managed context enabled, or a typed user message moving the body to version 4), or
+//!   nothing is stored, the stored events are checked and the whole session is written.
 //!
 //! ## Durability
 //!
@@ -115,9 +116,9 @@ impl JsonlStore {
         if stored != *view.expected {
             return Err(refused(ErrorCode::StaleBase));
         }
-        self.check_extends(candidate, &stored).await?;
+        let appendable = self.check_extends(candidate, &stored).await?;
         let revision = accepted_revision(candidate)?;
-        let write = Write::of(candidate, &stored)?;
+        let write = Write::of(candidate, &stored, appendable)?;
         let count = u64::try_from(candidate.event_count())
             .map_err(|_| refused(ErrorCode::StorageCapacity))?;
         self.check_artifacts(candidate, &stored, view.artifacts)
@@ -199,35 +200,34 @@ impl JsonlStore {
     /// Refuses a candidate that does not extend what is stored: the log is append-only, so a
     /// checkpoint may add events after the stored ones and never change or drop one.
     ///
-    /// At the same body version the candidate's prefix digest must be the stored file's. Across
-    /// the one upgrade a body can make — version 2 to 3, whose header differs — the stored events
-    /// are read back and compared with the candidate's first events.
+    /// When the candidate's prefix digest is the stored file's, the file is the candidate's own
+    /// first lines, header included, and the new lines can simply follow them: `Ok(true)`. A
+    /// header the candidate states differently — the upgrade to managed context, or the move to
+    /// version 4 when a typed user message arrives, which may change the header without changing
+    /// its version — cannot be appended to, so the stored events are read back and compared with
+    /// the candidate's first events, and the whole session is written: `Ok(false)`.
     async fn check_extends(
         &self,
         candidate: &Session,
         stored: &ExpectedCheckpoint,
-    ) -> Result<(), CheckpointError> {
+    ) -> Result<bool, CheckpointError> {
         let ExpectedCheckpoint::Stored {
-            body_version,
             file_blake3,
             event_count,
+            ..
         } = stored
         else {
-            return Ok(());
+            return Ok(false);
         };
         let held = u64::try_from(candidate.event_count()).unwrap_or(u64::MAX);
         if held < *event_count {
             return Err(refused(ErrorCode::StaleBase));
         }
-        if *body_version == candidate.body_version() {
-            let prefix = candidate
-                .prefix_digest(*event_count)
-                .map_err(|_| refused(ErrorCode::StaleBase))?;
-            return if prefix == *file_blake3 {
-                Ok(())
-            } else {
-                Err(refused(ErrorCode::StaleBase))
-            };
+        let prefix = candidate
+            .prefix_digest(*event_count)
+            .map_err(|_| refused(ErrorCode::StaleBase))?;
+        if prefix == *file_blake3 {
+            return Ok(true);
         }
         let on_disk = self
             .load_blocking(candidate.id())
@@ -240,7 +240,7 @@ impl JsonlStore {
             .get(..count)
             .is_some_and(|events| events == on_disk.log().events());
         if same {
-            Ok(())
+            Ok(false)
         } else {
             Err(refused(ErrorCode::StaleBase))
         }
@@ -354,13 +354,16 @@ enum Write {
 
 impl Write {
     /// Encodes what `candidate` adds to `stored`, refusing what the store may not write.
-    fn of(candidate: &Session, stored: &ExpectedCheckpoint) -> Result<Self, CheckpointError> {
+    ///
+    /// `appendable` is what [`JsonlStore::check_extends`] found: the stored file is the
+    /// candidate's own first lines, header and all.
+    fn of(
+        candidate: &Session,
+        stored: &ExpectedCheckpoint,
+        appendable: bool,
+    ) -> Result<Self, CheckpointError> {
         let encoded = match stored {
-            ExpectedCheckpoint::Stored {
-                body_version,
-                event_count,
-                ..
-            } if *body_version == candidate.body_version() => {
+            ExpectedCheckpoint::Stored { event_count, .. } if appendable => {
                 candidate.encoded_lines_from(*event_count).map(Self::Tail)
             }
             _ => candidate.try_to_jsonl().map(Self::Whole),
