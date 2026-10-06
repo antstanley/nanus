@@ -462,7 +462,7 @@ pub trait SessionSource {
     /// sending a request nowhere.
     fn set_goal(&mut self, _action: GoalAction) {}
 
-    /// Asks the agent to report or reset the session's managed context.
+    /// Asks the agent to report, switch or reset the session's context.
     ///
     /// A default of doing nothing, for the same reason as [`SessionSource::set_goal`]: a recording
     /// has no agent, and the interface refuses `/context` on one rather than sending it nowhere.
@@ -1264,6 +1264,22 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     } else {
         crate::replay::transcript_of(source.session())
     };
+    // Mode is taken from the recorded policy even in a recording; a live status is authoritative
+    // if another viewer changed it after the attachment snapshot.
+    view.context_mode = source
+        .session()
+        .log()
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| {
+            if let nanus_domain::SessionEvent::ContextMode { payload } = event {
+                Some(payload.policy.mode)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
     view.tokens_used = u64::from(source.session().usage_totals().total_tokens());
     // The goal the replay ended on, so the frame an attachment sends about the same goal is not
     // drawn a second time.
@@ -1440,6 +1456,7 @@ async fn event_loop(
                         view.open_permissions();
                         view.status = String::from("permission: Enter applies, Esc cancels");
                     }
+                    Outcome::SetContext(action) => request_context(action, source, &mut view),
                     Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
                     Outcome::SetEffort(step) => set_effort_word(&step, source, &mut view),
                     Outcome::SetProvider { provider, plan } => {
@@ -1562,6 +1579,8 @@ enum Routed {
     ///
     /// Routed for the same reason as [`Routed::Goal`]: the context is the agent's session state.
     Context(ContextAction),
+    /// Open the context chooser, or review the impact of a named change.
+    ContextChooser(Option<crate::context::ContextChoice>),
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1594,9 +1613,13 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         Submission::Run(Command::Goal) => {
             goal_action(&prompt).map_or_else(Routed::Say, Routed::Goal)
         }
-        Submission::Run(Command::Context) => {
-            context_action(&prompt).map_or_else(Routed::Say, Routed::Context)
-        }
+        Submission::Run(Command::Context) => match model_argument(&prompt).as_deref() {
+            None => Routed::ContextChooser(None),
+            Some("legacy") => Routed::ContextChooser(Some(crate::context::ContextChoice::Legacy)),
+            Some("managed") => Routed::ContextChooser(Some(crate::context::ContextChoice::Managed)),
+            Some("reset") => Routed::ContextChooser(Some(crate::context::ContextChoice::Reset)),
+            Some(_) => context_action(&prompt).map_or_else(Routed::Say, Routed::Context),
+        },
         Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
             if command.trim().is_empty() {
@@ -1641,7 +1664,7 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
 fn send_or_queue(prompt: String, source: &mut dyn SessionSource, view: &mut ViewState) {
     // `busy` is the interface's read of the turn state and `has_queued` covers the moment
     // a turn just ended: a prompt typed then should join the line rather than overtake it.
-    if view.busy || view.has_queued() {
+    if view.busy || view.has_queued() || view.context_change_asked.is_some() {
         view.enqueue(prompt);
         view.status = queued_status(view.queue.len());
         return;
@@ -1661,7 +1684,7 @@ fn send_or_queue(prompt: String, source: &mut dyn SessionSource, view: &mut View
 /// the loop's next wake-up sends the one after it — the agent is asked for one turn at a
 /// time exactly as a person would be.
 fn flush_queue(source: &mut dyn SessionSource, view: &mut ViewState) {
-    if view.busy {
+    if view.busy || view.context_dialog.is_some() || view.context_change_asked.is_some() {
         return;
     }
     let Some(prompt) = view.take_queued() else {
@@ -1762,6 +1785,7 @@ async fn submitted(
         },
         Routed::Goal(action) => request_goal(action, source, view),
         Routed::Context(action) => request_context(action, source, view),
+        Routed::ContextChooser(choice) => open_context_chooser(choice, source, view),
         Routed::Say(message) => {
             view.transcript.push(Entry::notice(message));
             view.scroll_to_bottom();
@@ -2104,11 +2128,9 @@ fn request_goal(action: GoalAction, source: &mut dyn SessionSource, view: &mut V
     source.set_goal(action);
 }
 
-/// Reads a `/context` line into the action it names, or the sentence saying why it names none.
+/// Reads a named `/context` action; the router handles the bare command as a chooser.
 ///
-/// A bare `/context` (or `/context status`) reads; `/context reset` resets. Anything else is
-/// refused by name rather than guessed at, because a reset that a typo could reach is a reset
-/// nobody asked for.
+/// Parsing a mutation does not send it: named mutations are routed through impact confirmation.
 ///
 /// # Errors
 ///
@@ -2116,20 +2138,46 @@ fn request_goal(action: GoalAction, source: &mut dyn SessionSource, view: &mut V
 fn context_action(line: &str) -> Result<ContextAction, String> {
     match goal_argument(line).as_str() {
         "" | "status" => Ok(ContextAction::Status),
+        "legacy" => Ok(ContextAction::Legacy),
+        "managed" => Ok(ContextAction::Managed),
         "reset" => Ok(ContextAction::Reset),
         other => Err(format!(
-            "`/context` takes `status` or `reset`, not `{other}`"
+            "`/context` takes `status`, `legacy`, `managed` or `reset`, not `{other}`"
         )),
     }
 }
 
+/// Opens a chooser or a named warning. Busy sessions and recordings cannot change policy.
+fn open_context_chooser(
+    choice: Option<crate::context::ContextChoice>,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    if !source.accepts_prompts() || view.busy || view.context_change_asked.is_some() {
+        view.transcript.push(Entry::notice(String::from(
+            "context modes can only change in an idle live session; use `/context status` to read status",
+        )));
+        view.follow();
+        return;
+    }
+    view.context_dialog = Some(crate::context::ContextDialog::new(
+        view.context_mode,
+        choice,
+    ));
+    // Refresh the current-mode marker from the agent. This is only a read, never a switch.
+    request_context(ContextAction::Status, source, view);
+}
+
 /// Sends a context request to the agent, or says why the interface cannot.
 ///
-/// The agent is the authority, as it is for the goal: the status comes back as a
-/// [`Frame::ContextStatus`] and a reset as the checkpoint that saved it. A reset during a turn is
-/// refused here, where the reader is looking — the agent refuses it too — and a read is sent
-/// either way, because the agent answers one from the snapshot the turn published.
+/// The agent is the authority: status and saved changes arrive as [`Frame::ContextStatus`].
+/// Mutations during a turn are refused here and at the server; reads use the published snapshot.
+/// Only a confirmed mutation reaches this function from the interface's command or key routing.
 fn request_context(action: ContextAction, source: &mut dyn SessionSource, view: &mut ViewState) {
+    if view.context_change_asked.is_some() {
+        view.status = String::from("waiting for the context change to be acknowledged");
+        return;
+    }
     if !source.accepts_prompts() {
         view.transcript.push(Entry::notice(String::from(
             "this is a recording: its context cannot be read or reset",
@@ -2144,16 +2192,23 @@ fn request_context(action: ContextAction, source: &mut dyn SessionSource, view: 
                 view.status = String::from("reading the context status");
             }
         }
-        ContextAction::Reset if view.busy => {
+        ContextAction::Legacy | ContextAction::Managed | ContextAction::Reset if view.busy => {
             view.transcript.push(Entry::notice(String::from(
-                "a turn is running; the context can be reset when it is idle",
+                "a turn is running; the context can change when it is idle",
             )));
             view.follow();
             return;
         }
-        ContextAction::Reset => {
-            view.context_reset_asked = true;
-            view.status = String::from("resetting the context");
+        ContextAction::Legacy | ContextAction::Managed | ContextAction::Reset => {
+            let choice = match action {
+                ContextAction::Legacy => crate::context::ContextChoice::Legacy,
+                ContextAction::Managed => crate::context::ContextChoice::Managed,
+                ContextAction::Reset => crate::context::ContextChoice::Reset,
+                ContextAction::Status => return,
+            };
+            view.context_change_asked = Some(choice);
+            view.context_reset_asked = action == ContextAction::Reset;
+            view.status = String::from("saving the context change");
         }
     }
     source.set_context(action);
@@ -2236,6 +2291,8 @@ enum Outcome {
     /// states deserve: `permitted calls` and `all calls` are two words apart and grant very
     /// different things.
     OpenPermissions,
+    /// Submit an explicitly confirmed context mutation.
+    SetContext(ContextAction),
     /// Switch to this model, or to the next one when nothing is named.
     SetModel(Option<String>),
     /// Set the effort to this step, named as its wire word.
@@ -2325,6 +2382,9 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     // The model selector owns the keyboard while it is up, as the permission dialog does: the
     // reader is choosing from a list drawn over the composer, and a key that reached the text
     // behind it would be typed into a prompt nobody can see.
+    if view.context_dialog.is_some() {
+        return handle_context_key(key, view);
+    }
     if view.model_open {
         return handle_model_key(key, view);
     }
@@ -2489,6 +2549,78 @@ fn handle_permission_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             let _ = view.permission_select(position);
         }
         _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Routes the context dialog's keys. Enter opens the warning, but only `y` confirms it.
+fn handle_context_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    use crate::context::{ContextChoice, ContextDialog};
+    // Only an unmodified (or Shift-produced) letter is a decision. In particular Ctrl+Y is
+    // the composer's yank, not a yes hidden behind the warning. Copy is handled before this.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('q' | 'Q' | 'd' | 'D'))
+        {
+            Outcome::Quit
+        } else {
+            Outcome::Continue
+        };
+    }
+    let Some(dialog) = view.context_dialog.as_mut() else {
+        return Outcome::Continue;
+    };
+    if let Some(choice) = dialog.confirming {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => view.context_dialog = None,
+            KeyCode::Char('y' | 'Y') if !view.context_asked => {
+                view.context_dialog = None;
+                return Outcome::SetContext(match choice {
+                    ContextChoice::Legacy => ContextAction::Legacy,
+                    ContextChoice::Managed => ContextAction::Managed,
+                    ContextChoice::Reset => ContextAction::Reset,
+                });
+            }
+            KeyCode::Up | KeyCode::Char('k') => dialog.scroll = dialog.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => dialog.scroll = dialog.scroll.saturating_add(1),
+            KeyCode::PageUp => dialog.scroll = dialog.scroll.saturating_sub(8),
+            KeyCode::PageDown => dialog.scroll = dialog.scroll.saturating_add(8),
+            KeyCode::Home => dialog.scroll = 0,
+            KeyCode::End => dialog.scroll = u16::MAX,
+            _ => {}
+        }
+    } else {
+        match key.code {
+            KeyCode::Esc => view.context_dialog = None,
+            KeyCode::Enter => {
+                dialog.confirming = Some(dialog.selected());
+                dialog.scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                dialog.selection = if dialog.selection == 0 {
+                    2
+                } else {
+                    dialog.selection.saturating_sub(1)
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                dialog.selection = if dialog.selection == 2 {
+                    0
+                } else {
+                    dialog.selection.saturating_add(1)
+                };
+            }
+            KeyCode::Char(digit @ '1'..='3') => {
+                dialog.selection = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
+            }
+            _ => {}
+        }
+        if let Some(dialog) = &view.context_dialog {
+            assert!(dialog.selection < ContextDialog::CHOICES.len());
+        }
     }
     Outcome::Continue
 }
@@ -3391,6 +3523,10 @@ fn apply_from(frame: Frame, view: &mut ViewState, arrival: Arrival) {
         }
         Frame::Done { answer, reason } => apply_done(&answer, &reason, view),
         Frame::Failed { message } => {
+            view.context_asked = false;
+            view.context_change_asked = None;
+            view.context_reset_asked = false;
+            view.context_dialog = None;
             // A failure ends whatever was in front of the reader, including an authorization prompt:
             // its refusal is the answer the prompt was waiting for.
             view.close_auth();
@@ -3464,6 +3600,23 @@ fn apply_context_status(
     }
     let asked = std::mem::take(&mut view.context_asked);
     let idle = envelope.turn.is_none();
+    view.context_mode = match payload.mode {
+        ContextModeState::Legacy => nanus_domain::context::managed::ContextMode::Legacy,
+        ContextModeState::Managed => nanus_domain::context::managed::ContextMode::Managed,
+    };
+    if idle
+        && !asked
+        && view
+            .context_change_asked
+            .is_some_and(|choice| choice.mode() == view.context_mode)
+    {
+        view.context_change_asked = None;
+    }
+    if let Some(dialog) = view.context_dialog.as_mut()
+        && dialog.confirming.is_none()
+    {
+        dialog.selection = usize::from(payload.mode == ContextModeState::Managed);
+    }
     let line = context_status_line(payload);
     let key = context_status_key(payload);
     if asked || idle || view.context_shown.as_deref() != Some(key.as_str()) {
@@ -3691,6 +3844,7 @@ fn apply_refused(message: String, view: &mut ViewState) {
     // A refusal is the answer a `/context` was waiting for, so nothing is waiting any more.
     view.context_asked = false;
     view.context_reset_asked = false;
+    view.context_change_asked = None;
     view.transcript.push(Entry::notice(message));
     view.follow();
     if !view.busy {
@@ -7804,7 +7958,7 @@ mod tests {
         assert!(context_action("/context wipe").is_err());
         assert!(matches!(
             route_submission(String::from("/context reset"), true),
-            Routed::Context(ContextAction::Reset)
+            Routed::ContextChooser(Some(crate::context::ContextChoice::Reset))
         ));
 
         let mut source = Scripted::new(Vec::new());
@@ -7843,6 +7997,184 @@ mod tests {
         request_context(ContextAction::Status, &mut recording, &mut reading);
         assert!(recording.requests.borrow().is_empty());
         assert_eq!(reading.transcript.entries().len(), 1);
+    }
+
+    /// Named changes and the chooser both require reviewing impact and an explicit yes; stray
+    /// keys and repeated Enter cannot switch modes or leak into the draft behind the dialog.
+    #[test]
+    fn context_switching_requires_confirmation_and_escape_changes_nothing() {
+        use crate::context::ContextChoice;
+        assert_eq!(
+            route_submission("/context".into(), true),
+            Routed::ContextChooser(None)
+        );
+        for (word, choice, action) in [
+            ("legacy", ContextChoice::Legacy, ContextAction::Legacy),
+            ("managed", ContextChoice::Managed, ContextAction::Managed),
+            ("reset", ContextChoice::Reset, ContextAction::Reset),
+        ] {
+            assert_eq!(
+                route_submission(format!("/context {word}"), true),
+                Routed::ContextChooser(Some(choice))
+            );
+            let mut source = Scripted::new(Vec::new());
+            let mut view = attached_view("e1", 0);
+            view.input.insert('x');
+            open_context_chooser(Some(choice), &mut source, &mut view);
+            assert_eq!(source.requests.borrow().len(), 1, "only a status read");
+            assert!(
+                matches!(
+                    handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+                    Outcome::Continue
+                ),
+                "wait for the current status before confirmation"
+            );
+            apply(
+                Frame::ContextStatus {
+                    envelope: envelope("e1", None, 1),
+                    payload: status(ContextModeState::Legacy, 0, 0),
+                },
+                &mut view,
+            );
+            for code in [KeyCode::Enter, KeyCode::Char('z'), KeyCode::Enter] {
+                assert!(matches!(
+                    handle_key(key(code, KeyModifiers::NONE), &mut view),
+                    Outcome::Continue
+                ));
+            }
+            // The keyboard is modal, but copy/quit retain their global meanings.
+            assert_context_modal_keys(&mut view);
+            assert_eq!(view.input.text(), "x");
+            assert!(view.context_dialog.is_some());
+            let Outcome::SetContext(sent) =
+                handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view)
+            else {
+                panic!("explicit yes must confirm")
+            };
+            assert_eq!(sent, action);
+            request_context(sent, &mut source, &mut view);
+            assert_eq!(view.context_change_asked, Some(choice));
+            assert_eq!(
+                view.context_mode,
+                nanus_domain::context::managed::ContextMode::Legacy,
+                "the view never switches optimistically"
+            );
+            assert_eq!(
+                source.requests.borrow().last(),
+                Some(&Request::Context { action })
+            );
+            assert!(view.context_dialog.is_none());
+        }
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        open_context_chooser(None, &mut source, &mut view);
+        handle_key(key(KeyCode::Down, KeyModifiers::NONE), &mut view);
+        handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert_eq!(
+            view.context_dialog.as_ref().unwrap().confirming,
+            Some(ContextChoice::Managed)
+        );
+        handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(view.context_dialog.is_none());
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            [Request::Context {
+                action: ContextAction::Status
+            }]
+        );
+    }
+
+    fn assert_context_modal_keys(view: &mut ViewState) {
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert!(
+                matches!(
+                    handle_key(key(KeyCode::Char('y'), modifiers), view),
+                    Outcome::Continue
+                ),
+                "a modified y is not confirmation"
+            );
+        }
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), view),
+            Outcome::Copy
+        ));
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL), view),
+            Outcome::Quit
+        ));
+    }
+
+    /// Changes are unavailable while busy or viewing a recording. A queue cannot race a confirmed
+    /// change: it waits for the saved status or refusal, not just the checkpoint announcement.
+    #[test]
+    fn context_changes_are_idle_only_and_queue_waits_for_acknowledgement() {
+        use crate::context::ContextChoice;
+        for recording in [false, true] {
+            let mut source = if recording {
+                Scripted::recording(Vec::new())
+            } else {
+                Scripted::new(Vec::new())
+            };
+            let mut view = ViewState::new();
+            view.busy = !recording;
+            open_context_chooser(None, &mut source, &mut view);
+            assert!(source.requests.borrow().is_empty());
+            assert!(view.context_dialog.is_none());
+        }
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        open_context_chooser(None, &mut source, &mut view);
+        view.enqueue("next".into());
+        flush_queue(&mut source, &mut view);
+        assert!(view.has_queued(), "a chooser pauses the queue");
+        view.context_dialog = None;
+        view.context_asked = false;
+        request_context(ContextAction::Managed, &mut source, &mut view);
+        flush_queue(&mut source, &mut view);
+        assert!(view.has_queued());
+        apply(
+            Frame::Checkpoint {
+                envelope: envelope("e1", None, 1),
+                payload: CheckpointInfo {
+                    frontier: mark("e1", 1, 1).frontier,
+                    body_digest: "ab".repeat(32),
+                    durability: nanus_link::protocol::DurabilityState::ProcessCrash,
+                },
+            },
+            &mut view,
+        );
+        assert_eq!(view.context_change_asked, Some(ContextChoice::Managed));
+        apply(
+            Frame::ContextStatus {
+                envelope: envelope("e1", None, 2),
+                payload: status(ContextModeState::Managed, 0, 0),
+            },
+            &mut view,
+        );
+        assert!(view.context_change_asked.is_none());
+        assert_eq!(
+            view.context_mode,
+            nanus_domain::context::managed::ContextMode::Managed
+        );
+        flush_queue(&mut source, &mut view);
+        assert!(!view.has_queued());
+        assert!(
+            view.busy,
+            "the next prompt was sent after the status acknowledged the mode"
+        );
+        view.busy = false;
+        request_context(ContextAction::Legacy, &mut source, &mut view);
+        apply(
+            Frame::Refused {
+                message: "could not checkpoint".into(),
+            },
+            &mut view,
+        );
+        assert!(view.context_change_asked.is_none());
+        assert_eq!(
+            view.context_mode,
+            nanus_domain::context::managed::ContextMode::Managed
+        );
     }
 
     /// A trimmed prompt is drawn where the gap is, because an answer that contradicts

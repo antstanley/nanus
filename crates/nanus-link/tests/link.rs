@@ -3388,17 +3388,21 @@ fn a_context_reset_during_a_turn_is_refused_and_a_status_read_is_answered() {
             .await
             .expect("the agent answers");
         other.attach(&mine.session).await.expect("joins");
-        other
-            .send(&Request::Context {
-                action: ContextAction::Reset,
-            })
-            .await
-            .expect("the reset is sent");
-        let refused = context_answer(&mut other).await;
-        assert!(
-            matches!(&refused, Frame::Refused { message } if message.contains("turn is running")),
-            "a reset of a busy session is refused: {refused:?}"
-        );
+        for action in [
+            ContextAction::Legacy,
+            ContextAction::Managed,
+            ContextAction::Reset,
+        ] {
+            other
+                .send(&Request::Context { action })
+                .await
+                .expect("the change is sent");
+            let refused = context_answer(&mut other).await;
+            assert!(
+                matches!(&refused, Frame::Refused { message } if message.contains("turn is running")),
+                "a context mutation of a busy session is refused: {refused:?}"
+            );
+        }
         other
             .send(&Request::Context {
                 action: ContextAction::Status,
@@ -3605,6 +3609,291 @@ impl LlmPort for ManagedLlm {
                 reservation: request.request.max_tokens.unwrap_or(0),
             },
         }))
+    }
+}
+
+/// Seeds a managed projection so disable/re-enable and reset have observably different effects.
+fn selected_session(id: &SessionId) -> Session {
+    use nanus_domain::context::managed::{
+        ContextModeRecord, ContextPolicy, Digest, FragmentId, ModeActor, ModeReason, NoteCategory,
+        NoteId, ProjectionRevision, RevisionAuthor, RevisionReason, SourceField, SourceKind,
+        SourceRef, WorkingNote, notes::notes_digest, state::frontier_at,
+    };
+    let mut session = Session::new(id.clone(), 1, "/work");
+    session.upgrade_to_managed_body();
+    session.append(SessionEvent::ContextMode {
+        payload: Box::new(ContextModeRecord {
+            policy: ContextPolicy {
+                output_reserve_tokens: 1024,
+                ..ContextPolicy::managed()
+            },
+            actor: ModeActor::Human,
+            reason: ModeReason::Enable,
+            previous_revision: 0,
+        }),
+    });
+    session.append(SessionEvent::UserMessage {
+        text: "constraint".into(),
+        content_blocks: None,
+    });
+    for text in ["old work", "recent work", "newest work"] {
+        session.append(SessionEvent::AssistantMessage {
+            text: Some(text.into()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+            model: None,
+            effort: None,
+            replay: None,
+        });
+    }
+    let notes = vec![WorkingNote {
+        id: NoteId::parse("n:1").expect("valid"),
+        claim: "keep the constraint".into(),
+        category: NoteCategory::Observed,
+        sources: vec![SourceRef {
+            kind: SourceKind::Event,
+            event_seq: Some(1),
+            block_index: None,
+            artifact_id: None,
+            field: SourceField::UserText,
+            offset: 0,
+            length: 10,
+            source_digest: Digest::of(b"constraint"),
+        }],
+    }];
+    session.append(SessionEvent::ContextRevision {
+        payload: Box::new(ProjectionRevision {
+            revision: 1,
+            base_revision: 0,
+            base_frontier: frontier_at(&session, 5, 0).expect("frontier"),
+            hidden: vec![FragmentId::new(2)],
+            notes_digest: notes_digest(&notes),
+            notes,
+            author: RevisionAuthor::Model,
+            reason: RevisionReason::ModelProposal,
+            policy_version: 1,
+            decision_id: "d:1".into(),
+            goal_revision: None,
+            base_profile_digest: Digest::empty(),
+        }),
+    });
+    session
+}
+
+/// Mode changes are durable and reach every viewer; disabling preserves the projection,
+/// re-enabling reuses it, a no-op writes nothing, and reset alone clears it.
+#[test]
+fn context_modes_switch_over_the_link_without_resetting_the_saved_projection() {
+    use nanus_domain::context::managed::{ContextMode, ManagedState};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = agent_over(dir.path(), Rc::new(Box::new(ManagedLlm)), "scripted");
+    let socket = dir.path().join("agent.sock");
+    let id = SessionId::new("switch-modes");
+    nanus_kernel::runtime::block_on(store.save(&selected_session(&id))).expect("seeded");
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let serving = serve(
+            nanus_link::bind(&socket).await.expect("binds"),
+            agent,
+            async move {
+                let _ = stop_rx.await;
+            },
+        );
+        let mut client = Client::connect(&socket).await.expect("connects");
+        client.attach_at(id.as_str()).await.expect("attaches");
+        let mut watcher = Client::connect(&socket).await.expect("connects");
+        watcher.attach_at(id.as_str()).await.expect("watches");
+        for (action, mode, revision, hidden) in [
+            (ContextAction::Legacy, ContextMode::Legacy, 1, 1),
+            (ContextAction::Managed, ContextMode::Managed, 1, 1),
+            (ContextAction::Managed, ContextMode::Managed, 1, 1),
+            (ContextAction::Reset, ContextMode::Legacy, 2, 0),
+        ] {
+            let before = store.load(&id).await.expect("before");
+            client
+                .send(&Request::Context { action })
+                .await
+                .expect("sent");
+            let first = context_answer(&mut client).await;
+            let noop = action == ContextAction::Managed
+                && AgentRunner::context_policy(&before).mode == ContextMode::Managed;
+            let status = if noop {
+                assert!(matches!(first, Frame::ContextStatus { .. }), "{first:?}");
+                first
+            } else {
+                let Frame::Checkpoint { payload, .. } = first else {
+                    panic!("{first:?}")
+                };
+                let disk = store.load(&id).await.expect("already saved");
+                assert_eq!(
+                    payload.frontier.event_count,
+                    u64::try_from(disk.event_count()).unwrap()
+                );
+                context_answer(&mut client).await
+            };
+            let Frame::ContextStatus { payload, .. } = status else {
+                panic!("{status:?}")
+            };
+            assert_eq!(
+                payload.mode == ContextModeState::Managed,
+                mode == ContextMode::Managed
+            );
+            assert_eq!(payload.hidden_fragments, hidden);
+            assert_eq!(payload.output_reserve_tokens, 1024);
+            let mut observed = context_answer(&mut watcher).await;
+            if matches!(observed, Frame::Checkpoint { .. }) {
+                observed = context_answer(&mut watcher).await;
+            }
+            assert!(matches!(observed, Frame::ContextStatus { payload: p, .. } if p == payload));
+            let disk = store.load(&id).await.expect("after");
+            let state = ManagedState::fold(disk.log()).expect("valid projection");
+            assert_eq!(state.mode(), mode);
+            assert_eq!(state.revision(), revision);
+            assert_eq!(state.notes().len(), usize::from(hidden != 0));
+            assert_eq!(disk.body_version(), 3, "disabling never downgrades");
+            if noop {
+                assert_eq!(disk.try_to_jsonl().unwrap(), before.try_to_jsonl().unwrap());
+            }
+        }
+        client
+            .send(&Request::Prompt {
+                text: "continue in legacy".into(),
+            })
+            .await
+            .expect("sent");
+        assert_eq!(
+            answer_of(&turn_frames(&mut client).await),
+            Some("hello back")
+        );
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
+/// A never-managed session can opt in through the link, upgrade durably, run a managed turn,
+/// disable without downgrading, and still run and save an ordinary turn afterwards.
+#[test]
+fn a_legacy_session_can_enable_managed_context_and_continue_after_disabling() {
+    use nanus_domain::context::managed::{ContextMode, ModeActor, ModeReason};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = agent_over(dir.path(), Rc::new(Box::new(ManagedLlm)), "scripted");
+    let socket = dir.path().join("agent.sock");
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let serving = serve(
+            nanus_link::bind(&socket).await.expect("binds"),
+            agent,
+            async move {
+                let _ = stop_rx.await;
+            },
+        );
+        let mut client = Client::connect(&socket).await.expect("connects");
+        let attachment = client.start_at(None).await.expect("starts");
+        let id = SessionId::new(attachment.session.session);
+        for (action, mode) in [
+            (ContextAction::Managed, ContextMode::Managed),
+            (ContextAction::Legacy, ContextMode::Legacy),
+        ] {
+            client
+                .send(&Request::Context { action })
+                .await
+                .expect("sent");
+            let first = context_answer(&mut client).await;
+            assert!(matches!(first, Frame::Checkpoint { .. }), "{first:?}");
+            let disk = store.load(&id).await.expect("already saved");
+            assert_eq!(disk.body_version(), 3);
+            assert_eq!(AgentRunner::context_policy(&disk).mode, mode);
+            assert!(
+                matches!(disk.log().events().last(), Some(SessionEvent::ContextMode { payload })
+                if payload.actor == ModeActor::Human && payload.reason == if mode == ContextMode::Managed {
+                    ModeReason::Enable
+                } else { ModeReason::Disable })
+            );
+            let status = context_answer(&mut client).await;
+            assert!(matches!(status, Frame::ContextStatus { payload, .. }
+                if (payload.mode == ContextModeState::Managed) == (mode == ContextMode::Managed)));
+            client
+                .send(&Request::Prompt {
+                    text: format!("continue in {}", mode.as_str()),
+                })
+                .await
+                .expect("sent");
+            let frames = turn_frames(&mut client).await;
+            assert_eq!(answer_of(&frames), Some("hello back"), "{frames:?}");
+            let disk = store.load(&id).await.expect("turn saved");
+            assert_eq!(
+                disk.turn_count(),
+                if mode == ContextMode::Managed { 1 } else { 2 }
+            );
+            assert!(disk.is_managed_body());
+        }
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
+/// Unsupported providers and stores refuse activation without changing either the held log or
+/// the durable transcript. Selecting legacy on a never-managed session remains a no-op.
+#[test]
+fn unsupported_context_activation_keeps_the_session_legacy_and_unchanged() {
+    for no_checkpoint in [false, true] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (agent, store) = if no_checkpoint {
+            let (agent, store, _gate) = save_gated_agent(dir.path());
+            (agent, store)
+        } else {
+            scripted_agent(dir.path())
+        };
+        let socket = dir.path().join("agent.sock");
+        nanus_kernel::runtime::block_on_local(async move {
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let serving = serve(
+                nanus_link::bind(&socket).await.expect("binds"),
+                agent,
+                async move {
+                    let _ = stop_rx.await;
+                },
+            );
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let attached = client.start_at(None).await.expect("starts");
+            let id = SessionId::new(attached.session.session);
+            client
+                .send(&Request::Prompt {
+                    text: "earlier history".into(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let before = store.load(&id).await.expect("stored");
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            let refused = context_answer(&mut client).await;
+            assert!(matches!(refused, Frame::Refused { .. }), "{refused:?}");
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Legacy,
+                })
+                .await
+                .expect("sent");
+            assert!(
+                matches!(context_answer(&mut client).await, Frame::ContextStatus { payload, .. }
+                if payload.mode == ContextModeState::Legacy)
+            );
+            let after = store.load(&id).await.expect("stored");
+            assert_eq!(
+                after.try_to_jsonl().unwrap(),
+                before.try_to_jsonl().unwrap()
+            );
+            assert!(!after.is_managed_body());
+            let _ = stop_tx.send(());
+            serving.await.expect("joined").expect("clean");
+        });
     }
 }
 

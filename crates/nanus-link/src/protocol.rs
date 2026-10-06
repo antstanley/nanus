@@ -199,21 +199,20 @@ pub enum GoalAction {
     Clear,
 }
 
-/// What a client asks to do about a session's managed context.
+/// What a client asks to do about a session's context.
 ///
-/// One request with an action, for the reason [`GoalAction`] is one: the two actions are about
-/// one piece of session state, and the words are the ones a person types after `/context`. Both
-/// are *idle-session* operations in the sense that matters: a status read never borrows a
-/// running session — it is answered from the snapshot the turn last published — and a reset,
-/// which writes, is refused while a turn runs.
-///
-/// A bare word on the wire rather than a tagged object, because neither action carries anything:
-/// `{"request":"context","action":"reset"}`.
+/// Status never borrows a running session: it reads the last published snapshot. Every mutation
+/// is refused while the session is busy and persisted before it is acknowledged. Mode changes
+/// preserve the managed selection; only reset clears it. Actions are bare words on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextAction {
     /// Report the context status without changing anything.
     Status,
+    /// Select whole-turn fitting, retaining the managed selection for later re-enabling.
+    Legacy,
+    /// Enable managed selection, retaining the reservation and leaving capture unchanged.
+    Managed,
     /// Empty the selection, select legacy replay, and persist that decision.
     Reset,
 }
@@ -554,14 +553,12 @@ pub enum Request {
         action: GoalAction,
     },
 
-    /// Report or reset the session's managed context.
+    /// Report, switch or reset the session's context.
     ///
-    /// A request rather than something a client does for itself for the reason
-    /// [`Request::Goal`] is one: the context is session state, and the session is the agent's.
-    /// The agent answers a status read with [`Frame::ContextStatus`] — from the snapshot a running
-    /// turn last published, never by borrowing that turn's session — and a reset of a busy session
-    /// with [`Frame::Refused`]. A reset that is saved is told to every viewer as a
-    /// [`Frame::Checkpoint`] and the status that follows it.
+    /// The session belongs to the agent; a client cannot change its policy itself. Status reads
+    /// use the last published snapshot during a turn. Mutations of a busy session are refused;
+    /// saved changes are broadcast as a checkpoint followed by status. A no-op mode change
+    /// broadcasts status without writing a checkpoint.
     Context {
         /// What to do.
         action: ContextAction,
@@ -1060,7 +1057,10 @@ impl Frame {
 /// to ignore fields it does not know. The same version added [`Request::Context`] and the three
 /// context frames, [`Frame::ContextStatus`], [`Frame::ContextDecision`] and
 /// [`Frame::Checkpoint`].
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// Version 11 adds explicit legacy/managed mode changes to [`ContextAction`]. An older agent
+/// cannot decode those requests, so it must be refused at the handshake rather than mid-session.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -1450,11 +1450,15 @@ mod tests {
         assert!(!frame.is_end_of_turn());
     }
 
-    /// Both context actions survive the wire, because `/context` and `/context reset` are what a
-    /// person types and each has to reach the agent unchanged.
+    /// Every context action survives the wire unchanged; unknown actions are refused.
     #[test]
     fn the_context_requests_round_trip() {
-        for action in [ContextAction::Status, ContextAction::Reset] {
+        for action in [
+            ContextAction::Status,
+            ContextAction::Legacy,
+            ContextAction::Managed,
+            ContextAction::Reset,
+        ] {
             let request = Request::Context { action };
             let encoded = encode(&request).unwrap_or_else(|error| panic!("{error}"));
             assert_eq!(decode::<Request>(&encoded).ok(), Some(request));

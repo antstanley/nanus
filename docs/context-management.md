@@ -359,8 +359,23 @@ The command line takes the three flags in [configuration](#configuration-activat
 A managed session run by `nanus run` is saved only through its checkpoints; the command reports
 an unsaved or uncertain outcome on stderr, keeps stdout for the answer, and exits non-zero.
 
-The link adds a `context` request with `status` and `reset` actions on a held session, and the
-interface `/context` and `/context reset`. A reset while a turn runs is refused; a status read
+The link has a `context` request with `status`, `legacy`, `managed` and `reset` actions on a held
+session. In the interface, `/context` opens a mode chooser; `/context legacy`, `/context managed`
+and `/context reset` open the named change's impact warning, and `/context status` reads status.
+Every mutation requires an explicit `y` after the warning (`Esc` cancels); warnings scroll on short
+terminals. The chooser and a confirmed change pause the interface's prompt queue until dismissal
+or acknowledgement. Changes apply only to future requests, never to a request in flight.
+
+Switching to legacy preserves the managed hidden selection and working notes for re-enabling,
+but stops using them, removes context tools, disables new shell capture and returns to whole-turn
+fitting, which can omit original user constraints. Re-enabling managed reuses that selection and
+notes. Reset alone clears them. Switching can change model-visible history, token use and cost,
+invalidate prompt caches and lose prior reasoning replay or answer continuity. Enabling upgrades
+the stored body format irreversibly; older builds may no longer read it. Raw events and existing
+archives are never deleted. A switch preserves the output reserve and never enables shell capture
+implicitly. Unsupported activation is refused by the agent, without changing the policy.
+
+A mutation while a turn runs is refused; a status read
 during a turn is answered from the snapshot the turn last published, never by borrowing the
 running session. A reset selects legacy, appends an empty host revision and persists both before
 it is acknowledged. Status carries the mode, readiness and its reason, the revision and frontier,
@@ -371,7 +386,7 @@ provider payloads or evidence.
 `ContextStatus`, `ContextDecision` and `Checkpoint` frames carry the session id, the stream epoch,
 the turn and step (null when idle), a frame id assigned by the session, the stream watermark and
 the durable frontier. Attachment and backlog semantics are described in
-[sessions](sessions.md#what-travels-over-the-link); the link protocol is version 10. The interface
+[sessions](sessions.md#what-travels-over-the-link); the link protocol is version 11. The interface
 draws context notices with the replay's own wording, so a watched turn and the same turn read
 back say the same things. A managed session whose store cannot checkpoint, or whose recovery or
 reconciliation could not be settled, is held but takes no turn until it is reset.

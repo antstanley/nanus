@@ -54,12 +54,11 @@ pub enum Command {
     /// `complete`, `done`, `abandon`, `clear`) on its own — or before a colon and a reason — moves
     /// it, and anything else is an objective to set.
     Goal,
-    /// Read or reset the session's managed context.
+    /// Choose a context mode, read its status, or review a reset.
     ///
-    /// The context is session state the agent owns, so like `/goal` this reaches the agent rather
-    /// than being answered on screen. A bare `/context` (or `/context status`) reads the status,
-    /// and `/context reset` empties the selection and selects legacy replay — which the agent
-    /// persists, and refuses while a turn is running.
+    /// A bare `/context` opens the chooser; `/context status` asks the agent. Named `legacy`,
+    /// `managed` and `reset` actions open an impact warning before anything changes. The agent
+    /// persists confirmed changes and refuses them while a turn is running.
     Context,
     /// Put the newest answer on the clipboard.
     ///

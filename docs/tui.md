@@ -409,7 +409,7 @@ than sending it to the model.
 | `/effort [step]` | open the effort chooser, or switch to the step named |
 | `/provider [name]` | open the provider chooser, or switch to the provider named |
 | `/goal [objective\|status\|pause\|resume\|done[: reason]\|abandon[: reason]\|clear]` | read, set, or move the session's goal |
-| `/context [reset]` | show the session's context status, or reset its managed context to legacy replay |
+| `/context [status\|legacy\|managed\|reset]` | open the context-mode chooser, read status, or review a named mode change/reset |
 | `/copy` | put the newest answer on the clipboard |
 
 `/stats` exists because the row under the composer cannot hold everything. Four readings fit
@@ -456,13 +456,27 @@ which is where a replay of the log draws it too. Two things the model may not do
 the goal (that is `/goal clear`), and complete one without saying what it checked — the
 `evidence` argument is required. See [the toolset](features.md#the-goal-tools).
 
-`/context` also reaches the agent: it asks for the held session's context status and draws it as
-a `context:` notice — the mode, the revision, the hidden and protected counts, and whether
-managed requests can be prepared, with the reason when they cannot. `/context reset` asks the
-agent to reset a [managed](context-management.md) session to legacy replay; the agent refuses it
-while a turn runs, persists it before acknowledging, and every viewer's watermark moves with the
-checkpoint. A managed turn also sends its own status when a step's request is prepared, drawn
-only when something in it changed, and each accepted or rejected proposal in the replay's words.
+`/context` opens a per-session chooser for legacy, managed and reset. `Enter` opens a scrollable
+impact warning, and only `y` confirms it; repeated Enter cannot accidentally switch modes. `Esc`
+cancels. `/context legacy`, `/context managed` and `/context reset` go directly to that warning.
+Mode changes require an idle live session. The prompt queue waits while the chooser is open and
+while a confirmed change awaits acknowledgement, and the mode is not updated optimistically.
+
+The warnings explain how switching changes the history the model sees and may affect continuity,
+token use, cost, prompt caches and reasoning replay. Legacy may omit whole old user turns;
+managed keeps user messages but selects among assistant/tool fragments and adds working notes.
+Disabling managed preserves its saved selection and notes for re-enabling, whereas reset clears
+them. Raw transcript records and existing archives survive either action. The stored body cannot
+be downgraded after enabling managed. Shell capture is never enabled implicitly, and disabling
+stops new capture. Managed remains opt-in, without live-provider or quality/cost validation;
+unsupported model paths are refused by the agent.
+
+`/context status` reaches the agent and draws a `context:` notice — the mode, revision, hidden
+and protected counts, and whether managed requests can be prepared, with the reason when they
+cannot. The agent persists mode changes and resets before acknowledging them to every viewer.
+A managed turn sends its own status when a step's request is prepared, drawn only when something
+changed, and each accepted or rejected proposal in the replay's words. See
+[managed context](context-management.md) for the policy and supported provider paths.
 
 Nothing else is a command yet, and an unrecognised one is not sent to the model: it is
 named in the transcript along with the commands that do exist, because a typo should say so

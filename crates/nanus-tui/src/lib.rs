@@ -44,6 +44,7 @@
 pub mod buffer;
 pub mod command;
 pub mod compact;
+pub mod context;
 // The key list the overlay and `/help` draw. Private because it is a rendering detail of
 // this crate: nobody outside needs to name a binding.
 mod help;

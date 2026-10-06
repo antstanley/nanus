@@ -1,4 +1,4 @@
-//! Managed context over the link: the bound checkpoint, the frontier, and the two requests.
+//! Managed context over the link: the bound checkpoint, frontier, status and policy changes.
 //!
 //! ## Why the host does not save a managed session
 //!
@@ -25,7 +25,7 @@ use std::rc::Rc;
 use nanus_bundle::{ManagedRun, SessionContext, StoreCheckpoint};
 use nanus_domain::context::managed::{
     CheckpointReceipt, ContextDecision, ContextFrontier, ContextMode, ContextStatus,
-    DecisionOutcome, Digest, Durability, ManagedState,
+    DecisionOutcome, Digest, Durability, ErrorCode, ManagedState, ModeActor,
 };
 use nanus_domain::{Session, SessionId};
 use nanus_ports::{
@@ -500,8 +500,115 @@ pub(super) async fn answer(
 ) {
     match action {
         ContextAction::Status => status(registry, frames, held).await,
+        ContextAction::Legacy | ContextAction::Managed => {
+            change_mode(registry, frames, held, action).await;
+        }
         ContextAction::Reset => reset(registry, frames, held).await,
     }
+}
+
+/// Changes only the mode, under the same idle reservation and durability rules as a reset.
+async fn change_mode(
+    registry: &Rc<Registry>,
+    frames: &mpsc::Sender<Frame>,
+    held: &Rc<Held>,
+    action: ContextAction,
+) {
+    if held.busy.replace(true) {
+        send(
+            frames,
+            Frame::Refused {
+                message: String::from(
+                    "a turn is running; the context mode can change when it is idle",
+                ),
+            },
+        )
+        .await;
+        return;
+    }
+    // Keep the reservation through publication: sending a checkpoint can yield to a viewer's
+    // prompt, and the fresh status must not borrow a turn that started in that gap.
+    let _reserved = Reserved(&held.busy);
+    let outcome = change_mode_reserved(registry, held, action).await;
+    match outcome {
+        Ok(receipt) => {
+            if let Some(receipt) = receipt {
+                announce_checkpoint(held, &receipt).await;
+            }
+            match fresh(registry, held) {
+                Ok(frame) => broadcast_awaited(held, frame, None).await,
+                Err(message) => send(frames, Frame::Refused { message }).await,
+            }
+        }
+        Err(message) => send(frames, Frame::Refused { message }).await,
+    }
+}
+
+/// Installs a policy only once the runner has checkpointed it. No-op changes write nothing.
+async fn change_mode_reserved(
+    registry: &Registry,
+    held: &Held,
+    action: ContextAction,
+) -> Result<Option<CheckpointReceipt>, String> {
+    assert!(held.busy.get(), "a mode change runs in a reserved session");
+    if let Some(reason) = held.quarantine.borrow().as_ref() {
+        return Err(format!(
+            "{reason}; use `/context reset` before changing modes"
+        ));
+    }
+    let mut candidate = held.session.borrow().clone();
+    let current = nanus_bundle::AgentRunner::context_policy(&candidate);
+    let mode = match action {
+        ContextAction::Legacy => ContextMode::Legacy,
+        ContextAction::Managed => ContextMode::Managed,
+        ContextAction::Status | ContextAction::Reset => {
+            return Err(String::from("a mode change must name legacy or managed"));
+        }
+    };
+    if current.mode == mode {
+        return Ok(None);
+    }
+    let bound = held.managed.borrow().clone();
+    let binding = match bound {
+        Some(binding) => binding,
+        None => Rc::new(Binding::bind(&registry.agent.store, &held.id).await?),
+    };
+    // Keep the reservation and policy version. Disabling turns capture off; enabling never
+    // starts capturing implicitly, including when the session was previously disabled.
+    let policy = if mode == ContextMode::Legacy {
+        current.disabled()
+    } else {
+        nanus_domain::context::managed::ContextPolicy { mode, ..current }
+    };
+    let changed = registry
+        .agent
+        .runner()
+        .set_context_policy(&mut candidate, policy, ModeActor::Human, binding.runtime())
+        .await;
+    let state = match changed {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            if error.managed_code() == Some(ErrorCode::CheckpointUnknown) {
+                held.quarantine(String::from(QUARANTINED));
+            }
+            return Err(format!("the context mode could not be changed: {error}"));
+        }
+    };
+    let receipt = match settle(&binding, state, &candidate).await {
+        Settled::Durable(receipt) => receipt,
+        Settled::Kept => return Err(String::from("the context mode change was not saved")),
+        Settled::Quarantined(reason) => {
+            held.quarantine(reason.clone());
+            return Err(reason);
+        }
+    };
+    assert_eq!(receipt.frontier.event_count, count(&candidate));
+    held.refresh(&candidate);
+    *held.session.borrow_mut() = candidate;
+    *held.managed.borrow_mut() = Some(binding);
+    held.saved(receipt.frontier.clone());
+    Ok(Some(receipt))
 }
 
 /// Answers a status read: from the published snapshot while a turn runs, fresh while idle.
@@ -552,8 +659,7 @@ fn fresh(registry: &Registry, held: &Held) -> Result<Frame, String> {
     // A quarantined session takes no turn, whatever its selection could prepare: say so.
     if held.quarantine.borrow().is_some() {
         status.managed_ready = false;
-        status.unavailable_reason =
-            Some(nanus_domain::context::managed::ErrorCode::CheckpointUnknown);
+        status.unavailable_reason = Some(ErrorCode::CheckpointUnknown);
     }
     let id = held.next_frame_id();
     let frame = Frame::ContextStatus {
@@ -581,10 +687,8 @@ async fn reset(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, held: &Rc<
         send(frames, Frame::Refused { message }).await;
         return;
     }
-    let outcome = {
-        let _reserved = Reserved(&held.busy);
-        reset_reserved(registry, held).await
-    };
+    let _reserved = Reserved(&held.busy);
+    let outcome = reset_reserved(registry, held).await;
     match outcome {
         Ok(receipt) => {
             announce_checkpoint(held, &receipt).await;
@@ -675,6 +779,8 @@ mod tests {
         identity: Rc<RefCell<ExpectedCheckpoint>>,
         saves: Rc<Cell<u32>>,
         commits: Rc<Cell<u32>>,
+        /// Simulate an uncertain replacement whose disk identity is neither known copy.
+        uncertain: Rc<Cell<bool>>,
     }
 
     impl StorePort for ScriptedStore {
@@ -748,7 +854,16 @@ mod tests {
             _view: CheckpointView<'a>,
         ) -> LocalBoxFuture<'a, Result<CheckpointReceipt, CheckpointError>> {
             self.commits.set(self.commits.get().saturating_add(1));
-            Box::pin(async { Err(CheckpointError::NotCommitted(ErrorCode::StorageCapacity)) })
+            if self.uncertain.get() {
+                *self.identity.borrow_mut() = ExpectedCheckpoint::Absent;
+                Box::pin(async {
+                    Err(CheckpointError::CommitOutcomeUnknown(
+                        ErrorCode::CheckpointUnknown,
+                    ))
+                })
+            } else {
+                Box::pin(async { Err(CheckpointError::NotCommitted(ErrorCode::StorageCapacity)) })
+            }
         }
     }
 
@@ -786,10 +901,12 @@ mod tests {
         identity: Rc<RefCell<ExpectedCheckpoint>>,
         saves: Rc<Cell<u32>>,
         commits: Rc<Cell<u32>>,
+        uncertain: Rc<Cell<bool>>,
     }
 
     /// The host's side of a managed session: the store, the binding, and the held session.
     struct Fixture {
+        handle: StoreHandle,
         store: Probe,
         held: Held,
         binding: Binding,
@@ -800,11 +917,13 @@ mod tests {
             identity: Rc::new(RefCell::new(stored(loaded))),
             saves: Rc::new(Cell::new(0)),
             commits: Rc::new(Cell::new(0)),
+            uncertain: Rc::new(Cell::new(false)),
         };
         let handle: StoreHandle = Rc::new(Box::new(ScriptedStore {
             identity: Rc::clone(&store.identity),
             saves: Rc::clone(&store.saves),
             commits: Rc::clone(&store.commits),
+            uncertain: Rc::clone(&store.uncertain),
         }));
         let binding = Binding {
             checkpoint: StoreCheckpoint::new(
@@ -812,10 +931,11 @@ mod tests {
                 loaded.id().clone(),
                 stored(loaded),
             ),
-            context: SessionContext::with_key(Some(handle), [7; 32]),
+            context: SessionContext::with_key(Some(Rc::clone(&handle)), [7; 32]),
         };
         let held = Held::new(loaded.clone(), None, None, String::from("e"), 0);
         Fixture {
+            handle,
             store,
             held,
             binding,
@@ -844,6 +964,89 @@ mod tests {
         ManagedRun {
             outcome: Ok(outcome),
             persistence: state,
+        }
+    }
+
+    /// A model never called: disabling needs no managed preparation or HTTP.
+    struct IdleLlm;
+
+    impl nanus_ports::LlmPort for IdleLlm {
+        fn model(&self) -> &'static str {
+            "idle"
+        }
+        fn stream_chat(&self, _: nanus_ports::ChatRequest) -> nanus_ports::LlmStream {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    /// Builds only the host pieces the idle mode-change path needs.
+    fn registry_for(store: &StoreHandle) -> Registry {
+        let clock = nanus_adapter_local::SystemClock::new().handle();
+        let runner = nanus_bundle::AgentRunner::new(
+            Rc::new(Box::new(IdleLlm)),
+            nanus_bundle::ToolRegistryHandle::new(nanus_domain::ToolRegistry::new()),
+            "a test",
+            nanus_domain::AgentConfig::new(4, 1, "idle", 4096).expect("valid"),
+            Rc::clone(&clock),
+        )
+        .expect("runner");
+        let agent = super::super::Agent::from_parts(super::super::Parts {
+            runner: Rc::new(runner),
+            store: Rc::clone(store),
+            clock,
+            workspace: PathBuf::from("/work"),
+            models: vec!["idle".into()],
+            tools: 0,
+            switch: None,
+        });
+        Registry::new(Rc::new(agent), "a test".into())
+    }
+
+    /// A failed mode checkpoint installs nothing and never falls back to a terminal save.
+    /// An unreconciled outcome quarantines the session and refuses even no-op changes.
+    #[test]
+    fn a_mode_change_that_cannot_be_checkpointed_keeps_the_policy_and_quarantines_unknown() {
+        use nanus_domain::context::managed::{ContextModeRecord, ContextPolicy, ModeReason};
+        for uncertain in [false, true] {
+            let mut session = Session::new(SessionId::new("idle"), 1, "/work");
+            session.upgrade_to_managed_body();
+            session.append(SessionEvent::ContextMode {
+                payload: Box::new(ContextModeRecord {
+                    policy: ContextPolicy::managed(),
+                    actor: ModeActor::Human,
+                    reason: ModeReason::Enable,
+                    previous_revision: 0,
+                }),
+            });
+            let fixture = fixture(&session);
+            fixture.store.uncertain.set(uncertain);
+            let registry = registry_for(&fixture.handle);
+            let held = fixture.held;
+            *held.managed.borrow_mut() = Some(Rc::new(fixture.binding));
+            held.busy.set(true);
+            let result = nanus_kernel::runtime::block_on(change_mode_reserved(
+                &registry,
+                &held,
+                ContextAction::Legacy,
+            ));
+            assert!(result.is_err());
+            assert_eq!(
+                held.session.borrow().try_to_jsonl().unwrap(),
+                session.try_to_jsonl().unwrap()
+            );
+            assert_eq!(held.frontier.borrow().event_count, 1);
+            assert_eq!(fixture.store.commits.get(), 1);
+            assert_eq!(fixture.store.saves.get(), 0);
+            assert_eq!(held.quarantine.borrow().is_some(), uncertain);
+            if uncertain {
+                let result = nanus_kernel::runtime::block_on(change_mode_reserved(
+                    &registry,
+                    &held,
+                    ContextAction::Managed,
+                ));
+                assert!(result.is_err(), "quarantine refuses no-op changes too");
+                assert_eq!(fixture.store.commits.get(), 1);
+            }
         }
     }
 

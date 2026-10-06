@@ -395,6 +395,12 @@ pub struct ViewState {
     pub context_asked: bool,
     /// Whether a `/context reset` is waiting for the checkpoint that says it was saved.
     pub context_reset_asked: bool,
+    /// The last acknowledged mode, read from the log or an admitted status, never optimistically.
+    pub context_mode: nanus_domain::context::managed::ContextMode,
+    /// The chooser or warning that currently owns the keyboard.
+    pub context_dialog: Option<crate::context::ContextDialog>,
+    /// A confirmed mode change awaiting its status or refusal; prompts wait for this reply.
+    pub context_change_asked: Option<crate::context::ContextChoice>,
     /// The context status a step last showed, so a step whose status did not change draws no
     /// second line saying the same thing.
     pub context_shown: Option<String>,
@@ -749,6 +755,9 @@ impl Default for ViewState {
             stream: crate::stream::StreamCursor::default(),
             context_asked: false,
             context_reset_asked: false,
+            context_mode: nanus_domain::context::managed::ContextMode::Legacy,
+            context_dialog: None,
+            context_change_asked: None,
             context_shown: None,
             decisions_shown: std::collections::BTreeSet::new(),
             step: 0,
@@ -1488,6 +1497,7 @@ impl ViewState {
         self.queue_open
             || self.help_open
             || self.permission_open
+            || self.context_dialog.is_some()
             || self.model_open
             || self.effort_open
             || self.provider_open
@@ -2704,6 +2714,19 @@ impl ViewState {
         if let Some(status) = chunks.get(6) {
             self.render_status(frame, *status);
         }
+        self.render_dialogs(frame, area);
+        // The frame is finished, so this is the screen the reader is looking at. Recorded, then
+        // highlighted: the snapshot is taken before the paint because the highlight adds a modifier
+        // and no text, and the paint comes last because a selection may be over a dialogue, which
+        // is only drawn now.
+        self.capture_screen(frame);
+        if let Some(selection) = self.screen_selection {
+            paint_screen_selection(frame, selection);
+        }
+    }
+
+    /// Draws overlays in keyboard-routing order, with the active modal on top.
+    fn render_dialogs(&mut self, frame: &mut Frame<'_>, area: Rect) {
         // Before the approval dialog, because a question the agent is blocked on has to be
         // the thing a reader sees: the queue is something they can act on afterwards.
         if self.queue_open {
@@ -2722,6 +2745,9 @@ impl ViewState {
         }
         if self.effort_open {
             self.render_efforts(frame, area);
+        }
+        if self.context_dialog.is_some() {
+            self.render_context_dialog(frame, area);
         }
         if self.provider_open {
             self.render_providers(frame, area);
@@ -2745,14 +2771,6 @@ impl ViewState {
         // see. `Esc` closes this and gives the question back.
         if self.permission_open {
             self.render_permissions(frame, area);
-        }
-        // The frame is finished, so this is the screen the reader is looking at. Recorded, then
-        // highlighted: the snapshot is taken before the paint because the highlight adds a modifier
-        // and no text, and the paint comes last because a selection may be over a dialogue, which
-        // is only drawn now.
-        self.capture_screen(frame);
-        if let Some(selection) = self.screen_selection {
-            paint_screen_selection(frame, selection);
         }
     }
 
@@ -3140,6 +3158,70 @@ impl ViewState {
             )));
         // Cleared first, so the transcript behind the dialog does not show through the gaps
         // between its letters.
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .style(self.theme.notice),
+            dialog,
+        );
+    }
+
+    /// Draws the chooser or its scrollable impact warning. Confirmation deliberately uses `y`,
+    /// not Enter: the key that chooses a mode cannot also confirm the warning it just opened.
+    fn render_context_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(state) = self.context_dialog.as_mut() else {
+            return;
+        };
+        let width = area.width.saturating_sub(4).clamp(1, 78);
+        let inner = usize::from(width.saturating_sub(2).max(1));
+        let height = area.height.saturating_sub(4).max(4).min(area.height);
+        let room = usize::from(height.saturating_sub(2));
+        let (lines, footer) = if let Some(choice) = state.confirming {
+            let rows = crate::context::warning_rows(choice, inner);
+            let max_scroll = rows.len().saturating_sub(room);
+            state.scroll = state
+                .scroll
+                .min(u16::try_from(max_scroll).unwrap_or(u16::MAX));
+            let lines = rows
+                .into_iter()
+                .skip(usize::from(state.scroll))
+                .take(room)
+                .map(Line::from)
+                .collect();
+            (lines, " y confirms, Esc cancels; arrows scroll ")
+        } else {
+            let mut lines = vec![Line::from(format!(
+                "current: {} (per session)",
+                self.context_mode.as_str()
+            ))];
+            for (index, choice) in crate::context::ContextDialog::CHOICES.iter().enumerate() {
+                let marker = if state.selection == index {
+                    "\u{25b6}"
+                } else {
+                    " "
+                };
+                lines.push(Line::from(clip_row(
+                    &format!("{marker} {} {}", index.saturating_add(1), choice.label()),
+                    inner,
+                )));
+            }
+            lines.push(Line::from("Changes apply only while idle."));
+            (lines, " Enter reviews impact, Esc cancels ")
+        };
+        let dialog = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height) >> 1),
+            width,
+            height,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.busy)
+            .title(" context mode ")
+            .title_bottom(footer);
         frame.render_widget(Clear, dialog);
         frame.render_widget(
             Paragraph::new(Text::from(lines))
@@ -4527,6 +4609,10 @@ impl ViewState {
                 Style::default().fg(Color::DarkGray),
             )
         };
+        let context = Span::styled(
+            format!("  ·  context: {} (/context)", self.context_mode.as_str()),
+            Style::default().fg(Color::DarkGray),
+        );
         let usage = Span::styled(
             format!("  ·  {} tokens", self.tokens_used),
             Style::default().fg(Color::DarkGray),
@@ -4575,7 +4661,7 @@ impl ViewState {
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                busy, queued, step, permission, usage, collapsed,
+                busy, queued, step, permission, usage, collapsed, context,
             ])),
             area,
         );
@@ -6030,6 +6116,45 @@ mod tests {
                 row.chars().count() <= 34,
                 "no row is wider than the terminal: {row:?}"
             );
+        }
+    }
+
+    /// The context chooser marks the acknowledged mode and warnings distinguish disabling from
+    /// resetting. On a short terminal every warning remains reachable by scrolling.
+    #[test]
+    fn context_warnings_show_the_impact_and_scroll_to_the_end() {
+        use crate::context::{ContextChoice, ContextDialog};
+        use nanus_domain::context::managed::ContextMode;
+        let mut state = ViewState::new();
+        state.context_mode = ContextMode::Managed;
+        state.context_dialog = Some(ContextDialog::new(ContextMode::Managed, None));
+        assert!(state.modal_open());
+        let text = rendered(&mut state, 90, 28);
+        assert!(text.contains("current: managed"), "{text}");
+        assert!(text.contains("legacy -"), "{text}");
+        assert!(text.contains("managed -"), "{text}");
+        assert!(text.contains("reset -"), "{text}");
+        assert!(text.contains("Enter reviews impact"), "{text}");
+        for choice in ContextDialog::CHOICES {
+            state.context_dialog = Some(ContextDialog::new(ContextMode::Managed, Some(choice)));
+            let text = rendered(&mut state, 90, 38);
+            assert!(text.contains("prompt caches"), "{text}");
+            assert!(text.contains("cost"), "{text}");
+            assert!(text.contains("y confirms"), "{text}");
+            let specific = match choice {
+                ContextChoice::Managed => "has not been live-provider",
+                ContextChoice::Legacy => "selection and notes remain",
+                ContextChoice::Reset => "will not restore",
+            };
+            assert!(text.contains(specific), "{text}");
+            state.context_dialog.as_mut().unwrap().scroll = u16::MAX;
+            let bottom = rendered(&mut state, 42, 12);
+            assert!(bottom.contains("raw session log is kept"), "{bottom}");
+            assert!(state.context_dialog.as_ref().unwrap().scroll < u16::MAX);
+            state.context_dialog.as_mut().unwrap().scroll = 0;
+            let top = rendered(&mut state, 42, 12);
+            assert!(top.contains("Change to"), "{top}");
+            assert_ne!(top, bottom);
         }
     }
 

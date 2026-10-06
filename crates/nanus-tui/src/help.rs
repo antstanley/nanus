@@ -69,6 +69,14 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("Ctrl+V", "paste an image from the clipboard, as a path"),
     ("@path", "name a file; Tab completes it"),
     ("!command", "run a shell command here, without the model"),
+    (
+        "/context",
+        "choose context mode and review its impact before switching",
+    ),
+    (
+        "/context status",
+        "read context mode, readiness and selection counts",
+    ),
     ("/copy", "put the newest answer on the clipboard"),
     ("?", "show this list, when the prompt is empty"),
     ("", "while an approval dialog is up"),
