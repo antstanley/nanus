@@ -425,3 +425,80 @@ fn notes_bound_to_an_older_goal_are_marked_stale() {
     );
     assert!(memory.contains("a new direction"));
 }
+
+/// A batch-admission host that admits everything and records what it was shown.
+#[derive(Default)]
+struct Watching {
+    seen: std::cell::RefCell<Vec<(usize, Option<(u64, usize)>)>>,
+}
+
+struct Lease;
+
+impl nanus_ports::ToolBatchReservation for Lease {
+    fn admit(&self, _: &ToolCall) -> Result<(), nanus_ports::AdmissionError> {
+        Ok(())
+    }
+    fn before_dispatch(&self, _: &ToolCall) -> Result<(), nanus_ports::AdmissionError> {
+        Ok(())
+    }
+    fn validate_result(
+        &self,
+        _: &ToolCall,
+        _: &nanus_domain::ToolResult,
+        _: &nanus_domain::ToolResult,
+    ) -> Result<(), nanus_ports::AdmissionError> {
+        Ok(())
+    }
+    fn commit(&self, _: &nanus_ports::ChatRequest) -> Result<(), nanus_ports::AdmissionError> {
+        Ok(())
+    }
+}
+
+impl nanus_ports::ToolAdmission for Watching {
+    fn reserve(
+        &self,
+        projection: &nanus_ports::ToolBatchProjection<'_>,
+    ) -> Result<Box<dyn nanus_ports::ToolBatchReservation>, nanus_ports::AdmissionError> {
+        let managed = projection
+            .managed
+            .as_ref()
+            .map(|managed| (managed.revision, managed.effective.messages.len()));
+        self.seen
+            .borrow_mut()
+            .push((projection.request.messages.len(), managed));
+        Ok(Box::new(Lease))
+    }
+}
+
+/// T20: admission sees the full original request, unchanged, and the effective request the next
+/// step would send, with the accepted revision — never one in place of the other.
+#[test]
+fn admission_sees_the_original_and_the_effective_request_side_by_side() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let watching = Rc::new(Watching::default());
+    let runner = runner(&model, 64_000).with_tool_admission(watching.clone());
+    let (mut session, disk, context) = managed(&runner);
+    model.push(call("w1", "echo", r#"{"size": 10}"#));
+    model.push(call("w2", "echo", r#"{"size": 10}"#));
+    model.push(call("w3", "echo", r#"{"size": 10}"#));
+    model.push(call("i1", "context_manage", INSPECT));
+    model.push_with(propose_oldest("i2"));
+    model.push(call("w4", "echo", r#"{"size": 10}"#));
+    model.push(text("done"));
+    block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)))
+        .outcome
+        .unwrap();
+    let seen = watching.seen.borrow();
+    assert_eq!(seen.len(), 6, "every batch was admitted: {seen:?}");
+    assert!(seen.iter().all(|(_, managed)| managed.is_some()));
+    let (original, last) = seen.last().copied().unwrap();
+    let (revision, effective) = last.unwrap();
+    assert_eq!(revision, 1, "the accepted revision is named");
+    // Original: system + every message; effective: system, notice, generated data, fewer
+    // messages because one fragment (a call and its result) is hidden.
+    assert!(
+        effective < original.saturating_add(2),
+        "{effective} vs {original}"
+    );
+    assert!(original >= 10);
+}

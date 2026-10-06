@@ -32,12 +32,16 @@ fn derive<M: Metric>(c: &mut Criterion<M>) {
     for turns in TURNS {
         let session = session(turns);
         group.throughput(Throughput::Elements(events(turns)));
-        group.bench_with_input(BenchmarkId::from_parameter(turns), &session, |b, session| {
-            b.iter(|| {
-                let fragments = fragments::derive(black_box(session).log());
-                fragments.map(|fragments| state::protected(session.log(), &fragments))
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(turns),
+            &session,
+            |b, session| {
+                b.iter(|| {
+                    let fragments = fragments::derive(black_box(session).log());
+                    fragments.map(|fragments| state::protected(session.log(), &fragments))
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -48,9 +52,13 @@ fn fold<M: Metric>(c: &mut Criterion<M>) {
     for turns in TURNS {
         let session = session(turns);
         group.throughput(Throughput::Elements(events(turns)));
-        group.bench_with_input(BenchmarkId::from_parameter(turns), &session, |b, session| {
-            b.iter(|| ManagedState::fold(black_box(session).log()));
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(turns),
+            &session,
+            |b, session| {
+                b.iter(|| ManagedState::fold(black_box(session).log()));
+            },
+        );
     }
     group.finish();
 }
@@ -61,9 +69,13 @@ fn frontier<M: Metric>(c: &mut Criterion<M>) {
     for turns in TURNS {
         let session = session(turns);
         group.throughput(Throughput::Bytes(session.to_jsonl().len() as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(turns), &session, |b, session| {
-            b.iter(|| state::frontier(black_box(session), 0));
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(turns),
+            &session,
+            |b, session| {
+                b.iter(|| state::frontier(black_box(session), 0));
+            },
+        );
     }
     group.finish();
 }
@@ -92,24 +104,28 @@ fn compile<M: Metric>(c: &mut Criterion<M>) {
             recovery_available: true,
         };
         group.throughput(Throughput::Elements(events(turns)));
-        group.bench_with_input(BenchmarkId::from_parameter(turns), &session, |b, session| {
-            b.iter(|| {
-                let selection = Selection {
-                    revision: 1,
-                    hidden: &hidden,
-                    notes: &[],
-                    notes_goal_revision: None,
-                };
-                derive_effective_context(
-                    black_box(session),
-                    &fragments,
-                    &protected,
-                    selection,
-                    None,
-                    &facts,
-                )
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(turns),
+            &session,
+            |b, session| {
+                b.iter(|| {
+                    let selection = Selection {
+                        revision: 1,
+                        hidden: &hidden,
+                        notes: &[],
+                        notes_goal_revision: None,
+                    };
+                    derive_effective_context(
+                        black_box(session),
+                        &fragments,
+                        &protected,
+                        selection,
+                        None,
+                        &facts,
+                    )
+                });
+            },
+        );
     }
     group.finish();
 }

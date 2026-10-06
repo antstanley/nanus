@@ -103,6 +103,11 @@ impl AgentRunner {
         if let Some(code) = self.unready(turn.policy()) {
             return Err(refusal(code));
         }
+        // Recall and inspect cursors are sealed with the runtime's process-held key; a turn
+        // with no runtime has no key, so it does not run managed rather than run unsealed.
+        if turn.context.is_none() {
+            return Err(refusal(ErrorCode::UnsupportedMode));
+        }
         Self::snapshot(session).map(|_| ())
     }
 
