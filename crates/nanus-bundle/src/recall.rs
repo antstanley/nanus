@@ -143,7 +143,7 @@ fn seal(scope: &Scope<'_>, query: &str, position: &Position) -> String {
         scope.frontier.event_count,
         scope
             .frontier
-            .prefix_sha256
+            .prefix_blake3
             .as_str()
             .get(..16)
             .unwrap_or_default(),
@@ -380,7 +380,7 @@ fn hit(
                 offset: position,
                 length,
                 source_digest: receipt
-                    .retained_sha256
+                    .retained_blake3
                     .clone()
                     .unwrap_or_else(Digest::empty),
                 field: SourceField::Artifact,
@@ -626,7 +626,7 @@ async fn resolve_artifact(
             offset: start,
             length: 0,
             source_digest: receipt
-                .retained_sha256
+                .retained_blake3
                 .clone()
                 .unwrap_or_else(Digest::empty),
             field: SourceField::Artifact,

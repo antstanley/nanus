@@ -261,7 +261,7 @@ async fn sends_exactly_what_it_prepared(llm: &OpenAiLlm, request: ChatRequest) -
     assert_eq!(Digest::of(&received), digest);
     let sent: Value = serde_json::from_slice(&received).unwrap();
     let caps = llm.capabilities(&request.model);
-    let again = nanus_ports::capabilities::estimate_payload(caps, &request, &sent).unwrap();
+    let again = nanus_ports::capabilities::estimate_managed_payload(caps, &request, &sent).unwrap();
     assert_eq!(again, estimate, "the estimate is of the body that was sent");
     assert!(
         events

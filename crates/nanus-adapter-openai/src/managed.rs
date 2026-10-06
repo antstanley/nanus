@@ -181,7 +181,7 @@ pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCh
 
     // Encoded once: the estimate, the digest and the dispatch all read this one value.
     let payload = crate::wire::build_request(config, &request);
-    let estimate = nanus_ports::capabilities::estimate_payload(caps, &request, &payload)?;
+    let estimate = nanus_ports::capabilities::estimate_managed_payload(caps, &request, &payload)?;
     if !estimate.fits(caps, &request) {
         return Err(refuse(
             ErrorCode::CandidateTooLarge,

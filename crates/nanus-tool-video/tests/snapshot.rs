@@ -16,7 +16,6 @@ use nanus_tool_video::{
     MediaInfo, Sample, SampledFrame, Snapshot, VideoAnalyzer, VideoDecoder, VideoError,
     VideoRouting, VideoServices, VideoSource, Window, read_video_tool,
 };
-use sha2::{Digest as _, Sha256};
 
 struct Lease {
     _directory: tempfile::TempDir,
@@ -42,7 +41,7 @@ fn owned() -> (PathBuf, Arc<AtomicUsize>, Arc<Lease>) {
 }
 
 fn snapshot(path: PathBuf, owner: Arc<Lease>) -> Snapshot {
-    let digest = format!("{:x}", Sha256::digest(b"fictional source"));
+    let digest = blake3::hash(b"fictional source").to_hex().to_string();
     Snapshot::from_owned_file(path, digest, 16, owner).expect("caller receipt")
 }
 

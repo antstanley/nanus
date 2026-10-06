@@ -355,7 +355,7 @@ design docs too.
   `nanus-link` and to the server that produces it — not a new field smuggled
   through an existing one.
 - **A Windows pipe peer is proven, not assumed.** A pipe name is global and computable, so both
-  ends of the Windows link run the HMAC handshake in `nanus-link/src/transport/guard.rs` before
+  ends of the Windows link run the keyed-BLAKE3 handshake in `nanus-link/src/transport/guard.rs` before
   the first frame, keyed by a file the agent writes under the user's local app data *after* it
   owns the name. `Listener::accept` returns an `Accepted` that only `verify` turns into a
   `Stream`, and the server verifies in the connection's task so a silent peer cannot stall

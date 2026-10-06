@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-sha2 = { workspace = true }
+blake3 = { workspace = true }
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }
 tokio = { workspace = true }

@@ -189,7 +189,7 @@ pub fn prepare(llm: &AnthropicLlm, managed: ManagedRequest) -> LlmResult<Prepare
             "a kept assistant turn carries only replay this request cannot admit",
         ));
     }
-    let estimate = nanus_ports::capabilities::estimate_payload(caps, &request, &payload)?;
+    let estimate = nanus_ports::capabilities::estimate_managed_payload(caps, &request, &payload)?;
     if !estimate.fits(caps, &request) {
         return Err(refuse(
             ErrorCode::CandidateTooLarge,

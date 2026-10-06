@@ -3,7 +3,6 @@ use std::io::Write;
 
 use nanus_ports::{LlmError, LlmResult};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 fn refused() -> LlmError {
     LlmError::Unsupported {
@@ -13,7 +12,7 @@ fn refused() -> LlmError {
 
 #[derive(Clone)]
 struct Writer {
-    hash: Sha256,
+    hash: blake3::Hasher,
     used: usize,
     limit: usize,
 }
@@ -34,12 +33,12 @@ impl Write for Writer {
 
 pub fn json(value: &impl Serialize, limit: usize) -> LlmResult<String> {
     let mut writer = Writer {
-        hash: Sha256::new(),
+        hash: blake3::Hasher::new(),
         used: 0,
         limit,
     };
     serde_json::to_writer(&mut writer, value).map_err(|_| refused())?;
-    Ok(format!("{:x}", writer.hash.finalize()))
+    Ok(writer.hash.finalize().to_hex().as_str().to_owned())
 }
 
 pub struct Source {
@@ -49,7 +48,7 @@ pub struct Source {
 impl Source {
     pub fn new() -> LlmResult<Self> {
         let mut writer = Writer {
-            hash: Sha256::new(),
+            hash: blake3::Hasher::new(),
             used: 0,
             limit: nanus_domain::content::SESSION_BYTES_MAX,
         };
@@ -70,6 +69,6 @@ impl Source {
     pub fn prefix(&self) -> LlmResult<String> {
         let mut writer = self.writer.clone();
         writer.write_all(b"]").map_err(|_| refused())?;
-        Ok(format!("{:x}", writer.hash.finalize()))
+        Ok(writer.hash.finalize().to_hex().as_str().to_owned())
     }
 }

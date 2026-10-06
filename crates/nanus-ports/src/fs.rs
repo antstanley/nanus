@@ -138,8 +138,8 @@ pub struct RangeRead {
     pub bytes: Vec<u8>,
     /// The file's identity when it was read.
     pub identity: FileIdentity,
-    /// SHA-256 of the returned bytes.
-    pub range_sha256: nanus_domain::context::managed::Digest,
+    /// BLAKE3 of the returned bytes.
+    pub range_blake3: nanus_domain::context::managed::Digest,
     /// Whether the window reached the end of the file.
     pub eof: bool,
 }

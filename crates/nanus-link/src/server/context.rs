@@ -123,13 +123,13 @@ pub(super) fn frontier_of(session: &Session) -> ContextFrontier {
     let event_count = count(session);
     // The count is the log's own length, which a prefix digest cannot refuse; the empty digest is
     // the answer to a failure that cannot happen rather than a panic waiting for one.
-    let prefix_sha256 = session
+    let prefix_blake3 = session
         .prefix_digest(event_count)
         .unwrap_or_else(|_| Digest::empty());
     ContextFrontier {
         session_id: session.id().as_str().to_owned(),
         event_count,
-        prefix_sha256,
+        prefix_blake3,
         projection_revision: revision_of(session),
     }
 }
@@ -139,7 +139,7 @@ pub(super) fn wire_frontier(frontier: &ContextFrontier) -> FrontierInfo {
     FrontierInfo {
         session_id: frontier.session_id.clone(),
         event_count: frontier.event_count,
-        prefix_sha256: frontier.prefix_sha256.as_str().to_owned(),
+        prefix_blake3: frontier.prefix_blake3.as_str().to_owned(),
         projection_revision: frontier.projection_revision,
     }
 }
@@ -304,8 +304,8 @@ async fn settle(binding: &Binding, state: PersistenceState, session: &Session) -
         // what the contract forbids.
         PersistenceState::Unsaved { .. } => Settled::Kept,
         PersistenceState::Unknown {
-            candidate_sha256, ..
-        } => match binding.checkpoint.reconcile(&candidate_sha256).await {
+            candidate_blake3, ..
+        } => match binding.checkpoint.reconcile(&candidate_blake3).await {
             Ok(Reconciled::Installed(stored)) => receipt_from(&stored, session).map_or_else(
                 || Settled::Quarantined(String::from(QUARANTINED)),
                 Settled::Durable,
@@ -329,14 +329,14 @@ async fn settle(binding: &Binding, state: PersistenceState, session: &Session) -
 /// disk does not hold, and let the next commit overwrite what the disk does.
 fn receipt_from(stored: &ExpectedCheckpoint, session: &Session) -> Option<CheckpointReceipt> {
     let ExpectedCheckpoint::Stored {
-        file_sha256,
+        file_blake3,
         event_count,
         ..
     } = stored
     else {
         return None;
     };
-    if session.prefix_digest(*event_count).ok()? != *file_sha256 {
+    if session.prefix_digest(*event_count).ok()? != *file_blake3 {
         return None;
     }
     let prefix = session.prefix(*event_count).ok()?;
@@ -344,7 +344,7 @@ fn receipt_from(stored: &ExpectedCheckpoint, session: &Session) -> Option<Checkp
         frontier: ContextFrontier {
             session_id: session.id().as_str().to_owned(),
             event_count: *event_count,
-            prefix_sha256: file_sha256.clone(),
+            prefix_blake3: file_blake3.clone(),
             projection_revision: revision_of(&prefix),
         },
         body_digest: prefix.body_digest(),
@@ -455,12 +455,12 @@ pub(super) async fn record_idle(
             ));
         }
         Err(CheckpointError::CommitOutcomeUnknown(_)) => {
-            let candidate_sha256 = updated
+            let candidate_blake3 = updated
                 .prefix_digest(count(updated))
                 .map_err(|error| error.to_string())?;
             let unknown = PersistenceState::Unknown {
                 previous: expected,
-                candidate_sha256,
+                candidate_blake3,
             };
             match settle(&binding, unknown, updated).await {
                 Settled::Durable(receipt) => receipt,
@@ -756,7 +756,7 @@ mod tests {
     fn stored(session: &Session) -> ExpectedCheckpoint {
         ExpectedCheckpoint::Stored {
             body_version: session.body_version(),
-            file_sha256: frontier_of(session).prefix_sha256,
+            file_blake3: frontier_of(session).prefix_blake3,
             event_count: count(session),
         }
     }
@@ -930,7 +930,7 @@ mod tests {
         let (before, after) = sessions();
         let unknown = || PersistenceState::Unknown {
             previous: stored(&before),
-            candidate_sha256: frontier_of(&after).prefix_sha256,
+            candidate_blake3: frontier_of(&after).prefix_blake3,
         };
 
         // The candidate is on disk: the turn is durable, and ends as it would have.
@@ -945,8 +945,8 @@ mod tests {
         assert!(matches!(ending, Frame::Done { .. }), "{ending:?}");
         assert_eq!(installed.held.frontier.borrow().event_count, 3);
         assert_eq!(
-            installed.held.frontier.borrow().prefix_sha256,
-            frontier_of(&after).prefix_sha256
+            installed.held.frontier.borrow().prefix_blake3,
+            frontier_of(&after).prefix_blake3
         );
 
         // The previous file is on disk: not saved, not quarantined.
@@ -1049,8 +1049,8 @@ mod tests {
         assert_eq!(wire.revision, 4);
         assert_eq!(wire.frontier.event_count, 2);
         assert_eq!(
-            wire.frontier.prefix_sha256,
-            status.frontier.prefix_sha256.as_str()
+            wire.frontier.prefix_blake3,
+            status.frontier.prefix_blake3.as_str()
         );
         assert_eq!(wire.hidden_fragments, 3);
         assert_eq!(wire.profile_digest, Digest::of(b"profile").as_str());
@@ -1085,7 +1085,7 @@ mod tests {
         disk.append(SessionEvent::UserMessage { text: "b".into() });
         let stored = |session: &Session| ExpectedCheckpoint::Stored {
             body_version: 3,
-            file_sha256: session.prefix_digest(2).expect("encodes"),
+            file_blake3: session.prefix_digest(2).expect("encodes"),
             event_count: 2,
         };
         assert!(

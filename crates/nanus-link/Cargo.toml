@@ -34,15 +34,13 @@ nanus-sys-windows = { workspace = true }
 # `transport::guard`. `etcetera` finds the user's private local data directory for its key.
 etcetera = { workspace = true }
 getrandom = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 # The handshake is exercised on every platform, so its crates are here as well.
 etcetera = { workspace = true }
 getrandom = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
+blake3 = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
 nanus-adapter-local = { workspace = true }

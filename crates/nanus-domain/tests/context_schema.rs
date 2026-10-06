@@ -27,7 +27,7 @@ fn frontier() -> ContextFrontier {
     ContextFrontier {
         session_id: "s".into(),
         event_count: 1,
-        prefix_sha256: digest(),
+        prefix_blake3: digest(),
         projection_revision: 0,
     }
 }
@@ -165,11 +165,11 @@ fn samples() -> Vec<(&'static str, Value)> {
                 stream: CaptureStream::Stdout,
                 retained_bytes: 0,
                 observed_bytes: 0,
-                retained_sha256: None,
+                retained_blake3: None,
                 status: CaptureStatus::Unavailable,
                 reason: CaptureReason::Unsupported,
                 encoding: RawEncoding::Raw,
-                chunk_sha256: Vec::new(),
+                chunk_blake3: Vec::new(),
             })
             .unwrap(),
         ),

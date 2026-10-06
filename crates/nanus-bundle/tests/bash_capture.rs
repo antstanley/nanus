@@ -55,7 +55,7 @@ impl RawCaptureSink for Memory {
             stream: self.stream,
             retained_bytes: retained,
             observed_bytes: observed,
-            retained_sha256: Some(Digest::of(&bytes)),
+            retained_blake3: Some(Digest::of(&bytes)),
             status: if reason == CaptureReason::Eof && retained == observed {
                 CaptureStatus::Complete
             } else {
@@ -63,7 +63,7 @@ impl RawCaptureSink for Memory {
             },
             reason,
             encoding: RawEncoding::Raw,
-            chunk_sha256: bytes.chunks(65_536).map(Digest::of).collect(),
+            chunk_blake3: bytes.chunks(65_536).map(Digest::of).collect(),
         };
         Box::pin(async move {
             CaptureFinalization {

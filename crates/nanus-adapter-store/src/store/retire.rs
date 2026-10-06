@@ -94,6 +94,7 @@ impl JsonlStore {
     /// Deletes a session under exclusive ownership, retiring its id.
     pub(super) async fn delete_blocking(&self, id: &SessionId) -> StoreResult<()> {
         let dir = self.session_dir(id)?;
+        self.forget_written(id);
         let metadata = match fs::symlink_metadata(&dir).await {
             Ok(metadata) => metadata,
             // The port is explicit: deleting something absent is not an error, because the

@@ -11,10 +11,18 @@
 //! append StepStart -> HTTP/stream -> append the assembled observation
 //! classify mixed proposals -> policy/approval -> admission -> execute -> ordered append
 //! append StepEnd -> evaluate a staged proposal
-//! checkpoint the candidate revision or the unchanged one + RequestAttempt(finished)
+//! a proposal: checkpoint the candidate revision or the unchanged one + RequestAttempt(finished)
+//! none: append RequestAttempt(finished) for the next checkpoint to carry
 //! install what was acknowledged -> honour cancellation -> release the selection
 //! next step, or append and checkpoint TurnEnd before the answer is reported
 //! ```
+//!
+//! A step with nothing to decide is not checkpointed on its own. Between its settlement and the
+//! next checkpoint — the next step's intent, or the turn's end — nothing leaves the process: no
+//! request is sent and no tool runs. So one commit can carry both, and a turn of `n` steps takes
+//! `n + 1` checkpoints rather than `2n + 1`. If that commit is refused, the session holds exactly
+//! what a refused settlement would have left: the attempt's finished record, which both outcomes
+//! append.
 //!
 //! Every checkpoint commits a *candidate* — a copy of the session with the new records — and only
 //! an acknowledged commit installs it. A refused commit leaves the previous file intact and the
@@ -107,6 +115,8 @@ pub(super) struct ManagedTurn<'a> {
     persistence: RefCell<Option<PersistenceState>>,
     /// Events below this count are on disk.
     durable: Cell<u64>,
+    /// Steps settled into the session whose records the next checkpoint will carry.
+    settled: Cell<u32>,
     /// Finalized archive objects the next checkpoint will newly reference.
     artifacts: RefCell<Vec<FinalizedArtifact>>,
     /// Receipts of streams that could not be reserved, waiting for their call's result.
@@ -131,6 +141,7 @@ impl<'a> ManagedTurn<'a> {
             halt: Cell::new(Halt::Running),
             persistence: RefCell::new(None),
             durable: Cell::new(durable),
+            settled: Cell::new(0),
             artifacts: RefCell::new(Vec::new()),
             unpublished: RefCell::new(Vec::new()),
             step: RefCell::new(step::StepState::default()),
@@ -443,12 +454,18 @@ impl AgentRunner {
     ) -> CheckpointReceipt {
         turn.artifacts.borrow_mut().clear();
         turn.durable.set(receipt.frontier.event_count);
+        // The steps this commit carried are settled now, and counted as settled steps are.
+        for _ in 0..turn.settled.replace(0) {
+            Self::count_step(turn);
+        }
         *turn.persistence.borrow_mut() = Some(PersistenceState::Acknowledged(receipt.clone()));
         progress.checkpointed(&receipt);
         receipt
     }
 
     fn refused(turn: &ManagedTurn<'_>, expected: nanus_ports::ExpectedCheckpoint) {
+        // Steps carried by a commit that did not land were never settled on disk.
+        turn.settled.set(0);
         if turn.halt.get() == Halt::Running {
             turn.halt.set(Halt::Unsaved {
                 terminal_used: false,
@@ -484,10 +501,11 @@ impl AgentRunner {
                 Err(not_committed())
             }
             Ok(Reconciled::Quarantined) | Err(_) => {
+                turn.settled.set(0);
                 turn.halt.set(Halt::Frozen);
                 *turn.persistence.borrow_mut() = Some(PersistenceState::Unknown {
                     previous: expected,
-                    candidate_sha256: digest,
+                    candidate_blake3: digest,
                 });
                 Err(unknown())
             }

@@ -430,11 +430,11 @@ fn unavailable(call: &ToolCall, stream: CaptureStream, reason: CaptureReason) ->
         stream,
         retained_bytes: 0,
         observed_bytes: 0,
-        retained_sha256: None,
+        retained_blake3: None,
         status: CaptureStatus::Unavailable,
         reason,
         encoding: RawEncoding::Raw,
-        chunk_sha256: Vec::new(),
+        chunk_blake3: Vec::new(),
     }
 }
 

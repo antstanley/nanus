@@ -264,11 +264,11 @@ fn uncertain(call: &ToolCallId, stream: CaptureStream, observed: u64) -> Capture
         stream,
         retained_bytes: 0,
         observed_bytes: observed,
-        retained_sha256: None,
+        retained_blake3: None,
         status: CaptureStatus::Unavailable,
         reason: CaptureReason::Timeout,
         encoding: RawEncoding::Raw,
-        chunk_sha256: Vec::new(),
+        chunk_blake3: Vec::new(),
     };
     CaptureFinalization {
         receipt,
@@ -594,7 +594,7 @@ mod tests {
                     stream: self.stream,
                     retained_bytes: retained,
                     observed_bytes: observed,
-                    retained_sha256: Some(Digest::of(&self.bytes)),
+                    retained_blake3: Some(Digest::of(&self.bytes)),
                     status: if reason == CaptureReason::Eof && retained == observed {
                         CaptureStatus::Complete
                     } else {
@@ -602,7 +602,7 @@ mod tests {
                     },
                     reason,
                     encoding: RawEncoding::Raw,
-                    chunk_sha256: self.bytes.chunks(65_536).map(Digest::of).collect(),
+                    chunk_blake3: self.bytes.chunks(65_536).map(Digest::of).collect(),
                 };
                 assert!(
                     receipt.validate().is_ok(),
@@ -823,11 +823,11 @@ mod tests {
                 stream: CaptureStream::Stdout,
                 retained_bytes: 65_536,
                 observed_bytes: 70_000,
-                retained_sha256: Some(Digest::empty()),
+                retained_blake3: Some(Digest::empty()),
                 status: CaptureStatus::Partial,
                 reason: CaptureReason::Quota,
                 encoding: RawEncoding::Raw,
-                chunk_sha256: vec![Digest::empty()],
+                chunk_blake3: vec![Digest::empty()],
             };
             let rendered = render_archived(&ran, &[receipt]);
             assert!(

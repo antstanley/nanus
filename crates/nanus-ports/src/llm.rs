@@ -191,7 +191,7 @@ pub trait PreparedModelCall {
     /// The estimate of exactly the prepared body.
     fn estimate(&self) -> crate::RequestEstimate;
 
-    /// SHA-256 of exactly the prepared body.
+    /// BLAKE3 of exactly the prepared body.
     fn request_digest(&self) -> &nanus_domain::context::managed::Digest;
 
     /// The route, without credentials.

@@ -51,7 +51,7 @@
       "required": [
         "session_id",
         "event_count",
-        "prefix_sha256",
+        "prefix_blake3",
         "projection_revision"
       ],
       "properties": {
@@ -65,7 +65,7 @@
           "minimum": 0,
           "maximum": 18446744073709551615
         },
-        "prefix_sha256": {
+        "prefix_blake3": {
           "$ref": "#/$defs/Digest"
         },
         "projection_revision": {
@@ -531,11 +531,11 @@
         "stream",
         "retained_bytes",
         "observed_bytes",
-        "retained_sha256",
+        "retained_blake3",
         "status",
         "reason",
         "encoding",
-        "chunk_sha256"
+        "chunk_blake3"
       ],
       "properties": {
         "artifact_id": {
@@ -569,7 +569,7 @@
           "minimum": 0,
           "maximum": 18446744073709551615
         },
-        "retained_sha256": {
+        "retained_blake3": {
           "anyOf": [
             {
               "$ref": "#/$defs/Digest"
@@ -601,7 +601,7 @@
         "encoding": {
           "const": "raw"
         },
-        "chunk_sha256": {
+        "chunk_blake3": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/Digest"

@@ -17,7 +17,7 @@
 //! byte argument the tool is exactly the line-window tool it always was.
 //!
 //! A byte window reports true byte offsets, the version (a token of the file's observed
-//! identity) and the SHA-256 of exactly the bytes shown. Passing the version back on the
+//! identity) and the BLAKE3 of exactly the bytes shown. Passing the version back on the
 //! next window makes the tool say whether the file changed in between — which is what a
 //! model reading a large file piecewise needs to know, and which the tool states as a fact
 //! about metadata, never as proof that the whole file is the same.
@@ -445,8 +445,8 @@ fn render_byte_window(path: &str, read: &RangeRead, request: &ByteRequest) -> By
         .saturating_sub(WINDOW_FOOTER_RESERVE);
     let decoded = decode_bounded(read_bytes, budget, reached_end);
     let shown = read_bytes.get(..decoded.consumed).unwrap_or_default();
-    let range_sha256 = if shown.len() == read.bytes.len() {
-        read.range_sha256.clone()
+    let range_blake3 = if shown.len() == read.bytes.len() {
+        read.range_blake3.clone()
     } else {
         Digest::of(shown)
     };
@@ -463,7 +463,7 @@ fn render_byte_window(path: &str, read: &RangeRead, request: &ByteRequest) -> By
             .as_deref()
             .map(|previous| previous == version),
         version,
-        range_sha256,
+        range_blake3,
     };
     let mut text = window_header(&facts, request);
     text.push_str(&decoded.text);
@@ -492,8 +492,8 @@ struct WindowFacts {
     eof: bool,
     /// The token of the file's observed identity.
     version: String,
-    /// SHA-256 of exactly the bytes shown.
-    range_sha256: Digest,
+    /// BLAKE3 of exactly the bytes shown.
+    range_blake3: Digest,
     /// Whether the identity matches the version the call passed, when it passed one.
     same_as_previous: Option<bool>,
 }
@@ -503,8 +503,8 @@ fn window_header(facts: &WindowFacts, request: &ByteRequest) -> String {
     let mut header = String::new();
     let _ = writeln!(
         header,
-        "[bytes {}..{} of {}; version {}; sha256 {}]",
-        facts.start, facts.end, facts.len, facts.version, facts.range_sha256
+        "[bytes {}..{} of {}; version {}; blake3 {}]",
+        facts.start, facts.end, facts.len, facts.version, facts.range_blake3
     );
     match (facts.same_as_previous, request.previous.as_deref()) {
         (Some(true), _) => {
@@ -588,7 +588,7 @@ fn window_value(
         "eof": facts.eof,
         "file_bytes": facts.len,
         "version": facts.version,
-        "sha256": facts.range_sha256.as_str(),
+        "blake3": facts.range_blake3.as_str(),
         "invalid_utf8_sequences": decoded.invalid,
         "changed": facts.same_as_previous.map(|same| !same),
         "identity": identity_value(&read.identity),
@@ -958,7 +958,7 @@ mod tests {
                 usize::try_from(value["returned_bytes"].as_u64().unwrap_or(0)).unwrap_or(0);
             let slice = &contents[start..start + returned];
             assert_eq!(value["start"], offset);
-            assert_eq!(value["sha256"], Digest::of(slice).as_str());
+            assert_eq!(value["blake3"], Digest::of(slice).as_str());
             assert!(
                 text.contains(std::str::from_utf8(slice).unwrap_or("?")),
                 "{text}"

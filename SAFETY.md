@@ -208,7 +208,7 @@ Anonymous. So the pipe alone does not say who is at the other end, in either dir
 Both ends therefore prove themselves before a frame is exchanged. When an agent owns its pipe
 name it writes a fresh random key to `%LOCALAPPDATA%\nanus\run\<pipe name>.key`, a directory
 no other account can read, and removes it when it stops. The client challenges the agent, and
-sends nothing more until the agent answers with an HMAC-SHA-256 over two fresh nonces made with
+sends nothing more until the agent answers with a keyed BLAKE3 MAC over two fresh nonces made with
 that key; then it answers the agent's challenge the same way. The key never crosses the pipe. A
 squatter cannot answer, so the client refuses it with a sentence and sends it nothing; a client
 that cannot answer is dropped within five seconds, and the agent goes on serving. The handshake

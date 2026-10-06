@@ -170,6 +170,9 @@ pub struct JsonlStore {
     /// release is synchronous and the caller is a `Drop`: the open file has to outlive the call
     /// that opened it, and this is the thing that outlives it.
     locks: Mutex<BTreeMap<SessionId, std::fs::File>>,
+    /// The identity of each session file this process last checkpointed, and how the file looked
+    /// just after: what lets the next checkpoint skip reading the file back. See `checkpoint`.
+    written: Mutex<BTreeMap<SessionId, checkpoint::Written>>,
     /// The archive's byte limits, never above the policy's.
     quota: ArchiveQuota,
 }
@@ -186,6 +189,7 @@ impl JsonlStore {
         let store = Self {
             home,
             locks: Mutex::new(BTreeMap::new()),
+            written: Mutex::new(BTreeMap::new()),
             quota: ArchiveQuota::default(),
         };
         let root = store.sessions_root();
@@ -375,6 +379,8 @@ impl JsonlStore {
         if locks.remove(id).is_none() {
             tracing::debug!(session = %id.as_str(), "a claim this process does not hold");
         }
+        drop(locks);
+        self.forget_written(id);
     }
 
     /// Writes `session` atomically, replacing any existing log for its id.
@@ -396,6 +402,7 @@ impl JsonlStore {
             .try_to_jsonl()
             .map_err(|error| corrupt(session.id(), &error))?;
         assert!(!body.is_empty(), "an encoded session is never empty");
+        self.forget_written(session.id());
         write_atomic(&path, &body).await?;
         if self.retired(session.id())? {
             self.undo_resurrection(session.id());

@@ -117,10 +117,10 @@ knowledge of a per-agent key that only the user can read.** On owning its name, 
 32 random bytes to `%LOCALAPPDATA%\nanus\run\<pipe name>.key` (atomically, by rename) and
 removes the file when the listener is dropped. The exchange, before the first frame:
 
-1. The client sends `nanus-link-auth1` and a 32-byte nonce.
-2. The agent sends its own nonce and `HMAC-SHA256(key, "server" ‖ client nonce ‖ agent nonce)`.
+1. The client sends `nanus-link-auth2` and a 32-byte nonce.
+2. The agent sends its own nonce and `BLAKE3-keyed(key, "server" ‖ client nonce ‖ agent nonce)`.
 3. The client reads the key *now* — after the agent has answered, so it never reads a previous
-   agent's key — verifies, and only then sends `HMAC-SHA256(key, "client" ‖ …)`.
+   agent's key — verifies, and only then sends `BLAKE3-keyed(key, "client" ‖ …)`.
 
 A client that cannot verify the agent fails with `LinkError::Unverified` having sent only its
 challenge. The agent runs its half in the connection's own task with a five-second bound, so a
@@ -362,7 +362,7 @@ separate risk, and they should not ride on the transport change:
 |---|---|
 | How the user is named in a pipe | **SID**, always computed, never typed |
 | Is the default pipe descriptor enough | **Yes** for writers, held to a read-back test; identity is proven by the handshake |
-| Who is at the other end of a pipe | **Proven both ways** by an HMAC handshake over a key in the user's local app data |
+| Who is at the other end of a pipe | **Proven both ways** by a keyed-BLAKE3 handshake over a key in the user's local app data |
 | Boxed stream or concrete enum | **Concrete enum** over the two transports |
 | Service Control Manager integration | **None**; detached process or `--foreground` under a supervisor |
 | The `unsafe` rule | **Kept in every crate**; safe dependencies cover the Windows capabilities |

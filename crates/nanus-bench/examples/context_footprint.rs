@@ -124,7 +124,7 @@ impl SessionCheckpoint for Memory {
                 frontier: ContextFrontier {
                     session_id: view.candidate.id().as_str().to_owned(),
                     event_count: u64::try_from(view.candidate.event_count()).unwrap_or(0),
-                    prefix_sha256: Digest::of(body.as_bytes()),
+                    prefix_blake3: Digest::of(body.as_bytes()),
                     projection_revision: 0,
                 },
                 body_digest: view.candidate.body_digest(),

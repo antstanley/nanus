@@ -72,7 +72,7 @@ fn code_of(error: &nanus_ports::LlmError) -> ErrorCode {
 pub(in crate::agent_loop) fn probe_facts(allowance: u32) -> NoticeFacts {
     NoticeFacts {
         estimate_input_tokens: Some(u32::MAX),
-        estimator: String::from("adapter-serialized-body"),
+        estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
         input_allowance: allowance,
         budget_hint: true,
         recovery_available: true,
@@ -310,23 +310,38 @@ impl AgentRunner {
             let request = self.compose(session, &snapshot, selection, &probe, &base)?;
             self.probe_cost(request)
         };
-        let next = snapshot
-            .state
-            .max_revision
-            .max(snapshot.state.revision())
-            .saturating_add(1);
+        let current = snapshot.state.revision();
+        let next = snapshot.state.max_revision.max(current).saturating_add(1);
+        let accepted = snapshot.state.hidden();
+        // The accepted selection is costed at the revision it is sent under when it fits, so
+        // its probe is exactly the draft `freeze` would otherwise prepare a second time.
+        let kept = core::cell::Cell::new(None);
         let fitted = fit::hard_fit(
             &snapshot.fragments,
             &snapshot.protected,
-            snapshot.state.hidden(),
+            accepted,
             allowance,
-            |hidden| cost(hidden, next),
+            |hidden| {
+                if hidden == accepted {
+                    let tokens = cost(hidden, current)?;
+                    kept.set(Some(tokens));
+                    Ok(tokens)
+                } else {
+                    cost(hidden, next)
+                }
+            },
         )
         .map_err(refusal)?;
-        let (hidden, revision) = match &fitted {
-            Some(fitted) => (fitted.hidden.clone(), next),
-            None => (snapshot.state.hidden().to_vec(), snapshot.state.revision()),
-        };
+        let (hidden, revision, pre) = fitted.as_ref().map_or_else(
+            || {
+                // `hard_fit` costs the accepted selection before anything else, so a fit that
+                // kept it has always measured it.
+                let pre = kept.get();
+                assert!(pre.is_some(), "a kept selection was costed");
+                (accepted.to_vec(), current, pre.unwrap_or(u32::MAX))
+            },
+            |fitted| (fitted.hidden.clone(), next, fitted.estimate),
+        );
         let selection = Selection {
             revision,
             hidden: &hidden,
@@ -338,7 +353,7 @@ impl AgentRunner {
             turn,
             &snapshot,
             (selection, fitted.is_some()),
-            (&base, allowance),
+            (&base, allowance, pre),
         )
     }
 
@@ -349,15 +364,12 @@ impl AgentRunner {
         turn: &ManagedTurn<'_>,
         snapshot: &Snapshot,
         chosen: (Selection<'_>, bool),
-        shared: (&ChatRequest, u32),
+        shared: (&ChatRequest, u32, u32),
     ) -> Result<Prepared, BundleError> {
         let (selection, automatic) = chosen;
-        let (base, allowance) = shared;
-        let probe = probe_facts(allowance);
-        let draft = self
-            .compose(session, snapshot, selection, &probe, base)
-            .map_err(refusal)?;
-        let pre = self.probe_cost(draft).map_err(refusal)?;
+        // `pre` is the chosen selection's probe cost — the request with the probe's notice —
+        // which the fit has already measured; the notice is then written with it.
+        let (base, allowance, pre) = shared;
         if pre > allowance {
             return Err(refusal(ErrorCode::CandidateTooLarge));
         }
@@ -365,7 +377,7 @@ impl AgentRunner {
         let percent = nanus_domain::context::managed::compile::pressure_percent(pre, allowance);
         let facts = NoticeFacts {
             estimate_input_tokens: Some(pre),
-            estimator: String::from("adapter-serialized-body"),
+            estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
             input_allowance: allowance,
             budget_hint: reminder.observe(percent),
             recovery_available: true,
@@ -515,7 +527,7 @@ impl AgentRunner {
             estimate_input_tokens: None,
             estimate_protected_tokens: None,
             output_reserve_tokens: u64::from(policy.output_reserve_tokens),
-            estimator: String::from("adapter-serialized-body"),
+            estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
             hidden_fragments: 0,
             protected_fragments: 0,
             goal_revision: session.goal().as_ref().map(Goal::revision),

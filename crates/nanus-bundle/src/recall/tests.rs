@@ -66,11 +66,11 @@ fn receipt(bytes: &[u8]) -> ArtifactReceipt {
         stream: CaptureStream::Stdout,
         retained_bytes: u64::try_from(bytes.len()).unwrap_or(0),
         observed_bytes: u64::try_from(bytes.len()).unwrap_or(0),
-        retained_sha256: Some(Digest::of(bytes)),
+        retained_blake3: Some(Digest::of(bytes)),
         status: CaptureStatus::Complete,
         reason: CaptureReason::Eof,
         encoding: RawEncoding::Raw,
-        chunk_sha256: chunks,
+        chunk_blake3: chunks,
     }
 }
 

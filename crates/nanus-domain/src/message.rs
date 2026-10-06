@@ -254,7 +254,7 @@ impl From<Usage> for UsageWire {
 pub struct AssistantReplay {
     /// The protocol that produced these blocks.
     pub protocol: String,
-    /// SHA-256 of that request's system, tools and preceding encoded messages.
+    /// BLAKE3 of that request's system, tools and preceding encoded messages.
     pub prefix_digest: String,
     /// Original/fitted request receipts. Absent for legacy Messages and decoder-only fixtures.
     #[serde(skip_serializing_if = "Option::is_none")]

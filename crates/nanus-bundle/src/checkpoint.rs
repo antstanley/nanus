@@ -90,7 +90,7 @@ impl SessionCheckpoint for StoreCheckpoint {
 
     fn reconcile<'a>(
         &'a self,
-        candidate_sha256: &'a Digest,
+        candidate_blake3: &'a Digest,
     ) -> LocalBoxFuture<'a, Result<Reconciled, CheckpointError>> {
         Box::pin(async move {
             let unknown = CheckpointError::CommitOutcomeUnknown(
@@ -103,10 +103,10 @@ impl SessionCheckpoint for StoreCheckpoint {
                 .map_err(|_| unknown)?;
             let previous = self.expected.borrow().clone();
             let found = match &stored {
-                ExpectedCheckpoint::Stored { file_sha256, .. } => Some(file_sha256),
+                ExpectedCheckpoint::Stored { file_blake3, .. } => Some(file_blake3),
                 ExpectedCheckpoint::Absent => None,
             };
-            if found == Some(candidate_sha256) {
+            if found == Some(candidate_blake3) {
                 *self.expected.borrow_mut() = stored.clone();
                 Ok(Reconciled::Installed(stored))
             } else if stored == previous {

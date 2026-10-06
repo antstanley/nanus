@@ -16,8 +16,8 @@ use crate::VideoError;
 pub struct Snapshot {
     /// Where the copy lives; the file name is fixed so no model text reaches a command line.
     pub path: PathBuf,
-    /// The hex SHA-256 of the copied bytes.
-    pub sha256: String,
+    /// The hex BLAKE3 of the copied bytes.
+    pub blake3: String,
     /// The copied length.
     pub byte_len: u64,
     /// Opaque host/stock lease; its final release owns cleanup, including physical workers.
@@ -34,11 +34,11 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Refuses a non-absolute/non-fixed path, malformed SHA-256 or over-bound claimed length.
+    /// Refuses a non-absolute/non-fixed path, malformed BLAKE3 digest or over-bound claimed length.
     /// Refusal releases this owner reference; other physical owners remain responsible for cleanup.
     pub fn from_owned_file(
         path: PathBuf,
-        sha256: String,
+        blake3: String,
         byte_len: u64,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<Self, VideoError> {
@@ -50,8 +50,8 @@ impl Snapshot {
                     std::path::Component::CurDir | std::path::Component::ParentDir
                 )
             })
-            || sha256.len() != 64
-            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || blake3.len() != 64
+            || !blake3.bytes().all(|byte| byte.is_ascii_hexdigit())
             || byte_len > crate::source::SNAPSHOT_BYTES_MAX
         {
             return Err(VideoError::Source(
@@ -62,7 +62,7 @@ impl Snapshot {
         assert!(byte_len <= crate::source::SNAPSHOT_BYTES_MAX);
         Ok(Self {
             path,
-            sha256,
+            blake3,
             byte_len,
             owner,
         })
@@ -83,7 +83,7 @@ impl std::fmt::Debug for Snapshot {
         formatter
             .debug_struct("Snapshot")
             .field("path", &self.path)
-            .field("sha256", &self.sha256)
+            .field("blake3", &self.blake3)
             .field("byte_len", &self.byte_len)
             .finish_non_exhaustive()
     }

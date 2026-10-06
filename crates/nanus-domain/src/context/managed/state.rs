@@ -236,13 +236,13 @@ pub fn frontier_at(
     count: u64,
     projection_revision: u64,
 ) -> Result<ContextFrontier, ErrorCode> {
-    let prefix_sha256 = session
+    let prefix_blake3 = session
         .prefix_digest(count)
         .map_err(|_| ErrorCode::SourceCorrupt)?;
     Ok(ContextFrontier {
         session_id: session.id().as_str().to_owned(),
         event_count: count,
-        prefix_sha256,
+        prefix_blake3,
         projection_revision,
     })
 }
@@ -261,7 +261,7 @@ pub fn check_frontier(session: &Session, frontier: &ContextFrontier) -> Result<(
     let actual = session
         .prefix_digest(frontier.event_count)
         .map_err(|_| ErrorCode::StaleBase)?;
-    if actual == frontier.prefix_sha256 {
+    if actual == frontier.prefix_blake3 {
         Ok(())
     } else {
         Err(ErrorCode::StaleBase)

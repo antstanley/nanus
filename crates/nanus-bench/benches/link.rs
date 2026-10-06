@@ -208,7 +208,7 @@ fn backlog<M: Metric>(c: &mut Criterion<M>) {
             frontier: nanus_link::protocol::FrontierInfo {
                 session_id: String::from("s"),
                 event_count: 0,
-                prefix_sha256: "0".repeat(64),
+                prefix_blake3: "0".repeat(64),
                 projection_revision: 0,
             },
         },
