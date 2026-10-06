@@ -54,6 +54,13 @@ pub enum Command {
     /// `complete`, `done`, `abandon`, `clear`) on its own — or before a colon and a reason — moves
     /// it, and anything else is an objective to set.
     Goal,
+    /// Read or reset the session's managed context.
+    ///
+    /// The context is session state the agent owns, so like `/goal` this reaches the agent rather
+    /// than being answered on screen. A bare `/context` (or `/context status`) reads the status,
+    /// and `/context reset` empties the selection and selects legacy replay — which the agent
+    /// persists, and refuses while a turn is running.
+    Context,
     /// Put the newest answer on the clipboard.
     ///
     /// A command as well as a key, because the commonest thing a reader wants out of a transcript is
@@ -82,6 +89,7 @@ impl Command {
         (Self::Effort, &["/effort"]),
         (Self::Provider, &["/provider"]),
         (Self::Goal, &["/goal"]),
+        (Self::Context, &["/context"]),
         (Self::Copy, &["/copy"]),
     ];
 
@@ -335,6 +343,7 @@ mod tests {
             Command::Effort,
             Command::Provider,
             Command::Goal,
+            Command::Context,
             Command::Copy,
         ];
         for command in every {
@@ -368,6 +377,7 @@ mod tests {
                 "/effort",
                 "/provider",
                 "/goal",
+                "/context",
                 "/copy"
             ]
         );
@@ -392,7 +402,24 @@ mod tests {
         // joining, and this is about what a reader who mistypes a command actually sees.
         assert_eq!(
             Command::names_sentence(),
-            "/exit, /quit, /stats, /help, /clear, /model, /effort, /provider, /goal and /copy"
+            "/exit, /quit, /stats, /help, /clear, /model, /effort, /provider, /goal, /context and \
+             /copy"
+        );
+    }
+
+    /// The context command reads by default and resets on its one word, and it reaches the agent
+    /// like `/goal` rather than being answered on screen.
+    #[test]
+    fn context_is_a_command() {
+        assert_eq!(submission_of("/context"), Submission::Run(Command::Context));
+        assert_eq!(
+            submission_of("/context reset"),
+            Submission::Run(Command::Context)
+        );
+        assert_eq!(
+            submission_of("what is /context for?"),
+            Submission::Prompt,
+            "a command is only ever the first word"
         );
     }
 }

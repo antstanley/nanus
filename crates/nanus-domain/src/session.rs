@@ -1278,6 +1278,51 @@ impl Session {
         Ok(hasher.finish())
     }
 
+    /// Returns a copy holding only the first `count` events, under the same header.
+    ///
+    /// What a reader that was told a frontier does with a file that has grown since: it reads
+    /// the prefix the frontier names and nothing past it, because the events after it belong to
+    /// a stream the reader is being sent separately. The copy keeps this session's id, creation
+    /// time, working directory, origin and body version, so its [`Session::prefix_digest`] at
+    /// `count` is this session's — which is what lets the reader verify the clip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NonContiguousSequence`] for a count past the log's end: a shorter
+    /// file cannot be clipped to a longer frontier, and padding it would invent history.
+    pub fn prefix(&self, count: u64) -> Result<Self, SessionError> {
+        let events = usize::try_from(count)
+            .ok()
+            .and_then(|count| self.log.events().get(..count))
+            .ok_or_else(|| SessionError::NonContiguousSequence {
+                line: 1,
+                expected: u64::try_from(self.log.len()).unwrap_or(u64::MAX),
+                found: count,
+            })?;
+        let mut clipped = Self {
+            id: self.id.clone(),
+            created_at_ms: self.created_at_ms,
+            cwd: self.cwd.clone(),
+            origin: self.origin.clone(),
+            body_version: self.body_version,
+            log: SessionLog::new(),
+        };
+        for event in events {
+            clipped.append(event.clone());
+        }
+        // Postcondition: exactly the prefix, and nothing about the header moved.
+        assert_eq!(
+            clipped.event_count(),
+            events.len(),
+            "a prefix holds its count"
+        );
+        assert_eq!(
+            clipped.body_version, self.body_version,
+            "the body version is kept"
+        );
+        Ok(clipped)
+    }
+
     /// Returns the digest of every event line, header excluded.
     #[must_use]
     pub fn body_digest(&self) -> Digest {
@@ -2156,6 +2201,37 @@ mod tests {
         let body: String = encoded.split_inclusive('\n').skip(1).collect();
         assert_eq!(managed.body_digest(), Digest::of(body.as_bytes()));
         assert!(managed.prefix_digest(total.saturating_add(1)).is_err());
+    }
+
+    /// A prefix is the first events under the same header, so its digest at its own length is
+    /// the original's digest at that count — and a count past the end is refused, not padded.
+    #[test]
+    fn a_prefix_keeps_the_header_and_verifies_against_the_original() {
+        let mut managed = session();
+        managed.upgrade_to_managed_body();
+        record_read_turn(&mut managed);
+        let total = u64::try_from(managed.event_count()).unwrap_or(0);
+        assert!(total > 2, "the fixture has a turn to clip");
+
+        let clipped = managed.prefix(2).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(clipped.event_count(), 2);
+        assert_eq!(clipped.id(), managed.id());
+        assert_eq!(clipped.body_version(), managed.body_version());
+        assert_eq!(clipped.prefix_digest(2), managed.prefix_digest(2));
+        assert_eq!(clipped.log().events(), &managed.log().events()[..2]);
+
+        let whole = managed
+            .prefix(total)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(whole, managed, "the whole log is the session itself");
+        let empty = managed.prefix(0).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(empty.event_count(), 0);
+        assert_eq!(empty.prefix_digest(0), managed.prefix_digest(0));
+
+        assert!(matches!(
+            managed.prefix(total.saturating_add(1)),
+            Err(SessionError::NonContiguousSequence { .. })
+        ));
     }
 
     #[test]

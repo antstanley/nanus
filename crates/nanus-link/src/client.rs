@@ -23,9 +23,23 @@ use tokio::io::{AsyncWriteExt as _, BufReader};
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
-    AgentInfo, ApprovalState, Frame, PROTOCOL_VERSION, Request, SessionInfo, encode,
+    AgentInfo, ApprovalState, Frame, PROTOCOL_VERSION, Request, SessionInfo, StreamMark, encode,
 };
 use crate::wire::read_message;
+
+/// What an attachment told a client: the session, and where its stream stood.
+///
+/// The second half is what makes catching up exact. A client reads the store only through the
+/// frontier here, applies the backlog that follows, and then the live frames; a file that has
+/// grown since is clipped to the frontier rather than read to its end, because what lies past it
+/// is already on its way down the link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    /// The session.
+    pub session: SessionInfo,
+    /// The stream's epoch, watermark and durable frontier at the attachment barrier.
+    pub stream: StreamMark,
+}
 
 /// A connection to an agent.
 pub struct Client {
@@ -121,6 +135,15 @@ impl Client {
     /// is the ordinary reason — and [`LinkError::Protocol`] when the reply is not an
     /// attachment.
     pub async fn start(&mut self, name: Option<String>) -> LinkResult<SessionInfo> {
+        Ok(self.start_at(name).await?.session)
+    }
+
+    /// Starts a session as [`Client::start`] does, and keeps where its stream stood.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::start`].
+    pub async fn start_at(&mut self, name: Option<String>) -> LinkResult<Attachment> {
         self.send(&Request::New { name }).await?;
         self.attached().await
     }
@@ -135,6 +158,17 @@ impl Client {
     /// Returns [`LinkError::Agent`] when nothing answers to the reference, and
     /// [`LinkError::Protocol`] when the reply is not an attachment.
     pub async fn attach(&mut self, session: &str) -> LinkResult<SessionInfo> {
+        Ok(self.attach_at(session).await?.session)
+    }
+
+    /// Attaches as [`Client::attach`] does, and keeps where the session's stream stood.
+    ///
+    /// The frontier is what an interface reads the store through; see [`Attachment`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::attach`].
+    pub async fn attach_at(&mut self, session: &str) -> LinkResult<Attachment> {
         self.send(&Request::Attach {
             session: session.to_owned(),
         })
@@ -200,10 +234,12 @@ impl Client {
     /// belong to the session it has just left — the reply it is waiting for is the only
     /// thing it can act on. A freshly opened connection cannot receive them at all, so
     /// the discard never happens in the ordinary path.
-    async fn attached(&mut self) -> LinkResult<SessionInfo> {
+    async fn attached(&mut self) -> LinkResult<Attachment> {
         loop {
             match self.next().await? {
-                Some(Frame::Attached(info)) => return Ok(info),
+                Some(Frame::Attached { session, stream }) => {
+                    return Ok(Attachment { session, stream });
+                }
                 // A refusal is the agent answering the question rather than a broken link,
                 // so it keeps its own message instead of being reported as a protocol
                 // failure.
@@ -442,14 +478,26 @@ mod tests {
             Frame::Text {
                 delta: "from the session being left".to_owned(),
             },
-            Frame::Attached(SessionInfo {
-                session: "01a09558".to_owned(),
-                name: None,
-                title: None,
-                events: 0,
-                busy: false,
-                viewers: 1,
-            }),
+            Frame::Attached {
+                session: SessionInfo {
+                    session: "01a09558".to_owned(),
+                    name: None,
+                    title: None,
+                    events: 0,
+                    busy: false,
+                    viewers: 1,
+                },
+                stream: StreamMark {
+                    stream_epoch: "e1".to_owned(),
+                    stream_watermark: 0,
+                    frontier: crate::protocol::FrontierInfo {
+                        session_id: "01a09558".to_owned(),
+                        event_count: 0,
+                        prefix_sha256: "00".repeat(32),
+                        projection_revision: 0,
+                    },
+                },
+            },
         ] {
             let mut line = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
             line.push('\n');
@@ -570,6 +618,57 @@ mod tests {
         assert!(
             matches!(opened, Err(LinkError::Version { agent: 0, .. })),
             "an unversioned handshake is version zero: {opened:?}"
+        );
+    }
+
+    /// An agent one version behind — the attachment semantics before the durable frontier — is
+    /// refused at its handshake, and nothing has been asked of it by then.
+    ///
+    /// The old peer's attachment means "read the whole stored file, then apply the backlog",
+    /// which against a session that checkpoints mid-turn draws the checkpointed part twice. So
+    /// the refusal has to come before the first request rather than as a decode error later:
+    /// the peer is read to its end after the refusal, and the client wrote nothing to it.
+    #[tokio::test]
+    async fn an_agent_from_before_the_durable_frontier_is_refused_before_any_request() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (agent, client) = pair();
+        let mut agent = agent;
+        let mut line = encode(&Frame::Ready(AgentInfo {
+            workspace: "/work".to_owned(),
+            model: "scripted".to_owned(),
+            models: Vec::new(),
+            effort: None,
+            model_efforts: Vec::new(),
+            provider: String::new(),
+            plan: String::new(),
+            providers: Vec::new(),
+            tools: 0,
+            version: 9,
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        line.push('\n');
+        let written = agent.write_all(line.as_bytes()).await;
+        assert!(written.is_ok(), "the peer writes");
+
+        let opened = Client::open(client).await;
+        assert!(
+            matches!(opened, Err(LinkError::Version { agent: 9, client }) if client == PROTOCOL_VERSION),
+            "{opened:?}"
+        );
+        // The client is gone, and it sent nothing: no `new`, no `attach`, no prompt.
+        drop(opened);
+        let mut received = Vec::new();
+        let read = agent.read_to_end(&mut received).await;
+        assert!(read.is_ok(), "{read:?}");
+        assert!(
+            received.is_empty(),
+            "nothing was asked of an agent the client refused: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        assert_ne!(
+            PROTOCOL_VERSION, 9,
+            "the attachment change moved the version"
         );
     }
 

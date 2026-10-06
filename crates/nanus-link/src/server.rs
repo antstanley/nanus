@@ -45,7 +45,11 @@ use crate::transport::{Listener, OwnedWriteHalf, Stream};
 use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{
-    AgentRunner, Approver, Harness, LastSelection, Progress, Provider, ProviderSwitch,
+    AgentRunner, Approver, BundleError, Harness, LastSelection, Progress, Provider, ProviderSwitch,
+    RunOutcome, TurnHost,
+};
+use nanus_domain::context::managed::{
+    CheckpointReceipt, ContextDecision, ContextFrontier, ContextStatus,
 };
 use nanus_domain::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Goal, GoalPhase, Session, SessionEvent,
@@ -59,10 +63,16 @@ use tokio::time::sleep;
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
-    AgentInfo, ApprovalState, EffortState, Frame, GoalAction, GoalInfo, GoalState, ModelEfforts,
-    PlanInfo, ProviderInfo, Request, SessionInfo, TurnEnd,
+    AgentInfo, ApprovalState, BacklogSegment, ContextEnvelope, EffortState, Frame, GoalAction,
+    GoalInfo, GoalState, ModelEfforts, PlanInfo, ProviderInfo, Request, SessionInfo, StreamMark,
+    TurnEnd,
 };
 use crate::wire::{read_request, write_frame};
+
+#[path = "server/context.rs"]
+mod context;
+
+use context::{Binding, Published, wire_frontier};
 
 /// How many frames may be queued to one client before progress is dropped.
 const FRAME_BUFFER: usize = 256;
@@ -294,6 +304,13 @@ impl core::fmt::Debug for Agent {
     }
 }
 
+/// Where in a session's turns a frame was produced: the turn from zero, the step from one.
+///
+/// `None` for the step is the part of a turn before its first step — the prompt — and the
+/// ordering of the pair is the order the frames were produced in, which is what lets a
+/// checkpoint retire "everything before here" by comparison.
+type Position = (Option<u64>, Option<u64>);
+
 /// The parts of a session a listing shows.
 ///
 /// Cached beside the session rather than read from it, because a turn borrows the session
@@ -402,12 +419,47 @@ struct Held {
     /// The frames of the turn in progress, so a client that attaches in the middle of one
     /// can be shown the whole turn rather than its tail.
     ///
-    /// This is exactly the part of the turn the store does not have yet, and no more: the
-    /// log is written when a turn ends, so a turn that is running is the one thing a client
-    /// cannot read anywhere else. Cleared the moment the turn is saved. Adjacent deltas are
-    /// folded together as they arrive, which bounds this by the number of *segments* a turn
-    /// has rather than by the number of tokens it streamed.
-    turn: RefCell<Vec<Frame>>,
+    /// This is exactly the part of the turn the store does not have yet, and no more. A legacy
+    /// session's log is written when a turn ends, so its backlog is the whole running turn and
+    /// is cleared the moment the turn is saved; a managed session checkpoints as it runs, and
+    /// each checkpoint retires the segments it covers. Every segment is tagged with the turn and
+    /// step it came from, which is what a checkpoint is matched against, and with its frame id.
+    /// Adjacent deltas are folded together as they arrive, which bounds this by the number of
+    /// *segments* a turn has rather than by the number of tokens it streamed.
+    turn: RefCell<Vec<BacklogSegment>>,
+    /// This stream's identity, fixed when the session is held.
+    ///
+    /// Frame ids mean something only inside one epoch: they start again when a session is let go
+    /// and held again, or when the agent restarts, and a client refuses a frame from another one.
+    epoch: String,
+    /// The last frame id this session assigned.
+    ///
+    /// Assigned by the session rather than per viewer, so every client watching sees the same id
+    /// for the same frame, and the watermark an attachment is given is this.
+    frame_seq: Cell<u64>,
+    /// What the store holds: the durable frontier.
+    ///
+    /// Moved by a legacy session's terminal save, by an acknowledged checkpoint, and by an idle
+    /// change that was recorded — always in the same no-await step that retires the backlog it
+    /// covers, so an attachment never sees one moved without the other.
+    frontier: RefCell<ContextFrontier>,
+    /// The checkpoint and context runtime a managed body runs through, once bound.
+    ///
+    /// Bound after the claim is taken and kept for as long as the session is held, because the
+    /// checkpoint remembers the stored identity the next commit must replace: a fresh binding per
+    /// turn would forget it.
+    managed: RefCell<Option<Rc<Binding>>>,
+    /// The context status a turn, a read or a reset last published.
+    ///
+    /// What a status read during a turn is answered from: the turn holds the session, and a
+    /// reader asking how its context stands has asked nothing a turn needs to refuse.
+    context: RefCell<Option<Published>>,
+    /// Why this session may not take another turn, when a checkpoint left it somewhere nothing
+    /// should be built on.
+    ///
+    /// Set when an interrupted turn could not be closed, or when the outcome of a commit could
+    /// not be settled; a reset that is saved clears it, and so does letting the session go.
+    quarantine: RefCell<Option<String>>,
     /// Approval questions this session is waiting on, keyed by the id sent to clients.
     ///
     /// The sender is how a client's answer reaches the turn: `Request::Approve` looks the
@@ -429,6 +481,45 @@ struct Held {
 }
 
 impl Held {
+    /// Holds `session`, whose stored copy — if it has one — is exactly this.
+    ///
+    /// The frontier is the whole session, because every caller holds a session it has just
+    /// loaded from the store or one the store does not have yet: a new session's frontier is its
+    /// empty log, which a client reads as "nothing to read" rather than as a file to verify.
+    fn new(
+        session: Session,
+        name: Option<String>,
+        claim: Option<Claim>,
+        epoch: String,
+        touched: u64,
+    ) -> Self {
+        let frontier = context::frontier_of(&session);
+        let held = Self {
+            id: session.id().clone(),
+            claim,
+            headline: RefCell::new(Headline::default()),
+            goal: RefCell::new(None),
+            session: RefCell::new(session),
+            name: RefCell::new(name),
+            turn: RefCell::new(Vec::new()),
+            epoch,
+            frame_seq: Cell::new(0),
+            frontier: RefCell::new(frontier),
+            managed: RefCell::new(None),
+            context: RefCell::new(None),
+            quarantine: RefCell::new(None),
+            viewers: RefCell::new(Vec::new()),
+            busy: Cell::new(false),
+            stop: Cell::new(false),
+            approvals: RefCell::new(BTreeMap::new()),
+            approved: RefCell::new(BTreeSet::new()),
+            approval_seq: Cell::new(0),
+            touched: Cell::new(touched),
+        };
+        held.refresh(&held.session.borrow());
+        held
+    }
+
     /// Describes the session for a client.
     fn info(&self) -> SessionInfo {
         let headline = self.headline.borrow();
@@ -477,35 +568,143 @@ impl Held {
         *self.goal.borrow_mut() = session.goal().as_ref().map(wire_goal);
     }
 
-    /// Records one frame of the turn in progress.
-    ///
-    /// Two adjacent deltas of the same kind are one piece of text however they were
-    /// divided, so they are folded here: a client replays the same answer either way, and
-    /// this keeps a long turn from being thousands of frames in memory. Everything else is
-    /// pushed as it came, because the order of a turn is the turn.
-    fn seen(&self, frame: &Frame) {
-        let mut turn = self.turn.borrow_mut();
-        match (turn.last_mut(), frame) {
-            (Some(Frame::Text { delta: held }), Frame::Text { delta: more }) => held.push_str(more),
-            (Some(Frame::Reasoning { delta: held }), Frame::Reasoning { delta: more }) => {
-                held.push_str(more);
-            }
-            _ => turn.push(frame.clone()),
-        }
+    /// Assigns the next frame id in this session's stream.
+    fn next_frame_id(&self) -> u64 {
+        let next = self.frame_seq.get().saturating_add(1);
+        self.frame_seq.set(next);
+        assert!(
+            next > 0,
+            "frame ids start at one, so zero is a watermark before any frame"
+        );
+        next
     }
 
-    /// Returns the frames of the turn in progress, oldest first.
-    fn turn_frames(&self) -> Vec<Frame> {
+    /// Records one frame of the turn in progress, under the id it was assigned.
+    ///
+    /// Two adjacent deltas of the same kind in the same step are one piece of text however
+    /// they were divided, so they are folded here, and the segment takes the newer id: a client
+    /// replays the same answer either way, and this keeps a long turn from being thousands of
+    /// frames in memory. Everything else is pushed as it came, because the order of a turn is
+    /// the turn.
+    fn keep(&self, frame_id: u64, turn: Option<u64>, step: Option<u64>, frame: &Frame) {
+        let mut kept = self.turn.borrow_mut();
+        if let Some(last) = kept.last_mut()
+            && last.turn == turn
+            && last.step == step
+        {
+            let folded = match (&mut last.frame, frame) {
+                (Frame::Text { delta: held }, Frame::Text { delta: more })
+                | (Frame::Reasoning { delta: held }, Frame::Reasoning { delta: more }) => {
+                    held.push_str(more);
+                    true
+                }
+                _ => false,
+            };
+            if folded {
+                assert!(
+                    frame_id > last.frame_id,
+                    "a folded delta is newer than its segment"
+                );
+                last.frame_id = frame_id;
+                return;
+            }
+        }
+        kept.push(BacklogSegment {
+            frame_id,
+            turn,
+            step,
+            frame: frame.clone(),
+        });
+    }
+
+    /// Returns the segments of the turn in progress, oldest first.
+    fn turn_frames(&self) -> Vec<BacklogSegment> {
         self.turn.borrow().clone()
     }
 
-    /// Notes that the session has been written down.
+    /// Where this session's stream stands now: its epoch, its watermark, and what is durable.
+    fn mark(&self) -> StreamMark {
+        StreamMark {
+            stream_epoch: self.epoch.clone(),
+            stream_watermark: self.frame_seq.get(),
+            frontier: wire_frontier(&self.frontier.borrow()),
+        }
+    }
+
+    /// The envelope of a context frame with id `frame_id`.
+    fn envelope(&self, turn: Option<u64>, step: Option<u64>, frame_id: u64) -> ContextEnvelope {
+        ContextEnvelope {
+            session_id: self.id.as_str().to_owned(),
+            stream_epoch: self.epoch.clone(),
+            turn,
+            step,
+            frame_id,
+            stream_watermark: frame_id,
+            frontier: wire_frontier(&self.frontier.borrow()),
+        }
+    }
+
+    /// Notes that the whole session has been written down, and what the store now holds.
     ///
-    /// Called immediately after a *successful* save and never after a failed one: what this
-    /// holds is what the store does not have, so a turn the store failed to record is
-    /// exactly what a later client still needs to be caught up with.
-    fn saved(&self) {
+    /// Called immediately after a *successful* save and never after a failed one: what the
+    /// backlog holds is what the store does not have, so a turn the store failed to record is
+    /// exactly what a later client still needs to be caught up with. The frontier moves in the
+    /// same step, with no await between, so an attachment sees both or neither.
+    fn saved(&self, frontier: ContextFrontier) {
         self.turn.borrow_mut().clear();
+        *self.frontier.borrow_mut() = frontier;
+    }
+
+    /// Moves the durable frontier to an acknowledged checkpoint's, and retires what it covers.
+    ///
+    /// A checkpoint never holds an open step, and it is a checkpoint of the whole session as it
+    /// was when the commit began. So everything from a step before the one in progress is
+    /// covered, and the step in progress is covered exactly when it has already produced
+    /// something its records hold — a delta, a call, a result, a usage report — because a step
+    /// that has produced output has been opened, and a checkpoint taken while it was open would
+    /// have held an open step. Before that, the step's own frames (its number, a trimmed-prompt
+    /// notice, a context status) are kept: they describe a request the checkpoint precedes.
+    ///
+    /// One mutation, no await: the frontier and the backlog cannot be seen out of step, and a
+    /// frame produced after this goes into what is left.
+    fn checkpointed(&self, frontier: ContextFrontier, at: Position, produced: bool) {
+        let before = self.frontier.borrow().event_count;
+        if frontier.event_count < before {
+            // An older receipt than the one already held moves nothing back: the store holds at
+            // least what the newer one said.
+            tracing::debug!(
+                before,
+                after = frontier.event_count,
+                "a stale receipt is ignored"
+            );
+            return;
+        }
+        self.turn.borrow_mut().retain(|segment| {
+            let position = (segment.turn, segment.step);
+            !(position < at || (position == at && produced))
+        });
+        *self.frontier.borrow_mut() = frontier;
+        assert!(
+            self.frontier.borrow().event_count >= before,
+            "the durable frontier only moves forward"
+        );
+    }
+
+    /// Moves the durable frontier forward without retiring anything.
+    ///
+    /// For a receipt that does not cover the whole session — the last checkpoint of a turn
+    /// whose tail was not saved — whose own retirement already happened as it was reported.
+    fn advance(&self, frontier: ContextFrontier) {
+        let mut held = self.frontier.borrow_mut();
+        if frontier.event_count >= held.event_count {
+            *held = frontier;
+        }
+    }
+
+    /// Refuses further turns in this session, saying why.
+    fn quarantine(&self, reason: String) {
+        tracing::warn!(session = %self.id.as_str(), %reason, "a session is quarantined");
+        *self.quarantine.borrow_mut() = Some(reason);
     }
 
     /// Returns a question frame for every approval this session is still waiting on.
@@ -604,11 +803,20 @@ struct Registry {
     tick: Cell<u64>,
     /// The next viewer id, which is how a connection unsubscribes.
     viewer: Cell<u64>,
+    /// What every stream epoch this registry hands out begins with: this process, and when it
+    /// started serving.
+    ///
+    /// A frame id is not kept across a restart, so the epoch has to differ across one even when
+    /// the operating system hands the new process the old one's id.
+    epoch: String,
 }
 
 impl Registry {
     /// Wraps an agent, which will claim the sessions it holds as `owner`.
     fn new(agent: Rc<Agent>, owner: String) -> Self {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
         Self {
             agent,
             owner,
@@ -616,6 +824,7 @@ impl Registry {
             turns: RefCell::new(JoinSet::new()),
             tick: Cell::new(0),
             viewer: Cell::new(0),
+            epoch: format!("p{}-t{started:x}", std::process::id()),
         }
     }
 
@@ -660,27 +869,15 @@ impl Registry {
         // second client would load a second copy of it, and the two would overwrite each
         // other's log.
         self.evict_idle(1);
-        let entry = Rc::new(Held {
+        let claim = Claim {
+            store: Rc::clone(&self.agent.store),
             id: id.clone(),
-            claim: Some(Claim {
-                store: Rc::clone(&self.agent.store),
-                id: id.clone(),
-                armed: Cell::new(true),
-            }),
-            headline: RefCell::new(Headline::default()),
-            goal: RefCell::new(None),
-            session: RefCell::new(session),
-            name: RefCell::new(name),
-            turn: RefCell::new(Vec::new()),
-            viewers: RefCell::new(Vec::new()),
-            busy: Cell::new(false),
-            stop: Cell::new(false),
-            approvals: RefCell::new(BTreeMap::new()),
-            approved: RefCell::new(BTreeSet::new()),
-            approval_seq: Cell::new(0),
-            touched: Cell::new(self.stamp()),
-        });
-        entry.refresh(&entry.session.borrow());
+            armed: Cell::new(true),
+        };
+        // A stamp of its own in the epoch, so a session let go and held again in this process
+        // starts a stream no client can mistake for the one it had.
+        let epoch = format!("{}-h{}", self.epoch, self.stamp());
+        let entry = Rc::new(Held::new(session, name, Some(claim), epoch, self.stamp()));
         let mut held = self.held.borrow_mut();
         // The map is the authority, not this call. Two connections can reach here with the
         // same session — `open_reference` awaits the store between its check and its insert,
@@ -769,11 +966,16 @@ impl Registry {
         // A session this agent is not already holding has to be claimed, and a refusal here is
         // another *agent* writing the same conversation: the reader's answer is to attach to
         // that one rather than to start a second, so the message says so.
-        self.hold(session, name).await.map_err(|error| {
+        let held = self.hold(session, name).await.map_err(|error| {
             format!(
                 "{error}; attach to it with `nanus tui --connect`, or stop the agent that holds it"
             )
-        })
+        })?;
+        // A managed session is bound to its checkpoint under the claim just taken, and whatever
+        // a crash left open is closed before anything can be asked of it. A session already held
+        // was prepared when it was first held, and this does nothing for it.
+        context::prepare(self, &held).await;
+        Ok(held)
     }
 
     /// Attaches a client to a session and returns the id it unsubscribes by.
@@ -1103,45 +1305,96 @@ impl Approver for LinkApprover<'_> {
 ///
 /// The session is borrowed for the whole turn, which is why exactly one turn may run at a
 /// time in it and why everything a listing shows is cached outside.
+///
+/// Two paths, chosen by the body the session is written as. A legacy body runs the turn as it
+/// always has and is recorded once it ends. A managed body runs through the checkpoint bound to
+/// it, which saves *while the turn runs*, and is never saved here: the runner says how far its
+/// checkpoints got, and the ending is decided from that and from nothing else.
 // The borrow is the design rather than an oversight: a turn needs `&mut`, and `Held::busy`
 // is what keeps a second one from starting while it holds. Everything a listing or an
 // attachment needs is cached outside the borrow, so no other path can reach it.
 #[allow(clippy::await_holding_refcell_ref)]
-async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
+async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String, turn: u64) {
     let mut session = held.session.borrow_mut();
-    let outcome = {
-        // Scoped rather than dropped: the bridge borrows the session only for as long as
-        // the turn runs, so a frame it queues cannot overtake the ending.
-        let mut progress = Broadcast {
-            held,
-            started: None,
-            head: None,
-            first_token: None,
-            last_token: None,
-        };
-        // The approver borrows the session too — for its viewers rather than its log — so it
-        // is built here and lives exactly as long as the turn that may ask through it.
-        let approver = LinkApprover { held };
-        agent
-            .runner()
-            .run_turn(&mut session, &text, &mut progress, Some(&approver))
-            .await
+    let managed = session
+        .is_managed_body()
+        .then(|| held.managed.borrow().clone());
+    let ending = match managed {
+        None => {
+            let outcome = {
+                // Scoped rather than dropped: the bridge borrows the session only for as long
+                // as the turn runs, so a frame it queues cannot overtake the ending.
+                let mut progress = Broadcast::new(held, turn);
+                // The approver borrows the session too — for its viewers rather than its log —
+                // so it is built here and lives exactly as long as the turn that may ask
+                // through it.
+                let approver = LinkApprover { held };
+                agent
+                    .runner()
+                    .run_turn(&mut session, &text, &mut progress, Some(&approver))
+                    .await
+            };
+            // A question still open when the turn ended belongs to a turn that is over.
+            // Abandoning it drops the sender, so a late answer cannot be read as a decision
+            // about the next turn's call.
+            held.abandon_approvals();
+            legacy_ending(agent, held, &session, outcome).await
+        }
+        Some(Some(binding)) => {
+            let run = {
+                let mut progress = Broadcast::new(held, turn);
+                let approver = LinkApprover { held };
+                let host = TurnHost {
+                    approver: Some(&approver),
+                    control: None,
+                    runtime: binding.runtime(),
+                };
+                agent
+                    .runner()
+                    .run_turn_with_runtime(&mut session, &text, &mut progress, host)
+                    .await
+            };
+            held.abandon_approvals();
+            context::managed_ending(held, &session, run, &binding).await
+        }
+        // Refused before the turn starts, so this is a race the reservation already closed —
+        // but a managed body must never fall back to the legacy save, so it is answered here
+        // rather than assumed away.
+        Some(None) => Frame::Failed {
+            message: String::from(
+                "this session's managed context is not bound to its store; nothing was run",
+            ),
+        },
     };
-    // A question still open when the turn ended belongs to a turn that is over. Abandoning
-    // it drops the sender, so a late answer cannot be read as a decision about the next
-    // turn's call, and a waiting approver — none can be waiting here — would be denied.
-    held.abandon_approvals();
 
-    let ending = match outcome {
+    // Settled before the ending goes out, so a client that sees the ending and then asks
+    // what is running is told the truth. A goal the model changed is not announced here: it
+    // went out as it happened, through the progress bridge, between the call that made it and
+    // that call's result.
+    held.refresh(&session);
+    drop(session);
+    held.busy.set(false);
+    broadcast_end(held, ending).await;
+}
+
+/// Records a legacy turn and decides how it ends: exactly the path every session had before
+/// managed context.
+async fn legacy_ending(
+    agent: &Agent,
+    held: &Held,
+    session: &Session,
+    outcome: Result<RunOutcome, BundleError>,
+) -> Frame {
+    match outcome {
         // The reason travels with the ending. A turn that closed at its step budget is
         // not a completed turn, and only the reason says so: without it the interface
         // draws the last thing the model happened to say as though it were an answer.
-        Ok(result) => match agent.record(&session).await {
+        Ok(result) => match agent.record(session).await {
             // Cleared with no await in between, so the backlog and the log cannot both be
             // behind or ahead: a client attaching at any instant sees the turn either in the
             // store or in the backlog, and never in both and never in neither.
             Ok(()) => {
-                held.saved();
+                held.saved(context::frontier_of(session));
                 Frame::Done {
                     answer: result.answer,
                     reason: TurnEnd::from(&result.reason),
@@ -1155,26 +1408,17 @@ async fn run_turn(agent: &Agent, held: &Rc<Held>, text: String) {
         // failed is what the next attempt has to work from, and a conversation that
         // silently forgot its own failure would repeat it.
         Err(error) => {
-            match agent.record(&session).await {
+            match agent.record(session).await {
                 // Cleared here for the same reason and in the same place: a turn that failed
                 // is still written down, and once it is, the log has it.
-                Ok(()) => held.saved(),
+                Ok(()) => held.saved(context::frontier_of(session)),
                 Err(recorded) => tracing::warn!(%recorded, "a failed turn could not be recorded"),
             }
             Frame::Failed {
                 message: error.to_string(),
             }
         }
-    };
-
-    // Settled before the ending goes out, so a client that sees the ending and then asks
-    // what is running is told the truth. A goal the model changed is not announced here: it
-    // went out as it happened, through the progress bridge, between the call that made it and
-    // that call's result.
-    held.refresh(&session);
-    drop(session);
-    held.busy.set(false);
-    broadcast_end(held, ending).await;
+    }
 }
 
 /// Forwards the loop's progress to every client attached to a session.
@@ -1211,6 +1455,16 @@ struct Broadcast<'a> {
     /// the whole request: between the first token and this one the model was generating, and
     /// outside them it was not.
     last_token: Option<Instant>,
+    /// The turn this bridge reports, counting from zero.
+    turn: u64,
+    /// The step the loop last started, or `None` before the first.
+    step: Option<u64>,
+    /// Whether the step in progress has produced something its records will hold.
+    ///
+    /// What decides whether a checkpoint covers that step: see [`Held::checkpointed`]. True
+    /// before the first step, whose only frame is the prompt, which the loop records before any
+    /// checkpoint of the turn can be taken.
+    produced: bool,
 }
 
 /// Milliseconds between two instants, saturating rather than failing.
@@ -1224,16 +1478,47 @@ fn millis_between(from: Instant, to: Instant) -> u64 {
     u64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(u64::MAX)
 }
 
-impl Broadcast<'_> {
-    /// Queues one frame for every attached client.
+impl<'a> Broadcast<'a> {
+    /// A bridge for turn `turn` of `held`, before its first step.
+    const fn new(held: &'a Held, turn: u64) -> Self {
+        Self {
+            held,
+            started: None,
+            head: None,
+            first_token: None,
+            last_token: None,
+            turn,
+            step: None,
+            produced: true,
+        }
+    }
+
+    /// Where the turn is now.
+    const fn position(&self) -> Position {
+        (Some(self.turn), self.step)
+    }
+
+    /// Records a frame of the turn under a fresh id and queues it for every attached client.
     ///
     /// A client that has gone is dropped here, and one that has fallen behind loses the
     /// frame: the store holds the conversation, so a missing delta costs a re-read rather
     /// than a fact.
     fn push(&self, frame: &Frame) {
+        let id = self.held.next_frame_id();
+        self.keep_and_send(id, frame);
+    }
+
+    /// Records a frame that already carries its id, and queues it for every attached client.
+    fn keep_and_send(&self, id: u64, frame: &Frame) {
         // Recorded before it is queued, so the backlog holds every frame any viewer was
         // sent: a client that attaches after this one goes out is caught up with it.
-        self.held.seen(frame);
+        let (turn, step) = self.position();
+        self.held.keep(id, turn, step, frame);
+        self.send(frame);
+    }
+
+    /// Queues a frame for every attached client without keeping it in the backlog.
+    fn send(&self, frame: &Frame) {
         self.held.viewers.borrow_mut().retain(|(_, sender)| {
             !matches!(
                 sender.try_send(frame.clone()),
@@ -1249,6 +1534,8 @@ impl Broadcast<'_> {
     /// that a step either has a measurable generation window or has none, and never half of
     /// one.
     fn note_token(&mut self) {
+        // Anything generated is held by the step's records once the step settles.
+        self.produced = true;
         let now = Instant::now();
         if self.first_token.is_none() {
             self.first_token = Some(now);
@@ -1296,6 +1583,10 @@ impl Progress for Broadcast<'_> {
 
     fn step_started(&mut self, step: u32) {
         self.start_request();
+        // A new step has produced nothing yet, so a checkpoint taken before its request — the
+        // intent a managed request is saved with — leaves its frames in the backlog.
+        self.step = Some(u64::from(step));
+        self.produced = false;
         self.push(&Frame::Step { step });
     }
 
@@ -1317,6 +1608,7 @@ impl Progress for Broadcast<'_> {
         // that answers it: the frames of a step's calls all go out before its results, and
         // the results go out in the order the tools finished rather than the order they
         // were asked for.
+        self.produced = true;
         self.push(&Frame::Tool {
             call_id: Some(call_id.as_str().to_owned()),
             name: name.as_str().to_owned(),
@@ -1325,6 +1617,7 @@ impl Progress for Broadcast<'_> {
     }
 
     fn tool_finished(&mut self, call_id: &ToolCallId, name: &ToolName, is_error: bool) {
+        self.produced = true;
         self.push(&Frame::ToolDone {
             call_id: Some(call_id.as_str().to_owned()),
             name: name.as_str().to_owned(),
@@ -1346,7 +1639,59 @@ impl Progress for Broadcast<'_> {
     fn goal_changed(&mut self, goal: Option<&Goal>) {
         let goal = goal.map(wire_goal);
         self.held.goal.borrow_mut().clone_from(&goal);
+        self.produced = true;
         self.push(&Frame::Goal { goal });
+    }
+
+    /// Publishes the status a managed step's request was prepared under, and tells every viewer.
+    ///
+    /// Kept as the session's published snapshot — what a status read during the turn is
+    /// answered from — and in the backlog, as part of the step it describes.
+    fn context_status(&mut self, status: &ContextStatus) {
+        let (turn, step) = self.position();
+        *self.held.context.borrow_mut() = Some(Published {
+            status: status.clone(),
+            turn,
+            step,
+        });
+        let id = self.held.next_frame_id();
+        let frame = Frame::ContextStatus {
+            envelope: self.held.envelope(turn, step, id),
+            payload: context::wire_status(status),
+        };
+        self.keep_and_send(id, &frame);
+    }
+
+    /// Tells every viewer a context decision settled.
+    ///
+    /// A decision is written into the log as a record, so it belongs to the step it settled in
+    /// and is retired with it.
+    fn context_decision(&mut self, decision: &ContextDecision) {
+        self.produced = true;
+        let (turn, step) = self.position();
+        let id = self.held.next_frame_id();
+        let frame = Frame::ContextDecision {
+            envelope: self.held.envelope(turn, step, id),
+            payload: context::wire_decision(decision),
+        };
+        self.keep_and_send(id, &frame);
+    }
+
+    /// Moves the durable frontier, retires what the checkpoint covers, and tells every viewer.
+    ///
+    /// The retirement and the frontier move together, synchronously, before the loop can report
+    /// anything else; the frame that follows is not kept, because a client attaching later is
+    /// given the newer frontier directly and reads what it covers from the store.
+    fn checkpointed(&mut self, receipt: &CheckpointReceipt) {
+        let at = self.position();
+        self.held
+            .checkpointed(receipt.frontier.clone(), at, self.produced);
+        let id = self.held.next_frame_id();
+        let frame = Frame::Checkpoint {
+            envelope: self.held.envelope(at.0, at.1, id),
+            payload: context::wire_receipt(receipt),
+        };
+        self.send(&frame);
     }
 
     /// Reports that this step's prompt had part of the conversation dropped.
@@ -1362,6 +1707,8 @@ impl Progress for Broadcast<'_> {
     }
 
     fn usage(&mut self, usage: &Usage) {
+        // The usage is held by the step's assistant record.
+        self.produced = true;
         let now = Instant::now();
         let started = self.started.take();
         let head = self.head.take();
@@ -1715,6 +2062,10 @@ async fn serve_connection(
                 Some((_, held)) => apply_goal(&registry, &frames, held, action).await,
                 None => refuse_unattached(&frames).await,
             },
+            Request::Context { action } => match &watching {
+                Some((_, held)) => context::answer(&registry, &frames, held, action).await,
+                None => refuse_unattached(&frames).await,
+            },
             Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
                 shutdown.notify_one();
@@ -1963,8 +2314,11 @@ async fn change_goal(registry: &Rc<Registry>, held: &Rc<Held>, action: GoalActio
         updated.append(SessionEvent::GoalChange { goal: next.clone() });
         updated
     };
-    if let Err(error) = registry.agent.record(&updated).await {
-        return GoalAnswer::Refused(format!("the goal could not be recorded: {error}"));
+    // A managed body is saved through its checkpoint and nothing else, so the stored identity
+    // the next commit expects is the one this write leaves; a legacy body is recorded as it
+    // always was. Either way the frontier moves only once the store has the change.
+    if let Err(message) = context::record_idle(registry, held, &updated).await {
+        return GoalAnswer::Refused(format!("the goal could not be recorded: {message}"));
     }
     held.refresh(&updated);
     *held.session.borrow_mut() = updated;
@@ -2260,15 +2614,32 @@ async fn attach(
     //
     // An await in here would open a window where a live frame could be queued ahead of the
     // backlog — the newest delta drawn before the text it continues.
+    //
+    // The mark is taken in the same region: the frontier and the watermark it carries are the
+    // ones the backlog was cut against, so a client reads the store through exactly the prefix
+    // the backlog continues from, and every frame after the watermark reaches it live.
     let backlog = held.turn_frames();
+    let stream = held.mark();
     let viewer = registry.view(held, frames);
-    if !queue_now(frames, Frame::Attached(held.info())) {
+    let attached = Frame::Attached {
+        session: held.info(),
+        stream: stream.clone(),
+    };
+    if !queue_now(frames, attached) {
         held.unview(viewer);
         return Err(String::from(
             "this connection has fallen too far behind to be attached; reconnect and attach again",
         ));
     }
-    if !backlog.is_empty() && !queue_now(frames, Frame::Backlog { frames: backlog }) {
+    if !backlog.is_empty()
+        && !queue_now(
+            frames,
+            Frame::Backlog {
+                stream,
+                segments: backlog,
+            },
+        )
+    {
         held.unview(viewer);
         return Err(String::from(
             "this connection has fallen too far behind to catch up with the running turn; \
@@ -2361,6 +2732,9 @@ async fn start_turn(
     frames: &mpsc::Sender<Frame>,
     viewer: u64,
 ) {
+    // A managed body that has not been bound yet is bound — and anything a crash left open is
+    // closed — before a turn is admitted. Ordinarily that happened when it was loaded.
+    context::prepare(registry, held).await;
     if held.busy.replace(true) {
         let message = String::from(
             "a turn is already running in this session; wait for it to finish or start another session",
@@ -2368,6 +2742,16 @@ async fn start_turn(
         send(frames, Frame::Failed { message }).await;
         return;
     }
+    // A session a checkpoint left in a state nothing should be built on takes no new turn: the
+    // reason says what happened and what would let it continue.
+    let quarantined = held.quarantine.borrow().clone();
+    if let Some(reason) = quarantined {
+        held.busy.set(false);
+        send(frames, Frame::Failed { message: reason }).await;
+        return;
+    }
+    // The index the loop will give this turn, read while the session is reserved and idle.
+    let turn = u64::from(held.session.borrow().turn_count());
     // Cleared only once this call is the one running the turn, and after the refusal above
     // has returned. Clearing it first — which is what this did — meant that a prompt to a
     // busy session *cancelled the interrupt aimed at the turn it was refused by*: press
@@ -2382,7 +2766,8 @@ async fn start_turn(
     let asked = Frame::User { text: text.clone() };
     // The prompt is part of the turn, so a client that arrives after it goes out is shown
     // it too: an answer to a question a reader never saw is the conversation unreadable.
-    held.seen(&asked);
+    let id = held.next_frame_id();
+    held.keep(id, Some(turn), None, &asked);
     broadcast_awaited(held, asked, Some(viewer)).await;
     held.touched.set(registry.stamp());
     // Two handles: one for the task to own, one to hand the task to. Building the future
@@ -2390,7 +2775,7 @@ async fn start_turn(
     // borrow of the second.
     let owner = Rc::clone(registry);
     let held = Rc::clone(held);
-    let task = async move { run_turn(&owner.agent, &held, text).await };
+    let task = async move { run_turn(&owner.agent, &held, text, turn).await };
     registry.spawn_turn(task);
 }
 
@@ -2566,24 +2951,24 @@ mod tests {
     /// store: what is under test is who a session is talking to, which is `Held` alone.
     fn held(id: &str) -> Rc<Held> {
         let session = Session::new(SessionId::new(id), 0, "/work");
-        Rc::new(Held {
-            id: session.id().clone(),
-            // No claim: these tests exercise who a session is talking to, and a `Registry` — the
-            // only thing that produces a `Held` in service — always claims first.
-            claim: None,
-            session: RefCell::new(session),
-            name: RefCell::new(None),
-            headline: RefCell::new(Headline::default()),
-            goal: RefCell::new(None),
-            turn: RefCell::new(Vec::new()),
-            viewers: RefCell::new(Vec::new()),
-            busy: Cell::new(false),
-            stop: Cell::new(false),
-            approvals: RefCell::new(BTreeMap::new()),
-            approved: RefCell::new(BTreeSet::new()),
-            approval_seq: Cell::new(0),
-            touched: Cell::new(0),
-        })
+        // No claim: these tests exercise who a session is talking to, and a `Registry` — the
+        // only thing that produces a `Held` in service — always claims first.
+        Rc::new(Held::new(session, None, None, format!("test-{id}"), 0))
+    }
+
+    /// Records a frame as the bridge would, under a fresh id, at `step` of turn zero.
+    fn seen(held: &Held, step: Option<u64>, frame: &Frame) -> u64 {
+        let id = held.next_frame_id();
+        held.keep(id, Some(0), step, frame);
+        id
+    }
+
+    /// The frames of a backlog, without their tags.
+    fn frames_of(held: &Held) -> Vec<Frame> {
+        held.turn_frames()
+            .into_iter()
+            .map(|segment| segment.frame)
+            .collect()
     }
 
     /// Builds a registry over a store in `dir`, with a model no turn ever reaches.
@@ -2620,27 +3005,37 @@ mod tests {
     #[test]
     fn the_turn_in_progress_is_kept_for_a_client_that_has_not_arrived_yet() {
         let session = held("catch-up");
-        session.seen(&Frame::User {
-            text: "do it".to_owned(),
-        });
-        session.seen(&Frame::Step { step: 1 });
-        session.seen(&Frame::Text {
-            delta: "Hel".to_owned(),
-        });
-        session.seen(&Frame::Text {
-            delta: "lo".to_owned(),
-        });
-        session.seen(&Frame::Reasoning {
-            delta: "hmm".to_owned(),
-        });
-        session.seen(&Frame::Reasoning {
-            delta: " more".to_owned(),
-        });
-        session.seen(&Frame::Text {
-            delta: "!".to_owned(),
-        });
+        seen(
+            &session,
+            None,
+            &Frame::User {
+                text: "do it".to_owned(),
+            },
+        );
+        seen(&session, Some(1), &Frame::Step { step: 1 });
+        let text = |delta: &str| Frame::Text {
+            delta: delta.to_owned(),
+        };
+        let reasoning = |delta: &str| Frame::Reasoning {
+            delta: delta.to_owned(),
+        };
+        for frame in [
+            text("Hel"),
+            text("lo"),
+            reasoning("hmm"),
+            reasoning(" more"),
+            text("!"),
+        ] {
+            seen(&session, Some(1), &frame);
+        }
 
-        let frames = session.turn_frames();
+        let segments = session.turn_frames();
+        // Ids are the session's, and a folded segment carries the id of the newest delta in it,
+        // so the last segment's id is the watermark.
+        let ids: Vec<u64> = segments.iter().map(|segment| segment.frame_id).collect();
+        assert_eq!(ids, vec![1, 2, 4, 6, 7], "{segments:?}");
+        assert_eq!(session.mark().stream_watermark, 7);
+        let frames = frames_of(&session);
         // Five, not seven: two adjacent deltas of one kind are one piece of text either way,
         // and a non-delta frame between them keeps them apart.
         assert_eq!(frames.len(), 5, "{frames:?}");
@@ -2653,8 +3048,22 @@ mod tests {
         assert!(matches!(frames.get(3), Some(Frame::Reasoning { delta }) if delta == "hmm more"));
         assert!(matches!(frames.get(4), Some(Frame::Text { delta }) if delta == "!"));
 
-        // A question the turn is waiting on is state, so a client arriving now is shown it —
-        // with the words the first client was given — and can answer it.
+        // Written down, there is nothing left that the store does not have, and the frontier is
+        // what the store now holds.
+        let mut written = session.session.borrow().clone();
+        written.append(SessionEvent::UserMessage {
+            text: "do it".to_owned(),
+        });
+        session.saved(context::frontier_of(&written));
+        assert!(session.turn_frames().is_empty());
+        assert_eq!(session.mark().frontier.event_count, 1);
+    }
+
+    /// A question the turn is waiting on is state, so a client arriving now is shown it — with
+    /// the words the first client was given — and can answer it, once.
+    #[test]
+    fn an_open_question_is_shown_to_a_client_that_arrives_later() {
+        let session = held("question");
         let (sender, _receiver) = oneshot::channel();
         let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
         let reason = String::from("the sandbox mode `read_only` does not permit execute");
@@ -2672,10 +3081,423 @@ mod tests {
         // Answered, it is over, and it must not be asked a second time.
         assert!(session.answer(&call_id, true, false));
         assert!(session.open_questions().is_empty());
+    }
 
-        // Written down, there is nothing left that the store does not have.
-        session.saved();
-        assert!(session.turn_frames().is_empty());
+    /// What a client shows: the stored prefix it read, then its backlog, then its live frames.
+    ///
+    /// Folded the way a transcript folds them — a run of deltas is one answer, broken by
+    /// anything else — so "exactly one copy of everything" is an equality on this list.
+    fn visible(prefix: &Session, backlog: &[Frame], live: &[Frame]) -> Vec<String> {
+        let mut shown: Vec<String> = Vec::new();
+        for event in prefix.log().events() {
+            match event {
+                SessionEvent::UserMessage { text } => shown.push(format!("user:{text}")),
+                SessionEvent::AssistantMessage {
+                    text: Some(text), ..
+                } => shown.push(format!("answer:{text}")),
+                _ => {}
+            }
+        }
+        let mut answering = false;
+        for frame in backlog.iter().chain(live) {
+            match frame {
+                Frame::User { text } => {
+                    shown.push(format!("user:{text}"));
+                    answering = false;
+                }
+                Frame::Text { delta } => {
+                    match shown.last_mut() {
+                        Some(last) if answering => last.push_str(delta),
+                        _ => shown.push(format!("answer:{delta}")),
+                    }
+                    answering = true;
+                }
+                // A checkpoint only moves the watermark, and the rest of what a turn sends is
+                // not text; either way, a run of deltas ends.
+                _ => answering = false,
+            }
+        }
+        shown
+    }
+
+    /// Reads the store as a client must: only through the advertised frontier, verified.
+    fn read_through(stored: &Session, mark: &StreamMark) -> Result<Session, String> {
+        let prefix = stored
+            .prefix(mark.frontier.event_count)
+            .map_err(|error| format!("shorter than the frontier: {error}"))?;
+        let digest = prefix
+            .prefix_digest(mark.frontier.event_count)
+            .map_err(|error| error.to_string())?;
+        if digest.as_str() == mark.frontier.prefix_sha256 {
+            Ok(prefix)
+        } else {
+            Err(String::from("the stored prefix is not the advertised one"))
+        }
+    }
+
+    /// One attached client: what the attachment said, what it was caught up with, and what came.
+    struct Watcher {
+        mark: StreamMark,
+        backlog: Vec<Frame>,
+        live: Vec<Frame>,
+        queue: mpsc::Receiver<Frame>,
+    }
+
+    /// Attaches a watcher at this instant, through the real attachment barrier.
+    async fn watch(registry: &Rc<Registry>, held: &Rc<Held>) -> Watcher {
+        let (frames, mut queue) = mpsc::channel(FRAME_BUFFER);
+        let attached = attach(registry, held, &frames).await;
+        assert!(
+            attached.is_ok(),
+            "the barrier attaches: {:?}",
+            attached.err()
+        );
+        let Ok(Frame::Attached { stream: mark, .. }) = queue.try_recv() else {
+            panic!("the attachment comes first");
+        };
+        let mut backlog = Vec::new();
+        let mut live = Vec::new();
+        while let Ok(frame) = queue.try_recv() {
+            match frame {
+                Frame::Backlog { stream, segments } => {
+                    assert_eq!(stream, mark, "the backlog is the attachment's own snapshot");
+                    assert!(
+                        segments
+                            .iter()
+                            .all(|segment| segment.frame_id <= mark.stream_watermark),
+                        "a backlog holds nothing past its watermark"
+                    );
+                    backlog = segments.into_iter().map(|segment| segment.frame).collect();
+                }
+                // The attachment's own state frames: the approval state and the model.
+                Frame::ApprovalChanged { .. } | Frame::ModelChanged { .. } => {}
+                other => live.push(other),
+            }
+        }
+        // Kept for the frames the turn sends after the barrier.
+        drop(frames);
+        Watcher {
+            mark,
+            backlog,
+            live,
+            queue,
+        }
+    }
+
+    impl Watcher {
+        /// Takes everything sent since, checking every context frame is new to this attachment.
+        fn drain(&mut self) {
+            while let Ok(frame) = self.queue.try_recv() {
+                if let Frame::Checkpoint { envelope, .. } = &frame {
+                    assert_eq!(envelope.stream_epoch, self.mark.stream_epoch);
+                    assert!(
+                        envelope.frame_id > self.mark.stream_watermark,
+                        "a live frame is newer than the attachment"
+                    );
+                }
+                self.live.push(frame);
+            }
+        }
+    }
+
+    /// The runner's side of a checkpoint: the store gets the session, the bridge the receipt.
+    async fn checkpoint(registry: &Registry, progress: &mut Broadcast<'_>, session: &Session) {
+        let saved = registry.agent.store.save(session).await;
+        assert!(saved.is_ok(), "{saved:?}");
+        progress.checkpointed(&CheckpointReceipt {
+            frontier: context::frontier_of(session),
+            body_digest: session.body_digest(),
+            durability: nanus_domain::context::managed::Durability::ProcessCrash,
+        });
+    }
+
+    /// T13: clients attach while the disk is being checkpointed under them, while a backlog is
+    /// being delivered, and before and after each checkpoint — and every one of them shows every
+    /// message exactly once.
+    ///
+    /// The turn is driven through the real progress bridge and the real attachment barrier, with
+    /// the store written at each checkpoint the way a managed runner writes it. Each client then
+    /// reads the store *after* the turn has moved it past every frontier any of them was given,
+    /// which is the race: a client that read the file to its end would show the checkpointed part
+    /// of the turn twice, once from the disk and once from the backlog or the live frames.
+    #[test]
+    fn attaching_while_checkpoints_race_the_disk_and_the_backlog_shows_everything_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        nanus_kernel::runtime::block_on_local(async move {
+            let registry = registry_over(dir.path()).await;
+            let mut session = Session::new(SessionId::new("raced"), 1, "/work");
+            session.upgrade_to_managed_body();
+            session.append(SessionEvent::UserMessage {
+                text: "earlier".to_owned(),
+            });
+            session.append(assistant("before"));
+            let saved = registry.agent.store.save(&session).await;
+            assert!(saved.is_ok(), "{saved:?}");
+            let held = registry.hold(session.clone(), None).await.expect("held");
+
+            let mut watchers = vec![watch(&registry, &held).await];
+            let mut progress = Broadcast::new(&held, 0);
+            progress.push(&Frame::User {
+                text: "go".to_owned(),
+            });
+            progress.step_started(1);
+            // The intent checkpoint before the first request: the prompt is in it, the step is
+            // not, so the step's own frame stays in the backlog.
+            session.append(SessionEvent::TurnStart { turn: 0 });
+            session.append(SessionEvent::UserMessage {
+                text: "go".to_owned(),
+            });
+            checkpoint(&registry, &mut progress, &session).await;
+            progress.text("Hel");
+            progress.text("lo");
+            watchers.push(watch(&registry, &held).await);
+            // The first step settles and is checkpointed.
+            session.append(SessionEvent::StepStart { turn: 0, step: 0 });
+            session.append(assistant("Hello"));
+            session.append(SessionEvent::StepEnd { turn: 0, step: 0 });
+            checkpoint(&registry, &mut progress, &session).await;
+            watchers.push(watch(&registry, &held).await);
+            progress.step_started(2);
+            progress.text("more");
+            watchers.push(watch(&registry, &held).await);
+            session.append(SessionEvent::StepStart { turn: 0, step: 1 });
+            session.append(assistant("more"));
+            session.append(SessionEvent::StepEnd { turn: 0, step: 1 });
+            session.append(SessionEvent::TurnEnd {
+                turn: 0,
+                reason: TurnEndReason::Completed,
+            });
+            checkpoint(&registry, &mut progress, &session).await;
+
+            let frontiers: Vec<u64> = watchers
+                .iter()
+                .map(|watcher| watcher.mark.frontier.event_count)
+                .collect();
+            assert_eq!(
+                frontiers,
+                vec![2, 4, 7, 7],
+                "each barrier saw the frontier of its time"
+            );
+            assert!(
+                held.turn_frames().is_empty(),
+                "the last checkpoint covered the turn"
+            );
+
+            // Every client reads the disk now, long after its own barrier.
+            let stored = registry.agent.store.load(&SessionId::new("raced")).await;
+            let stored = stored.expect("the store holds the turn");
+            assert_eq!(stored.event_count(), 11);
+            for (index, watcher) in watchers.iter_mut().enumerate() {
+                watcher.drain();
+                let prefix = read_through(&stored, &watcher.mark).expect("the prefix verifies");
+                assert_eq!(
+                    visible(&prefix, &watcher.backlog, &watcher.live),
+                    vec![
+                        "user:earlier",
+                        "answer:before",
+                        "user:go",
+                        "answer:Hello",
+                        "answer:more"
+                    ],
+                    "client {index} shows every message exactly once"
+                );
+            }
+
+            // And the two ways a disk read must be refused rather than trusted: a file shorter
+            // than the frontier, and one whose prefix is not the one advertised.
+            let late = &watchers[3].mark;
+            let shorter = stored.prefix(5).expect("a prefix");
+            assert!(
+                read_through(&shorter, late).is_err(),
+                "a shorter file is refused"
+            );
+            let mut forged = Session::new(SessionId::new("raced"), 1, "/work");
+            forged.upgrade_to_managed_body();
+            for event in stored.log().events().iter().skip(1) {
+                forged.append(event.clone());
+            }
+            forged.append(SessionEvent::UserMessage {
+                text: "padding".to_owned(),
+            });
+            assert!(
+                read_through(&forged, late).is_err(),
+                "a different prefix is refused"
+            );
+        });
+    }
+
+    /// An assistant message with only text, as a settled step records one.
+    fn assistant(text: &str) -> SessionEvent {
+        SessionEvent::AssistantMessage {
+            replay: None,
+            text: Some(text.to_owned()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            interrupted: false,
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// A checkpoint before a step's request keeps that step's frames, one after the step has
+    /// produced output retires them, and an older receipt moves nothing back.
+    #[test]
+    fn a_checkpoint_retires_exactly_the_segments_it_covers() {
+        let session = held("retire");
+        let mut progress = Broadcast::new(&session, 3);
+        progress.push(&Frame::User {
+            text: "go".to_owned(),
+        });
+        progress.step_started(1);
+        let frontier = |count: u64| ContextFrontier {
+            session_id: String::from("retire"),
+            event_count: count,
+            prefix_sha256: nanus_domain::context::managed::Digest::of(&count.to_le_bytes()),
+            projection_revision: 0,
+        };
+        let receipt = |count: u64| CheckpointReceipt {
+            frontier: frontier(count),
+            body_digest: nanus_domain::context::managed::Digest::empty(),
+            durability: nanus_domain::context::managed::Durability::ProcessCrash,
+        };
+        progress.checkpointed(&receipt(2));
+        assert_eq!(frames_of(&session), vec![Frame::Step { step: 1 }]);
+        progress.reasoning("hmm");
+        progress.checkpointed(&receipt(5));
+        assert!(
+            frames_of(&session).is_empty(),
+            "the settled step is on disk"
+        );
+        progress.step_started(2);
+        progress.text("next");
+        // A stale receipt: the frontier and the backlog stay where they are.
+        progress.checkpointed(&receipt(4));
+        assert_eq!(session.frontier.borrow().event_count, 5);
+        assert_eq!(frames_of(&session).len(), 2, "{:?}", session.turn_frames());
+        let tags: Vec<(Option<u64>, Option<u64>)> = session
+            .turn_frames()
+            .iter()
+            .map(|segment| (segment.turn, segment.step))
+            .collect();
+        assert_eq!(tags, vec![(Some(3), Some(2)), (Some(3), Some(2))]);
+    }
+
+    /// The status a step publishes reaches every viewer as a context frame of its own, with the
+    /// turn, the step and a fresh id, and a status read during the turn is answered from that
+    /// snapshot — while the turn holds the session, which the read must never borrow.
+    // The borrow held across the read is the point: it is what a running turn does, and a read
+    // that borrowed the session would panic here.
+    #[allow(clippy::await_holding_refcell_ref)]
+    #[test]
+    fn a_published_status_reaches_viewers_and_answers_a_read_during_the_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        nanus_kernel::runtime::block_on_local(async move {
+            let registry = registry_over(dir.path()).await;
+            let session = held("status");
+            let (frames, mut queue) = mpsc::channel(FRAME_BUFFER);
+            session.viewers.borrow_mut().push((1, frames.clone()));
+            let status = hand_built_status(&session);
+            let mut progress = Broadcast::new(&session, 2);
+            progress.step_started(1);
+            progress.context_status(&status);
+            let _step = queue.try_recv();
+            let Ok(Frame::ContextStatus { envelope, payload }) = queue.try_recv() else {
+                panic!("the status is its own frame");
+            };
+            assert_eq!(envelope.turn, Some(2));
+            assert_eq!(envelope.step, Some(1));
+            assert_eq!(envelope.frame_id, 2);
+            assert_eq!(envelope.stream_epoch, session.epoch);
+            assert_eq!(payload.revision, 4);
+            assert_eq!(payload.mode, crate::protocol::ContextModeState::Managed);
+
+            // A read while the turn runs: the session is mutably borrowed, exactly as a turn
+            // borrows it, and the read is answered from the snapshot without touching it.
+            session.busy.set(true);
+            let borrowed = session.session.borrow_mut();
+            let (asker, mut answers) = mpsc::channel(FRAME_BUFFER);
+            context::answer(
+                &registry,
+                &asker,
+                &session,
+                crate::protocol::ContextAction::Status,
+            )
+            .await;
+            drop(borrowed);
+            let Ok(Frame::ContextStatus { envelope, payload }) = answers.try_recv() else {
+                panic!("a read during the turn is answered from the snapshot");
+            };
+            assert_eq!(payload.revision, 4);
+            assert_eq!((envelope.turn, envelope.step), (Some(2), Some(1)));
+            assert!(envelope.frame_id > 2, "the answer takes a fresh id");
+
+            // And a reset while the turn runs is refused, changing nothing.
+            context::answer(
+                &registry,
+                &asker,
+                &session,
+                crate::protocol::ContextAction::Reset,
+            )
+            .await;
+            assert!(
+                matches!(answers.try_recv(), Ok(Frame::Refused { ref message }) if message.contains("turn is running")),
+                "a reset of a busy session is refused"
+            );
+            assert!(session.busy.get(), "the turn still holds the session");
+        });
+    }
+
+    /// A status read on an idle legacy session asks the runner, never a snapshot, and a status
+    /// the runner cannot give is a refusal with its reason rather than a frame with a guess.
+    #[test]
+    fn an_idle_legacy_status_is_read_from_the_runner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        nanus_kernel::runtime::block_on_local(async move {
+            let registry = registry_over(dir.path()).await;
+            let session = held("idle");
+            let (asker, mut answers) = mpsc::channel(FRAME_BUFFER);
+            context::answer(
+                &registry,
+                &asker,
+                &session,
+                crate::protocol::ContextAction::Status,
+            )
+            .await;
+            match answers.try_recv() {
+                Ok(Frame::ContextStatus { envelope, payload }) => {
+                    assert_eq!(payload.mode, crate::protocol::ContextModeState::Legacy);
+                    assert_eq!((envelope.turn, envelope.step), (None, None));
+                }
+                Ok(Frame::Refused { message }) => {
+                    assert!(message.contains("context status"), "{message}");
+                }
+                other => panic!("expected a status or its refusal, got {other:?}"),
+            }
+        });
+    }
+
+    /// A context status built by hand, as a managed step would publish it.
+    fn hand_built_status(held: &Held) -> ContextStatus {
+        ContextStatus {
+            mode: nanus_domain::context::managed::ContextMode::Managed,
+            revision: 4,
+            frontier: held.frontier.borrow().clone(),
+            estimate_input_tokens: Some(1_000),
+            estimate_protected_tokens: None,
+            output_reserve_tokens: 4_096,
+            estimator: String::from("bytes/4"),
+            hidden_fragments: 1,
+            protected_fragments: 2,
+            goal_revision: None,
+            goal_data_available: false,
+            recall_available: true,
+            archive_available: false,
+            last_decision: None,
+            profile_digest: nanus_domain::context::managed::Digest::of(b"profile"),
+            managed_ready: true,
+            unavailable_reason: None,
+        }
     }
 
     /// A step whose prompt was trimmed tells every client watching, and the notice is part of
@@ -2692,14 +3514,7 @@ mod tests {
             kept_tokens: 100,
             budget: 200,
         };
-        Broadcast {
-            held: &session,
-            started: None,
-            head: None,
-            first_token: None,
-            last_token: None,
-        }
-        .elided(&elision);
+        Broadcast::new(&session, 0).elided(&elision);
 
         match queued.try_recv() {
             Ok(Frame::Elided {
@@ -2714,7 +3529,7 @@ mod tests {
         // And a client that attaches after the trim is caught up with it: the notice belongs to
         // the turn it happened in.
         assert!(
-            matches!(session.turn_frames().first(), Some(Frame::Elided { .. })),
+            matches!(frames_of(&session).first(), Some(Frame::Elided { .. })),
             "{:?}",
             session.turn_frames()
         );
