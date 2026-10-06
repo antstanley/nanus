@@ -74,6 +74,7 @@ pub mod notice;
 pub mod queue;
 pub mod replay;
 pub mod stats;
+pub mod stream;
 pub mod summary;
 pub mod transcript;
 pub mod view;

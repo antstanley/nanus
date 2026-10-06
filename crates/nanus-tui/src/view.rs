@@ -384,6 +384,26 @@ pub struct ViewState {
     /// Whether a `/goal` is waiting for its answer, which is drawn even when it repeats the
     /// line above: the reader asked, and silence would read as the request being lost.
     pub goal_asked: bool,
+    /// Where this interface stands in the session's stream: the epoch it attached to, the
+    /// newest frame id it has accounted for, and how much of the log the store holds.
+    ///
+    /// A context frame that is not new to this attachment, or that comes from another epoch, is
+    /// not applied; see [`crate::stream`].
+    pub stream: crate::stream::StreamCursor,
+    /// Whether a `/context` read is waiting for its answer, which is drawn even when it repeats
+    /// the status the transcript last showed.
+    pub context_asked: bool,
+    /// Whether a `/context reset` is waiting for the checkpoint that says it was saved.
+    pub context_reset_asked: bool,
+    /// The context status a step last showed, so a step whose status did not change draws no
+    /// second line saying the same thing.
+    pub context_shown: Option<String>,
+    /// The context decisions already in the transcript, by id and outcome.
+    ///
+    /// The replayed log draws a decision from its record, and a backlog that caught this
+    /// interface up can carry the frame the same decision was announced with; this is what keeps
+    /// that to one line.
+    pub decisions_shown: std::collections::BTreeSet<String>,
     /// The current step within the open turn.
     pub step: u32,
     /// Total tokens the session has used.
@@ -726,6 +746,11 @@ impl Default for ViewState {
             busy: false,
             goal_shown: None,
             goal_asked: false,
+            stream: crate::stream::StreamCursor::default(),
+            context_asked: false,
+            context_reset_asked: false,
+            context_shown: None,
+            decisions_shown: std::collections::BTreeSet::new(),
             step: 0,
             tokens_used: 0,
             stats: Throughput::default(),

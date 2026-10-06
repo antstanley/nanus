@@ -78,8 +78,10 @@ use nanus_adapter_config::{NanusConfig, TuiDetail};
 use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
 use nanus_link::protocol::{
-    ApprovalState, EffortState, Frame, GoalAction, GoalInfo, GoalState, ProviderInfo, Request,
-    SessionInfo, TurnEnd,
+    ApprovalState, BacklogSegment, CheckpointInfo, ContextAction, ContextDecisionInfo,
+    ContextEnvelope, ContextModeState, ContextStatusInfo, DecisionState, EffortState, Frame,
+    FrontierInfo, GoalAction, GoalInfo, GoalState, ProviderInfo, Request, SessionInfo, StreamMark,
+    TurnEnd,
 };
 use nanus_ports::{ReasoningEffort, StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
@@ -93,6 +95,7 @@ use crate::command::{Command, Submission, submission_of};
 use crate::compact::Detail;
 use crate::notice::{self, Ending};
 use crate::stats::{Generation, Throughput};
+use crate::stream::{Admission, StreamCursor};
 use crate::transcript::{Entry, Role};
 use crate::view::{PendingApproval, ProviderChoice, Theme, ViewState};
 
@@ -459,6 +462,28 @@ pub trait SessionSource {
     /// sending a request nowhere.
     fn set_goal(&mut self, _action: GoalAction) {}
 
+    /// Asks the agent to report or reset the session's managed context.
+    ///
+    /// A default of doing nothing, for the same reason as [`SessionSource::set_goal`]: a recording
+    /// has no agent, and the interface refuses `/context` on one rather than sending it nowhere.
+    fn set_context(&mut self, _action: ContextAction) {}
+
+    /// Where the session's stream stood when this source attached to it.
+    ///
+    /// `None` for a source with no stream — a recording — whose view then accepts no context
+    /// frame as its own.
+    fn stream(&self) -> Option<StreamCursor> {
+        None
+    }
+
+    /// A sentence the transcript opens with, when reading the stored session went wrong.
+    ///
+    /// A store that could not be read, or a stored file that is not the prefix the agent named, is
+    /// said out loud rather than shown as an empty conversation.
+    fn opening_notice(&self) -> Option<String> {
+        None
+    }
+
     /// Re-reads the session from wherever it is authoritative, before the summary is drawn.
     ///
     /// A live session's copy here is a snapshot taken when this interface attached, and the
@@ -640,13 +665,16 @@ pub struct Remote {
     effort: Option<ReasoningEffort>,
     /// Whether a turn was already running in the session when it was attached to.
     busy: bool,
-    /// Whether the backlog the agent sent is already in the log this client read.
+    /// Where the session's stream stood at the attachment barrier.
     ///
-    /// The two are read at different instants — the agent snapshots the running turn when it
-    /// answers the attachment, and this client reads the log afterwards — so a turn that ended
-    /// in between is in both. Applying the backlog then draws it twice; see
-    /// [`backlog_is_redundant`].
-    redundant_backlog: bool,
+    /// The log was read through this frontier and no further: the agent snapshots the running
+    /// turn when it answers the attachment and this client reads the store afterwards, so a file
+    /// that has grown in between holds part of what the backlog and the live frames are about to
+    /// deliver. Reading only the advertised prefix is what makes the two add up to the
+    /// conversation exactly once; see [`read_through`].
+    stream: StreamMark,
+    /// What reading the store through that frontier went wrong with, if anything did.
+    notice: Option<String>,
 }
 
 impl Remote {
@@ -667,11 +695,12 @@ impl Remote {
             .await
             .map_err(|error| error.to_string())?;
         let agent = client.info().clone();
-        let attached = match target {
-            Target::New { name } => client.start(name).await,
-            Target::Resume(reference) => client.attach(&reference).await,
+        let attachment = match target {
+            Target::New { name } => client.start_at(name).await,
+            Target::Resume(reference) => client.attach_at(&reference).await,
         }
         .map_err(|error| error.to_string())?;
+        let (attached, stream) = (attachment.session, attachment.stream);
         // A state named at startup is sent to the agent before the interface draws, so a
         // reader who asked for `all_calls` is not asked about the first call while the
         // request is still in flight. The agent answers with its own state either way.
@@ -682,16 +711,9 @@ impl Remote {
                 .map_err(|error| error.to_string())?;
         }
         let workspace = agent.workspace.clone();
-        let session = history(store, &attached, &agent.workspace).await;
+        let (session, notice) = history(store, &attached, &stream.frontier, &agent.workspace).await;
         let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
         let busy = attached.busy;
-        // The backlog the agent is about to send was snapshotted when it answered the
-        // attachment, and the log was read a moment later. A turn that ended in between is in
-        // both, and the log is where a finished turn belongs.
-        let redundant_backlog = backlog_is_redundant(
-            attached.events,
-            u64::try_from(session.event_count()).unwrap_or(u64::MAX),
-        );
         let (requests, pending) = mpsc::unbounded_channel();
         Ok(Self {
             session,
@@ -723,26 +745,10 @@ impl Remote {
             plan: (!agent.plan.is_empty()).then(|| agent.plan.clone()),
             providers: provider_choices(&agent.providers),
             busy,
-            redundant_backlog,
+            stream,
+            notice,
         })
     }
-}
-
-/// Whether the backlog an agent sent is already in the log the client read.
-///
-/// The agent snapshots the running turn when it answers an attachment, and this client reads
-/// the log from the store afterwards. The log only grows when a turn *ends*, so:
-///
-/// - a log that holds exactly what the agent said it held ends where the backlog begins, and
-///   the backlog is the rest of the turn;
-/// - a log that has moved past that point already contains the turn the backlog carries — the
-///   turn ended between the two reads — so applying the backlog would draw it a second time.
-///
-/// The count the agent reports is the one it snapshotted, which is why this is a comparison
-/// rather than a guess: it is what makes catching up exact when the two reads are not one
-/// instant.
-fn backlog_is_redundant(snapshot_events: u64, stored_events: u64) -> bool {
-    stored_events > snapshot_events
 }
 
 /// The first few characters of a session id, for a title bar.
@@ -753,29 +759,85 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// Reads the conversation a client has attached to.
+/// Reads the conversation a client has attached to, through the frontier it was told.
 ///
-/// The history comes from the store rather than down the link, and the two ways that can
-/// go wrong are different things:
-///
-/// - **Nothing is stored under that key.** A brand-new session, which is not a failure at
-///   all: it is a conversation that has not said anything yet.
-/// - **Something is stored and cannot be read.** A damaged log, or an unreadable
-///   directory. The client can still talk, so it is given an empty conversation rather
-///   than refused — but it is *reported*, because quietly showing an empty transcript for
-///   a session that has history would misrepresent the conversation the reader is in.
-///
-/// A live session never shows a creation time — the reader is in it — so the timestamp is
-/// the epoch and the recorded path reads a real one.
-async fn history(store: &StoreHandle, attached: &SessionInfo, workspace: &str) -> Session {
+/// The history comes from the store rather than down the link, and only as far as the
+/// attachment's frontier: everything past it reaches this client as the backlog and the live
+/// frames, so reading further would draw it twice. See [`read_through`] for what is checked.
+async fn history(
+    store: &StoreHandle,
+    attached: &SessionInfo,
+    frontier: &FrontierInfo,
+    workspace: &str,
+) -> (Session, Option<String>) {
     let id = SessionId::new(&attached.session);
-    match store.load(&id).await {
+    let loaded = store.load(&id).await;
+    read_through(loaded, &id, frontier, workspace)
+}
+
+/// Keeps exactly the prefix of a stored session that an attachment's frontier names.
+///
+/// What can come back, and what each is:
+///
+/// - **Nothing is stored, and the frontier is empty.** A brand-new session, which is not a
+///   failure at all: it is a conversation that has not said anything yet.
+/// - **A file at least as long as the frontier, whose prefix has the advertised digest.** The
+///   ordinary case. A longer file is clipped to the frontier: the agent checkpointed after it
+///   answered the attachment, and what it wrote is already on its way down the link.
+/// - **Anything else** — a file shorter than the frontier, one whose prefix is not the one the
+///   agent is holding, nothing stored where the agent says something is, or a log that cannot be
+///   read. The client can still talk, so it is given an empty conversation rather than refused,
+///   and the second half of the answer is the sentence that says why: quietly showing an empty
+///   transcript for a session that has history would misrepresent the conversation the reader is
+///   in.
+///
+/// A live session never shows a creation time — the reader is in it — so the timestamp of an
+/// empty stand-in is the epoch and the recorded path reads a real one.
+fn read_through(
+    loaded: Result<Session, StoreError>,
+    id: &SessionId,
+    frontier: &FrontierInfo,
+    workspace: &str,
+) -> (Session, Option<String>) {
+    let wanted = frontier.event_count;
+    let empty = || Session::new(id.clone(), 0, workspace);
+    let session = match loaded {
         Ok(session) => session,
-        Err(StoreError::NotFound { .. }) => Session::new(id, 0, workspace),
+        Err(StoreError::NotFound { .. }) if wanted == 0 => return (empty(), None),
+        Err(StoreError::NotFound { .. }) => {
+            let notice = format!(
+                "the agent holds {wanted} stored events of this session and the store has none; \
+                 the transcript starts here"
+            );
+            return (empty(), Some(notice));
+        }
         Err(error) => {
             tracing::warn!(%error, "the recorded history could not be read");
-            Session::new(id, 0, workspace)
+            let notice = format!(
+                "the stored session could not be read ({error}); the transcript starts here"
+            );
+            return (empty(), Some(notice));
         }
+    };
+    let held = session.event_count();
+    let Ok(prefix) = session.prefix(wanted) else {
+        let notice = format!(
+            "the stored session holds {held} events, fewer than the {wanted} the agent has \
+             saved; it was not shown, and the transcript starts here"
+        );
+        return (empty(), Some(notice));
+    };
+    let verified = prefix
+        .prefix_digest(wanted)
+        .is_ok_and(|digest| digest.as_str() == frontier.prefix_sha256);
+    if verified {
+        (prefix, None)
+    } else {
+        let notice = String::from(
+            "the stored session is not the one the agent is holding; it was not shown, and the \
+             transcript starts here",
+        );
+        (empty(), Some(notice))
     }
 }
 
@@ -840,10 +902,7 @@ impl SessionSource for Remote {
             return;
         };
         let frames = frames.clone();
-        let redundant_backlog = self.redundant_backlog;
-        tokio::task::spawn_local(
-            async move { pump(client, requests, frames, redundant_backlog).await },
-        );
+        tokio::task::spawn_local(async move { pump(client, requests, frames).await });
     }
 
     fn submit(&mut self, prompt: String) {
@@ -897,6 +956,22 @@ impl SessionSource for Remote {
 
     fn set_goal(&mut self, action: GoalAction) {
         self.send(Request::Goal { action });
+    }
+
+    fn set_context(&mut self, action: ContextAction) {
+        self.send(Request::Context { action });
+    }
+
+    fn stream(&self) -> Option<StreamCursor> {
+        Some(StreamCursor::attached(
+            self.stream.stream_epoch.clone(),
+            self.stream.stream_watermark,
+            self.stream.frontier.event_count,
+        ))
+    }
+
+    fn opening_notice(&self) -> Option<String> {
+        self.notice.clone()
     }
 
     fn refresh(&mut self) {
@@ -1023,7 +1098,6 @@ async fn pump(
     client: Client,
     mut requests: mpsc::UnboundedReceiver<Request>,
     frames: mpsc::Sender<Frame>,
-    redundant_backlog: bool,
 ) {
     // Split, because the two directions run at once and one borrow cannot serve both.
     let (mut reader, mut sender) = client.split();
@@ -1042,9 +1116,10 @@ async fn pump(
             frame = reader.next() => {
                 match frame {
                     Ok(Some(frame)) => {
-                        if !forwarded(&frame, redundant_backlog) {
-                            continue;
-                        }
+                        // Every frame is forwarded: what the store already holds was never read
+                        // past the frontier, so a backlog cannot repeat it, and a context frame
+                        // the attachment already accounted for is dropped by the view, which
+                        // holds the watermark.
                         // A receiver that has gone away means the interface is closing, so
                         // there is nobody left to tell.
                         if frames.send(frame).await.is_err() {
@@ -1063,15 +1138,6 @@ async fn pump(
             }
         }
     }
-}
-
-/// Whether a frame the link sent should reach the interface.
-///
-/// The one frame that can arrive already answered: a turn that ended between the agent's
-/// snapshot of it and this client's read of the log is in the log, and the transcript was built
-/// from that — so the backlog that carries it is dropped rather than drawn on top of it.
-fn forwarded(frame: &Frame, redundant_backlog: bool) -> bool {
-    !(redundant_backlog && matches!(frame, Frame::Backlog { .. }))
 }
 
 /// Tells the interface that the conversation ended, when it is still there to hear it.
@@ -1205,6 +1271,17 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
         .session()
         .goal()
         .map(|goal| crate::replay::goal_line(Some(&goal)));
+    // The decisions the replay drew, so the frame a backlog carries for the same decision is
+    // not drawn a second time.
+    view.decisions_shown = replayed_decisions(source.session());
+    if let Some(stream) = source.stream() {
+        view.stream = stream;
+    }
+    // Said where the reader will see it first: the stored session could not be read through the
+    // frontier the agent named, and an empty transcript is not to be taken for an empty session.
+    if let Some(notice) = source.opening_notice() {
+        view.transcript.push(Entry::notice(notice));
+    }
     // Opening at the end, or part way back from it: the offset is applied on the first
     // render, when the viewport it is measured against is known.
     view.pending_scroll_back = Some(source.initial_scroll());
@@ -1234,6 +1311,51 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
         view.status = String::from("viewing a recorded session · Ctrl-C quits");
     }
     Ok(view)
+}
+
+/// The context decisions a replay of `session` draws, keyed as [`decision_key`] keys them.
+fn replayed_decisions(session: &Session) -> std::collections::BTreeSet<String> {
+    session
+        .log()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            nanus_domain::SessionEvent::ContextDecision { payload } => Some(decision_key(
+                &payload.decision_id,
+                wire_outcome(payload.outcome),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What identifies one decision line: the decision and what became of it.
+fn decision_key(decision_id: &str, outcome: DecisionState) -> String {
+    format!("{decision_id}:{outcome:?}")
+}
+
+/// Renders a recorded outcome in the link's vocabulary, so the two keys compare.
+///
+/// An exhaustive match, so an outcome the domain grows is a compile error here.
+const fn wire_outcome(outcome: nanus_domain::context::managed::DecisionOutcome) -> DecisionState {
+    use nanus_domain::context::managed::DecisionOutcome;
+    match outcome {
+        DecisionOutcome::Staged => DecisionState::Staged,
+        DecisionOutcome::Accepted => DecisionState::Accepted,
+        DecisionOutcome::Rejected => DecisionState::Rejected,
+        DecisionOutcome::Cancelled => DecisionState::Cancelled,
+    }
+}
+
+/// Reads a wire outcome back into the domain's, for the replay's wording.
+const fn domain_outcome(outcome: DecisionState) -> nanus_domain::context::managed::DecisionOutcome {
+    use nanus_domain::context::managed::DecisionOutcome;
+    match outcome {
+        DecisionState::Staged => DecisionOutcome::Staged,
+        DecisionState::Accepted => DecisionOutcome::Accepted,
+        DecisionState::Rejected => DecisionOutcome::Rejected,
+        DecisionState::Cancelled => DecisionOutcome::Cancelled,
+    }
 }
 
 /// The event loop: draw, then wait for a keystroke or for the agent to say something.
@@ -1436,6 +1558,10 @@ enum Routed {
     /// Routed for the same reason as [`Routed::SetModel`]: the goal is the agent's session state,
     /// the interface is only a view of it, and the router is a pure function of the line.
     Goal(GoalAction),
+    /// Read or reset the session's managed context, as `/context` asked.
+    ///
+    /// Routed for the same reason as [`Routed::Goal`]: the context is the agent's session state.
+    Context(ContextAction),
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1467,6 +1593,9 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         // The reader's words choose the action — a bare `/goal`, a lifecycle word, or an objective.
         Submission::Run(Command::Goal) => {
             goal_action(&prompt).map_or_else(Routed::Say, Routed::Goal)
+        }
+        Submission::Run(Command::Context) => {
+            context_action(&prompt).map_or_else(Routed::Say, Routed::Context)
         }
         Submission::Run(Command::Copy) => Routed::Copy,
         Submission::Shell(command) => {
@@ -1632,6 +1761,7 @@ async fn submitted(
             None => open_provider_chooser(view),
         },
         Routed::Goal(action) => request_goal(action, source, view),
+        Routed::Context(action) => request_context(action, source, view),
         Routed::Say(message) => {
             view.transcript.push(Entry::notice(message));
             view.scroll_to_bottom();
@@ -1972,6 +2102,61 @@ fn request_goal(action: GoalAction, source: &mut dyn SessionSource, view: &mut V
     };
     view.goal_asked = true;
     source.set_goal(action);
+}
+
+/// Reads a `/context` line into the action it names, or the sentence saying why it names none.
+///
+/// A bare `/context` (or `/context status`) reads; `/context reset` resets. Anything else is
+/// refused by name rather than guessed at, because a reset that a typo could reach is a reset
+/// nobody asked for.
+///
+/// # Errors
+///
+/// Returns the sentence to show for a word `/context` does not take.
+fn context_action(line: &str) -> Result<ContextAction, String> {
+    match goal_argument(line).as_str() {
+        "" | "status" => Ok(ContextAction::Status),
+        "reset" => Ok(ContextAction::Reset),
+        other => Err(format!(
+            "`/context` takes `status` or `reset`, not `{other}`"
+        )),
+    }
+}
+
+/// Sends a context request to the agent, or says why the interface cannot.
+///
+/// The agent is the authority, as it is for the goal: the status comes back as a
+/// [`Frame::ContextStatus`] and a reset as the checkpoint that saved it. A reset during a turn is
+/// refused here, where the reader is looking — the agent refuses it too — and a read is sent
+/// either way, because the agent answers one from the snapshot the turn published.
+fn request_context(action: ContextAction, source: &mut dyn SessionSource, view: &mut ViewState) {
+    if !source.accepts_prompts() {
+        view.transcript.push(Entry::notice(String::from(
+            "this is a recording: its context cannot be read or reset",
+        )));
+        view.scroll_to_bottom();
+        return;
+    }
+    match action {
+        ContextAction::Status => {
+            view.context_asked = true;
+            if !view.busy {
+                view.status = String::from("reading the context status");
+            }
+        }
+        ContextAction::Reset if view.busy => {
+            view.transcript.push(Entry::notice(String::from(
+                "a turn is running; the context can be reset when it is idle",
+            )));
+            view.follow();
+            return;
+        }
+        ContextAction::Reset => {
+            view.context_reset_asked = true;
+            view.status = String::from("resetting the context");
+        }
+    }
+    source.set_context(action);
 }
 
 /// The status line while prompts are waiting.
@@ -3071,10 +3256,42 @@ fn stopping_notice(reason: &TurnEnd, step: u32) -> Option<String> {
     notice::stopping(&Ending::from(reason), step)
 }
 
-/// Applies one frame from the agent to the view.
+/// Applies one frame from the agent to the view, as it arrived live.
 fn apply(frame: Frame, view: &mut ViewState) {
+    apply_from(frame, view, Arrival::Live);
+}
+
+/// How a frame reached the view: on its own, or inside the backlog an attachment was caught up
+/// with.
+///
+/// The difference matters only to a frame with a stream position. A live one has to be newer
+/// than everything the attachment accounted for; one inside the backlog *is* part of what the
+/// attachment accounted for, so it is applied as the snapshot it belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arrival {
+    /// On its own, after the attachment.
+    Live,
+    /// Inside the attachment's backlog.
+    Backlog,
+}
+
+/// Applies one frame from the agent to the view.
+// One flat match over the frame vocabulary is the whole vocabulary in one place, and it is
+// exhaustive on purpose so a new frame cannot be silently ignored; the length is the
+// protocol's, and splitting the match would hide exactly what the exhaustiveness is for.
+#[allow(clippy::too_many_lines)]
+fn apply_from(frame: Frame, view: &mut ViewState, arrival: Arrival) {
     match frame {
-        Frame::Backlog { frames } => apply_backlog(frames, view),
+        Frame::Backlog { stream, segments } => apply_backlog(&stream, segments, view),
+        Frame::ContextStatus { envelope, payload } => {
+            apply_context_status(&envelope, &payload, arrival, view);
+        }
+        Frame::ContextDecision { envelope, payload } => {
+            apply_context_decision(&envelope, &payload, arrival, view);
+        }
+        Frame::Checkpoint { envelope, payload } => {
+            apply_checkpoint(&envelope, &payload, arrival, view);
+        }
         Frame::Text { delta } => {
             view.transcript
                 .append_stream(Role::Assistant, &delta, false);
@@ -3185,11 +3402,214 @@ fn apply(frame: Frame, view: &mut ViewState) {
         // the attachment, a listing, a status, and the goodbye. The interface learned what it
         // needed from the first two before it drew anything, and a `Bye` is the transport's
         // business rather than the transcript's.
+        //
+        // The attachment's stream position is not read here either: the interface took it from
+        // the attachment before the first frame was drawn, and a second attachment on a live
+        // connection is the client half's business, not the transcript's.
         Frame::Ready(_)
-        | Frame::Attached(_)
+        | Frame::Attached {
+            session: _,
+            stream: _,
+        }
         | Frame::Sessions { .. }
         | Frame::Status(_)
         | Frame::Bye => {}
+    }
+}
+
+/// Decides whether a live context frame is applied: only one new to this attachment, and only
+/// from the stream this interface attached to.
+///
+/// A frame inside the backlog is not asked: it is part of the snapshot the attachment
+/// accounted for. A frame from another epoch is refused out loud — it belongs to a stream this
+/// interface never joined, and its ids say nothing about this one.
+fn admitted(envelope: &ContextEnvelope, arrival: Arrival, view: &mut ViewState) -> bool {
+    if arrival == Arrival::Backlog {
+        return view.stream.is_own(&envelope.stream_epoch);
+    }
+    match view.stream.admit(&envelope.stream_epoch, envelope.frame_id) {
+        Admission::Apply => true,
+        Admission::Duplicate => {
+            tracing::debug!(
+                frame_id = envelope.frame_id,
+                "a context frame already accounted for"
+            );
+            false
+        }
+        Admission::ForeignEpoch => {
+            tracing::warn!(epoch = %envelope.stream_epoch, "a context frame from another stream");
+            view.transcript.push(Entry::notice(String::from(
+                "a context frame from another stream of this session was ignored; attach again \
+                 to follow it",
+            )));
+            view.follow();
+            false
+        }
+    }
+}
+
+/// Draws a context status: always when it answers `/context` or describes an idle session, and
+/// for a step only when it differs from the one the transcript last showed.
+///
+/// A notice with an explicit label, so it reads as the interface's report rather than as anything
+/// the model said, and is followed like every other append.
+fn apply_context_status(
+    envelope: &ContextEnvelope,
+    payload: &ContextStatusInfo,
+    arrival: Arrival,
+    view: &mut ViewState,
+) {
+    if !admitted(envelope, arrival, view) {
+        return;
+    }
+    let asked = std::mem::take(&mut view.context_asked);
+    let idle = envelope.turn.is_none();
+    let line = context_status_line(payload);
+    let key = context_status_key(payload);
+    if asked || idle || view.context_shown.as_deref() != Some(key.as_str()) {
+        view.transcript.push(Entry::notice(line));
+        view.follow();
+    }
+    view.context_shown = Some(key);
+    if !view.busy {
+        view.status = resting_status(view);
+    }
+}
+
+/// What makes one step's context status worth a second line: the parts that change what the
+/// model is answering from, and not the estimates, which move with every step.
+fn context_status_key(payload: &ContextStatusInfo) -> String {
+    format!(
+        "{:?}/{}/{}/{}/{}/{:?}",
+        payload.mode,
+        payload.revision,
+        payload.hidden_fragments,
+        payload.protected_fragments,
+        payload.managed_ready,
+        payload.unavailable_reason
+    )
+}
+
+/// Renders a context status as one labelled line.
+///
+/// Counts, codes and the durable frontier only: nothing a status carries is content, and nothing
+/// here prints more than the status says.
+fn context_status_line(payload: &ContextStatusInfo) -> String {
+    let ContextStatusInfo {
+        mode,
+        revision,
+        frontier,
+        estimate_input_tokens,
+        estimate_protected_tokens: _,
+        output_reserve_tokens,
+        estimator: _,
+        hidden_fragments,
+        protected_fragments,
+        goal_revision: _,
+        goal_data_available: _,
+        recall_available,
+        archive_available,
+        last_decision: _,
+        profile_digest: _,
+        managed_ready,
+        unavailable_reason,
+    } = payload;
+    let mut parts = vec![match mode {
+        ContextModeState::Legacy => format!("context: legacy replay · revision {revision}"),
+        ContextModeState::Managed => format!(
+            "context: managed · revision {revision} · {hidden_fragments} hidden, \
+             {protected_fragments} protected · reserve {output_reserve_tokens}"
+        ),
+    }];
+    if let Some(tokens) = estimate_input_tokens {
+        parts.push(format!("~{tokens} input tokens"));
+    }
+    if *mode == ContextModeState::Managed {
+        let on = |flag: bool| if flag { "on" } else { "off" };
+        parts.push(format!(
+            "recall {}, archive {}",
+            on(*recall_available),
+            on(*archive_available)
+        ));
+        parts.push(match (managed_ready, unavailable_reason) {
+            (true, _) => String::from("ready"),
+            (false, Some(reason)) => format!("not ready ({reason})"),
+            (false, None) => String::from("not ready"),
+        });
+    }
+    parts.push(format!("{} events saved", frontier.event_count));
+    parts.join(" · ")
+}
+
+/// Draws a context decision with the words the replayed log draws its record with.
+///
+/// Once: a decision the replay already drew, or one a backlog and a live frame both carried, is
+/// one line. A decision whose record draws nothing — a staged or accepted one, which the revision
+/// it produced describes — draws nothing here either.
+fn apply_context_decision(
+    envelope: &ContextEnvelope,
+    payload: &ContextDecisionInfo,
+    arrival: Arrival,
+    view: &mut ViewState,
+) {
+    if !admitted(envelope, arrival, view) {
+        return;
+    }
+    let ContextDecisionInfo {
+        decision_id,
+        outcome,
+        revision,
+        error_code,
+    } = payload;
+    if !view
+        .decisions_shown
+        .insert(decision_key(decision_id, *outcome))
+    {
+        return;
+    }
+    // The record the decision is written as, so the line is the replay's own.
+    let record = nanus_domain::SessionEvent::ContextDecision {
+        payload: Box::new(nanus_domain::context::managed::ContextDecision {
+            decision_id: decision_id.clone(),
+            outcome: domain_outcome(*outcome),
+            revision: *revision,
+            error_code: error_code.as_ref().and_then(|code| {
+                serde_json::from_value(serde_json::Value::String(code.clone())).ok()
+            }),
+        }),
+    };
+    if let Some(line) = crate::replay::context_line(&record) {
+        view.transcript.push(Entry::notice(line));
+        view.follow();
+    }
+}
+
+/// Applies a checkpoint: the store holds more, and nothing new is drawn.
+///
+/// A viewer already shows what the checkpoint covers, so the frame moves only the watermark and
+/// what this interface knows the store holds — except for the reader who asked for the reset it
+/// saves, who is told it happened in the words the replay uses for the same record.
+fn apply_checkpoint(
+    envelope: &ContextEnvelope,
+    payload: &CheckpointInfo,
+    arrival: Arrival,
+    view: &mut ViewState,
+) {
+    if !admitted(envelope, arrival, view) {
+        return;
+    }
+    let CheckpointInfo {
+        frontier,
+        body_digest: _,
+        durability: _,
+    } = payload;
+    view.stream.durable(frontier.event_count);
+    if envelope.turn.is_none() && std::mem::take(&mut view.context_reset_asked) {
+        view.transcript.push(Entry::notice(String::from(
+            "context reset: legacy replay selected",
+        )));
+        view.follow();
+        view.status = resting_status(view);
     }
 }
 
@@ -3268,6 +3688,9 @@ fn apply_auth_prompt(
 /// the answer it was waiting for.
 fn apply_refused(message: String, view: &mut ViewState) {
     view.close_auth();
+    // A refusal is the answer a `/context` was waiting for, so nothing is waiting any more.
+    view.context_asked = false;
+    view.context_reset_asked = false;
     view.transcript.push(Entry::notice(message));
     view.follow();
     if !view.busy {
@@ -3410,9 +3833,35 @@ fn apply_done(answer: &str, reason: &TurnEnd, view: &mut ViewState) {
 /// up*: the reader sees the prompt, the steps and the answer so far, and the live turn then
 /// continues from there. There is no second rendering path for any of it, which is the point
 /// — a caught-up transcript and a watched one are the same transcript.
-fn apply_backlog(frames: Vec<Frame>, view: &mut ViewState) {
-    for frame in frames {
-        apply(frame, view);
+///
+/// The backlog belongs to the attachment that sent it, and a backlog from any other stream is
+/// refused whole rather than merged: its frames are a different snapshot's, and drawing them on a
+/// transcript read through this attachment's frontier is exactly the double copy the frontier
+/// exists to prevent. Every segment is at or below the attachment's watermark, because it is part
+/// of what the attachment accounted for.
+fn apply_backlog(stream: &StreamMark, segments: Vec<BacklogSegment>, view: &mut ViewState) {
+    if !view.stream.is_own(&stream.stream_epoch) {
+        tracing::warn!(epoch = %stream.stream_epoch, "a backlog from another stream");
+        view.transcript.push(Entry::notice(String::from(
+            "the turn in progress could not be caught up with: it belongs to another stream of \
+             this session; attach again to follow it",
+        )));
+        view.follow();
+        return;
+    }
+    for segment in segments {
+        let BacklogSegment {
+            frame_id,
+            turn: _,
+            step: _,
+            frame,
+        } = segment;
+        if frame_id > stream.stream_watermark {
+            // Not something an agent of this version sends; drawn rather than dropped, because
+            // the frame is still part of the turn, but said in the log.
+            tracing::warn!(frame_id, "a backlog segment past its watermark");
+        }
+        apply_from(frame, view, Arrival::Backlog);
     }
 }
 
@@ -3558,6 +4007,10 @@ mod tests {
 
         fn set_goal(&mut self, action: GoalAction) {
             self.requests.borrow_mut().push(Request::Goal { action });
+        }
+
+        fn set_context(&mut self, action: ContextAction) {
+            self.requests.borrow_mut().push(Request::Context { action });
         }
     }
 
@@ -5803,7 +6256,8 @@ mod tests {
             "one `and`, at the end: {message}"
         );
         assert!(
-            message.contains("/model, /effort") && message.contains("/provider, /goal and /copy"),
+            message.contains("/model, /effort")
+                && message.contains("/provider, /goal, /context and /copy"),
             "commas between the names and `and` before the last: {message}"
         );
 
@@ -6726,14 +7180,17 @@ mod tests {
         let mut view = ViewState::new();
         for frame in [
             Frame::Bye,
-            Frame::Attached(SessionInfo {
-                session: "s".to_owned(),
-                name: None,
-                title: None,
-                events: 0,
-                busy: false,
-                viewers: 1,
-            }),
+            Frame::Attached {
+                session: SessionInfo {
+                    session: "s".to_owned(),
+                    name: None,
+                    title: None,
+                    events: 0,
+                    busy: false,
+                    viewers: 1,
+                },
+                stream: mark("e1", 0, 0),
+            },
             Frame::Status(nanus_link::protocol::AgentInfo {
                 workspace: "/tmp".to_owned(),
                 model: "m".to_owned(),
@@ -6992,6 +7449,74 @@ mod tests {
         assert_eq!(view.approval, ApprovalPolicy::PerCall);
     }
 
+    /// The stream position an attachment names, for a frame or a view to carry.
+    fn mark(epoch: &str, watermark: u64, events: u64) -> StreamMark {
+        StreamMark {
+            stream_epoch: epoch.to_owned(),
+            stream_watermark: watermark,
+            frontier: FrontierInfo {
+                session_id: "s".to_owned(),
+                event_count: events,
+                prefix_sha256: "00".repeat(32),
+                projection_revision: 0,
+            },
+        }
+    }
+
+    /// A view attached to stream `epoch` at `watermark`.
+    fn attached_view(epoch: &str, watermark: u64) -> ViewState {
+        let mut view = ViewState::new();
+        view.stream = StreamCursor::attached(epoch, watermark, 0);
+        view
+    }
+
+    /// The envelope of a context frame in stream `epoch`.
+    fn envelope(epoch: &str, turn: Option<u64>, frame_id: u64) -> ContextEnvelope {
+        let frontier = mark(epoch, frame_id, 4).frontier;
+        ContextEnvelope {
+            session_id: "s".to_owned(),
+            stream_epoch: epoch.to_owned(),
+            turn,
+            step: turn.map(|_| 1),
+            frame_id,
+            stream_watermark: frame_id,
+            frontier,
+        }
+    }
+
+    /// A context status as a managed step reports it.
+    fn status(mode: ContextModeState, revision: u64, hidden: u64) -> ContextStatusInfo {
+        ContextStatusInfo {
+            mode,
+            revision,
+            frontier: mark("e1", 0, 4).frontier,
+            estimate_input_tokens: Some(12_000),
+            estimate_protected_tokens: None,
+            output_reserve_tokens: 8_192,
+            estimator: "bytes/4".to_owned(),
+            hidden_fragments: hidden,
+            protected_fragments: 5,
+            goal_revision: None,
+            goal_data_available: false,
+            recall_available: true,
+            archive_available: false,
+            last_decision: None,
+            profile_digest: "ab".repeat(32),
+            managed_ready: true,
+            unavailable_reason: None,
+        }
+    }
+
+    /// A backlog segment of turn zero.
+    fn segment(frame_id: u64, frame: Frame) -> BacklogSegment {
+        BacklogSegment {
+            frame_id,
+            turn: Some(0),
+            step: Some(1),
+            frame,
+        }
+    }
+
     /// A client that attached in the middle of a turn draws the whole turn.
     ///
     /// The frames inside a backlog are the ones a client that had been there all along would
@@ -7000,17 +7525,24 @@ mod tests {
     /// Without this the transcript of a joined session began mid-sentence.
     #[test]
     fn a_backlog_frame_draws_the_turn_it_caught_up_with() {
-        let mut view = ViewState::new();
+        let mut view = attached_view("e1", 3);
         apply(
             Frame::Backlog {
-                frames: vec![
-                    Frame::User {
-                        text: "do the thing".to_owned(),
-                    },
-                    Frame::Step { step: 1 },
-                    Frame::Text {
-                        delta: "the answer so far".to_owned(),
-                    },
+                stream: mark("e1", 3, 0),
+                segments: vec![
+                    segment(
+                        1,
+                        Frame::User {
+                            text: "do the thing".to_owned(),
+                        },
+                    ),
+                    segment(2, Frame::Step { step: 1 }),
+                    segment(
+                        3,
+                        Frame::Text {
+                            delta: "the answer so far".to_owned(),
+                        },
+                    ),
                 ],
             },
             &mut view,
@@ -7036,51 +7568,281 @@ mod tests {
             vec!["do the thing", "the answer so far, and the rest"]
         );
 
-        // An empty backlog — an attachment to an idle session — draws nothing at all.
-        let mut view = ViewState::new();
-        apply(Frame::Backlog { frames: Vec::new() }, &mut view);
+        // An empty backlog draws nothing at all.
+        let mut view = attached_view("e1", 0);
+        apply(
+            Frame::Backlog {
+                stream: mark("e1", 0, 0),
+                segments: Vec::new(),
+            },
+            &mut view,
+        );
         assert!(view.transcript.entries().is_empty());
     }
 
-    /// A backlog the log already holds is dropped on its way to the interface.
+    /// A backlog from another stream is refused whole, and says so: its frames belong to a
+    /// snapshot this interface did not read the store through.
     #[test]
-    fn a_redundant_backlog_does_not_reach_the_view() {
-        let backlog = Frame::Backlog {
-            frames: vec![Frame::Text {
-                delta: "already there".to_owned(),
-            }],
-        };
-        assert!(!forwarded(&backlog, true), "the turn is in the log");
-        assert!(
-            forwarded(&backlog, false),
-            "and reaches a client that needs it"
+    fn a_backlog_from_another_epoch_is_refused_whole() {
+        let mut view = attached_view("e1", 3);
+        apply(
+            Frame::Backlog {
+                stream: mark("e0", 3, 0),
+                segments: vec![segment(
+                    3,
+                    Frame::Text {
+                        delta: "from another stream".to_owned(),
+                    },
+                )],
+            },
+            &mut view,
         );
-        // Everything else is forwarded either way: the flag is about one frame, not a mode.
-        for frame in [Frame::Step { step: 2 }, Frame::Bye] {
-            assert!(forwarded(&frame, true), "{frame:?}");
-            assert!(forwarded(&frame, false), "{frame:?}");
-        }
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said.first()
+                .is_some_and(|line| line.contains("another stream")),
+            "{said:?}"
+        );
+        assert_eq!(
+            view.transcript.entries().first().map(Entry::kind),
+            Some(&EntryKind::Notice)
+        );
     }
 
-    /// A backlog is dropped when the log this client read already holds the turn.
-    ///
-    /// The agent snapshots the running turn when it answers the attachment, and the log is read
-    /// a moment later, so a turn that ends in between is in both — and applying the backlog on
-    /// top of a transcript built from the log draws the prompt and the answer twice. The count
-    /// the agent reports is the one it snapshotted, which is what makes the comparison exact:
-    /// the log only grows when a turn ends.
+    /// A context frame is applied once: one at or below the attachment's watermark was accounted
+    /// for by the attachment, a repeat is dropped, and one from another epoch is refused out loud.
+    /// A context frame inside the backlog is part of the snapshot and is drawn.
     #[test]
-    fn a_backlog_the_log_already_holds_is_redundant() {
-        // The ordinary case: the log ends where the backlog begins.
-        assert!(!backlog_is_redundant(4, 4));
-        // A brand-new session the store has never seen: the agent reported nothing and the log
-        // read nothing, so the backlog is the whole conversation.
-        assert!(!backlog_is_redundant(0, 0));
-        // The turn ended between the snapshot and the read, so the log gained its events.
-        assert!(backlog_is_redundant(4, 9));
-        // A log that somehow holds less than the agent said is not treated as redundant: the
-        // backlog is the only source for the turn that was running.
-        assert!(!backlog_is_redundant(4, 2));
+    fn a_context_frame_is_applied_once_and_only_from_its_own_stream() {
+        let mut view = attached_view("e1", 5);
+        apply(
+            Frame::Backlog {
+                stream: mark("e1", 5, 4),
+                segments: vec![segment(
+                    4,
+                    Frame::ContextStatus {
+                        envelope: envelope("e1", Some(0), 4),
+                        payload: status(ContextModeState::Managed, 2, 1),
+                    },
+                )],
+            },
+            &mut view,
+        );
+        assert_eq!(
+            view.transcript.entries().len(),
+            1,
+            "the snapshot's status is drawn"
+        );
+
+        let changed = || Frame::ContextStatus {
+            envelope: envelope("e1", Some(0), 7),
+            payload: status(ContextModeState::Managed, 3, 2),
+        };
+        // At the watermark: already accounted for.
+        apply(
+            Frame::ContextStatus {
+                envelope: envelope("e1", Some(0), 5),
+                payload: status(ContextModeState::Managed, 3, 2),
+            },
+            &mut view,
+        );
+        assert_eq!(view.transcript.entries().len(), 1);
+        // New, and different: drawn once, even if it arrives twice.
+        apply(changed(), &mut view);
+        apply(changed(), &mut view);
+        assert_eq!(view.transcript.entries().len(), 2);
+        let line = view
+            .transcript
+            .entries()
+            .last()
+            .map(Entry::text)
+            .unwrap_or_default();
+        assert!(line.starts_with("context: managed · revision 3"), "{line}");
+        assert!(line.contains("2 hidden"), "{line}");
+        assert!(line.contains("4 events saved"), "{line}");
+        // Another epoch: refused, and the refusal is a notice rather than silence.
+        apply(
+            Frame::ContextStatus {
+                envelope: envelope("e2", Some(0), 99),
+                payload: status(ContextModeState::Legacy, 0, 0),
+            },
+            &mut view,
+        );
+        let last = view
+            .transcript
+            .entries()
+            .last()
+            .map(Entry::text)
+            .unwrap_or_default();
+        assert!(last.contains("another stream"), "{last}");
+        assert_eq!(view.stream.watermark(), 7, "a refused frame moves nothing");
+    }
+
+    /// A step whose status did not change draws no second line, a step whose status changed
+    /// does, and a status the reader asked for is drawn even when it repeats the last one.
+    #[test]
+    fn a_step_status_is_drawn_when_it_changes_and_an_asked_one_always() {
+        let mut view = attached_view("e1", 0);
+        let step = |frame_id: u64, revision: u64| Frame::ContextStatus {
+            envelope: envelope("e1", Some(0), frame_id),
+            payload: status(ContextModeState::Managed, revision, 1),
+        };
+        apply(step(1, 2), &mut view);
+        apply(step(2, 2), &mut view);
+        assert_eq!(
+            view.transcript.entries().len(),
+            1,
+            "an unchanged status is one line"
+        );
+        apply(step(3, 3), &mut view);
+        assert_eq!(
+            view.transcript.entries().len(),
+            2,
+            "a new revision is a new line"
+        );
+        view.context_asked = true;
+        apply(step(4, 3), &mut view);
+        assert_eq!(
+            view.transcript.entries().len(),
+            3,
+            "an asked status is always drawn"
+        );
+        assert!(!view.context_asked, "and the question is answered");
+    }
+
+    /// A checkpoint draws nothing for a viewer who already shows what it covers; it moves the
+    /// watermark and what the store holds. The reader who asked for a reset is told it is saved.
+    #[test]
+    fn a_checkpoint_moves_the_watermark_and_answers_a_reset() {
+        let mut view = attached_view("e1", 2);
+        let checkpoint = |frame_id: u64, turn: Option<u64>, events: u64| Frame::Checkpoint {
+            envelope: envelope("e1", turn, frame_id),
+            payload: CheckpointInfo {
+                frontier: mark("e1", frame_id, events).frontier,
+                body_digest: "cd".repeat(32),
+                durability: nanus_link::protocol::DurabilityState::ProcessCrash,
+            },
+        };
+        apply(checkpoint(3, Some(0), 9), &mut view);
+        assert!(
+            view.transcript.entries().is_empty(),
+            "a checkpoint mid-turn draws nothing"
+        );
+        assert_eq!(view.stream.durable_events(), 9);
+        assert_eq!(view.stream.watermark(), 3);
+
+        view.context_reset_asked = true;
+        apply(checkpoint(4, None, 10), &mut view);
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(said, vec!["context reset: legacy replay selected"]);
+        assert!(!view.context_reset_asked);
+
+        // A refused reset leaves nothing waiting for a checkpoint that will never come.
+        view.context_reset_asked = true;
+        apply(
+            Frame::Refused {
+                message: "a turn is running".to_owned(),
+            },
+            &mut view,
+        );
+        assert!(!view.context_reset_asked);
+    }
+
+    /// A refused decision is drawn in the replay's words, once: the replay already drew it, or
+    /// a backlog and a live frame both carried it, and it is still one line.
+    #[test]
+    fn a_context_decision_is_drawn_in_the_replays_words_once() {
+        let mut view = attached_view("e1", 0);
+        let decision = |frame_id: u64| Frame::ContextDecision {
+            envelope: envelope("e1", Some(0), frame_id),
+            payload: ContextDecisionInfo {
+                decision_id: "d1".to_owned(),
+                outcome: DecisionState::Rejected,
+                revision: None,
+                error_code: Some("stale_base".to_owned()),
+            },
+        };
+        apply(decision(1), &mut view);
+        apply(decision(2), &mut view);
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(said, vec!["context proposal rejected: stale_base"]);
+
+        // One the replayed log already drew is not drawn from the frame.
+        let mut replayed = attached_view("e1", 0);
+        replayed
+            .decisions_shown
+            .insert(decision_key("d1", DecisionState::Rejected));
+        apply(decision(1), &mut replayed);
+        assert!(replayed.transcript.entries().is_empty());
+
+        // And an accepted one draws nothing: its revision is what describes it.
+        let mut accepted = attached_view("e1", 0);
+        apply(
+            Frame::ContextDecision {
+                envelope: envelope("e1", Some(0), 1),
+                payload: ContextDecisionInfo {
+                    decision_id: "d2".to_owned(),
+                    outcome: DecisionState::Accepted,
+                    revision: Some(3),
+                    error_code: None,
+                },
+            },
+            &mut accepted,
+        );
+        assert!(accepted.transcript.entries().is_empty());
+    }
+
+    /// `/context` reads and `/context reset` resets; a word it does not take is refused rather
+    /// than guessed at, a reset during a turn is refused where the reader is looking, and a
+    /// recording has nothing to ask.
+    #[test]
+    fn the_context_command_reaches_the_agent_as_the_request_it_names() {
+        assert_eq!(context_action("/context"), Ok(ContextAction::Status));
+        assert_eq!(context_action("/context status"), Ok(ContextAction::Status));
+        assert_eq!(context_action("/context reset"), Ok(ContextAction::Reset));
+        assert!(context_action("/context wipe").is_err());
+        assert!(matches!(
+            route_submission(String::from("/context reset"), true),
+            Routed::Context(ContextAction::Reset)
+        ));
+
+        let mut source = Scripted::new(Vec::new());
+        let mut view = ViewState::new();
+        request_context(ContextAction::Status, &mut source, &mut view);
+        request_context(ContextAction::Reset, &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            [
+                Request::Context {
+                    action: ContextAction::Status
+                },
+                Request::Context {
+                    action: ContextAction::Reset
+                }
+            ]
+        );
+        assert!(view.context_asked && view.context_reset_asked);
+
+        let mut busy = Scripted::new(Vec::new());
+        let mut turning = ViewState::new();
+        turning.busy = true;
+        request_context(ContextAction::Reset, &mut busy, &mut turning);
+        request_context(ContextAction::Status, &mut busy, &mut turning);
+        assert_eq!(
+            busy.requests.borrow().as_slice(),
+            [Request::Context {
+                action: ContextAction::Status
+            }],
+            "a read is sent during a turn and a reset is not"
+        );
+        assert!(!turning.context_reset_asked);
+
+        let mut recording = Scripted::recording(Vec::new());
+        let mut reading = ViewState::new();
+        request_context(ContextAction::Status, &mut recording, &mut reading);
+        assert!(recording.requests.borrow().is_empty());
+        assert_eq!(reading.transcript.entries().len(), 1);
     }
 
     /// A trimmed prompt is drawn where the gap is, because an answer that contradicts
@@ -7230,10 +7992,10 @@ mod tests {
         //   - something is stored and cannot be read: a damaged log.
         //
         // Both fall back to an empty conversation, and that is the *policy* this pins — a
-        // damaged transcript must not become a refusal to start. The difference between
-        // them is a log line, which a behavioural test cannot see; what it can see is that
-        // the session's identity survives, so a reader is still in the right conversation
-        // rather than silently shown an empty one under a different name.
+        // damaged transcript must not become a refusal to start. The difference is the notice:
+        // a new session has nothing to say, and a damaged one says it could not be read rather
+        // than showing an empty transcript as though the session had none. Either way the
+        // session's identity survives, so a reader is still in the right conversation.
         let home = std::env::temp_dir().join(format!("nanus-tui-history-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let store = block_on(JsonlStore::new(&home)).expect("a store in the temporary directory");
@@ -7261,22 +8023,118 @@ mod tests {
             busy: false,
             viewers: 1,
         };
+        let whole = frontier_of(&saved, 1);
+        let nothing = mark("e1", 0, 0).frontier;
 
-        let read = block_on(history(&store, &info("recorded"), "/work"));
+        let (read, notice) = block_on(history(&store, &info("recorded"), &whole, "/work"));
         assert_eq!(read.event_count(), 1, "a recorded log comes back whole");
+        assert_eq!(notice, None);
 
-        let fresh = block_on(history(&store, &info("never-saved"), "/work"));
+        let (fresh, notice) = block_on(history(&store, &info("never-saved"), &nothing, "/work"));
         assert_eq!(fresh.event_count(), 0, "nothing stored is an empty session");
         assert_eq!(fresh.id().as_str(), "never-saved");
         assert_eq!(fresh.cwd(), "/work");
+        assert_eq!(notice, None, "and nothing to say about it");
 
-        let broken = block_on(history(&store, &info("damaged"), "/work"));
+        let (broken, notice) = block_on(history(&store, &info("damaged"), &nothing, "/work"));
         assert_eq!(broken.event_count(), 0, "a damaged log reads as empty");
         assert_eq!(
             broken.id().as_str(),
             "damaged",
             "and it is still the session the client attached to"
         );
+        assert!(
+            notice.is_some_and(|notice| notice.contains("could not be read")),
+            "but the reader is told, rather than shown an empty conversation as though it were one"
+        );
+    }
+
+    /// The frontier of `session` at `count` events, as an attachment advertises it.
+    fn frontier_of(session: &Session, count: u64) -> FrontierInfo {
+        FrontierInfo {
+            session_id: session.id().as_str().to_owned(),
+            event_count: count,
+            prefix_sha256: session
+                .prefix_digest(count)
+                .map(|digest| digest.as_str().to_owned())
+                .unwrap_or_default(),
+            projection_revision: 0,
+        }
+    }
+
+    /// T13, the client's half: a file that grew after the attachment is clipped to the
+    /// advertised prefix and verified, and one that is shorter or not the advertised prefix is
+    /// refused with a notice rather than drawn.
+    #[test]
+    fn a_stored_session_is_read_only_through_the_advertised_frontier() {
+        let id = SessionId::new("s");
+        let mut stored = Session::new(id.clone(), 1, "/work");
+        for text in ["first", "second", "third", "fourth"] {
+            stored.append(nanus_domain::SessionEvent::UserMessage {
+                text: text.to_owned(),
+            });
+        }
+        let at_two = frontier_of(&stored, 2);
+
+        // Grown since: the two events past the frontier are the backlog's, not the disk's.
+        let (clipped, notice) = read_through(Ok(stored.clone()), &id, &at_two, "/work");
+        assert_eq!(notice, None);
+        assert_eq!(clipped.event_count(), 2);
+        assert_eq!(clipped.log().events(), &stored.log().events()[..2]);
+
+        // Shorter than the frontier: refused, not padded and not shown.
+        let shorter = stored.prefix(1).expect("a prefix");
+        let (shown, notice) = read_through(Ok(shorter), &id, &at_two, "/work");
+        assert_eq!(shown.event_count(), 0);
+        assert!(notice.is_some_and(|notice| notice.contains("fewer")));
+
+        // The same length, a different history: refused.
+        let mut other = Session::new(id.clone(), 1, "/work");
+        for text in ["someone", "else"] {
+            other.append(nanus_domain::SessionEvent::UserMessage {
+                text: text.to_owned(),
+            });
+        }
+        let (shown, notice) = read_through(Ok(other), &id, &at_two, "/work");
+        assert_eq!(shown.event_count(), 0);
+        assert!(notice.is_some_and(|notice| notice.contains("not the one")));
+
+        // Nothing stored where the agent says something is: said, not silently empty.
+        let missing = Err(StoreError::NotFound { id: "s".to_owned() });
+        let (shown, notice) = read_through(missing, &id, &at_two, "/work");
+        assert_eq!(shown.event_count(), 0);
+        assert!(notice.is_some());
+    }
+
+    /// The notice a refused read leaves is the first thing the transcript shows, so an empty
+    /// conversation is never mistaken for one with no history.
+    #[test]
+    fn a_refused_read_opens_the_transcript_with_its_reason() {
+        struct Refused(Session);
+        impl SessionSource for Refused {
+            fn session(&self) -> &Session {
+                &self.0
+            }
+            fn accepts_prompts(&self) -> bool {
+                true
+            }
+            fn opening_notice(&self) -> Option<String> {
+                Some(String::from("the stored session could not be read"))
+            }
+            fn stream(&self) -> Option<StreamCursor> {
+                Some(StreamCursor::attached("e1", 7, 3))
+            }
+        }
+        let view =
+            opening_view(&Refused(Session::new(SessionId::new("s"), 0, "/w"))).expect("a view");
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert_eq!(said, vec!["the stored session could not be read"]);
+        assert_eq!(
+            view.stream.watermark(),
+            7,
+            "the attachment's position is kept"
+        );
+        assert_eq!(view.stream.epoch(), Some("e1"));
     }
 
     #[test]
