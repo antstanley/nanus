@@ -48,7 +48,8 @@ impl AgentRunner {
             )
             .await;
         }
-        self.execute_registry(calls, &registry, results, progress, context)
+        let scope = session.id().as_str().to_owned();
+        self.execute_registry(calls, (&registry, &scope), results, progress, context)
             .await;
         assert!(results.iter().all(Option::is_some));
     }
@@ -108,7 +109,7 @@ impl AgentRunner {
     pub(super) async fn execute_registry(
         &self,
         calls: &[ToolCall],
-        indexes: &[usize],
+        selected: (&[usize], &str),
         results: &mut [Option<ToolResult>],
         progress: &mut dyn Progress,
         context: Dispatch<'_>,
@@ -118,6 +119,7 @@ impl AgentRunner {
             reservation,
             ..
         } = context;
+        let (indexes, scope) = selected;
         assert_eq!(calls.len(), results.len());
         for batch in indexes.chunks(self.parallel_limit()) {
             // Static futures own their work. Never retain a registry borrow across an await.
@@ -132,7 +134,9 @@ impl AgentRunner {
                 if control.is_some_and(TurnControl::is_cancelled) {
                     return interrupted_result(call);
                 }
-                let work = self.tools.borrow().execute(call.clone());
+                // Scoped to the session, so a tool that takes a per-call hand-off — `bash` and
+                // its capture lease — can only take its own session's.
+                let work = crate::capture::scoped(scope, self.tools.borrow().execute(call.clone()));
                 until_cancelled(control, work)
                     .await
                     .unwrap_or_else(|| interrupted_result(call))

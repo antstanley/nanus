@@ -94,6 +94,7 @@ impl JsonlStore {
         if stored != *view.expected {
             return Err(refused(ErrorCode::StaleBase));
         }
+        self.check_extends(candidate, &stored).await?;
         let revision = accepted_revision(candidate)?;
         let body = candidate
             .try_to_jsonl()
@@ -122,6 +123,56 @@ impl JsonlStore {
             "a checkpoint's frontier digest is the candidate's whole-file digest"
         );
         Ok(receipt)
+    }
+
+    /// Refuses a candidate that does not extend what is stored: the log is append-only, so a
+    /// checkpoint may add events after the stored ones and never change or drop one.
+    ///
+    /// At the same body version the candidate's prefix digest must be the stored file's. Across
+    /// the one upgrade a body can make — version 2 to 3, whose header differs — the stored events
+    /// are read back and compared with the candidate's first events.
+    async fn check_extends(
+        &self,
+        candidate: &Session,
+        stored: &ExpectedCheckpoint,
+    ) -> Result<(), CheckpointError> {
+        let ExpectedCheckpoint::Stored {
+            body_version,
+            file_sha256,
+            event_count,
+        } = stored
+        else {
+            return Ok(());
+        };
+        let held = u64::try_from(candidate.event_count()).unwrap_or(u64::MAX);
+        if held < *event_count {
+            return Err(refused(ErrorCode::StaleBase));
+        }
+        if *body_version == candidate.body_version() {
+            let prefix = candidate
+                .prefix_digest(*event_count)
+                .map_err(|_| refused(ErrorCode::StaleBase))?;
+            return if prefix == *file_sha256 {
+                Ok(())
+            } else {
+                Err(refused(ErrorCode::StaleBase))
+            };
+        }
+        let on_disk = self
+            .load_blocking(candidate.id())
+            .await
+            .map_err(|_| refused(ErrorCode::StaleBase))?;
+        let count = on_disk.event_count();
+        let same = candidate
+            .log()
+            .events()
+            .get(..count)
+            .is_some_and(|events| events == on_disk.log().events());
+        if same {
+            Ok(())
+        } else {
+            Err(refused(ErrorCode::StaleBase))
+        }
     }
 
     /// Refuses a checkpoint this process may not write.

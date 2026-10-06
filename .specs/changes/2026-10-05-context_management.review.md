@@ -494,3 +494,37 @@ same schemas … same event trace".
 - The documentation's "what is verified" list (`docs/context-management.md:372-391`) should not
   claim hard fitting, recall cursors or checkpoint atomicity as verified until F1–F3 are fixed
   and covered by tests whose doubles refuse the way the adapters do.
+
+## Resolution — 2026-10-06
+
+Every finding was addressed on the same branch; each fix is in a commit that names its findings,
+and each confirmed defect that a test can reproduce has a regression test that fails without the
+fix (re-checked by reverting the fix for F5 and F9).
+
+| Finding | Resolution | Regression evidence |
+|---|---|---|
+| F1, F22 | Probes read an adapter's `candidate_too_large` as a cost that does not fit and keep any other code; probes use a notice at least as long as the final one. The test double now refuses oversized candidates exactly as the adapters do. | `automatic_fitting_hides_old_fragments_and_keeps_every_user_message`, `a_protected_floor_over_the_budget_refuses_before_any_request` (with the refusing double) |
+| F2, F6 | Session, checkpoint and archive writes flush before they sync; the runner verifies each finalized object before publishing it and publishes `unavailable` for one that does not verify. | None automated: a short final write needs a process-wide file-size limit; recorded in `docs/context-management.md` |
+| F3 | A search reads and seals its cursors at the snapshot its first page read. | `paging_a_search_reads_its_own_snapshot_after_the_session_grows` |
+| F4 | The link trusts a reconciliation only for a file that is byte for byte a prefix of the held session. | `a_reconciled_file_must_be_a_prefix_of_the_held_session` |
+| F5 | The inspect cursor binds revision and profile and positions by the last fragment listed. | `an_inspect_cursor_pages_the_whole_catalog_across_steps` (fails on the previous code) |
+| F7 | Only activation upgrades a body; the CLI refuses a reserve flag without managed mode and recovers an open turn before any policy change. | `a_legacy_policy_change_leaves_a_version_two_body_alone` |
+| F8 | OpenAI managed support is limited to the offered models, whose ceiling is declared. | `every_responses_route_is_unsupported_and_refused_before_any_request` (now also refuses `gpt-5`) |
+| F9 | A window shorter than the needle resumes where it started. | `a_window_shorter_than_the_needle_resumes_where_it_started` (fails on the previous code) |
+| F10 | Optional usage categories are absent rather than zero; raw counters are kept. | `a_counter_that_may_be_missing_is_never_written_as_zero` |
+| F11 | A proposal staged in a failed step is refused. | `a_proposal_in_a_failed_step_is_never_accepted` |
+| F12 | An intent refused at record admission is finished as `refused`. | Traced; covered by the attempt-uniqueness fold check |
+| F13 | A failed recovery reports its actual persistence state to the host. | Traced |
+| F14 | Kept as specified: CM-09 extends `read` and `grep` for every session. The documentation's legacy claim now names the exception: legacy requests are unchanged apart from those two schemas, whose results are unchanged when the new arguments are absent. | `a_call_without_byte_arguments_is_the_line_window_it_always_was` |
+| F15 | Generated data is identified by position in the compiler and every adapter. | Adapter grammar tests now send a labelled reply elsewhere |
+| F16 | The hidden-id cap limits how far fitting goes, not whether it fits. | `the_hidden_cap_limits_how_far_fitting_goes_not_whether_it_fits` |
+| F17 | Note claims and goal objectives render on one line. | `model_written_text_cannot_forge_a_line_of_generated_data` |
+| F18 | Accepted decisions and attempt outcomes are each recorded once. | `a_decision_or_an_attempt_outcome_is_recorded_once` |
+| F19 | `StorePort::collect_artifacts` and `nanus sessions collect`. | `sweeping_an_idle_sessions_archive_reports_what_it_reclaimed` |
+| F20 | A quarantined session reports itself unready; its reset starts from the stored session through a fresh binding. | `a_quarantined_session_reports_itself_unready` |
+| F21 | One staging budget covers the queue in front of the sinks and their write buffers. | Existing capture tests |
+| Plausible: broker shared across sessions | Leases and finalizations are keyed by session through a task-local scope the runner sets. | `the_same_call_id_in_two_sessions_never_crosses` |
+| Plausible: policy before recovery | Fixed with F7. | — |
+| Plausible: unbounded arguments before a late name | Managed chat decoders bound an unnamed call at one record. | Existing decoder tests |
+| Plausible: candidate prefix not checked | A checkpoint must extend the stored file: same-version prefix digest, or event equality across the v2→v3 upgrade. | `a_checkpoint_that_rewrites_stored_history_is_refused` |
+| Plausible: quota released during an in-flight write | Accepted: the store measures partial files on disk, so the window is a transient undercount of in-flight bytes, bounded by the staging budget. | — |

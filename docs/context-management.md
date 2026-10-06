@@ -8,8 +8,10 @@ every accepted decision before a request uses it. The raw session log stays the 
 the effective request is a derived view, and nothing rewrites, reorders or deletes an event.
 
 A session that never enables it is read, encoded, run and saved exactly as before — same request
-bytes, same schemas and tool count, same event trace, same terminal save. The one deliberate
-exception, for every session, is [deletion](#deletion-and-retirement).
+bytes, same tool count, same event trace, same terminal save. Two changes apply to every session
+by design: [deletion](#deletion-and-retirement) retires the id, and the `read` and `grep` tools
+gain the [byte-window and coverage](#evidence-recall-and-file-windows) arguments in their schemas;
+their results are unchanged when those arguments are absent.
 
 The boundary payloads are defined in [`context-management.schema.json`](context-management.schema.json)
 (JSON Schema Draft 2020-12). Schema validity is necessary and never sufficient: every semantic,
@@ -202,7 +204,8 @@ Support requires the official endpoint and a known model; anything else is unsup
 | Provider | Endpoint and plan | Protocol label | Models | Support |
 |---|---|---|---|---|
 | DeepSeek | `https://api.deepseek.com` | `deepseek.chat` | `deepseek-flash`, `deepseek-v4-pro` | Supported |
-| OpenAI | API plan, `https://api.openai.com/v1`, routed to Chat Completions | `openai.chat` | Ids before `gpt-5.6`, or an exact chat preference whose tool support is not refused | Supported |
+| OpenAI | API plan, `https://api.openai.com/v1`, with an exact Chat Completions preference | `openai.chat` | The offered models whose chat tool support is not refused (`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) | Supported |
+| OpenAI | Any id the vendor does not offer, which has no declared output ceiling | — | — | Unsupported |
 | OpenAI | Anything routed to Responses: automatic `gpt-5.6`+, the `subscription` plan, exact Responses, stateless Responses | — | All | Unsupported; refused before HTTP |
 | z.ai | API plan, `https://api.z.ai/api/paas/v4` | `openai.chat` | The known API models | Supported |
 | z.ai | Coding Plan, gateways | — | — | Unsupported |
@@ -210,8 +213,11 @@ Support requires the official endpoint and a known model; anything else is unsup
 
 The output reservation must be present and within the model's declared ceiling; it is refused,
 never clamped. Every adapter validates the managed role grammar — leading system messages only,
-one labelled generated message directly after the first user message and never last, and every
-surviving call paired with exactly one result.
+the generated message, when present, directly after the first user message and never last, and
+every surviving call paired with exactly one result. Generated data is identified by that
+position; a model reply elsewhere that opens with the same label is sent as the reply it is.
+Under managed preparation the chat decoders also bound a call's arguments before its name is
+known, at one record.
 
 Anthropic signed replay is sent only when the adapter's existing check accepts it: the original
 blocks under the encoded prefix that produced them. When hiding changes a turn's prefix, that turn
@@ -399,6 +405,11 @@ Not verified, and not claimed:
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
   is no claim that managed context improves anything, and the default stays legacy.
+- **A final short write is now seen, but not by a test.** Session, checkpoint and archive writes
+  flush before they sync, so an error on the last chunk refuses the commit instead of
+  acknowledging a truncated file; the review reproduced the earlier failure with a file-size
+  limit, and the fix has no automated regression test, because inducing a short write needs a
+  process-wide resource limit.
 - **Durability is process-crash only.** Power-loss durability needs parent-directory
   synchronization (and `F_FULLFSYNC` on macOS) and is not claimed.
 - **Native Windows** was checked by cross-target lint of the local and store adapters, not run.

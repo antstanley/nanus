@@ -16,13 +16,41 @@
 //! The broker is shared by `Rc` and borrowed only for the length of one method, never across an
 //! `await`, so the runner and a tool running concurrently in the same local set cannot collide
 //! on its cell.
+//!
+//! One agent runs turns in several sessions at once, and two of them can be handed the same
+//! provider call id. So every entry is keyed by the session too, read from a task-local scope
+//! the runner sets around a session's dispatch ([`scoped`], [`in_scope`]): a `bash` call can only
+//! ever take a lease its own session reserved, and file what it finalized where its own session
+//! will collect it. Outside any scope — a host that files leases itself — the key is empty.
 
 use core::cell::RefCell;
+use core::future::Future;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use nanus_domain::ToolCallId;
 use nanus_ports::{CaptureFinalization, CaptureLease};
+
+tokio::task_local! {
+    /// The session whose dispatch is running, as the broker keys it.
+    static SESSION: String;
+}
+
+/// Runs `future` as the dispatch of `session`, so the broker keys what it files by that session.
+pub async fn scoped<F: Future>(session: &str, future: F) -> F::Output {
+    SESSION.scope(session.to_owned(), future).await
+}
+
+/// Runs `work` as part of `session`'s dispatch, synchronously.
+pub fn in_scope<T>(session: &str, work: impl FnOnce() -> T) -> T {
+    SESSION.sync_scope(session.to_owned(), work)
+}
+
+/// The key of `call` in the current scope.
+fn key(call: &ToolCallId) -> (String, ToolCallId) {
+    let session = SESSION.try_with(Clone::clone).unwrap_or_default();
+    (session, call.clone())
+}
 
 /// What the broker holds for one call.
 #[derive(Default)]
@@ -40,7 +68,7 @@ struct Slot {
 /// under.
 #[derive(Clone, Default)]
 pub struct CaptureBroker {
-    slots: Rc<RefCell<BTreeMap<ToolCallId, Slot>>>,
+    slots: Rc<RefCell<BTreeMap<(String, ToolCallId), Slot>>>,
 }
 
 impl core::fmt::Debug for CaptureBroker {
@@ -66,7 +94,7 @@ impl CaptureBroker {
     pub fn insert(&self, lease: CaptureLease) -> Option<CaptureLease> {
         let call = lease.call_id().clone();
         let mut slots = self.slots.borrow_mut();
-        let slot = slots.entry(call.clone()).or_default();
+        let slot = slots.entry(key(&call)).or_default();
         let replaced = slot.lease.replace(lease);
         assert!(
             slot.lease
@@ -79,11 +107,12 @@ impl CaptureBroker {
 
     /// Takes the lease filed for `call`, once.
     pub fn take_lease(&self, call: &ToolCallId) -> Option<CaptureLease> {
+        let key = key(call);
         let mut slots = self.slots.borrow_mut();
-        let slot = slots.get_mut(call)?;
+        let slot = slots.get_mut(&key)?;
         let lease = slot.lease.take();
         if slot.finalizations.is_empty() {
-            slots.remove(call);
+            slots.remove(&key);
         }
         lease
     }
@@ -93,7 +122,7 @@ impl CaptureBroker {
     pub fn has_lease(&self, call: &ToolCallId) -> bool {
         self.slots
             .borrow()
-            .get(call)
+            .get(&key(call))
             .is_some_and(|slot| slot.lease.is_some())
     }
 
@@ -103,7 +132,7 @@ impl CaptureBroker {
             return;
         }
         let mut slots = self.slots.borrow_mut();
-        let slot = slots.entry(call.clone()).or_default();
+        let slot = slots.entry(key(call)).or_default();
         slot.finalizations.extend(finalizations);
         assert!(
             !slot.finalizations.is_empty(),
@@ -113,13 +142,14 @@ impl CaptureBroker {
 
     /// Takes every finalization filed for `call`, leaving none behind.
     pub fn take_finalizations(&self, call: &ToolCallId) -> Vec<CaptureFinalization> {
+        let key = key(call);
         let mut slots = self.slots.borrow_mut();
-        let Some(slot) = slots.get_mut(call) else {
+        let Some(slot) = slots.get_mut(&key) else {
             return Vec::new();
         };
         let taken = core::mem::take(&mut slot.finalizations);
         if slot.lease.is_none() {
-            slots.remove(call);
+            slots.remove(&key);
         }
         taken
     }
@@ -129,10 +159,11 @@ impl CaptureBroker {
     pub fn discard(&self, call: &ToolCallId) {
         // The slot leaves the map before it is dropped, so a lease's release callback runs with
         // the cell already unborrowed.
-        let removed = self.slots.borrow_mut().remove(call);
+        let key = key(call);
+        let removed = self.slots.borrow_mut().remove(&key);
         drop(removed);
         assert!(
-            !self.slots.borrow().contains_key(call),
+            !self.slots.borrow().contains_key(&key),
             "a discarded call is gone"
         );
     }
@@ -204,6 +235,35 @@ mod tests {
             Box::new(Idle),
             Box::new(move || flag.set(true)),
         )
+    }
+
+    /// Two sessions handed the same provider call id keep separate leases: each `bash` takes
+    /// only the one its own session reserved, so no archive is written into another session.
+    #[test]
+    fn the_same_call_id_in_two_sessions_never_crosses() {
+        let broker = CaptureBroker::new();
+        let first = Rc::new(Cell::new(false));
+        let second = Rc::new(Cell::new(false));
+        assert!(in_scope("a", || broker.insert(lease("call_0", &first))).is_none());
+        assert!(
+            in_scope("b", || broker.insert(lease("call_0", &second))).is_none(),
+            "the other session's lease is not replaced"
+        );
+        let id = ToolCallId::new("call_0");
+        assert!(
+            broker.take_lease(&id).is_none(),
+            "outside both sessions there is none"
+        );
+        let taken = in_scope("b", || broker.take_lease(&id));
+        drop(taken);
+        assert!(
+            second.get() && !first.get(),
+            "b took b's lease, and only b's"
+        );
+        assert!(in_scope("a", || broker.has_lease(&id)));
+        let scoped_take =
+            futures::executor::block_on(scoped("a", async { broker.take_lease(&id) }));
+        assert!(scoped_take.is_some(), "an async scope reads the same key");
     }
 
     #[test]

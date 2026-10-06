@@ -1226,3 +1226,46 @@ async fn collection_leaves_a_live_lease_alone_and_clears_a_dead_one() {
     );
     drop(live);
 }
+
+/// A checkpoint only ever appends: a candidate that rewrites a stored event is refused even when
+/// it names the stored identity correctly, and an upgrade from version 2 that appends is not.
+#[tokio::test]
+async fn a_checkpoint_that_rewrites_stored_history_is_refused() {
+    let (_dir, store) = store().await;
+    let legacy = session("history", &["the original question"]);
+    store.save(&legacy).await.expect("saved");
+    store.lock(legacy.id(), "a writer").await.expect("claimed");
+    let stored = store.stored_identity(legacy.id()).await.expect("identity");
+
+    let mut rewritten = managed("history", &["a different question"]);
+    rewritten.append(SessionEvent::UserMessage {
+        text: String::from("more"),
+    });
+    let refused = commit(&store, &rewritten, &stored, &[]).await;
+    assert_eq!(
+        refused,
+        Err(CheckpointError::NotCommitted(ErrorCode::StaleBase)),
+        "the stored question cannot be rewritten"
+    );
+    assert_eq!(store.load(legacy.id()).await.expect("load"), legacy);
+
+    let mut upgraded = legacy.clone();
+    upgraded.upgrade_to_managed_body();
+    upgraded.append(SessionEvent::UserMessage {
+        text: String::from("more"),
+    });
+    let receipt = commit(&store, &upgraded, &stored, &[]).await.expect("an upgrade appends");
+    let next = ExpectedCheckpoint::after(&receipt, upgraded.body_version());
+
+    let mut shortened = Session::new(upgraded.id().clone(), 1_700_000_000_000, "/work");
+    shortened.upgrade_to_managed_body();
+    for event in upgraded.log().events().iter().take(2) {
+        shortened.append(event.clone());
+    }
+    assert_eq!(
+        commit(&store, &shortened, &next, &[]).await,
+        Err(CheckpointError::NotCommitted(ErrorCode::StaleBase)),
+        "nor can stored events be dropped"
+    );
+    store.release_lock(legacy.id());
+}

@@ -359,7 +359,9 @@ impl AgentRunner {
             {
                 Ok(lease) => {
                     // A lease left over for this id is handed back and released here.
-                    drop(broker.insert(lease));
+                    let replaced =
+                        crate::capture::in_scope(session.id().as_str(), || broker.insert(lease));
+                    drop(replaced);
                 }
                 Err(failure) => turn.unpublished.borrow_mut().extend(
                     [CaptureStream::Stdout, CaptureStream::Stderr]
@@ -392,8 +394,11 @@ impl AgentRunner {
             return;
         };
         let archive = turn.context.and_then(nanus_ports::ContextRuntime::archive);
+        let scope = session.id().as_str().to_owned();
         for call in calls {
-            for finalization in broker.take_finalizations(&call.id) {
+            let finalizations =
+                crate::capture::in_scope(&scope, || broker.take_finalizations(&call.id));
+            for finalization in finalizations {
                 let mut receipt = finalization.receipt;
                 if let Some(artifact) = finalization.artifact {
                     let verified = match archive {
@@ -412,7 +417,7 @@ impl AgentRunner {
                     payload: Box::new(receipt),
                 });
             }
-            broker.discard(&call.id);
+            crate::capture::in_scope(&scope, || broker.discard(&call.id));
         }
     }
 }

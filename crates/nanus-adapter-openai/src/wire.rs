@@ -430,10 +430,16 @@ impl StreamAccumulator {
         }
         // Judged whenever the name is known, so a name that arrives after its arguments is
         // checked against everything already buffered; and the buffer is released at once.
-        if self
-            .argument_limits
-            .limit_for(&slot.name)
-            .is_some_and(|limit| slot.arguments.len() > limit)
+        // Before the name is known there is no tool to judge by, so a managed stream bounds the
+        // unnamed buffer at one record: a call whose name never comes cannot hold more.
+        let unnamed_over = !self.argument_limits.is_empty()
+            && slot.name.is_empty()
+            && slot.arguments.len() > nanus_domain::content::RECORD_BYTES_MAX;
+        if unnamed_over
+            || self
+                .argument_limits
+                .limit_for(&slot.name)
+                .is_some_and(|limit| slot.arguments.len() > limit)
         {
             slot.oversized = true;
             slot.arguments = String::new();
