@@ -72,6 +72,7 @@ impl ManagedState {
             }
         }
         state.fold_strict(events, barrier)?;
+        check_attempts(events)?;
         Ok(state)
     }
 
@@ -79,6 +80,7 @@ impl ManagedState {
     fn fold_strict(&mut self, events: &[SessionEvent], start: usize) -> Result<(), ErrorCode> {
         let state = self;
         let mut accepted_ids: BTreeSet<&str> = BTreeSet::new();
+        let mut decided_ids: BTreeSet<&str> = BTreeSet::new();
         for (index, event) in events.iter().enumerate().skip(start) {
             let seq = u64::try_from(index).map_err(|_| ErrorCode::SourceCorrupt)?;
             match event {
@@ -114,7 +116,9 @@ impl ManagedState {
                         .accepted
                         .as_ref()
                         .is_some_and(|revision| revision.decision_id == payload.decision_id);
-                    if accepted && !matches {
+                    // A decision is accepted once: a second acceptance record for one id is a
+                    // replayed record, not a second decision.
+                    if accepted && (!matches || !decided_ids.insert(&payload.decision_id)) {
                         return Err(ErrorCode::StaleBase);
                     }
                     state.last_decision = Some((**payload).clone());
@@ -185,6 +189,31 @@ impl ManagedState {
             .as_ref()
             .and_then(|revision| revision.goal_revision)
     }
+}
+
+/// Refuses an attempt finished twice, or finished without having started.
+///
+/// An attempt's outcome is recorded once: a second finished record would count its usage twice
+/// and let an accounting reader choose between two outcomes for one request.
+fn check_attempts(events: &[SessionEvent]) -> Result<(), ErrorCode> {
+    let mut started: BTreeSet<&str> = BTreeSet::new();
+    let mut finished: BTreeSet<&str> = BTreeSet::new();
+    for event in events {
+        let SessionEvent::RequestAttempt { payload } = event else {
+            continue;
+        };
+        let fresh = match payload.phase {
+            AttemptPhase::Started => started.insert(&payload.attempt_id),
+            AttemptPhase::Finished => {
+                started.contains(payload.attempt_id.as_str())
+                    && finished.insert(&payload.attempt_id)
+            }
+        };
+        if !fresh {
+            return Err(ErrorCode::SourceCorrupt);
+        }
+    }
+    Ok(())
 }
 
 /// Returns the frontier of `session` at its full length.
@@ -574,6 +603,74 @@ mod tests {
         assert!(
             ManagedState::fold(restarted.log()).is_err(),
             "numbers never restart"
+        );
+    }
+
+    /// F18: an acceptance or an attempt outcome recorded twice is refused.
+    #[test]
+    fn a_decision_or_an_attempt_outcome_is_recorded_once() {
+        use crate::context::managed::records::{
+            AttemptPhase, ContextDecision, DecisionOutcome, RequestAttemptRecord, SelectionIdentity,
+        };
+        let mut session = session();
+        session.append(SessionEvent::UserMessage { text: "go".into() });
+        let first = revision(&session, 1, 0, Vec::new());
+        session.append(SessionEvent::ContextRevision { payload: first });
+        let accepted = ContextDecision {
+            decision_id: "d:1".into(),
+            outcome: DecisionOutcome::Accepted,
+            revision: Some(1),
+            error_code: None,
+        };
+        session.append(SessionEvent::ContextDecision {
+            payload: Box::new(accepted.clone()),
+        });
+        assert!(ManagedState::fold(session.log()).is_ok());
+        let mut twice = session.clone();
+        twice.append(SessionEvent::ContextDecision {
+            payload: Box::new(accepted),
+        });
+        assert_eq!(ManagedState::fold(twice.log()), Err(ErrorCode::StaleBase));
+
+        let attempt = |phase| RequestAttemptRecord {
+            attempt_id: "a1".into(),
+            retry_of: None,
+            turn: 1,
+            step: 1,
+            selection: SelectionIdentity {
+                provider: "p".into(),
+                endpoint_digest: Digest::empty(),
+                protocol: "c".into(),
+                model: "m".into(),
+                effort: None,
+                epoch: 0,
+            },
+            projection_revision: 0,
+            request_digest: Digest::empty(),
+            phase,
+            outcome: (phase == AttemptPhase::Finished)
+                .then_some(crate::context::managed::records::AttemptOutcome::Failed),
+            usage: None,
+            assistant_seq: None,
+            included_management_fragments: Vec::new(),
+            started_at_ms: 0,
+            finished_at_ms: None,
+            timings_ms: None,
+        };
+        let mut attempts = session.clone();
+        attempts.append(SessionEvent::RequestAttempt {
+            payload: Box::new(attempt(AttemptPhase::Started)),
+        });
+        attempts.append(SessionEvent::RequestAttempt {
+            payload: Box::new(attempt(AttemptPhase::Finished)),
+        });
+        assert!(ManagedState::fold(attempts.log()).is_ok());
+        attempts.append(SessionEvent::RequestAttempt {
+            payload: Box::new(attempt(AttemptPhase::Finished)),
+        });
+        assert_eq!(
+            ManagedState::fold(attempts.log()),
+            Err(ErrorCode::SourceCorrupt)
         );
     }
 

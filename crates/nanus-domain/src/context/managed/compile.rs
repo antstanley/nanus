@@ -188,20 +188,20 @@ pub fn derive_effective_context(
     let anchor = messages
         .iter()
         .position(|message| matches!(message, Message::User { .. }));
-    let memory = if let (Some(text), Some(anchor)) = (memory_text, anchor)
+    let inserted = if let (Some(text), Some(anchor)) = (memory_text, anchor)
         && anchor.saturating_add(1) < messages.len()
     {
-        messages.insert(
-            anchor.saturating_add(1),
-            Message::assistant(Some(text), None, Vec::new()),
-        );
-        true
+        let at = anchor.saturating_add(1);
+        messages.insert(at, Message::assistant(Some(text), None, Vec::new()));
+        Some(at)
     } else {
-        false
+        None
     };
-    // Postcondition: generated data is never the message a model would continue from.
+    let memory = inserted.is_some();
+    // Postcondition: generated data is never the message a model would continue from. Stated
+    // by position rather than by the label, which a model's own reply may happen to open with.
     assert!(
-        !is_memory(messages.last()),
+        inserted.is_none_or(|at| at.saturating_add(1) < messages.len()),
         "generated data is never an assistant prefill"
     );
     let notice = render_notice(selection, goal, memory, facts, protected.len());
@@ -214,11 +214,21 @@ pub fn derive_effective_context(
     })
 }
 
-/// Whether a message is the generated data message.
-fn is_memory(message: Option<&Message>) -> bool {
-    message
-        .and_then(Message::text)
-        .is_some_and(|text| text.starts_with(MEMORY_LABEL))
+/// Renders free text on one line: control characters, newlines included, become spaces.
+///
+/// A note's claim and a goal's objective are text a model may have written. Rendered verbatim, a
+/// newline in one could start a line that reads like the harness's own — a forged label, a fake
+/// note — inside the generated message. Flattened, it can only ever be the content of its line.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Renders the generated working-data message, or `None` when it would say nothing.
@@ -239,7 +249,7 @@ fn render_memory(
             goal.revision(),
             goal.phase().as_str(),
             GoalProvenance::of(session).as_str(),
-            goal.objective()
+            one_line(goal.objective())
         );
     }
     if !selection.notes.is_empty() {
@@ -264,7 +274,7 @@ fn render_memory(
                 "\n- {} [{}] {} (sources: {})",
                 note.id.as_str(),
                 note.category.as_str(),
-                note.claim,
+                one_line(&note.claim),
                 render_sources(&note.sources)
             );
         }

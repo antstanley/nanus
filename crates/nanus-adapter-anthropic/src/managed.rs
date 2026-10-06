@@ -275,21 +275,13 @@ pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
     if !matches!(conversation.first(), Some(Message::User { .. })) {
         return Err(incompatible("the conversation opens with a user message"));
     }
-    let generated: Vec<usize> = conversation
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| is_generated(message))
-        .map(|(index, _)| index)
-        .collect();
-    match generated.as_slice() {
-        [] => {}
-        [1] if conversation.len() > 2 => {}
-        [1] => return Err(incompatible("generated data is never the last message")),
-        _ => {
-            return Err(incompatible(
-                "generated data appears once, directly after the first user message",
-            ));
-        }
+    // Only the message directly after the first user message can be the generated one. A
+    // reply elsewhere that happens to open with the label is the model's own text and is sent
+    // as it is: identifying generated data anywhere by its words would let one reply wedge
+    // every later request of its session.
+    let anchor_generated = conversation.get(1).is_some_and(is_generated);
+    if anchor_generated && conversation.len() <= 2 {
+        return Err(incompatible("generated data is never the last message"));
     }
     validate_pairs(conversation)
 }

@@ -78,11 +78,14 @@ pub fn hard_fit(
     let crossing = first_within(eligible.len(), allowance, |count| cost(&with(count)))?;
     let aim = target(allowance);
     let settled = first_within(eligible.len(), aim, |count| cost(&with(count)))?;
-    let count = settled.max(crossing);
-    let hidden = with(count);
-    if hidden.len() > limits::HIDDEN_MAX {
+    // The hidden-id cap bounds how far toward the target fitting goes, not whether it fits:
+    // only a crossing that itself needs more ids than the cap allows is refused.
+    let room = limits::HIDDEN_MAX.saturating_sub(accepted.len());
+    if crossing > room {
         return Err(ErrorCode::StorageCapacity);
     }
+    let count = settled.max(crossing).min(room);
+    let hidden = with(count);
     let estimate = cost(&hidden)?;
     if estimate > allowance {
         // The search assumes the cost falls as fragments are hidden. A candidate that breaks
@@ -208,6 +211,28 @@ mod tests {
         let protected: BTreeSet<FragmentId> = fragments.all().iter().map(|f| f.id).collect();
         let fit = hard_fit(&fragments, &protected, &[], 110, cost(3));
         assert_eq!(fit, Err(ErrorCode::ProtectedFloorTooLarge));
+    }
+
+    /// F16: the hidden-id cap stops fitting short of the target rather than refusing a fit
+    /// that exists inside it.
+    #[test]
+    fn the_hidden_cap_limits_how_far_fitting_goes_not_whether_it_fits() {
+        let fragments = derive(&log(4_102)).unwrap_or_default();
+        let accepted: Vec<FragmentId> = fragments.all().iter().take(4_090).map(|f| f.id).collect();
+        // 12 shown cost 220 against an allowance of 215: one more hidden crosses; the target
+        // would want ten, and only six fit under the cap.
+        let fit = hard_fit(&fragments, &BTreeSet::new(), &accepted, 215, cost(4_102));
+        let Ok(Some(fitted)) = fit else {
+            panic!("it fits inside the cap: {fit:?}");
+        };
+        assert_eq!(fitted.hidden.len(), limits::HIDDEN_MAX);
+        assert_eq!(fitted.estimate, 160);
+        let full: Vec<FragmentId> = fragments.all().iter().take(4_096).map(|f| f.id).collect();
+        assert_eq!(
+            hard_fit(&fragments, &BTreeSet::new(), &full, 150, cost(4_102)),
+            Err(ErrorCode::StorageCapacity),
+            "a crossing that needs more ids than the cap allows is refused"
+        );
     }
 
     #[test]

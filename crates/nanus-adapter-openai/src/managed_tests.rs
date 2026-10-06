@@ -573,10 +573,15 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     late_system.messages.push(Message::system("late"));
     refused_with(late_system, "follows the conversation");
 
+    // F15: text that opens with the label anywhere but directly after the first user message
+    // is the model's own reply, sent as it is; refusing it would let one reply wedge a session.
     let mut moved = valid;
     let generated = moved.messages.remove(3);
     moved.messages.insert(5, generated);
-    refused_with(moved, "directly after the first user message");
+    assert!(
+        prepare(&llm(), managed(moved)).is_ok(),
+        "a labelled reply elsewhere is sent"
+    );
 }
 
 /// T01: the ordinary path sends the body it always sent, and decodes without managed limits.
