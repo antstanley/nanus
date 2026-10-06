@@ -30,8 +30,12 @@ use crate::{
     ZAI_BASE_URL, ZAI_CODING_BASE_URL,
 };
 
-/// An `OpenAI` API model before the `gpt-5.6` generation, which automatic routing sends to chat.
-const MODEL: &str = "gpt-5";
+/// An offered `OpenAI` model, sent to chat by an exact chat preference.
+const MODEL: &str = "gpt-5.6-sol";
+
+/// A model before the `gpt-5.6` generation: automatic routing sends it to chat, but it is not one
+/// this vendor offers, so it has no declared output ceiling and managed context refuses it.
+const LEGACY_MODEL: &str = "gpt-5";
 
 fn work(session: &mut Session, id: &str, output: &str) {
     session.append(SessionEvent::AssistantMessage {
@@ -114,6 +118,14 @@ fn schema(name: &str) -> ToolSchema {
 }
 
 fn llm() -> OpenAiLlm {
+    let mut config = OpenAiConfig::new(Vendor::OpenAi, MODEL, "test-key");
+    config
+        .set_protocol_preference(ProtocolPreference::Exact(Protocol::ChatCompletions))
+        .unwrap();
+    OpenAiLlm::new(config).unwrap()
+}
+
+fn automatic() -> OpenAiLlm {
     OpenAiLlm::new(OpenAiConfig::new(Vendor::OpenAi, MODEL, "test-key")).unwrap()
 }
 
@@ -400,7 +412,13 @@ fn with_model(model: &str) -> ChatRequest {
 fn every_responses_route_is_unsupported_and_refused_before_any_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let automatic = llm();
+    let automatic = automatic();
+    // F8: an id this vendor does not offer has no declared ceiling, even routed to chat.
+    assert_eq!(
+        automatic.managed_support(LEGACY_MODEL),
+        ManagedSupport::Unsupported
+    );
+    refused_by(&automatic, with_model(LEGACY_MODEL), "unsupported_mode");
     assert_eq!(
         automatic.managed_support("gpt-5.6-sol"),
         ManagedSupport::Unsupported
@@ -566,14 +584,14 @@ fn a_request_outside_the_managed_grammar_is_refused() {
 async fn the_ordinary_request_bytes_and_decoding_are_unchanged() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
-    let config = OpenAiConfig::with_base_url(Vendor::OpenAi, MODEL, "k", base);
+    let config = OpenAiConfig::with_base_url(Vendor::OpenAi, LEGACY_MODEL, "k", base);
     let llm = OpenAiLlm::new(config).unwrap();
     let raw = manage_arguments(16 * 1024 + 1);
     let delta = json!({ "index": 0, "id": "m1",
         "function": { "name": "context_manage", "arguments": raw } });
     let server = serve_once(listener, tool_stream(&[delta]));
     let request = ChatRequest::new(
-        MODEL,
+        LEGACY_MODEL,
         vec![
             Message::system("sys"),
             Message::user("hi"),

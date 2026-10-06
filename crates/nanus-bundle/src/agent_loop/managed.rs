@@ -233,11 +233,13 @@ impl AgentRunner {
                 persistence: None,
             };
         };
-        if let Err(error) = self.recover_session(session, host.runtime).await {
+        if let (Err(error), persistence) = self.recover_tracked(session, host.runtime).await {
             return ManagedRun {
                 outcome: Err(error),
-                persistence: Some(PersistenceState::Unsaved {
-                    last: checkpoint.expected(),
+                persistence: persistence.or_else(|| {
+                    Some(PersistenceState::Unsaved {
+                        last: checkpoint.expected(),
+                    })
                 }),
             };
         }

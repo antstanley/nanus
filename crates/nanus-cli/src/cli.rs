@@ -1054,7 +1054,12 @@ fn bind_context(
         }
         wanted.capture_shell = true;
     }
-    if !session.is_managed_body() && wanted == current {
+    if !session.is_managed_body() && wanted.mode != ContextMode::Managed {
+        if flags.context_output_reserve.is_some() {
+            return Err(String::from(
+                "--context-output-reserve needs managed context; add --context-mode managed",
+            ));
+        }
         return Ok(None);
     }
     let checkpoint = kernel_block_on(nanus_bundle::StoreCheckpoint::bind(
@@ -1068,6 +1073,10 @@ fn bind_context(
         context: Some(&context),
         checkpoint: Some(&checkpoint),
     };
+    // A turn a crash left open is closed before anything new — a policy change included — is
+    // recorded after it.
+    kernel_block_on(harness.runner.recover_session(session, runtime))
+        .map_err(|error| format!("the session could not be recovered: {error}"))?;
     kernel_block_on(
         harness
             .runner

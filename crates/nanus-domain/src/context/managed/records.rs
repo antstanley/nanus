@@ -625,24 +625,30 @@ impl UsageObservation {
 
     /// Reads the neutral usage record into nullable counters.
     ///
-    /// The neutral record cannot say which counters a provider omitted, so every one it carries
-    /// is reported; cache writes are not in it at all and stay absent.
+    /// A usage report always carries its prompt and completion counts, so those are recorded as
+    /// reported. The neutral record cannot tell a reasoning or cache count the provider reported
+    /// as zero from one it never reported — both arrive as zero — so those categories are
+    /// recorded only when they are positive and are otherwise absent: missing is never written
+    /// as zero. Every counter, zeros included, is kept in `raw_counters` as the record carried
+    /// it, under the neutral semantics. Cache writes are not in the neutral record at all.
     #[must_use]
     pub fn from_usage(usage: &crate::Usage) -> Self {
+        let positive = |value: u32| (value > 0).then_some(u64::from(value));
         let mut raw_counters = BTreeMap::new();
-        raw_counters.insert(
-            "cache_hit_tokens".to_owned(),
-            u64::from(usage.cache_hit_tokens),
-        );
-        raw_counters.insert(
-            "cache_miss_tokens".to_owned(),
-            u64::from(usage.cache_miss_tokens),
-        );
+        for (name, value) in [
+            ("prompt_tokens", usage.prompt_tokens),
+            ("completion_tokens", usage.completion_tokens),
+            ("reasoning_tokens", usage.reasoning_tokens),
+            ("cache_hit_tokens", usage.cache_hit_tokens),
+            ("cache_miss_tokens", usage.cache_miss_tokens),
+        ] {
+            raw_counters.insert(name.to_owned(), u64::from(value));
+        }
         Self {
             prompt_tokens: Some(u64::from(usage.prompt_tokens)),
             completion_tokens: Some(u64::from(usage.completion_tokens)),
-            reasoning_tokens: Some(u64::from(usage.reasoning_tokens)),
-            cache_read_tokens: Some(u64::from(usage.cache_hit_tokens)),
+            reasoning_tokens: positive(usage.reasoning_tokens),
+            cache_read_tokens: positive(usage.cache_hit_tokens),
             cache_write_tokens: None,
             semantics_version: Self::NEUTRAL_SEMANTICS.to_owned(),
             raw_counters,
@@ -937,6 +943,19 @@ mod tests {
         let mut partial_eof = receipt(CaptureStatus::Partial, 1, 2);
         partial_eof.reason = CaptureReason::Eof;
         assert!(partial_eof.validate().is_err());
+    }
+
+    /// F10: an optional category the neutral record carries as zero is absent, not zero.
+    #[test]
+    fn a_counter_that_may_be_missing_is_never_written_as_zero() {
+        let usage = UsageObservation::from_usage(&crate::Usage::new(100, 20, 0, 0, 100));
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.raw_counters.get("cache_hit_tokens"), Some(&0));
+        let cached = UsageObservation::from_usage(&crate::Usage::new(100, 20, 5, 60, 40));
+        assert_eq!(cached.reasoning_tokens, Some(5));
+        assert_eq!(cached.cache_read_tokens, Some(60));
     }
 
     #[test]

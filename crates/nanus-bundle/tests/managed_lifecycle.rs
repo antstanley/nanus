@@ -552,3 +552,79 @@ fn an_inspect_cursor_pages_the_whole_catalog_across_steps() {
         "every fragment, the first inspect's own included: {total}"
     );
 }
+
+/// A batch admission whose lease refuses to commit any batch holding a proposal.
+struct RefusesProposals;
+
+struct RefusingLease(bool);
+
+impl nanus_ports::ToolBatchReservation for RefusingLease {
+    fn admit(&self, _: &ToolCall) -> Result<(), nanus_ports::AdmissionError> {
+        Ok(())
+    }
+    fn before_dispatch(&self, _: &ToolCall) -> Result<(), nanus_ports::AdmissionError> {
+        Ok(())
+    }
+    fn validate_result(
+        &self,
+        _: &ToolCall,
+        _: &nanus_domain::ToolResult,
+        _: &nanus_domain::ToolResult,
+    ) -> Result<(), nanus_ports::AdmissionError> {
+        Ok(())
+    }
+    fn commit(&self, _: &nanus_ports::ChatRequest) -> Result<(), nanus_ports::AdmissionError> {
+        if self.0 {
+            Err(nanus_ports::AdmissionError {
+                message: "the ledger is full".to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl nanus_ports::ToolAdmission for RefusesProposals {
+    fn reserve(
+        &self,
+        projection: &nanus_ports::ToolBatchProjection<'_>,
+    ) -> Result<Box<dyn nanus_ports::ToolBatchReservation>, nanus_ports::AdmissionError> {
+        let proposal = projection
+            .calls
+            .iter()
+            .any(|call| call.arguments["action"] == "propose");
+        Ok(Box::new(RefusingLease(proposal)))
+    }
+}
+
+/// F11: a proposal staged in a step whose batch lease could not commit is refused, not accepted.
+#[test]
+fn a_proposal_in_a_failed_step_is_never_accepted() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = runner(&model, 64_000).with_tool_admission(Rc::new(RefusesProposals));
+    let (mut session, disk, context) = managed(&runner);
+    model.push(call("w1", "echo", r#"{"size": 10}"#));
+    model.push(call("w2", "echo", r#"{"size": 10}"#));
+    model.push(call("w3", "echo", r#"{"size": 10}"#));
+    model.push(call("i1", "context_manage", INSPECT));
+    model.push_with(propose_oldest("i2"));
+    model.push(text("never"));
+    let run =
+        block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)));
+    assert!(run.outcome.is_err());
+    assert!(
+        !session
+            .log()
+            .events()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ContextRevision { .. })),
+        "no revision was accepted"
+    );
+    let rejected = session.log().events().iter().any(|event| {
+        matches!(event,
+        SessionEvent::ContextDecision { payload }
+            if payload.outcome == nanus_domain::context::managed::DecisionOutcome::Rejected)
+    });
+    assert!(rejected);
+    assert_eq!(disk.last(), session, "the failure is recorded and saved");
+}

@@ -322,8 +322,11 @@ async fn settle(binding: &Binding, state: PersistenceState, session: &Session) -
 
 /// The receipt a reconciliation that found the candidate on disk amounts to.
 ///
-/// `None` when the stored identity does not describe a prefix of `session`, which a
-/// reconciliation that found the candidate cannot produce and a caller treats as quarantine.
+/// `None` when the stored file is not, byte for byte, a prefix of `session` — the caller treats
+/// that as quarantine. An equal event count is not enough: after an uncertain commit the file on
+/// disk may hold the candidate the runner tried to write while the held session has since
+/// diverged from it, and a receipt built from the held copy would call a session saved that the
+/// disk does not hold, and let the next commit overwrite what the disk does.
 fn receipt_from(stored: &ExpectedCheckpoint, session: &Session) -> Option<CheckpointReceipt> {
     let ExpectedCheckpoint::Stored {
         file_sha256,
@@ -333,6 +336,9 @@ fn receipt_from(stored: &ExpectedCheckpoint, session: &Session) -> Option<Checkp
     else {
         return None;
     };
+    if session.prefix_digest(*event_count).ok()? != *file_sha256 {
+        return None;
+    }
     let prefix = session.prefix(*event_count).ok()?;
     Some(CheckpointReceipt {
         frontier: ContextFrontier {
@@ -1038,5 +1044,33 @@ mod tests {
             ..status
         });
         assert_eq!(legacy.mode, ContextModeState::Legacy);
+    }
+
+    /// F4: a reconciliation is trusted only for a file that is byte for byte a prefix of the
+    /// held session; an equal event count over different records is quarantine, not durable.
+    #[test]
+    fn a_reconciled_file_must_be_a_prefix_of_the_held_session() {
+        let mut held = Session::new(SessionId::new("s"), 0, "/w");
+        held.upgrade_to_managed_body();
+        held.append(SessionEvent::UserMessage { text: "a".into() });
+        held.append(SessionEvent::TurnEnd {
+            turn: 1,
+            reason: TurnEndReason::Interrupted,
+        });
+        let mut disk = Session::new(SessionId::new("s"), 0, "/w");
+        disk.upgrade_to_managed_body();
+        disk.append(SessionEvent::UserMessage { text: "a".into() });
+        disk.append(SessionEvent::UserMessage { text: "b".into() });
+        let stored = |session: &Session| ExpectedCheckpoint::Stored {
+            body_version: 3,
+            file_sha256: session.prefix_digest(2).expect("encodes"),
+            event_count: 2,
+        };
+        assert!(
+            receipt_from(&stored(&disk), &held).is_none(),
+            "same count, other records"
+        );
+        let receipt = receipt_from(&stored(&held), &held).expect("the held prefix is on disk");
+        assert_eq!(receipt.frontier.event_count, 2);
     }
 }

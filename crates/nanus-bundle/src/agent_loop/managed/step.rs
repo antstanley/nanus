@@ -170,7 +170,19 @@ impl AgentRunner {
             status: Some(status),
             staged: None,
         };
-        let lease = self.begin_managed_records(session, phase.position, turn_lease, &request)?;
+        let lease = match self.begin_managed_records(session, phase.position, turn_lease, &request)
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                // The intent is already durable, so its outcome is recorded too: refused before
+                // dispatch, never an open intent in a closed turn.
+                let refused = self.refused_attempt(attempt);
+                session.append(SessionEvent::RequestAttempt {
+                    payload: Box::new(refused),
+                });
+                return Err(error);
+            }
+        };
         let mut timing = Timing::new(progress);
         let mut assistant = None;
         let result = self
@@ -249,6 +261,14 @@ impl AgentRunner {
             finished_at_ms: None,
             timings_ms: None,
         }
+    }
+
+    /// The finished record of an attempt refused before it was dispatched.
+    fn refused_attempt(&self, mut attempt: RequestAttemptRecord) -> RequestAttemptRecord {
+        attempt.phase = AttemptPhase::Finished;
+        attempt.outcome = Some(nanus_domain::context::managed::AttemptOutcome::Refused);
+        attempt.finished_at_ms = Some(self.clock.now_ms());
+        attempt
     }
 
     /// Checkpoints the settled prefix, any automatic revision and the request intent, before

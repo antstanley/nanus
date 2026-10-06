@@ -342,3 +342,26 @@ fn reset_selects_legacy_and_a_re_enable_starts_from_an_empty_selection() {
 /// Silences an unused import on platforms where a helper is not used.
 #[allow(dead_code)]
 fn _uses(_: TurnHost<'_>) {}
+
+/// F7: a legacy policy never upgrades a session that has not enabled managed context.
+#[test]
+fn a_legacy_policy_change_leaves_a_version_two_body_alone() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = runner(&model, 64_000);
+    let mut session = session();
+    let disk = Disk::new();
+    let context = context();
+    let legacy = ContextPolicy {
+        output_reserve_tokens: 9_000,
+        ..ContextPolicy::default()
+    };
+    let changed = block(runner.set_context_policy(
+        &mut session,
+        legacy,
+        ModeActor::Human,
+        host(&disk, &context).runtime,
+    ));
+    assert!(matches!(changed, Ok(None)), "{changed:?}");
+    assert!(!session.is_managed_body());
+    assert_eq!(disk.commits(), 0);
+}

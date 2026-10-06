@@ -63,8 +63,12 @@ pub fn support(config: &OpenAiConfig, model: &str) -> ManagedSupport {
             Ok(Protocol::ChatCompletions)
         );
     let exact = match config.vendor() {
+        // Only the models this vendor offers: their output ceiling is the vendor's declared
+        // one. An unknown id — an old model, a fine-tune — has no ceiling anyone has declared,
+        // and a reservation it might refuse is exactly what managed preparation must not send.
         Vendor::OpenAi => {
             config.base_url().trim_end_matches('/') == OPENAI_BASE_URL
+                && Vendor::OpenAi.models().contains(&model)
                 && crate::tool_support::support(config, model, None) != ToolCallSupport::Unsupported
         }
         Vendor::Zai => crate::zai::known_api(config, model),

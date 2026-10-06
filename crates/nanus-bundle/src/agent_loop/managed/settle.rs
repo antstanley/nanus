@@ -68,8 +68,13 @@ impl AgentRunner {
         let decision = staged.map(|staged| {
             let stopped =
                 is_cancelled(progress, control) || matches!(result, Ok(StepOutcome::Interrupted));
+            // A step that failed — its stream, its admission lease's commit, anything — does not
+            // settle cleanly, so a proposal staged in it is refused rather than accepted on top
+            // of a failure.
             let outcome = if stopped {
                 Err(ErrorCode::Cancelled)
+            } else if result.is_err() {
+                Err(ErrorCode::PolicyDenied)
             } else {
                 self.evaluate(session, turn, &staged)
             };
@@ -248,6 +253,12 @@ impl AgentRunner {
         if current == policy && (recorded || policy.mode == ContextMode::Legacy) {
             return Ok(None);
         }
+        // Only activation upgrades a body. A legacy policy for a session that never managed its
+        // context has nothing to record, and recording it would make the session unreadable by
+        // a build that predates version 3 for no behaviour at all.
+        if policy.mode == ContextMode::Legacy && !session.is_managed_body() {
+            return Ok(None);
+        }
         let checkpoint = runtime
             .checkpoint
             .ok_or_else(|| refusal(ErrorCode::UnsupportedMode))?;
@@ -368,28 +379,48 @@ impl AgentRunner {
         session: &mut Session,
         runtime: TurnRuntime<'_>,
     ) -> Result<Option<PersistenceState>, BundleError> {
+        self.recover_tracked(session, runtime).await.0
+    }
+
+    /// Recovers, and reports where persistence stands whether or not it succeeded: a refused
+    /// commit and an unsettled one leave different things a host may still do.
+    pub(in crate::agent_loop) async fn recover_tracked(
+        &self,
+        session: &mut Session,
+        runtime: TurnRuntime<'_>,
+    ) -> (
+        Result<Option<PersistenceState>, BundleError>,
+        Option<PersistenceState>,
+    ) {
         if !session.is_managed_body() {
-            return Ok(None);
+            return (Ok(None), None);
         }
-        let state = ManagedState::fold(session.log()).unwrap_or_default();
-        let Some(plan) =
-            state::recovery_plan(session, &state, self.clock.now_ms()).map_err(refusal)?
-        else {
-            return Ok(None);
+        let Some(checkpoint) = runtime.checkpoint else {
+            return (Err(refusal(ErrorCode::UnsupportedMode)), None);
         };
-        let checkpoint = runtime
-            .checkpoint
-            .ok_or_else(|| refusal(ErrorCode::UnsupportedMode))?;
+        let state = ManagedState::fold(session.log()).unwrap_or_default();
+        let plan = match state::recovery_plan(session, &state, self.clock.now_ms()) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return (Ok(None), None),
+            Err(code) => return (Err(refusal(code)), None),
+        };
         let mut candidate = session.clone();
         for event in plan.events {
             candidate.append(event);
         }
         let policy = super::recorded_policy(session);
         let turn = ManagedTurn::new(checkpoint, runtime.context, policy, 0);
-        self.commit(&turn, &candidate, CheckpointReason::Recovery, &mut Silent)
-            .await?;
-        *session = candidate;
-        Ok(turn.persistence())
+        let committed = self
+            .commit(&turn, &candidate, CheckpointReason::Recovery, &mut Silent)
+            .await;
+        let persistence = turn.persistence();
+        match committed {
+            Ok(_) => {
+                *session = candidate;
+                (Ok(persistence.clone()), persistence)
+            }
+            Err(error) => (Err(error), persistence),
+        }
     }
 }
 
