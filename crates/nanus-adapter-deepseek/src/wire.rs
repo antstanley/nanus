@@ -48,7 +48,11 @@ pub fn build_request(config: &DeepSeekConfig, request: &ChatRequest) -> Value {
     );
     body.insert(
         "max_tokens".to_owned(),
-        json!(request.max_tokens.unwrap_or_else(|| config.max_tokens())),
+        json!(
+            request
+                .max_tokens
+                .unwrap_or_else(|| config.max_tokens_for(&request.model))
+        ),
     );
 
     let effort = request

@@ -248,7 +248,8 @@ pub struct OpenAiConfig {
     model: String,
     api_key: String,
     base_url: String,
-    max_tokens: u32,
+    /// The output budget a request that names none asks for; `None` is the model's ceiling.
+    max_tokens: Option<u32>,
     reasoning_effort: ReasoningEffort,
     temperature: Option<f32>,
     response_limits: Option<nanus_ports::ResponseLimits>,
@@ -341,7 +342,7 @@ impl OpenAiConfig {
             model: model.into(),
             api_key: api_key.into(),
             base_url: vendor.default_base_url().to_owned(),
-            max_tokens: vendor.max_output_tokens(),
+            max_tokens: Some(vendor.max_output_tokens()),
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
             response_limits: None,
@@ -540,25 +541,80 @@ impl OpenAiConfig {
         &self.base_url
     }
 
-    /// Returns the requested maximum output tokens, before the provider's ceiling
-    /// is applied.
+    /// Returns the requested maximum output tokens for the configured model, before the
+    /// provider's ceiling is applied.
     #[must_use]
-    pub const fn max_tokens(&self) -> u32 {
-        self.max_tokens
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens_for(&self.model)
     }
 
-    /// Returns the maximum output tokens a request may actually ask for.
+    /// Returns the requested maximum output tokens for `model`, before the ceiling is applied.
+    ///
+    /// The configured budget when one is set, and otherwise `model`'s own ceiling. Read per
+    /// request, because a runner switches models by naming another id without rebuilding the
+    /// adapter, and the ceiling is a fact about the model being asked.
+    #[must_use]
+    pub fn max_tokens_for(&self, model: &str) -> u32 {
+        self.max_tokens
+            .unwrap_or_else(|| self.output_ceiling(model))
+    }
+
+    /// Returns the most output tokens `model` may be asked for on this endpoint and wire.
+    ///
+    /// The exact model's documented ceiling where this endpoint has evidence for it, and
+    /// otherwise the vendor's [`Vendor::max_output_tokens`]: a proxy, a plan without API
+    /// evidence, or an unknown id inherits nothing.
+    #[must_use]
+    pub fn output_ceiling(&self, model: &str) -> u32 {
+        self.capabilities(model)
+            .max_output_tokens
+            .unwrap_or_else(|| self.vendor.max_output_tokens())
+    }
+
+    /// Returns the maximum output tokens a request to the configured model may ask for.
     ///
     /// The provider refuses a request above its ceiling rather than truncating the
     /// answer, so the budget sent is the smaller of what was configured and what
     /// the provider permits — and a caller that wants to *report* the difference
     /// asks this rather than repeating the rule.
     #[must_use]
-    pub const fn effective_max_tokens(&self) -> u32 {
-        if self.max_tokens < self.vendor.max_output_tokens() {
-            self.max_tokens
-        } else {
-            self.vendor.max_output_tokens()
+    pub fn effective_max_tokens(&self) -> u32 {
+        self.effective_max_tokens_for(&self.model)
+    }
+
+    /// Returns the maximum output tokens a request to `model` may ask for.
+    #[must_use]
+    pub fn effective_max_tokens_for(&self, model: &str) -> u32 {
+        self.max_tokens_for(model).min(self.output_ceiling(model))
+    }
+
+    /// Returns the documented limits and image support for `model` on this endpoint and wire.
+    ///
+    /// Evidence belongs to an exact model on a known endpoint: z.ai's API models, and `OpenAI`'s
+    /// image-profiled models on the Responses endpoints. Chat and proxies inherit nothing.
+    #[must_use]
+    pub fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        if self.vendor == Vendor::Zai {
+            return crate::zai::capabilities(self, model);
+        }
+        if !self.has_verified_responses_endpoint()
+            || !matches!(self.resolve_protocol(model), Ok(Protocol::Responses))
+        {
+            return nanus_ports::ModelCapabilities::default();
+        }
+        let Some(profile) = nanus_ports::capabilities::ImageProfile::for_openai_model(model) else {
+            return nanus_ports::ModelCapabilities::default();
+        };
+        nanus_ports::ModelCapabilities {
+            image_input: nanus_ports::ImageInputSupport::Supported,
+            image_profile: Some(profile),
+            context_window_tokens: Some(1_050_000),
+            max_input_tokens: Some(if model == "gpt-6-astra" {
+                1_050_000
+            } else {
+                922_000
+            }),
+            max_output_tokens: Some(128_000),
         }
     }
 
@@ -586,8 +642,16 @@ impl OpenAiConfig {
                 "must be greater than zero",
             ));
         }
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
         Ok(())
+    }
+
+    /// Makes a request that names no budget ask for its model's own ceiling.
+    ///
+    /// Undoes [`set_max_tokens`](Self::set_max_tokens) and the library default alike. The
+    /// ceiling is resolved per request, so it follows a model switch.
+    pub const fn use_model_output_ceiling(&mut self) {
+        self.max_tokens = None;
     }
 
     /// Sets the reasoning effort.
@@ -821,8 +885,8 @@ mod tests {
     /// request above it is refused rather than truncated.
     #[test]
     fn the_requested_budget_is_capped_by_the_provider() {
-        // The configuration default is 128000: OpenAI's ceiling admits it, and
-        // z.ai's does not, so one provider caps and the other does not.
+        // A configured 128000: OpenAI's ceiling admits it, and z.ai's fallback does
+        // not, so one provider caps and the other does not.
         let mut openai = OpenAiConfig::new(Vendor::OpenAi, "gpt-5", "key");
         assert!(openai.set_max_tokens(128_000).is_ok());
         assert_eq!(openai.max_tokens(), 128_000);
@@ -839,6 +903,45 @@ mod tests {
         // Below it, the configured value is what is sent.
         assert!(zai.set_max_tokens(4_096).is_ok());
         assert_eq!(zai.effective_max_tokens(), 4_096);
+    }
+
+    /// An unset budget asks for the ceiling of the model a request names, and only an exact
+    /// model on an endpoint with evidence has one above the vendor's fallback.
+    #[test]
+    fn an_unset_budget_follows_the_documented_ceiling_of_the_model_asked() {
+        let mut zai = OpenAiConfig::new(Vendor::Zai, "glm-5.3", "key");
+        assert_eq!(zai.max_tokens(), 98_304);
+        zai.use_model_output_ceiling();
+        assert_eq!(zai.max_tokens(), 131_072);
+        assert_eq!(zai.effective_max_tokens_for("glm-5.2"), 131_072);
+        assert_eq!(zai.effective_max_tokens_for("glm-next"), 98_304);
+        // The Coding Plan's exact models share the API's limits; a gateway inherits nothing.
+        let mut coding =
+            OpenAiConfig::with_base_url(Vendor::Zai, "glm-5.3", "key", ZAI_CODING_BASE_URL);
+        coding.use_model_output_ceiling();
+        assert_eq!(coding.effective_max_tokens(), 131_072);
+        assert_eq!(
+            coding.capabilities("glm-5.3").context_window_tokens,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            coding.capabilities("glm-5.3").image_input,
+            nanus_ports::ImageInputSupport::Unknown,
+            "the limits are shared, the image evidence is not"
+        );
+        assert_eq!(coding.effective_max_tokens_for("glm-next"), 98_304);
+        let mut gateway = OpenAiConfig::with_base_url(Vendor::Zai, "glm-5.3", "key", "http://x");
+        gateway.use_model_output_ceiling();
+        assert_eq!(gateway.effective_max_tokens(), 98_304);
+        // A configured budget wins below the ceiling and is capped above it.
+        assert!(zai.set_max_tokens(4_096).is_ok());
+        assert_eq!(zai.effective_max_tokens_for("glm-5.2"), 4_096);
+        assert!(zai.set_max_tokens(200_000).is_ok());
+        assert_eq!(zai.effective_max_tokens_for("glm-5.2"), 131_072);
+
+        let mut openai = OpenAiConfig::new(Vendor::OpenAi, "gpt-6-astra", "key");
+        openai.use_model_output_ceiling();
+        assert_eq!(openai.effective_max_tokens(), 128_000);
     }
 
     /// Each vendor's ceiling field is its own, and neither accepts the other's.

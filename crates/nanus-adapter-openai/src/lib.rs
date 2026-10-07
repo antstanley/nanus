@@ -480,29 +480,7 @@ impl LlmPort for OpenAiLlm {
     }
 
     fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
-        if self.config.vendor() == Vendor::Zai {
-            return zai::capabilities(&self.config, model);
-        }
-        if !self.config.has_verified_responses_endpoint()
-            || !matches!(self.config.resolve_protocol(model), Ok(Protocol::Responses))
-        {
-            return nanus_ports::ModelCapabilities::default();
-        }
-        let Some(profile) = nanus_ports::capabilities::ImageProfile::for_openai_model(model) else {
-            return nanus_ports::ModelCapabilities::default();
-        };
-        // Evidence belongs to an exact model on these Responses endpoints, never Chat or a proxy.
-        nanus_ports::ModelCapabilities {
-            image_input: nanus_ports::ImageInputSupport::Supported,
-            image_profile: Some(profile),
-            context_window_tokens: Some(1_050_000),
-            max_input_tokens: Some(if model == "gpt-6-astra" {
-                1_050_000
-            } else {
-                922_000
-            }),
-            max_output_tokens: Some(128_000),
-        }
+        self.config.capabilities(model)
     }
 
     fn estimate_request(

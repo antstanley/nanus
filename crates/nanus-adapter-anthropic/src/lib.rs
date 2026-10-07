@@ -180,35 +180,7 @@ impl LlmPort for AnthropicLlm {
     }
 
     fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
-        if self.config.base_url().trim_end_matches('/') != DEFAULT_BASE_URL {
-            return nanus_ports::ModelCapabilities::default();
-        }
-        match model {
-            "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1" => {
-                nanus_ports::ModelCapabilities {
-                    // Pixel acceptance is per exact model and needs the live evidence in
-                    // `docs/vision-evidence.md`; Fable 5.1 has none, so it stays Unknown.
-                    image_input: if model == "claude-fable-5-1" {
-                        nanus_ports::ImageInputSupport::Unknown
-                    } else {
-                        nanus_ports::ImageInputSupport::Supported
-                    },
-                    image_profile: match model {
-                        "claude-opus-5-5" => Some(
-                            nanus_ports::capabilities::ImageProfile::AnthropicOpus55HighPatch28V1,
-                        ),
-                        "claude-sonnet-5-5" => Some(
-                            nanus_ports::capabilities::ImageProfile::AnthropicSonnet55HighPatch28V1,
-                        ),
-                        _ => None,
-                    },
-                    context_window_tokens: Some(1_000_000),
-                    max_input_tokens: Some(1_000_000),
-                    max_output_tokens: Some(128_000),
-                }
-            }
-            _ => nanus_ports::ModelCapabilities::default(),
-        }
+        self.config.capabilities(model)
     }
 
     fn estimate_request(

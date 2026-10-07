@@ -204,7 +204,7 @@ impl LlmPort for DeepSeekLlm {
     }
 
     fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
-        metadata::capabilities(&self.config, model)
+        self.config.capabilities(model)
     }
 
     fn estimate_request(

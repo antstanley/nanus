@@ -92,7 +92,7 @@ fn each_exact_api_model_has_independent_text_tools_and_effort_metadata() {
 }
 
 #[test]
-fn api_evidence_never_leaks_to_coding_gateways_unknown_models_or_other_vendors() {
+fn api_evidence_never_leaks_to_coding_gateways_unknown_models_or_other_vendors_beyond_limits() {
     for endpoint in [
         ZAI_CODING_BASE_URL,
         "https://gateway.invalid/api/paas/v4",
@@ -107,7 +107,18 @@ fn api_evidence_never_leaks_to_coding_gateways_unknown_models_or_other_vendors()
             endpoint,
         ))
         .expect("adapter");
-        assert_eq!(llm.capabilities("glm-5.3"), ModelCapabilities::default());
+        // The Coding Plan shares the API's token limits and nothing else; a gateway, not even those.
+        let expected = if endpoint == ZAI_CODING_BASE_URL {
+            ModelCapabilities {
+                context_window_tokens: Some(1_000_000),
+                max_input_tokens: Some(1_000_000),
+                max_output_tokens: Some(131_072),
+                ..ModelCapabilities::default()
+            }
+        } else {
+            ModelCapabilities::default()
+        };
+        assert_eq!(llm.capabilities("glm-5.3"), expected, "{endpoint}");
         assert_eq!(
             llm.tool_call_support("glm-5.3", None),
             ToolCallSupport::Unknown

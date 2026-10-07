@@ -330,12 +330,12 @@ fn assert_wire_requests(requests: &[Value]) {
 
 #[tokio::test]
 async fn actual_admission_transport_runner_and_reload_keep_original_items_and_fit_complete_turns() {
-    actual_admission_transport(false).await;
+    Box::pin(actual_admission_transport(false)).await;
 }
 
 #[tokio::test]
 async fn original_record_and_batch_leases_cover_actual_transport_reload_and_whole_turn_fitting() {
-    actual_admission_transport(true).await;
+    Box::pin(actual_admission_transport(true)).await;
 }
 
 async fn actual_admission_transport(record_admission: bool) {

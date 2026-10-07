@@ -71,7 +71,7 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
         json!(
             request
                 .max_tokens
-                .unwrap_or_else(|| config.effective_max_tokens())
+                .unwrap_or_else(|| config.effective_max_tokens_for(&request.model))
         ),
     );
 

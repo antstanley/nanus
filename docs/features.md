@@ -32,15 +32,19 @@ that runs a turn.
   the harness produces; the domain's vocabulary carries two more, a policy block
   and a human abort, that nothing mints yet.
 - **A bounded prompt.** Every step replays the whole log, so a long session
-  eventually exceeds the model's window. `context_budget` (default 64000 estimated
-  tokens) is the ceiling for one request: past it the _oldest turns_ are dropped,
-  whole, with a notice the model reads where the gap is, and the reader is told —
+  eventually exceeds the model's window. `context_budget` is the ceiling for one request;
+  unset, it is the selected model's documented window, read per request so it follows a
+  model switch — the conversation is fitted into that window less the model's output
+  ceiling, with a quarter left unspent for the estimate's error — and a model with no
+  documented window keeps 64000 estimated tokens. Past it the _oldest turns_ are
+  dropped, whole, with a notice the model reads where the gap is, and the reader is told —
   the CLI on stderr and the interface as a notice in the transcript. A turn whose
   _newest_ part does not fit is refused with a sentence naming the field rather
   than sent to a provider that would refuse the request. The estimate is
   characters over four plus a small per-message cost, deliberately approximate:
   there is no tokenizer here, the provider reports the real count with every
-  response, and the default sits well below every provider's window. See
+  response, and the margin above is why an unset budget is not spent to the
+  window's edge. See
   [context fitting](../crates/nanus-domain/src/context.rs).
 - **Interruptible turns.** `Esc` in the interface and `SIGINT` on a
   headless run ask the turn to stop at the next safe point. (`Ctrl+C` is the copy
@@ -363,8 +367,9 @@ remembered selection, wins over that default.
   `tool_result` content blocks.
 - **Usage accounting** — prompt, cached, and generated tokens, including how much of
   the generation was thinking, decoded from each provider's own spelling.
-- **Request controls**: `max_tokens` (default 128000, capped at the provider's
-  documented ceiling because a request above it is refused rather than truncated)
+- **Request controls**: `max_tokens` (unset, the selected model's documented output ceiling,
+  read per request so a switch takes its own; a configured value is capped at the ceiling
+  because a request above it is refused rather than truncated)
   and `reasoning_effort` (`minimal` / `low` / `medium` / `high`; when the file names none, the
   plan's own default applies — `high` for OpenAI's `subscription` plan, `max` for known z.ai API
   models on their verified endpoint — and then `medium`).
@@ -494,12 +499,12 @@ this build offers.
 | `plan`                  | the provider's default            | `api`, `coding` (z.ai), `subscription` (OpenAI, authorized with OAuth)                                                    |
 | `base_url`              | the plan's endpoint               | an override, for a proxy or a gateway                                                                                     |
 | `model`                 | the plan's or provider's default  | any id the provider serves                                                                                                |
-| `max_tokens`            | `128000`                          | per-response budget, capped at the provider's ceiling                                                                     |
+| `max_tokens`            | the model's output ceiling        | per-response budget, capped at the model's ceiling                                                                        |
 | `reasoning_effort`      | the plan's default, then `medium` | `minimal`, `low`, `medium`, `high`                                                                                        |
 | `approval_policy`       | `per_call`                        | `per_call`, `permitted`, `all_calls`                                                                                      |
 | `sandbox_mode`          | `read_only`                       | `read_only`, `workspace_write`, `danger_full_access`                                                                      |
 | `max_steps_per_turn`    | `512`                             | steps in one turn                                                                                                         |
-| `context_budget`        | `64000`                           | estimated prompt tokens for one request                                                                                   |
+| `context_budget`        | the model's window, else `64000`  | estimated prompt tokens for one request                                                                                   |
 | `max_parallel_tools`    | `4`                               | how many of a step's calls may be in flight at once                                                                       |
 | `tui_detail`            | `compact`                         | `compact`, `full`                                                                                                         |
 | `markdown`              | `true`                            | render the model's answers as markdown                                                                                    |

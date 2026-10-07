@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use nanus_adapter_config::{
-    CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN, DEFAULT_MAX_TOKENS,
-    NanusConfig, ReasoningEffort, TuiDetail,
+    CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN, NanusConfig,
+    ReasoningEffort, TuiDetail,
 };
 use nanus_domain::{ApprovalPolicy, SandboxMode};
 
@@ -66,7 +66,14 @@ fn the_built_in_defaults_are_the_documented_ones() {
     assert!(config.provider.is_none(), "no provider is named by default");
     assert!(config.plan.is_none(), "no plan is named by default");
     assert!(config.base_url.is_none(), "no endpoint is named by default");
-    assert_eq!(config.max_tokens, DEFAULT_MAX_TOKENS);
+    assert_eq!(
+        config.max_tokens, None,
+        "an unset output budget is the model's own ceiling"
+    );
+    assert_eq!(
+        config.context_budget, None,
+        "an unset context budget is the model's own window"
+    );
     assert_eq!(config.max_steps_per_turn, DEFAULT_MAX_STEPS_PER_TURN);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
     assert_eq!(
@@ -109,10 +116,7 @@ fn a_partial_file_uses_defaults_for_everything_else() {
     std::fs::write(&path, "model = \"deepseek-v4-pro\"\n").expect("seed");
     let config = NanusConfig::load(Some(&path)).expect("load");
     assert_eq!(config.model.as_deref(), Some("deepseek-v4-pro"));
-    assert_eq!(
-        config.max_tokens, DEFAULT_MAX_TOKENS,
-        "unset fields default"
-    );
+    assert_eq!(config.max_tokens, None, "unset fields default");
     assert_eq!(config.sandbox_mode, SandboxMode::ReadOnly);
 }
 
@@ -246,7 +250,8 @@ fn the_zero_to_one_migration_renames_the_legacy_field() {
     .expect("seed");
     let config = NanusConfig::load(Some(&path)).expect("load");
     assert_eq!(
-        config.max_tokens, 4096,
+        config.max_tokens,
+        Some(4096),
         "the legacy field was carried across by the migration"
     );
     assert_eq!(
@@ -259,13 +264,13 @@ fn the_zero_to_one_migration_renames_the_legacy_field() {
 fn the_migration_chain_runs_through_the_kernel() {
     let mut document = serde_json::json!({ "max_output_tokens": 777 });
     let config = NanusConfig::migrate(document.clone()).expect("migrate");
-    assert_eq!(config.max_tokens, 777);
+    assert_eq!(config.max_tokens, Some(777));
     assert_eq!(config.config_version, CONFIG_VERSION);
     // The migration is idempotent in effect: a document that already has the new
     // field keeps its value rather than being overwritten by a stale one.
     document = serde_json::json!({ "max_output_tokens": 111, "max_tokens": 222 });
     let config = NanusConfig::migrate(document).expect("migrate");
-    assert_eq!(config.max_tokens, 222, "the existing field wins");
+    assert_eq!(config.max_tokens, Some(222), "the existing field wins");
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +319,8 @@ fn save_then_load_round_trips() {
         plan: Some(String::from("coding")),
         base_url: Some(String::from("https://api.z.ai/api/coding/paas/v4")),
         model: Some(String::from("glm-4.5")),
-        max_tokens: 1234,
+        max_tokens: Some(1234),
+        context_budget: Some(200_000),
         reasoning_effort: Some(ReasoningEffort::Low),
         approval_policy: ApprovalPolicy::AllCalls,
         sandbox_mode: SandboxMode::DangerFullAccess,

@@ -169,12 +169,12 @@ config file: /Users/you/.config/nanus/config.toml
 provider: deepseek (plan api)
 model: deepseek-flash
 endpoint: https://api.deepseek.com
-max tokens: 128000 (ceiling 256000)
+max tokens: 393216 (the model's ceiling; unset)
 reasoning effort: Medium
 approval policy: per_call
 sandbox mode: ReadOnly
 max steps per turn: 512
-context budget: 64000 estimated tokens (older turns are dropped past it)
+context budget: 1048576 tokens (the model's window; unset; older turns are dropped past it)
 max parallel tools: 4
 tui detail: compact
 markdown answers: true

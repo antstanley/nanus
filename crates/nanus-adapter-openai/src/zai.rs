@@ -1,5 +1,9 @@
 //! Exact z.ai API contracts; Coding Plan and gateways inherit no API evidence.
 //!
+//! The one exception is the token limits: the Coding Plan's exact models are given the API's
+//! context window and output ceiling, so an unset budget means the same numbers on both plans.
+//! Efforts, function-tool admission, image support, preflight and managed context stay API-only.
+//!
 //! Checked 2026-10-03: <https://docs.z.ai/guides/capabilities/thinking>,
 //! <https://docs.z.ai/api-reference/llm/chat-completion>, and the GLM-5.3,
 //! GLM-5.2 and GLM-5.3-Flash/FlashX model pages under <https://docs.z.ai/guides/>.
@@ -11,7 +15,7 @@ use nanus_ports::{
     ToolCallSupport,
 };
 
-use crate::{OpenAiConfig, Protocol, Vendor, ZAI_BASE_URL};
+use crate::{OpenAiConfig, Protocol, Vendor, ZAI_BASE_URL, ZAI_CODING_BASE_URL};
 
 const CONTEXT_TOKENS: u32 = 1_000_000;
 const OUTPUT_TOKENS: u32 = 131_072;
@@ -34,6 +38,20 @@ const DYNAMIC_EFFORTS: [ReasoningEffort; 7] = [
 pub fn known_api(config: &OpenAiConfig, model: &str) -> bool {
     config.vendor() == Vendor::Zai
         && config.base_url().trim_end_matches('/') == ZAI_BASE_URL
+        && matches!(
+            config.resolve_protocol(model),
+            Ok(Protocol::ChatCompletions)
+        )
+        && matches!(
+            model,
+            "glm-5.3-flashx" | "glm-5.3-flash" | "glm-5.3" | "glm-5.2"
+        )
+}
+
+/// An exact model on the Coding Plan endpoint and Chat wire, which shares the API's limits only.
+fn known_coding_plan(config: &OpenAiConfig, model: &str) -> bool {
+    config.vendor() == Vendor::Zai
+        && config.base_url().trim_end_matches('/') == ZAI_CODING_BASE_URL
         && matches!(
             config.resolve_protocol(model),
             Ok(Protocol::ChatCompletions)
@@ -67,6 +85,15 @@ pub fn default_effort(config: &OpenAiConfig) -> ReasoningEffort {
 
 /// Text/output metadata does not imply verified image admission.
 pub fn capabilities(config: &OpenAiConfig, model: &str) -> ModelCapabilities {
+    if known_coding_plan(config, model) {
+        // The API's limits and nothing else: image support stays Unknown without evidence.
+        return ModelCapabilities {
+            context_window_tokens: Some(CONTEXT_TOKENS),
+            max_input_tokens: Some(CONTEXT_TOKENS),
+            max_output_tokens: Some(OUTPUT_TOKENS),
+            ..ModelCapabilities::default()
+        };
+    }
     if !known_api(config, model) {
         return ModelCapabilities::default();
     }
@@ -114,7 +141,7 @@ pub fn validate(config: &OpenAiConfig, request: &ChatRequest) -> LlmResult<()> {
     }
     let output = request
         .max_tokens
-        .unwrap_or_else(|| config.effective_max_tokens());
+        .unwrap_or_else(|| config.effective_max_tokens_for(&request.model));
     if !(1..=OUTPUT_TOKENS).contains(&output) || request.tools.len() > 128 {
         return Err(LlmError::Unsupported {
             feature: "this z.ai API request exceeds its output or function-tool limit".into(),

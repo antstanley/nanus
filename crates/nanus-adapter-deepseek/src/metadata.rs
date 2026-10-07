@@ -55,7 +55,9 @@ pub fn requires_preflight(config: &DeepSeekConfig, request: &ChatRequest) -> boo
 
 /// Rejects invalid output reservations only when this exact endpoint/model has known limits.
 pub fn validate_output(config: &DeepSeekConfig, request: &ChatRequest) -> LlmResult<()> {
-    let output = request.max_tokens.unwrap_or_else(|| config.max_tokens());
+    let output = request
+        .max_tokens
+        .unwrap_or_else(|| config.max_tokens_for(&request.model));
     if capabilities(config, &request.model)
         .max_output_tokens
         .is_some_and(|limit| output == 0 || output > limit)

@@ -111,7 +111,8 @@ pub struct AnthropicConfig {
     model: String,
     api_key: String,
     base_url: String,
-    max_tokens: u32,
+    /// The output budget a request that names none asks for; `None` is the model's ceiling.
+    max_tokens: Option<u32>,
     temperature: Option<f32>,
     response_limits: Option<nanus_ports::ResponseLimits>,
 }
@@ -147,7 +148,7 @@ impl AnthropicConfig {
             model: model.into(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
-            max_tokens: MAX_OUTPUT_TOKENS,
+            max_tokens: Some(MAX_OUTPUT_TOKENS),
             temperature: None,
             response_limits: None,
         }
@@ -224,16 +225,65 @@ impl AnthropicConfig {
         &self.base_url
     }
 
-    /// Returns the requested maximum output tokens, before the ceiling is applied.
+    /// Returns the requested maximum output tokens for the configured model, before the
+    /// ceiling is applied.
     #[must_use]
-    pub const fn max_tokens(&self) -> u32 {
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens_for(&self.model)
+    }
+
+    /// Returns the requested maximum output tokens for `model`, before the ceiling is applied.
+    ///
+    /// The configured budget when one is set, and otherwise `model`'s own ceiling. Read per
+    /// request, because a runner switches models by naming another id without rebuilding the
+    /// adapter, and Haiku's ceiling is half the 5-series'.
+    #[must_use]
+    pub fn max_tokens_for(&self, model: &str) -> u32 {
         self.max_tokens
+            .unwrap_or_else(|| model_max_output_tokens(model))
     }
 
     /// Returns the maximum output tokens a request may actually ask for.
     #[must_use]
     pub fn effective_max_tokens(&self) -> u32 {
-        self.max_tokens.min(model_max_output_tokens(&self.model))
+        self.max_tokens().min(model_max_output_tokens(&self.model))
+    }
+
+    /// Returns the documented limits and image support for `model` on this endpoint.
+    ///
+    /// Known only for exact models on the documented endpoint; a proxy or another id inherits
+    /// nothing, and an unknown limit is `None` rather than a plausible number.
+    #[must_use]
+    pub fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        if self.base_url.trim_end_matches('/') != DEFAULT_BASE_URL {
+            return nanus_ports::ModelCapabilities::default();
+        }
+        match model {
+            "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-1" => {
+                nanus_ports::ModelCapabilities {
+                    // Pixel acceptance is per exact model and needs the live evidence in
+                    // `docs/vision-evidence.md`; Fable 5.1 has none, so it stays Unknown.
+                    image_input: if model == "claude-fable-5-1" {
+                        nanus_ports::ImageInputSupport::Unknown
+                    } else {
+                        nanus_ports::ImageInputSupport::Supported
+                    },
+                    image_profile: match model {
+                        "claude-opus-5-5" => Some(
+                            nanus_ports::capabilities::ImageProfile::AnthropicOpus55HighPatch28V1,
+                        ),
+                        "claude-sonnet-5-5" => Some(
+                            nanus_ports::capabilities::ImageProfile::AnthropicSonnet55HighPatch28V1,
+                        ),
+                        _ => None,
+                    },
+                    context_window_tokens: Some(1_000_000),
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(model_max_output_tokens(model)),
+                }
+            }
+            _ => nanus_ports::ModelCapabilities::default(),
+        }
     }
 
     /// Returns the configured sampling temperature, if any.
@@ -254,8 +304,16 @@ impl AnthropicConfig {
                 "must be greater than zero",
             ));
         }
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
         Ok(())
+    }
+
+    /// Makes a request that names no budget ask for its model's own ceiling.
+    ///
+    /// Undoes [`set_max_tokens`](Self::set_max_tokens) and the library default alike. The
+    /// ceiling is resolved per request, so it follows a model switch.
+    pub const fn use_model_output_ceiling(&mut self) {
+        self.max_tokens = None;
     }
 
     /// Sets the sampling temperature.
@@ -378,5 +436,18 @@ mod tests {
             assert!(effort_levels(model).contains(&ReasoningEffort::Max));
         }
         assert_eq!(model_max_output_tokens("claude-haiku-4-5-20251001"), 64_000);
+    }
+
+    #[test]
+    fn an_unset_budget_follows_the_ceiling_of_the_model_asked() {
+        let mut config = AnthropicConfig::new("claude-haiku-4-5-20251001", "fixture-key");
+        assert_eq!(config.max_tokens_for("claude-opus-5-5"), MAX_OUTPUT_TOKENS);
+        config.use_model_output_ceiling();
+        assert_eq!(config.max_tokens(), 64_000);
+        assert_eq!(config.effective_max_tokens(), 64_000);
+        // A switch to a 5-series model is a request naming it, and its ceiling is twice Haiku's.
+        assert_eq!(config.max_tokens_for("claude-opus-5-5"), 128_000);
+        assert!(config.set_max_tokens(4_096).is_ok());
+        assert_eq!(config.max_tokens_for("claude-opus-5-5"), 4_096);
     }
 }

@@ -127,7 +127,7 @@ fn validate(
         || config.resolve_protocol(&request.model)? != Protocol::Responses
         || support != ToolCallSupport::Supported
         || !config.sends_output_ceiling()
-        || output > config.effective_max_tokens()
+        || output > config.effective_max_tokens_for(&request.model)
         || request.separate_reasoning_tokens != 0
         || request
             .temperature

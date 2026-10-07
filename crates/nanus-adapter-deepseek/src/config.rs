@@ -47,7 +47,8 @@ pub struct DeepSeekConfig {
     model: String,
     api_key: String,
     base_url: String,
-    max_tokens: u32,
+    /// The output budget a request that names none asks for; `None` is the model's ceiling.
+    max_tokens: Option<u32>,
     reasoning_effort: ReasoningEffort,
     temperature: Option<f32>,
     response_limits: Option<nanus_ports::ResponseLimits>,
@@ -85,7 +86,7 @@ impl DeepSeekConfig {
             model: model.into(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
-            max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
             response_limits: None,
@@ -159,10 +160,38 @@ impl DeepSeekConfig {
         &self.base_url
     }
 
-    /// Returns the maximum output tokens per request.
+    /// Returns the maximum output tokens a request to the configured model asks for.
     #[must_use]
-    pub const fn max_tokens(&self) -> u32 {
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens_for(&self.model)
+    }
+
+    /// Returns the maximum output tokens a request to `model` asks for when it names none.
+    ///
+    /// The configured budget when one is set, and otherwise `model`'s own ceiling. Read per
+    /// request rather than once, because a runner switches models by naming another id in the
+    /// request without rebuilding the adapter, and the ceiling is a fact about the model asked.
+    #[must_use]
+    pub fn max_tokens_for(&self, model: &str) -> u32 {
         self.max_tokens
+            .unwrap_or_else(|| self.output_ceiling(model))
+    }
+
+    /// Returns the most output tokens `model` may be asked for on this endpoint.
+    ///
+    /// The documented ceiling where this exact endpoint and model have one, and otherwise
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`]: a custom host or an unknown id inherits no evidence.
+    #[must_use]
+    pub fn output_ceiling(&self, model: &str) -> u32 {
+        self.capabilities(model)
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+    }
+
+    /// Returns the documented limits and image support for `model` on this endpoint.
+    #[must_use]
+    pub fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+        crate::metadata::capabilities(self, model)
     }
 
     /// Returns the configured reasoning effort.
@@ -190,8 +219,16 @@ impl DeepSeekConfig {
                 "must be greater than zero",
             ));
         }
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
         Ok(())
+    }
+
+    /// Makes a request that names no budget ask for its model's own ceiling.
+    ///
+    /// Undoes [`set_max_tokens`](Self::set_max_tokens) and the library default alike. The
+    /// ceiling is resolved per request, so it follows a model switch.
+    pub const fn use_model_output_ceiling(&mut self) {
+        self.max_tokens = None;
     }
 
     /// Sets the reasoning effort.
@@ -302,6 +339,26 @@ mod tests {
         assert!(config.set_max_tokens(0).is_err());
         // Pair assertion: a rejected value leaves the previous one in place.
         assert_eq!(config.max_tokens(), 1);
+    }
+
+    #[test]
+    fn an_unset_budget_follows_the_documented_ceiling_of_the_model_asked() {
+        let mut config = DeepSeekConfig::new(MODEL_FLASH, "key");
+        assert_eq!(config.max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+        config.use_model_output_ceiling();
+        assert_eq!(config.max_tokens(), 393_216);
+        assert_eq!(config.max_tokens_for(MODEL_PRO), 393_216);
+        // An id with no evidence falls back to the adapter default rather than guessing.
+        assert_eq!(
+            config.max_tokens_for("deepseek-next"),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+        let mut custom = DeepSeekConfig::with_base_url(MODEL_FLASH, "key", "http://127.0.0.1:1");
+        custom.use_model_output_ceiling();
+        assert_eq!(custom.max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+        // An explicit budget wins over the ceiling, for every model.
+        assert!(config.set_max_tokens(8_192).is_ok());
+        assert_eq!(config.max_tokens_for(MODEL_PRO), 8_192);
     }
 
     #[test]

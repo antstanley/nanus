@@ -1780,8 +1780,8 @@ async fn show_config(args: &Options) -> Result<(), String> {
     println!("sandbox mode: {:?}", config.sandbox_mode);
     println!("max steps per turn: {}", config.max_steps_per_turn);
     println!(
-        "context budget: {} estimated tokens (older turns are dropped past it)",
-        config.context_budget
+        "context budget: {}",
+        context_budget_display(&config, &selection)
     );
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
@@ -1824,14 +1824,36 @@ async fn credential_state(selection: &Selection) -> String {
 /// Renders the token budget, naming the provider's ceiling when it caps it.
 fn max_tokens_display(config: &NanusConfig, selection: &Selection) -> String {
     let ceiling = selection.max_output_tokens();
-    if config.max_tokens > ceiling {
+    let Some(max_tokens) = config.max_tokens else {
+        return format!("{ceiling} (the model's ceiling; unset)");
+    };
+    if max_tokens > ceiling {
         return format!(
-            "{} (capped to {ceiling} by {})",
-            config.max_tokens,
+            "{max_tokens} (capped to {ceiling} by {})",
             selection.provider()
         );
     }
-    format!("{} (ceiling {ceiling})", config.max_tokens)
+    format!("{max_tokens} (ceiling {ceiling})")
+}
+
+/// Renders the prompt budget, naming where it came from when the file names none.
+///
+/// An unset budget is the model's window, which the ordinary path fits into less the output
+/// ceiling and a margin; a model with no documented window keeps the conservative default.
+fn context_budget_display(config: &NanusConfig, selection: &Selection) -> String {
+    let dropped = "older turns are dropped past it";
+    if let Some(budget) = config.context_budget {
+        return format!("{budget} estimated tokens ({dropped})");
+    }
+    selection.context_window_tokens().map_or_else(
+        || {
+            format!(
+                "{} estimated tokens (unset, and the model's window is not documented; {dropped})",
+                nanus_domain::DEFAULT_CONTEXT_BUDGET
+            )
+        },
+        |window| format!("{window} tokens (the model's window; unset; {dropped})"),
+    )
 }
 
 /// Renders a resolved path, or names the home when it cannot be resolved.

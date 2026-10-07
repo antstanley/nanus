@@ -17,8 +17,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use nanus_adapter_anthropic::{AnthropicConfig, AnthropicLlm};
-use nanus_adapter_config::{DEFAULT_MAX_TOKENS, NanusConfig};
-use nanus_adapter_deepseek::{DEFAULT_MAX_OUTPUT_TOKENS, DeepSeekConfig, DeepSeekLlm};
+use nanus_adapter_config::NanusConfig;
+use nanus_adapter_deepseek::{DeepSeekConfig, DeepSeekLlm};
 use nanus_adapter_local::{LocalFs, LocalShell, SystemClock};
 use nanus_adapter_openai::{OpenAiConfig, OpenAiLlm, Protocol, Vendor, oauth};
 use nanus_adapter_secret::Secrets;
@@ -823,16 +823,6 @@ pub fn store_home() -> Result<PathBuf, BundleError> {
     nanus_adapter_store::resolve_home(None).map_err(|error| BundleError::session(error.to_string()))
 }
 
-/// The configured default has to fit inside the ceiling the shipped provider documents.
-///
-/// `build_llm` always overrides the adapter's own default with the configured one, so the
-/// configuration's default is what every request sends. A default above the provider's
-/// documented ceiling would ask for more output than the provider permits on every single
-/// request, and that failure surfaces as a refused request rather than as anything pointing
-/// back here. Stated as a constant so it fails the build instead of a run, and stated *here*
-/// because this is the only module where both numbers are in scope.
-const _: () = assert!(DEFAULT_MAX_TOKENS <= DEFAULT_MAX_OUTPUT_TOKENS);
-
 /// Builds the model adapter the selection calls for.
 ///
 /// This is the one place that maps a provider to an adapter, which is what keeps every
@@ -894,9 +884,12 @@ fn build_deepseek(
 ) -> Result<DeepSeekLlm, BundleError> {
     let mut adapter =
         DeepSeekConfig::with_base_url(selection.model(), key.expose(), selection.endpoint());
-    adapter
-        .set_max_tokens(config.max_tokens)
-        .map_err(|error| BundleError::config(error.to_string()))?;
+    match config.max_tokens {
+        Some(max_tokens) => adapter
+            .set_max_tokens(max_tokens)
+            .map_err(|error| BundleError::config(error.to_string()))?,
+        None => adapter.use_model_output_ceiling(),
+    }
     // The configuration carries its own spelling of the effort so a TOML file can
     // name it; the adapter speaks the ports vocabulary.
     adapter.set_reasoning_effort(selection.effort(config.reasoning_effort));
@@ -935,9 +928,12 @@ fn compatible_config(
     let mut adapter =
         OpenAiConfig::with_base_url(vendor, selection.model(), key, selection.endpoint());
     adapter.set_protocol(selection.protocol());
-    adapter
-        .set_max_tokens(config.max_tokens)
-        .map_err(|error| BundleError::config(error.to_string()))?;
+    match config.max_tokens {
+        Some(max_tokens) => adapter
+            .set_max_tokens(max_tokens)
+            .map_err(|error| BundleError::config(error.to_string()))?,
+        None => adapter.use_model_output_ceiling(),
+    }
     adapter.set_reasoning_effort(selection.effort(config.reasoning_effort));
     Ok(adapter)
 }
@@ -955,9 +951,12 @@ fn build_anthropic(
 ) -> Result<AnthropicLlm, BundleError> {
     let mut adapter =
         AnthropicConfig::with_base_url(selection.model(), key.expose(), selection.endpoint());
-    adapter
-        .set_max_tokens(config.max_tokens)
-        .map_err(|error| BundleError::config(error.to_string()))?;
+    match config.max_tokens {
+        Some(max_tokens) => adapter
+            .set_max_tokens(max_tokens)
+            .map_err(|error| BundleError::config(error.to_string()))?,
+        None => adapter.use_model_output_ceiling(),
+    }
     AnthropicLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
 }
 
@@ -1013,10 +1012,14 @@ fn build_runner(
         AGENT_SYSTEM_PROMPT_MAX,
     )
     .map_err(|error| BundleError::config(error.to_string()))?
-    .with_context_budget(config.context_budget)
-    .map_err(|error| BundleError::config(error.to_string()))?
     .with_approval(config.approval_policy)
     .with_sandbox(config.sandbox_mode);
+    let agent = match config.context_budget {
+        Some(budget) => agent
+            .with_context_budget(budget)
+            .map_err(|error| BundleError::config(error.to_string()))?,
+        None => agent,
+    };
     // The runner is given the same handle the context publishes, so registering a tool
     // later is visible on the next request rather than requiring a rebuild.
     let runner = AgentRunner::new(
@@ -1026,13 +1029,28 @@ fn build_runner(
         agent,
         clock.clone(),
     )?;
-    // A request that carries pixels needs an explicit output reservation, and the configured
-    // ceiling (128K) would not fit the default budget beside any input. A quarter of the budget
-    // is reserved, capped at 16K — below every offered model's own ceiling, so it holds after a
-    // model switch — and only for those requests. Both vendors count reasoning inside the output.
+    // An unset budget is the model's own window, resolved per request so it follows a switch;
+    // a model without a documented window keeps the domain's conservative default.
+    let runner = if config.context_budget.is_none() {
+        runner.with_model_context_budget()
+    } else {
+        runner
+    };
+    // A request that carries pixels needs an explicit output reservation, and a model's whole
+    // output ceiling would not fit a small budget beside any input. A quarter of a configured
+    // budget is reserved, capped at 16K — below every offered model's own ceiling, so it holds
+    // after a model switch — and only for those requests. Both vendors count reasoning inside
+    // the output.
     let image_output = config
         .max_tokens
-        .min(config.context_budget.checked_div(4).unwrap_or(0))
+        .unwrap_or(IMAGE_OUTPUT_RESERVATION_MAX)
+        .min(
+            config
+                .context_budget
+                .map_or(IMAGE_OUTPUT_RESERVATION_MAX, |budget| {
+                    budget.checked_div(4).unwrap_or(0)
+                }),
+        )
         .min(IMAGE_OUTPUT_RESERVATION_MAX);
     Ok(runner.with_image_request_budget(image_output, 0))
 }
@@ -1234,6 +1252,42 @@ mod tests {
                 if message.contains("nanus auth set deepseek")),
             "{collected:?}"
         );
+    }
+
+    /// An unset `max_tokens` asks each request for the ceiling of the model it names, which is
+    /// what makes a switch from Haiku to a 5-series model get the larger one; a configured value
+    /// is what every model is asked for.
+    #[test]
+    fn an_unset_output_budget_is_the_ceiling_of_the_model_each_request_names() {
+        let key = Secret::new("fixture-key");
+        let sent = |config: &NanusConfig, model: &str| {
+            let selection = Selection::resolve(config).unwrap();
+            let request =
+                nanus_ports::ChatRequest::new(model, vec![nanus_domain::Message::user("hi")]);
+            match selection.provider() {
+                Provider::Anthropic => build_anthropic(config, &selection, &key)
+                    .unwrap()
+                    .encode(&request)["max_tokens"]
+                    .clone(),
+                _ => build_deepseek(config, &selection, &key)
+                    .unwrap()
+                    .encode(&request)["max_tokens"]
+                    .clone(),
+            }
+        };
+        let mut anthropic = NanusConfig {
+            provider: Some(String::from("anthropic")),
+            model: Some(String::from("claude-haiku-4-5-20251001")),
+            ..NanusConfig::default()
+        };
+        assert_eq!(sent(&anthropic, "claude-haiku-4-5-20251001"), 64_000);
+        assert_eq!(sent(&anthropic, "claude-opus-5-5"), 128_000);
+        let deepseek = NanusConfig::default();
+        assert_eq!(sent(&deepseek, "deepseek-flash"), 393_216);
+
+        anthropic.max_tokens = Some(4_096);
+        assert_eq!(sent(&anthropic, "claude-haiku-4-5-20251001"), 4_096);
+        assert_eq!(sent(&anthropic, "claude-opus-5-5"), 4_096);
     }
 
     /// A `SecretPort` holding nothing, so the unconfigured case does not depend on whether the

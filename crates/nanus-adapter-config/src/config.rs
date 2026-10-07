@@ -37,26 +37,6 @@ pub const CONFIG_VERSION: u32 = 1;
 /// The environment variable that names an explicit configuration file.
 pub const CONFIG_ENV: &str = "NANUS_CONFIG";
 
-/// The per-response token budget used when the configuration names none.
-///
-/// It sits *below* the output ceiling `DeepSeek` documents (256000) rather than at it,
-/// because this is the value every deployment inherits unless it says otherwise and the
-/// budget is sent with every request. Spending a provider's whole ceiling as a shared
-/// default leaves no headroom for the second provider whose ceiling is lower, and the
-/// failure that buys is a request refused upstream rather than a file written short. It
-/// began at 8192, which cut long answers and large file writes off at the model's token
-/// ceiling.
-pub const DEFAULT_MAX_TOKENS: u32 = 128_000;
-
-/// The prompt budget in estimated tokens, for one request, when the configuration names none.
-///
-/// A conversation longer than this has its oldest turns dropped — with a notice the model reads
-/// — rather than being sent to a provider that would refuse it, and a turn whose *newest* part
-/// does not fit is refused with a sentence naming this field. The estimate is approximate by
-/// design (see `nanus-domain`'s context module), which is why the default sits well below every
-/// provider's window rather than at it.
-pub const DEFAULT_CONTEXT_BUDGET: u32 = 64_000;
-
 /// The step budget for one turn used when the configuration names none.
 ///
 /// The number exists to bound a *runaway* loop, and every value it has had was chosen to
@@ -208,8 +188,13 @@ pub struct NanusConfig {
     ///
     /// Absent means the provider's (or the plan's) default model.
     pub model: Option<String>,
-    /// The per-response token budget.
-    pub max_tokens: u32,
+    /// The per-response token budget, when the file names one.
+    ///
+    /// Absent means the selected model's own documented output ceiling, resolved for each
+    /// request, so it follows a model switch. A value above the ceiling is capped at it by the
+    /// adapters that cap, and refused before HTTP by the one that refuses. Absent is not the
+    /// same as any number: a file that writes the old `128000` default keeps it.
+    pub max_tokens: Option<u32>,
     /// How much reasoning to ask for, when the file names a step.
     ///
     /// Absent means the plan's own default effort, and where the plan has none,
@@ -222,8 +207,16 @@ pub struct NanusConfig {
     pub sandbox_mode: SandboxMode,
     /// How many model steps one turn may take.
     pub max_steps_per_turn: u32,
-    /// The prompt budget in estimated tokens, for one request.
-    pub context_budget: u32,
+    /// The prompt budget in estimated tokens, for one request, when the file names one.
+    ///
+    /// Absent means the selected model's own documented context window, resolved for each
+    /// request. The ordinary path fits the conversation into that window less the model's output
+    /// ceiling, with room left for the estimate's error; a model whose window this build has no
+    /// evidence for keeps the conservative default of 64000. A conversation longer than the
+    /// budget has its oldest turns dropped — with a notice the model reads — rather than being
+    /// sent to a provider that would refuse it, and a turn whose *newest* part does not fit is
+    /// refused with a sentence naming this field.
+    pub context_budget: Option<u32>,
     /// How many tool calls may run at once.
     pub max_parallel_tools: u32,
     /// How much of a tool call and a thinking segment the interface draws.
@@ -284,12 +277,12 @@ impl Default for NanusConfig {
             plan: None,
             base_url: None,
             model: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: None,
             reasoning_effort: None,
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,
-            context_budget: DEFAULT_CONTEXT_BUDGET,
+            context_budget: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             tui_detail: TuiDetail::default(),
             markdown: true,

@@ -590,14 +590,72 @@ impl Selection {
         self.plan.credential.is_some_and(PlanCredential::is_oauth)
     }
 
-    /// Returns the provider's documented maximum output tokens.
+    /// Returns the selected model's documented maximum output tokens.
+    ///
+    /// The exact model's ceiling on this endpoint where its adapter has evidence for one, and
+    /// otherwise the provider's: the number an unset `max_tokens` asks for.
     #[must_use]
     pub fn max_output_tokens(&self) -> u32 {
-        if self.provider == Provider::Anthropic {
-            nanus_adapter_anthropic::model_max_output_tokens(&self.model)
-        } else {
-            self.provider.max_output_tokens()
+        match self.provider {
+            Provider::DeepSeek => self.deepseek_config().output_ceiling(&self.model),
+            Provider::Anthropic => nanus_adapter_anthropic::model_max_output_tokens(&self.model),
+            Provider::Zai => self
+                .compatible_config(Vendor::Zai)
+                .output_ceiling(&self.model),
+            Provider::OpenAi => self
+                .compatible_config(Vendor::OpenAi)
+                .output_ceiling(&self.model),
         }
+    }
+
+    /// Returns the selected model's documented context window, when its adapter has one.
+    ///
+    /// `None` for a model, endpoint or wire with no evidence, which is the case an unset
+    /// `context_budget` keeps its conservative default for.
+    #[must_use]
+    pub fn context_window_tokens(&self) -> Option<u32> {
+        self.capabilities().context_window_tokens
+    }
+
+    /// Returns the selected model's documented limits, as the adapter that talks to it records them.
+    ///
+    /// Asked of an adapter configuration built from this selection as the composition builds one,
+    /// without a key: the limits are the adapter's facts, so restating them here could only drift,
+    /// and knowing a model's window needs no credential.
+    #[must_use]
+    pub fn capabilities(&self) -> nanus_ports::ModelCapabilities {
+        match self.provider {
+            Provider::DeepSeek => self.deepseek_config().capabilities(&self.model),
+            Provider::Anthropic => nanus_adapter_anthropic::AnthropicConfig::with_base_url(
+                &self.model,
+                "",
+                &self.endpoint,
+            )
+            .capabilities(&self.model),
+            Provider::Zai => self
+                .compatible_config(Vendor::Zai)
+                .capabilities(&self.model),
+            Provider::OpenAi => self
+                .compatible_config(Vendor::OpenAi)
+                .capabilities(&self.model),
+        }
+    }
+
+    /// A keyless `DeepSeek` configuration for this selection, for reading its facts.
+    fn deepseek_config(&self) -> nanus_adapter_deepseek::DeepSeekConfig {
+        nanus_adapter_deepseek::DeepSeekConfig::with_base_url(&self.model, "", &self.endpoint)
+    }
+
+    /// A keyless `OpenAI`-compatible configuration for this selection, on the plan's own wire.
+    fn compatible_config(&self, vendor: Vendor) -> nanus_adapter_openai::OpenAiConfig {
+        let mut config = nanus_adapter_openai::OpenAiConfig::with_base_url(
+            vendor,
+            &self.model,
+            "",
+            &self.endpoint,
+        );
+        config.set_protocol(self.protocol());
+        config
     }
 }
 
@@ -607,6 +665,61 @@ mod tests {
 
     fn config() -> NanusConfig {
         NanusConfig::default()
+    }
+
+    /// Resolves a selection for `provider`, `plan` and `model`, which are expected to resolve.
+    fn selected(provider: &str, plan: Option<&str>, model: &str) -> Selection {
+        let config = NanusConfig {
+            provider: Some(provider.to_owned()),
+            plan: plan.map(str::to_owned),
+            model: Some(model.to_owned()),
+            ..config()
+        };
+        Selection::resolve(&config).unwrap_or_else(|error| panic!("{provider}: {error}"))
+    }
+
+    /// The limits an unset budget resolves to are the exact model's, as its adapter documents
+    /// them, and a model, plan or endpoint with no evidence falls back rather than guessing.
+    #[test]
+    fn each_selected_model_reports_its_own_documented_limits() {
+        let cases = [
+            ("deepseek", None, "deepseek-flash", 393_216, Some(1_048_576)),
+            (
+                "deepseek",
+                None,
+                "deepseek-v4-pro",
+                393_216,
+                Some(1_048_576),
+            ),
+            (
+                "anthropic",
+                None,
+                "claude-opus-5-5",
+                128_000,
+                Some(1_000_000),
+            ),
+            ("anthropic", None, "claude-haiku-4-5-20251001", 64_000, None),
+            ("zai", None, "glm-5.3", 131_072, Some(1_000_000)),
+            ("zai", Some("coding"), "glm-5.3", 131_072, Some(1_000_000)),
+            ("openai", None, "gpt-6-astra", 128_000, Some(1_050_000)),
+        ];
+        for (provider, plan, model, output, window) in cases {
+            let selection = selected(provider, plan, model);
+            assert_eq!(selection.max_output_tokens(), output, "{provider} {model}");
+            assert_eq!(
+                selection.context_window_tokens(),
+                window,
+                "{provider} {model}"
+            );
+        }
+        // A proxy inherits no evidence, so it is the provider's fallback ceiling and no window.
+        let proxy = Selection::resolve(&NanusConfig {
+            base_url: Some(String::from("http://127.0.0.1:9")),
+            ..config()
+        })
+        .unwrap_or_else(|error| panic!("a proxy resolves: {error}"));
+        assert_eq!(proxy.max_output_tokens(), DEEPSEEK_MAX_OUTPUT_TOKENS);
+        assert_eq!(proxy.context_window_tokens(), None);
     }
 
     #[test]

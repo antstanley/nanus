@@ -186,7 +186,7 @@ impl AgentRunner {
         let window = caps
             .context_window_tokens
             .unwrap_or(u32::MAX)
-            .min(self.config.context_budget);
+            .min(self.context_budget());
         window
             .saturating_sub(reservation)
             .min(caps.max_input_tokens.unwrap_or(u32::MAX))
@@ -201,7 +201,7 @@ impl AgentRunner {
         request.separate_reasoning_tokens = self
             .request_reservation
             .map_or(0, |(_, reasoning)| reasoning);
-        request.context_budget = Some(self.config.context_budget);
+        request.context_budget = Some(self.context_budget());
         let mut source = vec![Message::system(self.managed_system_prompt())];
         source.extend(session.derive_messages());
         request.source_history = Some(source.into());

@@ -355,6 +355,12 @@ pub struct AgentRunner {
     selection: selection::Selection,
     /// How archive leases reach the `bash` tool, when its output can be captured.
     capture: Option<crate::CaptureBroker>,
+    /// Whether the context budget is the window of the model in force, read per request.
+    ///
+    /// `false` keeps [`AgentConfig::context_budget`] for every model, which is what a library
+    /// host gets. `true` is a configuration that named no budget: the model's documented window
+    /// is the budget, and a model with none keeps the configured value as its fallback.
+    model_context: bool,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -411,6 +417,7 @@ impl AgentRunner {
             records: None,
             selection: selection::Selection::default(),
             capture: None,
+            model_context: false,
         })
     }
 
@@ -448,6 +455,56 @@ impl AgentRunner {
     pub fn with_capture(mut self, broker: crate::CaptureBroker) -> Self {
         self.capture = Some(broker);
         self
+    }
+
+    /// Makes the context budget the documented window of the model in force.
+    ///
+    /// Read per request from the adapter, so a model switch takes its own window with it. A model
+    /// whose adapter documents no window keeps [`AgentConfig::context_budget`], so the fallback is
+    /// the conservative default rather than a guess.
+    #[must_use]
+    pub const fn with_model_context_budget(mut self) -> Self {
+        self.model_context = true;
+        self
+    }
+
+    /// Returns the budget a request is fitted to, its output reservation included.
+    ///
+    /// The configured budget, or with [`with_model_context_budget`](Self::with_model_context_budget)
+    /// the window of the model in force when its adapter documents one.
+    #[must_use]
+    pub fn context_budget(&self) -> u32 {
+        self.model_limits()
+            .and_then(|caps| caps.context_window_tokens)
+            .unwrap_or(self.config.context_budget)
+    }
+
+    /// Returns the budget the ordinary text path fits a conversation's messages into.
+    ///
+    /// The configured budget as it is. A model's window is not: that path counts only the
+    /// messages, at characters over four, and the request asks for the model's whole output
+    /// ceiling beside them. So the room is the window less that ceiling (and no more than the
+    /// input limit), and a quarter of it is left unspent for code and JSON, which tokenize closer
+    /// to three characters a token than four, and for the tool schemas sent outside the count.
+    fn prompt_budget(&self) -> u32 {
+        let Some(caps) = self.model_limits() else {
+            return self.config.context_budget;
+        };
+        let Some(window) = caps.context_window_tokens else {
+            return self.config.context_budget;
+        };
+        let room = window
+            .saturating_sub(caps.max_output_tokens.unwrap_or(0))
+            .min(caps.max_input_tokens.unwrap_or(u32::MAX));
+        let budget = room.checked_div(4).unwrap_or(0).saturating_mul(3);
+        assert!(budget <= window, "the prompt budget is inside the window");
+        budget.max(1)
+    }
+
+    /// The documented limits of the model in force, when the budget follows the model.
+    fn model_limits(&self) -> Option<nanus_ports::ModelCapabilities> {
+        self.model_context
+            .then(|| self.llm.borrow().capabilities(&self.model()))
     }
 
     /// Sets the actual output ceiling and separately bounded reasoning reservation.
@@ -892,7 +949,7 @@ impl AgentRunner {
             request.separate_reasoning_tokens = reasoning;
         }
         if images || self.request_reservation.is_some() {
-            request.context_budget = Some(self.config.context_budget);
+            request.context_budget = Some(self.context_budget());
             // Validate every retained image against the newly selected model, before elision.
             let model = self.llm.borrow().clone();
             let caps = model.capabilities(&request.model);
@@ -907,7 +964,7 @@ impl AgentRunner {
             let mut failure = None;
             let fitted = nanus_domain::context::fit_with_source(
                 &source,
-                self.config.context_budget.min(u32::MAX.saturating_sub(1)),
+                self.context_budget().min(u32::MAX.saturating_sub(1)),
                 |candidate| {
                     let mut probe = request.clone();
                     probe.messages = candidate.to_vec();
@@ -925,7 +982,7 @@ impl AgentRunner {
             request.messages = fitted.messages;
             return Ok((request, fitted.elision));
         }
-        let fitted = nanus_domain::fit(messages, self.config.context_budget)
+        let fitted = nanus_domain::fit(messages, self.prompt_budget())
             .map_err(|error| BundleError::context(error.to_string()))?;
         request.messages = fitted.messages;
         Ok((request, fitted.elision))
@@ -1753,6 +1810,96 @@ mod tests {
 
     fn runner(llm: Rc<Box<dyn LlmPort>>, tools: ToolRegistryHandle) -> Option<AgentRunner> {
         AgentRunner::new(llm, tools, "you are a test", config(), clock()).ok()
+    }
+
+    /// A model that documents a small window for one id and nothing for any other.
+    struct WindowedLlm;
+
+    impl LlmPort for WindowedLlm {
+        fn model(&self) -> &'static str {
+            "test-model"
+        }
+
+        fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
+            if model != "small-model" {
+                return nanus_ports::ModelCapabilities::default();
+            }
+            nanus_ports::ModelCapabilities {
+                context_window_tokens: Some(1_000),
+                max_input_tokens: Some(1_000),
+                max_output_tokens: Some(200),
+                ..nanus_ports::ModelCapabilities::default()
+            }
+        }
+    }
+
+    /// Five completed turns of about 160 estimated tokens each.
+    fn long_session() -> Session {
+        let mut session = session();
+        for turn in 0..5_u32 {
+            session.append(SessionEvent::TurnStart { turn });
+            session.append(SessionEvent::UserMessage {
+                content_blocks: None,
+                text: format!("question {turn} {}", "x".repeat(300)),
+            });
+            session.append(SessionEvent::AssistantMessage {
+                replay: None,
+                text: Some(format!("answer {turn} {}", "y".repeat(300))),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                interrupted: false,
+                model: None,
+                effort: None,
+            });
+            session.append(SessionEvent::TurnEnd {
+                turn,
+                reason: TurnEndReason::Completed,
+            });
+        }
+        session
+    }
+
+    /// An unconfigured budget is the window of the model in force, read per request: a switch to
+    /// a model with a small window trims the conversation, the prompt is fitted inside the window
+    /// less the output ceiling and the estimate's margin, and a model with no documented window
+    /// keeps the configured fallback.
+    #[test]
+    fn an_unconfigured_budget_follows_the_window_of_the_model_in_force() {
+        let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(WindowedLlm));
+        let follows = runner(Rc::clone(&llm), registry_with_echo())
+            .unwrap_or_else(|| unreachable!("the runner builds"))
+            .with_model_context_budget();
+        let session = long_session();
+
+        assert_eq!(
+            follows.context_budget(),
+            nanus_domain::DEFAULT_CONTEXT_BUDGET
+        );
+        let (_, elision) = follows.build_request(&session).unwrap();
+        assert_eq!(elision, None, "the fallback holds the whole conversation");
+
+        follows.set_model("small-model");
+        assert_eq!(follows.context_budget(), 1_000);
+        // (1000 - 200) less a quarter.
+        assert_eq!(follows.prompt_budget(), 600);
+        let (request, elision) = follows.build_request(&session).unwrap();
+        let elision = elision.unwrap_or_else(|| panic!("a small window trims the conversation"));
+        assert_eq!(elision.budget, 600);
+        assert!(nanus_domain::estimate(&request.messages) <= 600);
+
+        // A runner told nothing keeps its configured budget whatever the model.
+        let fixed =
+            runner(llm, registry_with_echo()).unwrap_or_else(|| unreachable!("the runner builds"));
+        fixed.set_model("small-model");
+        assert_eq!(fixed.context_budget(), nanus_domain::DEFAULT_CONTEXT_BUDGET);
+        assert_eq!(fixed.prompt_budget(), nanus_domain::DEFAULT_CONTEXT_BUDGET);
+        let (_, elision) = fixed.build_request(&session).unwrap();
+        assert_eq!(elision, None);
     }
 
     /// The budget is enforced by the turn machine and was, until it bit, invisible to the

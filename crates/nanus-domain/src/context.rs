@@ -25,8 +25,8 @@
 //! the number a budget is eventually checked against. What this module has is a deterministic
 //! approximation — characters over four, plus a small fixed cost per message — close for prose,
 //! generous for code and JSON, and identical on every platform. A budget is therefore a ceiling
-//! to stay under rather than a promise about a number, which is why the configuration's default
-//! sits well below every provider's window.
+//! to stay under rather than a promise about a number, which is why a budget taken from a model's
+//! window is spent to three quarters of it rather than to its edge.
 
 use crate::message::Message;
 

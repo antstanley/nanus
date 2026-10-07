@@ -61,7 +61,7 @@ pub fn build_counted(config: &AnthropicConfig, request: &ChatRequest) -> (Value,
         json!(
             request
                 .max_tokens
-                .unwrap_or_else(|| config.max_tokens())
+                .unwrap_or_else(|| config.max_tokens_for(&request.model))
                 .min(crate::config::model_max_output_tokens(&request.model))
         ),
     );
