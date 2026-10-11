@@ -226,8 +226,9 @@ second set. Where it does not, the divergence is named rather than papered over.
 | Key | Effect |
 |---|---|
 | `y` | while an approval dialog is up: allow the call once |
-| `a` | while an approval dialog is up: review a standing grant; a second `y` grants it for the session |
+| `a` | while an approval dialog is up: review a standing grant; after a pause, `y` grants it for the session and any other key withdraws it |
 | `Tab` / arrows, then `Enter` | while an approval dialog is up: choose an answer, initially Deny |
+| any key but `Esc`, within half a second of other typing | while an approval dialog is up: nothing — see below |
 | `PageUp` / `PageDown` | while a dialog is up: read its full explanations without changing the decision |
 | `n` (or `Esc`) | while an approval dialog is up: deny it |
 | `Shift+Tab` | open permissions from the composer or an approval; navigate backward inside other choosers |
@@ -237,8 +238,8 @@ second set. Where it does not, the divergence is named rather than papered over.
 | `Shift` + arrows, `Home` / `End` | select text in the transcript |
 | `Ctrl+C` | copy what is highlighted, wherever it is — transcript, dialogue, composer, title |
 | `F6` / `Ctrl+Shift+C` | copy the complete active dialog, including off-screen text; otherwise copy the visible screen |
-| `F7` / `Ctrl+Shift+U` | copy the authorization URL, including after hiding the note |
-| `F8` / `Ctrl+Shift+Y` | copy the authorization code, including after hiding the note |
+| `F7` / `Ctrl+Shift+U` | copy the authorization URL, including after hiding the note (the chord only where the terminal reports it — see below) |
+| `F8` / `Ctrl+Shift+Y` | copy the authorization code, including after hiding the note (likewise) |
 | `Esc` | clear the selection; then stop the running turn, then cancel the prompt, then quit |
 | `Ctrl+Q` / `F9` | quit from every dialog |
 | `Ctrl+D` | quit |
@@ -277,16 +278,38 @@ wherever the reader is: the text of the list is exactly the kind of thing somebo
 take out of this interface, and the highlight can be drawn over it while it is up.
 
 **An approval question owns the keyboard and the visible dialog.** `y` allows once, `n` or
-`Esc` denies, and `a` opens a standing-grant warning. Only a second `y` confirms that grant;
-repeated `a` or Enter does not. `Esc` from the warning returns to the question. `Tab` and arrows
-choose an answer and Enter applies it, with Deny selected for every new question. Ctrl/Alt-modified
-letters never count as consent: `Ctrl+Y` is not `y`, even if a question arrived while you were editing.
+`Esc` denies, and `a` opens a standing-grant warning. Only `y` confirms that grant, and every
+other key withdraws it and returns to the question — repeated `a`, Enter, a stray letter. `Tab` and
+arrows choose an answer and Enter applies it, with Deny selected for every new question. A chord
+never counts as consent, whichever modifier makes it one: `Ctrl+Y`, `Alt+Y` and `Super+Y` are not
+`y`, and a modified Enter — `Shift+Enter`, the composer's newline, included — decides nothing.
 
-The harness's reason wraps and scrolls with PageUp/PageDown and Home/End; the choices and exit
-instructions stay in a fixed footer when the screen can hold it. On exceptionally tiny terminals,
-all text, including the footer, remains scrollable rather than discarded. A provider or key-entry
-dialog waiting behind an approval retains its state but cannot receive hidden input. Permissions
-can still be opened with Shift+Tab, above the question; closing them returns to it.
+**A question takes no answer until the keyboard has been quiet for half a second with it on
+screen.** It opens whenever the agent asks, which is usually over a composer somebody is typing in,
+and its answers are letters of ordinary prose: without this, `okay` typed as a question arrived was
+a standing grant, and the mention gesture — `Tab`, then `Enter` — allowed the call. So a key that
+reaches a question sooner than `APPROVAL_SETTLE` after it appeared, or after the previous keystroke
+wherever that one went, is ignored, and the status line says so; a burst of typing or a paste holds
+the dialog shut for as long as it lasts. The quiet is asked for again whenever the question changes
+— a new one arrives, the standing-grant warning opens or is withdrawn — and whenever a key that
+means nothing to the dialog shows the reader is still typing. Once it has been given, choosing and
+deciding are as quick as the reader likes. `Esc` is never held back, because it only refuses. The
+interface has no timer: the clock is read when a key or a frame arrives and handed to the view,
+which stays a pure function of its state. This narrows the hazard and does not close it — a reader
+who pauses and then types `y` without looking has allowed one call — which is the limit of
+answering with a letter, and why the standing grant takes two keys with a pause between them.
+
+The harness's reason is drawn as it was written — runs of spaces and indentation included, since it
+may be the command being approved — and wraps and scrolls with PageUp/PageDown and Home/End; the
+choices and exit instructions stay in a fixed footer when the screen can hold it. Choosing an answer
+or resizing the terminal keeps the reader's place in a long reason; only a different dialog starts
+from its top. On exceptionally tiny terminals, all text, including the footer, remains scrollable
+rather than discarded. A provider or authorization dialog waiting behind an approval retains its
+state but cannot receive hidden input. The masked key field is the exception in the other
+direction: a provider can be changed while a turn runs, so a question can arrive while a key is
+being typed or pasted, and the field keeps the keyboard until it is closed — the status line says a
+decision is waiting — because a secret's characters must never be read as answers. Permissions can
+still be opened with Shift+Tab, above the question; closing them returns to it.
 `Ctrl+Q`, `Ctrl+D`, and `F9` quit from every dialog. `Ctrl+C` copies a selection without answering.
 
 **`Ctrl+R` searches the history** rather than toggling anything, because that is what it is
@@ -1014,16 +1037,24 @@ uses the terminal's own foreground/background, no dimming, and bold/reversal for
 contrast, like the default terminal palette's, depends on the terminal settings. A non-empty
 `NO_COLOR` removes every colour from whichever theme was chosen, preserving emphasis and focus.
 
-Dialogs are contained within the terminal, long names and explanations wrap, and PageUp/PageDown
-read the complete text. Selection changes and resizes reveal the selected item. Help descriptions
-are not truncated to a two-column table. The composer edits and wraps whole graphemes, including
-combining characters and joined emoji, measures wide characters by display columns, and positions
-the real terminal cursor at its insertion point when no modal is open.
+Dialogs are contained within the terminal, long names and explanations wrap literally — no space
+is collapsed — and PageUp/PageDown read the complete text. Selection changes and resizes reveal the
+selected item without otherwise moving the page. Help descriptions are not truncated to a two-column
+table. The composer edits and wraps whole graphemes, including combining characters and joined
+emoji, measures wide characters by display columns — for wrapping, for the caret, and for the cell a
+click or a drag lands on — and positions the real terminal cursor at its insertion point when no
+modal is open.
 
 `F6` copies the full active dialog, including text outside its viewport, or the visible screen
 when none is open. `F7` copies the authorization URL and `F8` copies its code; both remain available
 after hiding the note. Ctrl+Shift+C/U/Y are equivalent where a terminal reports those chords;
-function keys are the fallback where it does not. A masked API key is never copied as plaintext.
+function keys are the fallback where it does not, and they are the keys to reach for when unsure.
+A terminal without the enhanced keyboard protocol sends `Ctrl+Shift+U` as `Ctrl+U` and
+`Ctrl+Shift+Y` as `Ctrl+Y`, and the interface cannot tell them apart: in the composer those are the
+editing keys, so the first cuts the line being written (`Ctrl+Y` puts it back) and the second pastes
+the last cut. Nothing is copied and nothing is lost for good, but it is not what was asked for. The
+result of a copy is reported on the status line; when a dialog covers that row, it takes the
+dialog's top row instead. A masked API key is never copied as plaintext.
 `Ctrl+C` retains its selection-only behavior, and `/copy` still copies the newest answer.
 
 These are accessibility improvements, not a WCAG conformance or screen-reader compatibility

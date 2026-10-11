@@ -330,6 +330,12 @@ design docs too.
   the default state and denies when nobody can answer, and the permissive states
   (`permitted`, `all_calls`) are names a human chooses. `all_calls` grants every
   exception; it is not the default and must not become one.
+- **An approval is answered by a deliberate key, not by whatever was being typed.** The
+  interface's dialog takes nothing but `Esc` until the keyboard has been quiet for
+  `APPROVAL_SETTLE` with the question on screen, asks for that quiet again whenever the question
+  changes, rejects every chord, and sits *below* the masked key field in `active_modal` so a
+  secret's characters are never read as answers. Time reaches the view as a field the event loop
+  sets (`ViewState::now`), never from a clock, so the tests move it by assignment.
 - **Retired model ids do not resolve.** `deepseek-chat` and `deepseek-reasoner`
   are gone; the supported ids are `deepseek-flash` and `deepseek-v4-pro`.
 - **A credential is not configuration, and its account names what it is for.**

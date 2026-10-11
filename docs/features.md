@@ -650,9 +650,10 @@ supports:
   colour from all chrome and markdown while preserving focus and emphasis. Essential instructions
   are never dimmed, and `tui_mouse = false` preserves native terminal selection.
 - **Bounded, scrollable dialogs**: complete explanations and long choice names wrap; the selected
-  row is revealed and controls stay in a fixed footer. Approvals default to Deny, reject modified
-  letter shortcuts and require a second confirmation for standing grants. Global quit works in
-  every dialog. F6 copies complete UI text without dragging; F7/F8 copy authorization details.
+  row is revealed and controls stay in a fixed footer. Approvals default to Deny, reject every
+  chord, take no answer until the keyboard has been quiet for half a second, never take the keys
+  from a masked key being typed, and require a second confirmation for standing grants. Global
+  quit works in every dialog. F6 copies complete UI text without dragging; F7/F8 copy authorization details.
   The markdown renderer does no I/O and strips control characters at the parse boundary.
 
 ## The service

@@ -13,6 +13,8 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_segmentation::UnicodeSegmentation as _;
+use unicode_width::UnicodeWidthStr as _;
 
 use crate::Theme;
 
@@ -20,8 +22,8 @@ use crate::Theme;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Modal {
     Permissions,
-    Approval,
     KeyEntry,
+    Approval,
     Credential,
     Authorization,
     Provider,
@@ -92,9 +94,76 @@ impl Content {
     }
 }
 
+/// The columns a tab is drawn as: a terminal cell cannot hold one, and dropping it joins two words.
+const TAB: &str = "    ";
+
 /// Wraps literal text by display columns, preserving all content and hard newlines.
+///
+/// Its own wrapper rather than the markdown renderer's, which is for prose: that one treats a run
+/// of spaces as a single separator and drops the ones a line begins with. That is right for a
+/// paragraph and wrong here, where the text may be the command a reader is being asked to approve
+/// and `printf 'a    b'` is not `printf 'a b'`. Every space is kept except the ones a break lands
+/// on and the ones a line ends with, neither of which a reader could have seen.
 pub(crate) fn wrapped(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
-    crate::markdown::wrap_text(text, width, style)
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.contains('\t') {
+            wrap_line(&line.replace('\t', TAB), width, &mut rows);
+        } else {
+            wrap_line(line, width, &mut rows);
+        }
+    }
+    rows.into_iter()
+        .map(|row| Line::styled(row, style))
+        .collect()
+}
+
+/// Wraps one line that has no newline in it, adding at least one row.
+fn wrap_line(line: &str, width: usize, rows: &mut Vec<String>) {
+    let mut row = String::new();
+    let mut used = 0_usize;
+    // Whether the row holds anything but indentation, which is what makes a break before the
+    // next word worth taking: breaking an indent off onto a row of its own shows a blank line.
+    let mut content = false;
+    // The spaces since the last word, waiting to learn whether another follows on this row.
+    let mut gap = 0_usize;
+    for (index, word) in line.split(' ').enumerate() {
+        if index > 0 {
+            gap = gap.saturating_add(1);
+        }
+        if word.is_empty() {
+            continue;
+        }
+        let columns = word.width();
+        if content && used.saturating_add(gap).saturating_add(columns) > width {
+            rows.push(core::mem::take(&mut row));
+            (used, gap, content) = (0, 0, false);
+        }
+        // An indent wider than the dialog keeps a column for the text it is indenting.
+        let spaces = gap.min(width.saturating_sub(used).saturating_sub(1));
+        row.push_str(&" ".repeat(spaces));
+        used = used.saturating_add(spaces);
+        gap = 0;
+        for grapheme in word.graphemes(true) {
+            let cells = grapheme.width();
+            // A word longer than a row is cut by columns, never inside a grapheme. One wider
+            // than the whole dialog still gets a row to itself, so the loop always advances.
+            if used.saturating_add(cells) > width && used > 0 {
+                if content {
+                    rows.push(core::mem::take(&mut row));
+                } else {
+                    row.clear();
+                }
+                used = 0;
+            }
+            row.push_str(grapheme);
+            used = used.saturating_add(cells);
+            content = true;
+        }
+    }
+    rows.push(row);
 }
 
 /// A dialog's outer rectangle, always contained in the actual terminal area.
@@ -135,8 +204,11 @@ pub(crate) fn inner_width(area: Rect, maximum: u16) -> usize {
 
 /// Draws one page, reserving footer rows before granting rows to the scrollable body.
 ///
-/// The offset is kept by the view. On entry or selection change the caller clears it; on ordinary
-/// scrolling it is clamped here against the actual wrapped row count and viewport.
+/// The offset is kept by the view. The caller clears it when a different dialog opens; a moved
+/// selection is brought into view from wherever the reader was, and ordinary scrolling is clamped
+/// here against the actual wrapped row count and viewport.
+///
+/// Returns the rectangle the dialog was drawn in, which is what tells the caller what it covers.
 pub(crate) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -144,7 +216,7 @@ pub(crate) fn render(
     content: &Content,
     scroll: &mut u16,
     appearance: (bool, &Theme),
-) {
+) -> Rect {
     let (reveal_selection, theme) = appearance;
     let count = content
         .lines
@@ -169,7 +241,7 @@ pub(crate) fn render(
     let footer_rows = u16::try_from(content.footer.len()).unwrap_or(u16::MAX);
     if footer_rows >= inner.height {
         render_tiny(frame, inner, content, scroll, appearance);
-        return;
+        return rect;
     }
     let body_rows = inner.height.saturating_sub(footer_rows);
     let limit = content.lines.len().saturating_sub(usize::from(body_rows));
@@ -209,6 +281,7 @@ pub(crate) fn render(
         Paragraph::new(content.footer.clone()).style(theme.secondary),
         footer,
     );
+    rect
 }
 
 /// A tiny terminal has no room for fixed chrome. Nothing is discarded, including action hints.

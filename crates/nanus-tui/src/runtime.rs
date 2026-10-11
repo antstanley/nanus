@@ -70,6 +70,7 @@ use core::future::Future;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::Path;
+use std::time::Instant;
 
 use crossterm::event::EventStream;
 use futures::StreamExt as _;
@@ -1424,6 +1425,9 @@ async fn event_loop(
     let mut guard = TerminalGuard::enter(view.mouse_enabled);
 
     let mut events = EventStream::new();
+    // The one clock the view is told about. It is read here, on a wake-up, and never by the view:
+    // the only thing that needs it is how long a question has been in front of a quiet keyboard.
+    let clock = Instant::now();
 
     loop {
         guard.terminal().draw(|frame| view.render(frame))?;
@@ -1450,6 +1454,7 @@ async fn event_loop(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                view.now = clock.elapsed();
                 let outcome = handle_key(key, &mut view);
                 // After every keystroke, because a mention is a property of the text.
                 refresh_mentions(&mut view, &mut files, source.workspace());
@@ -1521,6 +1526,7 @@ async fn event_loop(
                 let Some(frame) = frame else {
                     continue;
                 };
+                view.now = clock.elapsed();
                 apply(frame, &mut view);
                 // Frames arrive in bursts — one per streamed fragment — and each redraw
                 // costs a full frame, so the queue is emptied before the next one.
@@ -2374,18 +2380,32 @@ enum Outcome {
 
 /// Applies one keystroke to the view.
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    let outcome = route_key(key, view);
+    // Recorded after the key is routed rather than before, so that what an approval measures is
+    // the quiet *before* the key it is deciding about. Every key counts, wherever it went: the
+    // one that closed a dialog above a waiting question is as much type-ahead as a letter.
+    view.last_key = Some(view.now);
+    outcome
+}
+
+/// Whether anything but Shift is held: a chord, which is never a plain letter or a plain Enter.
+///
+/// Every modifier rather than the two an ordinary terminal reports. The interface asks for
+/// disambiguated escape codes, and a terminal that grants them reports Super, Hyper and Meta too
+/// — so naming only Ctrl and Alt left `Super+y` meaning `y`.
+fn chorded(key: KeyEvent) -> bool {
+    !key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+}
+
+/// Sends one keystroke to whatever owns the keyboard.
+fn route_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     if let Some(outcome) = handle_global_key(key, view) {
         return outcome;
     }
     let modal = view.active_modal();
     // Shift+Tab still opens permissions from the composer or an approval. Inside any other
     // dialog it is backwards navigation, not a hidden permission change.
-    if shift_tab(key)
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        && matches!(modal, None | Some(Modal::Approval))
-    {
+    if shift_tab(key) && !chorded(key) && matches!(modal, None | Some(Modal::Approval)) {
         return Outcome::OpenPermissions;
     }
     if let Some(modal) = modal {
@@ -2464,16 +2484,18 @@ fn quit_key(key: KeyEvent) -> bool {
 
 /// Routes input through the same active-modal priority the renderer uses.
 fn handle_modal_key(modal: Modal, mut key: KeyEvent, view: &mut ViewState) -> Outcome {
-    // A Ctrl/Alt chord is not a plain letter decision. Key-entry Alt characters are accepted
-    // because international layouts may produce them, but Enter still cannot submit a chord.
-    let modified = key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-    if modified
-        && !(modal == Modal::KeyEntry
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char(_)))
-    {
+    // A chord is not a plain letter decision, whichever modifier makes it one. Key-entry Alt
+    // characters are accepted because international layouts may produce them. Enter is stricter
+    // still: Shift+Enter is the composer's newline, so in a dialog it is a key meant for somewhere
+    // else, and it decides nothing.
+    let typed = modal == Modal::KeyEntry
+        && matches!(key.code, KeyCode::Char(_))
+        && key
+            .modifiers
+            .difference(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            .is_empty();
+    let modified_enter = key.code == KeyCode::Enter && !key.modifiers.is_empty();
+    if (chorded(key) && !typed) || modified_enter {
         return Outcome::Continue;
     }
     if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -2998,42 +3020,33 @@ fn store_credential(
 }
 
 /// Answers only the visible approval, with denial selected initially and a second step for grants.
+///
+/// Nothing but `Esc` is taken until the question has settled — see
+/// [`ViewState::approval_takes_keys`] — because the dialog opens over a keyboard that is usually in
+/// use, and its answers are letters. `Esc` is let through at once: it only refuses or steps back,
+/// and a refusal never needs protecting from.
 fn handle_approval_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let Some(approval) = view.pending_approval.as_ref() else {
         return Outcome::Continue;
     };
     let call_id = approval.call_id.clone();
+    let held = key.code != KeyCode::Esc && !view.approval_takes_keys();
     if view.approval_confirming {
-        return match key.code {
-            KeyCode::Char('y' | 'Y') => Outcome::Answer {
-                call_id,
-                allow: true,
-                always: true,
-            },
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                view.approval_confirming = false;
-                view.approval_selection = 0;
-                Outcome::Continue
-            }
-            _ => Outcome::Continue,
-        };
+        return confirm_standing_grant(key, call_id, held, view);
     }
+    if held {
+        hold_approval_key(view);
+        return Outcome::Continue;
+    }
+    let once = |allow| Outcome::Answer {
+        call_id,
+        allow,
+        always: false,
+    };
     match key.code {
-        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-            return Outcome::Answer {
-                call_id,
-                allow: false,
-                always: false,
-            };
-        }
-        KeyCode::Char('y' | 'Y') => {
-            return Outcome::Answer {
-                call_id,
-                allow: true,
-                always: false,
-            };
-        }
-        KeyCode::Char('a' | 'A') => view.approval_confirming = true,
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => return once(false),
+        KeyCode::Char('y' | 'Y') => return once(true),
+        KeyCode::Char('a' | 'A') => ask_to_confirm_standing_grant(view),
         KeyCode::Up | KeyCode::Left | KeyCode::BackTab => {
             view.approval_selection = view.approval_selection.checked_sub(1).unwrap_or(2);
         }
@@ -3045,24 +3058,71 @@ fn handle_approval_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
                 .unwrap_or(0);
         }
         KeyCode::Enter => match view.approval_selection {
-            0 => {
-                return Outcome::Answer {
-                    call_id,
-                    allow: false,
-                    always: false,
-                };
-            }
-            1 => {
-                return Outcome::Answer {
-                    call_id,
-                    allow: true,
-                    always: false,
-                };
-            }
-            _ => view.approval_confirming = true,
+            0 => return once(false),
+            1 => return once(true),
+            _ => ask_to_confirm_standing_grant(view),
         },
-        _ => {}
+        // A key that means nothing here is a reader typing rather than answering, so what follows
+        // it is held to the same quiet a new question is: `okay` and `today` end in an `a` and a
+        // `y`, and after a pause they would otherwise be a standing grant.
+        _ => view.unsettle_approval(),
     }
+    Outcome::Continue
+}
+
+/// Says that a key reached the approval too soon to be an answer.
+///
+/// Said rather than silent, because a reader who did mean it has to know to press it again.
+fn hold_approval_key(view: &mut ViewState) {
+    let tool = view
+        .pending_approval
+        .as_ref()
+        .map_or("tool", |approval| approval.tool.as_str());
+    view.status = format!(
+        "{} · pause, then decide the {tool} call",
+        crate::view::HELD_KEY_NOTICE
+    );
+}
+
+/// Turns the question into the confirmation of a standing grant.
+///
+/// It is a different question on the same dialog, so it settles afresh: the `y` that confirms has
+/// to come after a pause over the warning rather than straight after the `a`, which is what keeps
+/// two adjacent letters of a word from being both steps.
+const fn ask_to_confirm_standing_grant(view: &mut ViewState) {
+    view.approval_confirming = true;
+    view.dialog_scroll = 0;
+    view.unsettle_approval();
+}
+
+/// The second step of a standing grant: `y` gives it, and every other key takes the first step back.
+///
+/// Withdrawn rather than ignored. A confirmation that waited through any number of other keys for
+/// its `y` was two letters of a sentence away from a grant nobody chose; one that ends at the first
+/// key that is not `y` has to be asked for again. Withdrawing needs no settling — it only ever
+/// refuses — so a `held` key does it too, and the one thing a held key cannot do is confirm.
+fn confirm_standing_grant(
+    key: KeyEvent,
+    call_id: String,
+    held: bool,
+    view: &mut ViewState,
+) -> Outcome {
+    if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+        if held {
+            hold_approval_key(view);
+            return Outcome::Continue;
+        }
+        return Outcome::Answer {
+            call_id,
+            allow: true,
+            always: true,
+        };
+    }
+    view.approval_confirming = false;
+    view.approval_selection = 0;
+    view.dialog_scroll = 0;
+    view.unsettle_approval();
+    view.status = String::from("no standing grant was given · the call is still waiting");
     Outcome::Continue
 }
 
@@ -3962,6 +4022,8 @@ fn apply_approval(call_id: String, tool: String, reason: Option<String>, view: &
     view.approval_selection = 0;
     view.approval_confirming = false;
     view.dialog_scroll = 0;
+    // A new question settles from the start, whatever the one before it had earned.
+    view.unsettle_approval();
     view.pending_approval = Some(PendingApproval {
         call_id,
         tool,
@@ -4209,6 +4271,13 @@ mod tests {
 
     pub(super) fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// Lets the keyboard go quiet for as long as an approval needs before it takes a key.
+    ///
+    /// Time in the view is a field the event loop sets, so a test passes it by adding to it.
+    pub(super) fn pause(view: &mut ViewState) {
+        view.now = view.now.saturating_add(crate::view::APPROVAL_SETTLE);
     }
 
     /// A mouse event at a cell, for the wheel and the click.
@@ -7581,6 +7650,7 @@ mod tests {
 
         // A key that is neither answer does nothing: it must not approve, and it must not
         // reach the composer either.
+        pause(&mut view);
         assert!(matches!(
             handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut view),
             Outcome::Continue
@@ -7591,6 +7661,13 @@ mod tests {
             "and the question is still open"
         );
 
+        // An answer straight after it is not one either: a key that meant nothing was someone
+        // typing, and what follows is held until the keyboard goes quiet again.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        pause(&mut view);
         assert!(matches!(
             handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
             Outcome::Answer {

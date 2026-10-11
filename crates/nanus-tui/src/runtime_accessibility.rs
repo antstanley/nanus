@@ -1,7 +1,7 @@
 //! Input regressions for modal safety, global exit and pointer-free UI copying.
 
 use super::*;
-use crate::runtime::tests::{drawn, key, recording_copier};
+use crate::runtime::tests::{drawn, key, pause, recording_copier};
 
 fn approve(view: &mut ViewState) {
     apply_approval(
@@ -12,14 +12,48 @@ fn approve(view: &mut ViewState) {
     );
 }
 
+/// One plain key, as a reader would press it.
+fn press(code: KeyCode, view: &mut ViewState) -> Outcome {
+    handle_key(key(code, KeyModifiers::NONE), view)
+}
+
+/// Types `text` the way a sentence or a paste arrives: one key after another, a fraction of the
+/// settling time apart. Returns whether any key was taken as an answer.
+fn typed(text: &str, view: &mut ViewState) -> bool {
+    let mut answered = false;
+    for character in text.chars() {
+        view.now = view
+            .now
+            .saturating_add(core::time::Duration::from_millis(120));
+        let code = match character {
+            '\n' => KeyCode::Enter,
+            '\t' => KeyCode::Tab,
+            other => KeyCode::Char(other),
+        };
+        answered |= matches!(press(code, view), Outcome::Answer { .. });
+    }
+    answered
+}
+
 #[test]
 fn modified_approval_letters_and_enter_never_grant_a_call() {
     let mut view = ViewState::new();
     approve(&mut view);
+    // Settled first, and shown to be: the chords below are refused for being chords, not because
+    // the question was still too new to take any key.
+    pause(&mut view);
+    press(KeyCode::Tab, &mut view);
+    assert_eq!(view.approval_selection, 1, "the dialog is taking keys");
     for modifiers in [
         KeyModifiers::CONTROL,
         KeyModifiers::ALT,
         KeyModifiers::CONTROL | KeyModifiers::ALT,
+        // What a terminal speaking the enhanced keyboard protocol reports, and an ordinary one
+        // never does: naming only Ctrl and Alt left every one of these meaning the bare letter.
+        KeyModifiers::SUPER,
+        KeyModifiers::HYPER,
+        KeyModifiers::META,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ] {
         for code in [
             KeyCode::Char('y'),
@@ -27,58 +61,227 @@ fn modified_approval_letters_and_enter_never_grant_a_call() {
             KeyCode::Char('n'),
             KeyCode::Enter,
         ] {
-            assert!(matches!(
-                handle_key(key(code, modifiers), &mut view),
-                Outcome::Continue
-            ));
+            assert!(
+                matches!(
+                    handle_key(key(code, modifiers), &mut view),
+                    Outcome::Continue
+                ),
+                "{modifiers:?}+{code:?}"
+            );
             assert!(view.pending_approval.is_some());
             assert!(!view.approval_confirming);
         }
     }
+    // Shift+Enter is the composer's newline, so with "allow once" selected it is still not a yes.
+    assert!(matches!(
+        handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT), &mut view),
+        Outcome::Continue
+    ));
+    // The other direction: the same letter with only Shift held is the letter, and the plain
+    // Enter is the selection.
+    assert!(matches!(
+        handle_key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT), &mut view),
+        Outcome::Answer {
+            allow: true,
+            always: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        press(KeyCode::Enter, &mut view),
+        Outcome::Answer {
+            allow: true,
+            always: false,
+            ..
+        }
+    ));
+    press(KeyCode::Up, &mut view);
     assert!(
         matches!(
-            handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view),
+            press(KeyCode::Enter, &mut view),
             Outcome::Answer {
                 allow: false,
                 always: false,
                 ..
             }
         ),
-        "Enter starts at denial"
+        "Enter on the first choice is denial"
     );
+}
+
+#[test]
+fn a_new_approval_starts_at_denial_and_takes_no_key_until_the_keyboard_is_quiet() {
+    let mut view = ViewState::new();
+    approve(&mut view);
+    assert_eq!(view.approval_selection, 0, "Enter starts at denial");
+    for code in [
+        KeyCode::Char('y'),
+        KeyCode::Char('a'),
+        KeyCode::Char('n'),
+        KeyCode::Enter,
+        KeyCode::Tab,
+    ] {
+        assert!(matches!(press(code, &mut view), Outcome::Continue));
+        assert!(view.pending_approval.is_some());
+        assert!(!view.approval_confirming);
+        assert_eq!(view.approval_selection, 0);
+    }
+    assert!(
+        view.status.contains("pause"),
+        "a reader who meant it is told to press again: {}",
+        view.status
+    );
+    // `Esc` is the exception, in the one direction that needs no protecting: it refuses at once.
+    assert!(matches!(
+        press(KeyCode::Esc, &mut view),
+        Outcome::Answer { allow: false, .. }
+    ));
+    // And the other direction: after a pause the same keys are answers.
+    pause(&mut view);
+    assert!(matches!(
+        press(KeyCode::Enter, &mut view),
+        Outcome::Answer {
+            allow: false,
+            always: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        press(KeyCode::Char('y'), &mut view),
+        Outcome::Answer {
+            allow: true,
+            always: false,
+            ..
+        }
+    ));
+}
+
+/// The dialog opens over a composer that is live during a turn, and its answers are letters. A
+/// sentence in flight when the question arrives used to answer it: `okay` and `today` were a
+/// standing grant, and the mention gesture — Tab, then Enter — allowed the call once.
+#[test]
+fn prose_in_flight_cannot_answer_an_arriving_approval() {
+    for sentence in [
+        "okay",
+        "today",
+        "play it",
+        "any",
+        "xyz",
+        "yes",
+        "no",
+        "ay",
+        "\t\n",
+        "sk-proj-a81Xy02",
+    ] {
+        let mut view = ViewState::new();
+        assert!(!typed("ple", &mut view));
+        assert_eq!(
+            view.input.text(),
+            "ple",
+            "the composer was being typed into"
+        );
+        approve(&mut view);
+        assert!(
+            !typed(sentence, &mut view),
+            "{sentence:?} answered a question nobody read"
+        );
+        assert!(view.pending_approval.is_some(), "{sentence:?}");
+        assert_eq!(view.input.text(), "ple", "the dialog owns the keys");
+        // Nothing typed is left half-agreed either. A pause, and Enter is still a denial.
+        pause(&mut view);
+        if view.approval_confirming {
+            // `ay`: the confirmation is on screen, unconfirmed, and any key but `y` withdraws it.
+            press(KeyCode::Enter, &mut view);
+            pause(&mut view);
+        }
+        assert!(
+            matches!(
+                press(KeyCode::Enter, &mut view),
+                Outcome::Answer { allow: false, .. }
+            ),
+            "{sentence:?} moved the selection off denial"
+        );
+    }
+}
+
+/// A reader who paused and went on typing has not read the question either. A key that means
+/// nothing to the dialog closes it to keys again, and a letter cannot be both steps of a grant.
+#[test]
+fn a_sentence_resumed_after_a_pause_is_not_a_standing_grant() {
+    for sentence in ["okay", "today", "may", "any", "lay"] {
+        let mut view = ViewState::new();
+        approve(&mut view);
+        pause(&mut view);
+        let mut granted = false;
+        for character in sentence.chars() {
+            view.now = view
+                .now
+                .saturating_add(core::time::Duration::from_millis(120));
+            granted |= matches!(
+                press(KeyCode::Char(character), &mut view),
+                Outcome::Answer { always: true, .. }
+            );
+        }
+        assert!(!granted, "{sentence:?} granted every later call");
+    }
 }
 
 #[test]
 fn a_standing_approval_needs_an_explicit_second_confirmation() {
     let mut view = ViewState::new();
     approve(&mut view);
+    pause(&mut view);
     assert!(matches!(
-        handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE), &mut view),
+        press(KeyCode::Char('a'), &mut view),
         Outcome::Continue
     ));
     assert!(view.approval_confirming);
-    for code in [KeyCode::Char('a'), KeyCode::Enter] {
-        assert!(matches!(
-            handle_key(key(code, KeyModifiers::NONE), &mut view),
-            Outcome::Continue
-        ));
-    }
-    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+    // The confirmation is a new question, so the `y` straight after the `a` is not its answer.
+    assert!(matches!(
+        press(KeyCode::Char('y'), &mut view),
+        Outcome::Continue
+    ));
+    assert!(view.approval_confirming, "held, not withdrawn");
+    pause(&mut view);
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
         assert!(matches!(
             handle_key(key(KeyCode::Char('y'), modifiers), &mut view),
             Outcome::Continue
         ));
     }
-    assert!(matches!(
-        handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
-        Outcome::Continue
-    ));
+    assert!(view.approval_confirming, "a chord is not a key here at all");
+    // Every other key takes the first step back: repeating `a`, Enter, `n`, a stray letter.
+    for code in [
+        KeyCode::Char('a'),
+        KeyCode::Enter,
+        KeyCode::Char('n'),
+        KeyCode::Char('x'),
+        KeyCode::Esc,
+    ] {
+        view.approval_confirming = true;
+        pause(&mut view);
+        assert!(matches!(press(code, &mut view), Outcome::Continue));
+        assert!(!view.approval_confirming, "{code:?} withdraws");
+        assert_eq!(view.approval_selection, 0);
+        assert!(
+            view.pending_approval.is_some(),
+            "and returns to the original question"
+        );
+    }
+    // Withdrawing needs no pause, because it only refuses.
+    pause(&mut view);
+    press(KeyCode::Char('a'), &mut view);
+    assert!(view.approval_confirming);
+    press(KeyCode::Char('n'), &mut view);
     assert!(!view.approval_confirming);
-    assert!(
-        view.pending_approval.is_some(),
-        "cancel returns to the original question"
-    );
-    handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE), &mut view);
+
+    pause(&mut view);
+    press(KeyCode::Char('a'), &mut view);
+    pause(&mut view);
     assert!(matches!(
         handle_key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT), &mut view),
         Outcome::Answer {
@@ -93,12 +296,17 @@ fn a_standing_approval_needs_an_explicit_second_confirmation() {
         "a new question cannot inherit consent"
     );
     assert_eq!(view.approval_selection, 0);
+    assert!(
+        matches!(press(KeyCode::Char('y'), &mut view), Outcome::Continue),
+        "nor the quiet the last one had earned"
+    );
 }
 
 #[test]
 fn approval_choices_have_forward_and_backward_navigation() {
     let mut view = ViewState::new();
     approve(&mut view);
+    pause(&mut view);
     handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &mut view);
     assert_eq!(view.approval_selection, 1);
     assert!(matches!(
@@ -122,14 +330,13 @@ fn approval_choices_have_forward_and_backward_navigation() {
 }
 
 #[test]
-fn the_visible_approval_owns_keys_when_provider_or_secret_entry_is_pending() {
+fn the_visible_approval_owns_keys_when_a_provider_or_authorization_is_pending() {
     let mut view = ViewState::new();
     view.provider_open = true;
     view.auth_open = true;
-    view.key_entry_open = true;
-    view.key_input = "private".into();
     approve(&mut view);
     assert_eq!(view.active_modal(), Some(Modal::Approval));
+    pause(&mut view);
     assert!(matches!(
         handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view),
         Outcome::Answer { allow: false, .. }
@@ -142,11 +349,53 @@ fn the_visible_approval_owns_keys_when_provider_or_secret_entry_is_pending() {
             ..
         }
     ));
-    assert_eq!(view.key_input, "private");
     assert!(
         view.provider_open && view.auth_open,
         "background state is not changed"
     );
+}
+
+/// The masked field is the one dialog an approval does not take the keyboard from. A provider can
+/// be changed while a turn runs, so a question can arrive halfway through a key being typed or
+/// pasted — and when the question outranked the field, `sk-proj-a81Xy02` was a standing grant and
+/// left `sk-02` behind the mask to be stored.
+#[test]
+fn a_key_being_typed_is_never_taken_by_an_arriving_approval() {
+    let mut view = ViewState::new();
+    view.key_entry_open = true;
+    assert!(!typed("sk-", &mut view));
+    approve(&mut view);
+    assert_eq!(view.active_modal(), Some(Modal::KeyEntry));
+    assert!(
+        view.status.contains("waiting for your decision"),
+        "the reader is told a question is waiting: {}",
+        view.status
+    );
+    // Slowly as well as quickly: a pause in the middle of a key is not an answer either.
+    assert!(!typed("proj-a81X", &mut view));
+    pause(&mut view);
+    assert!(!typed("y02", &mut view));
+    assert_eq!(view.key_input, "sk-proj-a81Xy02", "every character arrived");
+    assert!(view.pending_approval.is_some());
+    assert!(!view.approval_confirming);
+
+    // The field closes and the question is the dialog — but not answered by the key that closed
+    // it, nor by one that follows on its heels.
+    assert!(matches!(press(KeyCode::Esc, &mut view), Outcome::Continue));
+    assert_eq!(view.active_modal(), Some(Modal::Approval));
+    assert!(matches!(
+        press(KeyCode::Char('y'), &mut view),
+        Outcome::Continue
+    ));
+    pause(&mut view);
+    assert!(matches!(
+        press(KeyCode::Char('y'), &mut view),
+        Outcome::Answer {
+            allow: true,
+            always: false,
+            ..
+        }
+    ));
 }
 
 #[test]

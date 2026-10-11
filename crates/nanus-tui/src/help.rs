@@ -90,7 +90,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
     ("?", "show this list, when the prompt is empty"),
     ("", "while an approval dialog is up"),
     ("y", "allow the call once"),
-    ("a", "review a standing grant; y then confirms it"),
+    (
+        "a",
+        "review a standing grant; after a pause y confirms it, any other key cancels",
+    ),
     ("Tab / arrows", "select an approval answer (initially deny)"),
     ("Enter", "apply the selected approval answer"),
     (
@@ -98,6 +101,10 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "read the full dialog without changing its decision",
     ),
     ("n / Esc", "deny it"),
+    (
+        "any key, mid-typing",
+        "nothing: an answer needs half a second of quiet first (Esc excepted)",
+    ),
 ];
 
 /// What the overlay is titled.

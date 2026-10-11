@@ -4,6 +4,7 @@ use super::*;
 use ratatui::Terminal;
 use ratatui::backend::{Backend as _, TestBackend};
 use ratatui::style::Color;
+use unicode_width::UnicodeWidthChar as _;
 
 fn draw(state: &mut ViewState, width: u16, height: u16) -> ratatui::buffer::Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
@@ -246,15 +247,13 @@ fn keyboard_dialog_copy_contains_hidden_content_but_never_the_typed_secret() {
 }
 
 #[test]
-fn an_approval_preempts_all_other_dialogs_visually() {
+fn an_approval_preempts_every_dialog_but_permissions_and_a_key_being_typed() {
     let mut state = approval();
     state.provider_open = true;
-    state.key_entry_open = true;
     state.auth_open = true;
     state.help_open = true;
     let drawn = text(&draw(&mut state, 80, 24));
     assert!(drawn.contains("approval needed"));
-    assert!(!drawn.contains("api key"));
     assert!(!drawn.contains("Esc hides this"));
     state.open_permissions();
     let drawn = text(&draw(&mut state, 80, 24));
@@ -263,6 +262,141 @@ fn an_approval_preempts_all_other_dialogs_visually() {
     assert!(
         state.pending_approval.is_some(),
         "the hidden question is retained"
+    );
+    state.close_permissions();
+
+    // The masked field is the other dialog drawn over a question: what is on screen is what owns
+    // the keys, and a key being typed must not be handed to a dialog that reads letters as answers.
+    state.open_credential("vendor", Some("api"), "KEY");
+    state.open_key_entry();
+    assert_eq!(state.active_modal(), Some(Modal::KeyEntry));
+    let drawn = text(&draw(&mut state, 80, 24));
+    assert!(drawn.contains("Enter stores"), "{drawn}");
+    assert!(!drawn.contains("approval needed"));
+    state.close_key_entry();
+    state.credential_open = false;
+    let drawn = text(&draw(&mut state, 80, 24));
+    assert!(
+        drawn.contains("approval needed"),
+        "and the question is back when the field is closed: {drawn}"
+    );
+}
+
+/// A reason may be the command a reader is about to allow, so it is shown as it was written. The
+/// prose wrapper this used collapsed runs of spaces and dropped the ones a line began with, which
+/// drew — and copied — `printf 'a    b'` as `printf 'a b'`.
+#[test]
+fn a_reason_is_drawn_and_copied_exactly_as_it_was_written() {
+    let mut state = ViewState::new();
+    state.pending_approval = Some(PendingApproval {
+        call_id: "audit".into(),
+        tool: "bash".into(),
+        reason: Some("printf 'a    b'\n    indented\tcolumn".into()),
+    });
+    let drawn = text(&draw(&mut state, 80, 24));
+    let copied = state.dialog_text().expect("the dialog");
+    for shown in [&drawn, &copied] {
+        assert!(shown.contains("printf 'a    b'"), "{shown}");
+        assert!(shown.contains("    indented    column"), "{shown}");
+    }
+    assert!(!drawn.contains("printf 'a b'"));
+}
+
+#[test]
+fn literal_wrapping_keeps_spaces_and_never_exceeds_the_width() {
+    let rows = |source: &str, width: usize| {
+        dialog::wrapped(source, width, Style::default())
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows("alpha beta gamma", 10), ["alpha beta", "gamma"]);
+    assert_eq!(rows("  two  spaces", 40), ["  two  spaces"]);
+    assert_eq!(rows("a    b", 3), ["a", "b"], "a break takes its spaces");
+    assert_eq!(rows("x\n\ny", 9), ["x", "", "y"], "hard newlines survive");
+    assert_eq!(rows("", 9), [""]);
+    assert_eq!(rows("trailing   ", 20), ["trailing"]);
+    assert_eq!(
+        rows("abcdefgh", 3),
+        ["abc", "def", "gh"],
+        "a long word is cut"
+    );
+    assert_eq!(
+        rows("界界界", 4),
+        ["界界", "界"],
+        "by columns, not characters"
+    );
+    assert_eq!(
+        rows("e\u{301}e\u{301}e\u{301}", 2),
+        ["e\u{301}e\u{301}", "e\u{301}"],
+        "and never inside a grapheme"
+    );
+    assert_eq!(
+        rows("        deep", 6),
+        ["     d", "eep"],
+        "an indent leaves a column"
+    );
+    assert_eq!(
+        rows("界", 1),
+        ["界"],
+        "too wide for the dialog still gets a row"
+    );
+    // The other direction, across widths: nothing is lost but the spaces a break lands on.
+    let source = "one  two   three 界界 four\tfive   six";
+    for width in 2..40 {
+        let wrapped = rows(source, width);
+        for row in &wrapped {
+            assert!(row.width() <= width, "{row:?} at {width}");
+        }
+        let kept: String = wrapped.concat().split_whitespace().collect();
+        let original: String = source.split_whitespace().collect();
+        assert_eq!(kept, original, "at {width}");
+    }
+}
+
+/// Unselected rows keep the gutter the marker is drawn in, so choosing does not move the names.
+#[test]
+fn a_choosers_rows_stay_aligned_under_the_marker() {
+    let mut state = ViewState::new();
+    state.models = vec!["model-a".into(), "model-b".into(), "model-c".into()];
+    state.open_models();
+    state.model_selection = 1;
+    let drawn = text(&draw(&mut state, 80, 24));
+    let column = |needle: &str| {
+        drawn
+            .lines()
+            .find_map(|line| line.find(needle).map(|at| line[..at].width()))
+            .unwrap_or_else(|| panic!("{needle} is drawn: {drawn}"))
+    };
+    assert!(drawn.contains("▶ 2 model-b"));
+    assert_eq!(column("1 model-a"), column("2 model-b"));
+    assert_eq!(column("3 model-c"), column("2 model-b"));
+}
+
+/// A reader halfway down a long reason who presses Tab to choose an answer keeps their place. A
+/// different dialog opening is the other direction: that one does start from its top.
+#[test]
+fn choosing_an_answer_keeps_the_readers_place_in_a_long_reason() {
+    let mut state = approval();
+    draw(&mut state, 40, 12);
+    state.dialog_scroll = 3;
+    draw(&mut state, 40, 12);
+    assert_eq!(state.dialog_scroll, 3);
+    state.approval_selection = 1;
+    let chosen = text(&draw(&mut state, 40, 12));
+    assert_eq!(
+        state.dialog_scroll, 3,
+        "the selection moved, the page did not"
+    );
+    assert!(chosen.contains("Selected: allow once"), "{chosen}");
+    draw(&mut state, 44, 12);
+    assert_eq!(state.dialog_scroll, 3, "nor does a resize");
+
+    state.open_permissions();
+    draw(&mut state, 40, 12);
+    assert_eq!(
+        state.dialog_scroll, 0,
+        "a different dialog starts at its top"
     );
 }
 
@@ -322,6 +456,57 @@ fn copy_feedback_is_visible_when_a_short_modal_covers_the_status_line() {
     assert!(
         drawn.contains("Esc closes"),
         "feedback does not remove the exit hint: {drawn}"
+    );
+    // On a row of its own: painted over the dialog's border it left the border's tail showing.
+    let row = drawn
+        .lines()
+        .find(|line| line.contains("copied 42 characters"))
+        .expect("the feedback row");
+    assert!(
+        row.contains("copied 42 characters   ") && !row.contains(['─', '┐', '┌']),
+        "the row is the feedback and nothing of the border: {drawn}"
+    );
+}
+
+/// A reader on a short terminal who answers too soon has to be told the key was not taken, and the
+/// status line that says so is under the dialog.
+#[test]
+fn a_held_approval_key_is_reported_even_when_the_dialog_covers_the_status_line() {
+    let mut state = approval();
+    state.status = format!("{HELD_KEY_NOTICE} · pause, then decide the bash call");
+    let short = text(&draw(&mut state, 40, 12));
+    assert!(short.contains(HELD_KEY_NOTICE), "{short}");
+    assert!(
+        short.contains("n/Esc deny"),
+        "and the answers stay: {short}"
+    );
+    let tall = text(&draw(&mut state, 80, 24));
+    assert_eq!(tall.matches("that key was not").count(), 1, "{tall}");
+    assert!(tall.contains("approval needed"), "{tall}");
+}
+
+/// The other direction: while the status line can be seen, the result is there and nowhere else.
+/// It used to be painted over the title bar of every screen with a dialog open.
+#[test]
+fn copy_feedback_stays_on_the_status_line_when_the_dialog_leaves_it_visible() {
+    let mut state = approval();
+    state.label = Some("a session".into());
+    state.status = "copied 3 lines".into();
+    let drawn = text(&draw(&mut state, 80, 24));
+    let rows: Vec<&str> = drawn.lines().collect();
+    assert!(
+        rows.first().is_some_and(|row| !row.contains("copied")),
+        "the title bar is left alone: {drawn}"
+    );
+    assert!(
+        rows.last()
+            .is_some_and(|row| row.contains("copied 3 lines")),
+        "{drawn}"
+    );
+    assert_eq!(drawn.matches("copied 3 lines").count(), 1, "{drawn}");
+    assert!(
+        drawn.contains("approval needed"),
+        "the dialog keeps its title"
     );
 }
 

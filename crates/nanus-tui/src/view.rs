@@ -4,6 +4,7 @@
 //! against ratatui's `TestBackend` without a terminal. Nothing here performs I/O.
 
 use core::cell::RefCell;
+use core::time::Duration;
 use ratatui::Frame;
 use ratatui::buffer::CellWidth as _;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
@@ -14,7 +15,7 @@ use std::collections::BTreeMap;
 
 use nanus_domain::ApprovalPolicy;
 use unicode_segmentation::UnicodeSegmentation as _;
-use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
+use unicode_width::UnicodeWidthStr as _;
 
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
@@ -47,6 +48,22 @@ const COMPOSER_PADDING_COLS: u16 = 1;
 
 /// The blank rows the composer keeps above and below its box.
 const COMPOSER_PADDING_ROWS: u16 = 1;
+
+/// How long an approval must sit in front of a quiet keyboard before a key can decide it.
+///
+/// The question arrives whenever the agent asks it, which is usually while the reader is doing
+/// something else with the same keyboard: typing the next prompt, or pasting text that reaches a
+/// terminal as keystrokes. `y` and `a` are letters of ordinary prose, so without this a sentence in
+/// flight answers a question its author has not seen. Half a second is longer than the gap between
+/// two keys of someone typing and shorter than it takes to read the question, so it costs a reader
+/// who is answering nothing and stops the keys that were never meant for the dialog.
+pub(crate) const APPROVAL_SETTLE: Duration = Duration::from_millis(500);
+
+/// How the status line begins when an approval ignored a key pressed before it had settled.
+///
+/// Named because two places must agree on it: the key handling that says it, and the frame that
+/// keeps it visible when the dialog is drawn over the status line.
+pub(crate) const HELD_KEY_NOTICE: &str = "that key was not taken as an answer";
 
 /// How many files a mention menu lists at once.
 ///
@@ -408,6 +425,22 @@ pub struct ViewState {
     pub(crate) approval_selection: usize,
     /// Whether a standing grant is awaiting a second, explicit confirmation.
     pub(crate) approval_confirming: bool,
+    /// How long the interface has been running, as of the event being handled.
+    ///
+    /// Set by the event loop on every wake-up and never read from a clock here, so the view stays
+    /// a pure function of its state and a test moves time by assigning to it.
+    pub(crate) now: Duration,
+    /// When the previous keystroke was handled, whatever it was typed into.
+    pub(crate) last_key: Option<Duration>,
+    /// When the approval question on screen last changed: it arrived, or it became — or stopped
+    /// being — the confirmation of a standing grant.
+    pub(crate) approval_asked: Duration,
+    /// Whether the question has sat in front of a quiet keyboard for [`APPROVAL_SETTLE`].
+    ///
+    /// A latch rather than a comparison made on every key: once a reader has paused over the
+    /// question, choosing and deciding are as quick as they like. See
+    /// [`ViewState::approval_takes_keys`].
+    pub(crate) approval_settled: bool,
     /// Wrapped rows scrolled in the active dialog.
     pub(crate) dialog_scroll: u16,
     /// The last modal and selection drawn, so a new focus is revealed and a resumed one resets.
@@ -701,6 +734,10 @@ impl Default for ViewState {
             pending_approval: None,
             approval_selection: 0,
             approval_confirming: false,
+            now: Duration::ZERO,
+            last_key: None,
+            approval_asked: Duration::ZERO,
+            approval_settled: false,
             dialog_scroll: 0,
             dialog_focus: None,
             approval: ApprovalPolicy::default(),
@@ -863,37 +900,31 @@ fn column_in_line(line: &Line<'static>, x: usize, rows: usize, within: usize) ->
             line_text(line).chars().count()
         };
     }
-    let mut used = 0_usize;
-    let mut offset = 0_usize;
-    for span in &line.spans {
-        for character in span.content.chars() {
-            let current = character.width().unwrap_or(0);
-            if used.saturating_add(current) > x {
-                return offset;
-            }
-            used = used.saturating_add(current);
-            offset = offset.saturating_add(1);
-        }
-    }
-    offset
+    character_at(&line_text(line), x)
 }
 
-/// The index of the character drawn at a screen column, in a row of the frame that was drawn.
+/// The index of the character drawn at a screen column, in a row of text as it was drawn.
 ///
-/// Cell columns and character offsets are not the same number, and a wide character is where they
-/// part company: it covers two cells and is one character, so a drag that starts on either of them
-/// means the character. A column past the end of the row is the end of the row, which is what a
-/// drag that ran off the right edge of a line means.
-fn character_at(characters: &[char], column: usize) -> usize {
+/// Cell columns and character offsets are not the same number, and they part company in both
+/// directions. A wide character covers two cells and is one character, so a click on either cell
+/// means the character. A cluster is the other way round: `👩‍💻` is three characters drawn in two
+/// cells, and it is measured as the terminal draws it — a grapheme at a time — because adding up
+/// each character's own width makes it four cells and lands everything after it two characters
+/// early. The index is always the first character of a grapheme, never one inside it. A column
+/// past the end of the row is the end of the row, which is what a drag that ran off the right edge
+/// of a line means.
+fn character_at(text: &str, column: usize) -> usize {
     let mut used = 0_usize;
-    for (index, character) in characters.iter().enumerate() {
-        let width = character.width().unwrap_or(0);
-        if used.saturating_add(width) > column {
-            return index;
+    let mut offset = 0_usize;
+    for grapheme in text.graphemes(true) {
+        let cells = grapheme.width();
+        if used.saturating_add(cells) > column {
+            return offset;
         }
-        used = used.saturating_add(width);
+        used = used.saturating_add(cells);
+        offset = offset.saturating_add(grapheme.chars().count());
     }
-    characters.len()
+    offset
 }
 
 /// The text of one rendered line.
@@ -1271,10 +1302,11 @@ impl ViewState {
             self.input.place_cursor(last, usize::MAX);
             return true;
         };
-        let prefix = line.prefix.chars().count();
-        let within = usize::from(column.saturating_sub(area.x))
-            .saturating_sub(prefix)
-            .min(line.text.chars().count());
+        // The prefix is plain text of a fixed width; the row after it is measured in cells, the
+        // way it was drawn, so a click after a run of wide characters lands on the character
+        // under the pointer rather than twice as far along.
+        let cells = usize::from(column.saturating_sub(area.x)).saturating_sub(line.prefix.width());
+        let within = character_at(&line.text, cells);
         self.input
             .place_cursor(source_line, start.saturating_add(within));
         true
@@ -1412,8 +1444,12 @@ impl ViewState {
     pub(crate) fn active_modal(&self) -> Option<Modal> {
         [
             (self.permission_open, Modal::Permissions),
-            (self.pending_approval.is_some(), Modal::Approval),
+            // Above the approval, and it is the only text field that is: a key being typed or
+            // pasted is a run of letters the reader cannot see, so a question that took the
+            // keyboard from it would be answered by the secret and leave a truncated key behind
+            // the mask. The question waits, as the status line says, until the field is closed.
             (self.key_entry_open, Modal::KeyEntry),
+            (self.pending_approval.is_some(), Modal::Approval),
             (self.credential_open, Modal::Credential),
             (self.auth_open, Modal::Authorization),
             (self.provider_open, Modal::Provider),
@@ -1425,6 +1461,33 @@ impl ViewState {
         ]
         .into_iter()
         .find_map(|(open, modal)| open.then_some(modal))
+    }
+
+    /// Starts the approval's settling again, because the question on screen has changed.
+    ///
+    /// Called when a question arrives, when it becomes the confirmation of a standing grant, when
+    /// that confirmation is withdrawn, and when a key that means nothing to the dialog shows the
+    /// reader is typing rather than answering.
+    pub(crate) const fn unsettle_approval(&mut self) {
+        self.approval_settled = false;
+        self.approval_asked = self.now;
+    }
+
+    /// Whether the approval may act on a key pressed now.
+    ///
+    /// Not until the keyboard has been quiet for [`APPROVAL_SETTLE`] with this question on screen:
+    /// measured from the later of the question changing and the previous keystroke, wherever that
+    /// keystroke went. So a burst of typing or a paste that an arriving question interrupts keeps
+    /// the dialog closed to keys for as long as it lasts, and the keys that closed a dialog above
+    /// this one do not also answer it.
+    pub(crate) fn approval_takes_keys(&mut self) -> bool {
+        if !self.approval_settled {
+            let since = self
+                .last_key
+                .map_or(self.approval_asked, |key| key.max(self.approval_asked));
+            self.approval_settled = self.now.saturating_sub(since) >= APPROVAL_SETTLE;
+        }
+        self.approval_settled
     }
 
     /// Scrolls explanations without moving the selected decision.
@@ -1797,14 +1860,14 @@ impl ViewState {
             };
             let characters: Vec<char> = drawn.chars().collect();
             let from = if row == usize::from(start.row) {
-                character_at(&characters, usize::from(start.column))
+                character_at(drawn, usize::from(start.column))
             } else {
                 0
             };
             // Inclusive, and one past the head's cell on the head's own row: a column is a cell
             // rather than a character, so this is where a wide character is taken as a whole.
             let to = if row == usize::from(end.row) {
-                character_at(&characters, usize::from(end.column).saturating_add(1))
+                character_at(drawn, usize::from(end.column).saturating_add(1))
             } else {
                 usize::MAX
             };
@@ -2641,12 +2704,12 @@ impl ViewState {
         if let Some(status) = chunks.get(6) {
             self.render_status(frame, *status);
         }
-        self.render_dialogs(frame, area);
+        let dialog = self.render_dialogs(frame, area);
         // The frame is finished, so this is the screen the reader is looking at. Recorded, then
         // highlighted: the snapshot is taken before the paint because the highlight adds a modifier
         // and no text, and the paint comes last because a selection may be over a dialogue, which
         // is only drawn now.
-        self.keep_modal_feedback(frame, area);
+        self.keep_modal_feedback(frame, dialog, chunks.get(6).copied());
         self.capture_screen(frame);
         if let Some(selection) = self.screen_selection {
             paint_screen_selection(frame, selection);
@@ -2654,15 +2717,23 @@ impl ViewState {
     }
 
     /// Draws only the active modal: background dialogs retain their state but never own input.
-    fn render_dialogs(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    ///
+    /// Returns the rectangle it was drawn in, or `None` when no dialog is open.
+    fn render_dialogs(&mut self, frame: &mut Frame<'_>, area: Rect) -> Option<Rect> {
         let Some(modal) = self.active_modal() else {
             self.dialog_focus = None;
-            return;
+            return None;
         };
         let focus = (modal, self.dialog_selection(modal), area.width, area.height);
         let changed = self.dialog_focus != Some(focus);
         if changed {
-            self.dialog_scroll = 0;
+            // Only a different dialog starts from its top. A moved selection or a resized
+            // terminal keeps the reader's place — `dialog::render` clamps it and brings a
+            // chooser's selection into view — because a reader halfway down a long reason who
+            // pressed Tab to choose an answer has not asked to be taken back to the first row.
+            if self.dialog_focus.map(|(shown, ..)| shown) != Some(modal) {
+                self.dialog_scroll = 0;
+            }
             self.clear_selection();
         }
         self.dialog_focus = Some(focus);
@@ -2677,37 +2748,50 @@ impl ViewState {
         let scroll = if modal == Modal::Help {
             &mut self.help_scroll
         } else if modal == Modal::Context {
-            if let Some(state) = self.context_dialog.as_mut() {
-                &mut state.scroll
-            } else {
-                return;
-            }
+            &mut self.context_dialog.as_mut()?.scroll
         } else {
             &mut self.dialog_scroll
         };
-        dialog::render(
+        Some(dialog::render(
             frame,
             area,
             maximum,
             &content,
             scroll,
             (changed, &self.theme),
-        );
+        ))
     }
 
-    /// A clipboard result must be visible even when a full-height modal covers the status line.
-    fn keep_modal_feedback(&self, frame: &mut Frame<'_>, area: Rect) {
+    /// What a key just did to a dialog must be visible even when the dialog covers the status line:
+    /// a clipboard result, and the notice that an approval did not take a key as an answer.
+    ///
+    /// Only then, and on a row of its own. The status line is where the result belongs, so while
+    /// that row can be seen nothing else is drawn; when the dialog is over it, the result takes the
+    /// dialog's top row — cleared first, because a sentence painted over a border and a title
+    /// leaves the tail of both showing through.
+    fn keep_modal_feedback(
+        &self,
+        frame: &mut Frame<'_>,
+        dialog: Option<Rect>,
+        status: Option<Rect>,
+    ) {
+        let Some(dialog) = dialog else {
+            return;
+        };
         let copied = self.status.starts_with("copied ")
             || self.status.starts_with("the UI text was not copied")
-            || self.status == "there is no UI text to copy";
-        if self.modal_open() && copied && area.height > 0 {
+            || self.status == "there is no UI text to copy"
+            || self.status.starts_with(HELD_KEY_NOTICE);
+        let hidden = status.is_none_or(|row| row.height == 0 || dialog.intersects(row));
+        if copied && hidden && dialog.height > 0 {
+            let banner = Rect {
+                height: 1,
+                ..dialog
+            };
+            frame.render_widget(ratatui::widgets::Clear, banner);
             frame.render_widget(
                 Paragraph::new(self.status.clone()).style(self.theme.notice),
-                Rect {
-                    y: area.y,
-                    height: 1,
-                    ..area
-                },
+                banner,
             );
         }
     }
@@ -2924,7 +3008,7 @@ impl ViewState {
             .copied()
             .unwrap_or("deny");
         let controls = if self.approval_confirming {
-            "y confirms · n/Esc cancels\nPgUp/PgDn read · F6 copy"
+            "y confirms · any other key cancels\nPgUp/PgDn read · F6 copy"
         } else if width < 30 {
             "n/Esc deny · y once · a always\nTab choose · Enter decides\nPgUp/PgDn read"
         } else {
@@ -2948,7 +3032,7 @@ impl ViewState {
             out.push(
                 &format!(
                     "Always allow {} for this session? Every later call to this tool, \
-                    including destructive calls, will skip this question. Only y confirms.",
+                    including destructive calls, will skip this question. Pause, then y confirms.",
                     approval.tool
                 ),
                 width,
@@ -5540,16 +5624,31 @@ mod tests {
     /// a full-width character means that character.
     #[test]
     fn a_column_is_resolved_to_the_character_covering_it() {
-        let characters: Vec<char> = "a日b".chars().collect();
-        assert_eq!(character_at(&characters, 0), 0);
+        assert_eq!(character_at("a日b", 0), 0);
+        assert_eq!(character_at("a日b", 1), 1, "the wide char's first cell");
+        assert_eq!(character_at("a日b", 2), 1, "and its second cell");
+        assert_eq!(character_at("a日b", 3), 2);
+        assert_eq!(character_at("a日b", 99), 3, "past the end is the end");
+        // A cluster is several characters in two cells. Measured a character at a time it is four
+        // cells wide, which put everything drawn after it two characters early.
+        let cluster = "👩\u{200d}💻abc";
+        assert_eq!(character_at(cluster, 0), 0, "the cluster's first cell");
         assert_eq!(
-            character_at(&characters, 1),
-            1,
-            "the wide char's first cell"
+            character_at(cluster, 1),
+            0,
+            "and its second: never inside it"
         );
-        assert_eq!(character_at(&characters, 2), 1, "and its second cell");
-        assert_eq!(character_at(&characters, 3), 2);
-        assert_eq!(character_at(&characters, 99), 3, "past the end is the end");
+        assert_eq!(
+            character_at(cluster, 2),
+            3,
+            "the `a`, after three characters"
+        );
+        assert_eq!(character_at(cluster, 4), 5);
+        assert_eq!(
+            character_at("e\u{301}x", 1),
+            2,
+            "a combining mark takes no cell"
+        );
     }
 
     /// `/copy` needs the newest *answer*, which is the last thing the model wrote — not a tool line
@@ -6523,6 +6622,44 @@ mod tests {
             .saturating_add(5);
         assert!(state.place_caret(column, area.y), "the click landed");
         assert_eq!(state.input.cursor(), 5);
+    }
+
+    /// A click names a cell, and a wide character is two of them. Counted as characters, a click
+    /// on the third of six full-width glyphs put the caret after the fourth.
+    #[test]
+    fn a_click_on_wide_text_lands_on_the_glyph_under_the_pointer() {
+        let prompt = u16::try_from(ViewState::PROMPT_WIDTH).unwrap_or(0);
+        let mut state = ViewState::new();
+        state.input = InputBuffer::with_text("界界界界界界");
+        let area = drawn_composer(&mut state);
+        let first = area.x.saturating_add(prompt);
+        // The third glyph covers cells four and five; either one is that glyph.
+        for cell in [4, 5] {
+            assert!(state.place_caret(first.saturating_add(cell), area.y));
+            assert_eq!(state.input.cursor(), 2, "cell {cell}");
+        }
+        // A cluster is the other way round: three characters in two cells. A click after it is
+        // after all three, and a click on it is never inside it.
+        state.input = InputBuffer::with_text("👩\u{200d}💻abc");
+        let area = drawn_composer(&mut state);
+        let first = area.x.saturating_add(prompt);
+        assert!(state.place_caret(first.saturating_add(3), area.y));
+        assert_eq!(
+            state.input.cursor(),
+            4,
+            "the `b`, past the cluster and the `a`"
+        );
+        assert!(state.place_caret(first.saturating_add(1), area.y));
+        assert_eq!(
+            state.input.cursor(),
+            0,
+            "the cluster's second cell is the cluster"
+        );
+        // And narrow text is unchanged: one cell, one character.
+        state.input = InputBuffer::with_text("plain");
+        let area = drawn_composer(&mut state);
+        assert!(state.place_caret(area.x.saturating_add(prompt).saturating_add(3), area.y));
+        assert_eq!(state.input.cursor(), 3);
     }
 
     #[test]
