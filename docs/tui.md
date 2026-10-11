@@ -13,7 +13,7 @@ conversation is a recorded session, which is why it can be shown without a key.*
 ## Starting it
 
 ```sh
-cargo build --release          # builds both binaries
+cargo build --release --workspace # builds both binaries
 
 # Talk to a model in the current directory. The key comes from the secret store
 # (`nanus auth set deepseek`), or from the environment as the last fallback.
@@ -226,16 +226,21 @@ second set. Where it does not, the divergence is named rather than papered over.
 | Key | Effect |
 |---|---|
 | `y` | while an approval dialog is up: allow the call once |
-| `a` | while an approval dialog is up: allow the call and record the tool for the session |
+| `a` | while an approval dialog is up: review a standing grant; a second `y` grants it for the session |
+| `Tab` / arrows, then `Enter` | while an approval dialog is up: choose an answer, initially Deny |
+| `PageUp` / `PageDown` | while a dialog is up: read its full explanations without changing the decision |
 | `n` (or `Esc`) | while an approval dialog is up: deny it |
-| `Shift+Tab` | choose the approval state, from anywhere |
+| `Shift+Tab` | open permissions from the composer or an approval; navigate backward inside other choosers |
 | `Enter` | submit |
 | `\` + `Enter` | newline — the escape hatch that needs no terminal cooperation |
 | `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | newline |
 | `Shift` + arrows, `Home` / `End` | select text in the transcript |
 | `Ctrl+C` | copy what is highlighted, wherever it is — transcript, dialogue, composer, title |
+| `F6` / `Ctrl+Shift+C` | copy the complete active dialog, including off-screen text; otherwise copy the visible screen |
+| `F7` / `Ctrl+Shift+U` | copy the authorization URL, including after hiding the note |
+| `F8` / `Ctrl+Shift+Y` | copy the authorization code, including after hiding the note |
 | `Esc` | clear the selection; then stop the running turn, then cancel the prompt, then quit |
-| `Ctrl+Q` | quit |
+| `Ctrl+Q` / `F9` | quit from every dialog |
 | `Ctrl+D` | quit |
 | `Ctrl+R` | reverse-search submitted prompts |
 | `Ctrl+P` | open the queue of prompts waiting for the turn to end (and close it) |
@@ -271,15 +276,18 @@ opened the list to find. The one key it does not own is `Ctrl+C`, which is the c
 wherever the reader is: the text of the list is exactly the kind of thing somebody wants to
 take out of this interface, and the highlight can be drawn over it while it is up.
 
-**While an approval dialog is up, three answers are possible and every other key is
-swallowed.** The dialog is drawn over the interface, names the tool and the harness's reason,
-and names every option with the key that selects it. `y` allows that one call, `a` allows it
-and records the tool for the rest of the session so the question is not asked again, and `n`
-or `Esc` denies it. A stray keypress cannot approve a command. The status line says what is
-being waited for, and the dialog closes when the turn ends — an answer cannot outlive the
-question. `Ctrl+C` is not an answer here either: it copies, as it does everywhere else, and
-leaves the question open. Denying *and* stopping the turn in one press went with it; `n`
-denies, and the turn is stopped afterwards with the key that stops it.
+**An approval question owns the keyboard and the visible dialog.** `y` allows once, `n` or
+`Esc` denies, and `a` opens a standing-grant warning. Only a second `y` confirms that grant;
+repeated `a` or Enter does not. `Esc` from the warning returns to the question. `Tab` and arrows
+choose an answer and Enter applies it, with Deny selected for every new question. Ctrl/Alt-modified
+letters never count as consent: `Ctrl+Y` is not `y`, even if a question arrived while you were editing.
+
+The harness's reason wraps and scrolls with PageUp/PageDown and Home/End; the choices and exit
+instructions stay in a fixed footer when the screen can hold it. On exceptionally tiny terminals,
+all text, including the footer, remains scrollable rather than discarded. A provider or key-entry
+dialog waiting behind an approval retains its state but cannot receive hidden input. Permissions
+can still be opened with Shift+Tab, above the question; closing them returns to it.
+`Ctrl+Q`, `Ctrl+D`, and `F9` quit from every dialog. `Ctrl+C` copies a selection without answering.
 
 **`Ctrl+R` searches the history** rather than toggling anything, because that is what it is
 in every interface that has one — including the one these bindings are modelled on, where
@@ -370,10 +378,11 @@ can be corrected without arrow keys. A *drag* anywhere else selects what is draw
 see [selecting and copying](#selecting-and-copying) — and a click that does not drag takes
 the selection off.
 
-The wheel is taken wherever the pointer is rather than only over the conversation. A reader
+With a dialog open, the wheel reads that dialog instead of moving the hidden conversation.
+Otherwise the wheel is taken wherever the pointer is rather than only over the conversation. A reader
 reaching for it without looking should not have to find a band first, and the conversation
 is the only thing here there is to scroll. Mouse reporting is asked for when the interface
-starts and given back when it leaves, and while it is on the terminal's own
+starts (unless `tui_mouse = false`) and given back when it leaves, and while it is on the terminal's own
 click-and-drag selection needs whatever modifier that terminal uses for it — usually
 `Shift`. That is the cost of a program that draws its own screen, and it is the cost every
 full-screen terminal program pays.
@@ -545,14 +554,14 @@ new binding should do the same, and there is a test that fails if it does not.
 ### Choosing the permission state
 
 `Shift+Tab` opens a dialog listing the three approval states with what each one means. The key
-works from anywhere — including from behind an approval question, because a reader who wants to
+opens from the composer or an approval question, because a reader who wants to
 stop being asked must not have to answer a question first — and it opens on the state the old
 binding moved to, so `Shift+Tab` then `Enter` is the cycle it always was, with the chance to read
 what it grants before granting it. That reading is the whole point: `permitted calls` and `all
 calls` are two words apart and nothing alike in what they allow, and a status line can only name
 one of them at a time.
 
-Inside the dialog, `Up`/`Down` (or `k`/`j`) move, `Tab` and `Shift+Tab` walk forward, the digits
+Inside the dialog, `Up`/`Down` (or `k`/`j`) move, `Tab` walks forward and `Shift+Tab` backward, the digits
 `1`–`3` select directly, `Enter` applies and `Esc` cancels. Every other key does nothing rather
 than typing into the composer behind the dialog.
 
@@ -578,7 +587,7 @@ drawing a list nobody would honour.
 title bar happens to name what they wanted — so `/model` opens a dialog instead: one row per
 model the agent offers, the answering model marked `current`, and the selection starting on that
 model so `Enter` on it is a no-op rather than a surprise move. `Up`/`Down` (or `k`/`j`) move,
-`Tab` and `Shift+Tab` walk forward, the digits `1`–`9` select directly, `Enter` switches and
+`Tab` walks forward and `Shift+Tab` backward, the digits `1`–`9` select directly, `Enter` switches and
 `Esc` cancels. Every other key does nothing rather than typing into the composer behind the
 dialog, the same rule the permission dialog and the key list follow.
 
@@ -879,7 +888,9 @@ The composer grows with the prompt up to five rows and then scrolls to keep the 
 typed on screen, so a long prompt stays editable without squeezing the conversation out
 of the terminal.
 
-The caret is a **style on the cell it is over**, not a glyph in a cell of its own. Drawn as
+The caret is a **style on the cell it is over**, not a glyph in a cell of its own.
+The real terminal cursor is positioned at the same insertion point for terminal cursor tracking;
+it is not placed behind a modal. Drawn as
 a glyph it took a column of its own, so every character after it slid one place to the right
 whenever the cursor moved — which reads as the cursor displacing the text it is moving
 across, and is worst exactly where a caret is most useful: in the middle of a word being
@@ -985,10 +996,39 @@ toggles remain the way to fold runs away entirely.
 
 ## What it shows, and why
 
-**The answer is white; everything that is not the answer is marked.** Reasoning is dimmed
-and italic, tool activity is yellow, notices are blue — so a reader scanning for the answer
-can skip the thinking without reading it, and the thing they came for is not competing with
-a colour of its own.
+**The answer uses the terminal's ordinary text colours by default.** Reasoning is italic,
+roles have labels, and tool outcomes have distinct symbols; essential instructions are not dimmed.
+All transcript, title, status, menu, dialog and markdown styles share one theme. There is no second
+set of hard-coded dialog colours that can escape `NO_COLOR`.
+
+### Display accessibility preferences
+
+```toml
+tui_theme = "terminal" # terminal (default), light, dark, high_contrast
+tui_mouse = true       # false preserves native terminal selection instead of capturing the mouse
+```
+
+`light` and `dark` paint an explicit foreground/background pair. Their text and accent colours
+are tested for at least 4.5:1 contrast, including instructions and menu states. `high_contrast`
+uses the terminal's own foreground/background, no dimming, and bold/reversal for focus. Its actual
+contrast, like the default terminal palette's, depends on the terminal settings. A non-empty
+`NO_COLOR` removes every colour from whichever theme was chosen, preserving emphasis and focus.
+
+Dialogs are contained within the terminal, long names and explanations wrap, and PageUp/PageDown
+read the complete text. Selection changes and resizes reveal the selected item. Help descriptions
+are not truncated to a two-column table. The composer edits and wraps whole graphemes, including
+combining characters and joined emoji, measures wide characters by display columns, and positions
+the real terminal cursor at its insertion point when no modal is open.
+
+`F6` copies the full active dialog, including text outside its viewport, or the visible screen
+when none is open. `F7` copies the authorization URL and `F8` copies its code; both remain available
+after hiding the note. Ctrl+Shift+C/U/Y are equivalent where a terminal reports those chords;
+function keys are the fallback where it does not. A masked API key is never copied as plaintext.
+`Ctrl+C` retains its selection-only behavior, and `/copy` still copies the newest answer.
+
+These are accessibility improvements, not a WCAG conformance or screen-reader compatibility
+claim. The alternate-screen interface and diagram semantics still need live assistive-technology
+assessment; there is not yet a separate plain/screen-reader interaction mode.
 
 **Tool calls are paired with their results.** A call renders as `⚙ name · what it is doing`
 and its result as `✓ name` or `✗ name`, so a failure is visible at a glance rather than

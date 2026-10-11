@@ -48,7 +48,9 @@ and the **approval policy** decides what happens to a call _outside_ it.
 Every prompt offers a standing "always allow", which records the tool for the rest
 of the session. It is per session and in memory, and it is wider than one call:
 granting `bash` means every later `bash` call in that conversation runs without
-asking, including a destructive one.
+asking, including a destructive one. In the TUI, `a` reviews this grant and a second `y`
+confirms it; repeated Enter cannot confirm it. Every new approval selects Deny. Modified letter
+shortcuts (such as Ctrl+Y) do not count as consent, and a hidden dialog never receives input.
 
 The state is shown in the interface's status line and chosen with `Shift+Tab`;
 it can be chosen at startup with `--approval`. A state chosen in the interface

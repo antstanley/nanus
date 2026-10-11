@@ -213,6 +213,39 @@ fn markdown_rendering_can_be_turned_off() {
 }
 
 #[test]
+fn complete_tui_palettes_and_native_mouse_selection_round_trip() {
+    use nanus_adapter_config::TuiTheme;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    for (spelling, theme) in [
+        ("terminal", TuiTheme::Terminal),
+        ("light", TuiTheme::Light),
+        ("dark", TuiTheme::Dark),
+        ("high_contrast", TuiTheme::HighContrast),
+    ] {
+        std::fs::write(
+            &path,
+            format!("tui_theme = \"{spelling}\"\ntui_mouse = false\n"),
+        )
+        .expect("seed");
+        let config = NanusConfig::load(Some(&path)).expect("load");
+        assert_eq!(config.tui_theme, theme);
+        assert_eq!(config.tui_theme.to_string(), spelling);
+        assert!(!config.tui_mouse);
+        config.save_to(&path).expect("save");
+        assert_eq!(NanusConfig::load_from(&path).expect("reload"), config);
+    }
+    std::fs::write(&path, "tui_theme = \"unknown\"\n").expect("seed invalid");
+    assert!(
+        NanusConfig::load_from(&path).is_err(),
+        "a mistyped preference is refused"
+    );
+    let default = NanusConfig::default();
+    assert_eq!(default.tui_theme, TuiTheme::Terminal);
+    assert!(default.tui_mouse);
+}
+
+#[test]
 fn an_unknown_detail_spelling_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.toml");

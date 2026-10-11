@@ -149,6 +149,40 @@ impl core::fmt::Display for TuiDetail {
     }
 }
 
+/// The interface's complete colour preference, independent of provider or session policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTheme {
+    /// Ordinary text inherits the terminal's foreground and background; roles use ANSI accents.
+    #[default]
+    Terminal,
+    /// Dark text and accents on an explicit white background.
+    Light,
+    /// Light text and accents on an explicit near-black background.
+    Dark,
+    /// Terminal colours only, with no dimming; focus is marked with reversal and bold.
+    HighContrast,
+}
+
+impl TuiTheme {
+    /// The spelling used in the configuration file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Light => "light",
+            Self::Dark => "dark",
+            Self::HighContrast => "high_contrast",
+        }
+    }
+}
+
+impl core::fmt::Display for TuiTheme {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The default tokens `read_video` may spend on analysis over one agent's life.
 pub const DEFAULT_VIDEO_ANALYSIS_BUDGET: u64 = 200_000;
 
@@ -221,6 +255,10 @@ pub struct NanusConfig {
     pub max_parallel_tools: u32,
     /// How much of a tool call and a thinking segment the interface draws.
     pub tui_detail: TuiDetail,
+    /// Colours for the whole interface. Non-empty `NO_COLOR` overrides every palette.
+    pub tui_theme: TuiTheme,
+    /// Whether the interface captures the mouse; false preserves native terminal selection.
+    pub tui_mouse: bool,
     /// Whether the interface renders the model's answers as markdown.
     ///
     /// On by default: the model writes markdown, and a transcript that shows the source
@@ -285,6 +323,8 @@ impl Default for NanusConfig {
             context_budget: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             tui_detail: TuiDetail::default(),
+            tui_theme: TuiTheme::default(),
+            tui_mouse: true,
             markdown: true,
             mermaid: true,
             read_video: false,

@@ -39,6 +39,21 @@ mod wrap;
 
 pub(crate) use theme::MarkdownTheme;
 
+/// Wraps literal UI prose without interpreting markdown, using the renderer's display-column rules.
+pub(crate) fn wrap_text(
+    text: &str,
+    width: usize,
+    style: ratatui::style::Style,
+) -> Vec<Line<'static>> {
+    wrap::wrap(
+        &[ratatui::text::Span::styled(text.to_owned(), style)],
+        width,
+        "",
+        "",
+        style,
+    )
+}
+
 use ratatui::text::Line;
 
 /// Renders `source` as markdown at `width` columns.

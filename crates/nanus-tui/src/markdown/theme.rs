@@ -72,7 +72,7 @@ impl MarkdownTheme {
     /// notice accents, because a diagram is a figure rather than prose.
     pub(crate) fn from_view(theme: &Theme) -> Self {
         let body = theme.assistant;
-        let muted = body.add_modifier(Modifier::DIM);
+        let muted = theme.secondary;
         Self {
             text: body,
             muted,
@@ -83,7 +83,7 @@ impl MarkdownTheme {
             // second palette: a keyword takes the tool accent, which is the one colour here
             // that means "this is a name for an action", a string takes the human's input
             // colour, a number takes the busy accent, and a comment takes the reasoning
-            // style — dimmed and italic, because a comment is the one thing in a fence that
+            // style — italic but never dimmed, because a comment is the one thing in a fence that
             // is *about* the code rather than part of it. Under `NO_COLOR` every one of them
             // loses its colour and keeps its modifier, so a monochrome terminal still sees
             // keywords in bold and comments in italics.

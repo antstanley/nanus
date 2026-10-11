@@ -50,6 +50,6 @@ mod error;
 
 pub use config::{
     CONFIG_ENV, CONFIG_VERSION, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_STEPS_PER_TURN,
-    NanusConfig, ReasoningEffort, TuiDetail,
+    NanusConfig, ReasoningEffort, TuiDetail, TuiTheme,
 };
 pub use error::ConfigError;

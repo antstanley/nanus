@@ -5,115 +5,27 @@
 
 use core::cell::RefCell;
 use ratatui::Frame;
+use ratatui::buffer::CellWidth as _;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use std::collections::BTreeMap;
 
 use nanus_domain::ApprovalPolicy;
-use unicode_width::UnicodeWidthChar as _;
+use unicode_segmentation::UnicodeSegmentation as _;
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::buffer::InputBuffer;
 use crate::compact::{self, Detail};
+use crate::dialog::{self, Content as DialogContent, Modal};
 use crate::layout::{LayoutBlock, LayoutKey, Piece, TranscriptLayout};
 use crate::markdown::{self, MarkdownTheme};
 use crate::queue::Queue;
 use crate::stats::{Throughput, share, show, show_duration};
 use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_count};
 
-/// Colours and emphasis for each role.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Theme {
-    /// The style applied to the human's input.
-    pub user: Style,
-    /// The style applied to the model's answer.
-    pub assistant: Style,
-    /// The style applied to the model's reasoning.
-    pub reasoning: Style,
-    /// The style applied to tool calls and results.
-    pub tool: Style,
-    /// The style applied to harness notices.
-    pub notice: Style,
-    /// The style applied to errors.
-    pub error: Style,
-    /// The style applied to an open turn's status.
-    pub busy: Style,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            user: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            // White rather than a colour: the answer is the thing a reader came for, and
-            // the roles that are *not* the answer are the ones that should be marked. A
-            // colour here competes with the transcript instead of settling it.
-            assistant: Style::default().fg(Color::White),
-            // Reasoning is dimmed deliberately: it is not the answer, and a reader
-            // scanning for the answer should be able to skip it.
-            reasoning: Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-            tool: Style::default().fg(Color::Yellow),
-            notice: Style::default().fg(Color::Blue),
-            error: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            busy: Style::default().fg(Color::Magenta),
-        }
-    }
-}
-
-impl Theme {
-    /// Returns the same theme with every colour removed, for a terminal that asked for
-    /// none.
-    ///
-    /// `NO_COLOR` is honoured by not *asking* for colour, rather than by asking and
-    /// letting the backend drop it. The backend writes a colour change as one command
-    /// covering the foreground *and* the background, and when crossterm is suppressing
-    /// colour that command degenerates to a bare `ESC[;m`, which is not "no colour" but a
-    /// full SGR reset — so it clears the attributes set for the same cell just before it.
-    /// The caret is a reversed cell, so under a colour theme it was the caret that
-    /// vanished whenever it landed on a coloured prompt prefix. A theme with no colour in
-    /// it has no colour command to degenerate, and every modifier survives.
-    ///
-    /// The modifiers are kept exactly as the colour theme has them: this is that theme
-    /// with its colours taken out, not a second design. Roles that were told apart only
-    /// by colour are no longer told apart, which is what asking for no colour means.
-    #[must_use]
-    pub const fn monochrome() -> Self {
-        Self {
-            user: Style::new().add_modifier(Modifier::BOLD),
-            assistant: Style::new(),
-            reasoning: Style::new().add_modifier(Modifier::ITALIC),
-            tool: Style::new(),
-            notice: Style::new(),
-            error: Style::new().add_modifier(Modifier::BOLD),
-            busy: Style::new(),
-        }
-    }
-
-    /// Returns the style for a role.
-    #[must_use]
-    pub const fn style_for(&self, role: Role) -> Style {
-        match role {
-            Role::User => self.user,
-            Role::Assistant => self.assistant,
-            Role::Reasoning => self.reasoning,
-            Role::Tool => self.tool,
-            Role::Harness => self.notice,
-        }
-    }
-
-    /// Returns the style for an entry, accounting for failure.
-    #[must_use]
-    pub const fn style_for_entry(&self, entry: &Entry) -> Style {
-        if let EntryKind::ToolResult { is_error: true, .. } = entry.kind() {
-            return self.error;
-        }
-        self.style_for(entry.role())
-    }
-}
+pub use crate::theme::Theme;
 
 /// How many rows the composer grows to before it scrolls to follow the cursor.
 ///
@@ -275,7 +187,7 @@ pub(crate) struct ScreenSelection {
     /// dialogue does — and a highlight drawn before one opened is covered by it, which is a change
     /// to what those cells mean. Either way the selection is dropped rather than left holding
     /// something the reader never chose.
-    over_dialogue: bool,
+    over_dialogue: Option<Modal>,
 }
 
 impl ScreenSelection {
@@ -464,6 +376,8 @@ pub struct ViewState {
     pub label: Option<String>,
     /// Styling.
     pub theme: Theme,
+    /// Whether the runtime captures the mouse. False preserves native terminal selection.
+    pub(crate) mouse_enabled: bool,
     /// Whether the model's answers are rendered as markdown.
     ///
     /// On by default, because the model writes markdown and showing its source shows the
@@ -490,6 +404,14 @@ pub struct ViewState {
     /// While it is set, the dialog owns the keyboard: the composer is not taking text, and
     /// the only keys that do anything are the answers.
     pub pending_approval: Option<PendingApproval>,
+    /// The selected answer: deny, allow once, or always allow. A new question starts at deny.
+    pub(crate) approval_selection: usize,
+    /// Whether a standing grant is awaiting a second, explicit confirmation.
+    pub(crate) approval_confirming: bool,
+    /// Wrapped rows scrolled in the active dialog.
+    pub(crate) dialog_scroll: u16,
+    /// The last modal and selection drawn, so a new focus is revealed and a resumed one resets.
+    dialog_focus: Option<(Modal, usize, u16, u16)>,
 
     /// How the agent decides a call the sandbox refused, as last told to it.
     ///
@@ -772,10 +694,15 @@ impl Default for ViewState {
             effort: None,
             label: None,
             theme: Theme::default(),
+            mouse_enabled: true,
             markdown: true,
             mermaid: true,
             pending_scroll_back: None,
             pending_approval: None,
+            approval_selection: 0,
+            approval_confirming: false,
+            dialog_scroll: 0,
+            dialog_focus: None,
             approval: ApprovalPolicy::default(),
             queue: Queue::new(),
             queue_open: false,
@@ -864,7 +791,7 @@ pub struct ProviderChoice {
 /// The order is [`ApprovalPolicy::next`]'s, so the dialog and the key that opens it agree about
 /// which state comes next. The sentences are the interface's rather than the domain's: a domain
 /// state names itself, and a reader choosing between three of them needs the difference spelled
-/// out. ASCII only, because the layout counts characters rather than columns.
+/// out. Every meaning is wrapped in full by the shared dialog layout.
 const PERMISSIONS: [(ApprovalPolicy, &str); 3] = [
     (
         ApprovalPolicy::PerCall,
@@ -887,22 +814,6 @@ const PERMISSIONS: [(ApprovalPolicy, &str); 3] = [
 /// what the tools are confined to. Changing the second mid-session would make the prompt the model
 /// was sent a lie, so this dialog moves the first and says so about the second.
 const SANDBOX_NOTE: &str = "the sandbox mode is set in configuration and does not change here";
-
-/// Cuts a dialog row to the room it has, counting characters.
-///
-/// Characters rather than columns, which is honest because the rows this is used on are built from
-/// ASCII — the labels, the sentences, and the digits. A row wider than the dialog would wrap under
-/// a `Paragraph` without `Wrap` and be clipped, but it would be clipped at the *terminal's* width
-/// rather than at the dialog's border, so the last column of the border would be overwritten.
-fn clip_row(text: &str, room: usize) -> String {
-    if text.chars().count() <= room {
-        return text.to_owned();
-    }
-    let keep = room.saturating_sub(1);
-    let mut clipped: String = text.chars().take(keep).collect();
-    clipped.push('…');
-    clipped
-}
 
 /// Moves a selection's head to a line, whole, and points the anchor's line the right way.
 ///
@@ -1494,17 +1405,41 @@ impl ViewState {
     /// a word being typed, so the composer behind it is still live.
     #[must_use]
     pub(crate) fn modal_open(&self) -> bool {
-        self.queue_open
-            || self.help_open
-            || self.permission_open
-            || self.context_dialog.is_some()
-            || self.model_open
-            || self.effort_open
-            || self.provider_open
-            || self.credential_open
-            || self.key_entry_open
-            || self.auth_open
-            || self.pending_approval.is_some()
+        self.active_modal().is_some()
+    }
+
+    /// The single authority for which pending dialog is visible and receives input.
+    pub(crate) fn active_modal(&self) -> Option<Modal> {
+        [
+            (self.permission_open, Modal::Permissions),
+            (self.pending_approval.is_some(), Modal::Approval),
+            (self.key_entry_open, Modal::KeyEntry),
+            (self.credential_open, Modal::Credential),
+            (self.auth_open, Modal::Authorization),
+            (self.provider_open, Modal::Provider),
+            (self.context_dialog.is_some(), Modal::Context),
+            (self.model_open, Modal::Models),
+            (self.effort_open, Modal::Effort),
+            (self.help_open, Modal::Help),
+            (self.queue_open, Modal::Queue),
+        ]
+        .into_iter()
+        .find_map(|(open, modal)| open.then_some(modal))
+    }
+
+    /// Scrolls explanations without moving the selected decision.
+    pub(crate) fn scroll_dialog(&mut self, rows: i32) {
+        let next = i32::from(self.dialog_scroll).saturating_add(rows).max(0);
+        self.dialog_scroll = u16::try_from(next).unwrap_or(u16::MAX);
+    }
+
+    /// The visible screen as text, for a keyboard copy without a pointer selection.
+    pub(crate) fn screen_text_for_copy(&self) -> String {
+        self.screen
+            .iter()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Drops the selection, whichever surface it was over.
@@ -1567,7 +1502,7 @@ impl ViewState {
             anchor: cell,
             head: cell,
             viewport: self.screen_size,
-            over_dialogue: self.modal_open(),
+            over_dialogue: self.active_modal(),
         });
         true
     }
@@ -1991,15 +1926,11 @@ impl ViewState {
         let Some(file) = self.mentions.get(self.mention_selection).cloned() else {
             return false;
         };
-        for _ in 0..mention.before {
-            let _ = self.input.backspace();
-        }
-        for _ in 0..mention.after {
-            let _ = self.input.delete();
-        }
-        // A trailing space, so the next word starts as a word: a reader who completes a name and
-        // types on should not be gluing the two together.
-        self.input.insert_str(&format!("{file} "));
+        let cursor = self.input.cursor();
+        let range = cursor.saturating_sub(mention.before)..cursor.saturating_add(mention.after);
+        // A trailing space lets typing continue as a word. Replace the measured range once:
+        // repeated grapheme deletions cannot honor the mention's character counts.
+        self.input.replace_characters(range, &format!("{file} "));
         self.close_mentions();
         true
     }
@@ -2396,14 +2327,6 @@ impl ViewState {
         core::mem::take(&mut self.key_input)
     }
 
-    /// The rows of the key list that fit in `height`, and where they start.
-    #[must_use]
-    fn help_window(&self, height: u16) -> (usize, usize) {
-        let room = usize::from(height);
-        let offset = usize::from(self.help_scroll).min(crate::help::height().saturating_sub(room));
-        (offset, room)
-    }
-
     /// Moves the overlay's selection toward the front of the queue.
     pub fn queue_up(&mut self) {
         self.queue_selection = self.queue_selection.saturating_sub(1);
@@ -2623,6 +2546,10 @@ impl ViewState {
     /// transcript.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        // Explicit palettes own their background too; inherited terminal colours remain the default.
+        if self.theme.assistant.fg.is_some() || self.theme.assistant.bg.is_some() {
+            frame.render_widget(Block::default().style(self.theme.assistant), area);
+        }
         self.drop_stale_selection(area);
         // The composer grows with the prompt, so a multi-line one is visible rather
         // than clipped to a single row. The transcript keeps a floor of rows so that a
@@ -2676,7 +2603,7 @@ impl ViewState {
             .split(area);
 
         if let Some(title) = chunks.first() {
-            Self::render_title(
+            self.render_title(
                 frame,
                 *title,
                 self.label.as_deref(),
@@ -2719,58 +2646,69 @@ impl ViewState {
         // highlighted: the snapshot is taken before the paint because the highlight adds a modifier
         // and no text, and the paint comes last because a selection may be over a dialogue, which
         // is only drawn now.
+        self.keep_modal_feedback(frame, area);
         self.capture_screen(frame);
         if let Some(selection) = self.screen_selection {
             paint_screen_selection(frame, selection);
         }
     }
 
-    /// Draws overlays in keyboard-routing order, with the active modal on top.
+    /// Draws only the active modal: background dialogs retain their state but never own input.
     fn render_dialogs(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        // Before the approval dialog, because a question the agent is blocked on has to be
-        // the thing a reader sees: the queue is something they can act on afterwards.
-        if self.queue_open {
-            self.render_queue_dialog(frame, area);
+        let Some(modal) = self.active_modal() else {
+            self.dialog_focus = None;
+            return;
+        };
+        let focus = (modal, self.dialog_selection(modal), area.width, area.height);
+        let changed = self.dialog_focus != Some(focus);
+        if changed {
+            self.dialog_scroll = 0;
+            self.clear_selection();
         }
-        // The key list is a reference a reader opened deliberately, so it goes over the
-        // transcript and under the two things the agent is waiting on.
-        if self.help_open {
-            self.render_help(frame, area);
-        }
-        // Over the transcript and the key list, under the approval question and the permission
-        // dialog: the selector is a deliberate choice a reader made, but the things whose keys
-        // are routed first have to be the things on top.
-        if self.model_open {
-            self.render_models(frame, area);
-        }
-        if self.effort_open {
-            self.render_efforts(frame, area);
-        }
-        if self.context_dialog.is_some() {
-            self.render_context_dialog(frame, area);
-        }
-        if self.provider_open {
-            self.render_providers(frame, area);
-        }
-        if self.credential_open {
-            self.render_credential(frame, area);
-        }
-        if self.key_entry_open {
-            self.render_key_entry(frame, area);
-        }
-        if self.auth_open {
-            self.render_auth(frame, area);
-        }
-        // Last, so it covers whatever it overlaps: a question the agent is blocked on has to
-        // be the thing a reader sees, not a dialogue behind the transcript.
-        if self.pending_approval.is_some() {
-            self.render_approval(frame, area);
-        }
-        // Over even that, because the key that opened it is routed first: what owns the keyboard
-        // has to be what is on top, or a reader would be pressing keys at a dialogue they cannot
-        // see. `Esc` closes this and gives the question back.
-        if self.permission_open {
-            self.render_permissions(frame, area);
+        self.dialog_focus = Some(focus);
+        let maximum = if modal == Modal::Authorization {
+            84
+        } else {
+            78
+        };
+        let width = dialog::inner_width(area, maximum);
+        let content = self.dialog_content(modal, width);
+
+        let scroll = if modal == Modal::Help {
+            &mut self.help_scroll
+        } else if modal == Modal::Context {
+            if let Some(state) = self.context_dialog.as_mut() {
+                &mut state.scroll
+            } else {
+                return;
+            }
+        } else {
+            &mut self.dialog_scroll
+        };
+        dialog::render(
+            frame,
+            area,
+            maximum,
+            &content,
+            scroll,
+            (changed, &self.theme),
+        );
+    }
+
+    /// A clipboard result must be visible even when a full-height modal covers the status line.
+    fn keep_modal_feedback(&self, frame: &mut Frame<'_>, area: Rect) {
+        let copied = self.status.starts_with("copied ")
+            || self.status.starts_with("the UI text was not copied")
+            || self.status == "there is no UI text to copy";
+        if self.modal_open() && copied && area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(self.status.clone()).style(self.theme.notice),
+                Rect {
+                    y: area.y,
+                    height: 1,
+                    ..area
+                },
+            );
         }
     }
 
@@ -2780,7 +2718,7 @@ impl ViewState {
     /// at them, and a dialogue that has opened or closed has changed what is at every cell it
     /// covers. Dropped rather than clamped, for the reason a transcript selection is.
     fn drop_stale_selection(&mut self, area: Rect) {
-        let dialogue = self.modal_open();
+        let dialogue = self.active_modal();
         if self.screen_selection.is_some_and(|it| {
             it.viewport != (area.width, area.height) || it.over_dialogue != dialogue
         }) {
@@ -2805,9 +2743,16 @@ impl ViewState {
         self.screen.resize_with(rows, String::new);
         for (row, line) in (0..area.height).zip(self.screen.iter_mut()) {
             line.clear();
+            let mut covered = 0_u16;
             for column in 0..area.width {
+                // Continuation cells of a wide grapheme are not extra spaces in the copied text.
+                if covered > 0 {
+                    covered = covered.saturating_sub(1);
+                    continue;
+                }
                 if let Some(cell) = buffer.cell((column, row)) {
                     line.push_str(cell.symbol());
+                    covered = cell.cell_width().saturating_sub(1);
                 }
             }
         }
@@ -2853,7 +2798,7 @@ impl ViewState {
         if self.mentions.is_empty() || area.height == 0 {
             return;
         }
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = self.theme.secondary;
         let total = self.mentions.len();
         let shown = total.min(usize::from(MENTION_MAX_ROWS));
         // The window moves with the selection, so the row a reader arrowed to is always drawn.
@@ -2868,9 +2813,9 @@ impl ViewState {
         for (index, file) in self.mentions.iter().enumerate().skip(offset).take(shown) {
             let selected = index == self.mention_selection;
             let style = if selected {
-                Style::default().add_modifier(Modifier::BOLD)
+                self.theme.selected
             } else {
-                Style::default().fg(Color::DarkGray)
+                self.theme.secondary
             };
             let marker = if selected { "\u{25b6}" } else { " " };
             lines.push(Line::from(vec![
@@ -2893,7 +2838,7 @@ impl ViewState {
         if self.queue.is_empty() || area.height == 0 {
             return;
         }
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = self.theme.secondary;
         let total = self.queue.len();
         let mut lines = vec![Line::from(vec![
             Span::styled("── queued", self.theme.notice),
@@ -2907,7 +2852,7 @@ impl ViewState {
         {
             lines.push(Line::from(vec![
                 Span::styled(format!(" {:>2}  ", index.saturating_add(1)), dim),
-                Span::styled(first_line(prompt), Style::default()),
+                Span::styled(first_line(prompt), self.theme.assistant),
             ]));
         }
         if total > usize::from(QUEUE_MAX_ROWS) {
@@ -2925,722 +2870,349 @@ impl ViewState {
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
     }
 
-    /// Draws the queue overlay: every prompt, a selection, and the keys that act on it.
-    ///
-    /// Centred and bounded like the approval dialog, and drawn over the interface rather
-    /// than in it, because while it is up the keyboard belongs to the queue.
-    fn render_queue_dialog(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.queue.is_empty() {
-            return;
+    /// The selection whose first row must stay in view when keyboard focus changes.
+    fn dialog_selection(&self, modal: Modal) -> usize {
+        match modal {
+            Modal::Permissions => self.permission_selection,
+            Modal::Approval => self
+                .approval_selection
+                .saturating_add(usize::from(self.approval_confirming).saturating_mul(3)),
+            Modal::Models => self.model_selection,
+            Modal::Effort => self.effort_selection,
+            Modal::Provider => self.provider_selection,
+            Modal::Queue => self.queue_selection,
+            Modal::Context => self.context_dialog.as_ref().map_or(0, |it| {
+                it.selection
+                    .saturating_add(usize::from(it.confirming.is_some()).saturating_mul(3))
+            }),
+            Modal::KeyEntry => self.key_input.chars().count(),
+            _ => 0,
         }
-        // Clamped between a comfortable reading width and a usable one, and never wider
-        // than the terminal that has to draw it.
-        let width = area.width.saturating_sub(4).clamp(24, 72);
-        let mut lines: Vec<Line<'static>> = self
-            .queue
-            .iter()
-            .enumerate()
-            .map(|(index, prompt)| {
-                let selected = index == self.queue_selection;
-                let style = if selected {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let marker = if selected { "\u{25b6}" } else { " " };
-                Line::from(vec![
-                    Span::styled(format!("{marker} {:>2}  ", index.saturating_add(1)), style),
-                    Span::styled(first_line(prompt), style),
-                ])
-            })
-            .collect();
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" edit    "),
-            Span::styled(
-                "d",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" remove    "),
-            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
-            Span::raw(" close"),
-        ]));
-        // Taller than the terminal is a scroll, not a drawing: the block is clamped and
-        // the text is clipped, which is what the approval dialog does too.
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(4).max(4));
-        // Shifted rather than divided: the centring offset is an unsigned count of cells, and
-        // the workspace treats integer division as a defect wherever it appears.
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.busy)
-            .title(Line::from(Span::styled(
-                " queued prompts ",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-        // Cleared first, so the transcript behind the dialog does not show through the gaps
-        // between its letters.
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .wrap(Wrap { trim: false })
-                .style(self.theme.notice),
-            dialog,
-        );
     }
 
-    /// Draws the approval dialog over the interface.
-    ///
-    /// Centred and bounded, so it reads as a question rather than as part of the transcript,
-    /// and its keys are the only ones that do anything while it is up.
-    fn render_approval(&self, frame: &mut Frame<'_>, area: Rect) {
-        let Some(approval) = self.pending_approval.as_ref() else {
-            return;
-        };
-        // Clamped between a comfortable reading width and a usable one, and never wider
-        // than the terminal that has to draw it.
-        let width = area.width.saturating_sub(4).clamp(20, 64);
-        let mut lines = vec![Line::from(vec![
-            Span::styled("Run the ", Style::default()),
-            Span::styled(
-                approval.tool.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" tool?", Style::default()),
-        ])];
-        if let Some(reason) = approval.reason.as_deref().filter(|text| !text.is_empty()) {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                reason.to_owned(),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        lines.push(Line::from(""));
-        // The options are spelled out, each with the key that selects it: a prompt that says
-        // "approve?" and leaves the reader to guess is a prompt they will answer wrong.
-        lines.push(Line::from(vec![
-            Span::styled(
-                "y",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" allow once    "),
-            Span::styled(
-                "a",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" always allow    "),
-            Span::styled(
-                "n",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" deny"),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "always allow skips this question for the rest of the session · Esc denies",
-            Style::default().fg(Color::DarkGray),
-        )));
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(4).max(4));
-        // Shifted rather than divided: the centring offset is an unsigned count of cells, and
-        // the workspace treats integer division as a defect wherever it appears.
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.busy)
-            .title(Line::from(Span::styled(
-                " approval needed ",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-        let paragraph = Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .style(self.theme.notice);
-        // Cleared first, so the transcript behind the dialog does not show through the gaps
-        // between its letters.
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(paragraph, dialog);
+    /// The complete active dialog for keyboard copying, including text outside the viewport.
+    /// Masked credential entry never exposes the typed key through this route.
+    pub(crate) fn dialog_text(&self) -> Option<String> {
+        self.active_modal()
+            .map(|modal| self.dialog_content(modal, 4096).text())
     }
 
-    /// Draws the permission dialog.
-    ///
-    /// Three states with what each one means, because a label is not an explanation and this is
-    /// the one place a reader can see the difference before choosing: `permitted calls` and `all
-    /// calls` are two words apart and nothing alike in what they grant.
-    fn render_permissions(&self, frame: &mut Frame<'_>, area: Rect) {
-        let width = area.width.saturating_sub(4).clamp(30, 76);
-        // The label column is the widest label plus its mark and number, so the meanings line up.
-        let label_width = PERMISSIONS
-            .iter()
-            .map(|(policy, _)| policy.label().len())
-            .max()
-            .unwrap_or(0);
-        let room = usize::from(width.saturating_sub(2));
-        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-            "what happens to a call the sandbox refuses",
-            Style::default().fg(Color::DarkGray),
-        ))];
-        for (index, (policy, meaning)) in PERMISSIONS.iter().enumerate() {
-            let selected = index == self.permission_selection;
-            let style = if selected {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let marker = if selected { "\u{25b6}" } else { " " };
-            let head = format!(
-                "{marker} {} {:<width$}  ",
-                index.saturating_add(1),
-                policy.label(),
-                width = label_width
-            );
-            let text = format!("{head}{meaning}");
-            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            clip_row(SANDBOX_NOTE, room),
-            Style::default().fg(Color::DarkGray),
-        )));
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(4).max(4));
-        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
-        // workspace treats integer division as a defect wherever it appears.
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
+    /// Builds literal wrapped content; rendering and copying use this same vocabulary.
+    fn dialog_content(&self, modal: Modal, width: usize) -> DialogContent {
+        let mut content = match modal {
+            Modal::Approval => self.approval_content(width),
+            Modal::Permissions => self.permission_content(width),
+            Modal::Context => self.context_content(width),
+            Modal::Help => self.help_content(width),
+            Modal::Models | Modal::Effort | Modal::Provider | Modal::Queue => {
+                self.chooser_content(modal, width)
+            }
+            Modal::Credential | Modal::KeyEntry | Modal::Authorization => {
+                self.credential_content(modal, width)
+            }
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.busy)
-            .title(Line::from(Span::styled(
-                " permission ",
-                Style::default().add_modifier(Modifier::BOLD),
-            )))
-            .title_bottom(Line::from(Span::styled(
-                " Enter applies, Esc cancels ",
-                Style::default().fg(Color::DarkGray),
-            )));
-        // Cleared first, so the transcript behind the dialog does not show through the gaps
-        // between its letters.
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .style(self.theme.notice),
-            dialog,
-        );
+        content
+            .footer
+            .extend(dialog::wrapped("F9 quits", width, self.theme.secondary));
+        content
     }
 
-    /// Draws the chooser or its scrollable impact warning. Confirmation deliberately uses `y`,
-    /// not Enter: the key that chooses a mode cannot also confirm the warning it just opened.
-    fn render_context_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let Some(state) = self.context_dialog.as_mut() else {
-            return;
-        };
-        let width = area.width.saturating_sub(4).clamp(1, 78);
-        let inner = usize::from(width.saturating_sub(2).max(1));
-        let height = area.height.saturating_sub(4).max(4).min(area.height);
-        let room = usize::from(height.saturating_sub(2));
-        let (lines, footer) = if let Some(choice) = state.confirming {
-            let rows = crate::context::warning_rows(choice, inner);
-            let max_scroll = rows.len().saturating_sub(room);
-            state.scroll = state
-                .scroll
-                .min(u16::try_from(max_scroll).unwrap_or(u16::MAX));
-            let lines = rows
-                .into_iter()
-                .skip(usize::from(state.scroll))
-                .take(room)
-                .map(Line::from)
-                .collect();
-            (lines, " y confirms, Esc cancels; arrows scroll ")
+    /// Approval explanations scroll independently of the three fixed decision controls.
+    fn approval_content(&self, width: usize) -> DialogContent {
+        let selected = ["deny", "allow once", "always allow"]
+            .get(self.approval_selection)
+            .copied()
+            .unwrap_or("deny");
+        let controls = if self.approval_confirming {
+            "y confirms · n/Esc cancels\nPgUp/PgDn read · F6 copy"
+        } else if width < 30 {
+            "n/Esc deny · y once · a always\nTab choose · Enter decides\nPgUp/PgDn read"
         } else {
-            let mut lines = vec![Line::from(format!(
-                "current: {} (per session)",
-                self.context_mode.as_str()
-            ))];
+            "y allow once · a always allow · n/Esc deny\nTab chooses · Enter decides\nPgUp/PgDn read · F6 copy"
+        };
+        let footer = if self.approval_confirming {
+            controls.to_owned()
+        } else {
+            format!("Selected: {selected}\n{controls}")
+        };
+        let mut out = DialogContent::new(" approval needed ", &footer, width, &self.theme);
+        let Some(approval) = &self.pending_approval else {
+            return out;
+        };
+        out.push(
+            &format!("Run the {} tool?", approval.tool),
+            width,
+            self.theme.assistant,
+        );
+        if self.approval_confirming {
+            out.push(
+                &format!(
+                    "Always allow {} for this session? Every later call to this tool, \
+                    including destructive calls, will skip this question. Only y confirms.",
+                    approval.tool
+                ),
+                width,
+                self.theme.assistant,
+            );
+        } else {
+            out.push(&format!("Selected: {selected}"), width, self.theme.selected);
+        }
+        if let Some(reason) = &approval.reason {
+            out.push(reason, width, self.theme.secondary);
+        }
+        out.push(
+            "Always allow grants this tool for the rest of the session.",
+            width,
+            self.theme.secondary,
+        );
+        out
+    }
+
+    /// Every permission meaning remains reachable, even when one choice wraps onto many rows.
+    fn permission_content(&self, width: usize) -> DialogContent {
+        let mut out = DialogContent::new(
+            " permission ",
+            "Enter applies · Esc cancels\nPgUp/PgDn read · F6 copy",
+            width,
+            &self.theme,
+        );
+        out.push(
+            "what happens to a call the sandbox refuses",
+            width,
+            self.theme.secondary,
+        );
+        for (index, (policy, meaning)) in PERMISSIONS.iter().enumerate() {
+            out.choice(
+                index,
+                &format!("{}: {meaning}", policy.label()),
+                index == self.permission_selection,
+                width,
+                &self.theme,
+            );
+        }
+        out.push(SANDBOX_NOTE, width, self.theme.secondary);
+        out
+    }
+
+    /// The context chooser and its warning share bounded wrapping and the fixed action footer.
+    fn context_content(&self, width: usize) -> DialogContent {
+        let confirming = self.context_dialog.as_ref().and_then(|it| it.confirming);
+        let footer = if confirming.is_some() {
+            "y confirms · Esc cancels\nUp/Down scroll · F6 copy"
+        } else {
+            "Enter reviews impact · Esc cancels\nPgUp/PgDn read · F6 copy"
+        };
+        let mut out = DialogContent::new(" context mode ", footer, width, &self.theme);
+        let Some(state) = &self.context_dialog else {
+            return out;
+        };
+        if let Some(choice) = confirming {
+            out.lines.extend(
+                crate::context::warning_rows(choice, width)
+                    .into_iter()
+                    .map(Line::from),
+            );
+        } else {
+            out.push(
+                &format!("current: {} (per session)", self.context_mode.as_str()),
+                width,
+                self.theme.secondary,
+            );
             for (index, choice) in crate::context::ContextDialog::CHOICES.iter().enumerate() {
-                let marker = if state.selection == index {
-                    "\u{25b6}"
-                } else {
-                    " "
-                };
-                lines.push(Line::from(clip_row(
-                    &format!("{marker} {} {}", index.saturating_add(1), choice.label()),
-                    inner,
-                )));
+                out.choice(
+                    index,
+                    choice.label(),
+                    state.selection == index,
+                    width,
+                    &self.theme,
+                );
             }
-            lines.push(Line::from("Changes apply only while idle."));
-            (lines, " Enter reviews impact, Esc cancels ")
-        };
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.busy)
-            .title(" context mode ")
-            .title_bottom(footer);
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .style(self.theme.notice),
-            dialog,
-        );
+            out.push(
+                "Changes apply only while idle.",
+                width,
+                self.theme.secondary,
+            );
+        }
+        out
     }
 
-    /// Draws the model selector.
-    ///
-    /// The models the agent offered, one per row, with the one answering marked: `/model` opens
-    /// this rather than cycling blind, so a reader can read the list and choose instead of
-    /// pressing a key until the title bar happens to name what they wanted. The list comes from
-    /// the agent's handshake, so nothing here can offer an id the agent would refuse.
-    fn render_models(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.models.is_empty() {
-            return;
-        }
-        let width = area.width.saturating_sub(4).clamp(24, 72);
-        let room = usize::from(width.saturating_sub(2));
-        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-            "the models the agent offers",
-            Style::default().fg(Color::DarkGray),
-        ))];
-        for (index, model) in self.models.iter().enumerate() {
-            let selected = index == self.model_selection;
-            let style = if selected {
-                Style::default().add_modifier(Modifier::BOLD)
+    /// Help wraps the keys as well as their explanations instead of cutting either column.
+    fn help_content(&self, width: usize) -> DialogContent {
+        let mut out =
+            DialogContent::new(crate::help::TITLE, crate::help::FOOTER, width, &self.theme);
+        for (keys, effect) in crate::help::KEYS {
+            let text = if keys.is_empty() {
+                (*effect).to_owned()
             } else {
-                Style::default().fg(Color::DarkGray)
+                format!("{keys}: {effect}")
             };
-            let marker = if selected { "\u{25b6}" } else { " " };
-            // The model answering is marked in the row rather than left to the title bar
-            // behind the dialog: `Enter` on it changes nothing, and a reader should be able to
-            // see that before pressing it.
-            let current = if self.model.as_deref() == Some(model.as_str()) {
-                " · current"
-            } else {
-                ""
-            };
-            let text = format!("{marker} {} {model}{current}", index.saturating_add(1));
-            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
+            out.push(&text, width, self.theme.assistant);
         }
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(4).max(4));
-        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
-        // workspace treats integer division as a defect wherever it appears.
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.busy)
-            .title(Line::from(Span::styled(
-                " model ",
-                Style::default().add_modifier(Modifier::BOLD),
-            )))
-            .title_bottom(Line::from(Span::styled(
-                " Enter switches, Esc cancels ",
-                Style::default().fg(Color::DarkGray),
-            )));
-        // Cleared first, so the transcript behind the dialog does not show through the gaps
-        // between its letters.
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .style(self.theme.notice),
-            dialog,
-        );
+        out
     }
 
-    /// Draws the effort chooser.
-    ///
-    /// The steps the current model takes, one per row, with the one in force marked: `/effort`
-    /// opens this rather than cycling blind, and the list is the model's own so nothing here can
-    /// offer a step the provider refuses.
-    fn render_efforts(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.effort_levels.is_empty() {
-            return;
-        }
-        let width = area.width.saturating_sub(4).clamp(24, 60);
-        let room = usize::from(width.saturating_sub(2));
-        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-            "how hard the model is asked to think",
-            Style::default().fg(Color::DarkGray),
-        ))];
-        for (index, step) in self.effort_levels.iter().enumerate() {
-            let selected = index == self.effort_selection;
-            let style = if selected {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let marker = if selected { "\u{25b6}" } else { " " };
-            // The step in force is marked in the row rather than left to the title bar behind
-            // the dialog: `Enter` on it changes nothing, and a reader should see that first.
-            let current = if self.effort.as_deref() == Some(step.as_str()) {
-                " · current"
-            } else {
-                ""
-            };
-            let text = format!("{marker} {} {step}{current}", index.saturating_add(1));
-            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
-        }
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(4).max(4));
-        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
-        // workspace treats integer division as a defect wherever it appears.
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.busy)
-            .title(Line::from(Span::styled(
+    /// Lists scroll to the selected entry; complete long names and refusals are wrapped, not cut.
+    fn chooser_content(&self, modal: Modal, width: usize) -> DialogContent {
+        let (title, heading, footer) = match modal {
+            Modal::Models => (" model ", "the models the agent offers", "Enter switches"),
+            Modal::Effort => (
                 " thinking ",
-                Style::default().add_modifier(Modifier::BOLD),
-            )))
-            .title_bottom(Line::from(Span::styled(
-                " Enter applies, Esc cancels ",
-                Style::default().fg(Color::DarkGray),
-            )));
-        // Cleared first, so the transcript behind the dialog does not show through the gaps
-        // between its letters.
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .style(self.theme.notice),
-            dialog,
+                "how hard the model is asked to think",
+                "Enter applies",
+            ),
+            Modal::Provider => (" provider ", "where requests go", "Enter switches"),
+            _ => (
+                " queued prompts ",
+                "prompts waiting to run",
+                "Enter edits · d removes",
+            ),
+        };
+        let mut out = DialogContent::new(
+            title,
+            &format!("{footer} · Esc cancels\nPgUp/PgDn read · F6 copy"),
+            width,
+            &self.theme,
         );
-    }
-
-    /// Draws the provider chooser.
-    ///
-    /// One row per provider-and-plan the agent offers, with the one in force marked: `/provider`
-    /// opens this rather than switching blind, and a plan this build refuses is a row that says why.
-    fn render_providers(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.providers.is_empty() {
-            return;
-        }
-        let width = area.width.saturating_sub(4).clamp(30, 76);
-        let room = usize::from(width.saturating_sub(2));
-        let dim = Style::default().fg(Color::DarkGray);
-        let mut lines: Vec<Line<'static>> =
-            vec![Line::from(Span::styled("where requests go", dim))];
-        for (index, choice) in self.providers.iter().enumerate() {
-            let selected = index == self.provider_selection;
-            let style = if selected {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                dim
-            };
-            let marker = if selected { "\u{25b6}" } else { " " };
-            let note = choice.refused.as_deref().map_or_else(
-                || {
-                    if self.is_current(choice) {
-                        String::from(" · current")
+        out.push(heading, width, self.theme.secondary);
+        match modal {
+            Modal::Models => {
+                for (index, model) in self.models.iter().enumerate() {
+                    let current = if self.model.as_ref() == Some(model) {
+                        " · current"
                     } else {
-                        String::new()
-                    }
-                },
-                |refusal| format!(" — {refusal}"),
-            );
-            let text = format!(
-                "{marker} {} {}{note}",
-                index.saturating_add(1),
-                choice.label
-            );
-            lines.push(Line::from(Span::styled(clip_row(&text, room), style)));
-        }
-        self.render_dialog(
-            frame,
-            area,
-            width,
-            lines,
-            (" provider ", " Enter switches, Esc cancels "),
-        );
-    }
-
-    /// Draws the "no credential — store one?" question.
-    fn render_credential(&self, frame: &mut Frame<'_>, area: Rect) {
-        let provider = self.credential_label();
-        let width = area.width.saturating_sub(4).clamp(32, 80);
-        let room = usize::from(width.saturating_sub(2));
-        let dim = Style::default().fg(Color::DarkGray);
-        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-            clip_row(&format!("no credential is configured for {provider}"), room),
-            Style::default(),
-        ))];
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            clip_row(
-                &format!("it would otherwise be read from {}", self.credential_env),
-                room,
-            ),
-            dim,
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "y",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" store a key    "),
-            Span::styled(
-                "n",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" cancel"),
-        ]));
-        self.render_dialog(
-            frame,
-            area,
-            width,
-            lines,
-            (" credential ", " Enter stores, Esc cancels "),
-        );
-    }
-
-    /// Draws the masked key-entry field.
-    ///
-    /// The key is drawn as stars, and the count is cut so a long key cannot widen the dialog: what
-    /// is on the screen is never the secret.
-    fn render_key_entry(&self, frame: &mut Frame<'_>, area: Rect) {
-        let provider = self.credential_label();
-        let width = area.width.saturating_sub(4).clamp(30, 72);
-        let masked = "*".repeat(self.key_input.chars().count().min(48));
-        let dim = Style::default().fg(Color::DarkGray);
-        let lines: Vec<Line<'static>> = vec![
-            Line::from(Span::styled(
-                format!("key for {provider}, typed and stored by the agent"),
-                dim,
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("> "),
-                Span::styled(masked, Style::default().add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("it is never echoed back", dim)),
-        ];
-        self.render_dialog(
-            frame,
-            area,
-            width,
-            lines,
-            (" api key ", " Enter stores, Esc cancels "),
-        );
-    }
-
-    /// Draws the authorization prompt.
-    ///
-    /// The page and the code are the whole of it: there is nothing to type here, and the agent is
-    /// the one polling, so the prompt says that and leaves the reader to their browser.
-    fn render_auth(&self, frame: &mut Frame<'_>, area: Rect) {
-        let width = area.width.saturating_sub(4).clamp(34, 84);
-        let room = usize::from(width.saturating_sub(2));
-        let dim = Style::default().fg(Color::DarkGray);
-        let strong = Style::default().add_modifier(Modifier::BOLD);
-        let lines: Vec<Line<'static>> = vec![
-            Line::from(Span::styled(
-                clip_row(&format!("authorize {}", self.auth_label()), room),
-                Style::default(),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                clip_row(&format!("visit {}", self.auth_url), room),
-                strong,
-            )),
-            Line::from(Span::styled(
-                clip_row(&format!("and enter code {}", self.auth_code), room),
-                strong,
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                clip_row("waiting for authorization…", room),
-                dim,
-            )),
-        ];
-        self.render_dialog(
-            frame,
-            area,
-            width,
-            lines,
-            (" authorize ", " Esc hides this "),
-        );
-    }
-
-    /// Draws a centred, bounded dialog around `lines`.
-    ///
-    /// Shared by the provider flow's three dialogs, which differ only in their rows and their
-    /// titles; the frame, the border, the clearing, and the height clamp are the same for all.
-    fn render_dialog(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        width: u16,
-        lines: Vec<Line<'static>>,
-        chrome: (&str, &str),
-    ) {
-        let (title, footer) = chrome;
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(4).max(4));
-        // Shifted rather than divided: the centring offset is an unsigned count of cells, and the
-        // workspace treats integer division as a defect wherever it appears.
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.busy)
-            .title(Line::from(Span::styled(
-                title.to_owned(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )))
-            .title_bottom(Line::from(Span::styled(
-                footer.to_owned(),
-                Style::default().fg(Color::DarkGray),
-            )));
-        // Cleared first, so the transcript behind the dialog does not show through the gaps
-        // between its letters.
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .style(self.theme.notice),
-            dialog,
-        );
-    }
-
-    /// Draws the key list over the interface.
-    ///
-    /// It is a reference rather than a question, so it is drawn over the transcript and under
-    /// the two overlays the agent can be blocked on. The list is longer than a short terminal
-    /// holds, so it scrolls rather than being cut: a binding that fell off the bottom would be
-    /// exactly the one a reader was looking for.
-    fn render_help(&self, frame: &mut Frame<'_>, area: Rect) {
-        let width = area.width.saturating_sub(4).clamp(24, 76);
-        let height = area.height.saturating_sub(4).max(4);
-        let dialog = Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) >> 1),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) >> 1),
-            width,
-            height,
-        };
-        // The borders and the footer are not list rows, so the window is measured against what
-        // is left rather than against the dialog.
-        let inner = usize::from(width.saturating_sub(2));
-        let (offset, room) = self.help_window(height.saturating_sub(3));
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for row in crate::help::rows(offset, room, inner) {
-            match row {
-                crate::help::Row::Heading(text) => lines.push(Line::from(Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ))),
-                crate::help::Row::Keys { key, effect } => lines.push(Line::from(vec![
-                    Span::styled(key, self.theme.notice.add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {effect}"), Style::default()),
-                ])),
+                        ""
+                    };
+                    out.choice(
+                        index,
+                        &format!("{model}{current}"),
+                        index == self.model_selection,
+                        width,
+                        &self.theme,
+                    );
+                }
+            }
+            Modal::Effort => {
+                for (index, step) in self.effort_levels.iter().enumerate() {
+                    let current = if self.effort.as_ref() == Some(step) {
+                        " · current"
+                    } else {
+                        ""
+                    };
+                    out.choice(
+                        index,
+                        &format!("{step}{current}"),
+                        index == self.effort_selection,
+                        width,
+                        &self.theme,
+                    );
+                }
+            }
+            Modal::Provider => {
+                for (index, choice) in self.providers.iter().enumerate() {
+                    let note = choice.refused.as_deref().map_or_else(
+                        || {
+                            if self.is_current(choice) {
+                                " · current".to_owned()
+                            } else {
+                                String::new()
+                            }
+                        },
+                        |reason| format!(" — {reason}"),
+                    );
+                    out.choice(
+                        index,
+                        &format!("{}{note}", choice.label),
+                        index == self.provider_selection,
+                        width,
+                        &self.theme,
+                    );
+                }
+            }
+            _ => {
+                for (index, prompt) in self.queue.iter().enumerate() {
+                    out.choice(
+                        index,
+                        prompt,
+                        index == self.queue_selection,
+                        width,
+                        &self.theme,
+                    );
+                }
             }
         }
-        // The footer is part of the dialog rather than a row of the list, so it stays where it
-        // is while the list scrolls: the thing a reader needs after reading is how to leave.
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.notice)
-            .title(Line::from(Span::styled(
-                crate::help::TITLE,
-                Style::default().add_modifier(Modifier::BOLD),
-            )))
-            .title_bottom(Line::from(Span::styled(
-                crate::help::FOOTER,
-                Style::default().fg(Color::DarkGray),
-            )));
-        let paragraph = Paragraph::new(Text::from(lines))
-            .block(block)
-            .style(self.theme.notice);
-        // Cleared first, so the transcript behind the dialog does not show through the gaps
-        // between its letters.
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(paragraph, dialog);
+        out
+    }
+
+    /// Credential instructions and authorization details are literal and copyable, never the secret.
+    fn credential_content(&self, modal: Modal, width: usize) -> DialogContent {
+        let (title, footer) = match modal {
+            Modal::Authorization => (
+                " authorize ",
+                "Esc hides this\nF7 copy URL · F8 copy code\nPgUp/PgDn read · F6 copy",
+            ),
+            Modal::KeyEntry => (
+                " api key ",
+                "Enter stores · Esc cancels\nPgUp/PgDn read · F6 copies instructions",
+            ),
+            _ => (
+                " credential ",
+                "y/Enter stores · n/Esc cancels\nPgUp/PgDn read · F6 copy",
+            ),
+        };
+        let mut out = DialogContent::new(title, footer, width, &self.theme);
+        if modal == Modal::Authorization {
+            out.push(
+                &format!("authorize {}", self.auth_label()),
+                width,
+                self.theme.assistant,
+            );
+            out.push(
+                &format!("visit {}", self.auth_url),
+                width,
+                self.theme.assistant,
+            );
+            out.push(
+                &format!("and enter code {}", self.auth_code),
+                width,
+                self.theme.assistant,
+            );
+            out.push("waiting for authorization…", width, self.theme.secondary);
+        } else if modal == Modal::KeyEntry {
+            out.push(
+                &format!(
+                    "key for {}, typed and stored by the agent",
+                    self.credential_label()
+                ),
+                width,
+                self.theme.secondary,
+            );
+            let start = out.lines.len();
+            out.push(
+                &format!("> {}", "*".repeat(self.key_input.chars().count().min(48))),
+                width,
+                self.theme.selected,
+            );
+            out.selected = Some(start..out.lines.len());
+            out.push("it is never echoed back", width, self.theme.secondary);
+        } else {
+            out.push(
+                &format!(
+                    "no credential is configured for {}",
+                    self.credential_label()
+                ),
+                width,
+                self.theme.assistant,
+            );
+            out.push(
+                &format!("it would otherwise be read from {}", self.credential_env),
+                width,
+                self.theme.secondary,
+            );
+        }
+        out
     }
 
     /// Renders the title bar.
-    ///
-    /// Associated rather than a method: the title bar shows the same things in every
-    /// state, so taking `self` would suggest a dependence that does not exist. The session
-    /// label, the model, and the effort are passed in because they are the parts that vary.
     ///
     /// These are here rather than on the status line because they are the same kind of fact
     /// the label is — which conversation, answered by what, how hard it is thinking — and they
@@ -3648,6 +3220,7 @@ impl ViewState {
     /// them. The effort in particular has to be visible: a toggle whose state is invisible is
     /// one a reader has to press to find out about.
     fn render_title(
+        &self,
         frame: &mut Frame<'_>,
         area: Rect,
         label: Option<&str>,
@@ -3656,33 +3229,27 @@ impl ViewState {
     ) {
         let mut spans = vec![Span::styled(
             "nanus",
-            Style::default().add_modifier(Modifier::BOLD),
+            self.theme.assistant.add_modifier(Modifier::BOLD),
         )];
         if let Some(label) = label {
-            spans.push(Span::styled(
-                format!("  ·  {label}"),
-                Style::default().fg(Color::Cyan),
-            ));
+            spans.push(Span::styled(format!("  ·  {label}"), self.theme.user));
         }
         if let Some(model) = model {
-            spans.push(Span::styled(
-                format!("  ·  {model}"),
-                Style::default().fg(Color::Cyan),
-            ));
+            spans.push(Span::styled(format!("  ·  {model}"), self.theme.user));
         }
         if let Some(effort) = effort {
             // Named as *thinking* rather than as an effort level, because that is what the key
             // asks for and what a reader is looking for on the line.
             spans.push(Span::styled(
                 format!("  ·  thinking: {effort}"),
-                Style::default().fg(Color::Cyan),
+                self.theme.user,
             ));
         }
         // The three keys a reader cannot guess: how to send, how to break a line, and how
         // to find something they typed an hour ago. The rest are in docs/tui.md.
         spans.push(Span::styled(
             "  ·  Enter sends · Alt+Enter newline · Ctrl+R search · Ctrl+O verbose",
-            Style::default().fg(Color::DarkGray),
+            self.theme.secondary,
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -4327,7 +3894,8 @@ impl ViewState {
         let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
         // Recorded for the mouse: a click arrives as a cell, and the cell has to be
         // turned back into a line and column through this same layout.
-        self.last_composer = Some(block.inner(block_area));
+        let text_area = block.inner(block_area);
+        self.last_composer = Some(text_area);
         // No `Wrap`: the rows are already wrapped, and asking the renderer to wrap them
         // again would re-break lines the layout has counted — which is how the caret's
         // row and the drawn row drifted apart in the first place.
@@ -4337,6 +3905,21 @@ impl ViewState {
                 .scroll((offset, 0)),
             block_area,
         );
+        // A reversed cell is visible but does not tell terminal assistive technology where input
+        // is happening. Position the actual terminal cursor too, and never behind a modal.
+        if !self.modal_open() && visible > 0 && inner > 0 {
+            let column = composer
+                .rows
+                .get(composer.caret_row)
+                .map_or(0, |row| composer_column(row, composer.caret_column));
+            let column = u16::try_from(column)
+                .unwrap_or(u16::MAX)
+                .min(inner.saturating_sub(1));
+            frame.set_cursor_position((
+                text_area.x.saturating_add(column),
+                text_area.y.saturating_add(caret.saturating_sub(offset)),
+            ));
+        }
     }
 
     /// Lays the composer out into display rows, and says which row holds the caret.
@@ -4406,7 +3989,10 @@ impl ViewState {
         // terminal wraps the cursor onto the next line and so does this: the caret
         // becomes the first cell of the following row — the continuation indent, or a
         // row added for it when the caret was already on the last one.
-        if caret_column >= usable {
+        let caret_cells = rows
+            .get(caret_row)
+            .map_or(0, |row| composer_column(row, caret_column));
+        if caret_cells >= usable {
             let next = caret_row.saturating_add(1);
             caret_row = if next < rows.len() {
                 next
@@ -4521,7 +4107,7 @@ impl ViewState {
     /// reader can act on: the generating rate is the provider's and is not theirs to change,
     /// while the wait is what a shorter prompt — or a cached one — buys back.
     fn render_stats(&self, frame: &mut Frame<'_>, area: Rect) {
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = self.theme.secondary;
         // Ordered by what a reader would give up last, because the row takes as many as fit and
         // drops the rest from the end: the rates first, then the wait that explains the gap
         // between them, then the cache share that usually explains the wait.
@@ -4604,30 +4190,24 @@ impl ViewState {
         let busy = if self.busy {
             Span::styled(format!("● {}", self.status), self.theme.busy)
         } else {
-            Span::styled(
-                format!("○ {}", self.status),
-                Style::default().fg(Color::DarkGray),
-            )
+            Span::styled(format!("○ {}", self.status), self.theme.secondary)
         };
         let context = Span::styled(
             format!("  ·  context: {} (/context)", self.context_mode.as_str()),
-            Style::default().fg(Color::DarkGray),
+            self.theme.secondary,
         );
         let usage = Span::styled(
             format!("  ·  {} tokens", self.tokens_used),
-            Style::default().fg(Color::DarkGray),
+            self.theme.secondary,
         );
         // The state Shift+Tab cycles, always shown: the point of a three-state toggle is
         // that a reader can see which state they are in without pressing the key to find out.
         let permission = Span::styled(
             format!("  ·  approval: {} (Shift+Tab)", self.approval.label()),
-            Style::default().fg(Color::DarkGray),
+            self.theme.secondary,
         );
         let step = if self.step > 0 {
-            Span::styled(
-                format!("  ·  step {}", self.step),
-                Style::default().fg(Color::DarkGray),
-            )
+            Span::styled(format!("  ·  step {}", self.step), self.theme.secondary)
         } else {
             Span::raw("")
         };
@@ -4637,7 +4217,7 @@ impl ViewState {
         let queued = if self.has_queued() {
             Span::styled(
                 format!("  ·  {} queued (Ctrl+P)", self.queue.len()),
-                Style::default().fg(Color::Yellow),
+                self.theme.tool,
             )
         } else {
             Span::raw("")
@@ -4654,7 +4234,7 @@ impl ViewState {
             }
             Span::styled(
                 format!("  ·  summarized: {}", what.join(" and ")),
-                Style::default().fg(Color::DarkGray),
+                self.theme.secondary,
             )
         } else {
             Span::raw("")
@@ -4674,7 +4254,7 @@ struct ComposerLayout {
     rows: Vec<ComposerRow>,
     /// The index of the row holding the caret.
     caret_row: usize,
-    /// The caret's column counted from the start of that row, **prefix included**.
+    /// The caret's character offset from the start of that row, **prefix included**.
     ///
     /// Row-relative rather than text-relative because the caret can be on the prefix:
     /// a caret at the end of a row that is exactly full has no column inside the row's
@@ -4719,7 +4299,7 @@ impl ComposerLayout {
                 // the insertion point is before that line's indent, not on its text.
                 push_caret_run(&mut spans, &row.prefix, self.caret_column, prompt_style);
                 if !row.text.is_empty() {
-                    spans.push(Span::styled(row.text.clone(), Style::default()));
+                    spans.push(Span::styled(row.text.clone(), view.theme.assistant));
                 }
             } else {
                 if !row.prefix.is_empty() {
@@ -4730,10 +4310,10 @@ impl ComposerLayout {
                         &mut spans,
                         &row.text,
                         self.caret_column.saturating_sub(prefix_width),
-                        Style::default(),
+                        view.theme.assistant,
                     );
                 } else {
-                    spans.push(Span::styled(row.text.clone(), Style::default()));
+                    spans.push(Span::styled(row.text.clone(), view.theme.assistant));
                 }
             }
             lines.push(Line::from(spans));
@@ -4752,87 +4332,107 @@ impl ComposerLayout {
 /// The first row is narrower than the rest, because the prompt or indent is drawn once
 /// at the start of the line and the rows it wraps into begin at the left edge.
 ///
-/// Characters are counted, not display columns, matching the estimate the transcript
-/// uses: a wide character can therefore make a row one column wider than intended, which
-/// the terminal clips rather than mislays. Wrapping here rather than leaving it to the
-/// renderer is what makes the row count exact; see [`ViewState::composer_layout`].
+/// Display columns determine breaks, while character offsets are kept for editing and mouse
+/// mapping. Wide characters must not be silently clipped while their caret moves past them.
 fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<(String, usize, usize)> {
     let mut rows: Vec<(String, usize, usize)> = Vec::new();
-    let mut row: Vec<char> = Vec::new();
+    let mut row: Vec<&str> = Vec::new();
     let mut sources: Vec<usize> = Vec::new();
     let mut breaks: Option<usize> = None;
     let mut capacity = first.max(1);
-
-    for (source, character) in text.chars().enumerate() {
-        if row.len() >= capacity {
-            // The row is full. Break at the last space when there is one, so the word
-            // that did not fit starts the next row whole instead of being split.
-            let split = match breaks {
-                Some(position) if position > 0 => position,
-                _ => row.len(),
-            };
+    let mut used = 0_usize;
+    let mut source = 0_usize;
+    for grapheme in text.graphemes(true) {
+        let columns = grapheme.width();
+        while !row.is_empty() && used.saturating_add(columns) > capacity {
+            let split = breaks.filter(|position| *position > 0).unwrap_or(row.len());
+            let end = sources.get(split).copied().unwrap_or(source);
             rows.push((
-                row.iter().take(split).collect(),
+                row.iter().take(split).copied().collect(),
                 sources.first().copied().unwrap_or(source),
-                sources
-                    .get(split.saturating_sub(1))
-                    .map_or(source, |last| last.saturating_add(1)),
+                end,
             ));
-            // The space the break lands on belongs to no row, which is why the ranges
-            // can have a gap in them.
-            let keep_from = if split < row.len() {
+            // The space a word break lands on belongs to no display row.
+            let keep = if split < row.len() {
                 split.saturating_add(1)
             } else {
                 split
             };
-            row = row.iter().skip(keep_from).copied().collect();
-            sources = sources.iter().skip(keep_from).copied().collect();
+            row.drain(..keep);
+            sources.drain(..keep);
             capacity = rest.max(1);
-            breaks = row.iter().rposition(|character| character.is_whitespace());
+            breaks = row
+                .iter()
+                .rposition(|part| part.chars().all(char::is_whitespace));
+            used = row
+                .iter()
+                .map(|part| part.width())
+                .fold(0_usize, usize::saturating_add);
         }
-        if character.is_whitespace() {
+        used = used.saturating_add(columns);
+        if grapheme.chars().all(char::is_whitespace) {
             breaks = Some(row.len());
         }
-        row.push(character);
+        row.push(grapheme);
         sources.push(source);
+        source = source.saturating_add(grapheme.chars().count());
     }
-
     if !row.is_empty() {
-        let start = sources.first().copied().unwrap_or(0);
         rows.push((
             row.into_iter().collect(),
-            start,
-            sources.last().map_or(start, |last| last.saturating_add(1)),
+            sources.first().copied().unwrap_or(0),
+            source,
         ));
     }
     if rows.is_empty() {
-        // An empty line is still a row to put the caret on.
         rows.push((String::new(), 0, 0));
     }
     rows
 }
 
-/// Pushes `run` as spans with the caret drawn *in* the cell it is over.
-///
-/// The caret is a style on a cell rather than a glyph in a cell of its own: a glyph
-/// takes a column and pushes the rest of the row along, so moving the cursor through a
-/// word looked like editing it. A column past the end of the run has no cell to reverse,
-/// so the caret becomes one — a block in the space the next character will occupy.
+/// Pushes a whole grapheme under the caret; splitting a combining suffix changes its rendering.
 fn push_caret_run(spans: &mut Vec<Span<'static>>, run: &str, column: usize, style: Style) {
-    let characters: Vec<char> = run.chars().collect();
-    let at = column.min(characters.len());
-    let before: String = characters.iter().take(at).collect();
-    let under: String = characters
-        .get(at)
-        .map_or_else(|| String::from(" "), char::to_string);
-    let after: String = characters.iter().skip(at.saturating_add(1)).collect();
+    let mut before = String::new();
+    let mut under = None;
+    let mut after = String::new();
+    let mut offset = 0_usize;
+    for grapheme in run.graphemes(true) {
+        let end = offset.saturating_add(grapheme.chars().count());
+        if end <= column {
+            before.push_str(grapheme);
+        } else if under.is_none() {
+            under = Some(grapheme.to_owned());
+        } else {
+            after.push_str(grapheme);
+        }
+        offset = end;
+    }
     if !before.is_empty() {
         spans.push(Span::styled(before, style));
     }
-    spans.push(Span::styled(under, style.add_modifier(Modifier::REVERSED)));
+    spans.push(Span::styled(
+        under.unwrap_or_else(|| " ".into()),
+        style.add_modifier(Modifier::REVERSED),
+    ));
     if !after.is_empty() {
         spans.push(Span::styled(after, style));
     }
+}
+
+/// The screen columns occupied before a character offset, measured in complete graphemes.
+fn composer_column(row: &ComposerRow, column: usize) -> usize {
+    let text = format!("{}{}", row.prefix, row.text);
+    let mut offset = 0_usize;
+    let mut cells = 0_usize;
+    for grapheme in text.graphemes(true) {
+        let end = offset.saturating_add(grapheme.chars().count());
+        if end > column {
+            break;
+        }
+        cells = cells.saturating_add(grapheme.width());
+        offset = end;
+    }
+    cells
 }
 
 /// Returns the row and column that the source character `caret` lands on.
@@ -5246,7 +4846,7 @@ mod tests {
     #[test]
     fn the_compact_lines_are_drawn_in_their_roles_colours() {
         // The style is the view's business, and the compact form must not lose it: a
-        // one-line thinking entry is still dimmed, and a call is still tool-coloured.
+        // one-line thinking entry is still italic, and a call is still tool-coloured.
         let mut state = state_with(vec![
             Entry::prose(Role::Reasoning, "considering"),
             Entry::tool_call("read", "{\"file_path\":\"a.txt\"}"),
@@ -6102,21 +5702,29 @@ mod tests {
         assert_eq!(state.selected_permission(), ApprovalPolicy::Permitted);
     }
 
-    /// A terminal too narrow for the sentences cuts them rather than drawing over the border, and
-    /// says it cut them: a meaning that just stopped mid-word would read as a typo.
+    /// Narrow permission descriptions wrap and every word remains reachable by paging.
     #[test]
-    fn a_narrow_permission_dialog_cuts_its_rows() {
+    fn a_narrow_permission_dialog_preserves_its_meanings() {
         let mut state = ViewState::new();
         state.open_permissions();
-        let text = rendered(&mut state, 34, 14);
-        assert!(text.contains("permission"), "{text}");
-        assert!(text.contains('…'), "a cut row says so: {text}");
-        for row in text.lines() {
-            assert!(
-                row.chars().count() <= 34,
-                "no row is wider than the terminal: {row:?}"
-            );
-        }
+        let first = rendered(&mut state, 34, 14);
+        assert!(first.contains("permission"), "{first}");
+        assert!(first.contains("▶ 2 permitted calls"), "{first}");
+        assert!(
+            !first.contains('…'),
+            "instructions are not clipped: {first}"
+        );
+        state.dialog_scroll = u16::MAX;
+        let bottom = rendered(&mut state, 34, 14);
+        let compact: String = bottom.chars().filter(|c| c.is_alphanumeric()).collect();
+        assert!(
+            compact.contains("doesnotchangehere"),
+            "the final note remains reachable: {bottom}"
+        );
+        assert!(
+            bottom.contains("Esc cancels"),
+            "the footer stays visible: {bottom}"
+        );
     }
 
     /// The context chooser marks the acknowledged mode and warnings distinguish disabling from
@@ -6308,8 +5916,11 @@ mod tests {
         state.open_help();
         let text = rendered(&mut state, 80, 24);
         assert!(text.contains("keys"), "{text}");
-        assert!(text.contains("Ctrl+T"), "a binding is listed: {text}");
-        assert!(text.contains("summarise"), "with what it does: {text}");
+        assert!(
+            text.contains("PageUp / PageDown"),
+            "a binding is listed: {text}"
+        );
+        assert!(text.contains("scroll back"), "with what it does: {text}");
         assert!(text.contains("Esc closes"), "and how to leave: {text}");
         assert!(
             !text.contains("must not show through"),
@@ -6336,7 +5947,10 @@ mod tests {
         // Scrolling past the end lands on the last page rather than on blank rows.
         open.scroll_help(10_000);
         let last = rendered(&mut open, 60, 12);
-        assert!(last.contains("while an approval dialog is up"), "{last}");
+        assert!(
+            last.contains("approval answer"),
+            "the final group is reachable: {last}"
+        );
         assert!(
             last.contains("deny it"),
             "the last row is reachable: {last}"
@@ -7399,15 +7013,12 @@ mod tests {
             let style = theme.style_for(role);
             // Each role has *some* styling; an unstyled role would be invisible in a
             // monochrome-scanned transcript.
-            assert!(style != Style::default() || role == Role::Harness);
+            assert!(style != Style::default() || role == Role::Assistant);
         }
-        // The answer is white, as asked for. Checked on the style rather than on a
-        // capture, because a terminal that already draws in white emits no escape for
-        // it and the rendering looks identical either way.
         assert_eq!(
             Theme::default().assistant.fg,
-            Some(Color::White),
-            "the model's answer is drawn in white"
+            None,
+            "ordinary text uses the terminal foreground, including in light terminals"
         );
         let failure = Entry::tool_result("read", true, "x");
         assert_eq!(theme.style_for_entry(&failure), theme.error);
@@ -7494,7 +7105,8 @@ mod colour_tests {
             (0..buffer.area.height).any(|row| {
                 (0..buffer.area.width).any(|column| {
                     buffer.cell((column, row)).is_some_and(|cell| {
-                        !cell.symbol().trim().is_empty() && cell.style().fg == wanted
+                        !cell.symbol().trim().is_empty()
+                            && Some(cell.fg) == wanted.or(Some(Color::Reset))
                     })
                 })
             })
@@ -7801,3 +7413,7 @@ mod multi_call_step_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "view_accessibility.rs"]
+mod accessibility_tests;

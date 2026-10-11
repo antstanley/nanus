@@ -510,6 +510,8 @@ this build offers.
 | `context_budget`        | the model's window, else `64000`  | estimated prompt tokens for one request                                                                                   |
 | `max_parallel_tools`    | `4`                               | how many of a step's calls may be in flight at once                                                                       |
 | `tui_detail`            | `compact`                         | `compact`, `full`                                                                                                         |
+| `tui_theme`             | `terminal`                        | `terminal`, `light`, `dark`, `high_contrast`; applies to the whole screen |
+| `tui_mouse`             | `true`                            | capture the mouse; false preserves native terminal selection |
 | `markdown`              | `true`                            | render the model's answers as markdown                                                                                    |
 | `mermaid`               | `true`                            | draw `mermaid` fences as text diagrams                                                                                    |
 | `read_video`            | `false`                           | offer the optional [`read_video`](#read_video-optional) tool                                                              |
@@ -643,9 +645,15 @@ supports:
 - **`!` for your own commands**: a line that opens with `!` is a shell command the
   interface runs itself, echoed into the transcript. It is not the model's, is not
   recorded, and is not confined — see [SAFETY.md](../SAFETY.md).
-- **No colour leaks**: `NO_COLOR` switches to a monochrome theme that keeps
-  modifiers, so the caret and bold/italic still render. The markdown renderer
-  does no I/O and strips control characters at the parse boundary.
+- **Whole-screen display preferences**: `tui_theme` selects terminal colours, light, dark or
+  high contrast. Explicit light/dark text pairs meet 4.5:1 contrast in tests. `NO_COLOR` removes
+  colour from all chrome and markdown while preserving focus and emphasis. Essential instructions
+  are never dimmed, and `tui_mouse = false` preserves native terminal selection.
+- **Bounded, scrollable dialogs**: complete explanations and long choice names wrap; the selected
+  row is revealed and controls stay in a fixed footer. Approvals default to Deny, reject modified
+  letter shortcuts and require a second confirmation for standing grants. Global quit works in
+  every dialog. F6 copies complete UI text without dragging; F7/F8 copy authorization details.
+  The markdown renderer does no I/O and strips control characters at the parse boundary.
 
 ## The service
 

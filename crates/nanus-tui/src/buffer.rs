@@ -17,9 +17,11 @@
 //! several lines. The cursor is still one character index into the whole text; the
 //! line-oriented operations ([`InputBuffer::move_line_up`],
 //! [`InputBuffer::move_home`]) derive their line from it rather than storing a
-//! second, easily-desynchronised position.
+//! second, easily-desynchronised position. Left/right movement and deletion operate on whole
+//! graphemes while those public offsets remain character counts.
 
 use core::fmt;
+use unicode_segmentation::UnicodeSegmentation as _;
 
 /// What a key press meant, once the buffer has been updated.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -260,40 +262,112 @@ impl InputBuffer {
         }
     }
 
-    /// Deletes the character before the cursor.
+    /// Replaces a character range already measured by a completion, without repeated deletions.
+    /// A completion counts characters rather than graphemes, so iterating backspace could erase
+    /// text before a path that contains combining marks or joined emoji.
+    pub(crate) fn replace_characters(&mut self, range: core::ops::Range<usize>, text: &str) {
+        assert!(range.start <= range.end && range.end <= self.text.len());
+        self.cursor = range.start;
+        self.text.drain(range);
+        self.insert_str(text);
+    }
+
+    /// Deletes the whole grapheme before the cursor.
     ///
     /// Returns whether anything was removed.
     pub fn backspace(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
         }
-        self.cursor = self.cursor.saturating_sub(1);
-        self.text.remove(self.cursor);
+        let end = self.cursor;
+        self.move_left();
+        self.text.drain(self.cursor..end);
         self.leave_history();
         true
     }
 
-    /// Deletes the character under the cursor.
+    /// Deletes the whole grapheme under the cursor.
     ///
     /// Returns whether anything was removed.
     pub fn delete(&mut self) -> bool {
         if self.cursor >= self.text.len() {
             return false;
         }
-        self.text.remove(self.cursor);
+        let start = self.cursor;
+        self.move_right();
+        self.text.drain(start..self.cursor);
+        self.cursor = start;
         self.leave_history();
         true
     }
 
-    /// Moves the cursor one character left.
-    pub const fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+    /// Moves the cursor one grapheme left, keeping combining marks and joined emoji together.
+    pub fn move_left(&mut self) {
+        self.cursor = self.adjacent_grapheme(false);
     }
 
-    /// Moves the cursor one character right, stopping at the end.
+    /// Moves the cursor one grapheme right, stopping at the end.
     pub fn move_right(&mut self) {
-        if self.cursor < self.text.len() {
-            self.cursor = self.cursor.saturating_add(1);
+        self.cursor = self.adjacent_grapheme(true);
+    }
+
+    /// Returns the grapheme boundary on either side of the cursor, as a character offset.
+    fn adjacent_grapheme(&self, forward: bool) -> usize {
+        // The ordinary ASCII keystroke needs no segmentation or allocation. A neighbouring
+        // non-ASCII scalar may combine with the character, so that case takes the full path.
+        let adjacent = if forward {
+            self.cursor
+        } else {
+            self.cursor.saturating_sub(1)
+        };
+        let next = self.text.get(adjacent.saturating_add(1));
+        if self.text.get(adjacent).is_some_and(char::is_ascii) && next.is_none_or(char::is_ascii) {
+            if forward {
+                let count = if self.text.get(adjacent) == Some(&'\r') && next == Some(&'\n') {
+                    2
+                } else {
+                    1
+                };
+                return self.cursor.saturating_add(count).min(self.text.len());
+            }
+            let count = if self.text.get(adjacent) == Some(&'\n')
+                && self.text.get(adjacent.saturating_sub(1)) == Some(&'\r')
+            {
+                2
+            } else {
+                1
+            };
+            return self.cursor.saturating_sub(count);
+        }
+        let text = self.text();
+        let mut offset = 0_usize;
+        for grapheme in text.graphemes(true) {
+            let end = offset.saturating_add(grapheme.chars().count());
+            if forward && end > self.cursor {
+                return end;
+            }
+            if !forward && end >= self.cursor {
+                return offset;
+            }
+            offset = end;
+        }
+        offset
+    }
+
+    /// Clamps mouse and vertical movement to an entire grapheme instead of its combining suffix.
+    fn snap_cursor(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let text = self.text();
+        let mut offset = 0_usize;
+        for grapheme in text.graphemes(true) {
+            let end = offset.saturating_add(grapheme.chars().count());
+            if end > self.cursor {
+                self.cursor = offset;
+                return;
+            }
+            offset = end;
         }
     }
 
@@ -325,6 +399,7 @@ impl InputBuffer {
         let target = line.saturating_sub(1);
         let column = column.min(self.line_length(target));
         self.cursor = self.line_start(target).saturating_add(column);
+        self.snap_cursor();
         true
     }
 
@@ -340,6 +415,7 @@ impl InputBuffer {
         }
         let column = column.min(self.line_length(target));
         self.cursor = self.line_start(target).saturating_add(column);
+        self.snap_cursor();
         true
     }
 
@@ -352,6 +428,7 @@ impl InputBuffer {
         let start = self.line_start(line);
         let column = column.min(self.line_length(line));
         self.cursor = start.saturating_add(column);
+        self.snap_cursor();
         self.leave_history();
         // Postcondition: the cursor stays inside the text.
         assert!(self.cursor <= self.text.len());

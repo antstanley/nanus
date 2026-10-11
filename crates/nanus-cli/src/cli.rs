@@ -1785,6 +1785,8 @@ async fn show_config(args: &Options) -> Result<(), String> {
     );
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
+    println!("tui theme: {}", config.tui_theme);
+    println!("tui mouse capture: {}", config.tui_mouse);
     println!("markdown answers: {}", config.markdown);
     println!("mermaid diagrams: {}", config.mermaid);
     println!("workspace root: {}", workspace_display(&config));

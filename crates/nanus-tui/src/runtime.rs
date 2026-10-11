@@ -74,7 +74,7 @@ use std::path::Path;
 use crossterm::event::EventStream;
 use futures::StreamExt as _;
 use futures::future::LocalBoxFuture;
-use nanus_adapter_config::{NanusConfig, TuiDetail};
+use nanus_adapter_config::{NanusConfig, TuiDetail, TuiTheme};
 use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
 use nanus_link::protocol::{
@@ -93,6 +93,7 @@ use tokio::sync::mpsc;
 
 use crate::command::{Command, Submission, submission_of};
 use crate::compact::Detail;
+use crate::dialog::Modal;
 use crate::notice::{self, Ending};
 use crate::stats::{Generation, Throughput};
 use crate::stream::{Admission, StreamCursor};
@@ -149,6 +150,8 @@ fn configured_preferences() -> io::Result<Preferences> {
             detail: detail_from(config.tui_detail),
             markdown: config.markdown,
             mermaid: config.mermaid,
+            theme: configured_theme(config.tui_theme),
+            mouse: config.tui_mouse,
         })
         .map_err(|error| io::Error::other(format!("the configuration could not be read: {error}")))
 }
@@ -161,6 +164,18 @@ struct Preferences {
     detail: Detail,
     markdown: bool,
     mermaid: bool,
+    theme: Theme,
+    mouse: bool,
+}
+
+/// The configured palette, before the run's `NO_COLOR` override.
+fn configured_theme(preference: TuiTheme) -> Theme {
+    match preference {
+        TuiTheme::Terminal => Theme::default(),
+        TuiTheme::Light => Theme::light(),
+        TuiTheme::Dark => Theme::dark(),
+        TuiTheme::HighContrast => Theme::monochrome(),
+    }
 }
 
 /// Maps the configured spelling onto the rendering it selects.
@@ -203,12 +218,11 @@ impl TerminalGuard {
     /// answers that it speaks it, and not requested when it does not — a terminal that
     /// does not understand the request may print the escape sequence instead.
     ///
-    /// Mouse reporting is asked for unconditionally: a terminal that does not speak it
-    /// ignores the request rather than printing it, and until it is asked for the wheel
-    /// and the pointer are the terminal's rather than this program's.
-    fn enter() -> Self {
+    /// Mouse reporting is optional: `tui_mouse = false` preserves the terminal's selection.
+    /// A terminal that does not speak it ignores the request, and the keyboard remains sufficient.
+    fn enter(capture_mouse: bool) -> Self {
         let terminal = ratatui::init();
-        let mouse = enable_mouse();
+        let mouse = capture_mouse && enable_mouse();
         let enhanced = enable_keyboard_protocol();
         Self {
             terminal,
@@ -1249,11 +1263,13 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     view.detail = preferences.detail;
     view.markdown = preferences.markdown;
     view.mermaid = preferences.mermaid;
+    view.theme = preferences.theme;
+    view.mouse_enabled = preferences.mouse;
     // Chosen here, at the boundary with the terminal, rather than inside the view: the
     // environment is a property of this run, and a view built with one would render
     // differently in a test that happened to inherit `NO_COLOR` from whatever ran it.
     if no_color_requested(std::env::var_os("NO_COLOR").as_deref()) {
-        view.theme = Theme::monochrome();
+        view.theme = view.theme.without_color();
     }
     // The transcript comes from the session itself, so a recorded one looks exactly like
     // the live conversation it was: same event log, same rendering. The one difference is
@@ -1324,9 +1340,14 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
         view.status = String::from("a turn is already running");
     }
     if viewing_only {
-        view.status = String::from("viewing a recorded session · Ctrl-C quits");
+        view.status = String::from(recording_status());
     }
     Ok(view)
+}
+
+/// The recording's startup hint matches the global key behavior, not the old Ctrl+C exit.
+const fn recording_status() -> &'static str {
+    "viewing a recorded session · Ctrl+Q quits · Ctrl+C copies"
 }
 
 /// The context decisions a replay of `session` draws, keyed as [`decision_key`] keys them.
@@ -1400,7 +1421,7 @@ async fn event_loop(
     // The workspace's files, walked on demand rather than at startup: most sessions never type an
     // `@`, and a walk of a large tree is work nobody asked for until then.
     let mut files: Option<Vec<String>> = None;
-    let mut guard = TerminalGuard::enter();
+    let mut guard = TerminalGuard::enter(view.mouse_enabled);
 
     let mut events = EventStream::new();
 
@@ -1449,6 +1470,7 @@ async fn event_loop(
                         answer_and_report(&call_id, allow, always, source, &mut view);
                     }
                     Outcome::Copy => copy_selection(&system_clipboard, &mut view).await,
+                    Outcome::CopyText(text) => copy_ui_text(&text, &system_clipboard, &mut view).await,
                     Outcome::PasteImage => {
                         paste_image(&crate::paste::from_clipboard, source.workspace(), &mut view);
                     }
@@ -1887,6 +1909,24 @@ async fn copy_selection(copier: &Copier, view: &mut ViewState) {
     }
 }
 
+/// Copies explicitly requested UI text; clipboard errors do not close a modal or answer it.
+async fn copy_ui_text(text: &str, copier: &Copier, view: &mut ViewState) {
+    if text.trim().is_empty() {
+        view.status = String::from("there is no UI text to copy");
+        return;
+    }
+    view.status = match copier(text).await {
+        Ok(crate::copy::Copied::System) => format!("copied {}", count_of(text)),
+        Ok(crate::copy::Copied::Terminal) => {
+            format!(
+                "copied {} to the terminal (if it takes clipboard writes)",
+                count_of(text)
+            )
+        }
+        Err(error) => format!("the UI text was not copied: {error}"),
+    };
+}
+
 /// “3 lines” or “41 characters”, whichever a reader can picture.
 fn count_of(text: &str) -> String {
     let lines = text.lines().count();
@@ -2323,6 +2363,8 @@ enum Outcome {
     /// An outcome rather than something the key handling does, because copying runs a program: the
     /// keys decide what the reader meant, and the loop is where the side effects are.
     Copy,
+    /// Copy explicitly requested UI text without requiring a pointer selection.
+    CopyText(String),
     ///
     /// The key is a cycle rather than a toggle because the scale has four steps and only one of
     /// them means "no thinking": a toggle would have to invent what "on" means after a reader has
@@ -2332,71 +2374,22 @@ enum Outcome {
 
 /// Applies one keystroke to the view.
 fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
-    // `Ctrl+C` is copy wherever the reader is, and nothing else. It is routed before every
-    // dialogue for that reason: a key that closed an overlay, denied a tool, or stopped a turn
-    // would be a place a highlight could not be taken out of, and copying is the one thing a
-    // reader who has highlighted something is asking for. With nothing highlighted it says so
-    // on the status line and nothing else happens — a copy key that also quit would be a
-    // copy key nobody could press by accident.
-    if copy_key(key) {
-        return Outcome::Copy;
+    if let Some(outcome) = handle_global_key(key, view) {
+        return outcome;
     }
-    // The permission dialog owns the keyboard while it is up, and it is checked first for that
-    // reason: what a reader is looking at has to be what their keys reach.
-    if view.permission_open {
-        return handle_permission_key(key, view);
-    }
-    // The provider flow's modals own the keyboard, innermost first: the key field takes text, the
-    // credential question takes a yes or a no, and the chooser takes a movement or a decision.
-    if view.key_entry_open {
-        return handle_key_entry_key(key, view);
-    }
-    if view.credential_open {
-        return handle_credential_key(key, view);
-    }
-    if view.provider_open {
-        return handle_provider_key(key, view);
-    }
-    // The authorization prompt owns the keyboard too, though there is nothing to type: closing it is
-    // the only thing a key does, and a key that reached the composer would be typed behind a modal.
-    if view.auth_open {
-        return handle_auth_key(key, view);
-    }
-    // Shift+Tab opens the permission dialog wherever the focus is. It is a setting rather than an
-    // edit, so it is routed before the approval question takes the keyboard: a reader who wants to
-    // stop being asked must not have to answer a question first. The dialog is what makes that
-    // possible rather than merely convenient — the three states grant very different things, and a
-    // label alone does not say which is which.
-    //
-    // Terminals disagree about how they spell it: most send `BackTab`, and one that speaks an
-    // enhanced keyboard protocol may send `Tab` with Shift held. Both mean the key.
-    if shift_tab(key) {
+    let modal = view.active_modal();
+    // Shift+Tab still opens permissions from the composer or an approval. Inside any other
+    // dialog it is backwards navigation, not a hidden permission change.
+    if shift_tab(key)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(modal, None | Some(Modal::Approval))
+    {
         return Outcome::OpenPermissions;
     }
-    // An approval question owns the keyboard while it is up. Its answers are the only things
-    // a reader can mean, and letting a `y` reach the composer would answer a question *and*
-    // type a letter into a prompt nobody asked for.
-    if view.pending_approval.is_some() {
-        return handle_approval_key(key, view);
-    }
-    // The model selector owns the keyboard while it is up, as the permission dialog does: the
-    // reader is choosing from a list drawn over the composer, and a key that reached the text
-    // behind it would be typed into a prompt nobody can see.
-    if view.context_dialog.is_some() {
-        return handle_context_key(key, view);
-    }
-    if view.model_open {
-        return handle_model_key(key, view);
-    }
-    // The effort chooser owns the keyboard while it is up, on the same rule.
-    if view.effort_open {
-        return handle_effort_key(key, view);
-    }
-    // The key list is what the reader asked to look at, and it is drawn over the composer, so
-    // it owns the keyboard while it is up — as the queue overlay does. A key that reached the
-    // text behind it would be typed into a prompt nobody can see.
-    if view.help_open {
-        return handle_help_key(key, view);
+    if let Some(modal) = modal {
+        return handle_modal_key(modal, key, view);
     }
     // A running search rewrites what every key means: the composer is showing a match
     // rather than the reader's own text, so typing extends the *query* and the keys that
@@ -2429,6 +2422,113 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         return handle_control_key(key, view);
     }
     handle_plain_key(key, view)
+}
+
+/// Global copy and exit are never swallowed by a modal or mistaken for consent.
+fn handle_global_key(key: KeyEvent, view: &ViewState) -> Option<Outcome> {
+    if key.code == KeyCode::F(9) {
+        return Some(Outcome::Quit);
+    }
+    if quit_key(key) {
+        return Some(Outcome::Quit);
+    }
+    let shifted_control = key
+        .modifiers
+        .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    let text = match key.code {
+        KeyCode::F(6) => Some(
+            view.dialog_text()
+                .unwrap_or_else(|| view.screen_text_for_copy()),
+        ),
+        KeyCode::F(7) => Some(view.auth_url.clone()),
+        KeyCode::F(8) => Some(view.auth_code.clone()),
+        KeyCode::Char('c' | 'C') if shifted_control => Some(
+            view.dialog_text()
+                .unwrap_or_else(|| view.screen_text_for_copy()),
+        ),
+        KeyCode::Char('u' | 'U') if shifted_control => Some(view.auth_url.clone()),
+        KeyCode::Char('y' | 'Y') if shifted_control => Some(view.auth_code.clone()),
+        _ => None,
+    };
+    if let Some(text) = text {
+        return Some(Outcome::CopyText(text));
+    }
+    copy_key(key).then_some(Outcome::Copy)
+}
+
+/// Whether a key is a global quit request; modifiers do not turn a letter into consent.
+fn quit_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('q' | 'Q' | 'd' | 'D'))
+}
+
+/// Routes input through the same active-modal priority the renderer uses.
+fn handle_modal_key(modal: Modal, mut key: KeyEvent, view: &mut ViewState) -> Outcome {
+    // A Ctrl/Alt chord is not a plain letter decision. Key-entry Alt characters are accepted
+    // because international layouts may produce them, but Enter still cannot submit a chord.
+    let modified = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if modified
+        && !(modal == Modal::KeyEntry
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(_)))
+    {
+        return Outcome::Continue;
+    }
+    if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
+        key.code = KeyCode::BackTab;
+    }
+    if scroll_modal_key(modal, key, view) {
+        return Outcome::Continue;
+    }
+    match modal {
+        Modal::Permissions => handle_permission_key(key, view),
+        Modal::Approval => handle_approval_key(key, view),
+        Modal::KeyEntry => handle_key_entry_key(key, view),
+        Modal::Credential => handle_credential_key(key, view),
+        Modal::Authorization => handle_auth_key(key, view),
+        Modal::Provider => handle_provider_key(key, view),
+        Modal::Context => handle_context_key(key, view),
+        Modal::Models => handle_model_key(key, view),
+        Modal::Effort => handle_effort_key(key, view),
+        Modal::Help => handle_help_key(key, view),
+        Modal::Queue => handle_queue_key(key, view),
+    }
+}
+
+/// Page keys read long descriptions without changing the decision or selected item.
+fn scroll_modal_key(modal: Modal, key: KeyEvent, view: &mut ViewState) -> bool {
+    if modal == Modal::Help {
+        return false;
+    }
+    // The context warning already uses arrows, page keys and Home/End to read its whole impact.
+    if modal == Modal::Context
+        && view
+            .context_dialog
+            .as_ref()
+            .is_some_and(|it| it.confirming.is_some())
+    {
+        return false;
+    }
+    let rows = match key.code {
+        KeyCode::PageUp => -PAGE_ROWS,
+        KeyCode::PageDown => PAGE_ROWS,
+        KeyCode::Home => i32::MIN,
+        KeyCode::End => i32::MAX,
+        KeyCode::Up if matches!(modal, Modal::Authorization | Modal::Credential) => -1,
+        KeyCode::Down if matches!(modal, Modal::Authorization | Modal::Credential) => 1,
+        _ => return false,
+    };
+    if modal == Modal::Context {
+        if let Some(state) = &mut view.context_dialog {
+            let next = i32::from(state.scroll).saturating_add(rows).max(0);
+            state.scroll = u16::try_from(next).unwrap_or(u16::MAX);
+        }
+    } else {
+        view.scroll_dialog(rows);
+    }
+    true
 }
 
 /// Routes a key while a mention menu is offered.
@@ -2538,10 +2638,9 @@ fn handle_permission_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
             view.close_permissions();
             return Outcome::SetApproval(chosen);
         }
-        // Tab and Shift+Tab move it too, in the forward direction only: the key that opened the
-        // dialogue should walk it, and a reader who wants the other way has an arrow key.
-        KeyCode::Up | KeyCode::Char('k') => view.permission_up(),
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => {
+        // Tab moves forward and Shift+Tab backward, matching ordinary keyboard navigation.
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => view.permission_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
             view.permission_down();
         }
         KeyCode::Char(digit @ '1'..='3') => {
@@ -2643,8 +2742,8 @@ fn handle_model_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
                 return Outcome::SetModel(Some(chosen));
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => view.model_up(),
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => view.model_down(),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => view.model_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => view.model_down(),
         KeyCode::Char(digit @ '1'..='9') => {
             let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
             let _ = view.model_select(position);
@@ -2670,8 +2769,8 @@ fn handle_effort_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
                 return Outcome::SetEffort(chosen);
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => view.effort_up(),
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => view.effort_down(),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => view.effort_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => view.effort_down(),
         KeyCode::Char(digit @ '1'..='9') => {
             let position = usize::from(digit as u8).saturating_sub(usize::from(b'1'));
             let _ = view.effort_select(position);
@@ -2703,8 +2802,8 @@ fn handle_provider_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
                 }
             }
         }
-        KeyCode::Up | KeyCode::Char('k') => view.provider_up(),
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => view.provider_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
             view.provider_down();
         }
         KeyCode::Char(digit @ '1'..='9') => {
@@ -2781,6 +2880,8 @@ fn answer_and_report(
     view: &mut ViewState,
 ) {
     view.pending_approval = None;
+    view.approval_confirming = false;
+    view.approval_selection = 0;
     source.answer(call_id, allow, always);
     view.status = match (allow, always) {
         (true, true) => String::from("always allowed; the turn is running"),
@@ -2896,41 +2997,73 @@ fn store_credential(
     }
 }
 
-/// Applies one keystroke to an open approval question.
-///
-/// `y` allows the call once, `a` allows it for the rest of the session, and `n` or `Esc` denies it.
-/// Nothing else does anything: a stray keypress must not approve a command, and it must not close
-/// the question either, so the one key a reader has to get right is `y`.
-///
-/// `Ctrl+C` is the copy key here as it is everywhere else, and is routed before this. Denying *and*
-/// stopping the turn in one keypress went with it: `n` denies, `Esc` denies and closes, and the turn
-/// can be stopped with the key that stops it everywhere else afterwards.
-fn handle_approval_key(key: KeyEvent, view: &ViewState) -> Outcome {
+/// Answers only the visible approval, with denial selected initially and a second step for grants.
+fn handle_approval_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     let Some(approval) = view.pending_approval.as_ref() else {
         return Outcome::Continue;
     };
     let call_id = approval.call_id.clone();
-    match key.code {
-        KeyCode::Char('y' | 'Y') => Outcome::Answer {
-            call_id,
-            allow: true,
-            always: false,
-        },
-        // "Always allow": the tool is granted for the rest of the session, so the same
-        // question is not put to the reader again. It is a separate key from `y` because it
-        // is a bigger decision, and one a stray keypress must not make.
-        KeyCode::Char('a' | 'A') => Outcome::Answer {
-            call_id,
-            allow: true,
-            always: true,
-        },
-        KeyCode::Char('n' | 'N') | KeyCode::Esc => Outcome::Answer {
-            call_id,
-            allow: false,
-            always: false,
-        },
-        _ => Outcome::Continue,
+    if view.approval_confirming {
+        return match key.code {
+            KeyCode::Char('y' | 'Y') => Outcome::Answer {
+                call_id,
+                allow: true,
+                always: true,
+            },
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                view.approval_confirming = false;
+                view.approval_selection = 0;
+                Outcome::Continue
+            }
+            _ => Outcome::Continue,
+        };
     }
+    match key.code {
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            return Outcome::Answer {
+                call_id,
+                allow: false,
+                always: false,
+            };
+        }
+        KeyCode::Char('y' | 'Y') => {
+            return Outcome::Answer {
+                call_id,
+                allow: true,
+                always: false,
+            };
+        }
+        KeyCode::Char('a' | 'A') => view.approval_confirming = true,
+        KeyCode::Up | KeyCode::Left | KeyCode::BackTab => {
+            view.approval_selection = view.approval_selection.checked_sub(1).unwrap_or(2);
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+            view.approval_selection = view
+                .approval_selection
+                .saturating_add(1)
+                .checked_rem(3)
+                .unwrap_or(0);
+        }
+        KeyCode::Enter => match view.approval_selection {
+            0 => {
+                return Outcome::Answer {
+                    call_id,
+                    allow: false,
+                    always: false,
+                };
+            }
+            1 => {
+                return Outcome::Answer {
+                    call_id,
+                    allow: true,
+                    always: false,
+                };
+            }
+            _ => view.approval_confirming = true,
+        },
+        _ => {}
+    }
+    Outcome::Continue
 }
 
 /// Routes a key while the key list is open.
@@ -2952,6 +3085,8 @@ fn handle_help_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
         KeyCode::Down => view.scroll_help(1),
         KeyCode::PageUp => view.scroll_help(-PAGE_ROWS),
         KeyCode::PageDown => view.scroll_help(PAGE_ROWS),
+        KeyCode::Home => view.help_scroll = 0,
+        KeyCode::End => view.help_scroll = u16::MAX,
         _ => {}
     }
     Outcome::Continue
@@ -3278,6 +3413,12 @@ fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
     // underneath.
     let behind_a_dialogue = view.modal_open();
     match mouse.kind {
+        MouseEventKind::ScrollUp if behind_a_dialogue => {
+            scroll_modal_pointer(-MOUSE_SCROLL_ROWS, view);
+        }
+        MouseEventKind::ScrollDown if behind_a_dialogue => {
+            scroll_modal_pointer(MOUSE_SCROLL_ROWS, view);
+        }
         MouseEventKind::ScrollUp => view.scroll(-MOUSE_SCROLL_ROWS),
         MouseEventKind::ScrollDown => view.scroll(MOUSE_SCROLL_ROWS),
         MouseEventKind::Down(MouseButton::Left) => {
@@ -3302,6 +3443,21 @@ fn handle_mouse(mouse: MouseEvent, view: &mut ViewState) {
         // Scrolling sideways and every other button are not things this interface has
         // anywhere to put. Ignoring them is deliberate rather than an oversight.
         _ => {}
+    }
+}
+
+/// The wheel reads the visible modal rather than moving a transcript hidden behind it.
+fn scroll_modal_pointer(rows: i32, view: &mut ViewState) {
+    match view.active_modal() {
+        Some(Modal::Help) => view.scroll_help(rows),
+        Some(Modal::Context) => {
+            if let Some(state) = &mut view.context_dialog {
+                let next = i32::from(state.scroll).saturating_add(rows).max(0);
+                state.scroll = u16::try_from(next).unwrap_or(u16::MAX);
+            }
+        }
+        Some(Modal::KeyEntry) | None => {}
+        Some(_) => view.scroll_dialog(rows),
     }
 }
 
@@ -3802,6 +3958,10 @@ fn apply_tool_done(name: String, error: bool, call_id: Option<String>, view: &mu
 /// scrolled away still knows.
 fn apply_approval(call_id: String, tool: String, reason: Option<String>, view: &mut ViewState) {
     view.status = format!("waiting for your decision on the {tool} call");
+    view.clear_selection();
+    view.approval_selection = 0;
+    view.approval_confirming = false;
+    view.dialog_scroll = 0;
     view.pending_approval = Some(PendingApproval {
         call_id,
         tool,
@@ -4047,7 +4207,7 @@ mod tests {
     use super::*;
     use crate::transcript::EntryKind;
 
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    pub(super) fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
 
@@ -5140,7 +5300,7 @@ mod tests {
     ///
     /// A selection is made of *rendered* lines, so a test that means to select something has to render
     /// it first: there is nothing to point at until the view has drawn itself once.
-    fn drawn(view: &mut ViewState, width: u16, height: u16) -> String {
+    pub(super) fn drawn(view: &mut ViewState, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal always builds");
         let painted = terminal.draw(|frame| view.render(frame));
@@ -5166,7 +5326,7 @@ mod tests {
     /// decision. Boxed and annotated rather than returned as `impl Fn`, because a closure that hands
     /// back a future borrowing its own argument only generalises to `for<'a> Fn` when it is checked
     /// against that type.
-    fn recording_copier(refuses: bool) -> (Copied, Box<Copier>) {
+    pub(super) fn recording_copier(refuses: bool) -> (Copied, Box<Copier>) {
         let copied = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
         let recorder = std::rc::Rc::clone(&copied);
         let take: Box<Copier> = Box::new(
@@ -7440,22 +7600,6 @@ mod tests {
             } if call_id == "a1"
         ));
 
-        // `a` is the standing answer: it runs the call *and* records the tool for the rest of
-        // the session, which is a different thing from `y` and a separate key.
-        view.pending_approval = Some(PendingApproval {
-            call_id: "a1".to_owned(),
-            tool: "bash".to_owned(),
-            reason: None,
-        });
-        assert!(matches!(
-            handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE), &mut view),
-            Outcome::Answer {
-                call_id,
-                allow: true,
-                always: true,
-            } if call_id == "a1"
-        ));
-
         // The denial keys, in the other direction. `Esc` and `n` deny the call and leave the
         // turn running.
         view.pending_approval = Some(PendingApproval {
@@ -8532,3 +8676,7 @@ mod tests {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_accessibility.rs"]
+mod accessibility_tests;
