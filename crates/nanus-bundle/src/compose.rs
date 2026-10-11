@@ -928,6 +928,14 @@ fn compatible_config(
     let mut adapter =
         OpenAiConfig::with_base_url(vendor, selection.model(), key, selection.endpoint());
     adapter.set_protocol(selection.protocol());
+    // Stock tools have optional arguments, and `read`'s line and byte windows are mutually
+    // exclusive. Responses normalizes an omitted strictness policy to make every field
+    // required, forcing the model to combine both windows before the tool can read a file.
+    // Keep the schemas' optional fields optional on both OpenAI wires, including after a
+    // model switch. Library callers retain their own policy; z.ai accepts no explicit one.
+    if vendor == Vendor::OpenAi {
+        adapter.set_function_strictness(Some(false));
+    }
     match config.max_tokens {
         Some(max_tokens) => adapter
             .set_max_tokens(max_tokens)
@@ -1288,6 +1296,115 @@ mod tests {
         anthropic.max_tokens = Some(4_096);
         assert_eq!(sent(&anthropic, "claude-haiku-4-5-20251001"), 4_096);
         assert_eq!(sent(&anthropic, "claude-opus-5-5"), 4_096);
+    }
+
+    /// Uses the stock builders without touching a credential store. The subscription builder
+    /// needs a stored token set, whereas the API builder needs a plain key.
+    fn fictional_openai(plan: &str) -> OpenAiLlm {
+        let config = NanusConfig {
+            provider: Some(String::from("openai")),
+            plan: Some(plan.to_owned()),
+            model: Some(String::from("gpt-6.1-sol")),
+            ..NanusConfig::default()
+        };
+        let selection = Selection::resolve(&config).unwrap();
+        if plan == "subscription" {
+            let tokens = serde_json::json!({
+                "access_token": "fictional-access",
+                "refresh_token": "fictional-refresh",
+                "account_id": "fictional-account",
+            });
+            build_responses(&config, &selection, &Secret::new(tokens.to_string())).unwrap()
+        } else {
+            build_compatible(
+                Vendor::OpenAi,
+                &config,
+                &selection,
+                &Secret::new("fictional-key"),
+            )
+            .unwrap()
+        }
+    }
+
+    /// Real schemas, including `read`'s mutually exclusive optional windows: a fabricated
+    /// all-required schema cannot expose the Responses normalization that broke stock reads.
+    fn stock_tool_request(model: &str) -> nanus_ports::ChatRequest {
+        let fs: FsHandle = Rc::new(Box::new(crate::tests_support::UnusedFs));
+        let shell: ShellHandle = Rc::new(Box::new(crate::tests_support::UnusedShell));
+        let tools = crate::build_toolset(&fs, &shell).unwrap();
+        let mut schemas: Vec<_> = tools.schemas().into_iter().cloned().collect();
+        schemas.extend(crate::goal_tools::schemas());
+        nanus_ports::ChatRequest::new(model, vec![nanus_domain::Message::user("read a file")])
+            .with_tools(schemas)
+    }
+
+    #[test]
+    fn stock_openai_functions_keep_read_windows_optional_on_both_plans() {
+        let request = stock_tool_request("gpt-6.1-sol");
+        for plan in ["api", "subscription"] {
+            let adapter = fictional_openai(plan);
+            let body = adapter.encode(&request);
+            assert!(body.get("input").is_some(), "{plan} uses Responses");
+            for schema in &request.tools {
+                let tool = body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == schema.name.as_str())
+                    .unwrap();
+                assert_eq!(tool["parameters"], schema.parameters);
+                assert_eq!(
+                    tool["strict"], false,
+                    "{plan}: Responses must not make {}'s optional fields mandatory",
+                    schema.name
+                );
+                if schema.name.as_str() == "read" {
+                    assert_eq!(
+                        tool["parameters"]["required"],
+                        serde_json::json!(["file_path"])
+                    );
+                    assert_eq!(
+                        tool["parameters"]["properties"]["offset"]["type"],
+                        "integer"
+                    );
+                    assert_eq!(
+                        tool["parameters"]["properties"]["byte_offset"]["type"],
+                        "integer"
+                    );
+                }
+            }
+            let estimate = adapter.estimate_request(&request).unwrap();
+            assert_eq!(
+                estimate.request_bytes,
+                serde_json::to_vec(&body).unwrap().len()
+            );
+        }
+    }
+
+    #[test]
+    fn stock_openai_function_policy_follows_model_switches_but_does_not_reach_zai() {
+        let adapter = fictional_openai("api");
+        let request = stock_tool_request("gpt-5");
+        let body = adapter.encode(&request);
+        assert!(body.get("messages").is_some(), "an older model uses Chat");
+        for (tool, schema) in body["tools"].as_array().unwrap().iter().zip(&request.tools) {
+            assert_eq!(tool["function"]["strict"], false);
+            assert_eq!(tool["function"]["parameters"], schema.parameters);
+        }
+        let config = NanusConfig {
+            provider: Some(String::from("zai")),
+            ..NanusConfig::default()
+        };
+        let selection = Selection::resolve(&config).unwrap();
+        let config = compatible_config(Vendor::Zai, &config, &selection, "fictional-key").unwrap();
+        assert_eq!(config.function_strictness(), None);
+        let adapter = OpenAiLlm::new(config).unwrap();
+        let request = stock_tool_request(selection.model());
+        let body = adapter.encode(&request);
+        for (tool, schema) in body["tools"].as_array().unwrap().iter().zip(&request.tools) {
+            assert!(tool["function"].get("strict").is_none());
+            assert_eq!(tool["function"]["parameters"], schema.parameters);
+        }
     }
 
     /// A `SecretPort` holding nothing, so the unconfigured case does not depend on whether the

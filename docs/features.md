@@ -302,8 +302,11 @@ remembered selection, wins over that default.
 - **Explicit function policy (local preparation).** `OpenAiConfig::set_function_strictness`
   selects omitted/default, explicit false or explicit true. The two actual OpenAI encoders retain
   the caller's schema; false preserves optional parameters, while true refuses schemas outside
-  the bounded supported strict subset before estimation/HTTP. Non-OpenAI vendors refuse an explicit
-  policy. This local candidate is unpublished and is not a downstream host's pinned dependency.
+  the bounded supported strict subset before estimation/HTTP. Stock nanus explicitly selects
+  false on both OpenAI plans and wires: Responses otherwise makes every field required,
+  including `read`'s mutually exclusive line- and byte-window arguments. Library defaults remain
+  omitted, and non-OpenAI vendors refuse an explicit policy. This local candidate is unpublished
+  and is not a downstream host's pinned dependency.
 - **Responses replay decoder (local preparation).** `responses::StreamAccumulator::with_prefix`
   retains ordered completed encrypted reasoning/message/function items under fixed response bounds.
   Deltas, identities, phase and terminal output must agree before replay/calls/completion release.
