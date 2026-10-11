@@ -1,7 +1,7 @@
 //! Input regressions for modal safety, global exit and pointer-free UI copying.
 
 use super::*;
-use crate::runtime::tests::{drawn, key, pause, recording_copier};
+use crate::runtime::tests::{Scripted, drawn, key, pause, recording_copier};
 
 fn approve(view: &mut ViewState) {
     apply_approval(
@@ -634,4 +634,68 @@ fn preferences_select_complete_palettes_and_mouse_capture() {
     let default = NanusConfig::default();
     assert!(default.tui_mouse);
     assert_eq!(default.tui_theme, TuiTheme::Terminal);
+}
+
+/// A setting that is parsed and then dropped on the way to the view does nothing, and each of
+/// these had only ever been tested at its two ends: the configuration's default, and a view that
+/// was handed a theme directly.
+#[test]
+fn every_display_preference_in_the_configuration_reaches_the_opening_view() {
+    let source = Scripted::new(Vec::new());
+    for (theme, palette) in [
+        (TuiTheme::Terminal, Theme::default()),
+        (TuiTheme::Light, Theme::light()),
+        (TuiTheme::Dark, Theme::dark()),
+        (TuiTheme::HighContrast, Theme::monochrome()),
+    ] {
+        for mouse in [true, false] {
+            let config = NanusConfig {
+                tui_theme: theme,
+                tui_mouse: mouse,
+                tui_detail: TuiDetail::Full,
+                markdown: false,
+                mermaid: false,
+                ..NanusConfig::default()
+            };
+            let view = view_of(&source, &preferences_of(&config), false);
+            assert_eq!(view.theme, palette, "{theme:?}");
+            assert_eq!(view.mouse_enabled, mouse);
+            assert_eq!(view.detail, Detail::Full);
+            assert!(!view.markdown && !view.mermaid);
+
+            // `NO_COLOR` is applied on top of the palette that was chosen, not instead of it.
+            let plain = view_of(&source, &preferences_of(&config), true);
+            assert_eq!(plain.theme, palette.without_color(), "{theme:?}");
+            assert_eq!(plain.mouse_enabled, mouse, "and it changes nothing else");
+        }
+    }
+    // The other direction: a configuration that says nothing gets the defaults, and colour.
+    let view = view_of(&source, &preferences_of(&NanusConfig::default()), false);
+    assert_eq!(view.theme, Theme::default());
+    assert!(view.mouse_enabled && view.markdown && view.mermaid);
+    assert_eq!(view.detail, Detail::Compact);
+    assert_ne!(
+        Theme::light(),
+        Theme::light().without_color(),
+        "the override is a real change, so the comparisons above can tell the two apart"
+    );
+}
+
+/// `tui_mouse = false` promises the terminal's own selection, which means never asking for the
+/// mouse at all — not asking and then ignoring what arrives.
+#[test]
+fn a_reader_who_keeps_the_mouse_for_the_terminal_is_never_asked_for_it() {
+    let asked = core::cell::Cell::new(false);
+    let request = |granted: bool| {
+        asked.set(true);
+        granted
+    };
+    assert!(!mouse_captured(false, || request(true)));
+    assert!(!asked.get(), "the terminal was not asked");
+    assert!(mouse_captured(true, || request(true)));
+    assert!(asked.get());
+    assert!(
+        !mouse_captured(true, || request(false)),
+        "a request that fails is not a capture, so nothing is released on the way out"
+    );
 }

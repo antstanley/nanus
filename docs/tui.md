@@ -913,8 +913,12 @@ of the terminal.
 
 The caret is a **style on the cell it is over**, not a glyph in a cell of its own.
 The real terminal cursor is positioned at the same insertion point for terminal cursor tracking;
-it is not placed behind a modal. Drawn as
-a glyph it took a column of its own, so every character after it slid one place to the right
+it is not placed behind a modal. While the interface is up it is asked to be a steady bar, and the
+reader's own shape is restored on the way out: a terminal that colours a block cursor from the cell
+it is over draws it by reversing that cell, and a reversed caret reversed again is ordinary text —
+the caret would vanish exactly where it is. A terminal that does not know the request keeps its
+shape. Drawn as
+a glyph the caret took a column of its own, so every character after it slid one place to the right
 whenever the cursor moved — which reads as the cursor displacing the text it is moving
 across, and is worst exactly where a caret is most useful: in the middle of a word being
 corrected. Moving the cursor through `corvid` now leaves the word drawn identically at every

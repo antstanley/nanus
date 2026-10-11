@@ -147,14 +147,24 @@ fn no_color_requested(value: Option<&OsStr>) -> bool {
 /// did not ask for would be the wrong kind of silence.
 fn configured_preferences() -> io::Result<Preferences> {
     NanusConfig::load(None)
-        .map(|config| Preferences {
-            detail: detail_from(config.tui_detail),
-            markdown: config.markdown,
-            mermaid: config.mermaid,
-            theme: configured_theme(config.tui_theme),
-            mouse: config.tui_mouse,
-        })
+        .map(|config| preferences_of(&config))
         .map_err(|error| io::Error::other(format!("the configuration could not be read: {error}")))
+}
+
+/// The display preferences a configuration asks for.
+///
+/// A function of the configuration rather than of the file it was read from, for the reason
+/// [`no_color_requested`] is a function of a value: a setting that is parsed and then dropped on
+/// the way to the view is a setting that does nothing, and only a test that can hand a
+/// configuration in and look at what comes out can say that each one arrives.
+fn preferences_of(config: &NanusConfig) -> Preferences {
+    Preferences {
+        detail: detail_from(config.tui_detail),
+        markdown: config.markdown,
+        mermaid: config.mermaid,
+        theme: configured_theme(config.tui_theme),
+        mouse: config.tui_mouse,
+    }
 }
 
 /// The interface's display preferences, read together from one file.
@@ -206,6 +216,8 @@ struct TerminalGuard {
     enhanced: bool,
     /// Whether the mouse was captured, so it is only released if it was.
     mouse: bool,
+    /// Whether the cursor's shape was asked for, so it is only given back if it was.
+    cursor: bool,
 }
 
 impl TerminalGuard {
@@ -223,12 +235,14 @@ impl TerminalGuard {
     /// A terminal that does not speak it ignores the request, and the keyboard remains sufficient.
     fn enter(capture_mouse: bool) -> Self {
         let terminal = ratatui::init();
-        let mouse = capture_mouse && enable_mouse();
+        let mouse = mouse_captured(capture_mouse, enable_mouse);
         let enhanced = enable_keyboard_protocol();
+        let cursor = enable_bar_cursor();
         Self {
             terminal,
             enhanced,
             mouse,
+            cursor,
         }
     }
 
@@ -245,6 +259,11 @@ impl Drop for TerminalGuard {
         if self.mouse {
             let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
         }
+        if self.cursor {
+            // The shape the reader configured, not a guess at it: the terminal knows its default.
+            let shape = crossterm::cursor::SetCursorStyle::DefaultUserShape;
+            let _ = crossterm::execute!(io::stdout(), shape);
+        }
         if self.enhanced {
             // Given back before the screen is restored, so the shell that inherits the
             // terminal does not inherit a keyboard mode it never asked for.
@@ -253,6 +272,38 @@ impl Drop for TerminalGuard {
         }
         ratatui::restore();
     }
+}
+
+/// Asks the terminal to draw its cursor as a steady bar while the interface is up.
+///
+/// The caret is a reversed cell, and the real cursor sits on that same cell so that a screen
+/// magnifier or an input method knows where typing happens. A block cursor is the trouble with
+/// that: a terminal that takes the cursor's colours from the cell it is over — Alacritty by
+/// default, kitty and Ghostty when configured to — draws a block by reversing the cell, and
+/// reversing a reversed cell draws ordinary text, so the caret vanishes exactly where it is. A bar
+/// marks the insertion point without covering the cell, whatever the terminal does with colour.
+/// Steady rather than blinking, because nothing here should flash that the reader did not ask to.
+///
+/// Returns whether the request was made. A terminal that does not know the sequence ignores it and
+/// keeps the shape it had, which leaves the interface exactly as it was before this was asked.
+fn enable_bar_cursor() -> bool {
+    match crossterm::execute!(io::stdout(), crossterm::cursor::SetCursorStyle::SteadyBar) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(%error, "the cursor shape could not be set");
+            false
+        }
+    }
+}
+
+/// Captures the mouse only when the reader has not kept it for the terminal.
+///
+/// Returns whether it was captured, which is what decides whether it is released on the way out.
+/// The request is passed in rather than made here so that the one thing `tui_mouse = false`
+/// promises — that the terminal is never asked, and its own selection keeps working — is a
+/// statement a test can make without a terminal to ask.
+fn mouse_captured(wanted: bool, request: impl FnOnce() -> bool) -> bool {
+    wanted && request()
 }
 
 /// Asks the terminal to report mouse events.
@@ -1260,18 +1311,30 @@ pub fn run_source(source: &mut dyn SessionSource) -> io::Result<()> {
 /// Returns the error from reading the configuration.
 fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     let preferences = configured_preferences()?;
+    // Read here, at the boundary with the terminal, rather than inside the view: the
+    // environment is a property of this run, and a view built with one would render
+    // differently in a test that happened to inherit `NO_COLOR` from whatever ran it.
+    let no_color = no_color_requested(std::env::var_os("NO_COLOR").as_deref());
+    Ok(view_of(source, &preferences, no_color))
+}
+
+/// Builds the opening view from what was read: the source, the preferences, and `NO_COLOR`.
+///
+/// The half of [`opening_view`] that touches neither a file nor the environment, so that what a
+/// preference does to the view is a thing a test can state. `NO_COLOR` is applied on top of
+/// whichever palette was configured, never instead of it: it takes the colours out and leaves the
+/// emphasis and the focus the palette chose.
+fn view_of(source: &dyn SessionSource, preferences: &Preferences, no_color: bool) -> ViewState {
     let mut view = ViewState::new();
     view.detail = preferences.detail;
     view.markdown = preferences.markdown;
     view.mermaid = preferences.mermaid;
-    view.theme = preferences.theme;
+    view.theme = if no_color {
+        preferences.theme.without_color()
+    } else {
+        preferences.theme
+    };
     view.mouse_enabled = preferences.mouse;
-    // Chosen here, at the boundary with the terminal, rather than inside the view: the
-    // environment is a property of this run, and a view built with one would render
-    // differently in a test that happened to inherit `NO_COLOR` from whatever ran it.
-    if no_color_requested(std::env::var_os("NO_COLOR").as_deref()) {
-        view.theme = view.theme.without_color();
-    }
     // The transcript comes from the session itself, so a recorded one looks exactly like
     // the live conversation it was: same event log, same rendering. The one difference is
     // the header, which belongs to a recording and to nothing else.
@@ -1343,7 +1406,7 @@ fn opening_view(source: &dyn SessionSource) -> io::Result<ViewState> {
     if viewing_only {
         view.status = String::from(recording_status());
     }
-    Ok(view)
+    view
 }
 
 /// The recording's startup hint matches the global key behavior, not the old Ctrl+C exit.
@@ -4312,7 +4375,7 @@ mod tests {
     /// server lives; what this covers is the half that lives here: that a prompt reaches
     /// the transport, and that the frames a transport produces land in the right places in
     /// the view.
-    struct Scripted {
+    pub(super) struct Scripted {
         session: Session,
         requests: std::rc::Rc<std::cell::RefCell<Vec<Request>>>,
         script: Vec<Frame>,
@@ -4320,7 +4383,7 @@ mod tests {
     }
 
     impl Scripted {
-        fn new(script: Vec<Frame>) -> Self {
+        pub(super) fn new(script: Vec<Frame>) -> Self {
             Self {
                 session: session(),
                 requests: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),

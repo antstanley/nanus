@@ -185,6 +185,10 @@ Contract to preserve:
   `compact` (the default) is one line each, `full` is the whole argument block and the whole
   reasoning segment. The interface reads it itself, from the same file the core reads, so
   the setting reaches every way the interface is started. See `docs/tui.md`.
+- `tui_theme` / `tui_mouse` — the interface's palette (`terminal`, the default, `light`, `dark`,
+  `high_contrast`) and whether it captures the mouse (`true` by default; `false` keeps the
+  terminal's own selection and never asks for the mouse at all). Read by the interface itself,
+  like `tui_detail`; `NO_COLOR` is applied on top of whichever palette was chosen. See `docs/tui.md`.
 - `read_video` / `ffmpeg_dir` — whether the agent offers the optional `read_video` tool, and where
   `ffmpeg` and `ffprobe` live when they are not on `PATH`. Off by default. See `docs/features.md`.
 - `markdown` / `mermaid` — whether the interface renders the model's answers as markdown

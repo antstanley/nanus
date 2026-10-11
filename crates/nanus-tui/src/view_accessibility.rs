@@ -133,9 +133,25 @@ fn long_names_and_help_descriptions_are_reachable_without_horizontal_clipping() 
     assert!(!pages.contains('…'), "the help does not discard words");
 }
 
-#[test]
-fn monochrome_covers_every_dialog_and_markdown_not_just_transcript_roles() {
-    let mut state = approval();
+/// Every screen the interface can be showing: the conversation alone, and under each dialog.
+const SCREENS: [Option<Modal>; 12] = [
+    None,
+    Some(Modal::Approval),
+    Some(Modal::Permissions),
+    Some(Modal::Context),
+    Some(Modal::Models),
+    Some(Modal::Effort),
+    Some(Modal::Provider),
+    Some(Modal::Queue),
+    Some(Modal::Help),
+    Some(Modal::Credential),
+    Some(Modal::KeyEntry),
+    Some(Modal::Authorization),
+];
+
+/// A view with something of every kind in it: markdown, a list for each chooser, a queued prompt.
+fn busy_screen() -> ViewState {
+    let mut state = ViewState::new();
     state.transcript.push(Entry::prose(
         Role::Assistant,
         "# Heading\n\n[link](https://example.org)\n\n```rust\n// comment\nlet n = 3;\n```",
@@ -150,36 +166,34 @@ fn monochrome_covers_every_dialog_and_markdown_not_just_transcript_roles() {
         refused: None,
     }];
     state.queue.push("queued draft".into());
-    for modal in [
-        None,
-        Some(Modal::Approval),
-        Some(Modal::Permissions),
-        Some(Modal::Context),
-        Some(Modal::Models),
-        Some(Modal::Effort),
-        Some(Modal::Provider),
-        Some(Modal::Queue),
-        Some(Modal::Help),
-        Some(Modal::Credential),
-        Some(Modal::KeyEntry),
-        Some(Modal::Authorization),
-    ] {
-        state.pending_approval = if modal == Some(Modal::Approval) {
-            approval().pending_approval
-        } else {
-            None
-        };
-        state.permission_open = modal == Some(Modal::Permissions);
-        state.context_dialog = (modal == Some(Modal::Context))
-            .then(|| crate::context::ContextDialog::new(state.context_mode, None));
-        state.model_open = modal == Some(Modal::Models);
-        state.effort_open = modal == Some(Modal::Effort);
-        state.provider_open = modal == Some(Modal::Provider);
-        state.queue_open = modal == Some(Modal::Queue);
-        state.help_open = modal == Some(Modal::Help);
-        state.credential_open = modal == Some(Modal::Credential);
-        state.key_entry_open = modal == Some(Modal::KeyEntry);
-        state.auth_open = modal == Some(Modal::Authorization);
+    state
+}
+
+/// Opens exactly one dialog, or none.
+fn show(state: &mut ViewState, modal: Option<Modal>) {
+    state.pending_approval = if modal == Some(Modal::Approval) {
+        approval().pending_approval
+    } else {
+        None
+    };
+    state.permission_open = modal == Some(Modal::Permissions);
+    state.context_dialog = (modal == Some(Modal::Context))
+        .then(|| crate::context::ContextDialog::new(state.context_mode, None));
+    state.model_open = modal == Some(Modal::Models);
+    state.effort_open = modal == Some(Modal::Effort);
+    state.provider_open = modal == Some(Modal::Provider);
+    state.queue_open = modal == Some(Modal::Queue);
+    state.help_open = modal == Some(Modal::Help);
+    state.credential_open = modal == Some(Modal::Credential);
+    state.key_entry_open = modal == Some(Modal::KeyEntry);
+    state.auth_open = modal == Some(Modal::Authorization);
+}
+
+#[test]
+fn monochrome_covers_every_dialog_and_markdown_not_just_transcript_roles() {
+    let mut state = busy_screen();
+    for modal in SCREENS {
+        show(&mut state, modal);
         for theme in [
             Theme::monochrome(),
             Theme::light().without_color(),
@@ -194,6 +208,47 @@ fn monochrome_covers_every_dialog_and_markdown_not_just_transcript_roles() {
                     !cell.modifier.contains(Modifier::DIM),
                     "important text is never dimmed"
                 );
+            }
+        }
+    }
+}
+
+/// The other direction. An explicit palette owns its background, so its contrast is a property of
+/// the pair — which is only true if no cell is left to the terminal: one with the terminal's own
+/// background under the palette's text is exactly the unreadable pair the palette exists to rule
+/// out. Every cell that reaches the terminal carries both of the palette's colours.
+#[test]
+fn explicit_palettes_colour_every_cell_of_every_screen() {
+    for theme in [Theme::light(), Theme::dark()] {
+        let background = theme.assistant.bg.expect("a palette has a background");
+        let mut state = busy_screen();
+        state.theme = theme;
+        // Wide and joined glyphs too, in the transcript and under the caret.
+        state
+            .transcript
+            .push(Entry::prose(Role::User, "wide 界界 and joined 👩‍💻 text"));
+        state.input.insert_str("界 👩‍💻");
+        for modal in SCREENS {
+            show(&mut state, modal);
+            for (width, height) in [(80, 24), (40, 12)] {
+                let buffer = draw(&mut state, width, height);
+                for row in 0..height {
+                    // The cell after a wide glyph is never sent: the terminal draws the glyph
+                    // across both, in the glyph's colours, so the backend's copy of it stays
+                    // blank and is not a cell of its own to check.
+                    let mut covered = 0_usize;
+                    for column in 0..width {
+                        let cell = buffer.cell((column, row)).expect("a cell");
+                        if covered > 0 {
+                            covered = covered.saturating_sub(1);
+                            continue;
+                        }
+                        covered = cell.symbol().width().saturating_sub(1);
+                        let at = format!("{modal:?} {width}x{height} at {column},{row}");
+                        assert_eq!(cell.bg, background, "background in {at}");
+                        assert_ne!(cell.fg, Color::Reset, "foreground in {at}");
+                    }
+                }
             }
         }
     }

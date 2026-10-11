@@ -2617,7 +2617,15 @@ impl ViewState {
         // The composer grows with the prompt, so a multi-line one is visible rather
         // than clipped to a single row. The transcript keeps a floor of rows so that a
         // tall composer cannot squeeze the conversation out entirely.
-        let composer = self.composer_height(area.width);
+        //
+        // Laid out once for the frame. The layout decides how tall the composer is and is then
+        // what gets drawn, and wrapping a long draft a second time to draw it was most of what a
+        // keystroke in one cost.
+        let draft_width = area
+            .width
+            .saturating_sub(COMPOSER_PADDING_COLS.saturating_mul(2));
+        let draft = self.composer_layout(draft_width);
+        let composer = Self::composer_height(&draft);
         // The queue is drawn above the composer, so a reader can see what they have
         // already asked for while they type the next thing. It yields its rows the same
         // way the throughput line does — before the composer, which is the one row they
@@ -2696,7 +2704,7 @@ impl ViewState {
             self.render_queue(frame, *queue);
         }
         if let Some(input) = chunks.get(4) {
-            self.render_input(frame, *input);
+            self.render_input(frame, *input, (draft_width, draft));
         }
         if let Some(stats) = chunks.get(5) {
             self.render_stats(frame, *stats);
@@ -2835,8 +2843,16 @@ impl ViewState {
                     continue;
                 }
                 if let Some(cell) = buffer.cell((column, row)) {
-                    line.push_str(cell.symbol());
-                    covered = cell.cell_width().saturating_sub(1);
+                    let symbol = cell.symbol();
+                    line.push_str(symbol);
+                    // Measured only when it can be wide. A one-byte symbol is ASCII and one
+                    // cell, which is nearly every cell of every frame, and this runs on all of
+                    // them: measuring each cost a frame a tenth of its time.
+                    covered = if symbol.len() > 1 {
+                        cell.cell_width().saturating_sub(1)
+                    } else {
+                        0
+                    };
                 }
             }
         }
@@ -3962,7 +3978,12 @@ impl ViewState {
     /// The box is inset from the area it is granted, so the prompt is not flush against
     /// the terminal's edges, and it keeps only its top and bottom rules: a prompt is
     /// prose rather than a field, and a full rectangle draws more box than it needs.
-    fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    ///
+    /// `laid` is the layout the frame already made to size the composer, with the width it was
+    /// made for. It is the one drawn when that is the width the box was given — which the frame's
+    /// own arithmetic makes it — and is made again otherwise, rather than drawn at a width it was
+    /// not wrapped for.
+    fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect, laid: (u16, ComposerLayout)) {
         let block_area = Self::composer_box(area);
         // The block has no side border, so its inner width is the whole inset width.
         let inner = block_area.width;
@@ -3970,7 +3991,12 @@ impl ViewState {
         // terminal is short the layout gives the composer less than `composer_rows`, and
         // a window sized from the request would scroll the caret just off the bottom.
         let visible = block_area.height.saturating_sub(COMPOSER_BORDER_ROWS);
-        let composer = self.composer_layout(inner);
+        let (laid_width, laid) = laid;
+        let composer = if laid_width == inner {
+            laid
+        } else {
+            self.composer_layout(inner)
+        };
         // The window follows the caret, keeping it on the last row it can when the
         // prompt is taller than the composer.
         let caret = u16::try_from(composer.caret_row).unwrap_or(u16::MAX);
@@ -4103,22 +4129,26 @@ impl ViewState {
     /// The composer grows with the prompt so an explicit newline is visible, and stops
     /// at the cap so a long one cannot squeeze the conversation away; past the cap the
     /// window follows the caret instead.
+    #[cfg(test)]
     fn composer_rows(&self, inner_width: u16) -> u16 {
-        let rows = self.composer_layout(inner_width).rows.len();
-        u16::try_from(rows)
+        Self::shown_rows(&self.composer_layout(inner_width))
+    }
+
+    /// The rows of a layout the composer shows at once: all of them, up to the cap.
+    fn shown_rows(layout: &ComposerLayout) -> u16 {
+        u16::try_from(layout.rows.len())
             .unwrap_or(u16::MAX)
             .clamp(1, MAX_COMPOSER_ROWS)
     }
 
-    /// Returns the total rows the composer occupies at `width`: its text, its two
+    /// Returns the total rows the composer occupies for a layout: its text, its two
     /// rules, and the blank rows kept above and below it.
     ///
     /// One function rather than the arithmetic repeated, because the layout budgets rows
     /// against this figure and the renderer draws inside it; two copies would let a
     /// padding row be granted twice or not at all.
-    fn composer_height(&self, width: u16) -> u16 {
-        let inner = width.saturating_sub(COMPOSER_PADDING_COLS.saturating_mul(2));
-        self.composer_rows(inner)
+    fn composer_height(layout: &ComposerLayout) -> u16 {
+        Self::shown_rows(layout)
             .saturating_add(COMPOSER_BORDER_ROWS)
             .saturating_add(COMPOSER_PADDING_ROWS.saturating_mul(2))
     }
@@ -4406,6 +4436,21 @@ impl ComposerLayout {
     }
 }
 
+/// Visits the graphemes of `text` in order.
+///
+/// Segmenting is the expensive part of laying a prompt out, and the prompt is laid out on every
+/// frame. Text that is all ASCII has nothing to segment: every character is a grapheme of its own,
+/// a carriage return and its line feed aside. So that text is walked a character at a time and
+/// only the rest goes through the segmenter, which is what a long draft in plain English used to
+/// pay for on every keystroke without having a single cluster in it.
+fn each_grapheme<'text>(text: &'text str, visit: impl FnMut(&'text str)) {
+    if text.is_ascii() && !text.contains('\r') {
+        text.split_inclusive(|_: char| true).for_each(visit);
+    } else {
+        text.graphemes(true).for_each(visit);
+    }
+}
+
 /// Wraps one source line into display rows at the given widths.
 ///
 /// Greedy and word-aware: a row takes words while they fit, a word longer than the row
@@ -4426,7 +4471,7 @@ fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<(String, usize, usiz
     let mut capacity = first.max(1);
     let mut used = 0_usize;
     let mut source = 0_usize;
-    for grapheme in text.graphemes(true) {
+    each_grapheme(text, |grapheme| {
         let columns = grapheme.width();
         while !row.is_empty() && used.saturating_add(columns) > capacity {
             let split = breaks.filter(|position| *position > 0).unwrap_or(row.len());
@@ -4460,7 +4505,7 @@ fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<(String, usize, usiz
         row.push(grapheme);
         sources.push(source);
         source = source.saturating_add(grapheme.chars().count());
-    }
+    });
     if !row.is_empty() {
         rows.push((
             row.into_iter().collect(),

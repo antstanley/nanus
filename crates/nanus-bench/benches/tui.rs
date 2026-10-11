@@ -220,6 +220,13 @@ fn frame<M: Metric>(c: &mut Criterion<M>) {
     group.bench_function(BenchmarkId::new("empty", 0), |b| {
         b.iter(|| draw(&mut terminal, &mut state));
     });
+    // The same floor with a long prompt being written: the composer is wrapped on every frame,
+    // whatever the conversation holds, so this is what a keystroke costs once a draft is long.
+    let (mut state, mut terminal) = view(0, COMPACT);
+    state.input = InputBuffer::with_text(&fixtures::prose(2_000));
+    group.bench_function(BenchmarkId::new("draft", 2000), |b| {
+        b.iter(|| draw(&mut terminal, &mut state));
+    });
     group.finish();
 }
 
