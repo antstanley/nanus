@@ -16,6 +16,10 @@ pub const PROVIDER: &str = "deepseek";
 
 /// The current fast `DeepSeek` model.
 ///
+/// On 2026-10-17 the id began serving `DeepSeek-V4.1-Flash-1017`: the same id, calling method,
+/// limits, image input and effort levels as the V4.1 Flash it replaced, so a stored
+/// configuration keeps its meaning.
+///
 /// The retired ids — `deepseek-chat` and `deepseek-reasoner`, discontinued on
 /// 2026-07-24 — are deliberately not offered as aliases: silently mapping a retired
 /// name onto a new model would change a user's output without telling them.

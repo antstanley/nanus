@@ -1,6 +1,9 @@
 //! Exact-model limits and image support, each recorded only where it has evidence.
 //!
-//! Evidence: <https://api-docs.deepseek.com/api/list-models/> (checked 2026-10-03).
+//! Evidence: <https://api-docs.deepseek.com/api/list-models/> (checked 2026-10-17).
+//! On that date `deepseek-flash` was served by `DeepSeek-V4.1-Flash-1017` under the same
+//! id, limits, image modality and `low`/`high`/`max` effort levels as the V4.1 Flash entry
+//! this metadata was first recorded against; the calling method is unchanged.
 //! The response specifies combined input/output context, not a separate input quota.
 //! Input is therefore bounded by that same context and every reservation is charged
 //! against the combined limit. Retired aliases and custom endpoints inherit nothing.
@@ -70,7 +73,7 @@ pub fn validate_output(config: &DeepSeekConfig, request: &ChatRequest) -> LlmRes
 }
 
 /// Exact Chat function-tool contract; all existing neutral effort mappings are accepted.
-/// See <https://api-docs.deepseek.com/api/create-chat-completion/> (checked 2026-10-03).
+/// See <https://api-docs.deepseek.com/api/create-chat-completion/> (checked 2026-10-17).
 pub fn tool_support(
     config: &DeepSeekConfig,
     model: &str,

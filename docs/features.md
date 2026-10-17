@@ -340,8 +340,11 @@ remembered selection, wins over that default.
   The [models response](https://api-docs.deepseek.com/api/list-models/) supplies each entry
   independently. Custom endpoints and ids stay unknown. Zero or oversized output refuses
   before HTTP even without an explicit context budget; a valid request override takes
-  precedence over the configured output default. Text metadata does not qualify images:
-  Flash remains Unknown, and Pro is Unsupported because its contract lists text input only.
+  precedence over the configured output default. On 2026-10-17 the `deepseek-flash` id began
+  serving `DeepSeek-V4.1-Flash-1017`, reporting the same id, limits, image modality and effort
+  levels; the image evidence was re-run live against it with the same result. Text metadata does
+  not qualify images by itself: Flash is Supported on its [live evidence](vision-evidence.md), and
+  Pro is Unsupported because its contract lists text input only.
 - **Local tool-support admission metadata.** `LlmPort::tool_call_support(model, request_effort)`
   returns `ToolCallSupport::{Supported, Unsupported, Unknown}` for the actual endpoint/wire/model
   and effective effort; absence inherits the adapter default, while explicit `ReasoningEffort::None`

@@ -150,3 +150,15 @@ One behaviour worth knowing: with thinking on, DeepSeek demands the `reasoning_c
 turn whose tool results follow it directly, but not when a user message (the pixel attachment)
 intervenes. The loop always records and replays that reasoning, so this only matters to a synthetic
 session that has none, as the price measurement's twin did.
+
+### The 2026-10-17 checkpoint
+
+On 2026-10-17 DeepSeek began serving `DeepSeek-V4.1-Flash-1017` behind the same `deepseek-flash` id,
+at the same calling method and price. The image evidence was re-run against it that day with the
+credential the harness stores: all four formats were described and the follow-up named the call that
+produced the picture (`deepseek_flash_reads_a_tool_result_image_and_follows_the_call`), and
+`deepseek_flash_image_token_cost_by_size` measured exactly the costs above — 209, 209, 217, 391, 677
+and 1017 prompt tokens — so `deepseek-flash-area-v1` and its reservation are unchanged. The [models
+response](https://api-docs.deepseek.com/api/list-models/) also still lists `image` among Flash's input
+modalities, with the same 1,048,576-token context, 393,216-token output ceiling and
+`low`/`high`/`max` effort levels.
