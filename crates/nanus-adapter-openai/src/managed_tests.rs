@@ -534,6 +534,49 @@ fn zai_is_supported_on_its_api_models_only() {
 }
 
 #[test]
+fn inception_is_supported_on_its_api_models_only() {
+    let api = OpenAiLlm::new(OpenAiConfig::new(
+        Vendor::Inception,
+        "mercury-3",
+        "test-key",
+    ))
+    .unwrap();
+    for model in ["mercury-3", "mercury-2.5", "mercury-2"] {
+        assert_eq!(
+            api.managed_support(model),
+            ManagedSupport::Supported { policy_version: 1 },
+            "{model}"
+        );
+    }
+    assert_eq!(
+        api.managed_support("mercury-future"),
+        ManagedSupport::Unsupported
+    );
+    let prepared = prepare(&api, managed(with_model("mercury-3"))).expect("managed call prepared");
+    let body: Value = serde_json::from_str(prepared.body()).expect("the prepared body is JSON");
+    assert_eq!(body["max_completion_tokens"], 4_096);
+    assert!(body.get("max_tokens").is_none());
+    assert_eq!(body["reasoning_effort"], "medium");
+    assert!(body.get("thinking").is_none());
+    let mut over = with_model("mercury-3");
+    over.max_tokens = Some(131_073);
+    assert!(prepare(&api, managed(over)).is_err());
+
+    let gateway = OpenAiLlm::new(OpenAiConfig::with_base_url(
+        Vendor::Inception,
+        "mercury-3",
+        "test-key",
+        "https://gateway.invalid/v1",
+    ))
+    .unwrap();
+    assert_eq!(
+        gateway.managed_support("mercury-3"),
+        ManagedSupport::Unsupported
+    );
+    refused_by(&gateway, with_model("mercury-3"), "unsupported_mode");
+}
+
+#[test]
 fn the_output_reservation_is_explicit_and_within_the_ceiling() {
     let mut absent = compiled(&session());
     absent.max_tokens = None;

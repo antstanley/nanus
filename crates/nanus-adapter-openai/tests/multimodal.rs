@@ -238,6 +238,28 @@ async fn every_unpromoted_vendor_or_model_refuses_pixels_before_http() {
 }
 
 #[tokio::test]
+async fn an_inception_exact_model_refuses_pixels_before_http() {
+    use futures::StreamExt as _;
+    let adapter = nanus_adapter_openai::OpenAiLlm::new(nanus_adapter_openai::OpenAiConfig::new(
+        nanus_adapter_openai::Vendor::Inception,
+        "mercury-3",
+        "fixture-key",
+    ))
+    .unwrap();
+    let request = ChatRequest::new("mercury-3", fixture("mercury-3").derive_messages());
+    // The exact model is text-only, so this is a refusal rather than the absence of evidence.
+    let error = adapter
+        .estimate_request(&request)
+        .expect_err("Mercury chat models are text-only");
+    assert!(error.to_string().contains("Unsupported"), "{error}");
+    let events: Vec<_> = adapter.stream_chat(request).collect().await;
+    assert!(
+        matches!(events.as_slice(), [nanus_ports::LlmEvent::Error(message)] if message.contains("Unsupported")),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_chatgpt_backend_supports_every_profiled_model_and_refuses_the_rest_before_http() {
     use futures::StreamExt as _;
     let mut config = nanus_adapter_openai::OpenAiConfig::with_base_url(

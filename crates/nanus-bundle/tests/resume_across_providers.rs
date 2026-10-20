@@ -61,12 +61,15 @@ fn encoded(messages: &[Message]) -> Vec<(&'static str, Value)> {
     let deepseek = DeepSeekLlm::new(DeepSeekConfig::new("deepseek-flash", "key")).unwrap();
     let chat = OpenAiLlm::new(OpenAiConfig::new(Vendor::OpenAi, "gpt-5", "key")).unwrap();
     let responses = OpenAiLlm::new(OpenAiConfig::new(Vendor::OpenAi, "gpt-5.6", "key")).unwrap();
+    let inception =
+        OpenAiLlm::new(OpenAiConfig::new(Vendor::Inception, "mercury-3", "key")).unwrap();
     let request = |model: &str| ChatRequest::new(model, messages.to_vec());
     vec![
         ("anthropic", anthropic.encode(&request("claude-sonnet-5-5"))),
         ("deepseek", deepseek.encode(&request("deepseek-flash"))),
         ("openai_chat", chat.encode(&request("gpt-5"))),
         ("openai_responses", responses.encode(&request("gpt-5.6"))),
+        ("inception", inception.encode(&request("mercury-3"))),
     ]
 }
 

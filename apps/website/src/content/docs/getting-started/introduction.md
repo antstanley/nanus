@@ -19,7 +19,7 @@ is no privileged core to patch, just a context and components that register into
 buys three things that are hard to get any other way.
 
 - **Replace the model without touching the tools.** The adapter sits behind an `LlmPort`.
-  Four providers ship and are *selected*, not compiled in, so one line of configuration
+  Five providers ship and are *selected*, not compiled in, so one line of configuration
   changes the provider and nothing else notices.
 - **Replace the tools without touching the model.** Each tool is a plugin behind a
   `ToolExecutor`. Add one and its schema joins the prompt; remove one and it stops

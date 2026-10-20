@@ -57,6 +57,8 @@ pub enum Provider {
     Anthropic,
     /// `OpenAI`'s own API.
     OpenAi,
+    /// Inception Labs' Mercury API.
+    Inception,
 }
 
 /// The credential a plan takes, when it does not share the provider's own.
@@ -226,9 +228,30 @@ static OPENAI_PLANS: [Plan; 2] = [
 /// The model ids `DeepSeek` offers, in cycling order.
 static DEEPSEEK_MODELS: [&str; 2] = [deepseek::MODEL_FLASH, deepseek::MODEL_PRO];
 
+/// Inception Labs' plans: the API, under the vendor's own key.
+///
+/// Mercury has no second tier of its own: `mercury-voice` is an enterprise arrangement reached
+/// through the same endpoint, and the editor and decision models serve other endpoints, so they
+/// are not plans or offered models here. `mercury-3` is the current flagship and the default.
+static INCEPTION_PLANS: [Plan; 1] = [Plan {
+    name: DEFAULT_PLAN,
+    endpoint: nanus_adapter_openai::INCEPTION_BASE_URL,
+    model: Some("mercury-3"),
+    refusal: None,
+    credential: None,
+    protocol: Some(Protocol::ChatCompletions),
+    effort: None,
+}];
+
 impl Provider {
     /// Every provider this build offers, in the order a listing shows them.
-    pub const ALL: [Self; 4] = [Self::DeepSeek, Self::Zai, Self::Anthropic, Self::OpenAi];
+    pub const ALL: [Self; 5] = [
+        Self::DeepSeek,
+        Self::Zai,
+        Self::Anthropic,
+        Self::OpenAi,
+        Self::Inception,
+    ];
 
     /// Returns the name a configuration writes.
     ///
@@ -242,6 +265,7 @@ impl Provider {
             Self::Zai => Vendor::Zai.as_str(),
             Self::Anthropic => nanus_adapter_anthropic::PROVIDER,
             Self::OpenAi => Vendor::OpenAi.as_str(),
+            Self::Inception => Vendor::Inception.as_str(),
         }
     }
 
@@ -267,6 +291,7 @@ impl Provider {
             Self::Zai => nanus_adapter_openai::ZAI_API_KEY_ENV,
             Self::Anthropic => nanus_adapter_anthropic::API_KEY_ENV,
             Self::OpenAi => nanus_adapter_openai::OPENAI_API_KEY_ENV,
+            Self::Inception => nanus_adapter_openai::INCEPTION_API_KEY_ENV,
         }
     }
 
@@ -278,6 +303,7 @@ impl Provider {
             Self::Zai => &ZAI_PLANS,
             Self::Anthropic => &ANTHROPIC_PLANS,
             Self::OpenAi => &OPENAI_PLANS,
+            Self::Inception => &INCEPTION_PLANS,
         }
     }
 
@@ -361,6 +387,7 @@ impl Provider {
             // validate a plan.
             Self::Anthropic => nanus_adapter_anthropic::AnthropicConfig::models(),
             Self::OpenAi => Vendor::OpenAi.models(),
+            Self::Inception => Vendor::Inception.models(),
         }
     }
 
@@ -371,11 +398,12 @@ impl Provider {
         models.next().copied().unwrap_or(deepseek::MODEL_FLASH)
     }
 
-    /// Returns the provider's documented maximum output tokens.
+    /// Returns the output ceiling the provider applies when no exact-model evidence exists.
     ///
     /// Read from the adapter that talks to it rather than restated here: the number
     /// is a provider fact and the adapter is the crate that owns provider facts, so
-    /// two copies could only drift.
+    /// two copies could only drift. [`Selection::max_output_tokens`] is the exact model's
+    /// ceiling where its adapter has evidence, which is what a run actually sends.
     #[must_use]
     pub const fn max_output_tokens(self) -> u32 {
         match self {
@@ -383,6 +411,7 @@ impl Provider {
             Self::Zai => Vendor::Zai.max_output_tokens(),
             Self::Anthropic => nanus_adapter_anthropic::MAX_OUTPUT_TOKENS,
             Self::OpenAi => Vendor::OpenAi.max_output_tokens(),
+            Self::Inception => Vendor::Inception.max_output_tokens(),
         }
     }
 
@@ -605,6 +634,9 @@ impl Selection {
             Provider::OpenAi => self
                 .compatible_config(Vendor::OpenAi)
                 .output_ceiling(&self.model),
+            Provider::Inception => self
+                .compatible_config(Vendor::Inception)
+                .output_ceiling(&self.model),
         }
     }
 
@@ -637,6 +669,9 @@ impl Selection {
                 .capabilities(&self.model),
             Provider::OpenAi => self
                 .compatible_config(Vendor::OpenAi)
+                .capabilities(&self.model),
+            Provider::Inception => self
+                .compatible_config(Vendor::Inception)
                 .capabilities(&self.model),
         }
     }
@@ -702,6 +737,9 @@ mod tests {
             ("zai", None, "glm-5.3", 131_072, Some(1_000_000)),
             ("zai", Some("coding"), "glm-5.3", 131_072, Some(1_000_000)),
             ("openai", None, "gpt-6-astra", 128_000, Some(1_050_000)),
+            ("inception", None, "mercury-3", 131_072, Some(1_000_000)),
+            ("inception", None, "mercury-2.5", 65_536, Some(260_000)),
+            ("inception", None, "mercury-2", 50_000, Some(128_000)),
         ];
         for (provider, plan, model, output, window) in cases {
             let selection = selected(provider, plan, model);
@@ -796,6 +834,19 @@ mod tests {
         assert_eq!(selection.endpoint(), "https://api.anthropic.com/v1");
         // And a provider that does not use the effort knob says so.
         assert!(!selection.provider().effort_applies());
+
+        let inception = NanusConfig {
+            provider: Some(String::from("inception")),
+            ..config()
+        };
+        let selection = Selection::resolve(&inception).expect("inception resolves");
+        assert_eq!(selection.provider(), Provider::Inception);
+        assert_eq!(selection.endpoint(), "https://api.inceptionlabs.ai/v1");
+        assert_eq!(selection.model(), "mercury-3");
+        assert_eq!(selection.credential_account(), "inception");
+        assert_eq!(selection.credential_env(), Some("INCEPTION_API_KEY"));
+        assert_eq!(selection.protocol(), Protocol::ChatCompletions);
+        assert_eq!(selection.effort(None), nanus_ports::ReasoningEffort::Medium);
     }
 
     /// A plan changes the endpoint (z.ai's coding plan, `OpenAI`'s subscription) or the default

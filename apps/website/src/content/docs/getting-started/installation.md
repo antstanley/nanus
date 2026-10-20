@@ -57,6 +57,7 @@ export DEEPSEEK_API_KEY=...
 | `zai` | `ZAI_API_KEY` |
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openai` | `OPENAI_API_KEY` |
+| `inception` | `INCEPTION_API_KEY` |
 
 `nanus auth set <provider>` and `nanus auth status` work for every provider and plan. The account
 is the provider's name, or `provider:plan` for a plan with a credential of its own (`zai:coding`), so

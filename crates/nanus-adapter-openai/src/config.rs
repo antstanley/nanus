@@ -1,11 +1,11 @@
 //! Adapter configuration: which compatible vendor, which endpoint, and which knobs.
 //!
-//! Two providers share this adapter because they share a protocol: `OpenAI`'s
-//! `chat/completions` and z.ai's GLM endpoint both take the same request body and
-//! stream the same frames. What differs is the *vendor* — the host, the credential
-//! variable, the model ids, the output ceiling, and whether the reasoning knob is
-//! a scale or a mode — so that is what [`Vendor`] names, and the rest of the crate
-//! reads it rather than branching on a provider string.
+//! Three providers share this adapter because they share a protocol: `OpenAI`'s
+//! `chat/completions`, z.ai's GLM endpoint, and Inception Labs' Mercury endpoint all
+//! take the same request body and stream the same frames. What differs is the *vendor*
+//! — the host, the credential variable, the model ids, the output ceiling, and how the
+//! reasoning knob is spelled — so that is what [`Vendor`] names, and the rest of the
+//! crate reads it rather than branching on a provider string.
 
 use nanus_ports::ReasoningEffort;
 
@@ -28,11 +28,18 @@ pub const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 /// key, against this host.
 pub const ZAI_CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 
+/// Inception Labs' OpenAI-compatible API host, with the version prefix its documentation
+/// requires.
+pub const INCEPTION_BASE_URL: &str = "https://api.inceptionlabs.ai/v1";
+
 /// The credential variable `OpenAI`'s own tooling reads.
 pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// The credential variable z.ai's documentation uses.
 pub const ZAI_API_KEY_ENV: &str = "ZAI_API_KEY";
+
+/// The credential variable Inception Labs' documentation uses.
+pub const INCEPTION_API_KEY_ENV: &str = "INCEPTION_API_KEY";
 
 /// The models offered for `OpenAI`, in cycling order.
 ///
@@ -74,6 +81,8 @@ pub enum Vendor {
     OpenAi,
     /// z.ai's GLM API, pay-as-you-go and coding plans alike.
     Zai,
+    /// Inception Labs' Mercury API.
+    Inception,
 }
 
 impl Vendor {
@@ -87,6 +96,7 @@ impl Vendor {
         match self {
             Self::OpenAi => "openai",
             Self::Zai => "zai",
+            Self::Inception => "inception",
         }
     }
 
@@ -96,6 +106,7 @@ impl Vendor {
         match raw {
             "openai" => Some(Self::OpenAi),
             "zai" | "z.ai" => Some(Self::Zai),
+            "inception" => Some(Self::Inception),
             _ => None,
         }
     }
@@ -106,6 +117,7 @@ impl Vendor {
         match self {
             Self::OpenAi => OPENAI_API_KEY_ENV,
             Self::Zai => ZAI_API_KEY_ENV,
+            Self::Inception => INCEPTION_API_KEY_ENV,
         }
     }
 
@@ -115,6 +127,7 @@ impl Vendor {
         match self {
             Self::OpenAi => OPENAI_BASE_URL,
             Self::Zai => ZAI_BASE_URL,
+            Self::Inception => INCEPTION_BASE_URL,
         }
     }
 
@@ -124,20 +137,23 @@ impl Vendor {
         match self {
             Self::OpenAi => &OPENAI_MODELS,
             Self::Zai => &ZAI_MODELS,
+            // The adapter's exact-evidence module owns the list, so the offered ids and the
+            // ids its limits are recorded for cannot drift apart.
+            Self::Inception => &crate::inception::MODELS,
         }
     }
 
     /// Returns the field a request names its output ceiling with.
     ///
-    /// The two vendors spell this differently and neither accepts the other's: `OpenAI`'s
-    /// reasoning models require `max_completion_tokens` and reject `max_tokens`, while
-    /// z.ai's GLM models use the original `max_tokens`. Sending the wrong one is a
-    /// refused request rather than a truncated answer, so the field is a vendor fact in
-    /// the same sense the endpoint and the credential are.
+    /// The vendors spell this differently and none accepts another's: `OpenAI`'s and Inception's
+    /// reasoning models require `max_completion_tokens` and reject `max_tokens`, while z.ai's GLM
+    /// models use the original `max_tokens`. Sending the wrong one is a refused request rather
+    /// than a truncated answer, so the field is a vendor fact in the same sense the endpoint and
+    /// the credential are.
     #[must_use]
     pub const fn output_token_field(self) -> &'static str {
         match self {
-            Self::OpenAi => "max_completion_tokens",
+            Self::OpenAi | Self::Inception => "max_completion_tokens",
             Self::Zai => "max_tokens",
         }
     }
@@ -148,26 +164,38 @@ impl Vendor {
     /// `gpt-5.6` family takes `none` through `max` while `gpt-5.3-codex` has no `none`, and
     /// z.ai's GLM-5.3 models cannot turn thinking off at all. A chooser that offered the whole
     /// scale would offer steps the provider refuses, so the interface draws this list.
+    ///
+    /// Inception's own scale is `instant`, `low`, `medium` and `high`; the three steps the
+    /// neutral scale shares with it are offered, `minimal` travels as `instant`, and `none` is
+    /// refused because the provider has no way to switch reasoning off (see
+    /// [`crate::inception::effort_spelling`] and [`crate::inception::validate`]).
     #[must_use]
     pub fn effort_levels(self, model: &str) -> &'static [ReasoningEffort] {
         match self {
             Self::OpenAi => openai_effort_levels(model),
             Self::Zai => zai_effort_levels(model),
+            Self::Inception => crate::inception::effort_levels(model),
         }
     }
 
-    /// Returns the provider's documented maximum output tokens.
+    /// Returns the output ceiling this vendor applies when no exact-model evidence exists.
     ///
-    /// A request may not ask for more than this: the provider refuses the request
-    /// rather than truncating the answer, so [`crate::OpenAiConfig`] caps the
-    /// configured budget at it and says when it did. The number is a provider fact
-    /// and therefore lives here rather than in the ports crate, exactly as the
-    /// output ceiling does for `DeepSeek`.
+    /// A request may not ask for more than the ceiling that applies: the provider refuses the
+    /// request rather than truncating the answer, so [`crate::OpenAiConfig`] caps the configured
+    /// budget at it and says when it did. For `OpenAI` and z.ai this is the provider's documented
+    /// maximum. For Inception it is the *smallest* offered model's ceiling, because an unknown id
+    /// or a gateway could name any of the three and a request above the smallest is the one most
+    /// likely to be refused; an exact model on the documented endpoint reports its own ceiling
+    /// from its capabilities. The number is a provider fact and therefore lives here rather than
+    /// in the ports crate, exactly as the output ceiling does for `DeepSeek`.
     #[must_use]
     pub const fn max_output_tokens(self) -> u32 {
         match self {
             Self::OpenAi => 128_000,
             Self::Zai => 98_304,
+            // The smallest offered Mercury model's documented ceiling. A proxy or an id this
+            // table does not know is never asked for more than every offered model accepts.
+            Self::Inception => 50_000,
         }
     }
 }
@@ -342,7 +370,10 @@ impl OpenAiConfig {
             model: model.into(),
             api_key: api_key.into(),
             base_url: vendor.default_base_url().to_owned(),
-            max_tokens: Some(vendor.max_output_tokens()),
+            // Inception's ceiling is a fact about the model, and an unset budget is resolved per
+            // request so a switch follows it. A gateway or unknown id still falls back to the
+            // vendor's conservative ceiling in `output_ceiling`.
+            max_tokens: (vendor != Vendor::Inception).then_some(vendor.max_output_tokens()),
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
             response_limits: None,
@@ -369,7 +400,8 @@ impl OpenAiConfig {
     /// The configured shape is the endpoint's own, and an endpoint that serves only the Responses
     /// API stays on it. On the other shape, `OpenAI`'s own models from the `gpt-5.6` generation on
     /// are sent to `responses` instead, per request rather than per adapter, so a switch between
-    /// a newer and an older model changes the wire with it. z.ai has no Responses API.
+    /// a newer and an older model changes the wire with it. z.ai and Inception have no Responses
+    /// API.
     #[must_use]
     pub fn protocol_for(&self, model: &str) -> Protocol {
         if let ProtocolPreference::Exact(protocol) = self.protocol_preference {
@@ -402,11 +434,22 @@ impl OpenAiConfig {
     }
 
     /// Resolves the actual wire and rechecks it against the current vendor/endpoint.
+    ///
     /// # Errors
-    /// Refuses an incompatible exact policy, including after an endpoint edit.
+    ///
+    /// Refuses an incompatible exact policy, including after an endpoint edit, and refuses a
+    /// Responses wire for a vendor that serves only chat completions — whether it came from the
+    /// exact preference or from the fallback set by [`Self::set_protocol`].
     pub fn resolve_protocol(&self, model: &str) -> nanus_ports::LlmResult<Protocol> {
         self.check_protocol_preference(self.protocol_preference)?;
-        Ok(self.protocol_for(model))
+        let protocol = self.protocol_for(model);
+        if protocol == Protocol::Responses && matches!(self.vendor, Vendor::Zai | Vendor::Inception)
+        {
+            return Err(nanus_ports::LlmError::Unsupported {
+                feature: format!("{} has no Responses API", self.vendor),
+            });
+        }
+        Ok(protocol)
     }
 
     fn check_protocol_preference(
@@ -414,7 +457,13 @@ impl OpenAiConfig {
         preference: ProtocolPreference,
     ) -> nanus_ports::LlmResult<()> {
         let refused = match preference {
-            ProtocolPreference::Exact(Protocol::Responses) if self.vendor == Vendor::Zai => true,
+            // Neither z.ai nor Inception serves the Responses API, so an exact request for it is
+            // refused rather than sent to an endpoint that would reject the body.
+            ProtocolPreference::Exact(Protocol::Responses)
+                if matches!(self.vendor, Vendor::Zai | Vendor::Inception) =>
+            {
+                true
+            }
             ProtocolPreference::Exact(Protocol::ChatCompletions)
                 if self.base_url.trim_end_matches('/') == OPENAI_SUBSCRIPTION_BASE_URL =>
             {
@@ -590,31 +639,37 @@ impl OpenAiConfig {
 
     /// Returns the documented limits and image support for `model` on this endpoint and wire.
     ///
-    /// Evidence belongs to an exact model on a known endpoint: z.ai's API models, and `OpenAI`'s
-    /// image-profiled models on the Responses endpoints. Chat and proxies inherit nothing.
+    /// Evidence belongs to an exact model on a known endpoint: z.ai's API models, Inception's
+    /// chat models, and `OpenAI`'s image-profiled models on the Responses endpoints. Chat and
+    /// proxies inherit nothing.
     #[must_use]
     pub fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
-        if self.vendor == Vendor::Zai {
-            return crate::zai::capabilities(self, model);
-        }
-        if !self.has_verified_responses_endpoint()
-            || !matches!(self.resolve_protocol(model), Ok(Protocol::Responses))
-        {
-            return nanus_ports::ModelCapabilities::default();
-        }
-        let Some(profile) = nanus_ports::capabilities::ImageProfile::for_openai_model(model) else {
-            return nanus_ports::ModelCapabilities::default();
-        };
-        nanus_ports::ModelCapabilities {
-            image_input: nanus_ports::ImageInputSupport::Supported,
-            image_profile: Some(profile),
-            context_window_tokens: Some(1_050_000),
-            max_input_tokens: Some(if model == "gpt-6-astra" {
-                1_050_000
-            } else {
-                922_000
-            }),
-            max_output_tokens: Some(128_000),
+        match self.vendor {
+            Vendor::Zai => crate::zai::capabilities(self, model),
+            Vendor::Inception => crate::inception::capabilities(self, model),
+            Vendor::OpenAi => {
+                if !self.has_verified_responses_endpoint()
+                    || !matches!(self.resolve_protocol(model), Ok(Protocol::Responses))
+                {
+                    return nanus_ports::ModelCapabilities::default();
+                }
+                let Some(profile) =
+                    nanus_ports::capabilities::ImageProfile::for_openai_model(model)
+                else {
+                    return nanus_ports::ModelCapabilities::default();
+                };
+                nanus_ports::ModelCapabilities {
+                    image_input: nanus_ports::ImageInputSupport::Supported,
+                    image_profile: Some(profile),
+                    context_window_tokens: Some(1_050_000),
+                    max_input_tokens: Some(if model == "gpt-6-astra" {
+                        1_050_000
+                    } else {
+                        922_000
+                    }),
+                    max_output_tokens: Some(128_000),
+                }
+            }
         }
     }
 
@@ -693,10 +748,11 @@ impl OpenAiConfig {
 
 /// The spelling of a neutral effort on the wire.
 ///
-/// Both vendors name reasoning depth with the same seven words — `none`, `minimal`, `low`,
+/// `OpenAI` and z.ai name reasoning depth with the same seven words — `none`, `minimal`, `low`,
 /// `medium`, `high`, `xhigh`, `max` — so the neutral step travels as written. They differ in how
 /// they express *thinking off*: `OpenAI` just sends `none`, while z.ai needs the thinking switch on
-/// as well, which [`crate::wire`] writes for it.
+/// as well, which [`crate::wire`] writes for it. Inception names its own four-step scale instead,
+/// so it has [`crate::inception::effort_spelling`] rather than this one.
 #[must_use]
 pub const fn effort_spelling(effort: ReasoningEffort) -> &'static str {
     effort.as_str()
@@ -784,9 +840,11 @@ mod tests {
         // z.ai is written with a dot in prose; both spellings resolve so a
         // configuration copied from the vendor's own documentation works.
         assert_eq!(Vendor::parse("z.ai"), Some(Vendor::Zai));
+        assert_eq!(Vendor::parse("inception"), Some(Vendor::Inception));
         assert_eq!(Vendor::parse("deepseek"), None);
         assert_eq!(Vendor::OpenAi.as_str(), "openai");
         assert_eq!(Vendor::Zai.to_string(), "zai");
+        assert_eq!(Vendor::Inception.to_string(), "inception");
     }
 
     /// Each vendor's endpoint and credential are its own, so a configuration cannot
@@ -797,9 +855,12 @@ mod tests {
         assert_eq!(Vendor::OpenAi.env_var(), "OPENAI_API_KEY");
         assert_eq!(Vendor::Zai.default_base_url(), ZAI_BASE_URL);
         assert_eq!(Vendor::Zai.env_var(), "ZAI_API_KEY");
+        assert_eq!(Vendor::Inception.default_base_url(), INCEPTION_BASE_URL);
+        assert_eq!(Vendor::Inception.env_var(), "INCEPTION_API_KEY");
         // The coding plan is a host, not a different provider.
         assert_eq!(ZAI_CODING_BASE_URL, "https://api.z.ai/api/coding/paas/v4");
         assert_ne!(ZAI_BASE_URL, ZAI_CODING_BASE_URL);
+        assert_eq!(INCEPTION_BASE_URL, "https://api.inceptionlabs.ai/v1");
     }
 
     /// The Responses API is the first wire from the `gpt-5.6` generation on, read from the id's
@@ -837,7 +898,7 @@ mod tests {
     }
 
     /// The wire is chosen per request: a newer `OpenAI` model is sent to `responses`, an older one
-    /// stays on the endpoint's own shape, and z.ai never leaves chat completions.
+    /// stays on the endpoint's own shape, and z.ai and Inception never leave chat completions.
     #[test]
     fn the_wire_follows_the_model_on_the_api_plan() {
         let openai = OpenAiConfig::new(Vendor::OpenAi, "gpt-5", "key");
@@ -845,9 +906,38 @@ mod tests {
         assert_eq!(openai.protocol_for("gpt-5"), Protocol::ChatCompletions);
         let zai = OpenAiConfig::new(Vendor::Zai, "glm-5.3", "key");
         assert_eq!(zai.protocol_for("gpt-6.1-sol"), Protocol::ChatCompletions);
+        let inception = OpenAiConfig::new(Vendor::Inception, "mercury-3", "key");
+        assert_eq!(
+            inception.protocol_for("mercury-3"),
+            Protocol::ChatCompletions
+        );
+        assert_eq!(
+            inception.protocol_for("gpt-6.1-sol"),
+            Protocol::ChatCompletions
+        );
         let mut subscription = OpenAiConfig::new(Vendor::OpenAi, "gpt-5.3-codex", "token");
         subscription.set_protocol(Protocol::Responses);
         assert_eq!(subscription.protocol_for("gpt-5"), Protocol::Responses);
+    }
+
+    /// A vendor that serves only chat completions refuses a Responses *fallback* too, not just
+    /// an exact preference: `set_protocol` is public, and a library host can call it directly.
+    #[test]
+    fn a_chat_only_vendor_refuses_a_responses_fallback() {
+        for (vendor, model) in [(Vendor::Zai, "glm-5.3"), (Vendor::Inception, "mercury-3")] {
+            let mut config = OpenAiConfig::new(vendor, model, "key");
+            config.set_protocol(Protocol::Responses);
+            // The fallback is still what the unvalidated accessor reports; `resolve_protocol` is
+            // the checkpoint every dispatch and capability query goes through.
+            assert_eq!(config.protocol_for(model), Protocol::Responses);
+            assert!(config.resolve_protocol(model).is_err(), "{vendor}");
+        }
+        let mut subscription = OpenAiConfig::new(Vendor::OpenAi, "gpt-5.3-codex", "token");
+        subscription.set_protocol(Protocol::Responses);
+        assert!(matches!(
+            subscription.resolve_protocol("gpt-5.3-codex"),
+            Ok(Protocol::Responses)
+        ));
     }
 
     /// The offered models are the vendor's own, and none of them is another
@@ -869,8 +959,23 @@ mod tests {
             Vendor::Zai.models(),
             ["glm-5.3-flashx", "glm-5.3-flash", "glm-5.3", "glm-5.2"]
         );
+        // Only chat models are offered; the editor, voice and decision models serve other
+        // endpoints or arrangements and would be refused if a client selected them here.
+        assert_eq!(
+            Vendor::Inception.models(),
+            ["mercury-3", "mercury-2.5", "mercury-2"]
+        );
         for model in Vendor::OpenAi.models() {
             assert!(!model.contains("glm"), "{model}");
+            assert!(!model.starts_with("mercury"), "{model}");
+        }
+        for model in Vendor::Inception.models() {
+            assert!(model.starts_with("mercury-"), "{model}");
+            assert_ne!(*model, "mercury-edit-2", "an editor is not a chat model");
+            assert_ne!(
+                *model, "mercury-decide",
+                "a decision model is not a chat model"
+            );
         }
         // The default is the first, and it stays the general model rather than the
         // coding one: the coding model is reachable by the plan that names it, and by
@@ -942,16 +1047,38 @@ mod tests {
         let mut openai = OpenAiConfig::new(Vendor::OpenAi, "gpt-6-astra", "key");
         openai.use_model_output_ceiling();
         assert_eq!(openai.effective_max_tokens(), 128_000);
+
+        // Inception's exact models report their own ceilings; an unset budget follows the model
+        // a request names, and the vendor fallback is the smallest offered model's ceiling, so a
+        // proxy or an unknown id is never asked for more than every model accepts.
+        let mut inception = OpenAiConfig::new(Vendor::Inception, "mercury-2", "key");
+        assert_eq!(inception.max_tokens(), 50_000);
+        assert_eq!(inception.effective_max_tokens(), 50_000);
+        inception.use_model_output_ceiling();
+        assert_eq!(inception.max_tokens(), 50_000);
+        assert_eq!(inception.effective_max_tokens_for("mercury-3"), 131_072);
+        assert_eq!(inception.effective_max_tokens_for("mercury-2.5"), 65_536);
+        let gateway =
+            OpenAiConfig::with_base_url(Vendor::Inception, "mercury-3", "key", "http://x");
+        assert_eq!(gateway.effective_max_tokens(), 50_000);
+        assert_eq!(
+            gateway.capabilities("mercury-3"),
+            nanus_ports::ModelCapabilities::default()
+        );
     }
 
-    /// Each vendor's ceiling field is its own, and neither accepts the other's.
+    /// Each vendor's ceiling field is its own, and none accepts another's.
     #[test]
     fn each_vendor_names_its_output_ceiling_its_own_way() {
         assert_eq!(Vendor::OpenAi.output_token_field(), "max_completion_tokens");
         assert_eq!(Vendor::Zai.output_token_field(), "max_tokens");
+        assert_eq!(
+            Vendor::Inception.output_token_field(),
+            "max_completion_tokens"
+        );
     }
 
-    /// Every neutral step travels as its own name, for both vendors.
+    /// Every neutral step travels as its own name for the vendors that share the scale.
     #[test]
     fn every_effort_travels_as_its_own_name() {
         for effort in [
@@ -1016,6 +1143,20 @@ mod tests {
                 .effort_levels("glm-5.2")
                 .contains(&ReasoningEffort::None)
         );
+
+        // Inception's own scale has four steps, `instant` included; the three the neutral
+        // scale can name are the ones offered, for every chat model.
+        for model in Vendor::Inception.models() {
+            assert_eq!(
+                Vendor::Inception.effort_levels(model),
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ][..],
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -1047,10 +1188,10 @@ mod tests {
     }
 
     /// The `Debug` rendering reaches logs, so the key must not be recoverable from
-    /// it — for either vendor.
+    /// it — for any vendor.
     #[test]
     fn debug_never_renders_the_api_key() {
-        for vendor in [Vendor::OpenAi, Vendor::Zai] {
+        for vendor in [Vendor::OpenAi, Vendor::Zai, Vendor::Inception] {
             let config = OpenAiConfig::new(vendor, "some-model", "sk-super-secret-value");
             let rendered = format!("{config:?}");
             assert!(!rendered.contains("sk-super-secret-value"), "{rendered}");

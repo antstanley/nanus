@@ -42,7 +42,8 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   [what is and is not verified](context-management.md#what-is-and-is-not-verified).
 
 - **`read_video` is verified on Anthropic, OpenAI and DeepSeek.** z.ai has no model with live image
-  evidence and no stored credential, so there `analyze` and `auto` report that instead of guessing.
+  evidence and no stored credential, and Inception's Mercury chat models are text-only, so on
+  either `analyze` and `auto` report that instead of guessing.
   DeepSeek's image price is undocumented, so its profile reserves about twice what was measured. FFmpeg decoding was
   exercised on macOS with FFmpeg 9.0.2 only. A dropped call kills its decoder (tested on Unix with a
   stand-in process), but the Linux and Windows decoder paths, and Windows process teardown, are
@@ -106,9 +107,10 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   Concurrency is not parallelism, and there is no worker pool. A step's tool calls do run
   together — cooperatively, capped by `max_parallel_tools`, and interleaved at their await
   points — but a call that blocks the thread blocks all of them.
-- **Four providers, every plan they ship usable.** `deepseek`, `zai` (its API and a coding plan
-  with a key of its own), `anthropic`, and `openai` (its API and a `ChatGPT` subscription
-  authorized over OAuth, which speaks the Responses API through an encoder of its own) all run;
+- **Five providers, every plan they ship usable.** `deepseek`, `zai` (its API and a coding plan
+  with a key of its own), `anthropic`, `openai` (its API and a `ChatGPT` subscription
+  authorized over OAuth, which speaks the Responses API through an encoder of its own) and
+  `inception` (Mercury's OpenAI-compatible chat models, text-only) all run;
   on the API plan, `gpt-5.6` and later models are sent to the Responses API too, chosen per request.
   The subscription backend refuses an output ceiling, so none is sent there, and its plan starts on
   `gpt-6.1-sol` at `high`. Opus/Sonnet 5.5 and Fable 5.1 request adaptive thinking; Opus/Sonnet 5.5
@@ -141,8 +143,9 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   source/worker/payment authority or consumer budget implementation. Downstream adoption,
   credential-aware stock tests and native Windows execution remain separate.
 - **Vision is promoted for nine exact models.** Opus 5.5, Sonnet 5.5, GPT-6 Astra, GPT-6.1 Sol,
-  GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed live image and call-reference follow-ups; other models refuse image HTTP
-  (DeepSeek V4 Pro is explicitly Unsupported; the rest stay Unknown). `deepseek-flash` is the ninth.
+  GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed live image and call-reference follow-ups; other
+  models refuse image HTTP (DeepSeek V4 Pro and Inception's known chat models are explicitly
+  Unsupported; the rest stay Unknown). `deepseek-flash` is the ninth.
   [Evidence and limits](vision-evidence.md).
 - **Only the macOS keychain ships as a platform secret store.** `SecretPort` and the
   `SecretBackend` trait are the seam, and a `0600` file and the environment are the

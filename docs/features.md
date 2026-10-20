@@ -125,8 +125,9 @@ source timestamp. `mode` is `auto` (the default), `frames`, or `analyze`:
 - **`auto`** is `frames` when the conversation model has verified image input and `analyze` otherwise.
 
 The analysis models are `claude-sonnet-5-5` (Anthropic), `gpt-6-luna` (OpenAI API and
-subscription) and `deepseek-flash` (DeepSeek). z.ai has no model with live image evidence, so on it
-`analyze` reports that rather than guessing, and `auto` reaches it for the same reason.
+subscription) and `deepseek-flash` (DeepSeek). z.ai has no model with live image evidence, and
+Inception's Mercury chat models are text-only, so on either `analyze` reports that rather than
+guessing, and `auto` reaches it for the same reason.
 
 Every result begins with a JSON manifest: the source digest, container, codec, interval, each
 frame's timestamp, size and digest, the sampler and decoder versions, warnings, and for an analysis
@@ -256,7 +257,7 @@ why the goal tools are five and not fifteen.
 
 ## Model providers
 
-Four providers, selected with `provider` in the configuration. Each is an adapter
+Five providers, selected with `provider` in the configuration. Each is an adapter
 that implements `LlmPort`, and nothing in the tools, the domain, or the loop knows
 which one is in use.
 
@@ -266,6 +267,7 @@ which one is in use.
 | `zai`                | `nanus-adapter-openai`    | `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2`                                                                     | `api`, `coding`        |
 | `anthropic`          | `nanus-adapter-anthropic` | `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-5`, `claude-opus-5` | `api`                  |
 | `openai`             | `nanus-adapter-openai`    | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`                                  | `api`, `subscription`¹ |
+| `inception`          | `nanus-adapter-openai`    | `mercury-3`, `mercury-2.5`, `mercury-2`                                                                                     | `api`                  |
 
 ¹ The OpenAI `subscription` plan is a ChatGPT account **authorized with OAuth** rather than a typed
 key: choosing it runs the device flow, files the token set under `openai:subscription`, and reaches
@@ -278,6 +280,20 @@ conversation holding images stays on chat completions, because the Responses enc
 items yet. The plan starts on `gpt-6.1-sol` at `high` effort; a `reasoning_effort` in the configuration, or a
 remembered selection, wins over that default.
 
+The Inception `api` plan is Mercury's OpenAI-compatible chat-completions endpoint at
+`https://api.inceptionlabs.ai/v1`, with the key in `INCEPTION_API_KEY` and `mercury-3` as the
+default model. The three offered chat models are text-only, so image input is recorded as
+unsupported rather than unknown, and their documented limits are exact: `mercury-3` 1,000,000
+context / 131,072 output, `mercury-2.5` 260,000 / 65,536, and `mercury-2` 128,000 / 50,000.
+Requests name `max_completion_tokens`, and the provider's four-step reasoning scale — `instant`,
+`low`, `medium`, `high` — is mapped onto the neutral one: `minimal` travels as `instant`,
+`low`/`medium` as themselves, and `high` and above clamp to `high`. `none` is refused for an exact
+model rather than mapped to `instant`, because Inception has no way to switch reasoning off and
+`instant` still reasons; the interface does not offer a step the adapter would refuse. A gateway
+or an unknown id has no exact model evidence, so it falls back to the smallest offered model's
+50,000-token output ceiling rather than inheriting a larger one. The voice, editor and decision
+models serve other endpoints or arrangements and are not offered as chat models.
+
 - **A plan is an endpoint, a default model, a wire, and a credential.** z.ai's `coding` plan is
   the same protocol and a key of its own at a different host; OpenAI's `subscription` plan is a
   `ChatGPT` account, authorized in a browser, that serves the Responses API rather than chat
@@ -288,13 +304,15 @@ remembered selection, wins over that default.
   spelling of the API plan. z.ai's `coding` plan is unaffected: it is a different host and a
   different key.
 - **Streaming responses** over SSE, with reasoning content and tool calls
-  reassembled from their frames. DeepSeek and z.ai send `data:`-framed chunks ending
+  reassembled from their frames. DeepSeek, z.ai and Inception send `data:`-framed chunks ending
   in `[DONE]`; Anthropic sends event-typed frames ending in `message_stop`.
 - **Exact wire selection for library hosts.** `OpenAiConfig::set_protocol_preference` accepts
   `Automatic` (the stock default) or `Exact(ChatCompletions | Responses)`. Exact selection overrides
-  model routing and the fallback set by `set_protocol`; an incompatible z.ai/subscription wire is
-  refused without changing the preference. Endpoint edits are rechecked before construction and
-  dispatch. Capability/image evidence is specific to the selected Responses wire and its exact
+  model routing and the fallback set by `set_protocol`; an incompatible z.ai, Inception or
+  subscription wire is refused without changing the preference. `resolve_protocol` also refuses a
+  Responses *fallback* for z.ai or Inception, so a host cannot bypass the exact-preference check by
+  calling `set_protocol` directly. Endpoint edits are rechecked before
+  construction and dispatch. Capability/image evidence is specific to the selected Responses wire and its exact
   known API/subscription endpoints; Chat, custom gateways and unprofiled models remain Unknown.
   Exact Responses output controls follow the actual endpoint. A requested explicit ceiling is
   refused when that endpoint cannot honor it. Automatic retains legacy plan handling and routing;
@@ -352,7 +370,9 @@ remembered selection, wins over that default.
   Flash/Pro and Anthropic Opus/Sonnet 5.5/Fable 5.1 ordinary tools have local entries. Six exact
   OpenAI models have Responses entries; Astra/Sol Chat refuses tools, Luna Chat requires effective
   None, and other Chat/subscription/custom combinations remain Unknown. Known z.ai API entries
-  are scoped separately below; Coding Plan has no inherited API evidence. Images and token
+  are scoped separately below; Coding Plan has no inherited API evidence. Inception's three
+  offered chat models are Supported on the documented endpoint and Chat wire, at every neutral
+  effort, and Unknown elsewhere. Images and token
   metadata remain independent. OpenAI/Anthropic known Unsupported tool definitions or call/result
   replay refuse before HTTP even when the current tool list is empty; unknown stock behavior and
   valid text-only mapping remain. Strict hosts must query/delegate and require Supported themselves.
@@ -368,7 +388,16 @@ remembered selection, wins over that default.
   unknown ids retain stock defaults/behavior and Unknown metadata. Text-only GLM-5.3/5.2 image
   input is Unsupported; Flash/FlashX images remain Unknown with no image profile or promotion.
   [Contract, fixtures and limits](../.specs/changes/2026-10-03-zai_api_admission.review.md).
-- **Tool calling** for all four, including DeepSeek's reasoning passback and its
+- **Exact Inception API admission.** Official Chat requests for `mercury-3`, `mercury-2.5` and
+  `mercury-2` have local text-only limits and ordinary function-tool metadata. The service's own
+  model list supplies the exact context and output values (1,000,000 / 131,072, 260,000 / 65,536,
+  128,000 / 50,000); an output above the named model's ceiling refuses before HTTP, and a known
+  request is measured even without a caller context budget. The four documented reasoning steps
+  are mapped from the neutral scale (`instant` for `minimal`, `high` for `high` and above);
+  `none` is refused because the provider has no off switch. The temperature range 0.5–1.0 is
+  enforced. Gateways, unknown ids, the voice model and the editor/decision endpoints inherit
+  nothing, and a gateway is capped at the smallest offered model's 50,000-token output ceiling.
+- **Tool calling** for all five, including DeepSeek's reasoning passback and its
   empty assistant turn sent as `content: ""`, and Anthropic's `tool_use` /
   `tool_result` content blocks.
 - **Usage accounting** — prompt, cached, and generated tokens, including how much of
@@ -379,8 +408,9 @@ remembered selection, wins over that default.
   and `reasoning_effort` (`minimal` / `low` / `medium` / `high`; when the file names none, the
   plan's own default applies — `high` for OpenAI's `subscription` plan, `max` for known z.ai API
   models on their verified endpoint — and then `medium`).
-  The configured step reaches DeepSeek, z.ai (as a thinking mode) and OpenAI (as its own
-  scale). Anthropic is different: the file's `reasoning_effort` is **not** applied to it, and a
+  The configured step reaches DeepSeek, z.ai (as a thinking mode), OpenAI (as its own
+  scale) and Inception (mapped onto its four documented steps). Anthropic is different: the file's
+  `reasoning_effort` is **not** applied to it, and a
   step the reader _chooses_ — in the interface, or remembered from a switch — is sent as
   `output_config.effort` (`low` through `max`) to the 5-series models (Sonnet 5.5, Opus 5.5, Fable 5.1,
   and the earlier Sonnet 5 and Opus 5). Haiku 4.5 takes no effort at all, so none is sent and none is
@@ -397,7 +427,8 @@ remembered selection, wins over that default.
 - **`nanus config` reports the resolution**, so which provider, plan, model, and
   endpoint a run will use is answerable without running it.
 - **The provider seam is the boundary.** `LlmPort` is the port, `nanus-bundle`
-  owns the table of providers, and adding one is an adapter crate plus a row —
+  owns the table of providers, and adding one is an adapter — or a vendor entry in
+  `nanus-adapter-openai` when the provider speaks chat completions — plus a row;
   nothing in the tools or the domain changes.
 
 ### What the next start begins from
@@ -501,7 +532,7 @@ this build offers.
 
 | Field                   | Default                           | Values                                                                                                                    |
 | ----------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `provider`              | `deepseek`                        | `deepseek`, `zai`, `anthropic`, `openai`                                                                                  |
+| `provider`              | `deepseek`                        | `deepseek`, `zai`, `anthropic`, `openai`, `inception`                                                                     |
 | `plan`                  | the provider's default            | `api`, `coding` (z.ai), `subscription` (OpenAI, authorized with OAuth)                                                    |
 | `base_url`              | the plan's endpoint               | an override, for a proxy or a gateway                                                                                     |
 | `model`                 | the plan's or provider's default  | any id the provider serves                                                                                                |
@@ -536,6 +567,7 @@ Environment variables:
 | `ANTHROPIC_API_KEY`                | Anthropic credential.                                                                                   |
 | `OPENAI_API_KEY`                   | OpenAI credential, for the `api` plan. The `subscription` plan is authorized,                           |
 | not keyed: see `nanus auth login`. |
+| `INCEPTION_API_KEY`                | Inception Labs credential, for the `api` plan.                                                          |
 | `NANUS_CONFIG`                     | Override the configuration file path.                                                                   |
 | `NANUS_HOME`                       | Override the session-store home (and the default socket and log paths).                                 |
 | `NANUS_TUI`                        | Override the path to the interface binary.                                                              |
@@ -769,9 +801,9 @@ Opt in per session with `nanus run --context-mode managed` (and optionally
 `/context`. Every user message stays in every request; completed old tool work is hidden to fit
 the budget — automatically, or by the model through `context_manage` — and stays recallable
 through `context_recall`, including shell output past the preview when capture is on. Every step
-is checkpointed before its request is sent. Supported on DeepSeek, OpenAI and z.ai Chat
-Completions and Anthropic Messages at their official endpoints; Responses paths refuse. Legacy
-sessions are unchanged. See [managed context](context-management.md).
+is checkpointed before its request is sent. Supported on DeepSeek, OpenAI, z.ai and Inception
+Chat Completions and Anthropic Messages at their official endpoints; Responses paths refuse.
+Legacy sessions are unchanged. See [managed context](context-management.md).
 
 ## Not supported yet
 
@@ -781,8 +813,9 @@ The honest list lives in [status](status.md#known-limits); the headline items:
   over the Responses API GPT-6 Astra, GPT-6.1 Sol, GPT-6 Luna and GPT-5.6 Sol, Terra and Luna passed
   live follow-ups; see [vision evidence](vision-evidence.md). The same six OpenAI models are Supported on the `ChatGPT`
   subscription backend, which was run separately. `deepseek-flash` is Supported on its own endpoint
-  with a measured profile. Other models and z.ai stay Unknown and refuse images; DeepSeek V4 Pro is
-  explicitly Unsupported.
+  with a measured profile. Other models and z.ai stay Unknown and refuse images; Inception's known
+  chat models are explicitly Unsupported as text-only, and DeepSeek V4 Pro is explicitly
+  Unsupported.
 - **Only the macOS keychain ships as a platform store.** The port and the backend
   trait are in place, so another is an implementation plus a line in the chain.
 - **The link is local.** Unix sockets and Windows SID-named pipes share the same frames.

@@ -871,7 +871,9 @@ The steps each model takes travel with the handshake, beside the models, because
 what knows them: OpenAI's `gpt-5.6` family and `gpt-6-luna` take `none` through `max`, `gpt-6-astra` and `gpt-6.1-sol`
 start at `low`, and an id the table does not know takes the previous generation's `minimal` through `high`, Anthropic's 5-series takes `low` through `max`
 while Haiku 4.5 and the previous generation take no effort parameter at all, and z.ai's GLM-5.3
-models cannot turn thinking off, so `none` is not offered for them.
+models cannot turn thinking off, so `none` is not offered for them. Inception's own scale has
+`instant`, `low`, `medium` and `high`; the three steps the neutral scale shares are offered, and
+`minimal` reaches `instant` through the adapter's own spelling.
 
 Like the model, the effort belongs to the agent's runner and reaches every watcher, and it takes
 effect on the next request rather than the next turn. **A model change reconciles it**: the agent

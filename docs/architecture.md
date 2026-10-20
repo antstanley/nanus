@@ -56,7 +56,7 @@ is the only vocabulary the two share.
 | [`nanus-domain`](../crates/nanus-domain) | Messages, the tool contract, the append-only session log, prompt assembly, approval policy, the turn machine. Pure. |
 | [`nanus-ports`](../crates/nanus-ports) | The boundary owns model, filesystem, shell, store, clock and secret services, optional admission contracts, and session-scoped context, checkpoint and archive interfaces. Pure borrowed projections and owned leases let a provider and consumer agree without introducing concrete I/O into the domain. |
 | [`nanus-adapter-deepseek`](../crates/nanus-adapter-deepseek) | Request encoding, SSE decoding, streaming, tool-call reassembly. |
-| [`nanus-adapter-openai`](../crates/nanus-adapter-openai) | The same protocol for the OpenAI-compatible vendors: OpenAI and z.ai, kept one crate because the differences are a table rather than a branch per line. |
+| [`nanus-adapter-openai`](../crates/nanus-adapter-openai) | The same protocol for the OpenAI-compatible vendors: OpenAI, z.ai and Inception Labs, kept one crate because the differences are a table rather than a branch per line. |
 | [`nanus-adapter-anthropic`](../crates/nanus-adapter-anthropic) | The Messages API, which is not chat completions: a top-level system field, tool results as user turns, event-typed streaming. |
 | [`nanus-adapter-secret`](../crates/nanus-adapter-secret) | Where a credential is kept: a chain of stores — the macOS keychain, a `0600` file, the environment — behind one port, with the store itself pluggable. |
 | [`nanus-adapter-local`](../crates/nanus-adapter-local) | Rooted filesystem, process-group shell, clamping clock. |

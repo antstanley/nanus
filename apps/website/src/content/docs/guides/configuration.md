@@ -35,7 +35,7 @@ is refused at startup with a sentence naming the ones the build offers.
 
 | Field | Default | Values |
 | --- | --- | --- |
-| `provider` | `deepseek` | `deepseek`, `zai`, `anthropic`, `openai` |
+| `provider` | `deepseek` | `deepseek`, `zai`, `anthropic`, `openai`, `inception` |
 | `plan` | the provider's default | `api`, `coding` (z.ai), `subscription` (OpenAI, authorized with OAuth) |
 | `base_url` | the plan's endpoint | an override, for a proxy or a gateway |
 | `model` | the plan's or provider's default | any id the provider serves |
@@ -59,7 +59,8 @@ is refused at startup with a sentence naming the ones the build offers.
 
 `max_tokens` is a per-response budget, capped at the provider's documented ceiling because a
 request above it is refused rather than truncated. `reasoning_effort` reaches DeepSeek, z.ai
-(as a thinking mode), and OpenAI (as its own four-step scale). It is **not** sent to
+(as a thinking mode), OpenAI, and Inception (mapped onto its four documented steps). It is
+**not** sent to
 Anthropic, which has no place in the message model for the signed thinking blocks a
 tool-using turn would need to replay; the omission is reported where it is configured rather
 than silently ignored.
@@ -84,6 +85,7 @@ provider that would reject it.
 | `ANTHROPIC_API_KEY` | Anthropic credential. |
 | `OPENAI_API_KEY` | OpenAI credential, for the `api` plan. The `subscription` plan is authorized,
   not keyed: see `nanus auth login`. |
+| `INCEPTION_API_KEY` | Inception Labs credential, for the `api` plan. |
 | `NO_COLOR` | Render with no colour at all, keeping bold and italic. |
 | `RUST_LOG` | Tracing filter for the service and core logs. |
 

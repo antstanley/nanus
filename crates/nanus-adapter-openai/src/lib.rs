@@ -1,21 +1,21 @@
 //! # nanus-adapter-openai
 //!
-//! The `OpenAI`-compatible model adapter: `OpenAI`'s own API and z.ai's GLM API over
-//! the `chat/completions` protocol.
+//! The `OpenAI`-compatible model adapter: `OpenAI`'s own API, z.ai's GLM API, and Inception
+//! Labs' Mercury API over the `chat/completions` protocol.
 //!
-//! ## Why one crate serves two providers
+//! ## Why one crate serves three providers
 //!
-//! `OpenAI`'s chat-completions protocol is a de facto standard, and z.ai implements
-//! it: the request body, the tool-call envelope, the server-sent-events framing, and
-//! the usage object are the same shape for both. What differs is a handful of
-//! documented facts — the host, the credential variable, the model ids, the output
-//! ceiling, and how reasoning is requested — and those are collected in
-//! [`Vendor`] rather than being spread through the code as `if provider == ...`.
-//! A third compatible provider is one more entry in that enum.
+//! `OpenAI`'s chat-completions protocol is a de facto standard, and z.ai and Inception
+//! implement it: the request body, the tool-call envelope, the server-sent-events framing, and
+//! the usage object are the same shape for all three. What differs is a handful of documented
+//! facts — the host, the credential variable, the model ids, the output ceiling, and how
+//! reasoning is requested — and those are collected in [`Vendor`] rather than being spread
+//! through the code as `if provider == ...`. A fourth compatible provider is one more entry in
+//! that enum.
 //!
 //! `DeepSeek` has its own adapter despite also being compatible, because its
 //! requirements are its own: it needs an earlier turn's `reasoning_content` replayed
-//! and it expresses "do not think" as a mode beside the effort. Folding three
+//! and it expresses "do not think" as a mode beside the effort. Folding four
 //! vendors' exceptions into one encoder would make the exceptions harder to see
 //! than they are here, where each one is a line in a table.
 //!
@@ -44,6 +44,9 @@
 mod config;
 mod error;
 mod function_policy;
+mod inception;
+#[cfg(test)]
+mod inception_tests;
 mod managed;
 #[cfg(test)]
 mod managed_tests;
@@ -62,9 +65,10 @@ mod zai;
 mod zai_tests;
 
 pub use config::{
-    OPENAI_API_KEY_ENV, OPENAI_BASE_URL, OPENAI_SUBSCRIPTION_BASE_URL, OpenAiConfig, Protocol,
-    ProtocolPreference, Vendor, ZAI_API_KEY_ENV, ZAI_BASE_URL, ZAI_CODING_BASE_URL,
-    effort_spelling, openai_effort_levels, zai_effort_levels,
+    INCEPTION_API_KEY_ENV, INCEPTION_BASE_URL, OPENAI_API_KEY_ENV, OPENAI_BASE_URL,
+    OPENAI_SUBSCRIPTION_BASE_URL, OpenAiConfig, Protocol, ProtocolPreference, Vendor,
+    ZAI_API_KEY_ENV, ZAI_BASE_URL, ZAI_CODING_BASE_URL, effort_spelling, openai_effort_levels,
+    zai_effort_levels,
 };
 pub use error::OpenAiError;
 pub use nanus_ports::ReasoningEffort;
@@ -344,7 +348,9 @@ impl OpenAiLlm {
             self.tool_call_support(&request.model, request.reasoning_effort),
             request,
         )?;
-        if zai::requires_preflight(&self.config, request) {
+        if zai::requires_preflight(&self.config, request)
+            || inception::requires_preflight(&self.config, request)
+        {
             let checked = self.estimate_request(request).and_then(|estimate| {
                 nanus_ports::capabilities::validate_estimate(
                     self.capabilities(&request.model),
@@ -492,6 +498,7 @@ impl LlmPort for OpenAiLlm {
         }
         self.checked_protocol(request)?;
         zai::validate(&self.config, request)?;
+        inception::validate(&self.config, request)?;
         let capabilities = self.capabilities(&request.model);
         nanus_ports::capabilities::validate_image_input(capabilities, request)?;
         nanus_ports::tool_support::validate_input(

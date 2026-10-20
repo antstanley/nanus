@@ -67,7 +67,7 @@ does not link the interface, and `nanus-tui` does not link the agent loop. See
 | `crates/nanus-domain` | Messages, the tool contract, the append-only session log, prompt assembly, approval policy, the turn machine. Pure. |
 | `crates/nanus-ports` | The boundary: port traits (`LlmPort`, `FsPort`, `ShellPort`, `StorePort`, `ClockPort`) and the service keys that let provider and consumer meet without sharing a value. No I/O. |
 | `crates/nanus-adapter-deepseek` | Request encoding, SSE decoding, streaming, tool-call reassembly. |
-| `crates/nanus-adapter-openai` | OpenAI-compatible transport for OpenAI and z.ai, with vendor tables and exact endpoint/model admission modules; API evidence does not qualify Coding Plan or gateways. |
+| `crates/nanus-adapter-openai` | OpenAI-compatible transport for OpenAI, z.ai and Inception Labs, with vendor tables and exact endpoint/model admission modules; API evidence does not qualify Coding Plan or gateways. |
 | `crates/nanus-adapter-anthropic` | The Messages API: a top-level system field, tool results as user turns, event-typed streaming. |
 | `crates/nanus-adapter-secret` | The credential stores: a chain of `SecretBackend`s — the macOS keychain, a `0600` file, the environment — behind `SecretPort`. |
 | `crates/nanus-adapter-local` | Rooted filesystem, process-group shell, clamping clock. |
@@ -197,7 +197,8 @@ Contract to preserve:
   become a bulleted list. The renderer does no I/O — an image is a placeholder and a URL is
   never fetched — and `docs/tui.md` is the whole of it.
 - `<PROVIDER>_API_KEY` (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `OPENAI_API_KEY`) — provider credentials, and the *last* store in the chain. A key
+  `OPENAI_API_KEY`, `INCEPTION_API_KEY`) — provider credentials, and the *last* store in
+  the chain. A key
   is normally stored with `nanus auth set <provider>` (the macOS keychain, then a
   `0600` file under `<nanus home>/secrets/`). It is **never** stored in
   `NanusConfig`, serialised, or rendered by `Debug`.
@@ -434,11 +435,13 @@ array type, the `assert_eq!(registry.len(), 7, ...)` postcondition, and the
 name-list test — and you should seriously consider whether the tool meets the bar
 in `docs/design.md` (a mechanism the shell cannot do as well, not a convenience).
 
-**Add a model provider.** Implement `nanus_ports::LlmPort` in a new adapter crate,
-add a row to the table in `nanus-bundle/src/provider.rs` (name, credential variable,
-plans, models, output ceiling, whether the effort knob reaches it), and add the arm
-that builds it in `compose::build_llm`. The configuration schema does not change:
-`provider`, `plan`, `base_url`, and `model` are already optional strings, and
+**Add a model provider.** Implement `nanus_ports::LlmPort` in a new adapter crate. If
+the provider speaks OpenAI's chat-completions shape, add a `Vendor` entry to
+`nanus-adapter-openai` and an exact-evidence module beside `zai.rs` instead of a crate of
+its own. Either way, add a row to the table in `nanus-bundle/src/provider.rs` (name,
+credential variable, plans, models, output ceiling, whether the effort knob reaches it),
+and add the arm that builds it in `compose::build_llm`. The configuration schema does not
+change: `provider`, `plan`, `base_url`, and `model` are already optional strings, and
 `Selection` is what resolves them. Nothing under `nanus-domain` or the tools should
 change — if it does, the seam is being crossed.
 

@@ -57,12 +57,12 @@ goes away with it.
 That gives you three things that are hard to get any other way:
 
 **Replace the model without touching the tools.** The adapter is a plugin behind an
-`LlmPort`. Four providers ship — DeepSeek, z.ai (its API and a coding plan with a key
-of its own), Anthropic, and OpenAI (its API and a `ChatGPT` subscription authorized
-over OAuth) — and they are *selected*, not compiled in: one line in the
-configuration, and the tools never learn about it. Switch provider, model, or
-reasoning effort while the interface is open and that becomes the default the next start
-begins from — see
+`LlmPort`. Five providers ship — DeepSeek, z.ai (its API and a coding plan with a key
+of its own), Anthropic, OpenAI (its API and a `ChatGPT` subscription authorized
+over OAuth), and Inception Labs (its Mercury chat models) — and they are *selected*,
+not compiled in: one line in the configuration, and the tools never learn about it.
+Switch provider, model, or reasoning effort while the interface is open and that becomes
+the default the next start begins from — see
 [what the next start begins from](docs/features.md#what-the-next-start-begins-from).
 
 **Replace the tools without touching the model.** Each tool is a plugin behind a
@@ -190,6 +190,7 @@ credential stores: keychain+file+environment
   zai: not set  (fallback ZAI_API_KEY)
   anthropic: not set  (fallback ANTHROPIC_API_KEY)
   openai: not set  (fallback OPENAI_API_KEY)
+  inception: not set  (fallback INCEPTION_API_KEY)
 
 $ nanus sessions
 01a09558-9f82-720e-960b-8a587e072667  25 events  /Volumes/.../nanus  Use the glob tool to list the top-level Rust files…

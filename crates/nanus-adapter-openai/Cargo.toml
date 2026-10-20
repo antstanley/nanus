@@ -1,6 +1,6 @@
 [package]
 name = "nanus-adapter-openai"
-description = "The OpenAI-compatible model adapter: chat completions with streaming and tool calling, for OpenAI and z.ai."
+description = "The OpenAI-compatible model adapter: chat completions with streaming and tool calling, for OpenAI, z.ai and Inception Labs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

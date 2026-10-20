@@ -13,7 +13,8 @@
 //! - `OpenAI`'s API endpoint, for a model that resolves to chat completions there — automatic
 //!   routing for an id before the `gpt-5.6` generation, or an exact chat preference — and whose
 //!   function tools are not known to be refused at the configured effort;
-//! - z.ai's API endpoint, for the exact models with recorded API evidence.
+//! - z.ai's API endpoint, for the exact models with recorded API evidence;
+//! - Inception's API endpoint, for the exact chat models with recorded API evidence.
 //!
 //! **The Responses API is unsupported**, whatever routed the request there: automatic routing
 //! for `gpt-5.6` and later, the subscription plan, an exact Responses preference, or bounded
@@ -72,6 +73,14 @@ pub fn support(config: &OpenAiConfig, model: &str) -> ManagedSupport {
                 && crate::tool_support::support(config, model, None) != ToolCallSupport::Unsupported
         }
         Vendor::Zai => crate::zai::known_api(config, model),
+        // The same exactness as z.ai: the documented endpoint, an offered chat model, and a
+        // tool verdict that is not a refusal. A gateway or an unknown id declares no ceiling,
+        // and a reservation one might refuse is what managed preparation must not send.
+        Vendor::Inception => {
+            crate::inception::known_api(config, model)
+                && crate::inception::tool_support(config, model, None)
+                    != ToolCallSupport::Unsupported
+        }
     };
     if chat && exact {
         ManagedSupport::Supported {
@@ -167,6 +176,7 @@ pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCh
         ));
     }
     crate::zai::validate(config, &request)?;
+    crate::inception::validate(config, &request)?;
     let caps = llm.capabilities(&request.model);
     let ceiling = caps
         .max_output_tokens

@@ -842,6 +842,9 @@ pub(crate) fn build_llm(
             Box::new(build_responses(config, selection, key)?)
         }
         Provider::OpenAi => Box::new(build_compatible(Vendor::OpenAi, config, selection, key)?),
+        Provider::Inception => {
+            Box::new(build_compatible(Vendor::Inception, config, selection, key)?)
+        }
         Provider::Anthropic => Box::new(build_anthropic(config, selection, key)?),
     };
     Ok(Rc::new(port))
@@ -1379,6 +1382,46 @@ mod tests {
                 serde_json::to_vec(&body).unwrap().len()
             );
         }
+    }
+
+    #[test]
+    fn inception_composes_on_its_chat_endpoint_with_its_own_ceiling() {
+        let config = NanusConfig {
+            provider: Some(String::from("inception")),
+            ..NanusConfig::default()
+        };
+        let selection = Selection::resolve(&config).unwrap();
+        let adapter = build_compatible(
+            Vendor::Inception,
+            &config,
+            &selection,
+            &Secret::new("fictional-key"),
+        )
+        .unwrap();
+        assert_eq!(adapter.vendor(), Vendor::Inception);
+        assert_eq!(
+            adapter.config().base_url(),
+            "https://api.inceptionlabs.ai/v1"
+        );
+        assert_eq!(
+            adapter.endpoint(),
+            "https://api.inceptionlabs.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            adapter.config().effective_max_tokens_for("mercury-3"),
+            131_072
+        );
+        assert_eq!(
+            adapter.config().effective_max_tokens_for("mercury-2"),
+            50_000
+        );
+        // Like z.ai and unlike OpenAI, no explicit function-schema policy is sent: the
+        // provider's own default is the non-strict schema the stock tools expect.
+        assert_eq!(adapter.config().function_strictness(), None);
+        let body = adapter.encode(&stock_tool_request("mercury-3"));
+        assert!(body.get("messages").is_some());
+        assert_eq!(body["max_completion_tokens"], 131_072);
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]

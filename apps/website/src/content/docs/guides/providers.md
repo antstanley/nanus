@@ -1,11 +1,11 @@
 ---
 title: Model providers
-description: The four providers nanus ships, the plans they offer, and how to switch between them.
+description: The providers nanus ships, the plans they offer, and how to switch between them.
 sidebar:
   order: 2
 ---
 
-Four providers ship with `nanus`. Each is an adapter behind the `LlmPort`, and nothing in
+Five providers ship with `nanus`. Each is an adapter behind the `LlmPort`, and nothing in
 the tools, the domain, or the agent loop knows which one is in use - switching is a line of
 configuration, not a rebuild.
 
@@ -15,6 +15,12 @@ configuration, not a rebuild.
 | `zai` | `nanus-adapter-openai` | `glm-5.3-flashx`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2` | `api`, `coding` |
 | `anthropic` | `nanus-adapter-anthropic` | `claude-sonnet-5`, `claude-opus-5`, `claude-fable-5-1`, `claude-haiku-4-5-20251001`, `claude-sonnet-4-20250514`, `claude-opus-4-20250514` | `api` |
 | `openai` | `nanus-adapter-openai` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.3-codex`, `gpt-5`, `gpt-5-mini`, `gpt-5-codex` | `api`, `subscription`¹ |
+| `inception` | `nanus-adapter-openai` | `mercury-3`, `mercury-2.5`, `mercury-2` | `api` |
+
+Inception's `api` plan is Mercury's OpenAI-compatible chat endpoint, with the key in
+`INCEPTION_API_KEY` and `mercury-3` as the default. The three chat models are text-only, so they
+refuse images rather than guessing, and their exact context and output ceilings are reported per
+model. The voice, editor and decision models serve other endpoints and are not offered here.
 
 ¹ OpenAI's `subscription` plan is a ChatGPT account **authorized with OAuth** rather than a typed
 key: choosing it runs the device flow, files the token set under `openai:subscription`, and reaches
@@ -61,8 +67,8 @@ sent to another.
 
 ## What the adapters implement
 
-All four stream responses over SSE with reasoning content and tool calls reassembled from
-their frames - DeepSeek and z.ai send `data:`-framed chunks ending in `[DONE]`, Anthropic
-sends event-typed frames ending in `message_stop`. Usage accounting decodes each provider's
-own spelling of prompt, cached, and generated tokens, including how much of the generation
-was thinking.
+All five stream responses over SSE with reasoning content and tool calls reassembled from
+their frames - DeepSeek, z.ai and Inception send `data:`-framed chunks ending in `[DONE]`,
+Anthropic sends event-typed frames ending in `message_stop`. Usage accounting decodes each
+provider's own spelling of prompt, cached, and generated tokens, including how much of the
+generation was thinking.

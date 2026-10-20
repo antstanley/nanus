@@ -252,7 +252,14 @@ APIs and the `ChatGPT` subscription backend. Run it deliberately with
 subscription authorization must be current (run `nanus run` once to renew it). The results and the
 promotion rule are in [vision evidence](vision-evidence.md).
 
-The 14 skipped tests are the `#[ignore]`d live ones below. One test,
+**Live Inception smoke test.** `nanus-adapter-openai/tests/live_inception.rs` is `#[ignore]`d and
+spends credit. It asks `mercury-3` for one short answer at the `instant` step and requires visible
+text, usage and a terminal reason from the public endpoint. Run it deliberately with
+`INCEPTION_API_KEY=... cargo nextest run -p nanus-adapter-openai --test live_inception --run-ignored ignored-only`;
+it is the only test that reaches Inception's API. Adapter fixtures cover encoding, admission and
+managed preparation without a provider call.
+
+The skipped tests are the `#[ignore]`d live ones below. One test,
 `a_configuration_without_a_key_still_composes_unconfigured`, asserts the state of a machine with no
 provider credential stored; on a machine where `nanus auth set` has been used it fails because of
 the environment, not the code, so a clean-checkout run in CI or a fresh account is the reference.
@@ -266,11 +273,12 @@ it, for PNG, JPEG, WebP and still GIF:
 | OpenAI Responses (`api.openai.com`)       | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
 | OpenAI Responses (`ChatGPT` subscription) | the same six                                                                               |
 
-Fable 5.1, Haiku 4.5, DeepSeek and z.ai have no image profile and are tested only for the refusal
-before HTTP. The offered model lists themselves are pinned by tests in each adapter
-(`the_offered_models_belong_to_their_vendor`, `the_documented_numbers_are_what_the_api_expects`) and
-the plan defaults by `every_provider_has_its_own_credential_and_models`, so a retired id cannot
-creep back without a test changing.
+Fable 5.1, Haiku 4.5, DeepSeek, z.ai and Inception's Mercury chat models have no image profile and
+are tested only for the refusal before HTTP. The offered model lists themselves are pinned by tests
+in each adapter (`the_offered_models_belong_to_their_vendor`,
+`the_documented_numbers_are_what_the_api_expects`) and the plan defaults by
+`every_provider_has_its_own_credential_and_models`, so a retired id cannot creep back without a
+test changing.
 
 ## The tests that matter most
 

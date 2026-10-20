@@ -1,10 +1,9 @@
 //! The `OpenAI`-compatible wire protocol: request encoding and SSE decoding.
 //!
-//! This module is the only place that knows the JSON shapes shared by `OpenAI` and
-//! z.ai. The two vendors differ in a handful of documented ways — which reasoning
-//! control is sent, whether the credential is the same — and each difference is
-//! read from [`Vendor`] here rather than being branched on a provider string
-//! somewhere above.
+//! This module is the only place that knows the JSON shapes shared by `OpenAI`, z.ai and
+//! Inception. The vendors differ in a handful of documented ways — which reasoning control is
+//! sent, which output field is named, whether the credential is the same — and each difference
+//! is read from [`Vendor`] here rather than being branched on a provider string somewhere above.
 //!
 //! ## What is deliberately not sent
 //!
@@ -98,18 +97,31 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
 
 /// Writes the reasoning control the vendor understands.
 ///
-/// The neutral step travels as written (see [`crate::effort_spelling`]). Known z.ai API models
-/// are validated before dispatch: GLM-5.3 accepts low/high/max, whereas GLM-5.2 accepts all seven
-/// spellings, including none/minimal with enabled thinking. Coding Plan mappings remain separate.
+/// The neutral step travels as written for `OpenAI` and z.ai (see [`crate::effort_spelling`]).
+/// Known z.ai API models are validated before dispatch: GLM-5.3 accepts low/high/max, whereas
+/// GLM-5.2 accepts all seven spellings, including none/minimal with enabled thinking. Coding Plan
+/// mappings remain separate. Inception's own four-step scale is shorter than the neutral one, so
+/// it is spelled by [`crate::inception::effort_spelling`].
 fn insert_effort(body: &mut Map<String, Value>, vendor: Vendor, effort: ReasoningEffort) {
-    let spelling = crate::effort_spelling(effort);
     match vendor {
         Vendor::OpenAi => {
-            body.insert("reasoning_effort".to_owned(), json!(spelling));
+            body.insert(
+                "reasoning_effort".to_owned(),
+                json!(crate::effort_spelling(effort)),
+            );
         }
         Vendor::Zai => {
             body.insert("thinking".to_owned(), json!({ "type": "enabled" }));
-            body.insert("reasoning_effort".to_owned(), json!(spelling));
+            body.insert(
+                "reasoning_effort".to_owned(),
+                json!(crate::effort_spelling(effort)),
+            );
+        }
+        Vendor::Inception => {
+            body.insert(
+                "reasoning_effort".to_owned(),
+                json!(crate::inception::effort_spelling(effort)),
+            );
         }
     }
 }

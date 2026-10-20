@@ -2851,7 +2851,10 @@ mod tests {
             .iter()
             .map(|provider| provider.name.as_str())
             .collect();
-        assert_eq!(names, vec!["deepseek", "zai", "anthropic", "openai"]);
+        assert_eq!(
+            names,
+            vec!["deepseek", "zai", "anthropic", "openai", "inception"]
+        );
         for provider in &catalogue {
             assert!(!provider.credential_env.is_empty(), "{}", provider.name);
             assert!(!provider.plans.is_empty(), "{}", provider.name);

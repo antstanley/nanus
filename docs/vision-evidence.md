@@ -113,8 +113,10 @@ and reported the refusal accurately. The same run before the tool declared its e
 which is how an edit that silently did not apply was caught.
 
 Not covered by this evidence: z.ai (no model with live image evidence and no stored credential, so no
-analysis route), and native Windows and Linux (see [status](status.md#known-limits)). A later model has no analysis route until it has a profile
-and its own live run, exactly as above. Reproduce with `scripts/live-read-video.sh`, which spends credit.
+analysis route), Inception (its offered Mercury chat models are text-only, so it has no analysis
+route either), and native Windows and Linux (see [status](status.md#known-limits)). A later model
+has no analysis route until it has a profile and its own live run, exactly as above. Reproduce with
+`scripts/live-read-video.sh`, which spends credit.
 
 ## DeepSeek, 2026-10-04
 

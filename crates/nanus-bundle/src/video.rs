@@ -29,8 +29,8 @@ const ORIGIN_UNKNOWN: &str = "unknown";
 
 /// The model that reads frames for `provider`, when one has verified image input.
 ///
-/// z.ai has none: no model there has a profile with live evidence, and its credentials were never
-/// available to gather it.
+/// z.ai has none, and Inception's Mercury chat models are text-only: no model there has a
+/// profile with live evidence, and no image evidence was ever claimed for them.
 ///
 /// A model qualifies by having an exact image profile with live evidence in
 /// `docs/vision-evidence.md`; nothing here infers support from a name. Both are the smaller
@@ -40,7 +40,7 @@ const fn analysis_model(provider: Provider) -> Option<&'static str> {
         Provider::Anthropic => Some("claude-sonnet-5-5"),
         Provider::OpenAi => Some("gpt-6-luna"),
         Provider::DeepSeek => Some("deepseek-flash"),
-        Provider::Zai => None,
+        Provider::Zai | Provider::Inception => None,
     }
 }
 
@@ -149,7 +149,9 @@ fn protocol_of(provider: Provider, plan: Protocol, model: &str) -> &'static str 
         Provider::OpenAi if plan == Protocol::Responses || Protocol::responses_first(model) => {
             "responses"
         }
-        Provider::OpenAi | Provider::DeepSeek | Provider::Zai => "chat-completions",
+        Provider::OpenAi | Provider::DeepSeek | Provider::Zai | Provider::Inception => {
+            "chat-completions"
+        }
     }
 }
 
@@ -191,7 +193,7 @@ mod tests {
 
     #[test]
     fn only_providers_with_verified_image_models_have_a_route() {
-        // z.ai is the one stock provider with nothing to route to.
+        // z.ai and Inception are the stock providers with nothing to route to.
         assert_eq!(
             analysis_model(Provider::Anthropic),
             Some("claude-sonnet-5-5")
@@ -199,6 +201,7 @@ mod tests {
         assert_eq!(analysis_model(Provider::OpenAi), Some("gpt-6-luna"));
         assert_eq!(analysis_model(Provider::DeepSeek), Some("deepseek-flash"));
         assert_eq!(analysis_model(Provider::Zai), None);
+        assert_eq!(analysis_model(Provider::Inception), None);
     }
 
     #[test]
@@ -261,6 +264,10 @@ mod tests {
         assert_eq!(
             protocol_of(Provider::Anthropic, api, "claude-sonnet-5-5"),
             "messages"
+        );
+        assert_eq!(
+            protocol_of(Provider::Inception, api, "mercury-3"),
+            "chat-completions"
         );
     }
 }

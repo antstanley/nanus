@@ -223,7 +223,14 @@ Support requires the official endpoint and a known model; anything else is unsup
 | OpenAI | Anything routed to Responses: automatic `gpt-5.6`+, the `subscription` plan, exact Responses, stateless Responses | — | All | Unsupported; refused before HTTP |
 | z.ai | API plan, `https://api.z.ai/api/paas/v4` | `openai.chat` | The known API models | Supported |
 | z.ai | Coding Plan, gateways | — | — | Unsupported |
+| Inception | API plan, `https://api.inceptionlabs.ai/v1` | `openai.chat` | `mercury-3`, `mercury-2.5`, `mercury-2` | Supported |
+| Inception | Gateways, unknown ids | — | — | Unsupported |
 | Anthropic | `https://api.anthropic.com/v1` | `anthropic.messages` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Supported |
+
+Inception's row rests on the same local preparation and reload fixtures as the other chat
+providers, including the exact body the prepared call sends. Like every provider in this table it
+has **not** been sent a live managed request; [what is and is not verified](#what-is-and-is-not-verified)
+records that limitation for all of them.
 
 The output reservation must be present and within the model's declared ceiling; it is refused,
 never clamped. Every adapter validates the managed role grammar — leading system messages only,
@@ -438,7 +445,7 @@ Not verified, and not claimed:
 
 - **No live provider has been sent a managed request.** The provider matrix rests on wire and
   reload fixtures; in particular, nothing yet proves a provider accepts the generated assistant
-  message followed by an original one, or DeepSeek and z.ai a generated turn without
+  message followed by an original one, or DeepSeek, z.ai and Inception a generated turn without
   `reasoning_content`.
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there

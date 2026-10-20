@@ -18,6 +18,9 @@ pub fn support(
     if config.vendor() == Vendor::Zai {
         return crate::zai::tool_support(config, model, request_effort);
     }
+    if config.vendor() == Vendor::Inception {
+        return crate::inception::tool_support(config, model, request_effort);
+    }
     if config.vendor() != Vendor::OpenAi
         || config.base_url().trim_end_matches('/') != OPENAI_BASE_URL
         || !matches!(
