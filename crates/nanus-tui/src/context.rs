@@ -4,6 +4,8 @@
 
 use nanus_domain::context::managed::ContextMode;
 
+use crate::dialog::PARAGRAPH_GAP;
+
 /// A human context change, distinct from a status read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextChoice {
@@ -122,15 +124,29 @@ impl ContextDialog {
 /// Wraps the ASCII warning into actual rows so scrolling and drawing use the same coordinates.
 pub(crate) fn warning_rows(choice: ContextChoice, width: usize) -> Vec<String> {
     let width = width.max(1);
-    let mut rows = Vec::new();
+    let mut rows: Vec<String> = Vec::new();
     let text = format!(
         "Change to {}?\n\n{}\n\nOnly changes future requests. The raw session log is kept.",
         choice.label(),
         choice.warning()
     );
-    for paragraph in text.split('\n') {
+    let mut pending_gap = false;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            // A blank source line is a paragraph break; the same widened gap the dialog
+            // wrapper uses, so the confirmation reads as airy as the rest of the modal.
+            if !rows.is_empty() && rows.last().is_some_and(|row| !row.is_empty()) {
+                pending_gap = true;
+            }
+            continue;
+        }
+        if pending_gap {
+            rows.extend((0..PARAGRAPH_GAP).map(|_| String::new()));
+            pending_gap = false;
+        }
         let mut row = String::new();
-        for word in paragraph.split_whitespace() {
+        for word in line.split_whitespace() {
             if !row.is_empty() && row.len().saturating_add(word.len()).saturating_add(1) > width {
                 rows.push(std::mem::take(&mut row));
             }

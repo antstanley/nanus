@@ -3044,6 +3044,7 @@ impl ViewState {
             width,
             self.theme.assistant,
         );
+        out.section();
         if self.approval_confirming {
             out.push(
                 &format!(
@@ -3058,8 +3059,10 @@ impl ViewState {
             out.push(&format!("Selected: {selected}"), width, self.theme.selected);
         }
         if let Some(reason) = &approval.reason {
+            out.section();
             out.push(reason, width, self.theme.secondary);
         }
+        out.section();
         out.push(
             "Always allow grants this tool for the rest of the session.",
             width,
@@ -3081,6 +3084,7 @@ impl ViewState {
             width,
             self.theme.secondary,
         );
+        out.section();
         for (index, (policy, meaning)) in PERMISSIONS.iter().enumerate() {
             out.choice(
                 index,
@@ -3090,6 +3094,7 @@ impl ViewState {
                 &self.theme,
             );
         }
+        out.section();
         out.push(SANDBOX_NOTE, width, self.theme.secondary);
         out
     }
@@ -3118,6 +3123,7 @@ impl ViewState {
                 width,
                 self.theme.secondary,
             );
+            out.section();
             for (index, choice) in crate::context::ContextDialog::CHOICES.iter().enumerate() {
                 out.choice(
                     index,
@@ -3127,6 +3133,7 @@ impl ViewState {
                     &self.theme,
                 );
             }
+            out.section();
             out.push(
                 "Changes apply only while idle.",
                 width,
@@ -3142,6 +3149,9 @@ impl ViewState {
             DialogContent::new(crate::help::TITLE, crate::help::FOOTER, width, &self.theme);
         for (keys, effect) in crate::help::KEYS {
             let text = if keys.is_empty() {
+                // An empty key field is a group heading rather than a binding; it starts a
+                // new section, so it gets the same breathing room as the other dialogs.
+                out.section();
                 (*effect).to_owned()
             } else {
                 format!("{keys}: {effect}")
@@ -3174,6 +3184,7 @@ impl ViewState {
             &self.theme,
         );
         out.push(heading, width, self.theme.secondary);
+        out.section();
         match modal {
             Modal::Models => {
                 for (index, model) in self.models.iter().enumerate() {
@@ -3266,16 +3277,19 @@ impl ViewState {
                 width,
                 self.theme.assistant,
             );
+            out.section();
             out.push(
                 &format!("visit {}", self.auth_url),
                 width,
                 self.theme.assistant,
             );
+            out.section();
             out.push(
                 &format!("and enter code {}", self.auth_code),
                 width,
                 self.theme.assistant,
             );
+            out.section();
             out.push("waiting for authorization…", width, self.theme.secondary);
         } else if modal == Modal::KeyEntry {
             out.push(
@@ -3286,6 +3300,7 @@ impl ViewState {
                 width,
                 self.theme.secondary,
             );
+            out.section();
             let start = out.lines.len();
             out.push(
                 &format!("> {}", "*".repeat(self.key_input.chars().count().min(48))),
@@ -3293,6 +3308,7 @@ impl ViewState {
                 self.theme.selected,
             );
             out.selected = Some(start..out.lines.len());
+            out.section();
             out.push("it is never echoed back", width, self.theme.secondary);
         } else {
             out.push(
@@ -3303,6 +3319,7 @@ impl ViewState {
                 width,
                 self.theme.assistant,
             );
+            out.section();
             out.push(
                 &format!("it would otherwise be read from {}", self.credential_env),
                 width,

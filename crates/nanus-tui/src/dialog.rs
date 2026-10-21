@@ -59,6 +59,21 @@ impl Content {
         self.lines.extend(wrapped(text, width, style));
     }
 
+    /// Separates one section of the dialog from the next with a blank row.
+    ///
+    /// Distinct paragraphs a builder pushes are otherwise drawn flush against each other,
+    /// which reads as a wall of text: the question, the choices, and the notes each get
+    /// room to breathe. Repeated calls collapse to the same gap, so a section that
+    /// conditionally adds more text does not double the space. The gap is one row, not
+    /// the two a prose paragraph gets: the blanks between sections would otherwise push
+    /// the end of a long reason or a selected choice off a short terminal before it can
+    /// be scrolled to.
+    pub(crate) fn section(&mut self) {
+        if self.lines.last().is_some_and(|line| line.width() > 0) {
+            self.lines.push(Line::from(""));
+        }
+    }
+
     /// Adds an entire choice, marking every continuation as part of the selected entry.
     pub(crate) fn choice(
         &mut self,
@@ -97,6 +112,13 @@ impl Content {
 /// The columns a tab is drawn as: a terminal cell cannot hold one, and dropping it joins two words.
 const TAB: &str = "    ";
 
+/// The blank rows a paragraph break inside prose is drawn with.
+///
+/// Prose used to separate paragraphs with a single empty row, which read as cramped and
+/// dense. Two give the eye a real pause; runs of blank source lines still collapse to one
+/// gap, so a mess of empty lines cannot turn a dialog into a column of whitespace.
+pub(crate) const PARAGRAPH_GAP: usize = 2;
+
 /// Wraps literal text by display columns, preserving all content and hard newlines.
 ///
 /// Its own wrapper rather than the markdown renderer's, which is for prose: that one treats a run
@@ -104,16 +126,34 @@ const TAB: &str = "    ";
 /// paragraph and wrong here, where the text may be the command a reader is being asked to approve
 /// and `printf 'a    b'` is not `printf 'a b'`. Every space is kept except the ones a break lands
 /// on and the ones a line ends with, neither of which a reader could have seen.
+///
+/// A blank source line is a paragraph break: it widens the gap ([`PARAGRAPH_GAP`]) and collapses
+/// runs of blanks, so paragraphs get air without a dialog ever opening or closing on stray empty
+/// rows.
 pub(crate) fn wrapped(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
-    for line in text.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    let mut pending_gap = false;
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.is_empty() {
+            if !rows.is_empty() && rows.last().is_some_and(|row| !row.is_empty()) {
+                pending_gap = true;
+            }
+            continue;
+        }
+        if pending_gap {
+            rows.extend((0..PARAGRAPH_GAP).map(|_| String::new()));
+            pending_gap = false;
+        }
         if line.contains('\t') {
             wrap_line(&line.replace('\t', TAB), width, &mut rows);
         } else {
             wrap_line(line, width, &mut rows);
         }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
     }
     rows.into_iter()
         .map(|row| Line::styled(row, style))

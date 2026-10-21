@@ -368,7 +368,22 @@ fn literal_wrapping_keeps_spaces_and_never_exceeds_the_width() {
     assert_eq!(rows("alpha beta gamma", 10), ["alpha beta", "gamma"]);
     assert_eq!(rows("  two  spaces", 40), ["  two  spaces"]);
     assert_eq!(rows("a    b", 3), ["a", "b"], "a break takes its spaces");
-    assert_eq!(rows("x\n\ny", 9), ["x", "", "y"], "hard newlines survive");
+    assert_eq!(
+        rows("x\n\ny", 9),
+        ["x", "", "", "y"],
+        "hard newlines survive and leave a wider paragraph gap"
+    );
+    assert_eq!(
+        rows("a\n\n\nb", 9),
+        ["a", "", "", "b"],
+        "a run of blanks is one gap, not several"
+    );
+    assert_eq!(
+        rows("\n\na", 9),
+        ["a"],
+        "leading blanks do not open the dialog"
+    );
+    assert_eq!(rows("a\n\n", 9), ["a"], "trailing blanks do not close it");
     assert_eq!(rows("", 9), [""]);
     assert_eq!(rows("trailing   ", 20), ["trailing"]);
     assert_eq!(
