@@ -256,8 +256,10 @@ promotion rule are in [vision evidence](vision-evidence.md).
 spends credit. It asks `mercury-3` for one short answer at the `instant` step and requires visible
 text, usage and a terminal reason from the public endpoint. Run it deliberately with
 `INCEPTION_API_KEY=... cargo nextest run -p nanus-adapter-openai --test live_inception --run-ignored ignored-only`;
-it is the only test that reaches Inception's API. Adapter fixtures cover encoding, admission and
-managed preparation without a provider call.
+it is the only test that reaches Inception's API. It passed against the public endpoint on
+2026-10-21 in 1.292 s, returning visible text, usage and a terminal reason. That is evidence for
+the text chat wire at `instant`; tool-call framing and managed context still rest on the local
+fixtures, not a live call.
 
 The skipped tests are the `#[ignore]`d live ones below. One test,
 `a_configuration_without_a_key_still_composes_unconfigured`, asserts the state of a machine with no
