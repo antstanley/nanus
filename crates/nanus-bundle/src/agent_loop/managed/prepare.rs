@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 
 use nanus_domain::context::managed::{
     ContextFrontier, ContextMode, ContextPolicy, ContextStatus, Digest, ErrorCode, FragmentId,
-    Fragments, MANUAL_POLICY_V1, ManagedState, NoticeFacts, ProjectionRevision, Selection,
-    SnapshotProfile, derive_effective_context, fit, fragments, limits, proposal, state,
+    Fragments, MANUAL_POLICY_V1, ManagedState, NoticeFacts, ProjectionRevision, ReserveBudget,
+    Selection, SnapshotProfile, derive_effective_context, fit, fragments, limits, proposal, state,
 };
 use nanus_domain::{Goal, Message, Session};
 use nanus_ports::{ChatRequest, ManagedRequest, ModelCapabilities, PreparedModelCall, TurnRuntime};
@@ -174,13 +174,42 @@ impl AgentRunner {
             return Some(ErrorCode::ProtocolIncompatible);
         }
         let caps = llm.capabilities(&model);
+        // A following policy on a model with no declared ceiling has no reservation to resolve to.
+        let Some(reservation) = self.managed_reservation(caps, policy) else {
+            return Some(ErrorCode::UnsupportedMode);
+        };
         if caps
             .max_output_tokens
-            .is_some_and(|ceiling| ceiling < policy.output_reserve_tokens)
+            .is_some_and(|ceiling| ceiling < reservation)
         {
             return Some(ErrorCode::UnsupportedMode);
         }
         None
+    }
+
+    /// The output reservation a managed request reserves under `policy` on the model `caps`
+    /// describes, resolved now.
+    ///
+    /// An explicit policy is its number. A following one is the model's declared ceiling when the
+    /// requests are fitted to the model's window, and the smaller of that ceiling and a quarter of
+    /// a smaller budget otherwise. `None` only when a following policy meets a model that declares
+    /// no ceiling. A budget at or above the declared window is the window, whether it came from
+    /// `with_model_context_budget` or from a large configured number.
+    pub(in crate::agent_loop) fn managed_reservation(
+        &self,
+        caps: ModelCapabilities,
+        policy: ContextPolicy,
+    ) -> Option<u32> {
+        let budget = self.context_budget();
+        let fit = caps
+            .context_window_tokens
+            .map_or(budget, |window| budget.min(window));
+        let reserve_budget = if caps.context_window_tokens == Some(fit) {
+            ReserveBudget::ModelWindow
+        } else {
+            ReserveBudget::Configured(fit)
+        };
+        policy.effective_reservation(caps.max_output_tokens, reserve_budget)
     }
 
     /// The admissible input allowance: the budget and window less both reservations.
@@ -192,7 +221,12 @@ impl AgentRunner {
         let separate = self
             .request_reservation
             .map_or(0, |(_, reasoning)| reasoning);
-        let reservation = policy.output_reserve_tokens.saturating_add(separate);
+        // `unready` refuses the one case with no reservation, so the zero is never the basis of a
+        // request that is sent.
+        let reservation = self
+            .managed_reservation(caps, policy)
+            .unwrap_or(0)
+            .saturating_add(separate);
         let window = caps
             .context_window_tokens
             .unwrap_or(u32::MAX)
@@ -207,7 +241,8 @@ impl AgentRunner {
         let mut request = ChatRequest::new(self.model(), Vec::new());
         request.tools = self.managed_schemas();
         request.reasoning_effort = self.effort.get();
-        request.max_tokens = Some(policy.output_reserve_tokens);
+        let caps = self.llm().capabilities(&self.model());
+        request.max_tokens = self.managed_reservation(caps, policy);
         request.separate_reasoning_tokens = self
             .request_reservation
             .map_or(0, |(_, reasoning)| reasoning);
@@ -502,6 +537,9 @@ impl AgentRunner {
         } else {
             None
         };
+        let reserve = self
+            .managed_reservation(caps, turn.policy())
+            .unwrap_or_else(|| turn.policy().output_reserve_tokens);
         let status = Self::status_of(
             (session, snapshot, frontier),
             (selection, estimate.input_tokens, &facts),
@@ -510,6 +548,7 @@ impl AgentRunner {
                     .is_some_and(|context| context.archive().is_some()),
                 &profile,
             ),
+            reserve,
         );
         Ok(Prepared {
             management: state::management_in_flight(&snapshot.fragments, &snapshot.protected),
@@ -545,6 +584,7 @@ impl AgentRunner {
         at: (&Session, &Snapshot, ContextFrontier),
         prepared: (Selection<'_>, u32, &NoticeFacts),
         extra: (bool, &Digest),
+        output_reserve_tokens: u32,
     ) -> ContextStatus {
         let (session, snapshot, frontier) = at;
         let (selection, estimate, facts) = prepared;
@@ -556,9 +596,7 @@ impl AgentRunner {
             frontier,
             estimate_input_tokens: Some(u64::from(estimate)),
             estimate_protected_tokens: None,
-            output_reserve_tokens: u64::from(
-                snapshot.state.policy_or_default().output_reserve_tokens,
-            ),
+            output_reserve_tokens: u64::from(output_reserve_tokens),
             estimator: facts.estimator.clone(),
             hidden_fragments: u64::try_from(selection.hidden.len()).unwrap_or(u64::MAX),
             protected_fragments: u64::try_from(snapshot.protected.len()).unwrap_or(u64::MAX),
@@ -618,7 +656,10 @@ impl AgentRunner {
             frontier,
             estimate_input_tokens: None,
             estimate_protected_tokens: None,
-            output_reserve_tokens: u64::from(policy.output_reserve_tokens),
+            output_reserve_tokens: u64::from(
+                self.managed_reservation(self.llm().capabilities(&self.model()), policy)
+                    .unwrap_or(policy.output_reserve_tokens),
+            ),
             estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
             hidden_fragments: 0,
             protected_fragments: 0,

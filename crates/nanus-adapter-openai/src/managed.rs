@@ -1,4 +1,5 @@
-//! Managed-context preparation on the chat-completions wire, and its refusal everywhere else.
+//! Managed-context preparation on the chat-completions and Responses wires, and its refusal
+//! everywhere else.
 //!
 //! A managed call is encoded **once**: the estimate admits that value, the digest names its
 //! serialised bytes, and the prepared call sends exactly those bytes over a route and
@@ -7,21 +8,26 @@
 //!
 //! ## Which paths are supported
 //!
-//! Only the neutral chat-completions encoder, where a request is messages in order and nothing
-//! the provider signed has to survive an edited history:
+//! Only the neutral encoders, where a request is messages (or items) in order and nothing the
+//! provider signed has to survive an edited history:
 //!
 //! - `OpenAI`'s API endpoint, for a model that resolves to chat completions there — automatic
 //!   routing for an id before the `gpt-5.6` generation, or an exact chat preference — and whose
 //!   function tools are not known to be refused at the configured effort;
+//! - `OpenAI`'s API endpoint on the Responses wire, for every offered id: automatic routing for
+//!   `gpt-5.6` and later, or an exact Responses preference;
+//! - `OpenAI`'s `subscription` plan, on the Responses wire, under the stock automatic routing
+//!   whose fallback is Responses. The plan refuses `max_output_tokens`, so the reservation is
+//!   checked and charged here but never sent;
 //! - z.ai's API endpoint, for the exact models with recorded API evidence;
 //! - Inception's API endpoint, for the exact chat models with recorded API evidence.
 //!
-//! **The Responses API is unsupported**, whatever routed the request there: automatic routing
-//! for `gpt-5.6` and later, the subscription plan, an exact Responses preference, or bounded
-//! stateless replay. A Responses continuation carries opaque items and receipts bound to a whole
-//! turn, and a missing stateless replay check is not evidence that editing fragments is safe, so
-//! preparation refuses before any HTTP, and never by switching wire, model or effort to find a
-//! path that would accept the request. The coding plan and arbitrary gateways inherit nothing.
+//! On the Responses wire history is sent plain, exactly as an ordinary request sends it: no
+//! `include`, no `previous_response_id`, no reasoning item, and no encrypted replay. Stateless
+//! Responses replay stays refused, as does an exact subscription preference and an automatic one
+//! whose fallback is chat, since each would send a ceiling the plan refuses. Preparation refuses
+//! before any HTTP, and never by switching wire, model or effort to find a path that would accept
+//! the request. The coding plan and arbitrary gateways inherit nothing.
 //!
 //! ## The grammar
 //!
@@ -29,8 +35,8 @@
 //! conversation that opens with a user message; at most one generated working-data message,
 //! directly after the first user message and never last, so it is never an assistant prefill;
 //! every surviving call answered once, in place; and no turn only another protocol's replay can
-//! express, which the chat encoder would otherwise skip silently. A generated message next to
-//! an original assistant turn is sent as two assistant messages, because chat completions has no
+//! express, which the encoders would otherwise skip silently. A generated message next to an
+//! original assistant turn is sent as two assistant messages, because neither wire has an
 //! alternation rule: nothing is merged, no call is invented, no generated text changes role.
 //!
 //! ## Output
@@ -50,10 +56,24 @@ use nanus_ports::{
 };
 use serde_json::Value;
 
-use crate::{OPENAI_BASE_URL, OpenAiConfig, OpenAiLlm, Protocol, Vendor};
+use crate::{
+    OPENAI_BASE_URL, OPENAI_SUBSCRIPTION_BASE_URL, OpenAiConfig, OpenAiLlm, Protocol,
+    ProtocolPreference, Vendor,
+};
 
-/// The protocol label a managed call records: the `OpenAI`-compatible chat-completions wire.
+/// The protocol label a managed chat-completions call records.
 pub const PROTOCOL: &str = "openai.chat";
+
+/// The protocol label a managed Responses call records.
+pub const RESPONSES_PROTOCOL: &str = "openai.responses";
+
+/// The label a call on `protocol` records.
+const fn label(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::ChatCompletions => PROTOCOL,
+        Protocol::Responses => RESPONSES_PROTOCOL,
+    }
+}
 
 /// Whether `model` on this configuration can carry a managed projection.
 pub fn support(config: &OpenAiConfig, model: &str) -> ManagedSupport {
@@ -82,7 +102,7 @@ pub fn support(config: &OpenAiConfig, model: &str) -> ManagedSupport {
                     != ToolCallSupport::Unsupported
         }
     };
-    if chat && exact {
+    if (chat && exact) || responses_supported(config, model) {
         ManagedSupport::Supported {
             policy_version: POLICY_VERSION,
         }
@@ -91,12 +111,46 @@ pub fn support(config: &OpenAiConfig, model: &str) -> ManagedSupport {
     }
 }
 
-/// An admitted, not-yet-sent managed chat call.
+/// Whether `model` can carry a managed projection on the Responses wire.
+///
+/// Two admitted routes, and both require the model's declared window and output ceiling:
+///
+/// - the API endpoint, which takes `max_output_tokens`, so its reservation is sent;
+/// - the `subscription` endpoint under the stock automatic preference, whose fallback is
+///   Responses. That plan refuses the field, so the reservation is enforced by accounting only.
+///   An exact preference there promises a ceiling the endpoint refuses, and an automatic one
+///   whose fallback is chat would send one, so both are refused.
+fn responses_supported(config: &OpenAiConfig, model: &str) -> bool {
+    if config.vendor() != Vendor::OpenAi
+        || config.stateless_responses()
+        || !matches!(config.resolve_protocol(model), Ok(Protocol::Responses))
+        || !Vendor::OpenAi.models().contains(&model)
+    {
+        return false;
+    }
+    let caps = config.capabilities(model);
+    if caps.context_window_tokens.is_none()
+        || caps.max_output_tokens.is_none()
+        || crate::tool_support::support(config, model, None) == ToolCallSupport::Unsupported
+    {
+        return false;
+    }
+    let base = config.base_url().trim_end_matches('/');
+    let api =
+        base == OPENAI_BASE_URL && config.account_id().is_none() && config.sends_output_ceiling();
+    let subscription = base == OPENAI_SUBSCRIPTION_BASE_URL
+        && matches!(config.protocol_preference(), ProtocolPreference::Automatic)
+        && !config.sends_output_ceiling();
+    api || subscription
+}
+
+/// An admitted, not-yet-sent managed call, on either wire.
 ///
 /// It owns the exact body and the route and credential resolved when it was prepared; it has
 /// no setter and no serialisable form, and it touches the network only once its stream is
 /// polled.
-pub struct PreparedChat {
+pub struct PreparedCall {
+    protocol: Protocol,
     transport: crate::Transport,
     body: String,
     estimate: RequestEstimate,
@@ -104,11 +158,12 @@ pub struct PreparedChat {
     selection: SelectionIdentity,
 }
 
-impl core::fmt::Debug for PreparedChat {
+impl core::fmt::Debug for PreparedCall {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // The credential is deliberately absent, and so is the body: a `Debug` rendering
         // reaches logs, and the digest already names the body exactly.
-        f.debug_struct("PreparedChat")
+        f.debug_struct("PreparedCall")
+            .field("protocol", &label(self.protocol))
             .field("estimate", &self.estimate)
             .field("digest", &self.digest)
             .field("selection", &self.selection)
@@ -116,7 +171,7 @@ impl core::fmt::Debug for PreparedChat {
     }
 }
 
-impl PreparedModelCall for PreparedChat {
+impl PreparedModelCall for PreparedCall {
     fn estimate(&self) -> RequestEstimate {
         self.estimate
     }
@@ -131,16 +186,29 @@ impl PreparedModelCall for PreparedChat {
 
     fn stream(self: Box<Self>) -> LlmStream {
         let Self {
-            transport, body, ..
+            protocol,
+            transport,
+            body,
+            ..
         } = *self;
-        let mut accumulator = crate::wire::StreamAccumulator::default();
-        accumulator.set_argument_limits(ToolArgumentLimits::managed());
-        crate::send(transport, body, crate::Decoder::Chat(Box::new(accumulator)))
+        let decoder = match protocol {
+            Protocol::ChatCompletions => {
+                let mut accumulator = crate::wire::StreamAccumulator::default();
+                accumulator.set_argument_limits(ToolArgumentLimits::managed());
+                crate::Decoder::Chat(Box::new(accumulator))
+            }
+            Protocol::Responses => {
+                let mut accumulator = crate::responses::StreamAccumulator::default();
+                accumulator.set_argument_limits(ToolArgumentLimits::managed());
+                crate::Decoder::Responses(Box::new(accumulator))
+            }
+        };
+        crate::send(transport, body, decoder)
     }
 }
 
 #[cfg(test)]
-impl PreparedChat {
+impl PreparedCall {
     /// The exact bytes the call sends.
     pub fn body(&self) -> &str {
         &self.body
@@ -157,24 +225,22 @@ impl PreparedChat {
 ///
 /// # Errors
 ///
-/// Refuses any Responses route and any unsupported model or endpoint, a request outside the
-/// managed grammar, an output reservation that is absent or above the declared ceiling, and a
-/// candidate that does not fit.
-pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedChat> {
+/// Refuses an unsupported model, endpoint or wire, a request outside the managed grammar, an
+/// output reservation that is absent or above the declared ceiling, and a candidate that does
+/// not fit.
+pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCall> {
     let ManagedRequest {
         request,
         selection_epoch,
     } = managed;
     let config = llm.config();
-    if config.stateless_responses()
-        || llm.checked_protocol(&request)? == Protocol::Responses
-        || !support(config, &request.model).supports(POLICY_VERSION)
-    {
+    if config.stateless_responses() || !support(config, &request.model).supports(POLICY_VERSION) {
         return Err(refuse(
             ErrorCode::UnsupportedMode,
-            "managed context is supported on the chat-completions API path only",
+            "managed context is not supported for this model, endpoint or wire",
         ));
     }
+    let protocol = llm.checked_protocol(&request)?;
     crate::zai::validate(config, &request)?;
     crate::inception::validate(config, &request)?;
     let caps = llm.capabilities(&request.model);
@@ -189,8 +255,13 @@ pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCh
         &request,
     )?;
 
-    // Encoded once: the estimate, the digest and the dispatch all read this one value.
-    let payload = crate::wire::build_request(config, &request);
+    // Encoded once: the estimate, the digest and the dispatch all read this one value. Both
+    // encoders are the ordinary ones, so a managed Responses body differs from an ordinary one
+    // only in what the managed compiler selected.
+    let payload = match protocol {
+        Protocol::ChatCompletions => crate::wire::build_request(config, &request),
+        Protocol::Responses => crate::responses::build_request(config, &request),
+    };
     let estimate = nanus_ports::capabilities::estimate_managed_payload(caps, &request, &payload)?;
     if !estimate.fits(caps, &request) {
         return Err(refuse(
@@ -203,19 +274,25 @@ pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCh
     })?;
     // Postcondition: the estimate measured exactly the bytes that will be sent.
     assert_eq!(body.len(), estimate.request_bytes);
-    let transport = llm.transport(&llm.url(Protocol::ChatCompletions));
+    let transport = llm.transport(&llm.url(protocol));
+    let effort = match protocol {
+        Protocol::ChatCompletions => payload.get("reasoning_effort"),
+        Protocol::Responses => payload
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort")),
+    }
+    .and_then(Value::as_str)
+    .map(str::to_owned);
     let selection = SelectionIdentity {
         provider: config.vendor().as_str().to_owned(),
         endpoint_digest: Digest::of(transport.endpoint.as_bytes()),
-        protocol: PROTOCOL.to_owned(),
+        protocol: label(protocol).to_owned(),
         model: request.model,
-        effort: payload
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        effort,
         epoch: selection_epoch,
     };
-    Ok(PreparedChat {
+    Ok(PreparedCall {
+        protocol,
         transport,
         digest: Digest::of(body.as_bytes()),
         body,

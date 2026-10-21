@@ -11,6 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Test-only: lets a test serve the wire from a local listener. It changes where the transport sends and
+# nothing else; no release build enables it.
+test-endpoint = []
+
 [dependencies]
 nanus-domain = { workspace = true }
 nanus-ports = { workspace = true }

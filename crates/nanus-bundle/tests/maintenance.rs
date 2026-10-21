@@ -912,7 +912,7 @@ fn managed_with_a_large_header(
     let context = context();
     block(runner.set_context_policy(
         &mut session,
-        ContextPolicy::managed(),
+        explicit_managed(),
         ModeActor::Human,
         host(&disk, &context).runtime,
     ))
@@ -1056,4 +1056,13 @@ fn a_seeded_session_switched_to_legacy_still_leads_with_its_seed() {
         2,
         "the system prompt and the prompt"
     );
+}
+
+/// The managed policy with the explicit 4,096 reservation this file was written against. The
+/// default policy follows the model, which is a version-6 body and has its own tests.
+fn explicit_managed() -> ContextPolicy {
+    ContextPolicy {
+        output_reserve_follows_model: false,
+        ..ContextPolicy::managed()
+    }
 }

@@ -380,13 +380,16 @@ design docs too.
 - **A name is an alias for a store key, and one session has one name.** Naming is
   refused rather than moved when the name is held, and the alias lives in the
   session's own directory (`name`), so it cannot be lost with a shared table.
-- **A body is written at the lowest version that holds it; readers accept 1 to 5.** Version 5 when a
+- **A body is written at the lowest version that holds it; readers accept 1 to 6.** Version 6 when a
+  `context/mode` record's policy follows the model; version 5 when a
   body carries a record of a maintenance request — `context/compact`, `context/seed`,
   `context/handoff`, or a `request/attempt` with a `kind` — version 4 when a user message carries
   typed content, version 3 when managed context is enabled, version 2 otherwise, so an older build
   can still open what it can read faithfully. A version-5 body is refused at the header by a build
   that predates it, because that build would fail part-way through the body; those records, and an
-  attempt's `kind`, are refused in any body below version 5, on write and on read. Managed and typed
+  attempt's `kind`, are refused in any body below version 5, on write and on read. A version-6 body
+  is refused at the header by an older build, and the follows field is refused in any body below
+  version 6, on write and on read. Managed and typed
   user content are independent: version 3 implies managed, and a version-4 or version-5 header says
   `"managed":true` when it is. Anything that checks a header — the store's listing included — asks
   `reads_session_version`, never "is it the newest". Typed tool blocks and signed Messages replay
@@ -396,11 +399,15 @@ design docs too.
   not guess support from a model label.
 - **For OpenAI, Automatic routing follows the model.** `gpt-5.6` and later (read from the id's version) go
   to the Responses API per request on the API plan; the `subscription` plan is Responses already and
-  is sent no `max_output_tokens`, which that backend refuses. An image profile belongs to one exact
+  is sent no `max_output_tokens`, which that backend refuses. A model's window and ceilings are the
+  model's on every plan and wire. A managed request on the subscription still carries its reservation
+  in accounting: the reservation is checked against the declared ceiling and charged, but never sent.
+  An image profile belongs to one exact
   model id and is promoted only on live evidence (`nanus-bundle/tests/live_vision.rs`, `#[ignore]`d).
   Library hosts may choose `ProtocolPreference::Exact`: the chosen wire overrides automatic model
   routing or is refused before HTTP. Capability/image evidence belongs to the actual selected wire,
-  exact model and known endpoint; Chat/proxy support cannot inherit Responses evidence. Raw `encode`
+  exact model and known endpoint; Chat/proxy image and tool support cannot inherit Responses evidence;
+  text limits are the model's. Raw `encode`
   is inspection only. Exact endpoint output ceilings cannot be silently dropped.
   `reasoning_effort` in the configuration is optional: absent means the plan's default
   (`subscription`: `high`), then `medium`.
@@ -411,7 +418,7 @@ design docs too.
 - **Managed context is opt-in, and a legacy session must not notice it exists.** A session that
   never records a `context/mode` record keeps its version-2 body, request bytes, schemas, tool count
   and terminal save; tests pin each adapter's ordinary body and compare a legacy run through both
-  runner entry points. A managed session (version 3, or version 4 marked managed) is saved only
+  runner entry points. A managed session (version 3, or version 4, 5 or 6 marked managed) is saved only
   through its `SessionCheckpoint`:
   `nanus run` and the link never call `StorePort::save` for one, and act on the returned
   `PersistenceState` (no duplicate save after `Acknowledged`, nothing after `Unsaved`, only

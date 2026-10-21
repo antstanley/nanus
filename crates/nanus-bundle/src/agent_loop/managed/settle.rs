@@ -250,6 +250,26 @@ impl AgentRunner {
         }
     }
 
+    /// Writes the reservation a following policy resolves to on the model in force into its
+    /// number, so the record names what requests reserved when it was made.
+    ///
+    /// A managed policy on a model that declares no ceiling has nothing to resolve to and is
+    /// refused. A legacy one keeps its placeholder, because a legacy request reserves nothing.
+    fn resolve_following(&self, mut policy: ContextPolicy) -> Result<ContextPolicy, BundleError> {
+        if !policy.output_reserve_follows_model {
+            return Ok(policy);
+        }
+        let caps = self.llm().capabilities(&self.model());
+        match self.managed_reservation(caps, policy) {
+            Some(reservation) => {
+                policy.output_reserve_tokens = reservation;
+                Ok(policy)
+            }
+            None if policy.mode == ContextMode::Managed => Err(refusal(ErrorCode::UnsupportedMode)),
+            None => Ok(policy),
+        }
+    }
+
     /// Changes the recorded policy, persisting the record before it is acknowledged.
     pub(in crate::agent_loop) async fn change_policy(
         &self,
@@ -265,7 +285,9 @@ impl AgentRunner {
             .iter()
             .any(|event| matches!(event, SessionEvent::ContextMode { .. }));
         let current = super::recorded_policy(session);
-        if current == policy && (recorded || policy.mode == ContextMode::Legacy) {
+        // A following policy's number is a snapshot, so the comparison is of settings: an
+        // unchanged policy after a model switch writes nothing.
+        if current.same_settings(&policy) && (recorded || policy.mode == ContextMode::Legacy) {
             return Ok(None);
         }
         // Only activation upgrades a body. A legacy policy for a session that never managed its
@@ -284,6 +306,11 @@ impl AgentRunner {
             if session.is_compacted() {
                 return Err(refusal(ErrorCode::CompactedSession));
             }
+        }
+        // Resolved after the cut is refused, so a compacted session is told so rather than told
+        // its model has no ceiling, and before activation, which judges the reservation it resolves.
+        let policy = self.resolve_following(policy)?;
+        if policy.mode == ContextMode::Managed {
             self.check_activation(policy, runtime)?;
         }
         let reason = match (current.mode, policy.mode) {

@@ -229,7 +229,12 @@ fn managed(history: &Session, llm: &DeepSeekLlm) -> Row {
     session.upgrade_to_managed_body();
     session.append(SessionEvent::ContextMode {
         payload: Box::new(ContextModeRecord {
-            policy: ContextPolicy::managed(),
+            // Explicit, as the saved baselines were measured: a following reservation is a
+            // different hot path, measured on its own.
+            policy: ContextPolicy {
+                output_reserve_follows_model: false,
+                ..ContextPolicy::managed()
+            },
             actor: ModeActor::Human,
             reason: ModeReason::Enable,
             previous_revision: 0,

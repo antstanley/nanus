@@ -1,7 +1,9 @@
 //! Typed human input is never reduced to its display projection.
 #![allow(clippy::unwrap_used)]
 use base64::Engine as _;
-use nanus_domain::context::managed::{ContextModeRecord, ContextPolicy, ModeActor, ModeReason};
+use nanus_domain::context::managed::{
+    ContextMode, ContextModeRecord, ContextPolicy, ModeActor, ModeReason,
+};
 use nanus_domain::{ContentBlock, Message, Session, SessionEvent, SessionId};
 use serde_json::{Value, json};
 
@@ -109,11 +111,18 @@ fn a_session_is_written_at_the_lowest_version_that_holds_it() {
     }
 }
 
-/// The record a session enables managed context with.
+/// The record a session enables managed context with. Explicit, so the version rules under test
+/// are the ones for versions 3 to 5 rather than the following policy's version 6.
 fn enable() -> SessionEvent {
     SessionEvent::ContextMode {
         payload: Box::new(ContextModeRecord {
-            policy: ContextPolicy::managed(),
+            policy: ContextPolicy {
+                mode: ContextMode::Managed,
+                output_reserve_tokens: 4_096,
+                output_reserve_follows_model: false,
+                capture_shell: false,
+                policy_version: 1,
+            },
             actor: ModeActor::Human,
             reason: ModeReason::Enable,
             previous_revision: 0,

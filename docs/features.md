@@ -275,9 +275,8 @@ the account through the **Responses API** — the items-shaped wire that backend
 grant's access token as the bearer, the account named in its own header, and an expired access token
 renewed from the refresh token rather than sent and refused.
 On the `api` plan, models from `gpt-5.6` on (read from the id's version, so a later model is
-covered) go to the Responses API too, chosen per request; older ids stay on chat completions. A
-conversation holding images stays on chat completions, because the Responses encoder has no image
-items yet. The plan starts on `gpt-6.1-sol` at `high` effort; a `reasoning_effort` in the configuration, or a
+covered) go to the Responses API too, chosen per request; older ids stay on chat completions. The
+plan starts on `gpt-6.1-sol` at `high` effort; a `reasoning_effort` in the configuration, or a
 remembered selection, wins over that default.
 
 The Inception `api` plan is Mercury's OpenAI-compatible chat-completions endpoint at
@@ -799,12 +798,16 @@ The Cordis-style kernel is the framework underneath. See
 ## Managed context
 
 Opt in per session with `nanus run --context-mode managed` (and optionally `--context-output-reserve
-<tokens>` and `--capture-shell-evidence`), or from the interface with `/context`. Every user message
+<tokens>|model` and `--capture-shell-evidence`), or from the interface with `/context`. Every user message
 stays in every request; completed old tool work is hidden to fit the budget — automatically, or by
 the model through `context_manage` — and stays recallable through `context_recall`, including shell
 output past the preview when capture is on. Every step is checkpointed before its request is sent.
-Supported on DeepSeek, OpenAI, z.ai and Inception Chat Completions and Anthropic Messages at their
-official endpoints; Responses paths refuse. Legacy sessions are unchanged. A managed session can be
+Supported on DeepSeek, z.ai and Inception Chat Completions, OpenAI Chat Completions and Responses
+(the API and `subscription` plans), and Anthropic Messages, at their official endpoints. History is
+sent plain on every path except Anthropic's, which may also send signed replay. OpenAI's stateless
+replay mode refuses. The output reservation defaults to the model's declared ceiling and follows it
+across switches; with a configured `context_budget` smaller than the window it is at most a quarter
+of that budget. Legacy sessions are unchanged. A managed session can be
 handed off into a new one (`/handoff`): the agent drafts a summary of it, the reader reads and
 confirms it, and every request of the new session, the first included, carries that document as a
 labelled system message of generated data. See [handoff](context-management.md#handoff) and [managed

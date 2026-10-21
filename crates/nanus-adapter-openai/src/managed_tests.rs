@@ -24,7 +24,7 @@ use nanus_ports::{
 };
 use serde_json::{Value, json};
 
-use super::managed::{PROTOCOL, PreparedChat, prepare};
+use super::managed::{PROTOCOL, PreparedCall, RESPONSES_PROTOCOL, prepare};
 use crate::{
     OPENAI_SUBSCRIPTION_BASE_URL, OpenAiConfig, OpenAiLlm, Protocol, ProtocolPreference, Vendor,
     ZAI_BASE_URL, ZAI_CODING_BASE_URL,
@@ -206,10 +206,19 @@ fn tool_stream(deltas: &[Value]) -> String {
 }
 
 /// Sends a prepared call to a fixture server, proving nothing connects before the first poll.
-async fn exchange(mut prepared: PreparedChat, sse: String) -> (Vec<u8>, Vec<LlmEvent>) {
+async fn exchange(prepared: PreparedCall, sse: String) -> (Vec<u8>, Vec<LlmEvent>) {
+    exchange_at(prepared, "/chat/completions", sse).await
+}
+
+/// [`exchange`] at an endpoint path, so the Responses wire's `/responses` is what is hit.
+async fn exchange_at(
+    mut prepared: PreparedCall,
+    path: &str,
+    sse: String,
+) -> (Vec<u8>, Vec<LlmEvent>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    prepared.retarget(format!("http://{address}/chat/completions"));
+    prepared.retarget(format!("http://{address}{path}"));
     listener.set_nonblocking(true).unwrap();
     let stream = Box::new(prepared).stream();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -409,58 +418,66 @@ fn with_model(model: &str) -> ChatRequest {
     request
 }
 
-/// T22: every Responses route is unsupported and refused before HTTP, with nothing switched.
+/// Every Responses route the spec does not admit is refused before HTTP, with nothing switched:
+/// stateless replay, an exact subscription preference, a subscription whose fallback is chat, an
+/// id this vendor does not offer, and a gateway.
 #[test]
-fn every_responses_route_is_unsupported_and_refused_before_any_request() {
+fn every_refused_responses_route_is_refused_before_any_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let automatic = automatic();
+
     // F8: an id this vendor does not offer has no declared ceiling, even routed to chat.
+    let automatic = automatic();
     assert_eq!(
         automatic.managed_support(LEGACY_MODEL),
         ManagedSupport::Unsupported
     );
     refused_by(&automatic, with_model(LEGACY_MODEL), "unsupported_mode");
-    assert_eq!(
-        automatic.managed_support("gpt-5.6-sol"),
-        ManagedSupport::Unsupported
-    );
-    refused_by(&automatic, with_model("gpt-5.6-sol"), "unsupported_mode");
-    assert!(
-        automatic
-            .endpoint_for("gpt-5.6-sol")
-            .ends_with("/responses"),
-        "no wire switch"
-    );
-    assert_eq!(
-        automatic.config().reasoning_effort(),
-        nanus_ports::ReasoningEffort::Medium
-    );
 
-    let mut subscription = OpenAiConfig::with_base_url(
+    // A gateway is not the official endpoint, whatever model it names.
+    let gateway = OpenAiLlm::new(OpenAiConfig::with_base_url(
         Vendor::OpenAi,
-        "gpt-5.6-sol",
+        MODEL,
+        "test-key",
+        "https://gateway.example/v1",
+    ))
+    .unwrap();
+    assert_eq!(gateway.managed_support(MODEL), ManagedSupport::Unsupported);
+    refused_by(&gateway, with_model(MODEL), "unsupported_mode");
+
+    // An exact preference promises a ceiling the subscription endpoint refuses.
+    let mut exact_subscription = OpenAiConfig::with_base_url(
+        Vendor::OpenAi,
+        MODEL,
         "test-key",
         OPENAI_SUBSCRIPTION_BASE_URL,
     );
-    subscription.set_protocol(Protocol::Responses);
-    subscription.set_account_id("account");
-    let subscription = OpenAiLlm::new(subscription).unwrap();
-    for model in ["gpt-5.6-sol", MODEL] {
-        assert_eq!(
-            subscription.managed_support(model),
-            ManagedSupport::Unsupported
-        );
-        refused_by(&subscription, with_model(model), "unsupported_mode");
-    }
-
-    let mut exact = OpenAiConfig::new(Vendor::OpenAi, MODEL, "test-key");
-    exact
+    exact_subscription.set_account_id("account");
+    exact_subscription
         .set_protocol_preference(ProtocolPreference::Exact(Protocol::Responses))
         .unwrap();
-    let exact = OpenAiLlm::new(exact).unwrap();
-    assert_eq!(exact.managed_support(MODEL), ManagedSupport::Unsupported);
-    refused_by(&exact, compiled(&session()), "unsupported_mode");
+    let exact_subscription = OpenAiLlm::new(exact_subscription).unwrap();
+    assert_eq!(
+        exact_subscription.managed_support(MODEL),
+        ManagedSupport::Unsupported
+    );
+    refused_by(&exact_subscription, with_model(MODEL), "unsupported_mode");
+
+    // An automatic preference whose fallback is chat would send the same ceiling.
+    let mut chat_fallback = OpenAiConfig::with_base_url(
+        Vendor::OpenAi,
+        MODEL,
+        "test-key",
+        OPENAI_SUBSCRIPTION_BASE_URL,
+    );
+    chat_fallback.set_protocol(Protocol::ChatCompletions);
+    chat_fallback.set_account_id("account");
+    let chat_fallback = OpenAiLlm::new(chat_fallback).unwrap();
+    assert_eq!(
+        chat_fallback.managed_support(MODEL),
+        ManagedSupport::Unsupported
+    );
+    refused_by(&chat_fallback, with_model(MODEL), "unsupported_mode");
 
     let mut stateless = OpenAiConfig::new(Vendor::OpenAi, "gpt-6-astra", "test-key");
     stateless
@@ -481,6 +498,45 @@ fn every_responses_route_is_unsupported_and_refused_before_any_request() {
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "nothing was sent"
     );
+}
+
+/// The Responses wire is admitted on the API plan, automatically or by an exact Responses
+/// preference, and on the stock subscription plan.
+#[test]
+fn the_responses_wire_is_supported_on_the_api_plan_and_the_stock_subscription() {
+    let automatic = automatic();
+    assert_eq!(
+        automatic.managed_support(MODEL),
+        ManagedSupport::Supported { policy_version: 1 }
+    );
+    assert!(automatic.endpoint_for(MODEL).ends_with("/responses"));
+    assert!(prepare(&automatic, managed(with_model(MODEL))).is_ok());
+
+    let mut exact = OpenAiConfig::new(Vendor::OpenAi, MODEL, "test-key");
+    exact
+        .set_protocol_preference(ProtocolPreference::Exact(Protocol::Responses))
+        .unwrap();
+    let exact = OpenAiLlm::new(exact).unwrap();
+    assert_eq!(
+        exact.managed_support(MODEL),
+        ManagedSupport::Supported { policy_version: 1 }
+    );
+    assert!(prepare(&exact, managed(with_model(MODEL))).is_ok());
+
+    let mut subscription = OpenAiConfig::with_base_url(
+        Vendor::OpenAi,
+        MODEL,
+        "test-key",
+        OPENAI_SUBSCRIPTION_BASE_URL,
+    );
+    subscription.set_protocol(Protocol::Responses);
+    subscription.set_account_id("account");
+    let subscription = OpenAiLlm::new(subscription).unwrap();
+    assert_eq!(
+        subscription.managed_support(MODEL),
+        ManagedSupport::Supported { policy_version: 1 }
+    );
+    assert!(prepare(&subscription, managed(with_model(MODEL))).is_ok());
 }
 
 #[test]
@@ -816,4 +872,419 @@ mod seeded {
         assert_eq!(&roles[..3], ["system", "system", "user"]);
         assert!(!body.contains(HANDOFF_SEED_LABEL));
     }
+}
+
+/// The JSON body a prepared call sends, parsed back.
+fn sent(prepared: &PreparedCall) -> Value {
+    serde_json::from_str(prepared.body()).expect("the body is JSON")
+}
+
+/// On the API plan a managed Responses body is the ordinary encoding with plain history: the
+/// reservation is sent as the output ceiling, the prompt is `instructions`, and no replay field
+/// or reasoning item is present.
+#[test]
+fn a_managed_responses_body_on_the_api_plan_is_plain_and_sends_its_reservation() {
+    let llm = automatic();
+    let prepared = prepare(&llm, managed(with_model(MODEL))).unwrap();
+    let body = sent(&prepared);
+    assert_eq!(body["store"], json!(false));
+    assert_eq!(body["max_output_tokens"], json!(4_096));
+    assert_eq!(prepared.estimate().reservation, 4_096);
+    assert!(
+        body["instructions"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("you are nanus")),
+        "the prompt leads the instructions"
+    );
+    assert!(body.get("include").is_none());
+    assert!(body.get("previous_response_id").is_none());
+    let items = body["input"].as_array().expect("input items");
+    assert!(
+        items.iter().all(|item| item["type"] != "reasoning"),
+        "no reasoning item is sent back"
+    );
+    assert_eq!(prepared.selection().protocol, RESPONSES_PROTOCOL);
+}
+
+/// On the stock subscription plan the reservation is charged but never sent, because that plan
+/// refuses `max_output_tokens`. A candidate that fits only without the reservation is refused,
+/// and a reservation above the declared ceiling is refused rather than clamped.
+#[test]
+fn the_subscription_plan_omits_the_reservation_and_still_charges_it() {
+    let mut config = OpenAiConfig::with_base_url(
+        Vendor::OpenAi,
+        MODEL,
+        "test-key",
+        OPENAI_SUBSCRIPTION_BASE_URL,
+    );
+    config.set_protocol(Protocol::Responses);
+    config.set_account_id("account");
+    let llm = OpenAiLlm::new(config).unwrap();
+    let prepared = prepare(&llm, managed(with_model(MODEL))).unwrap();
+    let body = sent(&prepared);
+    assert!(body.get("max_output_tokens").is_none());
+    assert_eq!(prepared.estimate().reservation, 4_096);
+
+    let above = with_model(MODEL).with_max_tokens(128_001);
+    refused_by(&llm, above, "candidate_too_large");
+    assert!(
+        llm.prepare_managed(managed(with_model(MODEL).with_max_tokens(128_000)))
+            .is_ok(),
+        "the declared ceiling itself is admitted"
+    );
+}
+
+/// Each offered id declares the same text limits on every wire and on both official endpoints,
+/// so a budget is the model's whichever plan pays for it.
+#[test]
+fn every_offered_id_declares_the_same_limits_on_every_wire() {
+    for model in Vendor::OpenAi.models() {
+        let reference = automatic().capabilities(model);
+        for protocol in [Protocol::ChatCompletions, Protocol::Responses] {
+            let mut config = OpenAiConfig::new(Vendor::OpenAi, *model, "test-key");
+            config
+                .set_protocol_preference(ProtocolPreference::Exact(protocol))
+                .unwrap();
+            let caps = OpenAiLlm::new(config).unwrap().capabilities(model);
+            assert_eq!(caps.context_window_tokens, reference.context_window_tokens);
+            assert_eq!(caps.max_input_tokens, reference.max_input_tokens);
+            assert_eq!(caps.max_output_tokens, reference.max_output_tokens);
+        }
+    }
+}
+
+/// A Responses body answering `text` and completing.
+fn responses_answer(text: &str) -> String {
+    let mut sse = frame(&json!({ "type": "response.output_text.delta", "delta": text }));
+    sse.push_str(&frame(
+        &json!({ "type": "response.completed", "response": {} }),
+    ));
+    sse
+}
+
+/// The subscription plan's configuration: the stock automatic routing, which sends no ceiling.
+fn subscription() -> OpenAiLlm {
+    let mut config = OpenAiConfig::with_base_url(
+        Vendor::OpenAi,
+        MODEL,
+        "test-key",
+        OPENAI_SUBSCRIPTION_BASE_URL,
+    );
+    config.set_protocol(Protocol::Responses);
+    config.set_account_id("account");
+    OpenAiLlm::new(config).unwrap()
+}
+
+/// The exact bytes a managed Responses call sends reach the server, with the reservation as the
+/// output ceiling, plain history, and no replay field.
+#[tokio::test]
+async fn a_managed_responses_request_sends_exactly_the_bytes_it_prepared() {
+    let prepared = prepare(&automatic(), managed(with_model(MODEL))).unwrap();
+    let body = prepared.body().to_owned();
+    let digest = prepared.request_digest().clone();
+    let (received, events) = exchange_at(prepared, "/responses", responses_answer("ok")).await;
+    assert_eq!(
+        received,
+        body.as_bytes(),
+        "the server got the prepared body"
+    );
+    assert_eq!(Digest::of(&received), digest);
+    let sent: Value = serde_json::from_slice(&received).unwrap();
+    assert_eq!(sent["store"], json!(false));
+    assert_eq!(sent["max_output_tokens"], json!(4_096));
+    assert!(sent.get("include").is_none());
+    assert!(sent.get("previous_response_id").is_none());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::TextDelta(text) if text == "ok"))
+    );
+}
+
+/// The subscription plan's body reaches the server with no ceiling, the reservation being
+/// charged by accounting alone.
+#[tokio::test]
+async fn the_subscription_plan_sends_no_ceiling_to_the_server() {
+    let prepared = prepare(&subscription(), managed(with_model(MODEL))).unwrap();
+    let body = prepared.body().to_owned();
+    let (received, _) = exchange_at(prepared, "/responses", responses_answer("ok")).await;
+    assert_eq!(received, body.as_bytes());
+    let sent: Value = serde_json::from_slice(&received).unwrap();
+    assert!(sent.get("max_output_tokens").is_none());
+}
+
+/// A session reloaded from its log prepares the same bytes and digest.
+#[test]
+fn a_reloaded_responses_session_prepares_the_same_digest() {
+    let original = session();
+    let reloaded = Session::from_jsonl(&original.try_to_jsonl().unwrap()).unwrap();
+    let llm = automatic();
+    let first = prepare(&llm, managed(compiled(&original))).unwrap();
+    let second = prepare(&llm, managed(compiled(&reloaded))).unwrap();
+    assert_eq!(first.body(), second.body());
+    assert_eq!(first.request_digest(), second.request_digest());
+}
+
+/// An image turn is admitted on Responses, where the model declares image support, and refused on
+/// exact chat, where image support is unknown.
+#[test]
+fn an_image_turn_is_admitted_on_responses_and_refused_on_exact_chat() {
+    use base64::Engine as _;
+    use nanus_domain::ContentBlock;
+    let pixels = include_bytes!("../../nanus-domain/tests/data/tiny-green-triangle.png");
+    let turn = Message::user_with_content(vec![
+        ContentBlock::Text("what is in this picture?".into()),
+        ContentBlock::Image {
+            media_type: "image/png".into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(pixels),
+        },
+    ])
+    .unwrap();
+    let request = ChatRequest::new(MODEL, vec![Message::system("you are nanus"), turn])
+        .with_max_tokens(4_096);
+
+    let prepared = prepare(&automatic(), managed(request.clone())).unwrap();
+    assert!(prepared.body().contains("input_image"), "the image is sent");
+    assert!(
+        prepare(&llm(), managed(request)).is_err(),
+        "exact chat refuses images"
+    );
+}
+
+/// A `context_manage` call over its limit is cut on the Responses wire even though its name
+/// arrives only with the `done` event.
+#[tokio::test]
+async fn a_responses_call_over_its_limit_is_cut_on_the_wire() {
+    let big = "x".repeat(16 * 1024 + 1);
+    let mut sse = frame(&json!({ "type": "response.output_item.added", "item": {
+        "type": "function_call", "id": "fc_1", "call_id": "call_1", "arguments": "" } }));
+    sse.push_str(&frame(
+        &json!({ "type": "response.function_call_arguments.delta",
+        "item_id": "fc_1", "delta": big }),
+    ));
+    sse.push_str(&frame(
+        &json!({ "type": "response.output_item.done", "item": {
+        "type": "function_call", "id": "fc_1", "call_id": "call_1",
+        "name": "context_manage", "arguments": big } }),
+    ));
+    sse.push_str(&frame(
+        &json!({ "type": "response.completed", "response": {} }),
+    ));
+    let prepared = prepare(&automatic(), managed(with_model(MODEL))).unwrap();
+    let (_, events) = exchange_at(prepared, "/responses", sse).await;
+    assert_eq!(arguments(&events), OVERSIZED_ARGUMENTS);
+}
+
+/// An assistant turn recorded with another protocol's replay blocks, as an Anthropic turn is.
+fn anthropic_turn(text: Option<&str>, calls: Vec<ToolCall>) -> Message {
+    Message::Assistant {
+        text: text.map(str::to_owned),
+        reasoning: None,
+        replay: Some(nanus_domain::message::AssistantReplay {
+            protocol: "anthropic.messages".into(),
+            prefix_digest: "0".repeat(64),
+            context_receipt: None,
+            blocks: vec![json!({ "type": "thinking", "thinking": "hmm", "signature": "sig-1" })],
+        }),
+        tool_calls: calls,
+    }
+}
+
+/// Case 3: history is plain on the Responses wire. A replay turn is sent as its text and calls,
+/// never as its replay blocks, and a turn only replay can express is refused before HTTP.
+#[test]
+fn history_is_sent_plain_and_a_replay_only_turn_is_refused() {
+    let mut request = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("you are nanus"),
+            Message::user("first"),
+            anthropic_turn(Some("the answer"), Vec::new()),
+            Message::user("second"),
+        ],
+    )
+    .with_max_tokens(4_096);
+    let prepared = prepare(&automatic(), managed(request.clone())).unwrap();
+    let body = prepared.body();
+    assert!(body.contains("the answer"), "the text is sent");
+    assert!(!body.contains("sig-1"), "no signed block is sent");
+    let items: Value = serde_json::from_str(body).unwrap();
+    assert!(
+        items["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "reasoning"),
+        "no reasoning item"
+    );
+    assert!(!body.contains("encrypted"), "no encrypted replay");
+
+    // A stateless Responses replay turn: its encrypted items are not sent, only its text and calls.
+    let responses_turn = Message::Assistant {
+        text: Some("the stateless answer".into()),
+        reasoning: None,
+        replay: Some(nanus_domain::message::AssistantReplay {
+            protocol: "openai.responses".into(),
+            prefix_digest: "0".repeat(64),
+            context_receipt: None,
+            blocks: vec![
+                json!({ "id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "opaque-1" }),
+            ],
+        }),
+        tool_calls: Vec::new(),
+    };
+    let stateless = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("you are nanus"),
+            Message::user("first"),
+            responses_turn,
+            Message::user("second"),
+        ],
+    )
+    .with_max_tokens(4_096);
+    let stateless_body = prepare(&automatic(), managed(stateless)).unwrap();
+    assert!(stateless_body.body().contains("the stateless answer"));
+    assert!(
+        !stateless_body.body().contains("opaque-1"),
+        "no encrypted item is sent"
+    );
+
+    let replay_only = anthropic_turn(None, Vec::new());
+    request.messages = vec![
+        Message::system("you are nanus"),
+        Message::user("first"),
+        replay_only,
+    ];
+    refused_by(&automatic(), request, "protocol_incompatible");
+}
+
+/// Case 4: the generated working-data message sits directly after the first user item, as an
+/// assistant item, and is refused when it is the last message.
+#[test]
+fn the_generated_message_is_in_place_and_never_last() {
+    let generated = || Message::Assistant {
+        text: Some(format!(
+            "{}\n- a note",
+            nanus_domain::context::managed::compile::MEMORY_LABEL
+        )),
+        reasoning: None,
+        replay: None,
+        tool_calls: Vec::new(),
+    };
+    let placed = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("you are nanus"),
+            Message::user("first"),
+            generated(),
+            Message::user("second"),
+        ],
+    )
+    .with_max_tokens(4_096);
+    let prepared = prepare(&automatic(), managed(placed)).unwrap();
+    let body = sent(&prepared);
+    assert_eq!(
+        body["input"][1]["role"],
+        json!("assistant"),
+        "after the first user item"
+    );
+
+    let last = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("you are nanus"),
+            Message::user("first"),
+            generated(),
+        ],
+    )
+    .with_max_tokens(4_096);
+    refused_by(&automatic(), last, "protocol_incompatible");
+}
+
+/// Case 5: the seed is a system message and joins `instructions` after the notice; a session with
+/// no seed carries none of it.
+#[test]
+fn a_seed_leads_the_instructions_after_the_notice() {
+    let seeded = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("you are nanus"),
+            Message::system("the notice"),
+            Message::system("SEED: continue the parser"),
+            Message::user("hi"),
+        ],
+    )
+    .with_max_tokens(4_096);
+    let body = sent(&prepare(&automatic(), managed(seeded)).unwrap());
+    assert_eq!(
+        body["instructions"],
+        json!("you are nanus\n\nthe notice\n\nSEED: continue the parser")
+    );
+
+    let unseeded = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("you are nanus"),
+            Message::system("the notice"),
+            Message::user("hi"),
+        ],
+    )
+    .with_max_tokens(4_096);
+    let body = sent(&prepare(&automatic(), managed(unseeded)).unwrap());
+    assert_eq!(body["instructions"], json!("you are nanus\n\nthe notice"));
+}
+
+/// Case 6, tool results: an image result is answered with its label, and its pixels follow as one
+/// trailing user item once the whole group of results has been answered.
+#[test]
+fn an_image_tool_result_is_answered_with_its_label_and_its_pixels_follow() {
+    use base64::Engine as _;
+    let pixels = include_bytes!("../../nanus-domain/tests/data/tiny-green-triangle.png");
+    let call = ToolCall::new(
+        ToolCallId::new("look"),
+        ToolName::new("read").unwrap(),
+        json!({ "path": "pic.png" }),
+    );
+    let request = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::system("you are nanus"),
+            Message::user("look at the picture"),
+            Message::Assistant {
+                text: None,
+                reasoning: None,
+                replay: None,
+                tool_calls: vec![call],
+            },
+            Message::Tool {
+                call_id: ToolCallId::new("look"),
+                content: "the picture".into(),
+                content_blocks: Some(vec![nanus_domain::ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(pixels),
+                }]),
+                is_error: false,
+            },
+        ],
+    )
+    .with_tools(vec![schema("read")])
+    .with_max_tokens(4_096);
+    let body = sent(&prepare(&automatic(), managed(request)).unwrap());
+    let items = body["input"].as_array().unwrap();
+    let output = items
+        .iter()
+        .position(|item| item["type"] == json!("function_call_output"))
+        .expect("a result item");
+    assert_eq!(
+        items[output]["output"],
+        json!("[tool image attachment: look; is_error=false]"),
+        "the result is answered with its label"
+    );
+    let pixels_item = &items[items.len() - 1];
+    assert_eq!(pixels_item["role"], json!("user"));
+    assert!(
+        pixels_item.to_string().contains("input_image"),
+        "the pixels follow the group"
+    );
 }

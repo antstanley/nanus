@@ -42,8 +42,8 @@ pub use records::{
     ContextModeRecord, ContextPolicy, DecisionOutcome, Durability, HANDOFF_HEADER_FIELDS,
     HandoffRecord, HandoffSeed, MaintenanceAttemptKind, ModeActor, ModeReason, NoteCategory,
     ProjectionRevision, RawEncoding, RecoveryReason, RecoveryRecord, RequestAttemptRecord,
-    RevisionAuthor, RevisionReason, SelectionIdentity, SnapshotProfile, SourceField, SourceKind,
-    SourceRef, UsageObservation, WorkingNote, handoff_narrative_is_admissible,
+    ReserveBudget, RevisionAuthor, RevisionReason, SelectionIdentity, SnapshotProfile, SourceField,
+    SourceKind, SourceRef, UsageObservation, WorkingNote, handoff_narrative_is_admissible,
     imitates_handoff_header, split_handoff_document,
 };
 pub use state::{ManagedState, RecoveryPlan};

@@ -140,10 +140,13 @@ fn capability_evidence_belongs_to_the_selected_wire_and_endpoint() {
     let mut chat = config();
     exact(&mut chat, Protocol::ChatCompletions);
     let chat = OpenAiLlm::new(chat).expect("chat adapter");
-    assert_eq!(
-        chat.capabilities("gpt-6-astra"),
-        nanus_ports::ModelCapabilities::default()
-    );
+    // The model's text limits are the model's on every wire; image and tool evidence is not.
+    let caps = chat.capabilities("gpt-6-astra");
+    assert_eq!(caps.image_input, ImageInputSupport::Unknown);
+    assert_eq!(caps.image_profile, None);
+    assert_eq!(caps.context_window_tokens, Some(1_050_000));
+    assert_eq!(caps.max_input_tokens, Some(1_050_000));
+    assert_eq!(caps.max_output_tokens, Some(128_000));
     for endpoint in [
         "https://proxy.example.test/v1",
         "http://api.openai.com/v1",

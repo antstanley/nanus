@@ -641,26 +641,36 @@ impl OpenAiConfig {
     ///
     /// Evidence belongs to an exact model on a known endpoint: z.ai's API models, Inception's
     /// chat models, and `OpenAI`'s image-profiled models on the Responses endpoints. Chat and
-    /// proxies inherit nothing.
+    /// proxies inherit nothing. A model's window and ceilings are the model's, though: `OpenAI`'s
+    /// offered ids declare the same limits on chat, on Responses, and on either plan, so a budget
+    /// is the same whichever way the access is paid for. Only image and tool evidence stays with
+    /// the wire it was recorded on.
     #[must_use]
     pub fn capabilities(&self, model: &str) -> nanus_ports::ModelCapabilities {
         match self.vendor {
             Vendor::Zai => crate::zai::capabilities(self, model),
             Vendor::Inception => crate::inception::capabilities(self, model),
             Vendor::OpenAi => {
-                if !self.has_verified_responses_endpoint()
-                    || !matches!(self.resolve_protocol(model), Ok(Protocol::Responses))
-                {
+                let official = matches!(
+                    self.base_url.trim_end_matches('/'),
+                    OPENAI_BASE_URL | OPENAI_SUBSCRIPTION_BASE_URL
+                );
+                if !official || !Vendor::OpenAi.models().contains(&model) {
                     return nanus_ports::ModelCapabilities::default();
                 }
-                let Some(profile) =
+                let profile = if matches!(self.resolve_protocol(model), Ok(Protocol::Responses)) {
                     nanus_ports::capabilities::ImageProfile::for_openai_model(model)
-                else {
-                    return nanus_ports::ModelCapabilities::default();
+                } else {
+                    None
+                };
+                let image_input = if profile.is_some() {
+                    nanus_ports::ImageInputSupport::Supported
+                } else {
+                    nanus_ports::ImageInputSupport::Unknown
                 };
                 nanus_ports::ModelCapabilities {
-                    image_input: nanus_ports::ImageInputSupport::Supported,
-                    image_profile: Some(profile),
+                    image_input,
+                    image_profile: profile,
                     context_window_tokens: Some(1_050_000),
                     max_input_tokens: Some(if model == "gpt-6-astra" {
                         1_050_000

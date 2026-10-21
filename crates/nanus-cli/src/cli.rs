@@ -107,14 +107,37 @@ pub struct ContextArgs {
     #[arg(long, value_name = "MODE", value_parser = ["legacy", "managed"])]
     pub context_mode: Option<String>,
 
-    /// Output tokens every managed request reserves.
-    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
-    pub context_output_reserve: Option<u32>,
+    /// Output tokens every managed request reserves, or `model` to reserve the model's declared
+    /// output ceiling and follow it across model switches. Recorded in the session's policy.
+    #[arg(long, value_name = "TOKENS|model", value_parser = parse_reserve)]
+    pub context_output_reserve: Option<ReserveFlag>,
 
     /// Archive shell output before its preview is cut, so it can be recalled. Managed only:
     /// it never turns managed context on by itself.
     #[arg(long)]
     pub capture_shell_evidence: bool,
+}
+
+/// What `--context-output-reserve` names: an explicit number, or the model's own ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveFlag {
+    /// An explicit reservation of this many tokens, which does not move with the model.
+    Tokens(u32),
+    /// The model's declared output ceiling, resolved for each request.
+    Model,
+}
+
+/// Parses a positive token count or the word `model`.
+fn parse_reserve(raw: &str) -> Result<ReserveFlag, String> {
+    if raw == "model" {
+        return Ok(ReserveFlag::Model);
+    }
+    match raw.parse::<u32>() {
+        Ok(tokens) if tokens >= 1 => Ok(ReserveFlag::Tokens(tokens)),
+        _ => Err(format!(
+            "expected a positive token count or `model`, not `{raw}`"
+        )),
+    }
 }
 
 /// What the binary was asked to do.
@@ -1043,6 +1066,40 @@ fn report_answer(outcome: &nanus_bundle::RunOutcome, verbose: bool) -> Result<()
     Err(format!("the run did not complete: {:?}", outcome.reason))
 }
 
+/// The policy the flags ask for, on top of the one the session recorded: the mode, the reserve and
+/// capture as given, and everything else kept. Pure, so the flags' meaning is tested without a store.
+fn wanted_policy(
+    current: nanus_domain::context::managed::ContextPolicy,
+    flags: &ContextArgs,
+) -> nanus_domain::context::managed::ContextPolicy {
+    use nanus_domain::context::managed::ContextMode;
+    let mut wanted = current;
+    match flags.context_mode.as_deref() {
+        Some("managed") => wanted.mode = ContextMode::Managed,
+        Some(_) => wanted = wanted.disabled(),
+        None => {}
+    }
+    apply_reserve(&mut wanted, flags.context_output_reserve);
+    wanted
+}
+
+/// Applies `--context-output-reserve` to a policy. Absent keeps the policy's recorded reservation,
+/// a number makes it explicit, and `model` makes it follow the model, with the number left for the
+/// recording to resolve against the model in force.
+fn apply_reserve(
+    policy: &mut nanus_domain::context::managed::ContextPolicy,
+    flag: Option<ReserveFlag>,
+) {
+    match flag {
+        Some(ReserveFlag::Tokens(tokens)) => {
+            policy.output_reserve_tokens = tokens;
+            policy.output_reserve_follows_model = false;
+        }
+        Some(ReserveFlag::Model) => policy.output_reserve_follows_model = true,
+        None => {}
+    }
+}
+
 /// Applies a run's context flags, binding the session's checkpoint when it is or becomes managed.
 ///
 /// `None` is a session that never managed its context and is not asked to now: it runs, and is
@@ -1055,15 +1112,7 @@ fn bind_context(
 ) -> Result<Option<ManagedBinding>, String> {
     use nanus_domain::context::managed::{ContextMode, ModeActor};
     let current = nanus_bundle::AgentRunner::context_policy(session);
-    let mut wanted = current;
-    match flags.context_mode.as_deref() {
-        Some("managed") => wanted.mode = ContextMode::Managed,
-        Some(_) => wanted = wanted.disabled(),
-        None => {}
-    }
-    if let Some(reserve) = flags.context_output_reserve {
-        wanted.output_reserve_tokens = reserve;
-    }
+    let mut wanted = wanted_policy(current, flags);
     if flags.capture_shell_evidence {
         if wanted.mode != ContextMode::Managed {
             return Err(String::from(
@@ -2011,7 +2060,10 @@ mod tests {
             panic!("the flags parse: {parsed:?}");
         };
         assert_eq!(context.context_mode.as_deref(), Some("managed"));
-        assert_eq!(context.context_output_reserve, Some(8_000));
+        assert_eq!(
+            context.context_output_reserve,
+            Some(ReserveFlag::Tokens(8_000))
+        );
         assert!(context.capture_shell_evidence);
         assert!(check_new_session_flags(None, &context).is_ok());
 
@@ -2019,6 +2071,34 @@ mod tests {
         assert!(Args::try_parse_from(unknown).is_err());
         let zero = ["nanus", "run", "--context-output-reserve", "0", "x"];
         assert!(Args::try_parse_from(zero).is_err());
+        let negative = ["nanus", "run", "--context-output-reserve", "-1", "x"];
+        assert!(Args::try_parse_from(negative).is_err());
+        let plural = ["nanus", "run", "--context-output-reserve", "models", "x"];
+        assert!(Args::try_parse_from(plural).is_err());
+
+        let model = Args::try_parse_from([
+            "nanus",
+            "run",
+            "--context-mode",
+            "managed",
+            "--context-output-reserve",
+            "model",
+            "do it",
+        ]);
+        let Ok(Args {
+            command: Some(Command::Run { context, .. }),
+            ..
+        }) = model
+        else {
+            panic!("`model` parses: {model:?}");
+        };
+        assert_eq!(context.context_output_reserve, Some(ReserveFlag::Model));
+        assert!(check_new_session_flags(None, &context).is_ok());
+        let following_alone = ContextArgs {
+            context_output_reserve: Some(ReserveFlag::Model),
+            ..ContextArgs::default()
+        };
+        assert!(check_new_session_flags(None, &following_alone).is_err());
 
         let capture_alone = ContextArgs {
             capture_shell_evidence: true,
@@ -2027,13 +2107,58 @@ mod tests {
         let refused = check_new_session_flags(None, &capture_alone);
         assert!(refused.is_err_and(|error| error.contains("--context-mode managed")));
         let reserve_alone = ContextArgs {
-            context_output_reserve: Some(10),
+            context_output_reserve: Some(ReserveFlag::Tokens(10)),
             ..ContextArgs::default()
         };
         assert!(check_new_session_flags(None, &reserve_alone).is_err());
         // On resume the session's recorded policy decides, so the check is deferred to it.
         assert!(check_new_session_flags(Some("nightly"), &capture_alone).is_ok());
         assert!(check_new_session_flags(None, &ContextArgs::default()).is_ok());
+    }
+
+    /// Case 22, through the CLI's parser: `nanus run --resume <id> --context-output-reserve model`
+    /// asks for a following reservation on a resumed explicit session, keeping every other field of
+    /// the recorded policy. Without the flag the recorded reservation is kept.
+    #[test]
+    fn a_resumed_explicit_session_asks_for_a_following_reservation_through_the_cli() {
+        use nanus_domain::context::managed::{ContextMode, ContextPolicy};
+        let recorded = ContextPolicy {
+            mode: ContextMode::Managed,
+            output_reserve_tokens: 8_000,
+            output_reserve_follows_model: false,
+            capture_shell: true,
+            ..ContextPolicy::default()
+        };
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["nanus", "run", "--resume", "s", "--context-mode", "managed"];
+            argv.extend_from_slice(extra);
+            argv.push("continue");
+            match Args::try_parse_from(argv).unwrap().command {
+                Some(Command::Run { context, .. }) => context,
+                other => panic!("the run command parses: {other:?}"),
+            }
+        };
+
+        let absent = wanted_policy(recorded, &parse(&[]));
+        assert_eq!(
+            absent, recorded,
+            "absent keeps the recorded policy, capture included"
+        );
+
+        let asked = wanted_policy(recorded, &parse(&["--context-output-reserve", "model"]));
+        assert!(
+            asked.output_reserve_follows_model,
+            "`model` asks for a following reservation"
+        );
+        assert_eq!(
+            asked.output_reserve_tokens, 8_000,
+            "the number is left for the recording"
+        );
+        assert!(asked.capture_shell, "the other fields are kept");
+
+        let numbered = wanted_policy(asked, &parse(&["--context-output-reserve", "4096"]));
+        assert!(!numbered.output_reserve_follows_model);
+        assert_eq!(numbered.output_reserve_tokens, 4_096);
     }
 
     #[test]

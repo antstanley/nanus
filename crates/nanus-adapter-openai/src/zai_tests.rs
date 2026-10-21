@@ -299,6 +299,8 @@ fn local_adapter() -> (OpenAiLlm, TcpListener) {
         OpenAiLlm {
             client,
             config: config("glm-5.3"),
+            #[cfg(feature = "test-endpoint")]
+            test_origin: None,
         },
         listener,
     )

@@ -11,7 +11,14 @@ pub const POLICY_VERSION: u32 = 1;
 /// The version of the generated-memory and notice rendering, bound into the notes digest.
 pub const RENDERER_VERSION: u32 = 1;
 
-/// The output reservation a policy starts with.
+/// The placeholder reservation of a following policy, which no model has resolved yet.
+///
+/// A policy is built before any model is known, and [`ContextPolicy::validate`] refuses a zero
+/// reservation, so the placeholder keeps the number non-zero. It is never a reservation in force:
+/// recording a following policy replaces it with the resolved number, and a request resolves its
+/// own.
+///
+/// [`ContextPolicy::validate`]: crate::context::managed::records::ContextPolicy::validate
 pub const DEFAULT_OUTPUT_RESERVE_TOKENS: u32 = 4_096;
 
 /// Percent of the admissible input allowance at which a budget hint is given.

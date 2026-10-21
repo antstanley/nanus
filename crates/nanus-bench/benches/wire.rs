@@ -129,6 +129,36 @@ fn messages_body() -> String {
     body
 }
 
+/// A Responses body: the same answer as [`chat_body`] as named events, so the ordinary
+/// Responses decode path is measured on the deltas it carries, with no argument limits set.
+fn responses_body() -> String {
+    let mut body = String::new();
+    body.push_str(&event(
+        &json!({ "type": "response.created", "response": { "id": "resp_bench" } }),
+    ));
+    for _ in 0..DELTAS {
+        body.push_str(&event(
+            &json!({ "type": "response.output_text.delta", "delta": "the log " }),
+        ));
+    }
+    body.push_str(&event(&json!({ "type": "response.output_item.added", "item": {
+        "type": "function_call", "id": "fc_1", "call_id": "call-1", "name": "read", "arguments": "" } })));
+    for fragment in ARGUMENTS {
+        body.push_str(&event(
+            &json!({ "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1", "delta": fragment }),
+        ));
+    }
+    body.push_str(&event(
+        &json!({ "type": "response.output_item.done", "item": {
+        "type": "function_call", "id": "fc_1", "call_id": "call-1", "name": "read",
+        "arguments": ARGUMENTS.concat() } }),
+    ));
+    body.push_str(&event(&json!({ "type": "response.completed", "response": {
+        "id": "resp_bench", "usage": { "input_tokens": 14_500, "output_tokens": 420 } } })));
+    body
+}
+
 /// Budgets generous enough that the fixture never trips one, so the limited reader is
 /// measured doing its accounting rather than failing.
 fn limits() -> ResponseLimits {
@@ -364,6 +394,11 @@ fn openai_at(base: &str) -> Box<dyn LlmPort> {
     Box::new(OpenAiLlm::new(config).unwrap_or_else(|error| unreachable!("adapter: {error}")))
 }
 
+fn openai_responses_at(base: &str) -> Box<dyn LlmPort> {
+    let config = OpenAiConfig::with_base_url(Vendor::OpenAi, "gpt-5.6-sol", "bench-key", base);
+    Box::new(OpenAiLlm::new(config).unwrap_or_else(|error| unreachable!("adapter: {error}")))
+}
+
 fn anthropic_at(base: &str) -> Box<dyn LlmPort> {
     let config = AnthropicConfig::with_base_url("claude-sonnet-5-5", "bench-key", base);
     Box::new(AnthropicLlm::new(config).unwrap_or_else(|error| unreachable!("adapter: {error}")))
@@ -378,9 +413,16 @@ fn stream<M: Metric>(c: &mut Criterion<M>) {
     windows(&mut group, 10, Duration::from_secs(3));
     let chat = chat_body();
     let messages = messages_body();
-    let cases: [(&str, &str, &str, Build); 3] = [
+    let responses = responses_body();
+    let cases: [(&str, &str, &str, Build); 4] = [
         ("deepseek", "deepseek-flash", &chat, deepseek_at),
         ("openai_chat", "gpt-5", &chat, openai_at),
+        (
+            "openai_responses",
+            "gpt-5.6-sol",
+            &responses,
+            openai_responses_at,
+        ),
         ("anthropic", "claude-sonnet-5-5", &messages, anthropic_at),
     ];
     for (name, model, body, build) in cases {
@@ -405,4 +447,35 @@ fn stream<M: Metric>(c: &mut Criterion<M>) {
     group.finish();
 }
 
-nanus_bench::benches!(sse, encode, stream);
+/// The Responses decoder alone, over the frames the stream benchmark sends, with no socket. Its
+/// allocation count is the decoder's own: nothing here depends on how bytes arrived off the network,
+/// so it separates a decoder change from a change in transport timing.
+fn decode<M: Metric>(c: &mut Criterion<M>) {
+    let mut group = c.benchmark_group(M::group("wire/decode"));
+    windows(&mut group, 10, Duration::from_secs(3));
+    let frames: Vec<Value> = responses_body()
+        .split("\n\n")
+        .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+        .map(|json| {
+            serde_json::from_str(json).unwrap_or_else(|error| unreachable!("frame: {error}"))
+        })
+        .collect();
+    group.throughput(Throughput::Elements(frames.len() as u64));
+    group.bench_function("openai_responses", |b| {
+        b.iter(|| {
+            let mut accumulator = nanus_adapter_openai::responses::StreamAccumulator::default();
+            for frame in &frames {
+                accumulator.observe_frame(black_box(frame));
+            }
+            accumulator.close();
+            let mut events = 0_usize;
+            while accumulator.take_ready().is_some() {
+                events = events.saturating_add(1);
+            }
+            black_box(events)
+        });
+    });
+    group.finish();
+}
+
+nanus_bench::benches!(sse, encode, stream, decode);

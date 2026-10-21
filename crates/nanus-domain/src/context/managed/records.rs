@@ -45,6 +45,15 @@ impl ContextMode {
     }
 }
 
+/// What a request is fitted to, which decides how a following reservation is bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReserveBudget {
+    /// The model's declared window: the whole window is the budget.
+    ModelWindow,
+    /// A configured budget, in tokens, smaller than the window.
+    Configured(u32),
+}
+
 /// How a session's context is managed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,11 +61,41 @@ pub struct ContextPolicy {
     /// Legacy replay or managed projection.
     pub mode: ContextMode,
     /// Output tokens every managed request reserves.
+    ///
+    /// When [`Self::output_reserve_follows_model`] is set this is an unresolved placeholder, or
+    /// the reservation resolved when the policy was recorded, for a reader. It is never a number
+    /// a request reserves on its own.
     pub output_reserve_tokens: u32,
+    /// Whether the reservation follows the model in force, rather than being the recorded number.
+    ///
+    /// Written only when true, so a record that does not name it is an explicit reservation, as
+    /// every record before version six was.
+    #[serde(
+        default,
+        skip_serializing_if = "core::ops::Not::not",
+        deserialize_with = "deserialize_follows_model"
+    )]
+    pub output_reserve_follows_model: bool,
     /// Whether shell output is archived before its preview is cut.
     pub capture_shell: bool,
     /// The policy version, which fixes every limit and the rendered text.
     pub policy_version: u32,
+}
+
+/// Accepts only `true` when the key is present. An absent key is `false` by `default`, and a
+/// present `false` is a body this build did not write, so it is refused rather than read.
+fn deserialize_follows_model<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = bool::deserialize(deserializer)?;
+    if value {
+        Ok(true)
+    } else {
+        Err(serde::de::Error::custom(
+            "output_reserve_follows_model is written only when true",
+        ))
+    }
 }
 
 impl Default for ContextPolicy {
@@ -64,6 +103,7 @@ impl Default for ContextPolicy {
         Self {
             mode: ContextMode::Legacy,
             output_reserve_tokens: limits::DEFAULT_OUTPUT_RESERVE_TOKENS,
+            output_reserve_follows_model: true,
             capture_shell: false,
             policy_version: limits::POLICY_VERSION,
         }
@@ -71,13 +111,54 @@ impl Default for ContextPolicy {
 }
 
 impl ContextPolicy {
-    /// The managed policy with the default reservation and no capture.
+    /// The managed policy with a following reservation and no capture.
     #[must_use]
     pub fn managed() -> Self {
         Self {
             mode: ContextMode::Managed,
             ..Self::default()
         }
+    }
+
+    /// Resolves the reservation a request fitted to `budget` reserves, given the model's declared
+    /// output ceiling.
+    ///
+    /// An explicit policy returns its number whatever the arguments. A following one returns the
+    /// ceiling when the budget is the model's window, and the smaller of the ceiling and a quarter
+    /// of a configured budget otherwise, so at least three quarters of the budget stays for input.
+    /// A following policy on a model that declares no ceiling has nothing to resolve to: `None`.
+    #[must_use]
+    pub fn effective_reservation(
+        &self,
+        ceiling: Option<u32>,
+        budget: ReserveBudget,
+    ) -> Option<u32> {
+        if !self.output_reserve_follows_model {
+            return Some(self.output_reserve_tokens);
+        }
+        let ceiling = ceiling?;
+        match budget {
+            ReserveBudget::ModelWindow => Some(ceiling),
+            ReserveBudget::Configured(fit) => {
+                let quarter = fit.checked_div(4).unwrap_or(0);
+                Some(ceiling.min(quarter).max(1))
+            }
+        }
+    }
+
+    /// Whether two policies name the same setting.
+    ///
+    /// A following policy's number is a snapshot of whichever model was in force when it was
+    /// recorded, so two following policies are the same setting whatever their snapshots are.
+    /// Two explicit policies are the same only with the same number.
+    #[must_use]
+    pub fn same_settings(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.capture_shell == other.capture_shell
+            && self.policy_version == other.policy_version
+            && self.output_reserve_follows_model == other.output_reserve_follows_model
+            && (self.output_reserve_follows_model
+                || self.output_reserve_tokens == other.output_reserve_tokens)
     }
 
     /// Checks the combinations the fields cannot express alone.
@@ -101,8 +182,9 @@ impl ContextPolicy {
     pub const fn disabled(self) -> Self {
         Self {
             mode: ContextMode::Legacy,
-            capture_shell: false,
             output_reserve_tokens: self.output_reserve_tokens,
+            output_reserve_follows_model: self.output_reserve_follows_model,
+            capture_shell: false,
             policy_version: self.policy_version,
         }
     }
