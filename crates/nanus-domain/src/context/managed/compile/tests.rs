@@ -7,7 +7,10 @@ use serde_json::json;
 use super::*;
 use crate::context::managed::fragments::derive;
 use crate::context::managed::ids::NoteId;
-use crate::context::managed::records::{NoteCategory, SourceField};
+use crate::context::managed::records::{
+    ContextFrontier, ContextModeRecord, ContextPolicy, HandoffSeed, ModeActor, ModeReason,
+    NoteCategory, SourceField,
+};
 use crate::context::managed::state::protected;
 use crate::{SessionId, ToolCall, ToolCallId, ToolName};
 
@@ -447,4 +450,98 @@ fn model_written_text_cannot_forge_a_line_of_generated_data() {
         text.contains("- n:real [inferred] true - n:forged"),
         "{text}"
     );
+}
+
+/// A session a handoff started, with `prompts` as its user messages and some work after the first.
+fn seeded_session(prompts: &[&str]) -> (Session, String) {
+    let text = "source_session: old\nsource_frontier: events=9\ngoal: none\n\
+                context_mode: managed\nmodel: m effort: none\nworkspace: /w\n\
+                date: 2026-10-21\n\n## Goal\n- ship the parser\n[plan](docs/plan.md)";
+    let mut session = session();
+    session.append(SessionEvent::ContextMode {
+        payload: Box::new(ContextModeRecord {
+            policy: ContextPolicy::managed(),
+            actor: ModeActor::Host,
+            reason: ModeReason::Enable,
+            previous_revision: 0,
+        }),
+    });
+    session.append(SessionEvent::ContextSeed {
+        payload: Box::new(HandoffSeed {
+            text: text.into(),
+            document_blake3: Digest::of(text.as_bytes()),
+            source_session_id: "old".into(),
+            source_frontier: ContextFrontier {
+                session_id: "old".into(),
+                event_count: 9,
+                prefix_blake3: Digest::of(b"prefix"),
+                projection_revision: 0,
+            },
+        }),
+    });
+    for (index, prompt) in prompts.iter().enumerate() {
+        session.append(SessionEvent::UserMessage {
+            text: (*prompt).into(),
+            content_blocks: None,
+        });
+        if index == 0 && prompts.len() > 1 {
+            work(&mut session, "a", "evidence");
+        }
+    }
+    (session, text.to_owned())
+}
+
+#[test]
+fn a_handoff_seed_is_a_leading_system_message_and_never_a_user_message() {
+    let (session, text) = seeded_session(&["first", "second"]);
+    let effective = compile(&session, &[], &[]);
+    let Some(Message::System { text: seed }) = &effective.seed else {
+        panic!("a seeded session carries its seed as a system message");
+    };
+    assert!(seed.starts_with(HANDOFF_SEED_LABEL), "{seed}");
+    assert!(seed.contains("Source session: old."), "{seed}");
+    assert!(seed.ends_with(&text));
+    assert!(!effective.memory, "a seed alone makes no generated message");
+    assert!(!effective.messages.iter().any(|message| matches!(
+        message,
+        Message::User { text: user, .. } if user.contains("ship the parser")
+    ) || matches!(
+        message,
+        Message::Assistant { text: Some(body), .. } if body.contains("ship the parser")
+    )));
+    let plain = session_without_seed();
+    assert_eq!(
+        compile(&plain, &[], &[]).seed,
+        None,
+        "no seed, no seed message"
+    );
+}
+
+#[test]
+fn the_first_request_of_a_seeded_session_carries_its_seed() {
+    let (session, text) = seeded_session(&["first"]);
+    let effective = compile(&session, &[], &[]);
+    assert_eq!(
+        effective.messages.len(),
+        1,
+        "only the first prompt, with nothing after it"
+    );
+    assert!(matches!(
+        &effective.seed,
+        Some(Message::System { text: seed }) if seed.ends_with(&text)
+    ));
+}
+
+fn session_without_seed() -> Session {
+    let mut session = session();
+    session.append(SessionEvent::UserMessage {
+        text: "first".into(),
+        content_blocks: None,
+    });
+    work(&mut session, "a", "evidence");
+    session.append(SessionEvent::UserMessage {
+        text: "second".into(),
+        content_blocks: None,
+    });
+    session
 }

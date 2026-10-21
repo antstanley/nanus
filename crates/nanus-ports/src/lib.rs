@@ -122,7 +122,10 @@ pub use shell::{
     ShellRequest, ShellResult, ShellStream,
 };
 pub use sse::SseFrames;
-pub use store::{SessionSummary, StoreError, StoreHandle, StorePort, StoreResult};
+pub use store::{
+    SESSION_NAME_MAX_CHARS, SessionSummary, StoreError, StoreHandle, StorePort, StoreResult,
+    session_name_problem,
+};
 pub use tool_admission::{
     AdmissionError, ToolAdmission, ToolBatchProjection, ToolBatchReservation,
 };

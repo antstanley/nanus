@@ -211,6 +211,7 @@ fn backlog<M: Metric>(c: &mut Criterion<M>) {
                 prefix_blake3: "0".repeat(64),
                 projection_revision: 0,
             },
+            compaction_boundary: None,
         },
         segments,
     };

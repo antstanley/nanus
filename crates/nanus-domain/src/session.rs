@@ -44,15 +44,17 @@
 //! promises to guard.
 
 use core::fmt;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::context::managed::ids::{Digest, ErrorCode, Hasher};
 use crate::context::managed::records::{
-    ArtifactReceipt, ContextDecision, ContextModeRecord, ProjectionRevision, RecoveryRecord,
-    RequestAttemptRecord,
+    ArtifactReceipt, AttemptPhase, ContextDecision, ContextMode, ContextModeRecord, HandoffRecord,
+    HandoffSeed, ProjectionRevision, RecoveryRecord, RequestAttemptRecord, UsageObservation,
 };
+use crate::context::{COMPACTION_LABEL, CompactionMethod, CompactionRecord};
 use crate::goal::Goal;
 use crate::message::{Message, ToolCallId, Usage};
 use crate::tool::{ToolCall, ToolName};
@@ -78,11 +80,21 @@ pub const SESSION_FORMAT_VERSION: u32 = 2;
 /// session is managed is said by its header, because the version no longer implies it.
 pub const SESSION_FORMAT_VERSION_USER_CONTENT: u32 = 4;
 
+/// The body version of a session that carries a record of a maintenance request.
+///
+/// Those records are a compaction marker (`context/compact`), a handoff seed (`context/seed`), a
+/// handoff back-link (`context/handoff`), and a request attempt with a `kind`, which is what a
+/// handoff draft writes. Their own version because a reader that predates them does not know them
+/// and would fail part-way through the body, so a reader that predates it refuses the whole session
+/// at the header. It holds everything version 4 holds, and its header's `managed` flag means what
+/// it means at version 4. See [`SessionEvent::needs_version_five`].
+pub const SESSION_FORMAT_VERSION_COMPACTED: u32 = 5;
+
 /// The oldest session file format version this crate still reads.
 pub const OLDEST_SESSION_FORMAT_VERSION: u32 = 1;
 
 /// The newest session file format version this crate writes and reads.
-pub const NEWEST_SESSION_FORMAT_VERSION: u32 = SESSION_FORMAT_VERSION_USER_CONTENT;
+pub const NEWEST_SESSION_FORMAT_VERSION: u32 = SESSION_FORMAT_VERSION_COMPACTED;
 
 /// Whether this crate reads a session whose header names `version`.
 ///
@@ -400,9 +412,55 @@ pub enum SessionEvent {
         /// The recovery record.
         payload: Box<RecoveryRecord>,
     },
+    /// The confirmed handoff document a new session starts from.
+    ///
+    /// A managed record, and only ever the second event, directly after the managed `context/mode`
+    /// record that opens the session. It is generated data, never a user message: the managed
+    /// compiler sends it as a labelled leading system message on every request, the first
+    /// included, and a legacy prompt leads with the same message if the session is switched to
+    /// legacy context before any compaction cut.
+    #[serde(rename = "context/seed")]
+    ContextSeed {
+        /// The seed.
+        payload: Box<HandoffSeed>,
+    },
+    /// The old session's account of a handoff it made, naming the session it seeded.
+    #[serde(rename = "context/handoff")]
+    ContextHandoff {
+        /// The handoff record.
+        payload: Box<HandoffRecord>,
+    },
+    /// A compaction cut: everything before this record leaves the legacy prompt from now on.
+    ///
+    /// Legacy only, and not a managed record: it needs body version 5 rather than version 3,
+    /// because a managed body and a compacted one are different promises to an older reader. The
+    /// summary travels with the record and leads every later prompt. The raw log is untouched, and
+    /// the marker is itself the boundary: its own sequence is the event count it cuts at.
+    #[serde(rename = "context/compact")]
+    ContextCompact {
+        /// The compaction record.
+        payload: Box<CompactionRecord>,
+    },
 }
 
 impl SessionEvent {
+    /// Returns `true` for a record only a version-5 body may hold.
+    ///
+    /// The records of a maintenance request: a compaction marker, a handoff seed and back-link, and
+    /// a request attempt that names what maintenance it was for. A version-4 reader knows none of
+    /// them, and an attempt's `kind` is a field its strict parser would refuse part-way through the
+    /// body.
+    #[must_use]
+    pub fn needs_version_five(&self) -> bool {
+        match self {
+            Self::ContextCompact { .. }
+            | Self::ContextSeed { .. }
+            | Self::ContextHandoff { .. } => true,
+            Self::RequestAttempt { payload } => payload.kind.is_some(),
+            _ => false,
+        }
+    }
+
     /// Returns `true` for a record only a version-3 body may hold.
     #[must_use]
     pub const fn is_managed_record(&self) -> bool {
@@ -414,6 +472,8 @@ impl SessionEvent {
                 | Self::ArtifactPublished { .. }
                 | Self::RequestAttempt { .. }
                 | Self::ContextRecovery { .. }
+                | Self::ContextSeed { .. }
+                | Self::ContextHandoff { .. }
         )
     }
 
@@ -443,6 +503,8 @@ impl SessionEvent {
                     Ok(())
                 }
             }
+            Self::ContextSeed { payload } => payload.validate(),
+            Self::ContextHandoff { payload } => payload.validate(),
             _ => Ok(()),
         }
     }
@@ -539,6 +601,50 @@ impl SessionLog {
             .collect()
     }
 
+    /// Folds the log into the messages a legacy prompt is built from, after its compaction cut.
+    ///
+    /// Without a marker this is exactly [`SessionLog::derive_messages`]. With one, the newest
+    /// marker's summary leads as a system message, and only events from its boundary on are folded:
+    /// everything before the cut stays in the log and out of the prompt. The summary sits before
+    /// the first user message, so a legacy fit keeps it as part of the leading prompt.
+    #[must_use]
+    pub fn derive_prompt_messages(&self) -> Vec<Message> {
+        let Some(marker) = self.compaction_marker() else {
+            return self.derive_messages();
+        };
+        let boundary = marker.boundary_event_count;
+        let mut messages = vec![Message::system(format!(
+            "{COMPACTION_LABEL}\n{}",
+            marker.summary
+        ))];
+        messages.extend(
+            self.derive_messages_indexed(|seq| seq >= boundary)
+                .into_iter()
+                .map(|(_, message)| message),
+        );
+        // Postcondition: the cut adds one summary and folds nothing the log did not hold.
+        assert!(messages.len() <= self.events.len().saturating_add(1));
+        messages
+    }
+
+    /// Returns the newest compaction marker, which is the active one, when there is one.
+    #[must_use]
+    pub fn compaction_marker(&self) -> Option<&CompactionRecord> {
+        self.events.iter().rev().find_map(|event| match event {
+            SessionEvent::ContextCompact { payload } => Some(&**payload),
+            _ => None,
+        })
+    }
+
+    /// Returns the sequence of the newest compaction marker, which is what the next one's
+    /// `supersedes` names.
+    fn compaction_seq(&self) -> Option<u64> {
+        self.events
+            .iter()
+            .rposition(|event| matches!(event, SessionEvent::ContextCompact { .. }))
+            .and_then(|index| u64::try_from(index).ok())
+    }
+
     /// Folds the log as [`SessionLog::derive_messages`] does, keeping only the events `keep`
     /// accepts and pairing each message with the sequence of the event it came from.
     ///
@@ -610,7 +716,10 @@ impl SessionLog {
                 | SessionEvent::ContextDecision { .. }
                 | SessionEvent::ArtifactPublished { .. }
                 | SessionEvent::RequestAttempt { .. }
-                | SessionEvent::ContextRecovery { .. } => {}
+                | SessionEvent::ContextRecovery { .. }
+                | SessionEvent::ContextSeed { .. }
+                | SessionEvent::ContextHandoff { .. }
+                | SessionEvent::ContextCompact { .. } => {}
             }
         }
         // Postcondition: the fold only removes events, never invents messages.
@@ -623,11 +732,16 @@ impl SessionLog {
     pub fn usage_totals(&self) -> Usage {
         let mut total = Usage::default();
         for event in &self.events {
-            if let SessionEvent::AssistantMessage {
-                usage: Some(usage), ..
-            } = event
-            {
-                total.accumulate(usage);
+            let usage = match event {
+                SessionEvent::AssistantMessage { usage, .. } => *usage,
+                // A compaction's summary and a handoff draft are model calls the session paid for,
+                // so their cost counts.
+                SessionEvent::ContextCompact { payload } => payload.usage,
+                SessionEvent::RequestAttempt { payload } => maintenance_usage(payload),
+                _ => None,
+            };
+            if let Some(usage) = usage {
+                total.accumulate(&usage);
             }
         }
         total
@@ -644,17 +758,27 @@ impl SessionLog {
     pub fn usage_by_model(&self) -> Vec<(Option<String>, Usage)> {
         let mut totals: Vec<(Option<String>, Usage)> = Vec::new();
         for event in &self.events {
-            let SessionEvent::AssistantMessage {
-                usage: Some(usage),
-                model,
-                ..
-            } = event
-            else {
-                continue;
+            // A compaction and a handoff draft are attributed to the model that wrote them, so the
+            // per-model figures sum to the totals.
+            let (model, usage) = match event {
+                SessionEvent::AssistantMessage {
+                    usage: Some(usage),
+                    model,
+                    ..
+                } => (model.clone(), *usage),
+                SessionEvent::ContextCompact { payload } => match payload.usage {
+                    Some(usage) => (Some(payload.model.clone()), usage),
+                    None => continue,
+                },
+                SessionEvent::RequestAttempt { payload } => match maintenance_usage(payload) {
+                    Some(usage) => (Some(payload.selection.model.clone()), usage),
+                    None => continue,
+                },
+                _ => continue,
             };
-            match totals.iter_mut().find(|(seen, _)| seen == model) {
-                Some((_, total)) => total.accumulate(usage),
-                None => totals.push((model.clone(), *usage)),
+            match totals.iter_mut().find(|(seen, _)| *seen == model) {
+                Some((_, total)) => total.accumulate(&usage),
+                None => totals.push((model, usage)),
             }
         }
         totals
@@ -974,14 +1098,23 @@ impl Session {
     /// Returns the lowest body version a reader must understand to read this session faithfully,
     /// which is the version it is written as.
     ///
-    /// Version 4 when any user message carries typed content, because an older reader would drop
-    /// it silently; otherwise version 3 once managed context is enabled, because an older reader
-    /// would drop those records; otherwise version 2, the bytes every legacy session has always
-    /// had. A version is chosen by what the session holds, so an older build can open everything
-    /// it can read faithfully and refuses the rest.
+    /// Version 5 when the log carries a record of a maintenance request (see
+    /// [`SessionEvent::needs_version_five`]), because an older reader cannot read one; otherwise
+    /// version 4 when any user message carries typed content, because an older reader would drop it
+    /// silently; otherwise version 3 once managed context is enabled, because an older reader would
+    /// drop those records; otherwise version 2, the bytes every legacy session has always had. A
+    /// version is chosen by what the session holds, so an older build can open everything it can
+    /// read faithfully and refuses the rest.
     #[must_use]
     pub fn body_version(&self) -> u32 {
-        if self.has_typed_user_content() {
+        if self
+            .log
+            .events()
+            .iter()
+            .any(SessionEvent::needs_version_five)
+        {
+            SESSION_FORMAT_VERSION_COMPACTED
+        } else if self.has_typed_user_content() {
             SESSION_FORMAT_VERSION_USER_CONTENT
         } else if self.managed {
             SESSION_FORMAT_VERSION_MANAGED
@@ -1115,6 +1248,202 @@ impl Session {
     #[must_use]
     pub fn derive_messages(&self) -> Vec<Message> {
         self.log.derive_messages()
+    }
+
+    /// Folds the log into the messages a legacy prompt is built from, after its compaction cut.
+    ///
+    /// What `AgentRunner::build_request` sends. Equal to [`Session::derive_messages`] for a session
+    /// that was never compacted and never seeded; see [`SessionLog::derive_prompt_messages`].
+    ///
+    /// A session a handoff seeded and that has since been switched to legacy context still leads
+    /// with its seed, as the [same system message](crate::context::managed::seed_message) a
+    /// managed request carries: the seed is all that session knows of the work it continues, and
+    /// switching modes must not drop it without a word. It sits before the first user message, so
+    /// a legacy fit keeps it in the leading prompt. Once a compaction cut is made, its summary
+    /// stands in for it — the compaction request was built from this fold, seed included — so the
+    /// seed is not sent twice. A managed session's requests are built by the managed compiler,
+    /// which places the seed itself, so this adds it only while the mode in force is legacy.
+    #[must_use]
+    pub fn derive_prompt_messages(&self) -> Vec<Message> {
+        let mut messages = self.log.derive_prompt_messages();
+        if let Some(seed) = self.legacy_seed_message() {
+            messages.insert(0, seed);
+        }
+        messages
+    }
+
+    /// The seed message a legacy prompt leads with: a seeded session, legacy now, never cut.
+    fn legacy_seed_message(&self) -> Option<Message> {
+        if self.log.compaction_marker().is_some() {
+            return None;
+        }
+        let mode_now = self
+            .log
+            .events()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                SessionEvent::ContextMode { payload } => Some(payload.policy.mode),
+                _ => None,
+            });
+        if mode_now != Some(ContextMode::Legacy) {
+            return None;
+        }
+        crate::context::managed::seed_message(self)
+    }
+
+    /// Returns `true` once a compaction marker has cut this session's prompt.
+    ///
+    /// A compacted session cannot become managed: managed selection keeps every user message, which
+    /// is exactly what a cut removes.
+    #[must_use]
+    pub fn is_compacted(&self) -> bool {
+        self.log.compaction_marker().is_some()
+    }
+
+    /// Returns the boundary of the active compaction marker, when there is one.
+    #[must_use]
+    pub fn compaction_boundary(&self) -> Option<u64> {
+        self.log
+            .compaction_marker()
+            .map(|marker| marker.boundary_event_count)
+    }
+
+    /// Builds the `context/compact` event that cuts this session at its current end.
+    ///
+    /// Nothing is appended. The boundary is the event count now, which is the sequence the marker
+    /// will take; `prefix_blake3` is the digest [`Session::compaction_prefix_digest`] gives there;
+    /// and `supersedes` is the marker before it. The caller appends the event, and the write
+    /// refuses it if the cut is not at a turn boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::CompactUnavailable`] when the cut rule does not admit a cut at the end
+    /// of the log ([`Session::can_compact`]), and [`ErrorCode::InvalidCompact`] when the summary
+    /// breaks the text rule or the record is otherwise malformed.
+    pub fn compaction_event(
+        &self,
+        summary: String,
+        model: String,
+        usage: Option<Usage>,
+    ) -> Result<SessionEvent, ErrorCode> {
+        // A managed session keeps every user message, which is what a cut removes, so it is never
+        // cut; and a cut with no completed turn after the active marker would have nothing to
+        // compact.
+        if !self.can_compact() {
+            return Err(ErrorCode::CompactUnavailable);
+        }
+        let boundary = u64::try_from(self.log.len()).map_err(|_| ErrorCode::InvalidCompact)?;
+        let prefix_blake3 = self
+            .compaction_prefix_digest(boundary)
+            .map_err(|_| ErrorCode::InvalidCompact)?;
+        let record = CompactionRecord {
+            boundary_event_count: boundary,
+            prefix_blake3,
+            summary_blake3: Digest::of(summary.as_bytes()),
+            summary,
+            supersedes: self.log.compaction_seq(),
+            method: CompactionMethod::ModelGenerated,
+            model,
+            usage,
+        };
+        record.validate()?;
+        Ok(SessionEvent::ContextCompact {
+            payload: Box::new(record),
+        })
+    }
+
+    /// Whether a compaction cut may be made now, at the end of the log.
+    ///
+    /// The cut rule, which [`CutState`] is the one statement of and the write and read checks
+    /// share: no turn is open, the mode in force is not managed, and a turn completed after the
+    /// active marker, so there is something to compact. Bookkeeping after the last turn — a mode
+    /// switch back to legacy, a goal change, a handoff's records — does not stop a cut, because it
+    /// produces no message a cut could separate.
+    #[must_use]
+    pub fn can_compact(&self) -> bool {
+        let mut cut = CutState::default();
+        for event in self.log.events() {
+            cut.observe(event);
+        }
+        cut.admits()
+    }
+
+    /// Whether a turn has started and not yet ended. A cut is never made inside one.
+    #[must_use]
+    pub fn turn_open(&self) -> bool {
+        let last_start = self
+            .log
+            .events()
+            .iter()
+            .rposition(|event| matches!(event, SessionEvent::TurnStart { .. }));
+        let last_end = self
+            .log
+            .events()
+            .iter()
+            .rposition(|event| matches!(event, SessionEvent::TurnEnd { .. }));
+        match (last_start, last_end) {
+            (Some(start), Some(end)) => start > end,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// Returns the digest a compaction marker placed at `count` carries.
+    ///
+    /// The header is the one a body has once it holds a marker, which is version
+    /// [`SESSION_FORMAT_VERSION_COMPACTED`]; the marker is what moves the body there, so the digest
+    /// names that header whether or not the marker exists yet. It equals [`Session::prefix_digest`]
+    /// once the marker is in the log. It never uses the encoding cache, which is keyed to the
+    /// header the session has now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NonContiguousSequence`] for a count past the log's end.
+    pub fn compaction_prefix_digest(&self, count: u64) -> Result<Digest, SessionError> {
+        self.prefix_digest_at_version(count, SESSION_FORMAT_VERSION_COMPACTED)
+    }
+
+    /// Returns the digest of the first `count` event lines under the header this session would
+    /// have at body `version`, whatever version its body is at now.
+    ///
+    /// A body moves version as it gains records: typed user content takes a managed body from 3 to
+    /// 4, and a handoff draft's attempt, which carries a `kind`, takes it to 5. A frontier digest
+    /// covers the header, so one taken before such a move names the older header; this is how a
+    /// reader checks it against the same events under the header it was taken with. The `managed`
+    /// flag follows the rule [`Session::prefix_digest`]'s header does: a header says it from
+    /// version 4 on. The encoding cache, keyed to the current header, is never used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NonContiguousSequence`] for a count past the log's end.
+    pub fn prefix_digest_at_version(
+        &self,
+        count: u64,
+        version: u32,
+    ) -> Result<Digest, SessionError> {
+        let events = usize::try_from(count)
+            .ok()
+            .and_then(|count| self.log.events().get(..count))
+            .ok_or_else(|| SessionError::NonContiguousSequence {
+                line: 1,
+                expected: u64::try_from(self.log.len()).unwrap_or(u64::MAX),
+                found: count,
+            })?;
+        let mut hasher = self.hasher_at_version(version);
+        hash_lines(&mut hasher, events);
+        Ok(hasher.finish())
+    }
+
+    /// A hasher that has been fed the header line this session would have at body `version`.
+    fn hasher_at_version(&self, version: u32) -> Hasher {
+        let mut header = self.header();
+        header.version = version;
+        header.managed = self.managed && version >= SESSION_FORMAT_VERSION_USER_CONTENT;
+        let mut hasher = Hasher::new();
+        hasher.update(encode(&header).as_bytes());
+        hasher.update(b"\n");
+        hasher
     }
 
     /// Sums every usage record the session carries.
@@ -1264,8 +1593,11 @@ impl Session {
     /// Validates and measures the encoding; the body of [`Session::try_to_jsonl`].
     fn checked_len(&self) -> Result<usize, SessionError> {
         let mut total = 0_usize;
+        let version = self.body_version();
         for (index, event) in self.log.events().iter().enumerate() {
             self.check_event(index, event)?;
+            let line = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2);
+            check_version_five(event, Some(version), line)?;
             let seq = SessionSeq::new(u64::try_from(index).unwrap_or(u64::MAX));
             let size = crate::content::serialized_size(
                 &SessionLineRef { seq, event },
@@ -1284,6 +1616,8 @@ impl Session {
                     reason: "session exceeds 64 MiB".into(),
                 })?;
         }
+        check_compaction_positions(self)?;
+        check_handoff_positions(self)?;
         // The header contains caller-owned strings as well, so bound the whole serialized
         // session before allocating it; this also counts the header's newline.
         let header = self.header();
@@ -1445,6 +1779,7 @@ impl Session {
                     detail: error.to_string(),
                 })?;
             check_managed_record(&parsed.event, header.as_ref(), number)?;
+            check_version_five(&parsed.event, header.as_ref().map(|h| h.version), number)?;
             validate_event_replay(&parsed.event, number)?;
             if parsed.seq.value() != expected {
                 return Err(SessionError::NonContiguousSequence {
@@ -1468,6 +1803,8 @@ impl Session {
             log,
             encoding: encoding::Encoding::default(),
         };
+        check_compaction_positions(&session)?;
+        check_handoff_positions(&session)?;
         // Postcondition: the decoded log has exactly the events the file numbered.
         assert_eq!(
             session.event_count(),
@@ -1523,10 +1860,15 @@ fn parse_header(line: &str, number: u64) -> Result<SessionHeader, SessionError> 
 /// Feeds the encoded event lines, each with its LF, numbered from zero.
 fn hash_lines(hasher: &mut Hasher, events: &[SessionEvent]) {
     for (index, event) in events.iter().enumerate() {
-        let seq = SessionSeq::new(u64::try_from(index).unwrap_or(u64::MAX));
-        hasher.update(encode(&SessionLineRef { seq, event }).as_bytes());
-        hasher.update(b"\n");
+        hash_line(hasher, u64::try_from(index).unwrap_or(u64::MAX), event);
     }
+}
+
+/// Feeds one encoded event line, with its LF, at sequence `seq`.
+fn hash_line(hasher: &mut Hasher, seq: u64, event: &SessionEvent) {
+    let seq = SessionSeq::new(seq);
+    hasher.update(encode(&SessionLineRef { seq, event }).as_bytes());
+    hasher.update(b"\n");
 }
 
 /// Refuses a managed record in an older body, and one that breaks its own invariants.
@@ -1545,6 +1887,199 @@ fn check_managed_record(
     event
         .validate_managed()
         .map_err(|code| SessionError::InvalidManagedRecord { line, code })
+}
+
+/// Refuses a record of a maintenance request in a body below version 5, which an older reader
+/// does not know. `version` is the header's on read and the body's own on write.
+fn check_version_five(
+    event: &SessionEvent,
+    version: Option<u32>,
+    line: u64,
+) -> Result<(), SessionError> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+    if event.needs_version_five() && version < SESSION_FORMAT_VERSION_COMPACTED {
+        return Err(SessionError::MalformedEvent {
+            line,
+            detail: format!("version-{version} records cannot contain a maintenance record"),
+        });
+    }
+    Ok(())
+}
+
+/// The cut rule: where a compaction marker may sit, stated once.
+///
+/// [`Session::can_compact`] asks it about the end of the log before a draft is paid for, and
+/// [`check_compaction_positions`] asks it about every marker on write and on read, so the two can
+/// never disagree. A cut is admitted when no turn is open, the mode in force is not managed, and a
+/// turn completed since the previous marker. Events after the last turn that produce no message —
+/// a mode record, a goal change, a handoff's records — do not move it, so a session switched back
+/// to legacy, or given a new goal between turns, can still be cut.
+#[derive(Clone, Copy, Debug, Default)]
+struct CutState {
+    /// A turn has started and not ended.
+    open_turn: bool,
+    /// The mode in force is managed.
+    managed: bool,
+    /// A turn completed since the previous marker, or since the start.
+    completed: bool,
+}
+
+impl CutState {
+    /// Moves the state past one event.
+    fn observe(&mut self, event: &SessionEvent) {
+        match event {
+            SessionEvent::TurnStart { .. } => self.open_turn = true,
+            SessionEvent::TurnEnd { reason, .. } => {
+                self.open_turn = false;
+                if *reason == TurnEndReason::Completed {
+                    self.completed = true;
+                }
+            }
+            SessionEvent::ContextMode { payload } => {
+                self.managed = payload.policy.mode == ContextMode::Managed;
+            }
+            SessionEvent::ContextCompact { .. } => self.completed = false,
+            _ => {}
+        }
+    }
+
+    /// Whether a marker may be placed here.
+    const fn admits(self) -> bool {
+        !self.open_turn && !self.managed && self.completed
+    }
+}
+
+/// Refuses managed context enabled after a compaction marker: `compacted_session`.
+///
+/// Managed selection keeps every user message, which is exactly what a cut removes, so a compacted
+/// session never becomes managed. Checked before the markers themselves, so the refusal names the
+/// mode record rather than the prefix digest that enabling would also break.
+fn check_compacted_mode(events: &[SessionEvent]) -> Result<(), SessionError> {
+    let Some(first_marker) = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::ContextCompact { .. }))
+    else {
+        return Ok(());
+    };
+    let enabling = events
+        .iter()
+        .enumerate()
+        .skip(first_marker)
+        .find(|(_, event)| {
+            matches!(event, SessionEvent::ContextMode { payload }
+            if payload.policy.mode == ContextMode::Managed)
+        });
+    match enabling {
+        Some((index, _)) => Err(SessionError::InvalidManagedRecord {
+            line: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
+            code: ErrorCode::CompactedSession,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Checks where every compaction marker sits in its log, which the record alone cannot say.
+///
+/// Each marker must be admitted by the [cut rule](CutState); its boundary must be its own sequence;
+/// its `supersedes` must name the marker before it, so the chain strictly increases; no result
+/// after it may answer a call before it, because a cut never separates a call from its result; and
+/// its prefix digest must be the one this log gives at that count. A managed mode after a marker is
+/// `compacted_session`; every other break is `invalid_compact`.
+///
+/// The prefix digests are read off one hasher carried along the log, so a session with many
+/// markers is hashed once rather than once per marker; a session with none hashes nothing.
+fn check_compaction_positions(session: &Session) -> Result<(), SessionError> {
+    let events = session.log().events();
+    check_compacted_mode(events)?;
+    let mut prefix = session
+        .is_compacted()
+        .then(|| session.hasher_at_version(SESSION_FORMAT_VERSION_COMPACTED));
+    let mut latest: Option<u64> = None;
+    let mut cut = CutState::default();
+    let mut unanswered: BTreeSet<&ToolCallId> = BTreeSet::new();
+    let mut severed: BTreeSet<&ToolCallId> = BTreeSet::new();
+    for (index, event) in events.iter().enumerate() {
+        let seq = u64::try_from(index).unwrap_or(u64::MAX);
+        let invalid = || SessionError::InvalidManagedRecord {
+            line: seq.saturating_add(2),
+            code: ErrorCode::InvalidCompact,
+        };
+        match event {
+            SessionEvent::AssistantMessage { tool_calls, .. } => {
+                // A call made after the cut is a new call, even when a provider reuses the id of
+                // one an interrupted turn left unanswered before it: its result answers it, not
+                // the severed one.
+                for call in tool_calls {
+                    severed.remove(&call.id);
+                    unanswered.insert(&call.id);
+                }
+            }
+            SessionEvent::ToolResult { call_id, .. } => {
+                if severed.contains(call_id) {
+                    return Err(invalid());
+                }
+                unanswered.remove(call_id);
+            }
+            SessionEvent::ContextCompact { payload } => {
+                payload
+                    .validate()
+                    .map_err(|code| SessionError::InvalidManagedRecord {
+                        line: seq.saturating_add(2),
+                        code,
+                    })?;
+                if payload.boundary_event_count != seq || payload.supersedes != latest {
+                    return Err(invalid());
+                }
+                if !cut.admits() {
+                    return Err(invalid());
+                }
+                let digest = prefix.clone().map(Hasher::finish).ok_or_else(invalid)?;
+                if digest != payload.prefix_blake3 {
+                    return Err(invalid());
+                }
+                severed.append(&mut unanswered);
+                latest = Some(seq);
+            }
+            _ => {}
+        }
+        if let Some(hasher) = prefix.as_mut() {
+            hash_line(hasher, seq, event);
+        }
+        cut.observe(event);
+    }
+    Ok(())
+}
+
+/// Checks where a session's handoff records sit, on write and on read, as the managed fold does.
+///
+/// A seed is only ever the second event, after the managed `context/mode` record that opens the
+/// new session; a back-link names the session that holds it as its source; and a session's
+/// back-links name distinct sessions at strictly increasing frontiers. A break is
+/// `handoff_unavailable`, reported at the line of the record that breaks it.
+fn check_handoff_positions(session: &Session) -> Result<(), SessionError> {
+    crate::context::managed::state::check_handoff_positions(
+        Some(session.id().as_str()),
+        session.log().events(),
+    )
+    .map_err(|(index, code)| SessionError::InvalidManagedRecord {
+        line: u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2),
+        code,
+    })
+}
+
+/// The usage a finished maintenance attempt reported, which no assistant message carries.
+///
+/// A turn step's attempt is not counted, because its assistant message already carries its usage;
+/// a handoff draft has no assistant message, so its finished attempt is the only record of what it
+/// cost. Read back from the neutral counters it was written with, and absent for any other
+/// semantics, because a total built from counters whose meaning is unknown would be a guess.
+fn maintenance_usage(payload: &RequestAttemptRecord) -> Option<Usage> {
+    if payload.kind.is_none() || payload.phase != AttemptPhase::Finished {
+        return None;
+    }
+    payload.usage.as_ref().and_then(UsageObservation::to_usage)
 }
 
 /// Folds one assistant event into the message a model is shown, or nothing when it has

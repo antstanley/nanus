@@ -71,6 +71,8 @@ use crate::wire::{read_request, write_frame};
 
 #[path = "server/context.rs"]
 mod context;
+#[path = "server/maintenance.rs"]
+mod maintenance;
 
 use context::{Binding, Published, wire_frontier};
 
@@ -341,6 +343,27 @@ struct Question {
     sender: oneshot::Sender<ApprovalOutcome>,
 }
 
+/// What a session was started from, when a handoff started it.
+///
+/// Read from the session's `context/seed` once, when the session is held, and kept beside it so an
+/// attachment can send the document without borrowing the session, which a running turn may hold.
+#[derive(Clone)]
+struct SeedNote {
+    /// The document the session opened with.
+    text: String,
+    /// The session the document came from.
+    source_session_id: String,
+    /// The source's event count at the frontier the document was drawn from.
+    source_event_count: u64,
+    /// Whether the source session's log records the handoff that made this one.
+    ///
+    /// Read from the source's log — a `context/handoff` naming this session — whenever a client
+    /// attaches, so it is the same answer whichever agent holds the session and however long ago
+    /// the handoff was. `false` when the source does not record it or cannot be read: the field
+    /// claims only what was seen.
+    back_link_recorded: bool,
+}
+
 /// A session claimed for writing, released when the agent lets the session go.
 ///
 /// Dropping it releases the claim, which is why it is a field of [`Held`] rather than something
@@ -410,6 +433,15 @@ struct Held {
     /// it has not. Cleared when a turn starts, so a request that arrived a moment after the
     /// last turn ended cannot stop the next one before it begins.
     stop: Cell<bool>,
+    /// Wakes whatever is waiting on [`Held::stop`]: a maintenance draft's model call, which has no
+    /// steps or tokens to look between while a provider is silent.
+    stop_wake: Notify,
+    /// The viewer whose maintenance draft holds the session, while one does.
+    ///
+    /// A draft is one connection's request, so only that connection's interrupt stops it: another
+    /// viewer pressing `Esc` has no draft of its own running and no reason to cancel someone
+    /// else's. A turn is the session's and any viewer may stop it, so this is `None` for a turn.
+    drafting: Cell<Option<u64>>,
     /// The claim this agent holds on the session, for as long as it holds the session.
     ///
     /// `None` only where no store is involved at all: the unit tests build a bare `Held` to
@@ -468,6 +500,13 @@ struct Held {
     /// a question nobody answers a *denial* rather than a hang: the approver's receiver
     /// ends and it reports `Unavailable`.
     approvals: RefCell<BTreeMap<String, Question>>,
+    /// The event count of the session's active compaction marker, when one exists.
+    ///
+    /// Cached for the same reason as the headline: an attachment reads it without borrowing the
+    /// session.
+    compaction: Cell<Option<u64>>,
+    /// The handoff this session was started from, when it was.
+    seed: RefCell<Option<SeedNote>>,
     /// Tools a client has granted for this session with an *always* answer.
     ///
     /// Session state rather than agent state, because the grant was given about this
@@ -494,6 +533,17 @@ impl Held {
         touched: u64,
     ) -> Self {
         let frontier = context::frontier_of(&session);
+        let seed = session.log().events().get(1).and_then(|event| match event {
+            SessionEvent::ContextSeed { payload } => Some(SeedNote {
+                text: payload.text.clone(),
+                source_session_id: payload.source_session_id.clone(),
+                source_event_count: payload.source_frontier.event_count,
+                // Not known until the source is read, which `Registry::refresh_back_link` does
+                // before any client is told.
+                back_link_recorded: false,
+            }),
+            _ => None,
+        });
         let held = Self {
             id: session.id().clone(),
             claim,
@@ -511,9 +561,13 @@ impl Held {
             viewers: RefCell::new(Vec::new()),
             busy: Cell::new(false),
             stop: Cell::new(false),
+            stop_wake: Notify::new(),
+            drafting: Cell::new(None),
             approvals: RefCell::new(BTreeMap::new()),
             approved: RefCell::new(BTreeSet::new()),
             approval_seq: Cell::new(0),
+            compaction: Cell::new(None),
+            seed: RefCell::new(seed),
             touched: Cell::new(touched),
         };
         held.refresh(&held.session.borrow());
@@ -542,6 +596,54 @@ impl Held {
         *self.name.borrow_mut() = name;
     }
 
+    /// The `Seeded` frame for this session, when a handoff started it.
+    fn seeded(&self) -> Option<Frame> {
+        let name = self.name.borrow().clone();
+        self.seed.borrow().as_ref().map(|seed| Frame::Seeded {
+            name,
+            text: seed.text.clone(),
+            source_session_id: seed.source_session_id.clone(),
+            source_event_count: seed.source_event_count,
+            back_link_recorded: seed.back_link_recorded,
+        })
+    }
+
+    /// Records whether the back-link to this session's handoff source was written.
+    fn set_back_link(&self, recorded: bool) {
+        if let Some(seed) = self.seed.borrow_mut().as_mut() {
+            seed.back_link_recorded = recorded;
+        }
+    }
+
+    /// The session this one was seeded from, when a handoff started it.
+    fn seed_source(&self) -> Option<SessionId> {
+        self.seed
+            .borrow()
+            .as_ref()
+            .map(|seed| SessionId::new(seed.source_session_id.clone()))
+    }
+
+    /// Asks whatever is running in this session to stop, and wakes a draft waiting on a model.
+    fn request_stop(&self) {
+        self.stop.set(true);
+        self.stop_wake.notify_waiters();
+    }
+
+    /// Answers every open approval question as unavailable, so the call it was about is denied.
+    ///
+    /// What an interrupt does to a turn waiting on a person: the question is not left open for a
+    /// client to answer later, and nothing is decided for it either. A refused call ends the step,
+    /// and the stop the interrupt set ends the turn with [`TurnEnd::Interrupted`]. Every viewer
+    /// sees the question leave the way one answered elsewhere does: the frames after it are the
+    /// call's denial.
+    fn deny_approvals(&self) {
+        let open = core::mem::take(&mut *self.approvals.borrow_mut());
+        for (_, question) in open {
+            // A receiver that is gone was the turn's own, and it has already moved on.
+            let _ = question.sender.send(ApprovalOutcome::Unavailable);
+        }
+    }
+
     /// Returns whether `viewer` is still being sent this session's frames.
     fn is_watching(&self, viewer: u64) -> bool {
         self.viewers.borrow().iter().any(|(id, _)| *id == viewer)
@@ -561,6 +663,7 @@ impl Held {
 
     /// Refreshes the cached headline and goal from the session.
     fn refresh(&self, session: &Session) {
+        self.compaction.set(session.compaction_boundary());
         *self.headline.borrow_mut() = Headline {
             title: session.title(),
             events: u64::try_from(session.event_count()).unwrap_or(u64::MAX),
@@ -628,6 +731,7 @@ impl Held {
             stream_epoch: self.epoch.clone(),
             stream_watermark: self.frame_seq.get(),
             frontier: wire_frontier(&self.frontier.borrow()),
+            compaction_boundary: self.compaction.get(),
         }
     }
 
@@ -803,6 +907,8 @@ struct Registry {
     tick: Cell<u64>,
     /// The next viewer id, which is how a connection unsubscribes.
     viewer: Cell<u64>,
+    /// How many maintenance drafts this agent has issued, so each draft id is new.
+    drafts: Cell<u64>,
     /// What every stream epoch this registry hands out begins with: this process, and when it
     /// started serving.
     ///
@@ -824,6 +930,7 @@ impl Registry {
             turns: RefCell::new(JoinSet::new()),
             tick: Cell::new(0),
             viewer: Cell::new(0),
+            drafts: Cell::new(0),
             epoch: format!("p{}-t{started:x}", std::process::id()),
         }
     }
@@ -833,6 +940,13 @@ impl Registry {
         let next = self.tick.get().saturating_add(1);
         self.tick.set(next);
         next
+    }
+
+    /// Returns a new id for a maintenance draft: short, and unique for this agent's lifetime.
+    fn next_draft_id(&self) -> String {
+        let next = self.drafts.get().saturating_add(1);
+        self.drafts.set(next);
+        format!("d{next}")
     }
 
     /// Returns the next viewer id.
@@ -921,6 +1035,40 @@ impl Registry {
             Ok(name) => held.set_name(name),
             Err(error) => tracing::warn!(%error, "a session's name could not be read"),
         }
+    }
+
+    /// Reads whether a seeded session's source records the handoff that made it.
+    ///
+    /// The source's own log is the answer: a `context/handoff` naming this session. A source this
+    /// agent holds is read from memory, any other from the store; one that cannot be read leaves
+    /// the answer `false`, because the frame says only what was seen.
+    async fn refresh_back_link(&self, held: &Rc<Held>) {
+        let Some(source) = held.seed_source() else {
+            return;
+        };
+        let names_this = |session: &Session| {
+            session.log().events().iter().any(|event| {
+                matches!(event, SessionEvent::ContextHandoff { payload }
+                    if payload.new_session_id == held.id.as_str())
+            })
+        };
+        let recorded = match self.get(&source) {
+            // A source running a turn has its session borrowed by that turn, so it is read only
+            // when it is free; while it is busy the answer already held stands, because a turn
+            // never removes a back-link.
+            Some(open) => match open.session.try_borrow() {
+                Ok(session) => names_this(&session),
+                Err(_) => return,
+            },
+            None => match self.agent.store.load(&source).await {
+                Ok(session) => names_this(&session),
+                Err(error) => {
+                    tracing::debug!(%error, "a handoff's source could not be read");
+                    false
+                }
+            },
+        };
+        held.set_back_link(recorded);
     }
 
     /// Finds the session a reference names, loading it from the store if it is not held.
@@ -1896,7 +2044,8 @@ pub async fn serve(
                             return;
                         }
                     };
-                    if let Err(error) = serve_connection(stream, registry, &shutdown).await {
+                    let served = Box::pin(serve_connection(stream, registry, &shutdown)).await;
+                    if let Err(error) = served {
                         // A client that hung up mid-frame is ordinary; anything else is
                         // worth a line, and neither is worth stopping the agent for.
                         tracing::debug!(%error, "a link connection ended");
@@ -1974,8 +2123,10 @@ async fn refuse_if_detached(
 ///
 /// Returns an error when the connection cannot be read or its frames cannot be written.
 // One flat match over the protocol's requests is the whole vocabulary in one place, and splitting
-// it into a helper per arm would hide that; the complexity is the protocol's, not the logic's.
-#[allow(clippy::cognitive_complexity)]
+// it into a helper per arm would hide that; the complexity is the protocol's, not the logic's. The
+// maintenance requests are the one group that is a helper, so the arms that remain are one line
+// each.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn serve_connection(
     stream: Stream,
     registry: Rc<Registry>,
@@ -1990,18 +2141,24 @@ async fn serve_connection(
 
     // Which session this connection is watching, and the id it watches under.
     let mut watching: Option<(u64, Rc<Held>)> = None;
+    // The maintenance drafts this connection holds, shared with the drafts it has running.
+    // Discarded when it lets go of its session.
+    let drafts: maintenance::SharedDrafts = Rc::default();
     while let Some(request) = read_request(&mut reader).await? {
         if refuse_if_detached(&frames, watching.as_ref()).await {
+            drafts.borrow_mut().clear();
             continue;
         }
         match request {
             Request::New { name } => {
                 release(&mut watching);
+                drafts.borrow_mut().clear();
                 let opened = new_session_of(&registry, name).await;
                 watching = watch_opened(&registry, &frames, opened).await;
             }
             Request::Attach { session } => {
                 release(&mut watching);
+                drafts.borrow_mut().clear();
                 let opened = registry.open_reference(&session).await;
                 watching = watch_opened(&registry, &frames, opened).await;
             }
@@ -2013,18 +2170,26 @@ async fn serve_connection(
                 }
             }
             Request::Interrupt => {
-                if let Some((_, held)) = &watching {
-                    // Only the turn that is running is asked, and only if one is: an
-                    // interrupt with nothing to interrupt is not an error, it is a client
-                    // that pressed the key a moment after the turn ended.
-                    if held.busy.get() {
-                        held.stop.set(true);
-                    }
+                if let Some((viewer, held)) = &watching {
+                    interrupt(held, *viewer);
                 } else {
                     refuse_unattached(&frames).await;
                 }
             }
             Request::Sessions => list_sessions(&registry, &frames).await,
+            request @ (Request::HandoffDraft { .. }
+            | Request::HandoffCommit { .. }
+            | Request::CompactDraft
+            | Request::CompactCommit { .. }) => {
+                Box::pin(answer_maintenance(
+                    &registry,
+                    &frames,
+                    &mut watching,
+                    &drafts,
+                    request,
+                ))
+                .await;
+            }
             Request::Approve {
                 call_id,
                 allow,
@@ -2100,6 +2265,33 @@ fn answer_approval(watching: Option<&(u64, Rc<Held>)>, call_id: &str, allow: boo
     }
 }
 
+/// Asks what is running in a session to stop, on behalf of `viewer`.
+///
+/// Only what is running is asked, and only if something is: an interrupt with nothing to
+/// interrupt is not an error, it is a client that pressed the key a moment after the turn ended.
+/// A turn is the session's, so any viewer may stop it, and a turn waiting on an approval is
+/// answered as unavailable too, so the wait ends with the turn. A maintenance draft is the request
+/// of one connection, so only that connection stops it; it has no approvals to answer.
+fn interrupt(held: &Held, viewer: u64) {
+    if !held.busy.get() {
+        return;
+    }
+    match held.drafting.get() {
+        Some(owner) if owner != viewer => {
+            tracing::debug!(
+                viewer,
+                owner,
+                "an interrupt for another viewer's draft is ignored"
+            );
+        }
+        Some(_) => held.request_stop(),
+        None => {
+            held.request_stop();
+            held.deny_approvals();
+        }
+    }
+}
+
 /// Answers a listing of the sessions the agent is holding.
 ///
 /// A function rather than a few lines in the request loop, because reading the names back from
@@ -2133,7 +2325,14 @@ async fn set_model(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, model:
             "no such model: {model} — this agent offers {}",
             registry.agent.models().join(", ")
         );
-        send(frames, Frame::Refused { message }).await;
+        send(
+            frames,
+            Frame::Refused {
+                message,
+                code: None,
+            },
+        )
+        .await;
         return;
     }
     // The model belongs to the agent rather than to the session, exactly as the approval state
@@ -2245,6 +2444,7 @@ async fn apply_goal(
                 message: String::from(
                     "a turn is running in this session; the goal can be changed when it is idle",
                 ),
+                code: None,
             },
         )
         .await;
@@ -2260,7 +2460,16 @@ async fn apply_goal(
         // approval state already follow, here at the granularity of a session.
         GoalAnswer::Changed(goal) => broadcast_awaited(held, Frame::Goal { goal }, None).await,
         GoalAnswer::Unchanged(goal) => send(frames, Frame::Goal { goal }).await,
-        GoalAnswer::Refused(message) => send(frames, Frame::Refused { message }).await,
+        GoalAnswer::Refused(message) => {
+            send(
+                frames,
+                Frame::Refused {
+                    message,
+                    code: None,
+                },
+            )
+            .await;
+        }
     }
 }
 
@@ -2396,6 +2605,7 @@ async fn set_provider(
                     "unknown provider: {provider} — this build offers {}",
                     Provider::names().join(", ")
                 ),
+                code: None,
             },
         )
         .await;
@@ -2406,6 +2616,7 @@ async fn set_provider(
             frames,
             Frame::Refused {
                 message: String::from("this agent cannot change provider"),
+                code: None,
             },
         )
         .await;
@@ -2417,7 +2628,14 @@ async fn set_provider(
         // reached with a key gets the question the interface turns into a masked field.
         if name.credential_is_oauth(plan) {
             if let Err(message) = authorize(&switch, frames, name, plan).await {
-                send(frames, Frame::Refused { message }).await;
+                send(
+                    frames,
+                    Frame::Refused {
+                        message,
+                        code: None,
+                    },
+                )
+                .await;
                 return;
             }
         } else {
@@ -2457,6 +2675,7 @@ async fn set_provider(
                 frames,
                 Frame::Refused {
                     message: error.to_string(),
+                    code: None,
                 },
             )
             .await;
@@ -2481,6 +2700,7 @@ async fn set_credential(
             frames,
             Frame::Refused {
                 message: format!("unknown provider: {provider}"),
+                code: None,
             },
         )
         .await;
@@ -2491,6 +2711,7 @@ async fn set_credential(
             frames,
             Frame::Refused {
                 message: String::from("this agent cannot store a credential"),
+                code: None,
             },
         )
         .await;
@@ -2501,6 +2722,7 @@ async fn set_credential(
             frames,
             Frame::Refused {
                 message: error.to_string(),
+                code: None,
             },
         )
         .await;
@@ -2573,6 +2795,74 @@ fn release(watching: &mut Option<(u64, Rc<Held>)>) {
     }
 }
 
+/// Answers the four requests that draft or commit a maintenance request over the held session.
+///
+/// A commit of a handoff moves the connection: the source is left and the session the handoff
+/// created is attached, so `watching` is replaced once the commit has returned.
+async fn answer_maintenance(
+    registry: &Rc<Registry>,
+    frames: &mpsc::Sender<Frame>,
+    watching: &mut Option<(u64, Rc<Held>)>,
+    drafts: &maintenance::SharedDrafts,
+    request: Request,
+) {
+    let Some((viewer, held)) = watching
+        .as_ref()
+        .map(|(viewer, held)| (*viewer, Rc::clone(held)))
+    else {
+        let handoff = matches!(
+            request,
+            Request::HandoffDraft { .. } | Request::HandoffCommit { .. }
+        );
+        send(frames, maintenance::unattached(handoff)).await;
+        return;
+    };
+    let draft = |request| maintenance::Asked {
+        frames,
+        held: &held,
+        viewer,
+        drafts,
+        request,
+    };
+    match request {
+        // A draft runs in its own task, so this connection's interrupt is read while it does.
+        Request::HandoffDraft { name } => {
+            let request = maintenance::DraftRequest::Handoff { name };
+            maintenance::spawn_draft(registry, draft(request)).await;
+        }
+        Request::CompactDraft => {
+            maintenance::spawn_draft(registry, draft(maintenance::DraftRequest::Compact)).await;
+        }
+        Request::CompactCommit { draft_id } => {
+            Box::pin(maintenance::compact_commit(
+                registry, frames, &held, drafts, &draft_id,
+            ))
+            .await;
+        }
+        Request::HandoffCommit { draft_id } => {
+            let committed = Box::pin(maintenance::handoff_commit(
+                registry, &held, viewer, drafts, &draft_id,
+            ))
+            .await;
+            match committed {
+                Ok(seeded) => {
+                    // The connection moves to the session it created, after the back-link was
+                    // written in the source it leaves, and lets go of every draft of that source.
+                    // The new session stays reserved until this connection is watching it, so it
+                    // cannot be let go as idle and unwatched in between.
+                    release(watching);
+                    drafts.borrow_mut().clear();
+                    let opened = Ok(Rc::clone(seeded.held()));
+                    *watching = watch_opened(registry, frames, opened).await;
+                    drop(seeded);
+                }
+                Err(refusal) => send(frames, *refusal).await,
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Attaches a connection to a session and tells it which one it got.
 ///
 /// The order matters twice over, and both halves rest on the same fact — finding a
@@ -2603,6 +2893,7 @@ async fn attach(
     // produced during it is recorded in the backlog and this viewer is not registered yet, so
     // it is caught up with rather than missed — but an await inside the region would not be.
     registry.refresh_name(held).await;
+    registry.refresh_back_link(held).await;
     // One synchronous region: the backlog is snapshotted, the reply that explains it and the
     // batch itself are queued, and the viewer is registered — with no await anywhere in
     // between. That is what makes catching up exact rather than nearly exact:
@@ -2645,6 +2936,11 @@ async fn attach(
             "this connection has fallen too far behind to catch up with the running turn; \
              reconnect and attach again",
         ));
+    }
+    // A session a handoff started is shown its opening document after the backlog, on every
+    // attachment, so a reader always sees what the session was started with.
+    if let Some(seeded) = held.seeded() {
+        send(frames, seeded).await;
     }
     // A question the turn is waiting on is state rather than history: a client that arrived
     // after it went out is shown it here, and can answer it, because the answer is matched
@@ -3448,7 +3744,8 @@ mod tests {
             )
             .await;
             assert!(
-                matches!(answers.try_recv(), Ok(Frame::Refused { ref message }) if message.contains("turn is running")),
+                matches!(answers.try_recv(), Ok(Frame::Refused { ref message, .. })
+                    if message.contains("turn is running")),
                 "a reset of a busy session is refused"
             );
             assert!(session.busy.get(), "the turn still holds the session");
@@ -3476,7 +3773,7 @@ mod tests {
                     assert_eq!(payload.mode, crate::protocol::ContextModeState::Legacy);
                     assert_eq!((envelope.turn, envelope.step), (None, None));
                 }
-                Ok(Frame::Refused { message }) => {
+                Ok(Frame::Refused { message, .. }) => {
                     assert!(message.contains("context status"), "{message}");
                 }
                 other => panic!("expected a status or its refusal, got {other:?}"),

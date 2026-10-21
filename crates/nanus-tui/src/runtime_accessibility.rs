@@ -408,6 +408,8 @@ fn global_quit_works_in_every_modal_search_and_queue_editor() {
         Modal::Authorization,
         Modal::Provider,
         Modal::Context,
+        Modal::Preview,
+        Modal::Clear,
         Modal::Models,
         Modal::Effort,
         Modal::Help,
@@ -424,6 +426,22 @@ fn global_quit_works_in_every_modal_search_and_queue_editor() {
             Modal::Context => {
                 view.context_dialog =
                     Some(crate::context::ContextDialog::new(view.context_mode, None));
+            }
+            Modal::Preview => {
+                view.preview = Some(crate::maintenance::Preview::Compact {
+                    draft_id: "d1".to_owned(),
+                    text: "summary".to_owned(),
+                    dropped_turns: 0,
+                    boundary_event_count: 8,
+                    usage: None,
+                });
+            }
+            Modal::Clear => {
+                view.clear_dialog = Some(crate::maintenance::ClearDialog {
+                    old_id: "s-old".to_owned(),
+                    name: None,
+                    busy: false,
+                });
             }
             Modal::Models => view.model_open = true,
             Modal::Effort => view.effort_open = true,

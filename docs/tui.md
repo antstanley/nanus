@@ -122,7 +122,8 @@ reported.
 the prompt it sent was refused, or the connection stopped following the session — and the
 interface closes its view of the turn on it, taking an open approval with it and letting the
 queue go. A request that is *not* a prompt — a model, provider, credential, or goal change the
-agent will not make — is answered with `refused` instead, which is a sentence and nothing else.
+agent will not make, and a handoff or compaction request it refuses — is answered with `refused`
+instead: a sentence, and, when the refusal has one, the stable code beside it.
 Before protocol version 9 both were `failed`, so a model switch refused mid-turn dismissed the
 turn's approval dialog and sent the next queued prompt into a session that was still busy.
 
@@ -436,7 +437,9 @@ than sending it to the model.
 | `/quit` | the same command under its other name |
 | `/stats` | write the session's model figures into the transcript |
 | `/help` | draw the key list, the same one `?` opens |
-| `/clear` | empty the transcript, leaving the draft and the toggles alone |
+| `/clear` | stop the conversation and start a new one, after a `y`; in a recording, empty the transcript |
+| `/handoff [name]` | draft a handoff from a managed session into a new one, read it, and start it after a `y` |
+| `/compact` | summarise a legacy conversation and cut the prompt to the summary, after reading it and a `y` |
 | `/model [id]` | open the model selector, or switch to the one named |
 | `/effort [step]` | open the effort chooser, or switch to the step named |
 | `/provider [name]` | open the provider chooser, or switch to the provider named |
@@ -456,12 +459,16 @@ selector is the command's plain form rather than the cycle `Alt+P` still is: a r
 a particular model should be able to read the ids the agent offers and choose one, and the
 argument is there for when the id is already known. See [switching models](#switching-models).
 
-`/help` and `/clear` are the screen's business rather than the session's, which is why they
-are answered in a recorded session too: neither needs an agent, and a reader browsing a
-transcript still has a keyboard. `/help` opens the same overlay `?` does rather than a second
-list that says almost the same thing. `/clear` empties the transcript and nothing else — the
-draft in the composer and the two summary toggles are about what the reader is doing now, and
-`Ctrl+L` already means exactly this.
+`/help` is the screen's business and is answered in a recorded session too: it needs no agent, and
+a reader browsing a transcript still has a keyboard. `/help` opens the same overlay `?` does rather
+than a second list that says almost the same thing.
+
+`/clear` means two things, chosen by whether the interface is attached to a live session. In a live
+session it is the session-level control described under [clear, handoff and
+compaction](#clear-handoff-and-compaction): it stops the conversation and starts a new one, and the
+old one is kept. In a recording there is no session to stop, so it empties the transcript, as it
+always did, and leaves the draft and the two summary toggles alone. `Ctrl+L` is unchanged
+everywhere: it is the screen erasure, and it never stops anything.
 
 `/goal` is the one command that has to reach the agent rather than being answered on the
 screen. A goal is *session state* — a durable objective the conversation carries — and a
@@ -573,6 +580,84 @@ the key *code* and ignores the modifiers when inserting text, so typing is unaff
 new binding should do the same, and there is a test that fails if it does not.
 
 [shift-issue]: https://github.com/ratatui/templates/issues/26
+
+### Clear, handoff and compaction
+
+These three act on the conversation rather than the screen, so each one asks before it changes
+anything and names what it leaves behind. None is automatic, and each one calls the agent, which
+does the work and says whether it was done.
+
+**`/clear`** opens a warning that names the conversation a clear would stop, by its id and by its
+name only when it has one, and says that it is stopped, not deleted, and can be resumed by its id.
+`y` confirms it; any other key leaves the warning open, except `Esc` or `n`, which keep the
+conversation. If a turn is running, the warning says the turn will be stopped first. A confirmed
+clear with no turn running starts the new conversation at once. With a turn running, the interface
+sends the stop and shows *stopping…*. It asks for the new conversation only when the turn's own
+ending arrives, so the new session never races a turn that is still writing. `Esc` during that wait
+abandons the clear: the conversation stays attached, and nothing is created. The transcript then
+becomes the new conversation's, with a notice that names the one it left behind. Prompts queued for
+the conversation being left are dropped, with a notice that says how many: they were written for
+that conversation, and sending them as the new one's first words would start the clean session with
+someone else's question. A committed handoff drops them the same way, with the same notice. If a
+turn starts while the warning is open, the warning changes to say the turn will be stopped, and asks
+for the keyboard's quiet again before it takes a `y`.
+
+What belongs to a session follows the attachment, not the screen: the title becomes the new
+session's name (or its short id), the token count, goal and context lines are emptied, and the
+context mode is the new session's — managed after a handoff, and after a clear the agent's own
+answer, which the interface asks for at once and shows as a context-status notice. If the agent
+cannot start the new conversation, a notice says so. The agent let go of the old conversation before
+it tried, so the connection now follows none, and the notice names the old id and the
+`nanus tui --resume` that opens it again. A prompt typed while a draft is being made or a new
+conversation is being attached is queued rather than sent, because the session is reserved by the
+draft, and a prompt sent into the conversation being left would be stopped or dropped. `/clear`,
+`/handoff` and `/compact` are each refused with a notice while another of them is under way.
+
+The warning and both previews below take nothing but `Esc` until the keyboard has been quiet for
+`APPROVAL_SETTLE` with the dialog on screen, exactly as an approval does, and a stray key starts the
+quiet again. A preview arrives seconds after it was asked for, while the reader may still be typing,
+and a `y` typed into the composer must not start a new session or cut one.
+
+**`/handoff [name]`** asks the agent for a draft, and the status line says the handoff is being
+drafted until it arrives. The name is one word: `/handoff a b` is refused with a sentence and
+nothing is drafted. The draft opens as a read-only preview: the warning that the new session gets
+this document as generated data, not as the reader's words, and then the whole document. The arrow
+keys, page keys and Home and End scroll it. `y` starts the new session; `Esc` cancels, and nothing
+is created. A name asked for is carried through; the agent checks it against the store's name rules
+before it drafts, and again when the session is created. A handoff is refused in a recording, and in
+a legacy session, with a sentence that says why and the `handoff_unavailable` code (a recording's
+`/compact` likewise names `compact_unavailable`).
+
+When the new session is attached, its transcript is the new session's. The document it opened with
+is drawn once, as a block labelled as the handoff it was drafted from — once whether it came from
+the replayed log or from the agent's `Seeded` frame, which every attachment to a seeded session is
+sent. It is generated data, so it is drawn as the harness and never as the reader's message, and it
+collapses with `Ctrl+T` like a long run of tool calls. Two notices can follow it. If the old
+session's log does not record the handoff — its back-link could not be written — the notice says so;
+the new session is complete either way. If the name the reader asked for did not stick, the notice
+says the session was created but not named, and what it holds.
+
+**`/compact`** asks the agent for a draft of the legacy conversation's summary. The preview shows
+the summary, the warning that earlier content leaves the model's reach and that a legacy session
+cannot read it back, the event the cut falls at (or that it is unknown, when the agent sent no
+count), the usage the summary request cost, and, only when the request had to leave some turns out,
+a sentence that the summary covers only the most recent turns the model could see. `y` cuts the
+session; `Esc` cancels and changes nothing. A committed cut is drawn in the transcript as a divider:
+the earlier conversation stays above it, and the summary the model now reads sits beneath it. It
+follows `Ctrl+T` as well. The divider appears for every viewer of the session, and a client that
+opens the session later gets it too, because its transcript is replayed from the log, where the cut
+is.
+
+While either draft is being made, `Esc` asks the agent to stop it, the way it stops a turn: the
+agent runs a draft in a task of its own, so the request reaches it while the model is still
+answering, and the answer is the refusal that says the draft was interrupted. Nothing is drafted,
+and the session is free at once. An interrupted compaction draft has written nothing; an interrupted
+handoff draft keeps the two attempt records its model call made, the second recorded `cancelled`,
+as the accounting of a call that was made.
+
+A refusal from the agent shows its sentence, and the stable code it was refused with when it has
+one, in parentheses; the agent sends the two apart, so the code is never said twice. A `stale_draft`
+means the conversation moved after the draft was made, so the draft is stale; the reader asks again.
 
 ### Choosing the permission state
 
@@ -745,18 +830,19 @@ answer's own lines and no more, so the `──` line the view draws above it, wh
 than something the model wrote, is not in the copy either.
 
 A transcript selection is a range of *rendered* rows, which has a consequence worth knowing:
-anything *you* do that re-renders the transcript drops it, rather than leaving a highlight over
-text nobody chose. A resize re-wraps every paragraph; `Ctrl+L` or `/clear` takes the lines away
-altogether; and the two summary toggles (`Ctrl+T`, `Ctrl+E`) and `Ctrl+O` change what the lines
-*are*. Making a selection after the toggle rather than before is the whole cost, and it is
-cheaper than a highlight that says one thing and copies another. Text still streaming is the one
-thing that moves the rows under a highlight rather than dropping it — the answer grows and
+anything *you* do that re-renders the transcript drops it, rather than leaving a highlight over text
+nobody chose. A resize re-wraps every paragraph; `Ctrl+L` takes the lines away altogether, and so do a
+confirmed `/clear` and a committed handoff, which replace the transcript (and in a recording so does
+`/clear`); and the two summary toggles (`Ctrl+T`, `Ctrl+E`) and `Ctrl+O` change
+what the lines *are*. Making a selection after the toggle rather than before is the whole cost, and
+it is cheaper than a highlight that says one thing and copies another. Text still streaming is the
+one thing that moves the rows under a highlight rather than dropping it — the answer grows and
 re-wraps as it arrives — and there the highlight is what a copy follows, so what a reader sees
-selected is what they get. And a line the *drawer* has to wrap — one wider than the terminal
-that the renderer did not wrap itself — is selected whole, because which character a wrapped row
-begins with is the drawing library's business and it does not report it. Every line a model's
-answer is made of is wrapped by the renderer, so this is rare, and it errs towards copying too
-much rather than too little.
+selected is what they get. And a line the *drawer* has to wrap — one wider than the terminal that
+the renderer did not wrap itself — is selected whole, because which character a wrapped row begins
+with is the drawing library's business and it does not report it. Every line a model's answer is
+made of is wrapped by the renderer, so this is rare, and it errs towards copying too much rather
+than too little.
 
 A *screen* selection is the other way round, and deliberately so: it names cells, so a dialogue
 whose rows move under it copies what is drawn in those cells now. That is the honest answer for
@@ -970,6 +1056,10 @@ as the six lines they replaced — while two tool calls with an answer between t
 runs, because they are two thoughts. And **the summary keeps what a reader scanning for a
 problem needs**: how many calls, which tools, and whether any failed. The status line names
 what is folded, so a toggle is never a mystery about why the transcript looks short.
+
+The document a handoff starts from and the summary a compaction leaves beneath its divider are long
+blocks of the same kind, so `Ctrl+T` folds them to a line as well: the seed to its source and its
+length, and the summary to its length.
 
 ## One line for the machinery, by default
 

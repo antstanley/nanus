@@ -373,6 +373,14 @@ pub trait SessionSource {
         None
     }
 
+    /// The name the session holds, when it holds one.
+    ///
+    /// Unlike [`SessionSource::label`], never a fallback such as a short id: a warning that says a
+    /// session is "named" something must be quoting a name a reader can resume it by.
+    fn name(&self) -> Option<&str> {
+        None
+    }
+
     /// Rows to scroll back from the end when the interface opens.
     ///
     /// A conversation opens at its end, which is where the answer is; a reader who wants
@@ -533,6 +541,33 @@ pub trait SessionSource {
     /// A default of doing nothing, for the same reason as [`SessionSource::set_goal`]: a recording
     /// has no agent, and the interface refuses `/context` on one rather than sending it nowhere.
     fn set_context(&mut self, _action: ContextAction) {}
+
+    /// Follows an attachment the agent made on this connection, after a `New` or a committed
+    /// handoff.
+    ///
+    /// The session the source reports is the one the connection is in now, so an exit summary reads
+    /// the conversation the reader was last in rather than the one that was opened. A default of
+    /// doing nothing: a recording is never moved.
+    fn attached_to(&mut self, _session: &SessionInfo) {}
+
+    /// Starts a new conversation, leaving the one attached to the agent's own record of it.
+    ///
+    /// A default of doing nothing: a recording has no agent to start one in, and `/clear` asks for
+    /// it only on a live session.
+    fn new_session(&mut self) {}
+
+    /// Asks the agent to draft a handoff from the attached managed session, into a session named
+    /// `name`.
+    fn handoff_draft(&mut self, _name: Option<String>) {}
+
+    /// Asks the agent to commit the handoff draft it made under `draft_id`.
+    fn handoff_commit(&mut self, _draft_id: &str) {}
+
+    /// Asks the agent to draft a compaction of the attached legacy session.
+    fn compact_draft(&mut self) {}
+
+    /// Asks the agent to commit the compaction draft it made under `draft_id`.
+    fn compact_commit(&mut self, _draft_id: &str) {}
 
     /// Where the session's stream stood when this source attached to it.
     ///
@@ -704,6 +739,8 @@ pub enum Target {
 pub struct Remote {
     session: Session,
     label: String,
+    /// The name the agent says the session holds, when it holds one.
+    name: Option<String>,
     /// The store the conversation is written to by the agent, kept so the session can be
     /// re-read when the interface leaves.
     ///
@@ -778,6 +815,7 @@ impl Remote {
         }
         let workspace = agent.workspace.clone();
         let (session, notice) = history(store, &attached, &stream.frontier, &agent.workspace).await;
+        let name = attached.name.clone();
         let label = attached.name.unwrap_or_else(|| short_id(&attached.session));
         let busy = attached.busy;
         let (requests, pending) = mpsc::unbounded_channel();
@@ -785,6 +823,7 @@ impl Remote {
             session,
             workspace,
             label,
+            name,
             store: std::rc::Rc::clone(store),
             client: Some(client),
             requests,
@@ -948,6 +987,10 @@ impl SessionSource for Remote {
         Some(&self.label)
     }
 
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     fn accepts_prompts(&self) -> bool {
         true
     }
@@ -1026,6 +1069,46 @@ impl SessionSource for Remote {
 
     fn set_context(&mut self, action: ContextAction) {
         self.send(Request::Context { action });
+    }
+
+    fn attached_to(&mut self, session: &SessionInfo) {
+        // An empty session under the new id until the store is read: a conversation nobody has
+        // taken a turn in has no record yet, and an empty one is the truth about it.
+        self.session = Session::new(
+            SessionId::new(session.session.clone()),
+            0,
+            self.workspace.clone(),
+        );
+        self.name.clone_from(&session.name);
+        self.label = session
+            .name
+            .clone()
+            .unwrap_or_else(|| short_id(&session.session));
+        self.busy = session.busy;
+    }
+
+    fn new_session(&mut self) {
+        self.send(Request::New { name: None });
+    }
+
+    fn handoff_draft(&mut self, name: Option<String>) {
+        self.send(Request::HandoffDraft { name });
+    }
+
+    fn handoff_commit(&mut self, draft_id: &str) {
+        self.send(Request::HandoffCommit {
+            draft_id: draft_id.to_owned(),
+        });
+    }
+
+    fn compact_draft(&mut self) {
+        self.send(Request::CompactDraft);
+    }
+
+    fn compact_commit(&mut self, draft_id: &str) {
+        self.send(Request::CompactCommit {
+            draft_id: draft_id.to_owned(),
+        });
     }
 
     fn stream(&self) -> Option<StreamCursor> {
@@ -1373,6 +1456,7 @@ fn view_of(source: &dyn SessionSource, preferences: &Preferences, no_color: bool
     if let Some(stream) = source.stream() {
         view.stream = stream;
     }
+    view.attached_id = Some(source.session().id().as_str().to_owned());
     // Said where the reader will see it first: the stored session could not be read through the
     // frontier the agent named, and an empty transcript is not to be taken for an empty session.
     if let Some(notice) = source.opening_notice() {
@@ -1472,6 +1556,9 @@ const fn domain_outcome(outcome: DecisionState) -> nanus_domain::context::manage
 /// on the way out reports alongside the session's own totals. It cannot be read off the
 /// session afterwards: only the process that watched the responses arrive knows how fast they
 /// arrived, and that process is this one.
+// One wake-up is one arm per input the interface can receive, and splitting them would scatter the
+// one place that says what each wake-up does. The length is that list, not tangled logic.
+#[allow(clippy::too_many_lines)]
 async fn event_loop(
     source: &mut dyn SessionSource,
     mut frames: mpsc::Receiver<Frame>,
@@ -1547,6 +1634,9 @@ async fn event_loop(
                         view.status = String::from("permission: Enter applies, Esc cancels");
                     }
                     Outcome::SetContext(action) => request_context(action, source, &mut view),
+                    Outcome::ClearSession { .. }
+                    | Outcome::CommitHandoff { .. }
+                    | Outcome::CommitCompact(_) => session_outcome(outcome, source, &mut view),
                     Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
                     Outcome::SetEffort(step) => set_effort_word(&step, source, &mut view),
                     Outcome::SetProvider { provider, plan } => {
@@ -1590,10 +1680,10 @@ async fn event_loop(
                     continue;
                 };
                 view.now = clock.elapsed();
-                apply(frame, &mut view);
+                receive(frame, source, &mut view);
                 // Frames arrive in bursts — one per streamed fragment — and each redraw
                 // costs a full frame, so the queue is emptied before the next one.
-                drain_frames(&mut frames, &mut view);
+                drain_received(&mut frames, source, &mut view);
             }
         }
         // A turn ends with a frame and never with a keystroke, so this is the only place
@@ -1672,6 +1762,12 @@ enum Routed {
     Context(ContextAction),
     /// Open the context chooser, or review the impact of a named change.
     ContextChooser(Option<crate::context::ContextChoice>),
+    /// Confirm a clear of the attached conversation, after its warning.
+    ClearSession,
+    /// Draft a handoff into a new session, named if the word after the command names it.
+    Handoff(Option<String>),
+    /// Draft a compaction of the attached legacy session.
+    Compact,
     /// Say this in the transcript instead.
     Say(String),
 }
@@ -1686,7 +1782,35 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
         Submission::Run(Command::Exit) => Routed::Leave,
         Submission::Run(Command::Stats) => Routed::Stats,
         Submission::Run(Command::Help) => Routed::Help,
-        Submission::Run(Command::Clear) => Routed::Clear,
+        // `/clear` is the session-level control on a live session, and the screen-only erasure it
+        // always was on a recording, where there is no session to stop.
+        Submission::Run(Command::Clear) => {
+            if accepts_prompts {
+                Routed::ClearSession
+            } else {
+                Routed::Clear
+            }
+        }
+        Submission::Run(Command::Handoff) => {
+            if accepts_prompts {
+                handoff_route(&prompt)
+            } else {
+                Routed::Say(String::from(
+                    "a handoff is made from a live managed session; this is a recording \
+                     (handoff_unavailable)",
+                ))
+            }
+        }
+        Submission::Run(Command::Compact) => {
+            if accepts_prompts {
+                Routed::Compact
+            } else {
+                Routed::Say(String::from(
+                    "a compaction is made in a live legacy session; this is a recording \
+                     (compact_unavailable)",
+                ))
+            }
+        }
         // The argument is the rest of the line: `/model <id>` names one, and a bare `/model`
         // opens the selector rather than cycling blind, so the reader reads the ids the agent
         // offers and then chooses.
@@ -1754,8 +1878,11 @@ fn route_submission(prompt: String, accepts_prompts: bool) -> Routed {
 /// words are already on screen.
 fn send_or_queue(prompt: String, source: &mut dyn SessionSource, view: &mut ViewState) {
     // `busy` is the interface's read of the turn state and `has_queued` covers the moment
-    // a turn just ended: a prompt typed then should join the line rather than overtake it.
-    if view.busy || view.has_queued() || view.context_change_asked.is_some() {
+    // a turn just ended: a prompt typed then should join the line rather than overtake it. A
+    // draft reserves the session, so the agent would refuse the turn; and a prompt sent while a
+    // switch of conversation is pending would land in whichever session the agent puts this
+    // connection in, then be wiped from the screen by the attachment.
+    if view.busy || view.has_queued() || view.context_change_asked.is_some() || view.switching() {
         view.enqueue(prompt);
         view.status = queued_status(view.queue.len());
         return;
@@ -1775,7 +1902,20 @@ fn send_or_queue(prompt: String, source: &mut dyn SessionSource, view: &mut View
 /// the loop's next wake-up sends the one after it — the agent is asked for one turn at a
 /// time exactly as a person would be.
 fn flush_queue(source: &mut dyn SessionSource, view: &mut ViewState) {
-    if view.busy || view.context_dialog.is_some() || view.context_change_asked.is_some() {
+    // A clear waiting on a turn asks for the new conversation the moment that turn has ended.
+    finish_clear(source, view);
+    // Nothing is sent while a switch of conversation waits for its attachment: a prompt sent now
+    // would land in whichever session the agent puts this connection in. Nor while a draft runs,
+    // because the draft holds the session and the agent would refuse the turn; nor while its
+    // preview or the clear warning is open, because a turn sent under either moves the session
+    // the human is deciding about — a draft would go stale, and a clear would stop the turn.
+    if view.busy
+        || view.switching()
+        || view.preview.is_some()
+        || view.clear_dialog.is_some()
+        || view.context_dialog.is_some()
+        || view.context_change_asked.is_some()
+    {
         return;
     }
     let Some(prompt) = view.take_queued() else {
@@ -1877,6 +2017,9 @@ async fn submitted(
         Routed::Goal(action) => request_goal(action, source, view),
         Routed::Context(action) => request_context(action, source, view),
         Routed::ContextChooser(choice) => open_context_chooser(choice, source, view),
+        Routed::ClearSession => open_clear_dialog(source, view),
+        Routed::Handoff(name) => start_handoff(name, source, view),
+        Routed::Compact => start_compact(source, view),
         Routed::Say(message) => {
             view.transcript.push(Entry::notice(message));
             view.scroll_to_bottom();
@@ -2133,6 +2276,20 @@ fn next_model(models: &[String], current: Option<&str>) -> Option<String> {
 /// The model named after a command, if one was.
 fn model_argument(line: &str) -> Option<String> {
     line.split_whitespace().nth(1).map(str::to_owned)
+}
+
+/// Routes a live `/handoff` line: no word drafts an unnamed session, one word names it, and more
+/// than one is refused rather than cut down to the first, because a name is one word and the
+/// reader would otherwise get a session named something they did not type.
+fn handoff_route(line: &str) -> Routed {
+    let mut words = line.split_whitespace().skip(1);
+    match (words.next(), words.next()) {
+        (None, _) => Routed::Handoff(None),
+        (Some(name), None) => Routed::Handoff(Some(name.to_owned())),
+        (Some(_), Some(_)) => Routed::Say(String::from(
+            "a session name is one word: `/handoff` or `/handoff <name>`; nothing was drafted",
+        )),
+    }
 }
 
 /// The text after a command's own word, trimmed, or empty when there is none.
@@ -2402,6 +2559,23 @@ enum Outcome {
     OpenPermissions,
     /// Submit an explicitly confirmed context mutation.
     SetContext(ContextAction),
+    /// Confirmed `/clear` of the conversation `old_id`: stop any turn, then start a new one.
+    ClearSession {
+        /// The conversation the clear leaves behind.
+        old_id: String,
+        /// Its name, when it has one.
+        name: Option<String>,
+    },
+    /// Confirmed handoff: commit the draft the agent made under this id, into a session named
+    /// `name`.
+    CommitHandoff {
+        /// The id the agent answered the draft with.
+        draft_id: String,
+        /// The name the draft asked for, which the seed's name is checked against.
+        name: Option<String>,
+    },
+    /// Confirmed compaction: commit the draft the agent made under this id.
+    CommitCompact(String),
     /// Switch to this model, or to the next one when nothing is named.
     SetModel(Option<String>),
     /// Set the effort to this step, named as its wire word.
@@ -2579,6 +2753,8 @@ fn handle_modal_key(modal: Modal, mut key: KeyEvent, view: &mut ViewState) -> Ou
         Modal::Effort => handle_effort_key(key, view),
         Modal::Help => handle_help_key(key, view),
         Modal::Queue => handle_queue_key(key, view),
+        Modal::Preview => handle_preview_key(key, view),
+        Modal::Clear => handle_clear_key(key, view),
     }
 }
 
@@ -2601,8 +2777,22 @@ fn scroll_modal_key(modal: Modal, key: KeyEvent, view: &mut ViewState) -> bool {
         KeyCode::PageDown => PAGE_ROWS,
         KeyCode::Home => i32::MIN,
         KeyCode::End => i32::MAX,
-        KeyCode::Up if matches!(modal, Modal::Authorization | Modal::Credential) => -1,
-        KeyCode::Down if matches!(modal, Modal::Authorization | Modal::Credential) => 1,
+        KeyCode::Up
+            if matches!(
+                modal,
+                Modal::Authorization | Modal::Credential | Modal::Preview | Modal::Clear
+            ) =>
+        {
+            -1
+        }
+        KeyCode::Down
+            if matches!(
+                modal,
+                Modal::Authorization | Modal::Credential | Modal::Preview | Modal::Clear
+            ) =>
+        {
+            1
+        }
         _ => return false,
     };
     if modal == Modal::Context {
@@ -3600,7 +3790,16 @@ fn stop_or_cancel_or_quit(view: &mut ViewState) -> Outcome {
         view.clear_selection();
         return Outcome::Continue;
     }
-    if view.busy {
+    // A clear waiting on the turn it stopped: `Esc` abandons the clear and leaves the conversation
+    // attached. The turn still stops, because it was already asked to; nothing new is created.
+    if view.clearing.is_some() {
+        view.clearing = None;
+        view.status = String::from("clear abandoned; the conversation stays attached");
+        return Outcome::Continue;
+    }
+    // A draft the agent is running stops the way a turn does: its answer is the refusal that
+    // says it was interrupted, which also ends the wait.
+    if view.busy || view.drafting {
         return Outcome::Interrupt;
     }
     if view.input.is_empty() {
@@ -3801,18 +4000,39 @@ fn apply_from(frame: Frame, view: &mut ViewState, arrival: Arrival) {
             });
         }
         Frame::Done { answer, reason } => apply_done(&answer, &reason, view),
-        Frame::Failed { message } => {
-            view.context_asked = false;
-            view.context_change_asked = None;
-            view.context_reset_asked = false;
-            view.context_dialog = None;
-            // A failure ends whatever was in front of the reader, including an authorization prompt:
-            // its refusal is the answer the prompt was waiting for.
-            view.close_auth();
-            view.transcript.push(Entry::notice(message));
-            closed(view);
-        }
-        Frame::Refused { message } => apply_refused(message, view),
+        Frame::Failed { message } => apply_failed(message, view),
+        Frame::Refused { message, code } => apply_refused(message, code.as_deref(), view),
+        Frame::HandoffDraft { draft_id, text } => apply_handoff_draft(draft_id, text, view),
+        Frame::CompactDraft {
+            draft_id,
+            text,
+            dropped_turns,
+            usage,
+            boundary_event_count,
+        } => apply_compact_draft(
+            draft_id,
+            text,
+            (dropped_turns, boundary_event_count),
+            usage,
+            view,
+        ),
+        Frame::Seeded {
+            text,
+            source_session_id,
+            source_event_count: _,
+            name,
+            back_link_recorded,
+        } => apply_seeded(
+            text,
+            &source_session_id,
+            name.as_deref(),
+            back_link_recorded,
+            view,
+        ),
+        Frame::Compacted {
+            boundary_event_count,
+            summary,
+        } => apply_compacted(boundary_event_count, summary, view),
         // Frames that describe the connection rather than the conversation: the handshake,
         // the attachment, a listing, a status, and the goodbye. The interface learned what it
         // needed from the first two before it drew anything, and a `Bye` is the transport's
@@ -3821,14 +4041,495 @@ fn apply_from(frame: Frame, view: &mut ViewState, arrival: Arrival) {
         // The attachment's stream position is not read here either: the interface took it from
         // the attachment before the first frame was drawn, and a second attachment on a live
         // connection is the client half's business, not the transcript's.
-        Frame::Ready(_)
-        | Frame::Attached {
-            session: _,
-            stream: _,
+        Frame::Attached { session, stream } => apply_attached(&session, &stream, view),
+        Frame::Ready(_) | Frame::Sessions { .. } | Frame::Status(_) | Frame::Bye => {}
+    }
+}
+
+/// A request failed, or a turn did: whatever was waiting on an answer is over.
+///
+/// A switch of conversation is answered by an attachment, and an agent that could not open the new
+/// session answers with this frame instead; left pending, the switch would hold the queue for ever.
+/// A failure that arrives while a turn is on screen is that turn's ending rather than the switch's
+/// answer — the switch was asked for when nothing was running — so only an idle one ends it.
+///
+/// The agent lets go of the conversation a connection was following before it opens the next one,
+/// so a switch that failed leaves the connection following nothing. The notice says so and names
+/// how to get back, rather than implying the old conversation is still on the other end.
+fn apply_failed(message: String, view: &mut ViewState) {
+    let switch_failed = view.switch.is_some() && !view.busy;
+    let lost = view.switch.as_ref().map(switch_failure_notice);
+    view.drafting = false;
+    view.context_asked = false;
+    view.context_change_asked = None;
+    view.context_reset_asked = false;
+    view.context_dialog = None;
+    // A failure ends whatever was in front of the reader, including an authorization prompt:
+    // its refusal is the answer the prompt was waiting for.
+    view.close_auth();
+    view.transcript.push(Entry::notice(message));
+    if switch_failed {
+        view.switch = None;
+        if let Some(notice) = lost {
+            view.transcript.push(Entry::notice(notice));
         }
-        | Frame::Sessions { .. }
-        | Frame::Status(_)
-        | Frame::Bye => {}
+    }
+    closed(view);
+    if switch_failed {
+        view.status = resting_status(view);
+    }
+}
+
+/// What a reader is told when the agent could not attach the conversation a switch asked for.
+fn switch_failure_notice(switch: &crate::maintenance::Switch) -> String {
+    match switch {
+        crate::maintenance::Switch::Clear { old_id, .. } => format!(
+            "the new conversation was not started, and this connection no longer follows \
+             {old_id}; open it again with `nanus tui --resume {old_id}`"
+        ),
+        crate::maintenance::Switch::Handoff { .. } => String::from(
+            "the handed-off session was created but could not be attached; `nanus sessions` \
+             lists it",
+        ),
+    }
+}
+
+/// Tells the source which session an attachment put the connection in, so what it reports follows
+/// the reader.
+fn follow_attachment(source: &mut dyn SessionSource, frame: &Frame) {
+    if let Frame::Attached { session, .. } = frame {
+        source.attached_to(session);
+    }
+}
+
+/// Says, and answers `true`, when a session control cannot start because another is pending.
+///
+/// A second control started while a switch waits for its attachment would replace the switch the
+/// view is waiting on, so the attachment that arrives would be taken for the wrong one; and one
+/// started while a draft runs would be refused by the agent, which holds the session for the draft.
+fn refused_while_switching(what: &str, view: &mut ViewState) -> bool {
+    if !view.switching() {
+        return false;
+    }
+    let pending = if view.drafting {
+        "a draft is running"
+    } else {
+        "the conversation is changing"
+    };
+    view.transcript.push(Entry::notice(format!(
+        "{pending}; {what} can be asked for once it has finished"
+    )));
+    view.follow();
+    true
+}
+
+/// Opens the `/clear` warning for the attached conversation, which names what a clear stops.
+fn open_clear_dialog(source: &dyn SessionSource, view: &mut ViewState) {
+    if refused_while_switching("a clear", view) {
+        return;
+    }
+    let old_id = view
+        .attached_id
+        .clone()
+        .unwrap_or_else(|| source.session().id().as_str().to_owned());
+    view.clear_dialog = Some(crate::maintenance::ClearDialog {
+        old_id,
+        name: source.name().map(str::to_owned),
+        busy: view.busy,
+    });
+    view.unsettle_confirmation();
+    view.status = String::from("clear this conversation? y confirms · Esc keeps it");
+}
+
+/// Confirmed `/clear`: a running turn is stopped first and waited for; an idle conversation is left
+/// at once.
+fn ask_clear(
+    old_id: String,
+    name: Option<String>,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    let switch = crate::maintenance::Switch::Clear { old_id, name };
+    if view.busy {
+        view.clearing = Some(switch);
+        view.status = String::from("stopping the turn before the clear · Esc abandons the clear");
+        source.interrupt();
+        return;
+    }
+    begin_new_conversation(switch, source, view);
+}
+
+/// Asks for the new conversation, remembering the switch the attachment that answers it completes.
+///
+/// A clear discards the prompts queued behind the turn it stopped, and says how many: they were
+/// typed for the conversation being left, and sending them would make the clean session's first
+/// turn something the reader wrote for another one. They are not kept for later either, because
+/// a prompt held across a clear has lost the context it was written in.
+fn begin_new_conversation(
+    switch: crate::maintenance::Switch,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    drop_queued(view);
+    view.switch = Some(switch);
+    view.status = String::from("starting a new conversation");
+    source.new_session();
+}
+
+/// Discards the prompts queued for the conversation being left, and says how many.
+///
+/// Shared by a clear and a committed handoff, because a handoff clears as a clear does: either
+/// way the prompts were written for the conversation being left.
+fn drop_queued(view: &mut ViewState) {
+    let mut dropped = 0_usize;
+    while view.take_queued().is_some() {
+        dropped = dropped.saturating_add(1);
+    }
+    assert!(!view.has_queued(), "every queued prompt was discarded");
+    if dropped > 0 {
+        let noun = if dropped == 1 { "prompt" } else { "prompts" };
+        view.transcript.push(Entry::notice(format!(
+            "{dropped} queued {noun} for the conversation being left were not sent"
+        )));
+        view.follow();
+    }
+}
+
+/// The outcomes that change which conversation the interface is in, or commit a draft the agent
+/// made.
+///
+/// The event loop hands them here so its own match stays one arm each for the rest of the keys.
+fn session_outcome(outcome: Outcome, source: &mut dyn SessionSource, view: &mut ViewState) {
+    match outcome {
+        Outcome::ClearSession { old_id, name } => ask_clear(old_id, name, source, view),
+        Outcome::CommitHandoff { draft_id, name } => commit_handoff(&draft_id, name, source, view),
+        Outcome::CommitCompact(draft_id) => commit_compact(&draft_id, source, view),
+        _ => {}
+    }
+}
+
+/// Asks for the new conversation once a clear that waited on a turn finds the turn has ended.
+fn finish_clear(source: &mut dyn SessionSource, view: &mut ViewState) {
+    if view.busy {
+        return;
+    }
+    let Some(switch) = view.clearing.take() else {
+        return;
+    };
+    begin_new_conversation(switch, source, view);
+}
+
+/// Asks the agent to draft a handoff. A turn running in the session is said, not sent.
+fn start_handoff(name: Option<String>, source: &mut dyn SessionSource, view: &mut ViewState) {
+    if refused_while_switching("a handoff", view) {
+        return;
+    }
+    if view.busy {
+        view.transcript.push(Entry::notice(String::from(
+            "a turn is running; a handoff can be drafted when it is idle",
+        )));
+        view.follow();
+        return;
+    }
+    view.handoff_name.clone_from(&name);
+    view.drafting = true;
+    view.status =
+        String::from("drafting a handoff; Esc stops it, or the agent answers with a preview");
+    source.handoff_draft(name);
+}
+
+/// Asks the agent to draft a compaction. A turn running in the session is said, not sent.
+fn start_compact(source: &mut dyn SessionSource, view: &mut ViewState) {
+    if refused_while_switching("a compaction", view) {
+        return;
+    }
+    if view.busy {
+        view.transcript.push(Entry::notice(String::from(
+            "a turn is running; a compaction can be drafted when it is idle",
+        )));
+        view.follow();
+        return;
+    }
+    view.drafting = true;
+    view.status =
+        String::from("drafting a compaction; Esc stops it, or the agent answers with a preview");
+    source.compact_draft();
+}
+
+/// Confirmed handoff: the commit is sent, and the attachment that follows is the new session's.
+fn commit_handoff(
+    draft_id: &str,
+    name: Option<String>,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    drop_queued(view);
+    view.switch = Some(crate::maintenance::Switch::Handoff { name });
+    view.status = String::from("creating the new session");
+    source.handoff_commit(draft_id);
+}
+
+/// Confirmed compaction: the agent cuts the session and tells every viewer.
+fn commit_compact(draft_id: &str, source: &mut dyn SessionSource, view: &mut ViewState) {
+    view.status = String::from("compacting the session");
+    source.compact_commit(draft_id);
+}
+
+/// The attachment a clear or a handoff asked for: a new transcript, following the new session's
+/// stream.
+///
+/// Only an attachment the interface asked for is applied; a stray one is only a debug line, because
+/// the stream position it carries belongs to a session this interface did not choose to join.
+fn apply_attached(session: &SessionInfo, stream: &StreamMark, view: &mut ViewState) {
+    // A draft of the conversation being left is the agent's to drop, and it sends no answer.
+    view.drafting = false;
+    let Some(switch) = view.switch.clone() else {
+        tracing::debug!("an attachment arrived that the interface did not ask for");
+        return;
+    };
+    view.transcript.clear();
+    view.clear_selection();
+    view.stream = StreamCursor::attached(
+        stream.stream_epoch.clone(),
+        stream.stream_watermark,
+        stream.frontier.event_count,
+    );
+    view.attached_id = Some(session.session.clone());
+    joined_session(session, &switch, view);
+    if let crate::maintenance::Switch::Clear { old_id, name } = switch {
+        // A clear is complete at its attachment. A handoff stays pending until its seed arrives,
+        // which is the frame that says what the new session holds.
+        view.switch = None;
+        view.transcript
+            .push(Entry::notice(crate::maintenance::left_behind_notice(
+                &old_id,
+                name.as_deref(),
+            )));
+        view.status = resting_status(view);
+    }
+    view.follow();
+    view.scroll_to_bottom();
+}
+
+/// Forgets what the view knew about the conversation it left, and says what it knows of the new
+/// one.
+///
+/// The title, the token count, the context mode and the goal and decisions already drawn are facts
+/// about one session, read when the interface opened it. The agent sends no context status on an
+/// attachment, so left alone they would describe the old conversation under the new one's
+/// transcript. A handoff's session is managed by construction; a clear's is whatever the agent
+/// starts a new session as, which the interface asks about (see [`receive`]) and until then
+/// assumes is the default, legacy.
+fn joined_session(
+    session: &SessionInfo,
+    switch: &crate::maintenance::Switch,
+    view: &mut ViewState,
+) {
+    view.label = Some(
+        session
+            .name
+            .clone()
+            .unwrap_or_else(|| short_id(&session.session)),
+    );
+    view.tokens_used = 0;
+    view.goal_shown = None;
+    view.context_shown = None;
+    view.decisions_shown.clear();
+    view.context_mode = match switch {
+        crate::maintenance::Switch::Handoff { .. } => {
+            nanus_domain::context::managed::ContextMode::Managed
+        }
+        crate::maintenance::Switch::Clear { .. } => {
+            nanus_domain::context::managed::ContextMode::Legacy
+        }
+    };
+}
+
+/// Applies one frame from the agent, and follows the attachment a clear or a handoff asked for.
+///
+/// The source is told about an attachment only when the view takes it as the one it asked for, so
+/// what the exit summary reads and what the screen shows are always the same conversation. After a
+/// clear's attachment the agent is asked for the new session's context status, because whether a
+/// new session is managed is the agent's configuration and not something the interface knows.
+fn receive(frame: Frame, source: &mut dyn SessionSource, view: &mut ViewState) {
+    let switch = match frame {
+        Frame::Attached { .. } => view.switch.clone(),
+        _ => None,
+    };
+    if switch.is_some() {
+        follow_attachment(source, &frame);
+    }
+    apply(frame, view);
+    if matches!(switch, Some(crate::maintenance::Switch::Clear { .. })) {
+        request_context(ContextAction::Status, source, view);
+    }
+}
+
+/// Applies every frame already waiting, as [`receive`] applies one.
+fn drain_received(
+    frames: &mut mpsc::Receiver<Frame>,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    while let Ok(frame) = frames.try_recv() {
+        receive(frame, source, view);
+    }
+}
+
+/// The seed of a session a handoff started: its document, and what the handoff did not manage to
+/// write.
+fn apply_seeded(
+    text: String,
+    source: &str,
+    name: Option<&str>,
+    back_link_recorded: bool,
+    view: &mut ViewState,
+) {
+    // The agent sends the seed on every attachment, and a resumed session's transcript was
+    // replayed from a log that already opens with it: the block is drawn once, whichever came
+    // first. After a handoff's attachment the transcript was emptied, so it is drawn then.
+    let drawn = view.transcript.entries().iter().any(|entry| {
+        matches!(entry.kind(), crate::transcript::EntryKind::Seed { source: shown }
+            if shown == source)
+    });
+    if !drawn {
+        view.transcript.push(Entry::seed(source, text));
+    }
+    if !back_link_recorded {
+        view.transcript.push(Entry::notice(format!(
+            "this session was started from {source}, but {source} does not record the handoff"
+        )));
+    }
+    if let Some(crate::maintenance::Switch::Handoff { name: Some(asked) }) = view.switch.take()
+        && name != Some(asked.as_str())
+    {
+        let holds = name.map_or_else(
+            || String::from("no name"),
+            |name| format!("the name {name:?}"),
+        );
+        view.transcript.push(Entry::notice(format!(
+            "the session was created but not named {asked:?}; it holds {holds}"
+        )));
+    }
+    view.follow();
+}
+
+/// A handoff draft is ready: it is previewed, and nothing is created until the human commits it.
+fn apply_handoff_draft(draft_id: String, text: String, view: &mut ViewState) {
+    view.drafting = false;
+    let name = view.handoff_name.take();
+    view.preview = Some(crate::maintenance::Preview::Handoff {
+        draft_id,
+        text,
+        name,
+    });
+    view.unsettle_confirmation();
+    view.status = String::from("a handoff is drafted · y starts the new session, Esc cancels");
+}
+
+/// A compaction draft is ready: it is previewed, and nothing is cut until the human commits it.
+fn apply_compact_draft(
+    draft_id: String,
+    text: String,
+    (dropped_turns, boundary_event_count): (u32, u64),
+    usage: Option<nanus_link::protocol::DraftUsage>,
+    view: &mut ViewState,
+) {
+    view.drafting = false;
+    view.preview = Some(crate::maintenance::Preview::Compact {
+        draft_id,
+        text,
+        dropped_turns,
+        boundary_event_count,
+        usage: usage.map(|usage| crate::maintenance::UsageFigures {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_hit_tokens: usage.cache_hit_tokens,
+            cache_miss_tokens: usage.cache_miss_tokens,
+        }),
+    });
+    view.unsettle_confirmation();
+    view.status = String::from("a compaction is drafted · y compacts the session, Esc cancels");
+}
+
+/// A cut was committed, here or by another viewer: the divider goes where the earlier conversation
+/// ends.
+fn apply_compacted(boundary: u64, summary: String, view: &mut ViewState) {
+    view.transcript.push(Entry::cut(boundary, summary));
+    view.status = String::from("the session was compacted");
+    view.follow();
+}
+
+/// Holds a key that reached a confirmation dialog before it settled, and says so.
+///
+/// `Esc` is never held: it only cancels, and a cancel needs no protecting from. Every other key is
+/// held until the dialog has sat before a quiet keyboard — see
+/// [`ViewState::confirmation_takes_keys`] — and a key that means nothing to the dialog starts the
+/// quiet again, because it shows the reader is typing rather than answering.
+fn hold_confirmation_key(key: KeyEvent, view: &mut ViewState) -> bool {
+    if key.code == KeyCode::Esc || view.confirmation_takes_keys() {
+        return false;
+    }
+    view.status = format!(
+        "{} · pause, then answer the dialog",
+        crate::view::HELD_KEY_NOTICE
+    );
+    true
+}
+
+/// Routes a key while a handoff or compaction preview is up: `y` commits the draft, `Esc` drops it,
+/// and nothing else answers it, so a reader cannot commit by accident. Nothing but `Esc` is taken
+/// until the preview has settled, as an approval's answers are not.
+fn handle_preview_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    if hold_confirmation_key(key, view) {
+        return Outcome::Continue;
+    }
+    match key.code {
+        KeyCode::Char('y' | 'Y') => match view.preview.take() {
+            Some(crate::maintenance::Preview::Handoff { draft_id, name, .. }) => {
+                Outcome::CommitHandoff { draft_id, name }
+            }
+            Some(crate::maintenance::Preview::Compact { draft_id, .. }) => {
+                Outcome::CommitCompact(draft_id)
+            }
+            None => Outcome::Continue,
+        },
+        KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+            view.preview = None;
+            view.status = resting_status(view);
+            Outcome::Continue
+        }
+        _ => {
+            view.unsettle_confirmation();
+            Outcome::Continue
+        }
+    }
+}
+
+/// Routes a key while the `/clear` warning is up: `y` confirms it, `Esc` or `n` keeps the
+/// conversation. Settles first, as a preview does.
+fn handle_clear_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
+    if hold_confirmation_key(key, view) {
+        return Outcome::Continue;
+    }
+    match key.code {
+        KeyCode::Char('y' | 'Y') => match view.clear_dialog.take() {
+            Some(dialog) => Outcome::ClearSession {
+                old_id: dialog.old_id,
+                name: dialog.name,
+            },
+            None => Outcome::Continue,
+        },
+        KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+            view.clear_dialog = None;
+            view.status = resting_status(view);
+            Outcome::Continue
+        }
+        _ => {
+            view.unsettle_confirmation();
+            Outcome::Continue
+        }
     }
 }
 
@@ -4124,13 +4825,30 @@ fn apply_auth_prompt(
 /// It ends nothing — a turn that is running keeps its approval and its queue, which is the whole
 /// difference from a `Failed`. An authorization prompt is the exception, because the refusal is
 /// the answer it was waiting for.
-fn apply_refused(message: String, view: &mut ViewState) {
+fn apply_refused(message: String, code: Option<&str>, view: &mut ViewState) {
     view.close_auth();
-    // A refusal is the answer a `/context` was waiting for, so nothing is waiting any more.
+    // A refusal is the answer a `/context` was waiting for, so nothing is waiting any more. A draft
+    // that was refused is not waiting for anything either.
     view.context_asked = false;
     view.context_reset_asked = false;
     view.context_change_asked = None;
-    view.transcript.push(Entry::notice(message));
+    view.handoff_name = None;
+    view.drafting = false;
+    // A refused handoff commit made no session, so no attachment is coming to complete it: a
+    // later attachment the reader did not ask for must not be taken for this one.
+    if matches!(
+        view.switch,
+        Some(crate::maintenance::Switch::Handoff { .. })
+    ) {
+        view.switch = None;
+    }
+    // The stable code is shown beside the sentence when there is one, so a reader can say what
+    // failed. The agent sends the sentence bare, so the code is never shown twice.
+    let shown = match code {
+        Some(code) => format!("{message} ({code})"),
+        None => message,
+    };
+    view.transcript.push(Entry::notice(shown));
     view.follow();
     if !view.busy {
         view.status = resting_status(view);
@@ -4316,6 +5034,9 @@ fn call_entry(entry: Entry, call_id: Option<String>) -> Entry {
 }
 
 /// Applies every already-queued frame to the view, without waiting.
+///
+/// The tests' form of [`drain_received`], for frames that need no source to follow them.
+#[cfg(test)]
 fn drain_frames(frames: &mut mpsc::Receiver<Frame>, view: &mut ViewState) {
     while let Ok(frame) = frames.try_recv() {
         apply(frame, view);
@@ -4378,6 +5099,8 @@ mod tests {
     pub(super) struct Scripted {
         session: Session,
         requests: std::rc::Rc<std::cell::RefCell<Vec<Request>>>,
+        /// The sessions the source was told the connection moved to, in order.
+        followed: Vec<String>,
         script: Vec<Frame>,
         accepts: bool,
     }
@@ -4387,6 +5110,7 @@ mod tests {
             Self {
                 session: session(),
                 requests: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                followed: Vec::new(),
                 script,
                 accepts: true,
             }
@@ -4424,6 +5148,14 @@ mod tests {
                 .push(Request::Prompt { text: prompt });
         }
 
+        fn interrupt(&mut self) {
+            self.requests.borrow_mut().push(Request::Interrupt);
+        }
+
+        fn attached_to(&mut self, session: &SessionInfo) {
+            self.followed.push(session.session.clone());
+        }
+
         fn set_model(&mut self, model: &str) {
             self.requests.borrow_mut().push(Request::SetModel {
                 model: model.to_owned(),
@@ -4457,6 +5189,32 @@ mod tests {
 
         fn set_context(&mut self, action: ContextAction) {
             self.requests.borrow_mut().push(Request::Context { action });
+        }
+
+        fn new_session(&mut self) {
+            self.requests.borrow_mut().push(Request::New { name: None });
+        }
+
+        fn handoff_draft(&mut self, name: Option<String>) {
+            self.requests
+                .borrow_mut()
+                .push(Request::HandoffDraft { name });
+        }
+
+        fn handoff_commit(&mut self, draft_id: &str) {
+            self.requests.borrow_mut().push(Request::HandoffCommit {
+                draft_id: draft_id.to_owned(),
+            });
+        }
+
+        fn compact_draft(&mut self) {
+            self.requests.borrow_mut().push(Request::CompactDraft);
+        }
+
+        fn compact_commit(&mut self, draft_id: &str) {
+            self.requests.borrow_mut().push(Request::CompactCommit {
+                draft_id: draft_id.to_owned(),
+            });
         }
     }
 
@@ -6130,6 +6888,7 @@ mod tests {
         apply(
             Frame::Refused {
                 message: "no such model: x".to_owned(),
+                code: None,
             },
             &mut view,
         );
@@ -6703,7 +7462,7 @@ mod tests {
         );
         assert!(
             message.contains("/model, /effort")
-                && message.contains("/provider, /goal, /context and /copy"),
+                && message.contains("/provider, /goal, /context, /handoff, /compact and /copy"),
             "commas between the names and `and` before the last: {message}"
         );
 
@@ -6725,10 +7484,17 @@ mod tests {
                 Routed::Help,
                 "the key list is the interface's to draw"
             );
+            // A live `/clear` stops the conversation (after its warning), and a recording has no
+            // conversation to stop, so there it clears the screen as it always did.
             assert_eq!(
                 route_submission(String::from("/clear"), accepts),
-                Routed::Clear,
-                "clearing the transcript is the interface's to do"
+                if accepts {
+                    Routed::ClearSession
+                } else {
+                    Routed::Clear
+                },
+                "clearing is the interface's to do: a live one stops the conversation, a \
+                 recording clears the screen"
             );
         }
 
@@ -7898,6 +8664,7 @@ mod tests {
                 prefix_blake3: "00".repeat(32),
                 projection_revision: 0,
             },
+            compaction_boundary: None,
         }
     }
 
@@ -8181,6 +8948,7 @@ mod tests {
         apply(
             Frame::Refused {
                 message: "a turn is running".to_owned(),
+                code: None,
             },
             &mut view,
         );
@@ -8451,6 +9219,7 @@ mod tests {
         apply(
             Frame::Refused {
                 message: "could not checkpoint".into(),
+                code: None,
             },
             &mut view,
         );
@@ -8802,6 +9571,1439 @@ mod tests {
         assert!(outcome.is_err(), "a missing socket is refused");
         let Err(error) = outcome else { return };
         assert!(error.contains("/definitely/not/a/socket"), "{error}");
+    }
+
+    fn session_info(id: &str) -> SessionInfo {
+        SessionInfo {
+            session: id.to_owned(),
+            name: None,
+            title: None,
+            events: 0,
+            busy: false,
+            viewers: 1,
+        }
+    }
+
+    /// The text of every entry a view holds, in order, for asserting what a reader is shown.
+    fn shown(view: &ViewState) -> Vec<String> {
+        view.transcript
+            .entries()
+            .iter()
+            .map(|entry| entry.text().to_owned())
+            .collect()
+    }
+
+    /// A `/clear` on a live conversation opens its warning; `Esc` keeps the conversation and only
+    /// `y` stops it, and nothing is sent until then.
+    #[test]
+    fn clear_on_a_live_conversation_asks_first_and_escape_keeps_it() {
+        assert_eq!(
+            route_submission(String::from("/clear"), true),
+            Routed::ClearSession
+        );
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        view.attached_id = Some(String::from("s-old"));
+        open_clear_dialog(&source, &mut view);
+        let dialog = view.clear_dialog.clone().expect("the warning is open");
+        assert_eq!(
+            dialog.old_id, "s-old",
+            "it names the conversation it would stop"
+        );
+        assert!(!dialog.busy);
+        assert!(source.requests.borrow().is_empty(), "opening sends nothing");
+
+        // Other keys are not answers.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(view.clear_dialog.is_some(), "a stray key keeps the warning");
+
+        assert!(matches!(
+            handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(view.clear_dialog.is_none(), "escape keeps the conversation");
+        assert!(source.requests.borrow().is_empty(), "and sends nothing");
+        let _ = &mut source;
+    }
+
+    /// A `y` that reaches a preview or the clear warning before the keyboard has been quiet is
+    /// held, not taken; `Esc` is taken at once; and after a pause the same `y` answers.
+    #[test]
+    fn a_confirmation_takes_only_escape_until_the_keyboard_has_been_quiet() {
+        let source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        view.attached_id = Some(String::from("s-old"));
+        apply(
+            Frame::HandoffDraft {
+                draft_id: String::from("d1"),
+                text: String::from("source_session: s\n\nthe narrative"),
+            },
+            &mut view,
+        );
+        let typed = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        assert!(matches!(typed, Outcome::Continue), "a typed y is held");
+        assert!(view.preview.is_some(), "the preview is still open");
+        assert!(
+            view.status.contains(crate::view::HELD_KEY_NOTICE),
+            "{}",
+            view.status
+        );
+        pause(&mut view);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+            Outcome::CommitHandoff { .. }
+        ));
+
+        open_clear_dialog(&source, &mut view);
+        let early = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        assert!(matches!(early, Outcome::Continue));
+        assert!(view.clear_dialog.is_some(), "the warning stays open");
+        handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(view.clear_dialog.is_none(), "escape is never held");
+
+        apply(
+            Frame::CompactDraft {
+                draft_id: String::from("d2"),
+                text: String::from("the summary"),
+                dropped_turns: 0,
+                usage: None,
+                boundary_event_count: 8,
+            },
+            &mut view,
+        );
+        pause(&mut view);
+        handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &mut view);
+        let after_stray = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        assert!(
+            matches!(after_stray, Outcome::Continue),
+            "a stray key starts the quiet again"
+        );
+        pause(&mut view);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+            Outcome::CommitCompact(_)
+        ));
+    }
+
+    /// A clear that waited on a turn drops the prompts queued behind it, says so, and sends only
+    /// `New`: nothing typed for the old conversation reaches the new one.
+    #[test]
+    fn a_clear_that_waited_on_a_turn_never_sends_its_queued_prompts_into_the_new_session() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        view.busy = true;
+        view.enqueue(String::from("and then refactor X"));
+        view.enqueue(String::from("and test it"));
+        ask_clear(String::from("s-old"), None, &mut source, &mut view);
+        apply(
+            Frame::Done {
+                answer: String::new(),
+                reason: TurnEnd::Interrupted,
+            },
+            &mut view,
+        );
+        flush_queue(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::Interrupt, Request::New { name: None }],
+            "the turn is stopped, a new conversation is asked for, and no prompt is sent"
+        );
+        assert!(!view.has_queued(), "the queued prompts are dropped");
+        assert!(
+            shown(&view)
+                .iter()
+                .any(|text| text.contains("2 queued prompts")),
+            "the reader is told what was dropped"
+        );
+    }
+
+    /// Without a clear, a turn's ending still sends the next queued prompt.
+    #[test]
+    fn a_turns_ending_without_a_clear_still_sends_the_next_queued_prompt() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        view.busy = true;
+        view.enqueue(String::from("and then refactor X"));
+        apply(
+            Frame::Done {
+                answer: String::new(),
+                reason: TurnEnd::Completed,
+            },
+            &mut view,
+        );
+        flush_queue(&mut source, &mut view);
+        assert!(
+            source
+                .requests
+                .borrow()
+                .iter()
+                .any(|request| matches!(request, Request::Prompt { .. })),
+            "{:?}",
+            source.requests.borrow()
+        );
+    }
+
+    /// `y` on the warning is the one answer that asks for the clear.
+    #[test]
+    fn y_on_the_clear_warning_confirms_the_clear_of_that_conversation() {
+        let mut view = attached_view("e1", 0);
+        view.attached_id = Some(String::from("s-old"));
+        let mut source = Scripted::new(Vec::new());
+        open_clear_dialog(&source, &mut view);
+        pause(&mut view);
+        let outcome = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        let Outcome::ClearSession { old_id, name } = outcome else {
+            panic!("y confirms the clear")
+        };
+        assert_eq!(old_id, "s-old");
+        assert_eq!(name, None);
+        ask_clear(old_id, name, &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::New { name: None }],
+            "an idle conversation is left at once"
+        );
+    }
+
+    /// A clear while a turn runs stops the turn, and asks for the new conversation only once the
+    /// turn's ending has arrived.
+    #[test]
+    fn a_clear_during_a_turn_waits_for_its_ending_before_it_starts_the_new_conversation() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        view.busy = true;
+        ask_clear(String::from("s-old"), None, &mut source, &mut view);
+        assert!(view.clearing.is_some(), "the clear is waiting");
+        assert!(view.status.contains("stopping"), "{}", view.status);
+        finish_clear(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::Interrupt],
+            "the turn is asked to stop, and no new conversation is asked for while it runs"
+        );
+        apply(
+            Frame::Done {
+                answer: String::new(),
+                reason: TurnEnd::Interrupted,
+            },
+            &mut view,
+        );
+        assert!(!view.busy, "the ending closed the turn");
+        finish_clear(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::Interrupt, Request::New { name: None }],
+            "the new conversation is asked for after the ending"
+        );
+        assert!(view.clearing.is_none());
+    }
+
+    /// `Esc` while a draft runs asks the agent to stop it; once the refusal that answers the stop
+    /// has arrived, `Esc` on an empty composer quits as it always did.
+    #[test]
+    fn escape_while_a_draft_runs_stops_it_and_quits_only_once_it_has_answered() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        start_compact(&mut source, &mut view);
+        let outcome = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(
+            matches!(outcome, Outcome::Interrupt),
+            "escape asks the running draft to stop"
+        );
+        apply(
+            Frame::Refused {
+                message: String::from("the summary request was interrupted; nothing was compacted"),
+                code: Some(String::from("compact_unavailable")),
+            },
+            &mut view,
+        );
+        assert!(!view.drafting, "the refusal ends the wait");
+        let outcome = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(
+            matches!(outcome, Outcome::Quit),
+            "with nothing running, escape on an empty composer quits as it always did"
+        );
+    }
+
+    /// `Esc` during that wait abandons the clear: the conversation stays attached and nothing is
+    /// created, even when the turn then ends.
+    #[test]
+    fn escape_during_a_clear_wait_abandons_it_and_creates_nothing() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        view.busy = true;
+        ask_clear(String::from("s-old"), None, &mut source, &mut view);
+        let outcome = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "escape abandons the clear rather than asking the turn to stop again"
+        );
+        assert!(view.clearing.is_none());
+        assert!(view.status.contains("abandoned"), "{}", view.status);
+        apply(
+            Frame::Done {
+                answer: String::new(),
+                reason: TurnEnd::Interrupted,
+            },
+            &mut view,
+        );
+        finish_clear(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::Interrupt],
+            "the turn was asked to stop, and the abandoned clear never asks for a new conversation"
+        );
+    }
+
+    /// The attachment a clear asked for replaces the transcript with the new conversation's,
+    /// following its stream, and names the one it left behind.
+    #[test]
+    fn the_attachment_after_a_clear_shows_the_new_conversation_and_names_the_old() {
+        let mut view = attached_view("e1", 0);
+        view.attached_id = Some(String::from("s-old"));
+        view.transcript
+            .push(Entry::prose(Role::User, "an old question"));
+        let mut source = Scripted::new(Vec::new());
+        begin_new_conversation(
+            crate::maintenance::Switch::Clear {
+                old_id: String::from("s-old"),
+                name: None,
+            },
+            &mut source,
+            &mut view,
+        );
+        apply(
+            Frame::Attached {
+                session: session_info("s-new"),
+                stream: mark("p2-h1", 0, 0),
+            },
+            &mut view,
+        );
+        let shown = shown(&view);
+        assert!(
+            !shown.iter().any(|text| text.contains("old question")),
+            "{shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|text| text.contains("s-old") && text.contains("stopped and kept")),
+            "the old conversation is named: {shown:?}"
+        );
+        assert!(
+            view.stream.is_own("p2-h1"),
+            "the stream follows the new session"
+        );
+        assert_eq!(view.attached_id.as_deref(), Some("s-new"));
+        assert!(
+            view.switch.is_none(),
+            "the clear is complete at its attachment"
+        );
+    }
+
+    /// A recorded transcript's `/clear` stays the screen erasure it always was, and `/clear now`
+    /// still parses as the clear.
+    #[test]
+    fn a_recorded_clear_stays_on_the_screen_and_clear_now_still_parses() {
+        assert_eq!(
+            route_submission(String::from("/clear"), false),
+            Routed::Clear
+        );
+        assert_eq!(
+            route_submission(String::from("/clear now"), true),
+            Routed::ClearSession
+        );
+    }
+
+    /// A handoff drafts on `/handoff`, previews what the agent wrote, and `y` commits that draft by
+    /// its id, with the name asked for carried through.
+    #[test]
+    fn a_handoff_draft_is_previewed_and_y_commits_it_by_its_id() {
+        assert_eq!(
+            route_submission(String::from("/handoff"), true),
+            Routed::Handoff(None)
+        );
+        assert_eq!(
+            route_submission(String::from("/handoff notes"), true),
+            Routed::Handoff(Some(String::from("notes")))
+        );
+        assert!(
+            matches!(
+                route_submission(String::from("/handoff two words"), true),
+                Routed::Say(text) if text.contains("one word")
+            ),
+            "more than one word is refused, not cut to the first"
+        );
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        start_handoff(Some(String::from("notes")), &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::HandoffDraft {
+                name: Some(String::from("notes"))
+            }]
+        );
+        apply(
+            Frame::HandoffDraft {
+                draft_id: String::from("d1"),
+                text: String::from("source_session: s\n\nthe narrative"),
+            },
+            &mut view,
+        );
+        assert!(
+            matches!(
+                &view.preview,
+                Some(crate::maintenance::Preview::Handoff { draft_id, name, .. })
+                    if draft_id == "d1" && name.as_deref() == Some("notes")
+            ),
+            "the preview opens on the draft: {:?}",
+            view.preview
+        );
+        assert!(
+            !shown(&view)
+                .iter()
+                .any(|text| text.contains("notes") && text.contains("source")),
+            "the draft is not sent as the reader's own words"
+        );
+        pause(&mut view);
+        let outcome = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        let Outcome::CommitHandoff { draft_id, name } = outcome else {
+            panic!("y commits the draft")
+        };
+        assert_eq!(draft_id, "d1");
+        commit_handoff(&draft_id, name, &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().last(),
+            Some(&Request::HandoffCommit {
+                draft_id: String::from("d1")
+            })
+        );
+    }
+
+    /// `Esc` on a handoff preview drops the draft and sends nothing: the only request the agent
+    /// ever saw is the draft it was asked for, and a key after the preview has gone commits
+    /// nothing.
+    #[test]
+    fn escape_on_a_handoff_preview_sends_nothing() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        start_handoff(None, &mut source, &mut view);
+        apply(
+            Frame::HandoffDraft {
+                draft_id: String::from("d1"),
+                text: String::from("text"),
+            },
+            &mut view,
+        );
+        pause(&mut view);
+        let outcome = handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        assert!(matches!(outcome, Outcome::Continue));
+        session_outcome(outcome, &mut source, &mut view);
+        assert!(view.preview.is_none());
+        let after = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        assert!(
+            !matches!(
+                after,
+                Outcome::CommitHandoff { .. } | Outcome::CommitCompact(_)
+            ),
+            "with the preview gone, y commits nothing"
+        );
+        session_outcome(after, &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::HandoffDraft { name: None }],
+            "no commit and no session was asked for"
+        );
+        assert!(view.switch.is_none(), "no switch is pending");
+    }
+
+    /// The seed of a handoff is drawn as generated data, not as the reader's words, and the
+    /// session's history begins with it.
+    #[test]
+    fn a_seed_is_drawn_as_generated_data_and_never_as_the_readers_message() {
+        let mut view = attached_view("e1", 0);
+        let mut source = Scripted::new(Vec::new());
+        view.switch = Some(crate::maintenance::Switch::Handoff { name: None });
+        apply(
+            Frame::Attached {
+                session: session_info("s-new"),
+                stream: mark("p2-h1", 0, 0),
+            },
+            &mut view,
+        );
+        apply(
+            Frame::Seeded {
+                text: String::from("## Goal\n- ship the parser"),
+                source_session_id: String::from("s-old"),
+                source_event_count: 4,
+                name: None,
+                back_link_recorded: true,
+            },
+            &mut view,
+        );
+        let seed = view
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind(), EntryKind::Seed { .. }))
+            .expect("the seed is drawn");
+        assert_eq!(seed.role(), Role::Harness);
+        assert!(seed.text().contains("ship the parser"));
+        assert!(
+            !view
+                .transcript
+                .entries()
+                .iter()
+                .any(|entry| entry.role() == Role::User),
+            "no entry is the reader's own words"
+        );
+        let _ = &mut source;
+    }
+
+    /// Counts the seed blocks a transcript draws.
+    fn seed_blocks(view: &ViewState) -> usize {
+        view.transcript
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind(), EntryKind::Seed { .. }))
+            .count()
+    }
+
+    /// The `Seeded` frame the agent sends on an attachment to a session `s-old` handed off to.
+    fn seeded_frame() -> Frame {
+        Frame::Seeded {
+            text: String::from("## Goal\n- ship the parser"),
+            source_session_id: String::from("s-old"),
+            source_event_count: 2,
+            name: None,
+            back_link_recorded: true,
+        }
+    }
+
+    /// Resuming a seeded session draws its seed once: the replayed log already holds it, and the
+    /// `Seeded` frame of the live attachment adds no second block.
+    #[test]
+    fn a_live_attach_to_a_seeded_session_draws_its_seed_once() {
+        use nanus_domain::context::managed::{ContextFrontier, Digest, HandoffSeed};
+        let mut session = Session::new(SessionId::new("s-new"), 0, "/w");
+        session.upgrade_to_managed_body();
+        session.append(nanus_domain::SessionEvent::ContextSeed {
+            payload: Box::new(HandoffSeed {
+                text: String::from("## Goal\n- ship the parser"),
+                document_blake3: Digest::of(b"## Goal\n- ship the parser"),
+                source_session_id: String::from("s-old"),
+                source_frontier: ContextFrontier {
+                    session_id: String::from("s-old"),
+                    event_count: 2,
+                    prefix_blake3: Digest::of(b"prefix"),
+                    projection_revision: 0,
+                },
+            }),
+        });
+        let mut view = attached_view("e1", 0);
+        view.transcript = crate::replay::transcript_of(&session);
+        assert_eq!(seed_blocks(&view), 1, "the replay draws the seed");
+        apply(seeded_frame(), &mut view);
+        assert_eq!(
+            seed_blocks(&view),
+            1,
+            "the live frame does not draw it again"
+        );
+    }
+
+    /// After a handoff's attachment the transcript starts empty, so the `Seeded` frame draws it.
+    #[test]
+    fn the_attachment_a_handoff_makes_draws_its_seed_once() {
+        let mut view = attached_view("e1", 0);
+        view.transcript
+            .push(Entry::prose(Role::User, "old question"));
+        view.switch = Some(crate::maintenance::Switch::Handoff { name: None });
+        apply(
+            Frame::Attached {
+                session: session_info("s-new"),
+                stream: mark("p2-h1", 0, 0),
+            },
+            &mut view,
+        );
+        assert_eq!(seed_blocks(&view), 0);
+        apply(seeded_frame(), &mut view);
+        assert_eq!(seed_blocks(&view), 1);
+    }
+
+    /// `/context managed` on a compacted session is refused by the agent with `compacted_session`:
+    /// the refusal is shown with its code beside the bare sentence, and the mode does not move.
+    #[test]
+    fn a_compacted_session_refuses_managed_context_and_the_interface_changes_nothing() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        request_context(ContextAction::Managed, &mut source, &mut view);
+        assert!(
+            view.context_change_asked.is_some(),
+            "the change was asked for"
+        );
+        apply(
+            Frame::Refused {
+                message: String::from(
+                    "this session was compacted; managed context needs a new session",
+                ),
+                code: Some(String::from("compacted_session")),
+            },
+            &mut view,
+        );
+        assert_eq!(
+            view.context_mode,
+            nanus_domain::context::managed::ContextMode::Legacy,
+            "the mode stays legacy"
+        );
+        assert!(
+            view.context_change_asked.is_none(),
+            "nothing is waiting any more"
+        );
+        let shown = shown(&view);
+        let line = shown
+            .iter()
+            .find(|text| text.contains("compacted"))
+            .expect("the refusal is shown");
+        assert!(line.ends_with("(compacted_session)"), "{line}");
+        assert_eq!(
+            line.matches("compacted_session").count(),
+            1,
+            "the code once: {line}"
+        );
+        // Nothing is left waiting on the refused change: the next context request is sent rather
+        // than held behind an acknowledgement that will never come.
+        request_context(ContextAction::Status, &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[
+                Request::Context {
+                    action: ContextAction::Managed
+                },
+                Request::Context {
+                    action: ContextAction::Status
+                },
+            ],
+        );
+    }
+
+    /// The agent answers a handoff or compaction asked for with no session attached with a coded
+    /// refusal; the interface shows it as one, and a refused commit leaves no switch pending.
+    #[test]
+    fn an_unattached_maintenance_refusal_is_shown_with_its_code_and_clears_the_switch() {
+        let mut view = attached_view("e1", 0);
+        view.switch = Some(crate::maintenance::Switch::Handoff { name: None });
+        for code in ["handoff_unavailable", "compact_unavailable"] {
+            apply(
+                Frame::Refused {
+                    message: String::from("this connection is not attached to a session"),
+                    code: Some(code.to_owned()),
+                },
+                &mut view,
+            );
+            assert!(
+                shown(&view)
+                    .iter()
+                    .any(|text| text.ends_with(&format!("({code})"))),
+                "{code}"
+            );
+        }
+        assert!(
+            view.switch.is_none(),
+            "no attachment is coming for a refused handoff"
+        );
+        let mut clearing = attached_view("e1", 0);
+        clearing.switch = Some(crate::maintenance::Switch::Clear {
+            old_id: String::from("s-old"),
+            name: None,
+        });
+        apply(
+            Frame::Refused {
+                message: String::from("unrelated"),
+                code: None,
+            },
+            &mut clearing,
+        );
+        assert!(
+            clearing.switch.is_some(),
+            "a clear's switch is not a handoff's"
+        );
+    }
+
+    /// A seed whose back-link was not written says so, and a seed named differently from the name
+    /// asked for says the session was created but not named.
+    #[test]
+    fn a_seed_reports_a_missing_back_link_and_a_name_that_did_not_stick() {
+        let mut view = attached_view("e1", 0);
+        view.switch = Some(crate::maintenance::Switch::Handoff {
+            name: Some(String::from("later")),
+        });
+        apply(
+            Frame::Seeded {
+                text: String::from("doc"),
+                source_session_id: String::from("s-old"),
+                source_event_count: 4,
+                name: None,
+                back_link_recorded: false,
+            },
+            &mut view,
+        );
+        let shown = shown(&view);
+        assert!(
+            shown
+                .iter()
+                .any(|text| text.contains("does not record the handoff")),
+            "{shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|text| text.contains("created but not named") && text.contains("later")),
+            "{shown:?}"
+        );
+        assert!(view.switch.is_none(), "the handoff is complete");
+    }
+
+    /// A name that did stick draws no naming notice, and a back-link that was written draws none
+    /// either.
+    #[test]
+    fn a_seed_that_names_what_was_asked_and_links_back_draws_no_notice() {
+        let mut view = attached_view("e1", 0);
+        view.switch = Some(crate::maintenance::Switch::Handoff {
+            name: Some(String::from("later")),
+        });
+        apply(
+            Frame::Seeded {
+                text: String::from("doc"),
+                source_session_id: String::from("s-old"),
+                source_event_count: 4,
+                name: Some(String::from("later")),
+                back_link_recorded: true,
+            },
+            &mut view,
+        );
+        let shown = shown(&view);
+        assert!(
+            !shown
+                .iter()
+                .any(|text| text.contains("created but not named")
+                    || text.contains("does not record")),
+            "{shown:?}"
+        );
+    }
+
+    /// A handoff is a managed-session action: a recording refuses it with a sentence.
+    #[test]
+    fn a_handoff_or_compaction_on_a_recording_is_refused_with_a_sentence() {
+        for command in ["/handoff", "/compact"] {
+            let Routed::Say(message) = route_submission(String::from(command), false) else {
+                panic!("{command} is refused on a recording")
+            };
+            assert!(message.contains("recording"), "{message}");
+        }
+    }
+
+    /// A compaction draft is previewed; `y` commits it and `Esc` sends nothing.
+    #[test]
+    fn a_compaction_draft_is_previewed_and_y_commits_it() {
+        assert_eq!(
+            route_submission(String::from("/compact"), true),
+            Routed::Compact
+        );
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        start_compact(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::CompactDraft]
+        );
+        apply(
+            Frame::CompactDraft {
+                draft_id: String::from("d2"),
+                text: String::from("the summary"),
+                dropped_turns: 0,
+                usage: None,
+                boundary_event_count: 8,
+            },
+            &mut view,
+        );
+        pause(&mut view);
+        let outcome = handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view);
+        let Outcome::CommitCompact(draft_id) = outcome else {
+            panic!("y commits the compaction")
+        };
+        assert_eq!(draft_id, "d2");
+        commit_compact(&draft_id, &mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().last(),
+            Some(&Request::CompactCommit {
+                draft_id: String::from("d2")
+            })
+        );
+    }
+
+    /// The compaction preview says what was left out only when something was.
+    #[test]
+    fn the_compaction_preview_names_dropped_turns_only_when_there_are_some() {
+        let mut view = attached_view("e1", 0);
+        apply(
+            Frame::CompactDraft {
+                draft_id: String::from("d2"),
+                text: String::from("the summary"),
+                dropped_turns: 0,
+                usage: None,
+                boundary_event_count: 8,
+            },
+            &mut view,
+        );
+        let whole = view.dialog_text().expect("the preview is open");
+        assert!(!whole.contains("older turn"), "{whole}");
+        assert!(whole.contains("the summary"), "{whole}");
+        assert!(whole.contains("The cut is at event 8"), "{whole}");
+        assert!(
+            whole.contains("no way to read"),
+            "the warning is shown: {whole}"
+        );
+
+        apply(
+            Frame::CompactDraft {
+                draft_id: String::from("d3"),
+                text: String::from("the summary"),
+                dropped_turns: 2,
+                usage: Some(nanus_link::protocol::DraftUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 9,
+                    reasoning_tokens: 0,
+                    cache_hit_tokens: 40,
+                    cache_miss_tokens: 60,
+                }),
+                boundary_event_count: 0,
+            },
+            &mut view,
+        );
+        let partial = view.dialog_text().expect("the preview is open");
+        assert!(partial.contains("2 older turns did not fit"), "{partial}");
+        assert!(partial.contains("100 prompt"), "{partial}");
+        assert!(
+            partial.contains("did not say which event"),
+            "an absent count is unknown: {partial}"
+        );
+    }
+
+    /// `Esc` on a compaction preview sends nothing, and a stale refusal is shown with its code.
+    #[test]
+    fn a_compaction_cut_draws_a_divider_and_a_stale_refusal_shows_its_code() {
+        let mut view = attached_view("e1", 0);
+        view.transcript
+            .push(Entry::prose(Role::User, "first question"));
+        apply(
+            Frame::Compacted {
+                boundary_event_count: 4,
+                summary: String::from("the summary"),
+            },
+            &mut view,
+        );
+        let entries = view.transcript.entries();
+        assert!(
+            matches!(entries[0].kind(), EntryKind::Text),
+            "above the cut stays"
+        );
+        assert!(
+            matches!(entries[1].kind(), EntryKind::Cut { boundary: 4 }),
+            "the divider is at the cut: {:?}",
+            entries[1].kind()
+        );
+        assert_eq!(entries[1].text(), "the summary");
+
+        apply(
+            Frame::Refused {
+                message: String::from("the session changed after this summary was drafted"),
+                code: Some(String::from("stale_draft")),
+            },
+            &mut view,
+        );
+        let last = view
+            .transcript
+            .entries()
+            .last()
+            .expect("a notice")
+            .text()
+            .to_owned();
+        assert!(
+            last.contains("changed after") && last.contains("stale_draft"),
+            "{last}"
+        );
+        apply(
+            Frame::Refused {
+                message: String::from("no model is selected"),
+                code: None,
+            },
+            &mut view,
+        );
+        let last = view
+            .transcript
+            .entries()
+            .last()
+            .expect("a notice")
+            .text()
+            .to_owned();
+        assert_eq!(last, "no model is selected", "no code, no parenthesis");
+    }
+
+    /// A replayed transcript draws the cut, the seed and the handoff's new session as they were.
+    #[test]
+    fn a_replayed_session_draws_the_divider_the_seed_and_the_handoff() {
+        use nanus_domain::context::managed::{ContextFrontier, Digest, HandoffRecord, HandoffSeed};
+        let frontier = ContextFrontier {
+            session_id: String::from("s-old"),
+            event_count: 2,
+            prefix_blake3: Digest::of(b"prefix"),
+            projection_revision: 0,
+        };
+        let mut session = Session::new(SessionId::new("s-new"), 0, "/w");
+        session.upgrade_to_managed_body();
+        session.append(nanus_domain::SessionEvent::ContextSeed {
+            payload: Box::new(HandoffSeed {
+                text: String::from("## Goal\n- ship the parser"),
+                document_blake3: Digest::of(b"## Goal\n- ship the parser"),
+                source_session_id: String::from("s-old"),
+                source_frontier: frontier.clone(),
+            }),
+        });
+        session.append(nanus_domain::SessionEvent::ContextHandoff {
+            payload: Box::new(HandoffRecord {
+                source_frontier: frontier,
+                new_session_id: String::from("s-newer"),
+                document_blake3: Digest::of(b"doc"),
+                confirmed: true,
+            }),
+        });
+        let transcript = crate::replay::transcript_of(&session);
+        let kinds: Vec<&EntryKind> = transcript.entries().iter().map(Entry::kind).collect();
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, EntryKind::Seed { source } if source == "s-old")),
+            "the seed is replayed: {kinds:?}"
+        );
+        assert!(
+            transcript
+                .entries()
+                .iter()
+                .any(|entry| entry.text().contains("handed off to session s-newer")),
+            "the handoff names the new session"
+        );
+    }
+
+    /// A source over `store` that is attached to `id`, with no connection behind it.
+    fn detached_remote(store: &StoreHandle, id: &str) -> Remote {
+        let (requests, pending) = mpsc::unbounded_channel();
+        Remote {
+            session: Session::new(SessionId::new(id), 0, "/w"),
+            label: short_id(id),
+            name: None,
+            store: std::rc::Rc::clone(store),
+            client: None,
+            requests,
+            pending: Some(pending),
+            approval: None,
+            workspace: String::from("/w"),
+            model: None,
+            models: Vec::new(),
+            model_efforts: Vec::new(),
+            provider: None,
+            plan: None,
+            providers: Vec::new(),
+            effort: None,
+            busy: false,
+            stream: mark("e1", 0, 0),
+            notice: None,
+        }
+    }
+
+    /// A stored session with one prompt in it, so reading it back shows it has events.
+    fn save_with_prompt(store: &StoreHandle, id: &str, prompt: &str) {
+        let mut session = Session::new(SessionId::new(id), 0, "/w");
+        session.append(nanus_domain::SessionEvent::UserMessage {
+            text: prompt.to_owned(),
+            content_blocks: None,
+        });
+        nanus_kernel::runtime::block_on(store.save(&session)).expect("the session is saved");
+    }
+
+    /// The clear warning quotes a name only when the session holds one: an unnamed session's short
+    /// id is its label in the title bar, never a name it can be resumed by.
+    #[test]
+    fn the_clear_warning_names_a_session_only_when_it_has_a_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = nanus_kernel::runtime::block_on(async {
+            JsonlStore::new(dir.path().to_path_buf())
+                .await
+                .expect("the store opens")
+                .handle()
+        });
+        let mut source = detached_remote(&store, "01a09558-old");
+        assert!(
+            source.label().is_some(),
+            "an unnamed session still has a label"
+        );
+        let mut view = attached_view("e1", 0);
+        view.attached_id = Some(String::from("01a09558-old"));
+        open_clear_dialog(&source, &mut view);
+        let dialog = view.clear_dialog.clone().expect("the warning is open");
+        assert_eq!(dialog.name, None);
+        assert!(
+            !crate::maintenance::clear_warning(&dialog).contains("named"),
+            "{dialog:?}"
+        );
+        source.name = Some(String::from("notes"));
+        open_clear_dialog(&source, &mut view);
+        let named = view.clear_dialog.clone().expect("the warning is open");
+        assert_eq!(named.name.as_deref(), Some("notes"));
+        assert!(crate::maintenance::clear_warning(&named).contains("named \"notes\""));
+    }
+
+    /// After a clear and after a handoff, the session the exit summary reads is the one the
+    /// connection is in now: the attachment the agent made is what the source follows.
+    #[test]
+    fn after_a_clear_or_a_handoff_the_exit_summary_reads_the_session_the_connection_is_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = nanus_kernel::runtime::block_on(async {
+            JsonlStore::new(dir.path().to_path_buf())
+                .await
+                .expect("the store opens")
+                .handle()
+        });
+        save_with_prompt(&store, "s-old", "the old question");
+        save_with_prompt(&store, "s-clear", "the cleared conversation");
+        save_with_prompt(&store, "s-handoff", "the handed-off conversation");
+        let mut source = detached_remote(&store, "s-old");
+
+        follow_attachment(
+            &mut source,
+            &Frame::Attached {
+                session: session_info("s-clear"),
+                stream: mark("e2", 0, 0),
+            },
+        );
+        source.refresh();
+        assert_eq!(source.session().id().as_str(), "s-clear", "after a clear");
+        assert_eq!(source.session().event_count(), 1, "its own log is read");
+
+        follow_attachment(
+            &mut source,
+            &Frame::Attached {
+                session: session_info("s-handoff"),
+                stream: mark("e3", 0, 0),
+            },
+        );
+        source.refresh();
+        assert_eq!(
+            source.session().id().as_str(),
+            "s-handoff",
+            "after a handoff"
+        );
+        assert_eq!(source.session().event_count(), 1);
+    }
+
+    /// A connection that never switched still summarises the session it opened, and a new
+    /// conversation with no record yet is shown empty rather than as the one it left.
+    #[test]
+    fn a_connection_that_never_switched_summarises_its_own_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = nanus_kernel::runtime::block_on(async {
+            JsonlStore::new(dir.path().to_path_buf())
+                .await
+                .expect("the store opens")
+                .handle()
+        });
+        save_with_prompt(&store, "s-old", "the old question");
+        let mut source = detached_remote(&store, "s-old");
+        source.refresh();
+        assert_eq!(
+            source.session().id().as_str(),
+            "s-old",
+            "no attachment, no change"
+        );
+        assert_eq!(source.session().event_count(), 1);
+
+        follow_attachment(
+            &mut source,
+            &Frame::Attached {
+                session: session_info("s-unsaved"),
+                stream: mark("e4", 0, 0),
+            },
+        );
+        source.refresh();
+        assert_eq!(source.session().id().as_str(), "s-unsaved");
+        assert_eq!(
+            source.session().event_count(),
+            0,
+            "a conversation nothing was written to is empty, not the old one"
+        );
+    }
+
+    /// The view a clear or a handoff leaves: a session with a name, tokens spent, a managed mode
+    /// and a goal on screen, all of which belong to the conversation being left.
+    fn view_of_an_old_session() -> ViewState {
+        let mut view = attached_view("e1", 0);
+        view.attached_id = Some(String::from("s-old"));
+        view.label = Some(String::from("old-name"));
+        view.tokens_used = 500;
+        view.context_mode = nanus_domain::context::managed::ContextMode::Managed;
+        view.goal_shown = Some(String::from("goal: the old one"));
+        view.context_shown = Some(String::from("managed/1"));
+        view.decisions_shown.insert(String::from("d:1"));
+        view
+    }
+
+    /// After a clear's attachment the title, the token count, the goal and decisions drawn and the
+    /// mode are the new session's, the source follows it, and the agent is asked for its status.
+    #[test]
+    fn a_clear_attachment_forgets_the_old_sessions_title_tokens_and_mode() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = view_of_an_old_session();
+        ask_clear(String::from("s-old"), None, &mut source, &mut view);
+        receive(
+            Frame::Attached {
+                session: session_info("0123456789-new"),
+                stream: mark("p2-h1", 0, 0),
+            },
+            &mut source,
+            &mut view,
+        );
+        assert_eq!(
+            view.label.as_deref(),
+            Some("01234567"),
+            "an unnamed session's short id"
+        );
+        assert_eq!(view.tokens_used, 0);
+        assert_eq!(
+            view.context_mode,
+            nanus_domain::context::managed::ContextMode::Legacy,
+            "a new session is legacy until the agent says otherwise"
+        );
+        assert_eq!(view.goal_shown, None);
+        assert_eq!(view.context_shown, None);
+        assert!(view.decisions_shown.is_empty());
+        assert_eq!(source.followed, vec![String::from("0123456789-new")]);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[
+                Request::New { name: None },
+                Request::Context {
+                    action: ContextAction::Status
+                },
+            ],
+            "the new session's context is the agent's answer"
+        );
+    }
+
+    /// After a handoff's attachment the session is managed and titled by its name, and no status
+    /// is asked for, because a seeded session is managed by construction.
+    #[test]
+    fn a_handoff_attachment_is_managed_and_titled_by_the_new_sessions_name() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = view_of_an_old_session();
+        view.context_mode = nanus_domain::context::managed::ContextMode::Legacy;
+        commit_handoff("d1", Some(String::from("notes")), &mut source, &mut view);
+        let mut session = session_info("s-new");
+        session.name = Some(String::from("notes"));
+        receive(
+            Frame::Attached {
+                session,
+                stream: mark("p2-h1", 0, 0),
+            },
+            &mut source,
+            &mut view,
+        );
+        assert_eq!(view.label.as_deref(), Some("notes"));
+        assert_eq!(view.tokens_used, 0);
+        assert_eq!(
+            view.context_mode,
+            nanus_domain::context::managed::ContextMode::Managed
+        );
+        assert_eq!(source.followed, vec![String::from("s-new")]);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::HandoffCommit {
+                draft_id: String::from("d1")
+            }]
+        );
+    }
+
+    /// An attachment the interface did not ask for changes neither what the screen shows nor what
+    /// the source reports, so the two never describe different conversations.
+    #[test]
+    fn a_stray_attachment_changes_neither_the_view_nor_the_source() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = view_of_an_old_session();
+        receive(
+            Frame::Attached {
+                session: session_info("s-other"),
+                stream: mark("p9-h1", 0, 0),
+            },
+            &mut source,
+            &mut view,
+        );
+        assert_eq!(view.label.as_deref(), Some("old-name"));
+        assert_eq!(view.tokens_used, 500);
+        assert_eq!(view.attached_id.as_deref(), Some("s-old"));
+        assert!(source.followed.is_empty(), "the source is not moved");
+        assert!(source.requests.borrow().is_empty());
+    }
+
+    /// A prompt typed while a draft runs waits for it, because the draft holds the session; once
+    /// the draft is answered and its preview gone, the prompt is sent.
+    #[test]
+    fn a_prompt_typed_while_a_draft_runs_waits_until_the_draft_is_over() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        start_compact(&mut source, &mut view);
+        send_or_queue(String::from("next question"), &mut source, &mut view);
+        flush_queue(&mut source, &mut view);
+        assert!(view.has_queued(), "held while the draft runs");
+        apply(
+            Frame::CompactDraft {
+                draft_id: String::from("d1"),
+                text: String::from("the summary"),
+                dropped_turns: 0,
+                usage: None,
+                boundary_event_count: 4,
+            },
+            &mut view,
+        );
+        flush_queue(&mut source, &mut view);
+        assert!(view.has_queued(), "held while the preview is open");
+        handle_key(key(KeyCode::Esc, KeyModifiers::NONE), &mut view);
+        flush_queue(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[
+                Request::CompactDraft,
+                Request::Prompt {
+                    text: String::from("next question")
+                },
+            ],
+            "sent once the preview was cancelled"
+        );
+    }
+
+    /// A prompt typed while a clear waits for its attachment is held, not sent into whichever
+    /// session the agent puts the connection in, and is sent once the new conversation is there.
+    #[test]
+    fn a_prompt_typed_while_a_switch_is_pending_is_sent_after_the_attachment() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        ask_clear(String::from("s-old"), None, &mut source, &mut view);
+        send_or_queue(String::from("for the new one"), &mut source, &mut view);
+        flush_queue(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::New { name: None }]
+        );
+        receive(
+            Frame::Attached {
+                session: session_info("s-new"),
+                stream: mark("p2-h1", 0, 0),
+            },
+            &mut source,
+            &mut view,
+        );
+        flush_queue(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().last(),
+            Some(&Request::Prompt {
+                text: String::from("for the new one")
+            })
+        );
+        assert!(
+            shown(&view).iter().any(|text| text == "for the new one"),
+            "drawn in the new conversation"
+        );
+    }
+
+    /// A committed handoff clears as a clear does: the prompts queued for the conversation being
+    /// left are discarded, and the reader is told how many.
+    #[test]
+    fn a_committed_handoff_discards_the_prompts_queued_for_the_old_conversation() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        view.enqueue(String::from("for the old one"));
+        commit_handoff("d1", None, &mut source, &mut view);
+        assert!(!view.has_queued());
+        assert!(
+            shown(&view)
+                .iter()
+                .any(|text| text.contains("1 queued prompt for the conversation being left")),
+            "{:?}",
+            shown(&view)
+        );
+        let mut kept = attached_view("e1", 0);
+        kept.enqueue(String::from("still wanted"));
+        start_handoff(None, &mut source, &mut kept);
+        assert!(kept.has_queued(), "a draft alone discards nothing");
+    }
+
+    /// An agent that cannot open the new conversation answers `New` with a failure: the switch is
+    /// over, the reader is told, and the queue moves again.
+    #[test]
+    fn a_failed_new_conversation_ends_the_switch_and_the_queue_moves_again() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        ask_clear(String::from("s-old"), None, &mut source, &mut view);
+        send_or_queue(String::from("waiting"), &mut source, &mut view);
+        apply(
+            Frame::Failed {
+                message: String::from("the store could not open a session"),
+            },
+            &mut view,
+        );
+        assert!(view.switch.is_none(), "the switch is over");
+        assert!(
+            shown(&view).iter().any(|text| {
+                text.contains("new conversation was not started")
+                    && text.contains("no longer follows s-old")
+                    && text.contains("--resume s-old")
+            }),
+            "the notice says the old conversation was let go and how to get back: {:?}",
+            shown(&view)
+        );
+        assert!(
+            !shown(&view)
+                .iter()
+                .any(|text| text.contains("stays attached")),
+            "nothing claims the old conversation is still attached"
+        );
+        flush_queue(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().last(),
+            Some(&Request::Prompt {
+                text: String::from("waiting")
+            })
+        );
+    }
+
+    /// A failure that ends a turn on screen is that turn's, not the switch's answer: the switch
+    /// stays pending for the attachment that completes it.
+    #[test]
+    fn a_turns_failure_during_a_switch_leaves_the_switch_pending() {
+        let mut view = attached_view("e1", 0);
+        view.switch = Some(crate::maintenance::Switch::Clear {
+            old_id: String::from("s-old"),
+            name: None,
+        });
+        view.begin_turn(1);
+        apply(
+            Frame::Failed {
+                message: String::from("the model failed"),
+            },
+            &mut view,
+        );
+        assert!(view.switch.is_some());
+        assert!(
+            !shown(&view)
+                .iter()
+                .any(|text| text.contains("new conversation was not started")),
+        );
+    }
+
+    /// `/clear`, `/handoff` and `/compact` wait while a draft runs or a switch is pending, and are
+    /// sent when nothing is.
+    #[test]
+    fn a_session_control_waits_for_a_pending_draft_or_switch() {
+        let mut source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        start_compact(&mut source, &mut view);
+        open_clear_dialog(&source, &mut view);
+        assert!(view.clear_dialog.is_none(), "no warning while a draft runs");
+        start_handoff(None, &mut source, &mut view);
+        start_compact(&mut source, &mut view);
+        assert_eq!(
+            source.requests.borrow().as_slice(),
+            &[Request::CompactDraft],
+            "only the first draft was asked for"
+        );
+        assert!(
+            shown(&view)
+                .iter()
+                .any(|text| text.contains("a draft is running")),
+            "{:?}",
+            shown(&view)
+        );
+
+        let mut switching = attached_view("e1", 0);
+        switching.switch = Some(crate::maintenance::Switch::Handoff { name: None });
+        open_clear_dialog(&source, &mut switching);
+        assert!(switching.clear_dialog.is_none());
+        assert!(
+            shown(&switching)
+                .iter()
+                .any(|text| text.contains("the conversation is changing")),
+        );
+
+        let mut idle = attached_view("e1", 0);
+        open_clear_dialog(&source, &mut idle);
+        assert!(
+            idle.clear_dialog.is_some(),
+            "an idle conversation can be cleared"
+        );
+    }
+
+    /// A turn another viewer starts under an open clear warning is named by it, and the warning is
+    /// a new question: a `y` that arrives at once is held until the keyboard is quiet again.
+    #[test]
+    fn a_turn_that_starts_under_the_clear_warning_is_named_and_asks_for_quiet_again() {
+        let source = Scripted::new(Vec::new());
+        let mut view = attached_view("e1", 0);
+        open_clear_dialog(&source, &mut view);
+        pause(&mut view);
+        let quiet = view.clear_dialog.clone().expect("the warning is open");
+        assert!(!crate::maintenance::clear_warning(&quiet).contains("stopped first"));
+        apply(
+            Frame::User {
+                text: String::from("another viewer's prompt"),
+            },
+            &mut view,
+        );
+        let dialog = view
+            .clear_dialog
+            .clone()
+            .expect("the warning is still open");
+        assert!(dialog.busy);
+        assert!(crate::maintenance::clear_warning(&dialog).contains("stopped first"));
+        assert!(
+            matches!(
+                handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+                Outcome::Continue
+            ),
+            "the changed warning is not answered by a y pressed at once"
+        );
+        pause(&mut view);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+            Outcome::ClearSession { .. }
+        ));
+    }
+
+    /// A recording refuses `/handoff` and `/compact` with the stable codes a live agent would use.
+    #[test]
+    fn a_recordings_handoff_and_compaction_are_refused_with_their_codes() {
+        let Routed::Say(handoff) = route_submission(String::from("/handoff"), false) else {
+            panic!("a recording says why")
+        };
+        assert!(handoff.ends_with("(handoff_unavailable)"), "{handoff}");
+        let Routed::Say(compact) = route_submission(String::from("/compact"), false) else {
+            panic!("a recording says why")
+        };
+        assert!(compact.ends_with("(compact_unavailable)"), "{compact}");
+        assert_eq!(
+            route_submission(String::from("/compact"), true),
+            Routed::Compact,
+            "a live session routes it to the agent"
+        );
     }
 
     /// A store that is never read, for a test that only wants a connection refused.

@@ -117,12 +117,6 @@ const NAME_FILE: &str = "name";
 /// The file name of one session's write claim.
 const LOCK_FILE: &str = "lock";
 
-/// The longest session name accepted.
-///
-/// Not a security boundary — a name is content, not a path — but a bound, because
-/// a name is typed by a person and printed in a listing.
-const MAX_NAME_CHARS: usize = 128;
-
 /// How many characters of the first human turn become a session title.
 const TITLE_MAX_CHARS: usize = 72;
 
@@ -981,16 +975,8 @@ fn validate_name(name: &str) -> StoreResult<()> {
             reason: reason.to_owned(),
         })
     };
-    if name.trim().is_empty() {
-        return reject("it is empty");
-    }
-    if name.chars().count() > MAX_NAME_CHARS {
-        return reject("it is longer than 128 characters");
-    }
-    if name.chars().any(char::is_control) {
-        return reject("it contains a control character");
-    }
-    Ok(())
+    // The rules are the port's, so a caller that checks a name early refuses what this would.
+    nanus_ports::session_name_problem(name).map_or(Ok(()), reject)
 }
 
 /// Parses and checks one header line.

@@ -39,6 +39,8 @@ use std::rc::Rc;
 mod admission;
 #[path = "agent_loop/dispatch.rs"]
 mod dispatch;
+#[path = "agent_loop/maintenance.rs"]
+mod maintenance;
 #[path = "agent_loop/managed.rs"]
 mod managed;
 #[path = "agent_loop/records.rs"]
@@ -936,7 +938,20 @@ impl AgentRunner {
         session: &Session,
     ) -> Result<(ChatRequest, Option<nanus_domain::Elision>), BundleError> {
         let mut messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
-        messages.extend(session.derive_messages());
+        // After a compaction cut the prompt is the summary plus what follows it; with no cut this
+        // is exactly the whole fold.
+        messages.extend(session.derive_prompt_messages());
+        self.build_request_for(messages)
+    }
+
+    /// Fits `messages` into a legacy request: the schemas, reservations and budget a turn carries.
+    ///
+    /// The one assembly both a turn and a maintenance request go through, so a maintenance request
+    /// is fitted by exactly the rules that fit a turn.
+    fn build_request_for(
+        &self,
+        messages: Vec<nanus_domain::Message>,
+    ) -> Result<(ChatRequest, Option<nanus_domain::Elision>), BundleError> {
         let mut request = ChatRequest::new(self.model(), Vec::new());
         request.tools = self.offered_schemas();
         request.reasoning_effort = self.effort.get();
@@ -1686,6 +1701,7 @@ fn bound(call: &mut PartialCall, limits: &nanus_ports::ToolArgumentLimits) {
 /// vocabulary without importing the ports crate.
 pub use nanus_ports::FinishReason as ModelFinishReason;
 
+pub use maintenance::{COMPACTION_INSTRUCTION, CompactionDraft, HANDOFF_INSTRUCTION, HandoffDraft};
 pub use managed::{ManagedRun, TurnHost};
 
 #[cfg(test)]
@@ -2802,6 +2818,9 @@ mod tests {
             SessionEvent::ArtifactPublished { .. } => "artifact_published",
             SessionEvent::RequestAttempt { .. } => "request_attempt",
             SessionEvent::ContextRecovery { .. } => "context_recovery",
+            SessionEvent::ContextSeed { .. } => "context_seed",
+            SessionEvent::ContextHandoff { .. } => "context_handoff",
+            SessionEvent::ContextCompact { .. } => "context_compact",
         }
     }
 

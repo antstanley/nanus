@@ -1544,3 +1544,7 @@ mod tests {
 #[cfg(test)]
 #[path = "wire_bounds_tests.rs"]
 mod bounds_tests;
+
+#[cfg(test)]
+#[path = "compaction_wire_tests.rs"]
+mod compaction_wire_tests;

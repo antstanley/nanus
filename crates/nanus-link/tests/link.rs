@@ -773,7 +773,7 @@ fn a_model_switch_reaches_the_agent_and_is_answered() {
         let refused = loop {
             match client.next().await.expect("frames are readable") {
                 // A refusal of a request that is not a prompt ends no turn, so it is not `Failed`.
-                Some(Frame::Refused { message }) => break message,
+                Some(Frame::Refused { message, .. }) => break message,
                 Some(Frame::Failed { message }) => {
                     panic!("a refusal is not a turn ending: {message}")
                 }
@@ -3045,7 +3045,7 @@ fn a_goal_change_is_refused_during_a_turn_and_a_read_is_answered() {
             .expect("the goal request is sent");
         let refused = loop {
             match client.next().await.expect("frames are readable") {
-                Some(Frame::Refused { message }) => break message,
+                Some(Frame::Refused { message, .. }) => break message,
                 Some(frame) if frame.is_end_of_turn() => break String::new(),
                 Some(_) => {}
                 None => break String::new(),
@@ -3231,7 +3231,7 @@ fn a_goal_change_the_store_refuses_leaves_the_goal_unchanged() {
             .expect("the goal request is sent");
         let refused = loop {
             match client.next().await.expect("frames are readable") {
-                Some(Frame::Refused { message }) => break message,
+                Some(Frame::Refused { message, .. }) => break message,
                 Some(Frame::Goal { goal }) => panic!("a refused write was announced: {goal:?}"),
                 Some(_) => {}
                 None => break String::new(),
@@ -3399,7 +3399,8 @@ fn a_context_reset_during_a_turn_is_refused_and_a_status_read_is_answered() {
                 .expect("the change is sent");
             let refused = context_answer(&mut other).await;
             assert!(
-                matches!(&refused, Frame::Refused { message } if message.contains("turn is running")),
+                matches!(&refused, Frame::Refused { message, .. }
+                    if message.contains("turn is running")),
                 "a context mutation of a busy session is refused: {refused:?}"
             );
         }
@@ -3411,7 +3412,7 @@ fn a_context_reset_during_a_turn_is_refused_and_a_status_read_is_answered() {
             .expect("the read is sent");
         let read = context_answer(&mut other).await;
         assert!(
-            matches!(&read, Frame::Refused { message } if message.contains("not published")),
+            matches!(&read, Frame::Refused { message, .. } if message.contains("not published")),
             "a legacy turn publishes no status, and the read says so: {read:?}"
         );
 
@@ -3477,7 +3478,7 @@ fn a_context_status_on_an_idle_legacy_session_is_legacy_or_refused() {
                 assert!(envelope.frame_id > attachment.stream.stream_watermark);
                 assert_eq!((envelope.turn, envelope.step), (None, None));
             }
-            Frame::Refused { message } => {
+            Frame::Refused { message, .. } => {
                 assert!(message.contains("context status"), "{message}");
             }
             other => panic!("expected a status or its refusal, got {other:?}"),
@@ -3975,4 +3976,1890 @@ fn a_managed_turn_over_the_link_is_checkpointed_before_it_is_done() {
         .filter(|event| matches!(event, SessionEvent::RequestAttempt { .. }))
         .count();
     assert_eq!(attempts, 2, "one intent and one outcome");
+}
+
+// ---- Maintenance over the link: compaction, handoff, interrupts and clear. ----
+
+/// How long a test waits for a frame before the server is taken to have hung.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serves `agent` on a fresh socket for the length of `body`, then stops it and joins the server.
+fn over_socket<T>(socket: &Path, agent: Agent, body: impl Future<Output = T>) -> T {
+    let socket = socket.to_path_buf();
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let result = body.await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        result
+    })
+}
+
+/// Reads frames until one satisfies `want`, returning everything read, that one last. A frame that
+/// does not arrive within [`WAIT`] fails the test: a hung draft or commit is the failure to see.
+async fn frames_until(client: &mut Client, want: impl Fn(&Frame) -> bool) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    loop {
+        let next = tokio::time::timeout(WAIT, client.next())
+            .await
+            .expect("a frame arrives before the wait ends")
+            .expect("frames are readable");
+        let Some(frame) = next else {
+            panic!("the connection ended before the frame: {frames:?}");
+        };
+        let found = want(&frame);
+        frames.push(frame);
+        if found {
+            return frames;
+        }
+    }
+}
+
+/// The refusal text a stream ended with, when it ended with one.
+fn refusal_in(frames: &[Frame]) -> Option<&str> {
+    frames.iter().rev().find_map(|frame| match frame {
+        Frame::Refused { message, .. } => Some(message.as_str()),
+        _ => None,
+    })
+}
+
+/// The stable code of the refusal a stream ended with, when it ended with a coded one.
+fn refusal_code_in(frames: &[Frame]) -> Option<&str> {
+    frames.iter().rev().find_map(|frame| match frame {
+        Frame::Refused { code, .. } => code.as_deref(),
+        _ => None,
+    })
+}
+
+/// The last frame of a stream, which `frames_until` guarantees is the one awaited.
+fn last(frames: &[Frame]) -> &Frame {
+    frames.last().expect("a frame was read")
+}
+
+/// The store's view of a session, read after the socket has been stopped.
+fn stored(store: &StoreHandle, id: &str) -> Session {
+    nanus_kernel::runtime::block_on(store.load(&SessionId::new(id))).expect("the session loads")
+}
+
+/// A managed agent: the same scripted answers, with the managed preparation a managed session
+/// needs.
+fn managed_agent(dir: &Path) -> (Agent, StoreHandle) {
+    agent_over(dir, Rc::new(Box::new(ManagedLlm)), "scripted")
+}
+
+/// Compaction is drafted, committed and shown to every viewer, and the session on disk is the cut.
+#[test]
+fn a_compaction_is_committed_and_every_viewer_is_told() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (id, boundary, told, watched) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("a session starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let mut watcher = Client::connect(&socket).await.expect("connects");
+            watcher.attach_at(&id).await.expect("watches");
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft {
+                draft_id,
+                text,
+                dropped_turns,
+                ..
+            } = last(&drafted).clone()
+            else {
+                panic!("a draft: {drafted:?}")
+            };
+            assert_eq!(text, "hello back", "the summary is the model's answer");
+            assert_eq!(dropped_turns, 0, "the whole conversation fit");
+            client
+                .send(&Request::CompactCommit { draft_id })
+                .await
+                .expect("sent");
+            let told = frames_until(&mut client, |f| matches!(f, Frame::Compacted { .. })).await;
+            let watched_frames =
+                frames_until(&mut watcher, |f| matches!(f, Frame::Compacted { .. })).await;
+            let Frame::Compacted {
+                boundary_event_count,
+                summary,
+            } = last(&told).clone()
+            else {
+                panic!("a compaction: {told:?}")
+            };
+            assert_eq!(summary, "hello back");
+            (id, boundary_event_count, told, watched_frames)
+        }
+    });
+    assert!(matches!(last(&told), Frame::Compacted { .. }));
+    assert!(
+        matches!(last(&watched), Frame::Compacted { boundary_event_count, .. }
+            if *boundary_event_count == boundary)
+    );
+    let disk = stored(&store, &id);
+    assert!(disk.is_compacted(), "the cut is on disk");
+    assert_eq!(disk.compaction_boundary(), Some(boundary));
+    assert_eq!(disk.body_version(), 5);
+    assert_eq!(
+        u64::try_from(disk.event_count()).unwrap(),
+        boundary + 1,
+        "the marker sits at the boundary, and nothing was deleted"
+    );
+}
+
+/// A later attachment sees the cut in its stream mark, so it can draw the divider.
+#[test]
+fn a_later_attachment_sees_the_compaction_boundary() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (before, after) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let mut uncut = Client::connect(&socket).await.expect("connects");
+            let before = uncut.attach_at(&id).await.expect("attaches").stream;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            client
+                .send(&Request::CompactCommit { draft_id })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Compacted { .. })).await;
+            let mut late = Client::connect(&socket).await.expect("connects");
+            let after = late.attach_at(&id).await.expect("attaches").stream;
+            (before, after)
+        }
+    });
+    assert_eq!(before.compaction_boundary, None, "an uncut session says so");
+    let boundary = after.compaction_boundary.expect("a cut is named");
+    assert!(boundary > 0, "the cut is after the first event");
+}
+
+/// A draft writes nothing, and a commit that names a draft the connection does not hold is refused.
+#[test]
+fn a_compaction_draft_writes_nothing_and_an_unknown_commit_changes_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (id, refused) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        let home = dir.path().to_path_buf();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let file = home.join("sessions").join(&id).join("session.jsonl");
+            let before = std::fs::read(&file).expect("the session is stored");
+            client.send(&Request::CompactDraft).await.expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let drafted = std::fs::read(&file).expect("still stored");
+            client
+                .send(&Request::CompactCommit {
+                    draft_id: "not-the-draft".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            let after = std::fs::read(&file).expect("still stored");
+            assert_eq!(drafted, before, "drafting wrote nothing");
+            assert_eq!(after, before, "a refused commit wrote nothing");
+            (id, refused)
+        }
+    });
+    assert!(
+        refusal_code_in(&refused) == Some("stale_draft"),
+        "{refused:?}"
+    );
+    let disk = stored(&store, &id);
+    assert!(!disk.is_compacted(), "nothing was cut");
+    assert_eq!(disk.body_version(), 2, "a legacy session keeps its body");
+}
+
+/// A turn that ran after the draft makes the commit stale, and nothing is cut.
+#[test]
+fn a_compaction_commit_after_a_turn_is_refused_as_stale() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (id, refused) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "first".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            client
+                .send(&Request::Prompt {
+                    text: "second".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client
+                .send(&Request::CompactCommit { draft_id })
+                .await
+                .expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            (id, refused)
+        }
+    });
+    assert!(
+        refusal_code_in(&refused) == Some("stale_draft"),
+        "{refused:?}"
+    );
+    assert!(!stored(&store, &id).is_compacted());
+}
+
+/// A draft requested while a turn runs is refused, and the turn is untouched.
+#[test]
+fn a_compaction_draft_while_a_turn_runs_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(SlowRelentlessLlm)), "slow");
+    let socket = dir.path().join("agent.sock");
+    let refused = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            client
+                .send(&Request::Prompt {
+                    text: "keep going".to_owned(),
+                })
+                .await
+                .expect("sent");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            client.send(&Request::Interrupt).await.expect("sent");
+            turn_frames(&mut client).await;
+            refused
+        }
+    });
+    assert!(
+        refusal_code_in(&refused) == Some("compact_unavailable"),
+        "{refused:?}"
+    );
+}
+
+/// A managed session is refused a compaction, and nothing is drafted.
+#[test]
+fn a_managed_session_is_not_compacted_over_the_link() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let refused = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await
+        }
+    });
+    assert!(
+        refusal_code_in(&refused) == Some("compact_unavailable"),
+        "{refused:?}"
+    );
+}
+
+/// Two viewers each hold a draft; the first commit wins, and the second is stale.
+#[test]
+fn the_first_compaction_commit_wins_and_the_other_draft_is_stale() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (id, second) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut first = Client::connect(&socket).await.expect("connects");
+            let id = first.start(None).await.expect("starts").session;
+            first
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut first).await;
+            let mut second = Client::connect(&socket).await.expect("connects");
+            second.attach_at(&id).await.expect("attaches");
+            first.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut first, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft { draft_id: one, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            second.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut second, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft { draft_id: two, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            assert_ne!(one, two, "each draft has its own id");
+            first
+                .send(&Request::CompactCommit { draft_id: one })
+                .await
+                .expect("sent");
+            frames_until(&mut first, |f| matches!(f, Frame::Compacted { .. })).await;
+            second
+                .send(&Request::CompactCommit { draft_id: two })
+                .await
+                .expect("sent");
+            let second = frames_until(&mut second, |f| matches!(f, Frame::Refused { .. })).await;
+            (id, second)
+        }
+    });
+    assert!(
+        refusal_code_in(&second) == Some("stale_draft"),
+        "{second:?}"
+    );
+    assert!(stored(&store, &id).is_compacted());
+}
+
+/// A handoff is refused on a legacy session, which has nothing to seed from.
+#[test]
+fn a_handoff_is_refused_on_a_legacy_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let refused = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client
+                .send(&Request::HandoffDraft { name: None })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await
+        }
+    });
+    assert!(
+        refusal_code_in(&refused) == Some("handoff_unavailable"),
+        "{refused:?}"
+    );
+}
+
+/// Drafts a handoff from a managed session and commits it, returning the new session's id.
+async fn handoff_from(client: &mut Client) -> (String, String) {
+    client
+        .send(&Request::Context {
+            action: ContextAction::Managed,
+        })
+        .await
+        .expect("sent");
+    frames_until(client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+    client
+        .send(&Request::Prompt {
+            text: "first".to_owned(),
+        })
+        .await
+        .expect("sent");
+    turn_frames(client).await;
+    client
+        .send(&Request::HandoffDraft { name: None })
+        .await
+        .expect("sent");
+    let drafted = frames_until(client, |f| matches!(f, Frame::HandoffDraft { .. })).await;
+    let Frame::HandoffDraft { draft_id, text } = last(&drafted).clone() else {
+        panic!("a draft: {drafted:?}")
+    };
+    assert!(text.starts_with("source_session: "), "{text}");
+    (draft_id, text)
+}
+
+/// A handoff commit creates a seeded managed session, attaches to it after its attachment, and
+/// records the back-link in the source. Every later attachment to the new session is shown its
+/// seed.
+#[test]
+fn a_handoff_commit_attaches_a_seeded_session_and_records_the_back_link() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (old, new, attached, later) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let old = client.start(None).await.expect("starts").session;
+            let (draft_id, _text) = handoff_from(&mut client).await;
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let attached = frames_until(&mut client, |f| matches!(f, Frame::Seeded { .. })).await;
+            let new = match attached.first() {
+                Some(Frame::Attached { session, .. }) => session.session.clone(),
+                other => panic!("the connection attaches first: {other:?}"),
+            };
+            let mut other = Client::connect(&socket).await.expect("connects");
+            other.attach_at(&new).await.expect("attaches");
+            other.send(&Request::Status).await.expect("sent");
+            let later = frames_until(&mut other, |f| matches!(f, Frame::Status(_))).await;
+            (old, new, attached, later)
+        }
+    });
+    let seeded_at = attached
+        .iter()
+        .position(|f| matches!(f, Frame::Seeded { .. }))
+        .expect("seeded");
+    let attached_at = attached
+        .iter()
+        .position(|f| matches!(f, Frame::Attached { .. }))
+        .expect("attached");
+    assert!(attached_at < seeded_at, "Seeded follows the attachment");
+    assert_ne!(old, new, "the handoff created a new session");
+    assert!(matches!(
+        &attached[seeded_at],
+        Frame::Seeded { source_session_id, source_event_count, back_link_recorded: true, text, .. }
+            if *source_session_id == old && *source_event_count > 0 && text.contains("hello back")
+    ));
+    assert!(
+        later.iter().any(
+            |f| matches!(f, Frame::Seeded { source_session_id, .. } if *source_session_id == old)
+        ),
+        "a later attachment is shown the seed too: {later:?}"
+    );
+    let source = stored(&store, &old);
+    assert!(
+        source.log().events().iter().any(|event| matches!(
+            event,
+            SessionEvent::ContextHandoff { payload }
+                if payload.new_session_id == new && payload.confirmed
+        )),
+        "the source records the back-link"
+    );
+    let created = stored(&store, &new);
+    assert_eq!(
+        created.body_version(),
+        5,
+        "a seeded managed session is a version-5 body"
+    );
+    assert!(matches!(
+        created.log().events()[0],
+        SessionEvent::ContextMode { .. }
+    ));
+    assert!(matches!(
+        created.log().events()[1],
+        SessionEvent::ContextSeed { .. }
+    ));
+}
+
+/// Attaching to a session that a handoff did not start shows no seed: the seed is the session's
+/// own.
+#[test]
+fn a_session_no_handoff_started_is_not_shown_a_seed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let later = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            let mut other = Client::connect(&socket).await.expect("connects");
+            other.attach_at(&id).await.expect("attaches");
+            other.send(&Request::Status).await.expect("sent");
+            frames_until(&mut other, |f| matches!(f, Frame::Status(_))).await
+        }
+    });
+    assert!(
+        !later.iter().any(|f| matches!(f, Frame::Seeded { .. })),
+        "{later:?}"
+    );
+}
+
+/// A taken name is refused before any model call, and again at commit if it was taken in between.
+#[test]
+fn a_taken_handoff_name_is_refused_at_the_draft_and_again_at_the_commit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (at_draft, at_commit, listed_before, listed_after) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(Some("taken".to_owned())).await.expect("names");
+            client.start(None).await.expect("starts a managed one");
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            client
+                .send(&Request::Prompt {
+                    text: "first".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client
+                .send(&Request::HandoffDraft {
+                    name: Some("taken".to_owned()),
+                })
+                .await
+                .expect("sent");
+            let at_draft = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            client
+                .send(&Request::HandoffDraft {
+                    name: Some("later".to_owned()),
+                })
+                .await
+                .expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::HandoffDraft { .. })).await;
+            let Frame::HandoffDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            let mut namer = Client::connect(&socket).await.expect("connects");
+            namer.start(Some("later".to_owned())).await.expect("names");
+            let listed_before = store_count(&socket).await;
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let at_commit = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            let listed_after = store_count(&socket).await;
+            (at_draft, at_commit, listed_before, listed_after)
+        }
+    });
+    assert!(
+        refusal_in(&at_draft).is_some_and(|m| m.contains("already belongs")),
+        "{at_draft:?}"
+    );
+    assert!(
+        refusal_in(&at_commit).is_some_and(|m| m.contains("already belongs")),
+        "{at_commit:?}"
+    );
+    assert_eq!(
+        listed_before, listed_after,
+        "the refused commit created nothing"
+    );
+}
+
+/// How many sessions the store lists, read over the socket so the count is the agent's view.
+async fn store_count(socket: &Path) -> usize {
+    let mut client = Client::connect(socket).await.expect("connects");
+    client.sessions().await.expect("lists").len()
+}
+
+/// A draft is held by the connection that asked, for as long as it watches the session it was
+/// drafted from: a connection that closes takes its drafts with it, so a new one cannot commit
+/// them, and a connection that lets go of the session — even to attach to the same one again —
+/// has let go of its drafts too.
+#[test]
+fn a_handoff_draft_is_dropped_when_its_connection_lets_go() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (closed, reattached) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            let (draft_id, _) = handoff_from(&mut client).await;
+            drop(client);
+            let mut again = Client::connect(&socket).await.expect("connects");
+            again.attach_at(&id).await.expect("attaches");
+            again
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let closed = frames_until(&mut again, |f| matches!(f, Frame::Refused { .. })).await;
+            let (draft_id, _) = handoff_from(&mut again).await;
+            again.attach_at(&id).await.expect("attaches again");
+            again
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let reattached = frames_until(&mut again, |f| matches!(f, Frame::Refused { .. })).await;
+            (closed, reattached)
+        }
+    });
+    assert_eq!(refusal_code_in(&closed), Some("stale_draft"), "{closed:?}");
+    assert_eq!(
+        refusal_code_in(&reattached),
+        Some("stale_draft"),
+        "{reattached:?}"
+    );
+}
+
+/// A commit that names the wrong draft is refused and keeps the held one, which the right id then
+/// commits.
+#[test]
+fn a_wrong_handoff_id_keeps_the_held_draft() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (refused, attached) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            let (draft_id, _) = handoff_from(&mut client).await;
+            client
+                .send(&Request::HandoffCommit {
+                    draft_id: "d-none".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let attached = frames_until(&mut client, |f| matches!(f, Frame::Seeded { .. })).await;
+            (refused, attached)
+        }
+    });
+    assert!(
+        refusal_code_in(&refused) == Some("stale_draft"),
+        "{refused:?}"
+    );
+    assert!(attached.iter().any(|f| matches!(f, Frame::Attached { .. })));
+}
+
+/// Two viewers each draft a handoff; the one that commits first wins, and the other is stale.
+#[test]
+fn the_first_handoff_commit_wins_and_the_other_draft_is_stale() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (winner, loser) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut first = Client::connect(&socket).await.expect("connects");
+            let id = first.start(None).await.expect("starts").session;
+            first
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            frames_until(&mut first, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            first
+                .send(&Request::Prompt {
+                    text: "first".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut first).await;
+            let mut second = Client::connect(&socket).await.expect("connects");
+            second.attach_at(&id).await.expect("attaches");
+            first
+                .send(&Request::HandoffDraft { name: None })
+                .await
+                .expect("sent");
+            let drafted =
+                frames_until(&mut first, |f| matches!(f, Frame::HandoffDraft { .. })).await;
+            let Frame::HandoffDraft { draft_id: one, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            second
+                .send(&Request::HandoffDraft { name: None })
+                .await
+                .expect("sent");
+            let drafted =
+                frames_until(&mut second, |f| matches!(f, Frame::HandoffDraft { .. })).await;
+            let Frame::HandoffDraft { draft_id: two, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            // The second draft's attempt records moved the session, so the first draft's base is
+            // behind it. Committing the second draft is therefore the first commit that can win.
+            second
+                .send(&Request::HandoffCommit { draft_id: two })
+                .await
+                .expect("sent");
+            let winner = frames_until(&mut second, |f| matches!(f, Frame::Seeded { .. })).await;
+            first
+                .send(&Request::HandoffCommit { draft_id: one })
+                .await
+                .expect("sent");
+            let loser = frames_until(&mut first, |f| matches!(f, Frame::Refused { .. })).await;
+            (winner, loser)
+        }
+    });
+    assert!(winner.iter().any(|f| matches!(f, Frame::Seeded { .. })));
+    assert!(refusal_code_in(&loser) == Some("stale_draft"), "{loser:?}");
+}
+
+/// Interrupt ends a turn that is waiting on an approval another viewer holds, and the turn does not
+/// hang.
+#[test]
+fn an_interrupt_ends_a_turn_waiting_on_an_approval_another_viewer_holds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
+    let socket = dir.path().join("agent.sock");
+    let (asked, ended) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut prompter = Client::connect(&socket).await.expect("connects");
+            let id = prompter.start(None).await.expect("starts").session;
+            let mut other = Client::connect(&socket).await.expect("connects");
+            other.attach_at(&id).await.expect("attaches");
+            prompter
+                .send(&Request::Prompt {
+                    text: "run it".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let mut asked = Vec::new();
+            let question = until_approval(&mut other, &mut asked).await;
+            assert!(question.is_some(), "the other viewer is asked: {asked:?}");
+            prompter.send(&Request::Interrupt).await.expect("sent");
+            let ended = tokio::time::timeout(WAIT, turn_frames(&mut prompter))
+                .await
+                .expect("the turn ends rather than waiting for an answer");
+            (asked, ended)
+        }
+    });
+    assert!(asked.iter().any(|f| matches!(f, Frame::Approval { .. })));
+    assert_eq!(reason_of(&ended), Some(&TurnEnd::Interrupted), "{ended:?}");
+}
+
+/// Clear, the way the interface will drive it: interrupt a running turn, wait for its ending, then
+/// start a new session. The old session still loads by id, with its log exactly as the turn left
+/// it.
+#[test]
+fn clear_interrupts_waits_for_the_ending_then_starts_a_new_session_and_the_old_one_is_untouched() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = agent_over(dir.path(), Rc::new(Box::new(SlowRelentlessLlm)), "slow");
+    let socket = dir.path().join("agent.sock");
+    let (old, new, reattached) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        let home = dir.path().to_path_buf();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let old = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "keep going".to_owned(),
+                })
+                .await
+                .expect("sent");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            client.send(&Request::Interrupt).await.expect("sent");
+            let ended = tokio::time::timeout(WAIT, turn_frames(&mut client))
+                .await
+                .expect("the ending arrives");
+            assert_eq!(reason_of(&ended), Some(&TurnEnd::Interrupted));
+            // What the store holds once the turn has ended, before the clear touches anything.
+            let file = home.join("sessions").join(&old).join("session.jsonl");
+            let ended_with = std::fs::read(&file).expect("the old session is stored");
+            client
+                .send(&Request::New { name: None })
+                .await
+                .expect("sent");
+            let attached = frames_until(&mut client, |f| matches!(f, Frame::Attached { .. })).await;
+            let Frame::Attached { session, .. } = last(&attached).clone() else {
+                panic!("an attachment: {attached:?}")
+            };
+            let mut back = Client::connect(&socket).await.expect("connects");
+            let reattached = back
+                .attach_at(&old)
+                .await
+                .expect("the old one still loads")
+                .stream;
+            let after = std::fs::read(&file).expect("the old session is still stored");
+            assert_eq!(
+                after, ended_with,
+                "the clear did not touch the old session's log"
+            );
+            (old, session.session, reattached)
+        }
+    });
+    assert_ne!(old, new, "clear starts a new session");
+    let disk = stored(&store, &old);
+    assert!(disk.event_count() > 0, "the interrupted turn is on disk");
+    assert_eq!(
+        reattached.frontier.event_count,
+        u64::try_from(disk.event_count()).unwrap(),
+        "the old session loads by id, as it was left"
+    );
+}
+
+/// A store that delegates everything to a real one, except that naming a session fails while
+/// `refuse_names` is set. What a naming failure looks like after a handoff's seed has been saved,
+/// without a full disk.
+struct NamingRefusingStore {
+    /// The store that does the writing, including the checkpoints a managed session binds to.
+    inner: StoreHandle,
+    /// Whether every naming fails, for as long as it is set.
+    refuse_names: Rc<std::cell::Cell<bool>>,
+}
+
+impl StorePort for NamingRefusingStore {
+    fn save<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.save(session)
+    }
+
+    fn load<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Session>> {
+        self.inner.load(id)
+    }
+
+    fn list(
+        &self,
+    ) -> futures::future::LocalBoxFuture<
+        '_,
+        nanus_ports::StoreResult<Vec<nanus_ports::SessionSummary>>,
+    > {
+        self.inner.list()
+    }
+
+    fn delete<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.delete(id)
+    }
+
+    fn name<'a>(
+        &'a self,
+        id: &'a SessionId,
+        name: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        if self.refuse_names.get() {
+            return Box::pin(async {
+                Err(nanus_ports::StoreError::Io {
+                    path: std::path::PathBuf::from("names"),
+                    message: String::from("the name could not be written"),
+                })
+            });
+        }
+        self.inner.name(id, name)
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Option<SessionId>>> {
+        self.inner.resolve(name)
+    }
+
+    fn name_of<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Option<String>>> {
+        self.inner.name_of(id)
+    }
+
+    fn home(
+        &self,
+    ) -> futures::future::LocalBoxFuture<'_, nanus_ports::StoreResult<std::path::PathBuf>> {
+        self.inner.home()
+    }
+
+    fn lock<'a>(
+        &'a self,
+        id: &'a SessionId,
+        owner: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.lock(id, owner)
+    }
+
+    fn release_lock(&self, id: &SessionId) {
+        self.inner.release_lock(id);
+    }
+
+    fn stored_identity<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<
+        'a,
+        nanus_ports::StoreResult<nanus_ports::ExpectedCheckpoint>,
+    > {
+        self.inner.stored_identity(id)
+    }
+
+    fn checkpoint<'a>(
+        &'a self,
+        view: nanus_ports::CheckpointView<'a>,
+    ) -> futures::future::LocalBoxFuture<
+        'a,
+        Result<nanus_domain::context::managed::CheckpointReceipt, nanus_ports::CheckpointError>,
+    > {
+        self.inner.checkpoint(view)
+    }
+}
+
+/// A managed agent over a [`NamingRefusingStore`], the switch that makes naming fail, and the store
+/// beneath it.
+fn naming_store_agent(dir: &Path) -> (Agent, Rc<std::cell::Cell<bool>>, StoreHandle) {
+    let refuse_names = Rc::new(std::cell::Cell::new(false));
+    let inner = nanus_kernel::runtime::block_on(async {
+        JsonlStore::new(dir.to_path_buf())
+            .await
+            .expect("the store opens")
+            .handle()
+    });
+    let store: StoreHandle = Rc::new(Box::new(NamingRefusingStore {
+        inner: StoreHandle::clone(&inner),
+        refuse_names: Rc::clone(&refuse_names),
+    }));
+    let (agent, _store) = agent_with_store(dir, Rc::new(Box::new(ManagedLlm)), "scripted", store);
+    (agent, refuse_names, inner)
+}
+
+/// A named handoff whose name is written attaches a session that holds that name, and says so in
+/// its seed.
+#[test]
+fn a_named_handoff_seed_reports_the_name_the_session_holds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _refuse, _store) = naming_store_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let seeded = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            client
+                .send(&Request::Prompt {
+                    text: "first".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client
+                .send(&Request::HandoffDraft {
+                    name: Some("later".to_owned()),
+                })
+                .await
+                .expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::HandoffDraft { .. })).await;
+            let Frame::HandoffDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Seeded { .. })).await
+        }
+    });
+    assert!(
+        matches!(last(&seeded), Frame::Seeded { name, .. } if name.as_deref() == Some("later")),
+        "{seeded:?}"
+    );
+}
+
+/// When naming fails after the seed is saved, the session exists, the handoff completes, and the
+/// seed says it holds no name, so the client that asked for one can tell.
+#[test]
+fn a_name_that_fails_after_the_seed_is_saved_is_reported_as_unnamed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, refuse_names, store) = naming_store_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (seeded, created) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        let refuse_names = Rc::clone(&refuse_names);
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            client
+                .send(&Request::Prompt {
+                    text: "first".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client
+                .send(&Request::HandoffDraft {
+                    name: Some("later".to_owned()),
+                })
+                .await
+                .expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::HandoffDraft { .. })).await;
+            let Frame::HandoffDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            refuse_names.set(true);
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let seeded = frames_until(&mut client, |f| matches!(f, Frame::Seeded { .. })).await;
+            let Frame::Seeded { .. } = last(&seeded) else {
+                panic!("{seeded:?}")
+            };
+            let created = match seeded.first() {
+                Some(Frame::Attached { session, .. }) => session.session.clone(),
+                other => panic!("the connection attaches first: {other:?}"),
+            };
+            (seeded, created)
+        }
+    });
+    assert!(
+        matches!(last(&seeded), Frame::Seeded { name, back_link_recorded: true, .. }
+            if name.is_none()),
+        "the seed names no session: {seeded:?}"
+    );
+    let disk = stored(&store, &created);
+    assert!(
+        disk.event_count() > 0,
+        "the seeded session was saved before naming failed"
+    );
+    assert!(
+        nanus_kernel::runtime::block_on(store.name_of(&SessionId::new(&created)))
+            .expect("the name reads")
+            .is_none(),
+        "and it holds no name"
+    );
+}
+
+/// A model whose first answer is immediate and whose second request hangs until it is dropped,
+/// so a test can catch a maintenance draft inside its model call and interrupt it there.
+struct HangingSecondLlm {
+    /// How many requests have been made.
+    calls: std::cell::Cell<u32>,
+    /// Given when the second request is entered, so the test knows the draft is in flight.
+    entered: Arc<tokio::sync::Semaphore>,
+}
+
+impl LlmPort for HangingSecondLlm {
+    fn model(&self) -> &'static str {
+        "hanging"
+    }
+
+    fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        let call = self.calls.get();
+        self.calls.set(call.saturating_add(1));
+        if call != 1 {
+            return ScriptedLlm.stream_chat(request);
+        }
+        let entered = Arc::clone(&self.entered);
+        Box::pin(futures::stream::once(async move {
+            entered.add_permits(1);
+            std::future::pending::<()>().await;
+            LlmEvent::TextDelta("never".to_owned())
+        }))
+    }
+}
+
+/// An interrupt from the connection that asked stops a compaction draft inside its model call: the
+/// draft is refused, and the session is free for the next turn at once.
+#[test]
+fn an_interrupt_stops_a_compaction_draft_and_frees_the_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let llm = HangingSecondLlm {
+        calls: std::cell::Cell::new(0),
+        entered: Arc::clone(&entered),
+    };
+    let (agent, store) = agent_over(dir.path(), Rc::new(Box::new(llm)), "hanging");
+    let socket = dir.path().join("agent.sock");
+    let (id, refused, next) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let _permit = tokio::time::timeout(WAIT, entered.acquire())
+                .await
+                .expect("the draft reaches the model")
+                .expect("the semaphore is open");
+            client.send(&Request::Interrupt).await.expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            client
+                .send(&Request::Prompt {
+                    text: "again".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let next = turn_frames(&mut client).await;
+            (id, refused, next)
+        }
+    });
+    assert_eq!(
+        refusal_code_in(&refused),
+        Some("compact_unavailable"),
+        "{refused:?}"
+    );
+    assert!(refusal_in(&refused).is_some_and(|text| text.contains("interrupted")));
+    assert!(
+        answer_of(&next).is_some(),
+        "the session took the next turn: {next:?}"
+    );
+    assert!(!stored(&store, &id).is_compacted(), "nothing was compacted");
+}
+
+/// A model that answers as [`ScriptedLlm`] does and counts the requests it is sent.
+struct CountingLlm(Rc<std::cell::Cell<u32>>);
+
+impl LlmPort for CountingLlm {
+    fn model(&self) -> &'static str {
+        "counting"
+    }
+
+    fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        self.0.set(self.0.get().saturating_add(1));
+        ScriptedLlm.stream_chat(request)
+    }
+}
+
+/// A compaction draft and the interrupt that follows it, read together: the draft reserves the
+/// session as its request is read, so the interrupt finds it and stops it before the model is
+/// asked, rather than finding an idle session, being ignored, and leaving the draft to run.
+#[test]
+fn an_interrupt_sent_straight_after_a_draft_request_stops_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let calls = Rc::new(std::cell::Cell::new(0));
+    let llm = CountingLlm(Rc::clone(&calls));
+    let (agent, store) = agent_over(dir.path(), Rc::new(Box::new(llm)), "counting");
+    let socket = dir.path().join("agent.sock");
+    let (id, refused, asked, next) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        let calls = Rc::clone(&calls);
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let before = calls.get();
+            client.send(&Request::CompactDraft).await.expect("sent");
+            client.send(&Request::Interrupt).await.expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            let asked = calls.get().saturating_sub(before);
+            client
+                .send(&Request::Prompt {
+                    text: "again".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let next = turn_frames(&mut client).await;
+            (id, refused, asked, next)
+        }
+    });
+    assert_eq!(
+        refusal_code_in(&refused),
+        Some("compact_unavailable"),
+        "{refused:?}"
+    );
+    assert!(refusal_in(&refused).is_some_and(|text| text.contains("interrupted")));
+    assert!(
+        !refused
+            .iter()
+            .any(|frame| matches!(frame, Frame::CompactDraft { .. })),
+        "nothing was drafted: {refused:?}"
+    );
+    assert_eq!(
+        asked, 0,
+        "the model was not asked for the interrupted draft"
+    );
+    assert!(answer_of(&next).is_some(), "the session is free: {next:?}");
+    assert!(!stored(&store, &id).is_compacted(), "nothing was compacted");
+}
+
+/// Only the connection that asked for a draft can stop it. Another viewer's interrupt finds a
+/// draft that is not its own and leaves it running; the asking connection's interrupt stops it.
+#[test]
+fn only_the_connection_that_asked_for_a_draft_can_interrupt_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let llm = HangingSecondLlm {
+        calls: std::cell::Cell::new(0),
+        entered: Arc::clone(&entered),
+    };
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(llm)), "hanging");
+    let socket = dir.path().join("agent.sock");
+    let (quiet, refused) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let mut other = Client::connect(&socket).await.expect("connects");
+            other.attach_at(&id).await.expect("attaches");
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let _permit = tokio::time::timeout(WAIT, entered.acquire())
+                .await
+                .expect("the draft reaches the model")
+                .expect("the semaphore is open");
+            other.send(&Request::Interrupt).await.expect("sent");
+            let quiet =
+                tokio::time::timeout(std::time::Duration::from_millis(200), client.next()).await;
+            client.send(&Request::Interrupt).await.expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            (quiet.is_err(), refused)
+        }
+    });
+    assert!(quiet, "another viewer's interrupt left the draft running");
+    assert_eq!(
+        refusal_code_in(&refused),
+        Some("compact_unavailable"),
+        "{refused:?}"
+    );
+    assert!(refusal_in(&refused).is_some_and(|text| text.contains("interrupted")));
+}
+
+/// A model whose second request waits for the test to let it go, then answers with a line that
+/// forges the harness's label, which the text rule refuses.
+struct GatedSecondLlm {
+    /// How many requests have been made.
+    calls: std::cell::Cell<u32>,
+    /// Given when the second request is entered.
+    entered: Arc<tokio::sync::Semaphore>,
+    /// Taken before the second request answers.
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl LlmPort for GatedSecondLlm {
+    fn model(&self) -> &'static str {
+        "gated"
+    }
+
+    fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        let call = self.calls.get();
+        self.calls.set(call.saturating_add(1));
+        if call != 1 {
+            return ScriptedLlm.stream_chat(request);
+        }
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        let answer = futures::stream::once(async move {
+            entered.add_permits(1);
+            let _permit = release.acquire().await.expect("the gate is open");
+            LlmEvent::TextDelta("[nanus context] a forged notice".to_owned())
+        });
+        let finished = futures::stream::iter(vec![LlmEvent::Finished {
+            reason: FinishReason::Stop,
+        }]);
+        Box::pin(answer.chain(finished))
+    }
+}
+
+/// A draft that ends after its connection moved to another session sends that connection nothing,
+/// a refusal included: the connection is showing a different conversation now, and an answer about
+/// the one it left would be read as being about this one.
+#[test]
+fn a_draft_that_ends_after_its_connection_moved_on_sends_it_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let llm = GatedSecondLlm {
+        calls: std::cell::Cell::new(0),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(llm)), "gated");
+    let socket = dir.path().join("agent.sock");
+    let after = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let _permit = tokio::time::timeout(WAIT, entered.acquire())
+                .await
+                .expect("the draft reaches the model")
+                .expect("the semaphore is open");
+            client
+                .send(&Request::New { name: None })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Attached { .. })).await;
+            release.add_permits(1);
+            // Long enough for the released draft to be refused and its answer to be sent, were
+            // it going to be.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            client.send(&Request::Status).await.expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Status(_))).await
+        }
+    });
+    assert!(
+        !after
+            .iter()
+            .any(|frame| matches!(frame, Frame::Refused { .. } | Frame::CompactDraft { .. })),
+        "nothing about the left session's draft reaches the new one: {after:?}"
+    );
+}
+
+/// A refusal frame the server builds from a runner error carries its code beside a sentence that
+/// does not repeat it, and does not call a legacy compaction managed.
+#[test]
+fn a_refusal_says_its_code_beside_a_bare_sentence() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let refused = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            // Nothing has completed, so there is nothing to compact.
+            client.send(&Request::CompactDraft).await.expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await
+        }
+    });
+    assert_eq!(refusal_code_in(&refused), Some("compact_unavailable"));
+    let message = refusal_in(&refused).expect("a refusal");
+    assert!(!message.contains("compact_unavailable"), "{message}");
+    assert!(!message.contains("managed context"), "{message}");
+    assert!(!message.is_empty());
+}
+
+/// A maintenance request on a connection with no session is refused with the request's own code.
+#[test]
+fn a_maintenance_request_with_no_session_attached_is_refused_with_its_code() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (handoff, compact) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client
+                .send(&Request::HandoffDraft { name: None })
+                .await
+                .expect("sent");
+            let handoff = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            client
+                .send(&Request::CompactCommit {
+                    draft_id: "d1".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let compact = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            (handoff, compact)
+        }
+    });
+    assert_eq!(refusal_code_in(&handoff), Some("handoff_unavailable"));
+    assert_eq!(refusal_code_in(&compact), Some("compact_unavailable"));
+}
+
+/// Managed context asked of a compacted session over `Request::Context` is refused with
+/// `compacted_session`, and the session stays legacy and cut.
+#[test]
+fn managed_context_on_a_compacted_session_is_refused_with_its_code_over_the_link() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (id, refused) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            client
+                .send(&Request::CompactCommit { draft_id })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Compacted { .. })).await;
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            (id, refused)
+        }
+    });
+    assert_eq!(
+        refusal_code_in(&refused),
+        Some("compacted_session"),
+        "{refused:?}"
+    );
+    let message = refusal_in(&refused).expect("a refusal");
+    assert!(!message.contains("compacted_session"), "{message}");
+    let disk = stored(&store, &id);
+    assert!(disk.is_compacted());
+    assert!(!disk.is_managed_body(), "the session stayed legacy");
+}
+
+/// A session managed once and switched back to legacy is compacted through its checkpoint, and
+/// the next turn is checkpointed on top of the cut without a stale base.
+#[test]
+fn a_session_managed_once_is_compacted_through_its_checkpoint_and_takes_the_next_turn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (id, after) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            for action in [ContextAction::Managed, ContextAction::Legacy] {
+                client
+                    .send(&Request::Context { action })
+                    .await
+                    .expect("sent");
+                frames_until(&mut client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            }
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            client
+                .send(&Request::CompactCommit { draft_id })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::Compacted { .. })).await;
+            client
+                .send(&Request::Prompt {
+                    text: "after the cut".to_owned(),
+                })
+                .await
+                .expect("sent");
+            (id, turn_frames(&mut client).await)
+        }
+    });
+    assert!(
+        answer_of(&after).is_some(),
+        "the turn after the cut is done: {after:?}"
+    );
+    let disk = stored(&store, &id);
+    assert!(
+        disk.is_managed_body(),
+        "the body still holds its managed records"
+    );
+    assert!(disk.is_compacted());
+    assert!(disk.log().events().iter().any(|event| matches!(
+        event,
+        SessionEvent::UserMessage { text, .. } if text == "after the cut"
+    )));
+}
+
+/// A draft is dropped when the same connection lets go of its session, so a commit after it
+/// switches away and back is stale.
+#[test]
+fn a_handoff_draft_is_dropped_when_the_same_connection_attaches_elsewhere() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (refused, kept) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            let (draft_id, _) = handoff_from(&mut client).await;
+            client.start(None).await.expect("a second session starts");
+            client.attach_at(&id).await.expect("attaches back");
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            // Without the switch, the same connection's draft commits.
+            client
+                .send(&Request::HandoffDraft { name: None })
+                .await
+                .expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::HandoffDraft { .. })).await;
+            let Frame::HandoffDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let kept = frames_until(&mut client, |f| matches!(f, Frame::Seeded { .. })).await;
+            (refused, kept)
+        }
+    });
+    assert_eq!(
+        refusal_code_in(&refused),
+        Some("stale_draft"),
+        "{refused:?}"
+    );
+    assert!(kept.iter().any(|f| matches!(f, Frame::Seeded { .. })));
+}
+
+/// A handoff whose back-link cannot be written leaves a complete seeded session, says so on the
+/// commit, and says so again to a later attachment, because the answer is read from the source.
+#[cfg(unix)]
+#[test]
+fn a_failed_back_link_leaves_a_complete_seeded_session_and_says_so() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let sessions = dir.path().join("sessions");
+    let (old, new, committed, later) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let old = client.start(None).await.expect("starts").session;
+            let (draft_id, _) = handoff_from(&mut client).await;
+            // The source's directory refuses the back-link's write; the new session's does not.
+            let source_dir = sessions.join(&old);
+            std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o500))
+                .expect("the source directory is made read-only");
+            client
+                .send(&Request::HandoffCommit { draft_id })
+                .await
+                .expect("sent");
+            let committed = frames_until(&mut client, |f| matches!(f, Frame::Seeded { .. })).await;
+            std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("the source directory is writable again");
+            let new = match committed.first() {
+                Some(Frame::Attached { session, .. }) => session.session.clone(),
+                other => panic!("the connection attaches first: {other:?}"),
+            };
+            let mut other = Client::connect(&socket).await.expect("connects");
+            other.attach_at(&new).await.expect("attaches");
+            other.send(&Request::Status).await.expect("sent");
+            let later = frames_until(&mut other, |f| matches!(f, Frame::Status(_))).await;
+            (old, new, committed, later)
+        }
+    });
+    let seeded = |frames: &[Frame]| {
+        frames.iter().find_map(|frame| match frame {
+            Frame::Seeded {
+                back_link_recorded, ..
+            } => Some(*back_link_recorded),
+            _ => None,
+        })
+    };
+    assert_eq!(seeded(&committed), Some(false), "{committed:?}");
+    assert_eq!(
+        seeded(&later),
+        Some(false),
+        "a later attachment reads the source: {later:?}"
+    );
+    let created = stored(&store, &new);
+    assert!(matches!(
+        created.log().events()[1],
+        SessionEvent::ContextSeed { .. }
+    ));
+    assert!(
+        !stored(&store, &old)
+            .log()
+            .events()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ContextHandoff { .. })),
+        "the source does not record the handoff"
+    );
+}
+
+/// The interrupt that ends a turn waiting on an approval answers the question as unavailable: the
+/// call is denied, so the tool never runs.
+#[test]
+fn an_interrupt_answers_an_open_approval_as_unavailable_and_the_call_does_not_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
+    let socket = dir.path().join("agent.sock");
+    let id = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut prompter = Client::connect(&socket).await.expect("connects");
+            let id = prompter.start(None).await.expect("starts").session;
+            let mut other = Client::connect(&socket).await.expect("connects");
+            other.attach_at(&id).await.expect("attaches");
+            prompter
+                .send(&Request::Prompt {
+                    text: "run it".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let mut asked = Vec::new();
+            let question = until_approval(&mut other, &mut asked).await;
+            let (_, tool) = question.expect("the other viewer is asked");
+            prompter.send(&Request::Interrupt).await.expect("sent");
+            tokio::time::timeout(WAIT, turn_frames(&mut prompter))
+                .await
+                .expect("the turn ends");
+            // The viewer that held the question sees it leave as one answered elsewhere does: the
+            // call it was about is denied, the turn ends, and nothing asks it again.
+            let seen = tokio::time::timeout(WAIT, turn_frames(&mut other))
+                .await
+                .expect("the other viewer sees the turn end");
+            assert!(
+                seen.iter().any(
+                    |frame| matches!(frame, Frame::ToolDone { name, error: true, .. }
+                    if *name == tool)
+                ),
+                "the other viewer sees the call denied: {seen:?}"
+            );
+            assert!(
+                !seen
+                    .iter()
+                    .any(|frame| matches!(frame, Frame::Approval { .. })),
+                "the question is not asked again: {seen:?}"
+            );
+            assert_eq!(reason_of(&seen), Some(&TurnEnd::Interrupted), "{seen:?}");
+            let mut late = Client::connect(&socket).await.expect("connects");
+            late.attach_at(&id).await.expect("attaches");
+            late.send(&Request::Status).await.expect("sent");
+            let attached = frames_until(&mut late, |f| matches!(f, Frame::Status(_))).await;
+            assert!(
+                !attached
+                    .iter()
+                    .any(|frame| matches!(frame, Frame::Approval { .. })),
+                "a viewer arriving later is not shown the question: {attached:?}"
+            );
+            id
+        }
+    });
+    let disk = stored(&store, &id);
+    let results: Vec<(bool, &str)> = disk
+        .log()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult {
+                is_error, content, ..
+            } => Some((*is_error, content.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert!(!results.is_empty(), "the call was answered");
+    assert!(
+        results
+            .iter()
+            .all(|(error, content)| *error && !content.contains("\"ran\"")),
+        "the call was denied, not run: {results:?}"
+    );
+}
+
+/// A handoff name the store's rules refuse, or one of more than one word, is refused before the
+/// model is asked, so nothing is drafted and nothing is recorded.
+#[test]
+fn a_handoff_name_that_breaks_the_rules_is_refused_before_the_model_is_asked() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (id, before, refusals) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            frames_until(&mut client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            client
+                .send(&Request::Prompt {
+                    text: "first".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let before = stored_event_count(&socket, &id);
+            let mut refusals = Vec::new();
+            for name in ["two words", "bell\u{7}", "   "] {
+                client
+                    .send(&Request::HandoffDraft {
+                        name: Some(name.to_owned()),
+                    })
+                    .await
+                    .expect("sent");
+                let refused =
+                    frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+                refusals.push(refusal_in(&refused).unwrap_or_default().to_owned());
+            }
+            (id, before, refusals)
+        }
+    });
+    assert_eq!(refusals.len(), 3);
+    assert!(refusals[0].contains("one word"), "{refusals:?}");
+    assert!(refusals[1].contains("control character"), "{refusals:?}");
+    assert!(refusals[2].contains("empty"), "{refusals:?}");
+    assert_eq!(
+        stored(&store, &id).event_count(),
+        before,
+        "no attempt was recorded for a refused name"
+    );
+}
+
+/// How many events the stored copy of `id` holds, read from the file in the home beside the
+/// socket, so the count is what is on disk.
+fn stored_event_count(socket: &Path, id: &str) -> usize {
+    let home = socket.parent().expect("the socket is in the home");
+    let raw = std::fs::read_to_string(home.join("sessions").join(id).join("session.jsonl"))
+        .expect("the session is stored");
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .saturating_sub(1)
+}
+
+/// A compaction commit the store cannot save is refused, leaves the stored file exactly as it was,
+/// and leaves the held session uncut, so the draft can be made again once the store recovers.
+#[cfg(unix)]
+#[test]
+fn a_compaction_commit_the_store_cannot_save_leaves_the_file_intact() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let sessions = dir.path().join("sessions");
+    let (id, before, refused, again) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let mut client = Client::connect(&socket).await.expect("connects");
+            let id = client.start(None).await.expect("starts").session;
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            turn_frames(&mut client).await;
+            let file = sessions.join(&id).join("session.jsonl");
+            let before = std::fs::read(&file).expect("the session is stored");
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let drafted =
+                frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            let Frame::CompactDraft { draft_id, .. } = last(&drafted).clone() else {
+                panic!("a draft: {drafted:?}")
+            };
+            let session_dir = sessions.join(&id);
+            std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o500))
+                .expect("the session directory is made read-only");
+            client
+                .send(&Request::CompactCommit { draft_id })
+                .await
+                .expect("sent");
+            let refused = frames_until(&mut client, |f| matches!(f, Frame::Refused { .. })).await;
+            std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("the session directory is writable again");
+            assert_eq!(std::fs::read(&file).expect("still stored"), before);
+            // The held copy is uncut, so a new draft is made of the same conversation.
+            client.send(&Request::CompactDraft).await.expect("sent");
+            let again =
+                frames_until(&mut client, |f| matches!(f, Frame::CompactDraft { .. })).await;
+            (id, before, refused, again)
+        }
+    });
+    assert!(refusal_in(&refused).is_some(), "{refused:?}");
+    assert_eq!(
+        refusal_code_in(&refused),
+        Some("checkpoint_not_committed"),
+        "a cut the store could not hold is refused with its code: {refused:?}"
+    );
+    assert!(matches!(last(&again), Frame::CompactDraft { .. }));
+    let disk = stored(&store, &id);
+    assert!(!disk.is_compacted(), "nothing was cut on disk");
+    assert_eq!(disk.to_jsonl().into_bytes(), before);
 }

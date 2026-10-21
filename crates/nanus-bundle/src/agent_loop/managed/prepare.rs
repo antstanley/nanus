@@ -46,6 +46,16 @@ pub(in crate::agent_loop) struct Snapshot {
     pub(in crate::agent_loop) goal: Option<Goal>,
 }
 
+/// A frozen maintenance request and what it was prepared under.
+pub(super) struct PreparedMaintenance {
+    /// The adapter-owned call that will be dispatched.
+    pub(super) call: Box<dyn PreparedModelCall>,
+    /// The revision the request was built from.
+    pub(super) revision: u64,
+    /// The management fragments the request carries.
+    pub(super) management: Vec<FragmentId>,
+}
+
 /// The managed code an adapter's refusal carries, as the stable prefix of its message.
 ///
 /// Adapters report through the ordinary `LlmError`, which has no code of its own, so the code
@@ -226,11 +236,14 @@ impl AgentRunner {
             facts,
         )?;
         let mut request = base.clone();
-        request.messages = Vec::with_capacity(effective.messages.len().saturating_add(2));
+        request.messages = Vec::with_capacity(effective.messages.len().saturating_add(3));
         request
             .messages
             .push(Message::system(self.managed_system_prompt()));
         request.messages.push(effective.notice);
+        // A seeded session's handoff document leads every request, the first included, after the
+        // notice. It is composed here, so every probe the fitter measures carries it too.
+        request.messages.extend(effective.seed);
         request.messages.extend(effective.messages);
         Ok(request)
     }
@@ -355,6 +368,85 @@ impl AgentRunner {
             (selection, fitted.is_some()),
             (&base, allowance, pre),
         )
+    }
+
+    /// Prepares a maintenance request over the accepted selection, with `instruction` as its final
+    /// message.
+    ///
+    /// No fit is searched: a maintenance request is the selection the session already holds, so it
+    /// is refused as `candidate_too_large` when that does not fit, never clamped or hidden further.
+    /// The probe is measured first with the largest notice, as a turn's is, and the request sent is
+    /// prepared once more with its final notice. Returns the frozen call, the revision and the
+    /// management fragments the request carries.
+    pub(super) fn prepare_maintenance(
+        &self,
+        session: &Session,
+        turn: &ManagedTurn<'_>,
+        instruction: &str,
+    ) -> Result<PreparedMaintenance, BundleError> {
+        let policy = turn.policy();
+        if let Some(code) = self.unready(policy) {
+            return Err(refusal(code));
+        }
+        let snapshot = Self::snapshot(session)?;
+        let caps = self.llm().capabilities(&self.model());
+        let allowance = self.input_allowance(caps, policy);
+        let base = self.base_request(session, policy);
+        let notes = snapshot.state.notes().to_vec();
+        let hidden = snapshot.state.hidden().to_vec();
+        let revision = snapshot.state.revision();
+        let selection = Selection {
+            revision,
+            hidden: &hidden,
+            notes: &notes,
+            notes_goal_revision: snapshot.state.notes_goal_revision(),
+        };
+        let with_instruction = |mut request: ChatRequest| {
+            request.messages.push(Message::user(instruction));
+            request
+        };
+        let probe = with_instruction(
+            self.compose(
+                session,
+                &snapshot,
+                selection,
+                &probe_facts(allowance),
+                &base,
+            )
+            .map_err(refusal)?,
+        );
+        let pre = self
+            .prepare_call(probe)
+            .map_err(refusal)?
+            .estimate()
+            .input_tokens;
+        if pre > allowance {
+            return Err(refusal(ErrorCode::CandidateTooLarge));
+        }
+        let facts = NoticeFacts {
+            estimate_input_tokens: Some(pre),
+            estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
+            input_allowance: allowance,
+            budget_hint: false,
+            recovery_available: true,
+        };
+        let request = with_instruction(
+            self.compose(session, &snapshot, selection, &facts, &base)
+                .map_err(refusal)?,
+        );
+        nanus_ports::capabilities::validate_image_input(caps, &request)
+            .map_err(|error| BundleError::Model(error.to_string()))?;
+        let fits_check = request.clone();
+        let call = self.prepare_call(request).map_err(refusal)?;
+        let estimate = call.estimate();
+        if !estimate.fits(caps, &fits_check) || estimate.input_tokens > allowance {
+            return Err(refusal(ErrorCode::CandidateTooLarge));
+        }
+        Ok(PreparedMaintenance {
+            call,
+            revision,
+            management: state::management_in_flight(&snapshot.fragments, &snapshot.protected),
+        })
     }
 
     /// Prepares the chosen candidate with its final notice and builds what it is recorded as.

@@ -233,7 +233,7 @@ impl AgentRunner {
     }
 
     /// Builds the started record of this step's attempt.
-    fn started_attempt(
+    pub(super) fn started_attempt(
         &self,
         session: &Session,
         position: (u32, u32),
@@ -257,6 +257,7 @@ impl AgentRunner {
             usage: None,
             assistant_seq: None,
             included_management_fragments: management,
+            kind: None,
             started_at_ms: self.clock.now_ms(),
             finished_at_ms: None,
             timings_ms: None,
@@ -273,7 +274,7 @@ impl AgentRunner {
 
     /// Checkpoints the settled prefix, any automatic revision and the request intent, before
     /// anything is sent. Only an acknowledged commit installs them.
-    async fn record_intent(
+    pub(super) async fn record_intent(
         &self,
         session: &mut Session,
         turn: &ManagedTurn<'_>,

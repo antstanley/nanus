@@ -289,7 +289,16 @@ async fn a_listing_shows_every_version_a_load_reads_and_no_other() {
         .map(|summary| summary.id.as_str().to_owned())
         .collect();
     listed.sort();
-    assert_eq!(listed, ["version-1", "version-2", "version-3", "version-4"]);
+    assert_eq!(
+        listed,
+        [
+            "version-1",
+            "version-2",
+            "version-3",
+            "version-4",
+            "version-5"
+        ]
+    );
 }
 
 #[tokio::test]

@@ -645,8 +645,10 @@ supports:
   session's totals cover turns that ran before this interface opened. See
   [the interface](tui.md#commands).
 - **Slash commands**: `/exit`, `/quit`, `/stats`, `/help`, `/clear`, `/model`, `/effort`,
-  `/provider`, `/goal`, and `/copy`. Anything else is named in the transcript rather than sent to
-  the model.
+  `/provider`, `/goal`, `/context`, `/handoff`, `/compact`, and `/copy`. `/clear`, `/handoff` and
+  `/compact` act on the conversation and ask before they change it; see
+  [the interface](tui.md#clear-handoff-and-compaction). Anything else is named in the transcript
+  rather than sent to the model.
 - **A durable goal** (`/goal`): one objective per session, persisted in the session log, with a
   lifecycle a person drives — `/goal <objective>` sets one, a bare `/goal` reads it, and
   `pause`, `resume`, `complete`, `abandon`, and `clear` move it. It survives a resume, it is
@@ -796,14 +798,26 @@ The Cordis-style kernel is the framework underneath. See
 
 ## Managed context
 
-Opt in per session with `nanus run --context-mode managed` (and optionally
-`--context-output-reserve <tokens>` and `--capture-shell-evidence`), or from the interface with
-`/context`. Every user message stays in every request; completed old tool work is hidden to fit
-the budget — automatically, or by the model through `context_manage` — and stays recallable
-through `context_recall`, including shell output past the preview when capture is on. Every step
-is checkpointed before its request is sent. Supported on DeepSeek, OpenAI, z.ai and Inception
-Chat Completions and Anthropic Messages at their official endpoints; Responses paths refuse.
-Legacy sessions are unchanged. See [managed context](context-management.md).
+Opt in per session with `nanus run --context-mode managed` (and optionally `--context-output-reserve
+<tokens>` and `--capture-shell-evidence`), or from the interface with `/context`. Every user message
+stays in every request; completed old tool work is hidden to fit the budget — automatically, or by
+the model through `context_manage` — and stays recallable through `context_recall`, including shell
+output past the preview when capture is on. Every step is checkpointed before its request is sent.
+Supported on DeepSeek, OpenAI, z.ai and Inception Chat Completions and Anthropic Messages at their
+official endpoints; Responses paths refuse. Legacy sessions are unchanged. A managed session can be
+handed off into a new one (`/handoff`): the agent drafts a summary of it, the reader reads and
+confirms it, and every request of the new session, the first included, carries that document as a
+labelled system message of generated data. See [handoff](context-management.md#handoff) and [managed
+context](context-management.md).
+
+## Legacy context
+
+A legacy session replays its whole log and drops the oldest whole turns when the budget is spent,
+with a notice where the gap is. It can also be compacted (`/compact`): the agent drafts a summary of
+the conversation, the reader reads it with what it leaves out, and a confirmed cut keeps only the
+summary and what follows it in the prompt. Nothing is deleted, and the model cannot read the cut
+part back; the preview says so before anything changes. A compacted session cannot become managed.
+See [compaction](context-management.md#compaction-is-legacy-only).
 
 ## Not supported yet
 

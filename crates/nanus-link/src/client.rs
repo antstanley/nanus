@@ -496,6 +496,7 @@ mod tests {
                         prefix_blake3: "00".repeat(32),
                         projection_revision: 0,
                     },
+                    compaction_boundary: None,
                 },
             },
         ] {
@@ -596,6 +597,40 @@ mod tests {
             Err(LinkError::Version { agent, client }) => {
                 assert_eq!(agent, PROTOCOL_VERSION.saturating_add(1));
                 assert_eq!(client, PROTOCOL_VERSION);
+            }
+            other => panic!("expected a version refusal, got {other:?}"),
+        }
+    }
+
+    /// A version-12 client against a version-11 agent is refused at the handshake, by name: an
+    /// agent at 11 cannot parse the handoff and compaction requests, so the mismatch must end the
+    /// connection before any request is sent.
+    #[tokio::test]
+    async fn a_v12_client_is_refused_by_an_agent_at_11() {
+        let (agent, client) = pair();
+        let mut agent = agent;
+        let mut line = encode(&Frame::Ready(AgentInfo {
+            workspace: "/work".to_owned(),
+            model: "scripted".to_owned(),
+            models: Vec::new(),
+            effort: None,
+            model_efforts: Vec::new(),
+            provider: String::new(),
+            plan: String::new(),
+            providers: Vec::new(),
+            tools: 0,
+            version: PROTOCOL_VERSION.saturating_sub(1),
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        line.push('\n');
+        let written = agent.write_all(line.as_bytes()).await;
+        assert!(written.is_ok(), "the peer writes");
+
+        match Client::open(client).await {
+            Err(LinkError::Version { agent, client }) => {
+                assert_eq!(agent, 11, "the agent names its own version");
+                assert_eq!(client, PROTOCOL_VERSION);
+                assert_eq!(client, 12);
             }
             other => panic!("expected a version refusal, got {other:?}"),
         }

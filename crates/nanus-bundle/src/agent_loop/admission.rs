@@ -52,7 +52,9 @@ impl AgentRunner {
         };
         let mut request = fitted_base.clone();
         request.messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
-        request.messages.extend(prospective.derive_messages());
+        request
+            .messages
+            .extend(prospective.derive_prompt_messages());
         let llm = self.llm();
         let estimate = |request: &nanus_ports::ChatRequest| llm.estimate_request(request);
         let revision = managed.map(|_| super::managed::ManagedTurn::revision(session));

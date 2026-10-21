@@ -333,6 +333,24 @@ pub struct ViewState {
     /// The context status a step last showed, so a step whose status did not change draws no
     /// second line saying the same thing.
     pub context_shown: Option<String>,
+    /// The handoff or compaction draft the human is reading, until `y` commits it or `Esc` drops
+    /// it.
+    pub preview: Option<crate::maintenance::Preview>,
+    /// The `/clear` warning the human is reading, until `y` confirms it or `Esc` keeps the
+    /// conversation.
+    pub clear_dialog: Option<crate::maintenance::ClearDialog>,
+    /// A clear confirmed while a turn runs: the new conversation is asked for when that turn ends,
+    /// and `Esc` in the meantime abandons it. Holds the switch the clear will complete.
+    pub clearing: Option<crate::maintenance::Switch>,
+    /// A handoff or compaction draft was asked for and its answer has not arrived. The agent runs
+    /// a draft in its own task, so `Esc` while one runs asks it to stop, as it stops a turn.
+    pub drafting: bool,
+    /// The conversation this interface is attached to, as the agent last named it.
+    pub attached_id: Option<String>,
+    /// The conversation switch a request asked for, which the attachment that follows completes.
+    pub switch: Option<crate::maintenance::Switch>,
+    /// The name a handoff draft asked for, carried from the request to the draft's preview.
+    pub handoff_name: Option<String>,
     /// The context decisions already in the transcript, by id and outcome.
     ///
     /// The replayed log draws a decision from its record, and a backlog that caught this
@@ -441,6 +459,16 @@ pub struct ViewState {
     /// question, choosing and deciding are as quick as they like. See
     /// [`ViewState::approval_takes_keys`].
     pub(crate) approval_settled: bool,
+    /// When a handoff or compaction preview, or the `/clear` warning, last appeared.
+    ///
+    /// Those dialogs commit something a reader cannot take back with one key — a new session, a
+    /// cut the model never reads across, a conversation left — and they open while the keyboard
+    /// may be in use, so they settle as an approval does. See
+    /// [`ViewState::confirmation_takes_keys`].
+    pub(crate) confirm_asked: Duration,
+    /// Whether the confirmation dialog on screen has sat before a quiet keyboard for
+    /// [`APPROVAL_SETTLE`]. A latch, as [`ViewState::approval_settled`] is.
+    pub(crate) confirm_settled: bool,
     /// Wrapped rows scrolled in the active dialog.
     pub(crate) dialog_scroll: u16,
     /// The last modal and selection drawn, so a new focus is revealed and a resumed one resets.
@@ -714,6 +742,13 @@ impl Default for ViewState {
             context_dialog: None,
             context_change_asked: None,
             context_shown: None,
+            preview: None,
+            clear_dialog: None,
+            clearing: None,
+            drafting: false,
+            attached_id: None,
+            switch: None,
+            handoff_name: None,
             decisions_shown: std::collections::BTreeSet::new(),
             step: 0,
             tokens_used: 0,
@@ -738,6 +773,8 @@ impl Default for ViewState {
             last_key: None,
             approval_asked: Duration::ZERO,
             approval_settled: false,
+            confirm_asked: Duration::ZERO,
+            confirm_settled: false,
             dialog_scroll: 0,
             dialog_focus: None,
             approval: ApprovalPolicy::default(),
@@ -1353,6 +1390,15 @@ impl ViewState {
         self.busy = true;
         self.step = step;
         self.status = format!("thinking (step {step})");
+        // A turn another viewer started under an open `/clear` warning changes what the clear
+        // would do — it now stops a turn first — so the warning says so, and is a new question:
+        // the quiet the confirmation needs starts again, as an approval's does.
+        if let Some(dialog) = self.clear_dialog.as_mut()
+            && !dialog.busy
+        {
+            dialog.busy = true;
+            self.unsettle_confirmation();
+        }
     }
 
     /// Marks the turn closed.
@@ -1370,6 +1416,16 @@ impl ViewState {
     #[must_use]
     pub fn has_queued(&self) -> bool {
         !self.queue.is_empty()
+    }
+
+    /// Whether the conversation is about to change, or is held by a draft: a clear waiting on its
+    /// turn, a switch waiting on its attachment, or a draft the agent is running.
+    ///
+    /// Nothing that belongs to one conversation is sent while this holds — a prompt, or another
+    /// session control — because the agent would refuse it or put it in another conversation.
+    #[must_use]
+    pub const fn switching(&self) -> bool {
+        self.drafting || self.switch.is_some() || self.clearing.is_some()
     }
 
     /// Takes the oldest queued prompt, if there is one.
@@ -1454,6 +1510,10 @@ impl ViewState {
             (self.auth_open, Modal::Authorization),
             (self.provider_open, Modal::Provider),
             (self.context_dialog.is_some(), Modal::Context),
+            // The previews and the clear warning sit where the context warning does: below the
+            // approval and the masked key field, so a draft is never read as an answer.
+            (self.preview.is_some(), Modal::Preview),
+            (self.clear_dialog.is_some(), Modal::Clear),
             (self.model_open, Modal::Models),
             (self.effort_open, Modal::Effort),
             (self.help_open, Modal::Help),
@@ -1488,6 +1548,28 @@ impl ViewState {
             self.approval_settled = self.now.saturating_sub(since) >= APPROVAL_SETTLE;
         }
         self.approval_settled
+    }
+
+    /// Starts a confirmation dialog's settling again: a preview or the `/clear` warning appeared.
+    pub(crate) const fn unsettle_confirmation(&mut self) {
+        self.confirm_settled = false;
+        self.confirm_asked = self.now;
+    }
+
+    /// Whether a preview or the `/clear` warning may act on a key pressed now.
+    ///
+    /// The approval's rule, applied to the dialogs that commit a draft or leave a conversation:
+    /// not until the keyboard has been quiet for [`APPROVAL_SETTLE`] with the dialog on screen,
+    /// measured from the later of its appearing and the previous keystroke. So a `y` typed into
+    /// the composer as a preview arrives cannot start a new session.
+    pub(crate) fn confirmation_takes_keys(&mut self) -> bool {
+        if !self.confirm_settled {
+            let since = self
+                .last_key
+                .map_or(self.confirm_asked, |key| key.max(self.confirm_asked));
+            self.confirm_settled = self.now.saturating_sub(since) >= APPROVAL_SETTLE;
+        }
+        self.confirm_settled
     }
 
     /// Scrolls explanations without moving the selected decision.
@@ -2540,6 +2622,13 @@ impl ViewState {
                     })
                     .collect()
             }
+            // A seed and a cut are drawn as the text they carry, one line per source line, in the
+            // harness's style: they are generated data, so they are never markdown or a prompt.
+            EntryKind::Seed { .. } | EntryKind::Cut { .. } => entry
+                .text()
+                .split('\n')
+                .map(|line| Line::from(Span::styled(line.to_owned(), style)))
+                .collect(),
             EntryKind::Text => {
                 let mut lines: Vec<Line<'static>> = entry
                     .text()
@@ -3003,6 +3092,8 @@ impl ViewState {
             Modal::Approval => self.approval_content(width),
             Modal::Permissions => self.permission_content(width),
             Modal::Context => self.context_content(width),
+            Modal::Preview => self.preview_content(width),
+            Modal::Clear => self.clear_content(width),
             Modal::Help => self.help_content(width),
             Modal::Models | Modal::Effort | Modal::Provider | Modal::Queue => {
                 self.chooser_content(modal, width)
@@ -3136,6 +3227,86 @@ impl ViewState {
             out.section();
             out.push(
                 "Changes apply only while idle.",
+                width,
+                self.theme.secondary,
+            );
+        }
+        out
+    }
+
+    /// A draft, read in full before the human commits it: its text, what it leaves out, and the
+    /// warning.
+    fn preview_content(&self, width: usize) -> DialogContent {
+        let Some(preview) = &self.preview else {
+            return DialogContent::new(" preview ", "Esc closes", width, &self.theme);
+        };
+        let mut out = DialogContent::new(preview.title(), preview.footer(), width, &self.theme);
+        match preview {
+            crate::maintenance::Preview::Handoff { text, name, .. } => {
+                let asked = name.as_deref().map_or_else(String::new, |name| {
+                    format!("The new session will be named {name:?}.")
+                });
+                out.push(
+                    crate::maintenance::HANDOFF_WARNING,
+                    width,
+                    self.theme.secondary,
+                );
+                if !asked.is_empty() {
+                    out.push(&asked, width, self.theme.secondary);
+                }
+                out.section();
+                out.push(text, width, self.theme.assistant);
+            }
+            crate::maintenance::Preview::Compact {
+                text,
+                dropped_turns,
+                boundary_event_count,
+                usage,
+                ..
+            } => {
+                out.push(
+                    crate::maintenance::COMPACT_WARNING,
+                    width,
+                    self.theme.secondary,
+                );
+                out.push(
+                    &crate::maintenance::cut_sentence(*boundary_event_count),
+                    width,
+                    self.theme.secondary,
+                );
+                if *dropped_turns > 0 {
+                    out.section();
+                    out.push(
+                        &crate::maintenance::dropped_turns_sentence(*dropped_turns),
+                        width,
+                        self.theme.secondary,
+                    );
+                }
+                if let Some(usage) = usage {
+                    out.push(
+                        &crate::maintenance::usage_line(*usage),
+                        width,
+                        self.theme.secondary,
+                    );
+                }
+                out.section();
+                out.push(text, width, self.theme.assistant);
+            }
+        }
+        out
+    }
+
+    /// The `/clear` warning: what stops, what is kept, and the two keys that answer it.
+    fn clear_content(&self, width: usize) -> DialogContent {
+        let mut out = DialogContent::new(
+            " clear the conversation ",
+            "y clears · Esc keeps this conversation\nUp/Down scroll",
+            width,
+            &self.theme,
+        );
+        if let Some(dialog) = &self.clear_dialog {
+            out.push(
+                &crate::maintenance::clear_warning(dialog),
                 width,
                 self.theme.secondary,
             );
@@ -3496,6 +3667,13 @@ impl ViewState {
             let run = Self::run_length(entries, index, Role::Reasoning);
             return (Piece::ReasoningRun, run);
         }
+        // A seed and a cut are one block each: a document and a divider, not a run of anything.
+        if matches!(entry.kind(), EntryKind::Seed { .. }) {
+            return (Piece::Seed, 1);
+        }
+        if matches!(entry.kind(), EntryKind::Cut { .. }) {
+            return (Piece::Cut, 1);
+        }
         // The compact form draws the two things that are *about* the work as one row
         // each, with no heading and no blank row of their own: that is what "no space
         // above or below" comes to, and it is what makes a turn's machinery read as a
@@ -3550,6 +3728,8 @@ impl ViewState {
                 lines
             }
             Piece::CompactThinking => vec![self.compact_thinking_line(entry, width)],
+            Piece::Seed => self.seed_lines(entry, width),
+            Piece::Cut => self.cut_lines(entry, width),
             Piece::Whole => {
                 let mut lines = Vec::new();
                 // A tool's heading is dropped in the compact form: the call's own line already
@@ -3589,6 +3769,64 @@ impl ViewState {
                 lines
             }
         }
+    }
+
+    /// Draws a handoff's seed under a heading that says what it is.
+    ///
+    /// Collapsed with the tool runs (the same toggle, held in the layout key): then it is one line
+    /// that says how long the document is, and the reader who wants it turns the toggle off.
+    fn seed_lines(&self, entry: &Entry, width: u16) -> Vec<Line<'static>> {
+        let EntryKind::Seed { source } = entry.kind() else {
+            return Vec::new();
+        };
+        let style = self.theme.style_for_entry(entry);
+        let heading = format!("handoff from session {source} — generated data, not your message");
+        if self.collapse_tools {
+            let lines = entry.text().split('\n').count();
+            return vec![
+                Line::from(Span::styled(
+                    format!("· {heading} · {lines} lines collapsed"),
+                    style,
+                )),
+                Line::from(""),
+            ];
+        }
+        let mut lines = vec![Line::from(Span::styled(
+            heading,
+            style.add_modifier(Modifier::BOLD),
+        ))];
+        lines.extend(self.lines_for(entry, width));
+        lines.push(Line::from(""));
+        lines
+    }
+
+    /// Draws a compaction's cut: the divider the earlier conversation ends at, and the summary
+    /// beneath it.
+    ///
+    /// The divider always stands. The summary follows the same collapse as a seed.
+    fn cut_lines(&self, entry: &Entry, width: u16) -> Vec<Line<'static>> {
+        let EntryKind::Cut { boundary } = entry.kind() else {
+            return Vec::new();
+        };
+        let style = self.theme.style_for_entry(entry);
+        let mut lines = vec![Line::from(Span::styled(
+            format!(
+                "── compacted before event {boundary}: the model reads the summary below in place \
+                 of what came before ──"
+            ),
+            style,
+        ))];
+        if self.collapse_tools {
+            let rows = entry.text().split('\n').count();
+            lines.push(Line::from(Span::styled(
+                format!("· summary collapsed · {rows} lines"),
+                style,
+            )));
+        } else {
+            lines.extend(self.lines_for(entry, width));
+        }
+        lines.push(Line::from(""));
+        lines
     }
 
     /// Counts the entries from `start` that carry `role`, consecutively.
@@ -3645,7 +3883,10 @@ impl ViewState {
                         failures = failures.saturating_add(1);
                     }
                 }
-                EntryKind::Text | EntryKind::Notice => {}
+                EntryKind::Text
+                | EntryKind::Notice
+                | EntryKind::Seed { .. }
+                | EntryKind::Cut { .. } => {}
             }
         }
         let plural = if calls == 1 { "call" } else { "calls" };
@@ -6337,6 +6578,74 @@ mod tests {
         assert_coherent(&mut warm, 50, 20, "scrolled to the top");
         warm.scroll(5);
         assert_coherent(&mut warm, 50, 20, "scrolled into the middle");
+    }
+
+    /// A seed and a cut are blocks like any other: a kept layout draws them as a fresh one does,
+    /// through the collapse of tool runs, and a resize.
+    #[test]
+    fn a_seed_and_a_cut_draw_the_same_kept_as_fresh_and_collapse_with_the_tools() {
+        let mut warm = ViewState::new();
+        warm.transcript
+            .push(Entry::prose(Role::User, "an earlier question"));
+        warm.transcript
+            .push(Entry::cut(4, "the summary of what came before"));
+        warm.follow();
+        assert_coherent(&mut warm, 70, 24, "a cut");
+        warm.transcript.push(Entry::seed(
+            "s-old",
+            "## Goal\n- ship the parser\n- keep the tests green",
+        ));
+        warm.follow();
+        assert_coherent(&mut warm, 70, 24, "a seed");
+        assert_coherent(&mut warm, 40, 16, "a seed, narrower");
+        warm.collapse_tools = true;
+        assert_coherent(&mut warm, 70, 24, "collapsed with the tools");
+        warm.collapse_tools = false;
+        assert_coherent(&mut warm, 70, 24, "expanded again");
+    }
+
+    /// The previews and the clear warning sit where the context warning does: an approval and the
+    /// masked key field are above them, so a draft is never read as an answer to the question in
+    /// front of it.
+    #[test]
+    fn a_draft_and_the_clear_warning_sit_under_an_approval_and_the_key_field() {
+        let mut state = ViewState::new();
+        state.preview = Some(crate::maintenance::Preview::Compact {
+            draft_id: "d1".to_owned(),
+            text: "summary".to_owned(),
+            dropped_turns: 0,
+            boundary_event_count: 8,
+            usage: None,
+        });
+        state.clear_dialog = Some(crate::maintenance::ClearDialog {
+            old_id: "s-old".to_owned(),
+            name: None,
+            busy: false,
+        });
+        assert_eq!(state.active_modal(), Some(Modal::Preview), "a draft is up");
+        state.preview = None;
+        assert_eq!(
+            state.active_modal(),
+            Some(Modal::Clear),
+            "the clear warning is up"
+        );
+        state.pending_approval = Some(PendingApproval {
+            call_id: "c1".into(),
+            tool: "bash".into(),
+            reason: None,
+        });
+        assert_eq!(
+            state.active_modal(),
+            Some(Modal::Approval),
+            "an approval is answered before a warning about the conversation"
+        );
+        state.pending_approval = None;
+        state.key_entry_open = true;
+        assert_eq!(
+            state.active_modal(),
+            Some(Modal::KeyEntry),
+            "the key field is never covered"
+        );
     }
 
     #[test]

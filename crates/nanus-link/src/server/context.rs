@@ -95,9 +95,9 @@ pub(super) struct Published {
 }
 
 /// The sentence a session that may not continue is refused with.
-const QUARANTINED: &str = "this session cannot take another turn: the store holds neither the \
-     checkpoint the agent last wrote nor the one before it; `/context reset` or a repaired store \
-     is needed before it continues";
+pub(super) const QUARANTINED: &str = "this session cannot take another turn: the store holds \
+     neither the checkpoint the agent last wrote nor the one before it; `/context reset` or a \
+     repaired store is needed before it continues";
 
 /// How many events `session` holds, as the frontier counts them.
 fn count(session: &Session) -> u64 {
@@ -231,7 +231,21 @@ pub(super) async fn prepare(registry: &Registry, held: &Rc<Held>) {
         return;
     }
     let _reserved = Reserved(&held.busy);
-    if !held.session.borrow().is_managed_body() {
+    prepare_reserved(registry, held).await;
+}
+
+/// Binds and recovers as [`prepare`] does, for a caller that already holds the reservation.
+///
+/// A maintenance draft reserves the session the moment its request is read, so that an interrupt
+/// read straight after finds the draft it is aimed at; it then prepares inside that reservation
+/// rather than letting go of it and taking it again.
+pub(super) async fn prepare_reserved(registry: &Registry, held: &Rc<Held>) {
+    assert!(
+        held.busy.get(),
+        "the caller holds the session's reservation"
+    );
+    let unbound = held.managed.borrow().is_none() && held.quarantine.borrow().is_none();
+    if !unbound || !held.session.borrow().is_managed_body() {
         return;
     }
     let binding = match Binding::bind(&registry.agent.store, &held.id).await {
@@ -284,7 +298,7 @@ async fn recover(registry: &Registry, held: &Held, binding: &Binding) {
 }
 
 /// Where a managed write ended up.
-enum Settled {
+pub(super) enum Settled {
     /// The store holds the candidate, as this receipt describes.
     Durable(CheckpointReceipt),
     /// The previous file is intact and the candidate is not on disk.
@@ -318,6 +332,21 @@ async fn settle(binding: &Binding, state: PersistenceState, session: &Session) -
             )),
         },
     }
+}
+
+/// Settles a managed commit the runner reported as an unknown outcome, by reading the disk.
+///
+/// The one thing an unknown outcome allows: `candidate` is what the runner tried to write, and the
+/// store is asked whether that is what it holds. Nothing is written again.
+pub(super) async fn settle_uncertain(binding: &Binding, candidate: &Session) -> Settled {
+    let Ok(candidate_blake3) = candidate.prefix_digest(count(candidate)) else {
+        return Settled::Quarantined(String::from(QUARANTINED));
+    };
+    let unknown = PersistenceState::Unknown {
+        previous: binding.checkpoint.expected(),
+        candidate_blake3,
+    };
+    settle(binding, unknown, candidate).await
 }
 
 /// The receipt a reconciliation that found the candidate on disk amounts to.
@@ -477,18 +506,33 @@ pub(super) async fn record_idle(
         }
     };
     held.saved(receipt.frontier.clone());
-    announce_checkpoint(held, &receipt).await;
+    announce_checkpoint(held, &receipt, None).await;
     Ok(())
 }
 
-/// Tells every viewer of an idle session that a checkpoint moved its frontier.
-async fn announce_checkpoint(held: &Held, receipt: &CheckpointReceipt) {
+/// What the store's last acknowledged write of `session` amounts to, as the binding knows it.
+///
+/// `None` when the binding knows of no stored file that is, byte for byte, a prefix of `session`.
+pub(super) fn stored_receipt(binding: &Binding, session: &Session) -> Option<CheckpointReceipt> {
+    receipt_from(&binding.checkpoint.expected(), session)
+}
+
+/// Tells every viewer of an idle session but `except` that a checkpoint moved its frontier.
+///
+/// `except` is a viewer that is leaving the session in the same request — a handoff's commit moves
+/// its connection to the new session — and would read a checkpoint of the session it is leaving
+/// ahead of the attachment it asked for.
+pub(super) async fn announce_checkpoint(
+    held: &Held,
+    receipt: &CheckpointReceipt,
+    except: Option<u64>,
+) {
     let id = held.next_frame_id();
     let frame = Frame::Checkpoint {
         envelope: held.envelope(None, None, id),
         payload: wire_receipt(receipt),
     };
-    broadcast_awaited(held, frame, None).await;
+    broadcast_awaited(held, frame, except).await;
 }
 
 /// Answers a context request from the session this connection is watching.
@@ -521,6 +565,7 @@ async fn change_mode(
                 message: String::from(
                     "a turn is running; the context mode can change when it is idle",
                 ),
+                code: None,
             },
         )
         .await;
@@ -533,14 +578,49 @@ async fn change_mode(
     match outcome {
         Ok(receipt) => {
             if let Some(receipt) = receipt {
-                announce_checkpoint(held, &receipt).await;
+                announce_checkpoint(held, &receipt, None).await;
             }
             match fresh(registry, held) {
                 Ok(frame) => broadcast_awaited(held, frame, None).await,
-                Err(message) => send(frames, Frame::Refused { message }).await,
+                Err(message) => {
+                    send(
+                        frames,
+                        Frame::Refused {
+                            message,
+                            code: None,
+                        },
+                    )
+                    .await;
+                }
             }
         }
-        Err(message) => send(frames, Frame::Refused { message }).await,
+        Err(refusal) => {
+            send(
+                frames,
+                Frame::Refused {
+                    message: refusal.message,
+                    code: refusal.code.map(|code| code.as_str().to_owned()),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Why a mode change was refused: the sentence, and the stable code when the runner gave one.
+struct ModeRefusal {
+    /// The sentence, which never repeats the code.
+    message: String,
+    /// The runner's code, such as `compacted_session` for managed context on a compacted session.
+    code: Option<ErrorCode>,
+}
+
+impl From<String> for ModeRefusal {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: None,
+        }
     }
 }
 
@@ -549,12 +629,10 @@ async fn change_mode_reserved(
     registry: &Registry,
     held: &Held,
     action: ContextAction,
-) -> Result<Option<CheckpointReceipt>, String> {
+) -> Result<Option<CheckpointReceipt>, ModeRefusal> {
     assert!(held.busy.get(), "a mode change runs in a reserved session");
     if let Some(reason) = held.quarantine.borrow().as_ref() {
-        return Err(format!(
-            "{reason}; use `/context reset` before changing modes"
-        ));
+        return Err(format!("{reason}; use `/context reset` before changing modes").into());
     }
     let mut candidate = held.session.borrow().clone();
     let current = nanus_bundle::AgentRunner::context_policy(&candidate);
@@ -562,7 +640,7 @@ async fn change_mode_reserved(
         ContextAction::Legacy => ContextMode::Legacy,
         ContextAction::Managed => ContextMode::Managed,
         ContextAction::Status | ContextAction::Reset => {
-            return Err(String::from("a mode change must name legacy or managed"));
+            return Err(String::from("a mode change must name legacy or managed").into());
         }
     };
     if current.mode == mode {
@@ -589,18 +667,21 @@ async fn change_mode_reserved(
         Ok(Some(state)) => state,
         Ok(None) => return Ok(None),
         Err(error) => {
-            if error.managed_code() == Some(ErrorCode::CheckpointUnknown) {
+            if error.code() == Some(ErrorCode::CheckpointUnknown) {
                 held.quarantine(String::from(QUARANTINED));
             }
-            return Err(format!("the context mode could not be changed: {error}"));
+            return Err(ModeRefusal {
+                message: format!("the context mode could not be changed: {}", error.reason()),
+                code: error.code(),
+            });
         }
     };
     let receipt = match settle(&binding, state, &candidate).await {
         Settled::Durable(receipt) => receipt,
-        Settled::Kept => return Err(String::from("the context mode change was not saved")),
+        Settled::Kept => return Err(String::from("the context mode change was not saved").into()),
         Settled::Quarantined(reason) => {
             held.quarantine(reason.clone());
-            return Err(reason);
+            return Err(reason.into());
         }
     };
     assert_eq!(receipt.frontier.event_count, count(&candidate));
@@ -624,7 +705,16 @@ async fn status(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, held: &He
     };
     match reply {
         Ok(frame) => send(frames, frame).await,
-        Err(message) => send(frames, Frame::Refused { message }).await,
+        Err(message) => {
+            send(
+                frames,
+                Frame::Refused {
+                    message,
+                    code: None,
+                },
+            )
+            .await;
+        }
     }
 }
 
@@ -684,20 +774,36 @@ async fn reset(registry: &Rc<Registry>, frames: &mpsc::Sender<Frame>, held: &Rc<
         let message = String::from(
             "a turn is running in this session; the context can be reset when it is idle",
         );
-        send(frames, Frame::Refused { message }).await;
+        send(
+            frames,
+            Frame::Refused {
+                message,
+                code: None,
+            },
+        )
+        .await;
         return;
     }
     let _reserved = Reserved(&held.busy);
     let outcome = reset_reserved(registry, held).await;
     match outcome {
         Ok(receipt) => {
-            announce_checkpoint(held, &receipt).await;
+            announce_checkpoint(held, &receipt, None).await;
             match fresh(registry, held) {
                 Ok(frame) => broadcast_awaited(held, frame, None).await,
                 Err(message) => tracing::debug!(%message, "no status follows the reset"),
             }
         }
-        Err(message) => send(frames, Frame::Refused { message }).await,
+        Err(message) => {
+            send(
+                frames,
+                Frame::Refused {
+                    message,
+                    code: None,
+                },
+            )
+            .await;
+        }
     }
 }
 
@@ -1050,6 +1156,86 @@ mod tests {
         }
     }
 
+    /// A managed session two events long whose mode record says managed: what a handoff drafts
+    /// from.
+    fn managed_source() -> Session {
+        use nanus_domain::context::managed::{ContextModeRecord, ContextPolicy, ModeReason};
+        let mut session = Session::new(SessionId::new("source"), 1, "/work");
+        session.upgrade_to_managed_body();
+        session.append(SessionEvent::ContextMode {
+            payload: Box::new(ContextModeRecord {
+                policy: ContextPolicy::managed(),
+                actor: ModeActor::Human,
+                reason: ModeReason::Enable,
+                previous_revision: 0,
+            }),
+        });
+        session.append(SessionEvent::UserMessage {
+            text: "what was asked".to_owned(),
+            content_blocks: None,
+        });
+        session
+    }
+
+    /// Commits a handoff draft held under `d1` with base `base`, and returns the refusal's code.
+    fn commit_refusal(held: &Rc<Held>, store: &StoreHandle, base: ContextFrontier) -> String {
+        let registry = Rc::new(registry_for(store));
+        let drafts = super::super::maintenance::SharedDrafts::default();
+        let text = String::from("the document");
+        drafts.borrow_mut().hold_handoff(
+            "d1",
+            nanus_bundle::HandoffDraft {
+                document_blake3: Digest::of(text.as_bytes()),
+                text,
+                base,
+                source_session_id: String::from("source"),
+            },
+        );
+        let committed = nanus_kernel::runtime::block_on(super::super::maintenance::handoff_commit(
+            &registry, held, 1, &drafts, "d1",
+        ));
+        let Err(refusal) = committed else {
+            panic!("the commit is refused");
+        };
+        assert!(!held.busy.get(), "a refused commit gives the source back");
+        match *refusal {
+            Frame::Refused { code, .. } => code.expect("a coded refusal"),
+            other => panic!("a refusal: {other:?}"),
+        }
+    }
+
+    /// A handoff commit is never built on a quarantined source: it is refused before the base is
+    /// compared and before anything is written. A source that is not quarantined goes on to the
+    /// base check, which a moved base fails as stale.
+    #[test]
+    fn a_handoff_commit_from_a_quarantined_source_is_refused_before_anything_is_written() {
+        let source = managed_source();
+        let mut moved = frontier_of(&source);
+        moved.prefix_blake3 = Digest::of(b"another prefix");
+        let quarantined = fixture(&source);
+        let held = Rc::new(quarantined.held);
+        *held.managed.borrow_mut() = Some(Rc::new(quarantined.binding));
+        held.quarantine(String::from(QUARANTINED));
+        let code = commit_refusal(&held, &quarantined.handle, frontier_of(&source));
+        assert_eq!(code, "handoff_unavailable");
+        assert_eq!(
+            quarantined.store.commits.get(),
+            0,
+            "nothing was checkpointed"
+        );
+        assert_eq!(quarantined.store.saves.get(), 0, "nothing was saved");
+
+        let healthy = fixture(&source);
+        let held = Rc::new(healthy.held);
+        *held.managed.borrow_mut() = Some(Rc::new(healthy.binding));
+        let code = commit_refusal(&held, &healthy.handle, moved);
+        assert_eq!(
+            code, "stale_draft",
+            "an unquarantined source reaches the base check"
+        );
+        assert_eq!(healthy.store.commits.get(), 0);
+    }
+
     /// An acknowledged checkpoint covering the whole turn ends it with `Done`, moves the frontier,
     /// empties the backlog — and is not saved a second time, by either path.
     #[test]
@@ -1189,6 +1375,32 @@ mod tests {
                 "an unknown outcome is never overwritten"
             );
             assert_eq!(fixture.store.commits.get(), 0);
+        }
+    }
+
+    /// What a handoff commit does with a checkpoint whose outcome is unknown: the candidate is
+    /// reconciled against the disk the three ways a turn's is, and nothing is written again.
+    #[test]
+    fn an_uncertain_handoff_write_is_settled_against_the_disk_and_never_written_again() {
+        let (before, after) = sessions();
+        let installed = fixture(&before);
+        *installed.store.identity.borrow_mut() = stored(&after);
+        let durable = nanus_kernel::runtime::block_on(settle_uncertain(&installed.binding, &after));
+        assert!(matches!(durable, Settled::Durable(receipt)
+            if receipt.frontier.event_count == count(&after)));
+
+        let kept = fixture(&before);
+        let previous = nanus_kernel::runtime::block_on(settle_uncertain(&kept.binding, &after));
+        assert!(matches!(previous, Settled::Kept));
+
+        let lost = fixture(&before);
+        *lost.store.identity.borrow_mut() = ExpectedCheckpoint::Absent;
+        let neither = nanus_kernel::runtime::block_on(settle_uncertain(&lost.binding, &after));
+        assert!(matches!(neither, Settled::Quarantined(_)));
+
+        for fixture in [&installed, &kept, &lost] {
+            assert_eq!(fixture.store.saves.get(), 0, "nothing is saved over it");
+            assert_eq!(fixture.store.commits.get(), 0, "nothing is committed again");
         }
     }
 

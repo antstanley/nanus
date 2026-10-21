@@ -101,6 +101,21 @@ pub enum EntryKind {
     },
     /// A harness notice: a policy decision, a lifecycle event, a warning.
     Notice,
+    /// The document a session was started from by a handoff.
+    ///
+    /// Generated data: the model wrote it from the session it came from, and the harness drew it
+    /// beside its own label. It is never the human's words, so it is drawn as the harness, not as a
+    /// prompt, and it collapses like a long tool run.
+    Seed {
+        /// The session the document was drawn from.
+        source: String,
+    },
+    /// A compaction's cut: the divider a legacy session draws where everything before it left the
+    /// model's prompt, with the summary the model reads in its place beneath it.
+    Cut {
+        /// The event count the cut was made at, which is the marker's own sequence.
+        boundary: u64,
+    },
 }
 
 /// One rendered line of the conversation.
@@ -218,7 +233,10 @@ impl Entry {
         match &mut self.kind {
             EntryKind::ToolCall { call_id: slot, .. }
             | EntryKind::ToolResult { call_id: slot, .. } => *slot = Some(call_id),
-            EntryKind::Text | EntryKind::Notice => {}
+            EntryKind::Text
+            | EntryKind::Notice
+            | EntryKind::Seed { .. }
+            | EntryKind::Cut { .. } => {}
         }
         self.stamp = fresh_stamp();
         self
@@ -231,7 +249,10 @@ impl Entry {
             EntryKind::ToolCall { call_id, .. } | EntryKind::ToolResult { call_id, .. } => {
                 call_id.as_deref()
             }
-            EntryKind::Text | EntryKind::Notice => None,
+            EntryKind::Text
+            | EntryKind::Notice
+            | EntryKind::Seed { .. }
+            | EntryKind::Cut { .. } => None,
         }
     }
 
@@ -261,6 +282,34 @@ impl Entry {
         }
     }
 
+    /// Builds the seed block of a session a handoff started: the document, drawn as generated data.
+    #[must_use]
+    pub fn seed(source: impl Into<String>, document: impl Into<String>) -> Self {
+        Self {
+            role: Role::Harness,
+            kind: EntryKind::Seed {
+                source: source.into(),
+            },
+            text: document.into(),
+            streaming: false,
+            stamp: fresh_stamp(),
+            id: fresh_stamp(),
+        }
+    }
+
+    /// Builds the divider of a compaction, carrying the summary the model reads beneath it.
+    #[must_use]
+    pub fn cut(boundary: u64, summary: impl Into<String>) -> Self {
+        Self {
+            role: Role::Harness,
+            kind: EntryKind::Cut { boundary },
+            text: summary.into(),
+            streaming: false,
+            stamp: fresh_stamp(),
+            id: fresh_stamp(),
+        }
+    }
+
     /// Builds a harness notice.
     #[must_use]
     pub fn notice(text: impl Into<String>) -> Self {
@@ -279,7 +328,11 @@ impl Entry {
     pub fn text(&self) -> &str {
         match &self.kind {
             EntryKind::ToolResult { content, .. } => content,
-            EntryKind::Text | EntryKind::ToolCall { .. } | EntryKind::Notice => &self.text,
+            EntryKind::Text
+            | EntryKind::ToolCall { .. }
+            | EntryKind::Notice
+            | EntryKind::Seed { .. }
+            | EntryKind::Cut { .. } => &self.text,
         }
     }
 
@@ -369,7 +422,10 @@ impl Entry {
         let extra = match &self.kind {
             EntryKind::ToolCall { .. } => 3,
             EntryKind::ToolResult { .. } => 2,
-            EntryKind::Text | EntryKind::Notice => 1,
+            EntryKind::Text
+            | EntryKind::Notice
+            | EntryKind::Seed { .. }
+            | EntryKind::Cut { .. } => 1,
         };
         let total = lines.saturating_add(extra);
         u16::try_from(total).unwrap_or(u16::MAX)

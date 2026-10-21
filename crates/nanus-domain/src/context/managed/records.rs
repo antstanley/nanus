@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::{ArtifactId, Digest, ErrorCode, FragmentId, NoteId};
 use super::limits;
+use crate::context::model_text_is_admissible;
 
 /// Whether a session's requests are built by replaying the log or by the managed projection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -654,6 +655,31 @@ impl UsageObservation {
             raw_counters,
         }
     }
+
+    /// Reads a record written by [`UsageObservation::from_usage`] back into a neutral usage
+    /// record, or `None` for any other semantics.
+    ///
+    /// The neutral counters are kept whole in `raw_counters`, zeros included, so they are what is
+    /// read: a reasoning or cache count recorded as absent was a zero. A counter too large for the
+    /// neutral record saturates rather than wraps.
+    #[must_use]
+    pub fn to_usage(&self) -> Option<crate::Usage> {
+        if self.semantics_version != Self::NEUTRAL_SEMANTICS {
+            return None;
+        }
+        let counter = |name: &str| {
+            self.raw_counters
+                .get(name)
+                .map_or(0, |value| u32::try_from(*value).unwrap_or(u32::MAX))
+        };
+        Some(crate::Usage::new(
+            counter("prompt_tokens"),
+            counter("completion_tokens"),
+            counter("reasoning_tokens"),
+            counter("cache_hit_tokens"),
+            counter("cache_miss_tokens"),
+        ))
+    }
 }
 
 /// Whether an attempt record is the intent or the outcome.
@@ -680,6 +706,24 @@ pub enum AttemptOutcome {
     Refused,
     /// A crash left the intent with no outcome: it may or may not have been sent.
     UnknownDispatch,
+}
+
+/// What a maintenance request (handoff draft or compaction summary) is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceAttemptKind {
+    /// A handoff narrative, drafted before a session starts.
+    Handoff,
+}
+
+impl MaintenanceAttemptKind {
+    /// Returns the kind as it is written.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Handoff => "handoff",
+        }
+    }
 }
 
 /// Monotonic durations of one attempt, each absent when it was not measured.
@@ -724,6 +768,11 @@ pub struct RequestAttemptRecord {
     pub assistant_seq: Option<u64>,
     /// The management fragment the request carried, copied from its preparation.
     pub included_management_fragments: Vec<FragmentId>,
+    /// What the attempt is for, when it is a maintenance request rather than a turn step. Absent
+    /// for every turn step, and omitted when absent, so the attempt records written before this
+    /// field existed serialize byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MaintenanceAttemptKind>,
     /// Wall-clock start.
     pub started_at_ms: u64,
     /// Wall-clock finish.
@@ -764,12 +813,156 @@ impl RequestAttemptRecord {
     }
 }
 
+/// A `context/handoff` record: the old session's account of a handoff.
+///
+/// Written only when a handoff is human-confirmed and the new session has been created. The
+/// raw log is untouched; this is one record like any other.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffRecord {
+    /// The source frontier the handoff was made at (the draft's base).
+    pub source_frontier: ContextFrontier,
+    /// The new session the handoff seeded, so a reader can follow it.
+    pub new_session_id: String,
+    /// BLAKE3 of the handoff document that seeded the new session.
+    pub document_blake3: Digest,
+    /// Whether a human confirmed the handoff before it was written. Always true in a valid record:
+    /// a handoff nobody confirmed is not one this record may describe.
+    pub confirmed: bool,
+}
+
+impl HandoffRecord {
+    /// Checks the invariants the record states about itself.
+    ///
+    /// Whether a session's handoffs are distinct and move forward is a property of the sequence,
+    /// and is checked by the managed fold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::HandoffUnavailable`] for an unconfirmed or malformed record.
+    pub fn validate(&self) -> Result<(), ErrorCode> {
+        if !self.confirmed
+            || self.new_session_id.is_empty()
+            || self.new_session_id.len() > limits::REFERENCE_ID_BYTES_MAX
+            || self.source_frontier.session_id.is_empty()
+            || self.source_frontier.session_id.len() > limits::REFERENCE_ID_BYTES_MAX
+        {
+            return Err(ErrorCode::HandoffUnavailable);
+        }
+        Ok(())
+    }
+}
+
+/// The field names the deterministic header of a handoff document opens its lines with, in order.
+///
+/// The harness writes the header, one field per line, from facts the log holds; the model writes
+/// only the narrative after it. A narrative may not open a line with one of these names, so it
+/// cannot pass itself off as part of the header.
+pub const HANDOFF_HEADER_FIELDS: [&str; 7] = [
+    "source_session:",
+    "source_frontier:",
+    "goal:",
+    "context_mode:",
+    "model:",
+    "workspace:",
+    "date:",
+];
+
+/// Whether `text` opens a line with one of the handoff header's field names, after leading
+/// whitespace, in any case.
+///
+/// The line is read as a reader sees it ([`visible_opening`](crate::context::visible_opening)), so
+/// a zero-width joiner cannot slip a field name past the check.
+#[must_use]
+pub fn imitates_handoff_header(text: &str) -> bool {
+    text.split('\n').any(|line| {
+        let line = crate::context::visible_opening(line).to_ascii_lowercase();
+        HANDOFF_HEADER_FIELDS
+            .iter()
+            .any(|field| line.starts_with(field))
+    })
+}
+
+/// Splits a handoff document into its header and its narrative, or `None` when it is not one.
+///
+/// A document is exactly seven header lines, each opening with its field in
+/// [`HANDOFF_HEADER_FIELDS`] order, then a blank line, then the narrative.
+#[must_use]
+pub fn split_handoff_document(text: &str) -> Option<(&str, &str)> {
+    let (header, narrative) = text.split_once("\n\n")?;
+    let mut lines = header.split('\n');
+    for field in HANDOFF_HEADER_FIELDS {
+        if !lines.next()?.starts_with(field) {
+            return None;
+        }
+    }
+    if lines.next().is_some() {
+        return None;
+    }
+    Some((header, narrative))
+}
+
+/// Whether a handoff narrative may be stored: the text rule within its own bound, and no line that
+/// imitates the header.
+#[must_use]
+pub fn handoff_narrative_is_admissible(narrative: &str) -> bool {
+    model_text_is_admissible(narrative, limits::HANDOFF_NARRATIVE_BYTES_MAX)
+        && !imitates_handoff_header(narrative)
+}
+
+/// The seed of a new session, as a handoff carries it: the confirmed document text, the source
+/// session id, and the source frontier — nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffSeed {
+    /// The confirmed handoff document: the deterministic header plus the model narrative.
+    pub text: String,
+    /// BLAKE3 of `text`, so a reader can tell the seed is the document that was confirmed.
+    pub document_blake3: Digest,
+    /// The session the handoff came from.
+    pub source_session_id: String,
+    /// The source frontier the handoff was made at.
+    pub source_frontier: ContextFrontier,
+}
+
+impl HandoffSeed {
+    /// Checks the invariants the seed states about itself.
+    ///
+    /// The text passes the same [text rule](crate::context::model_text_is_admissible) as a
+    /// compaction summary, because it is model text the harness renders in its own system voice.
+    /// It is a document — the header, then the narrative — and the narrative is held to its own
+    /// bound and may not imitate a header line, on read as on write. The source frontier names the
+    /// source session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::HandoffUnavailable`] for an oversized, empty or malformed seed.
+    pub fn validate(&self) -> Result<(), ErrorCode> {
+        let narrative_ok = split_handoff_document(&self.text)
+            .is_some_and(|(_, narrative)| handoff_narrative_is_admissible(narrative));
+        if !narrative_ok
+            || !model_text_is_admissible(&self.text, limits::HANDOFF_DOCUMENT_BYTES_MAX)
+            || Digest::of(self.text.as_bytes()) != self.document_blake3
+            || self.source_frontier.session_id != self.source_session_id
+            || self.source_session_id.is_empty()
+            || self.source_session_id.len() > limits::REFERENCE_ID_BYTES_MAX
+            || self.source_frontier.session_id.is_empty()
+        {
+            return Err(ErrorCode::HandoffUnavailable);
+        }
+        Ok(())
+    }
+}
+
 /// Why a recovery record was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryReason {
     /// A checkpoint held an open turn, which is closed as interrupted.
     SettledOpenTurn,
+    /// A maintenance request's intent (a handoff draft) was left with no outcome, outside any turn,
+    /// and is closed as an unknown dispatch on its own rather than under the next turn.
+    SettledMaintenanceAttempt,
     /// An uncertain commit was reconciled against the disk.
     CommitReconciled,
 }
@@ -980,6 +1173,7 @@ mod tests {
             usage: None,
             assistant_seq: None,
             included_management_fragments: Vec::new(),
+            kind: None,
             started_at_ms: 0,
             finished_at_ms: None,
             timings_ms: None,

@@ -23,6 +23,31 @@ use crate::context::{CheckpointError, CheckpointView, ExpectedCheckpoint};
 /// A shared, key-addressable session store.
 pub type StoreHandle = std::rc::Rc<Box<dyn StorePort>>;
 
+/// The most characters a session name may hold.
+///
+/// Not a security boundary — a name is content, not a path — but a bound, because a name is
+/// typed by a person and printed in a listing.
+pub const SESSION_NAME_MAX_CHARS: usize = 128;
+
+/// Why `name` cannot be an alias for a session, or `None` when it can.
+///
+/// The one statement of the name rules, so a caller can refuse a name before it does work the
+/// name was for — a handoff checks its name before the model is asked — and a store refuses the
+/// same names when one is recorded: not empty or blank, at most [`SESSION_NAME_MAX_CHARS`]
+/// characters, and no control character.
+#[must_use]
+pub fn session_name_problem(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("it is empty")
+    } else if name.chars().count() > SESSION_NAME_MAX_CHARS {
+        Some("it is longer than 128 characters")
+    } else if name.chars().any(char::is_control) {
+        Some("it contains a control character")
+    } else {
+        None
+    }
+}
+
 /// The session store port.
 pub trait StorePort {
     /// Writes a session, replacing any stored copy.

@@ -95,6 +95,14 @@ fn revision() -> ProjectionRevision {
     }
 }
 
+/// A handoff's attempt: the one kind a maintenance request carries, which the schema names.
+fn handoff_attempt() -> RequestAttemptRecord {
+    RequestAttemptRecord {
+        kind: Some(MaintenanceAttemptKind::Handoff),
+        ..attempt()
+    }
+}
+
 fn attempt() -> RequestAttemptRecord {
     RequestAttemptRecord {
         attempt_id: "a".into(),
@@ -109,13 +117,47 @@ fn attempt() -> RequestAttemptRecord {
         usage: None,
         assistant_seq: None,
         included_management_fragments: Vec::new(),
+        kind: None,
         started_at_ms: 0,
         finished_at_ms: None,
         timings_ms: None,
     }
 }
 
+/// Every boundary payload's sample, for the checks below: the managed records and their parts.
 fn samples() -> Vec<(&'static str, Value)> {
+    let mut all = core_samples();
+    all.extend(handoff_samples());
+    all
+}
+
+/// The handoff records, which a session holds beside the managed records it opens with.
+fn handoff_samples() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "HandoffSeed",
+            serde_json::to_value(HandoffSeed {
+                text: "## Goal\n- ship".into(),
+                document_blake3: Digest::of(b"## Goal\n- ship"),
+                source_session_id: "old".into(),
+                source_frontier: frontier(),
+            })
+            .unwrap(),
+        ),
+        (
+            "HandoffRecord",
+            serde_json::to_value(HandoffRecord {
+                source_frontier: frontier(),
+                new_session_id: "next".into(),
+                document_blake3: digest(),
+                confirmed: true,
+            })
+            .unwrap(),
+        ),
+    ]
+}
+
+fn core_samples() -> Vec<(&'static str, Value)> {
     vec![
         (
             "ContextPolicy",
@@ -183,7 +225,7 @@ fn samples() -> Vec<(&'static str, Value)> {
         ),
         (
             "RequestAttemptRecord",
-            serde_json::to_value(attempt()).unwrap(),
+            serde_json::to_value(handoff_attempt()).unwrap(),
         ),
         (
             "AttemptTimings",
@@ -351,7 +393,7 @@ fn every_payload_has_exactly_the_properties_its_definition_lists() {
 }
 
 #[test]
-fn the_six_session_records_are_wrapped_as_the_event_union_says() {
+fn the_session_records_are_wrapped_as_the_event_union_says() {
     let schema = schema();
     let union: BTreeSet<String> = schema["$defs"]["ContextEvent"]["oneOf"]
         .as_array()
@@ -371,6 +413,22 @@ fn the_six_session_records_are_wrapped_as_the_event_union_says() {
         SessionEvent::RequestAttempt {
             payload: Box::new(attempt()),
         },
+        SessionEvent::ContextSeed {
+            payload: Box::new(HandoffSeed {
+                text: "seed".into(),
+                document_blake3: Digest::of(b"seed"),
+                source_session_id: "old".into(),
+                source_frontier: frontier(),
+            }),
+        },
+        SessionEvent::ContextHandoff {
+            payload: Box::new(HandoffRecord {
+                source_frontier: frontier(),
+                new_session_id: "next".into(),
+                document_blake3: digest(),
+                confirmed: true,
+            }),
+        },
         SessionEvent::ContextDecision {
             payload: Box::new(ContextDecision {
                 decision_id: "d".into(),
@@ -388,5 +446,17 @@ fn the_six_session_records_are_wrapped_as_the_event_union_says() {
         );
         assert!(union.contains(value["type"].as_str().unwrap()), "{value}");
     }
-    assert_eq!(union.len(), 6);
+    assert_eq!(union.len(), 8);
+}
+
+#[test]
+fn an_attempt_record_without_a_kind_serializes_without_the_key() {
+    let plain = serde_json::to_value(attempt()).unwrap();
+    assert!(
+        plain.get("kind").is_none(),
+        "an ordinary attempt keeps its bytes"
+    );
+    let mut handoff = attempt();
+    handoff.kind = Some(MaintenanceAttemptKind::Handoff);
+    assert_eq!(serde_json::to_value(handoff).unwrap()["kind"], "handoff");
 }

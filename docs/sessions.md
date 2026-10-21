@@ -40,12 +40,14 @@ separate file beside the log, and that is deliberate:
 - **A name is content, never a path.** It lives inside the session's own directory under a
   fixed file name, so no name can climb out of the store.
 
-A session is written at the lowest body version that holds it: version 4 when a user message
-carries typed content, version 3 when it has enabled [managed context](context-management.md), and
-version 2 otherwise, so an older build can still open what it can read faithfully. The two are
-independent: a version-4 header carries `"managed":true` when the session is managed, because the
-version no longer implies it, and no lower header may carry it. Readers — the store's listing as
-well as a load — accept versions 1 to 4; old
+A session is written at the lowest body version that holds it: version 5 when it carries a record
+of a maintenance request (a compaction marker, a handoff seed or back-link, or a request attempt
+with a `kind`), version 4 when a user message carries typed content, version 3 when it has enabled
+[managed context](context-management.md), and version 2 otherwise, so an older build can still open
+what it can read faithfully. Management is independent of the version: a version-4 or version-5
+header carries `"managed":true` when the session is managed, because the version no longer implies
+it, and no lower header may carry it. Readers — the store's listing as well as a load — accept
+versions 1 to 5; old
 text logs keep their sequence, usage and optional provenance without inferred pixels. Version 1
 cannot introduce typed content or signed replay via extra fields. Version 2 stores ordered image
 blocks inline beside display summaries, so resuming does not need the original image file. Signed
@@ -87,6 +89,39 @@ atomic replacement and bounds reads before parsing, leaving the existing log int
 save. The legacy infallible `to_jsonl` remains for trusted in-memory compatibility; hosts should
 use the fallible writer. CLI/link projections show summaries, never duplicate image blobs.
 The runner mutates memory; hosts own saving before success/Done acknowledgment.
+
+Version 5 holds everything version 4 does and says nothing new about management. It is written for
+the records a maintenance request leaves — `context/compact`, `context/seed`, `context/handoff`, and
+a `request/attempt` with a `kind`, which is what a handoff draft writes — because an older build
+does not know them and would fail part-way through the body (an attempt's strict parser refuses the
+unknown `kind`). A reader that predates version 5 therefore refuses the whole session at the header
+rather than reading it, and the listing shows it as unreadable, the same way it shows any version it
+cannot read. Those records, and an attempt's `kind`, are refused in a body below version 5, on read
+and on write. A session that never compacts or hands off keeps its bytes and its version.
+
+A compaction is a legacy-only record, and where its marker may sit is one rule, checked before a
+draft is paid for and again on every write and read (`CutState` in the session): no turn is open,
+the mode in force is not managed, and a turn completed since the previous marker. Bookkeeping after
+the last turn — a switch back to legacy, a goal change, a handoff's records — does not stop a cut,
+because it produces no message a cut could separate; a call that a closed, interrupted turn left
+unanswered does not stop one either, because no result can follow it. What is refused is a result
+after the marker that answers a call before it. The marker is one event with a boundary equal to its
+own sequence, the digest of the stored prefix the marker sits after, a summary bounded to 32 KiB and
+passing the text rule, a digest of that summary, the sequence of the marker it supersedes, the model
+that wrote the summary, and the usage the summary request cost. Every one of those is checked on
+write and again on read, so a log with a marker out of place is refused (`invalid_compact`) rather
+than folded, and a managed `context/mode` after a marker is refused as `compacted_session`. The raw
+log is never rewritten: everything before the marker stays on disk, and the prompt is folded from
+the marker on, with the summary leading.
+
+A managed session keeps the records it always had, plus two more. `context/seed` is the handoff
+document a new session opens with, and it is allowed only as the second event, directly after the
+`context/mode` record that opens the session. `context/handoff` is the back-link an old session
+records for each handoff it made, naming the session it seeded, with `confirmed: true`. A session
+may hand off more than once: each back-link names a new session, and their frontiers strictly
+increase. Both records are managed, so they are refused in a legacy body, and both are checked on
+write and on read — the seed's document included: its header, its narrative's 16 KiB bound and the
+rule against a narrative line that imitates a header field.
 
 A session that enables [managed context](context-management.md) is written as body version 3 — or
 4, marked managed, once it also holds typed user content — and also retains its context mode,
@@ -332,7 +367,10 @@ A session is the agent's; a client's view of it is a handful of frames.
 | `ContextDecision` | A context proposal accepted, rejected or cancelled, or an automatic fit. |
 | `Checkpoint` | A managed session's checkpoint was acknowledged: the durable frontier moved. It ends nothing. |
 | `Done`, `Failed` | How it ended. |
-| `Refused` | A request that is not a prompt — a model, provider, credential, or goal change — was not carried out. It ends no turn, which is why it is not `Failed`. |
+| `Refused` | A request that is not a prompt — a model, provider, credential, goal or context change, or a handoff or compaction draft or commit — was not carried out. It ends no turn, which is why it is not `Failed`. `message` is the bare sentence; the stable error code it was refused with travels in `code` when it has one (`compacted_session` on a context change, for instance), and a reader treats an absent code as "none". |
+| `HandoffDraft`, `CompactDraft` | The draft a request asked for, held on the agent under an id until it is committed or the connection lets go. Nothing has been written. `CompactDraft` also says the event count the cut would be made at; the field is defaulted, and `0` means unknown. |
+| `Seeded` | The document a session was started from, sent after `Backlog` on every attachment to such a session, and on the attachment a handoff commit makes. `name` is the name the session holds, absent when it holds none. `back_link_recorded` is read from the source session's log on every attachment — a `context/handoff` naming this session — and is false when the source does not record the handoff or cannot be read. |
+| `Compacted` | A compaction was committed: everything before `boundary_event_count` is out of the prompt, and `summary` is what the model reads in its place. Sent to every viewer. |
 
 Deliberately not a session log. A client that wants the conversation reads it from the
 store, where it is already durable, rather than receiving a second copy over a socket that
@@ -341,16 +379,50 @@ not yet have.
 
 Attachments identify an immutable durable event frontier. `Attached` and `Backlog` carry the same
 stream mark — the session's stream epoch, its frame watermark, and the frontier's event count and
-digest — taken in one step with the viewer's registration. A client replays the store only
-through that frontier, clipping a newer file to that prefix and refusing a shorter or mismatching
-one with a visible notice, then applies the backlog and the frames that follow. Checkpoint
-completion advances the frontier and retires only the backlog segments it covers, in the same
-step and before any new progress; existing viewers keep their visible stream, because a
-checkpoint does not send `Done` — the `Checkpoint` frame only moves their watermark. Context
-frames carry the session's own monotonically increasing frame id, so a duplicate or older one is
-ignored, and a frame from another stream epoch is refused. Context status and decisions have
-their own frames and stay distinguishable from assistant output and goal changes. The protocol
-is version 10; an older peer is refused before any request.
+digest — taken in one step with the viewer's registration. A client replays the store only through
+that frontier, clipping a newer file to that prefix and refusing a shorter or mismatching one with a
+visible notice, then applies the backlog and the frames that follow. Checkpoint completion advances
+the frontier and retires only the backlog segments it covers, in the same step and before any new
+progress; existing viewers keep their visible stream, because a checkpoint does not send `Done` —
+the `Checkpoint` frame only moves their watermark. Context frames carry the session's own
+monotonically increasing frame id, so a duplicate or older one is ignored, and a frame from another
+stream epoch is refused. Context status and decisions have their own frames and stay distinguishable
+from assistant output and goal changes. `Attached` and `Backlog` also carry the session's
+`compaction_boundary` when it has one, so a client that attaches after a cut can draw it. A client
+that reads the log sees the same cut in the marker itself, and the field exists for clients that
+have no store to read.
+
+The protocol is version 12; an older peer is refused before any request.
+
+The maintenance requests are `HandoffDraft`, `HandoffCommit`, `CompactDraft` and `CompactCommit`. A
+draft runs in a task of its own, as a turn does, so the connection keeps reading while the model is
+asked. The session is reserved before the request is answered, so an `Interrupt` from that
+connection stops the draft inside its model call — or before the model is asked, when it arrives
+first — and the draft is refused as `compact_unavailable` or `handoff_unavailable` with the session
+free for the next turn. Only the connection that asked can stop a draft; another viewer's
+`Interrupt` reaches a turn, never someone else's draft, and stopping a draft answers no approval. A
+draft is held by the connection that asked for it, under an id, and at most one draft of each kind
+is held per connection. A draft is discarded when the connection detaches, sends `New` or `Attach`,
+asks for a draft of the same kind, commits, or is moved by a handoff commit to the session it
+created; a draft that finishes after its connection let go of the session is dropped unsent. A
+commit naming an id the connection does not hold is refused as `stale_draft` and leaves the held
+draft in place. A commit made after the session moved is refused the same way. A compaction draft
+writes nothing, so it goes stale when anything is appended to the session after it — a turn, a goal
+or context change, another cut; a handoff draft writes its own attempt records, so two handoff
+drafts of one session invalidate each other. A maintenance request on a connection with no session
+is refused with `handoff_unavailable` or `compact_unavailable`, not `Failed`, because it ends no
+turn.
+
+A handoff's name is checked before the model is asked — one word, within the store's name rules
+(`nanus_ports::session_name_problem`, the rules the store applies when a name is recorded), and free
+— and checked again at the commit. A compaction commit is saved the way an idle change is: a legacy
+body through the store, and a body that still holds managed records, from a period when the session
+was managed, through its `SessionCheckpoint`, so the next checkpoint expects the file the cut left.
+A cut the store did not save is refused with `checkpoint_not_committed`, and the file is as it was;
+one whose outcome could not be established is refused with `checkpoint_unknown`, and the session is
+quarantined. A checkpoint whose outcome is unknown is only ever reconciled: while a handoff is
+drafted it quarantines the session, and during a commit the seeded session and the back-link are
+each read back from the disk.
 
 ## Known limits
 

@@ -1039,3 +1039,7 @@ mod tests {
 #[cfg(test)]
 #[path = "response_bounds_tests.rs"]
 mod response_bounds_tests;
+
+#[cfg(test)]
+#[path = "compaction_wire_tests.rs"]
+mod compaction_wire_tests;

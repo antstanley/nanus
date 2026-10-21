@@ -28,6 +28,10 @@ pub(crate) enum Modal {
     Authorization,
     Provider,
     Context,
+    /// A handoff or compaction draft, read before the human says `y` to commit it.
+    Preview,
+    /// The `/clear` warning, which names the conversation a clear would stop.
+    Clear,
     Models,
     Effort,
     Help,

@@ -77,6 +77,19 @@ pub enum BundleError {
         /// A bounded, content-free explanation.
         message: String,
     },
+
+    /// A legacy compaction refused, with its stable code.
+    ///
+    /// Its own variant rather than [`BundleError::Managed`], because compaction exists only for
+    /// a legacy session and a refusal that said "managed context" would describe the wrong mode.
+    /// It shares the closed code vocabulary, so a host acts on it the same way.
+    #[error("compaction refused ({code}): {message}")]
+    Compaction {
+        /// The stable code.
+        code: nanus_domain::context::managed::ErrorCode,
+        /// A bounded, content-free explanation.
+        message: String,
+    },
 }
 
 impl BundleError {
@@ -117,6 +130,17 @@ impl BundleError {
         }
     }
 
+    /// Builds a [`BundleError::Compaction`].
+    pub fn compaction(
+        code: nanus_domain::context::managed::ErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Compaction {
+            code,
+            message: message.into(),
+        }
+    }
+
     /// The managed-context code, for a managed refusal.
     #[must_use]
     pub const fn managed_code(&self) -> Option<nanus_domain::context::managed::ErrorCode> {
@@ -125,11 +149,73 @@ impl BundleError {
             _ => None,
         }
     }
+
+    /// The stable code of a refusal that has one: a managed refusal or a compaction's.
+    #[must_use]
+    pub const fn code(&self) -> Option<nanus_domain::context::managed::ErrorCode> {
+        match self {
+            Self::Managed { code, .. } | Self::Compaction { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The sentence a refusal says, without its code: what a client shows beside the code it is
+    /// sent separately. Every other error is its whole display.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Managed { message, .. } | Self::Compaction { message, .. } => message.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_coded_refusal_gives_its_code_and_a_bare_sentence_and_nothing_else_has_a_code() {
+        use nanus_domain::context::managed::ErrorCode;
+        let coded = [
+            (
+                BundleError::managed(ErrorCode::HandoffUnavailable, "the session is busy"),
+                ErrorCode::HandoffUnavailable,
+                "the session is busy",
+            ),
+            (
+                BundleError::compaction(ErrorCode::StaleDraft, "draft it again"),
+                ErrorCode::StaleDraft,
+                "draft it again",
+            ),
+        ];
+        for (error, code, sentence) in &coded {
+            assert_eq!(error.code(), Some(*code), "{error}");
+            assert_eq!(error.reason(), *sentence, "the sentence is bare");
+            assert!(
+                !error.reason().contains(code.as_str()),
+                "the sentence never repeats its code"
+            );
+            assert!(
+                error.to_string().contains(code.as_str()),
+                "the display names it"
+            );
+        }
+        assert_eq!(
+            coded[1].0.managed_code(),
+            None,
+            "a compaction is not a managed refusal"
+        );
+
+        let uncoded = [
+            BundleError::model("timeout"),
+            BundleError::config("bad model"),
+        ];
+        for error in &uncoded {
+            assert_eq!(error.code(), None);
+            assert_eq!(error.reason(), error.to_string(), "the whole display");
+        }
+    }
 
     #[test]
     fn a_missing_service_names_the_key() {

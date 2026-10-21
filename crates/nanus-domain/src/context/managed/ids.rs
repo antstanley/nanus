@@ -326,6 +326,18 @@ pub enum ErrorCode {
     Cancelled,
     /// A mutating proposal shared its batch with another call.
     MixedMutationBatch,
+    /// A compaction marker, or a summary, breaks an invariant the marker states.
+    InvalidCompact,
+    /// Compaction was asked of a session it cannot cut: managed, busy, recorded, or with nothing
+    /// after its marker.
+    CompactUnavailable,
+    /// Managed context was asked of a session that has a compaction marker.
+    CompactedSession,
+    /// A handoff was asked of a session it cannot seed from, or a handoff record or seed is
+    /// malformed.
+    HandoffUnavailable,
+    /// A commit's draft base moved, or its draft id is not the one held.
+    StaleDraft,
 }
 
 impl ErrorCode {
@@ -352,6 +364,11 @@ impl ErrorCode {
             Self::CaptureUnavailable => "capture_unavailable",
             Self::Cancelled => "cancelled",
             Self::MixedMutationBatch => "mixed_mutation_batch",
+            Self::InvalidCompact => "invalid_compact",
+            Self::CompactUnavailable => "compact_unavailable",
+            Self::CompactedSession => "compacted_session",
+            Self::HandoffUnavailable => "handoff_unavailable",
+            Self::StaleDraft => "stale_draft",
         }
     }
 }

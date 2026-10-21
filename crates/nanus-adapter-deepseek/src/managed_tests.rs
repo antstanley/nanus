@@ -512,3 +512,142 @@ const LEGACY_BODY: &str = concat!(
     r#"ion":"the read tool","name":"read","parameters":{"type":"object"}},"type":"funct"#,
     r#"ion"}]}"#,
 );
+
+/// A session a handoff started, on the managed wire: the seed is a leading system message after the
+/// notice on every request, the first included, and a session with no seed sends none.
+mod seeded {
+    use nanus_domain::context::managed::{
+        ContextFrontier, ContextModeRecord, ContextPolicy, HANDOFF_SEED_LABEL, HandoffSeed,
+        ModeActor, ModeReason,
+    };
+
+    use super::*;
+
+    /// The handoff document a seed carries: the harness header, a blank line, the narrative.
+    const DOCUMENT: &str = "source_session: old\nsource_frontier: events=9\ngoal: none\n\
+                            context_mode: managed\nmodel: m effort: none\nworkspace: /w\n\
+                            date: 2026-10-21\n\n## State\n- the parser is half done";
+
+    /// A session a handoff started: its mode record and seed, then `prompts`, with a tool call
+    /// after the first prompt when there is more than one.
+    fn seeded_session(prompts: &[&str]) -> Session {
+        let mut session = Session::new(SessionId::new("seeded-wire"), 0, "/w");
+        session.upgrade_to_managed_body();
+        session.append(SessionEvent::ContextMode {
+            payload: Box::new(ContextModeRecord {
+                policy: ContextPolicy::managed(),
+                actor: ModeActor::Human,
+                reason: ModeReason::Enable,
+                previous_revision: 0,
+            }),
+        });
+        session.append(SessionEvent::ContextSeed {
+            payload: Box::new(HandoffSeed {
+                text: DOCUMENT.into(),
+                document_blake3: Digest::of(DOCUMENT.as_bytes()),
+                source_session_id: "old".into(),
+                source_frontier: ContextFrontier {
+                    session_id: "old".into(),
+                    event_count: 9,
+                    prefix_blake3: Digest::of(b"prefix"),
+                    projection_revision: 0,
+                },
+            }),
+        });
+        for (index, prompt) in prompts.iter().enumerate() {
+            session.append(SessionEvent::UserMessage {
+                text: (*prompt).into(),
+                content_blocks: None,
+            });
+            if index == 0 && prompts.len() > 1 {
+                work(&mut session, "a", "seeded output a");
+            }
+        }
+        assert!(
+            session.try_to_jsonl().is_ok(),
+            "a session the store would write"
+        );
+        session
+    }
+
+    /// The request the runner composes for a seeded session: the system prompt, the notice, the
+    /// seed, then the conversation, with nothing hidden.
+    fn compiled_seeded(session: &Session) -> ChatRequest {
+        let derived = fragments::derive(session.log()).unwrap();
+        let protected = state::protected(session.log(), &derived);
+        let selection = Selection {
+            revision: 0,
+            hidden: &[],
+            notes: &[],
+            notes_goal_revision: None,
+        };
+        let facts = NoticeFacts {
+            input_allowance: 100_000,
+            ..NoticeFacts::default()
+        };
+        let effective =
+            derive_effective_context(session, &derived, &protected, selection, None, &facts)
+                .unwrap();
+        assert!(
+            effective.seed.is_some(),
+            "a seeded session carries its seed"
+        );
+        let mut messages = vec![Message::system("you are nanus"), effective.notice];
+        messages.extend(effective.seed);
+        messages.extend(effective.messages);
+        ChatRequest::new(MODEL_FLASH, messages)
+            .with_tools(vec![schema("read"), schema("context_manage")])
+            .with_max_tokens(4_096)
+    }
+
+    /// The roles and the leading messages of a prepared seeded request.
+    fn prepared(request: ChatRequest) -> (Vec<String>, Value, String) {
+        let prepared = prepare(&llm(), managed(request)).unwrap();
+        let body = prepared.body().to_owned();
+        let sent: Value = serde_json::from_str(&body).unwrap();
+        let roles = sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap().to_owned())
+            .collect();
+        (roles, sent["messages"].clone(), body)
+    }
+
+    #[test]
+    fn a_seeded_sessions_first_request_carries_the_seed_after_the_notice() {
+        let request = compiled_seeded(&seeded_session(&["continue the parser"]));
+        let (roles, messages, body) = prepared(request);
+        assert_eq!(roles, ["system", "system", "system", "user"]);
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[nanus context]")
+        );
+        let seed = messages[2]["content"].as_str().unwrap();
+        assert!(
+            seed.starts_with(HANDOFF_SEED_LABEL) && seed.ends_with(DOCUMENT),
+            "{seed}"
+        );
+        assert_eq!(messages[3]["content"], json!("continue the parser"));
+        assert!(!body.contains("[nanus working data"));
+    }
+
+    #[test]
+    fn a_seeded_sessions_later_request_still_leads_with_the_seed() {
+        let request = compiled_seeded(&seeded_session(&["first", "second"]));
+        let (roles, messages, _) = prepared(request);
+        assert_eq!(&roles[..4], ["system", "system", "system", "user"]);
+        assert!(messages[2]["content"].as_str().unwrap().ends_with(DOCUMENT));
+        assert_eq!(roles.last().map(String::as_str), Some("user"));
+    }
+
+    #[test]
+    fn a_managed_session_with_no_seed_sends_no_seed() {
+        let request = compiled(&session());
+        let (roles, _, body) = prepared(request);
+        assert_eq!(&roles[..3], ["system", "system", "user"]);
+        assert!(!body.contains(HANDOFF_SEED_LABEL));
+    }
+}

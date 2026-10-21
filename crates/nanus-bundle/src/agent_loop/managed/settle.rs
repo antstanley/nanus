@@ -278,6 +278,12 @@ impl AgentRunner {
             .checkpoint
             .ok_or_else(|| refusal(ErrorCode::UnsupportedMode))?;
         if policy.mode == ContextMode::Managed {
+            // A cut removed what managed selection keeps, so a compacted session cannot become
+            // managed. Refused here, before any write, from every entry point (the CLI's
+            // `--context-mode managed` and the link's context request both reach this).
+            if session.is_compacted() {
+                return Err(refusal(ErrorCode::CompactedSession));
+            }
             self.check_activation(policy, runtime)?;
         }
         let reason = match (current.mode, policy.mode) {

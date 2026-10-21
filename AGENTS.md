@@ -364,7 +364,9 @@ design docs too.
 - **The link's frame vocabulary is the interface's only view of a turn.** A new
   thing an interface must show is a new `Frame` variant, which means a change to
   `nanus-link` and to the server that produces it — not a new field smuggled
-  through an existing one.
+  through an existing one. A refusal's stable error code is `Frame::Refused.code`, never
+  a prefix of its message: the sentence and the code are separate fields, and an interface
+  reads the code rather than parsing the sentence.
 - **A Windows pipe peer is proven, not assumed.** A pipe name is global and computable, so both
   ends of the Windows link run the keyed-BLAKE3 handshake in `nanus-link/src/transport/guard.rs` before
   the first frame, keyed by a file the agent writes under the user's local app data *after* it
@@ -378,17 +380,20 @@ design docs too.
 - **A name is an alias for a store key, and one session has one name.** Naming is
   refused rather than moved when the name is held, and the alias lives in the
   session's own directory (`name`), so it cannot be lost with a shared table.
-- **A body is written at the lowest version that holds it; readers accept 1 to 4.** Version 4 when
-  a user message carries typed content, version 3 when managed context is enabled, version 2
-  otherwise, so an older build can still open what it can read faithfully. Managed and typed user
-  content are independent: version 3 implies managed, and a version-4 header says
-  `"managed":true` when it is. Anything that checks a header — the store's listing included —
-  asks `reads_session_version`, never "is it the newest". Typed tool blocks and signed Messages
-  replay are bounded. Version 1 cannot smuggle these fields; versions 1 to 3 cannot smuggle typed
-  user content.
-  Store saves use `try_to_jsonl`;
-  failed saves must leave the original intact. Image capability defaults Unknown until exact
-  profile wire/reload and live-follow-up evidence pass. Do not guess support from a model label.
+- **A body is written at the lowest version that holds it; readers accept 1 to 5.** Version 5 when a
+  body carries a record of a maintenance request — `context/compact`, `context/seed`,
+  `context/handoff`, or a `request/attempt` with a `kind` — version 4 when a user message carries
+  typed content, version 3 when managed context is enabled, version 2 otherwise, so an older build
+  can still open what it can read faithfully. A version-5 body is refused at the header by a build
+  that predates it, because that build would fail part-way through the body; those records, and an
+  attempt's `kind`, are refused in any body below version 5, on write and on read. Managed and typed
+  user content are independent: version 3 implies managed, and a version-4 or version-5 header says
+  `"managed":true` when it is. Anything that checks a header — the store's listing included — asks
+  `reads_session_version`, never "is it the newest". Typed tool blocks and signed Messages replay
+  are bounded. Version 1 cannot smuggle these fields; versions 1 to 3 cannot smuggle typed user
+  content. Store saves use `try_to_jsonl`; failed saves must leave the original intact. Image
+  capability defaults Unknown until exact profile wire/reload and live-follow-up evidence pass. Do
+  not guess support from a model label.
 - **For OpenAI, Automatic routing follows the model.** `gpt-5.6` and later (read from the id's version) go
   to the Responses API per request on the API plan; the `subscription` plan is Responses already and
   is sent no `max_output_tokens`, which that backend refuses. An image profile belongs to one exact
@@ -413,6 +418,12 @@ design docs too.
   reconciliation after `Unknown`). Every original user message survives managed selection;
   `context_manage`/`context_recall` go through host policy and admission with no goal-tool bypass;
   a proposal must be alone in its batch; the model never changes policy, capture or permissions.
+  A compacted session cannot become managed: managed selection keeps every user message, which a cut
+  removes, so enabling managed on a session with a `context/compact` marker is refused with
+  `compacted_session` at every entry point and by the session itself on write and read, and a marker
+  written under managed mode is refused on read. A session managed once and switched back to legacy
+  may be compacted; its body still holds managed records, so the cut is saved through its
+  `SessionCheckpoint`, never `StorePort::save`.
   See `docs/context-management.md` and its schema, which `context_schema.rs` checks.
 - **Deletion retires the id.** `delete` takes exclusive ownership and refuses a held session; a
   save, checkpoint, claim or name for a retired id is refused, so a stale writer cannot resurrect

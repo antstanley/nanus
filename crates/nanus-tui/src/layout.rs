@@ -60,6 +60,10 @@ pub(crate) enum Piece {
     /// The rest of an answer that is still streaming, from the byte offset: the part a token
     /// changes, with the cursor and the row that separates it from the next entry.
     StreamTail(usize),
+    /// A handoff's seed: the document a session was started from, drawn as generated data.
+    Seed,
+    /// A compaction's cut: the divider, with the summary beneath it.
+    Cut,
 }
 
 impl Piece {
@@ -73,6 +77,8 @@ impl Piece {
             | Self::CompactResult
             | Self::CompactThinking
             | Self::Whole
+            | Self::Seed
+            | Self::Cut
             | Self::StreamTail(_) => entry.stamp(),
         }
     }

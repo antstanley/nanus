@@ -313,6 +313,35 @@ labelled a read.
 - **What a result is.** Text inside a video, and the analysis model's answer, are untrusted data. The
   analysis is told so, and the result labels it as a model's reading of sampled stills.
 
+## Model-written text in the conversation
+
+Two session controls put text the model wrote into the conversation, and each handles it
+differently. Neither happens without a person confirming it. A third change, to how a turn is
+stopped, is recorded at the end of this section because it decides an approval.
+
+- **A compaction summary** is the model's own account of the conversation before a cut. It is sent
+  in the harness's system voice, on every later request, in place of what came before. Model text in
+  the harness's voice is the trade-off here, so it is labelled as a record of the conversation
+  rather than an instruction, it says where the original is not available to read back, and it
+  passes the text rule before it is stored: not empty or only whitespace, no control character but a
+  newline or a tab, no invisible formatting character (a zero-width space, a byte-order mark, a
+  bidirectional control) that could hide what a line says, and no line that opens with the harness's
+  own `[nanus` label, looked for through any zero-width joiner the text is allowed. Text that breaks
+  the rule is refused, never repaired.
+- **A handoff narrative** is written the same way, and it is refused for the same reasons. The whole
+  document is sent in the harness's system voice too: a leading system message on every request of
+  the new session, the first included, and still after a switch to legacy context, opened by a fixed
+  label that says a model wrote it from an earlier session and that it is generated data, not a user
+  instruction and not proof. It is never a user message, so it does not carry the human's authority.
+  A narrative line that imitates the document's own header is refused, so a narrative cannot pass
+  itself off as the harness's facts, and the narrative has a 16 KiB bound of its own. The text rule,
+  the header and that bound are checked when the seed is written and again whenever it is read, so a
+  seed edited on disk is refused rather than sent.
+
+**Interrupting a turn** that is waiting on an approval answers that approval as unavailable. The
+call is denied rather than left open for a later answer, which is the fail-closed reading: a stop
+the person asked for does not turn into an approval they never gave.
+
 ## Prompt injection
 
 A harness that reads files and fetches content will eventually read text written by

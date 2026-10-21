@@ -31,18 +31,20 @@ pub mod state;
 pub mod tooling;
 
 pub use compile::{
-    Effective, GoalProvenance, MANUAL_POLICY_V1, MEMORY_LABEL, NoticeFacts, Reminder, Selection,
-    derive_effective_context, manual_policy_digest,
+    Effective, GoalProvenance, HANDOFF_SEED_LABEL, MANUAL_POLICY_V1, MEMORY_LABEL, NoticeFacts,
+    Reminder, Selection, derive_effective_context, manual_policy_digest, seed_message,
 };
 pub use fragments::{Fragment, Fragments, MANAGE_TOOL, RECALL_TOOL};
 pub use ids::{ArtifactId, Digest, ErrorCode, FragmentId, Hasher, NoteId};
 pub use records::{
     ArtifactReceipt, AttemptOutcome, AttemptPhase, AttemptTimings, CaptureReason, CaptureStatus,
     CaptureStream, CheckpointReceipt, ContextDecision, ContextFrontier, ContextMode,
-    ContextModeRecord, ContextPolicy, DecisionOutcome, Durability, ModeActor, ModeReason,
-    NoteCategory, ProjectionRevision, RawEncoding, RecoveryReason, RecoveryRecord,
-    RequestAttemptRecord, RevisionAuthor, RevisionReason, SelectionIdentity, SnapshotProfile,
-    SourceField, SourceKind, SourceRef, UsageObservation, WorkingNote,
+    ContextModeRecord, ContextPolicy, DecisionOutcome, Durability, HANDOFF_HEADER_FIELDS,
+    HandoffRecord, HandoffSeed, MaintenanceAttemptKind, ModeActor, ModeReason, NoteCategory,
+    ProjectionRevision, RawEncoding, RecoveryReason, RecoveryRecord, RequestAttemptRecord,
+    RevisionAuthor, RevisionReason, SelectionIdentity, SnapshotProfile, SourceField, SourceKind,
+    SourceRef, UsageObservation, WorkingNote, handoff_narrative_is_admissible,
+    imitates_handoff_header, split_handoff_document,
 };
 pub use state::{ManagedState, RecoveryPlan};
 pub use tooling::{

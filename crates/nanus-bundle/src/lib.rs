@@ -117,7 +117,10 @@ pub mod tools;
 #[cfg(feature = "stock-compose")]
 mod video;
 
-pub use agent_loop::{AgentRunner, Approver, ManagedRun, Progress, RunOutcome, Silent, TurnHost};
+pub use agent_loop::{
+    AgentRunner, Approver, CompactionDraft, HandoffDraft, ManagedRun, Progress, RunOutcome, Silent,
+    TurnHost,
+};
 #[cfg(feature = "stock-compose")]
 pub use authorize::PendingAuth;
 pub use capture::CaptureBroker;

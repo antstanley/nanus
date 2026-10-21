@@ -255,6 +255,38 @@ pub struct StreamMark {
     pub stream_watermark: u64,
     /// What the store held at the barrier.
     pub frontier: FrontierInfo,
+    /// The event count of the session's active compaction marker, when one exists.
+    ///
+    /// For a client that has no store to read: it says where the cut is without the log. An
+    /// interface that replays the log draws its divider from the marker it finds there and need
+    /// not read this. Absent means no cut has been made, so the whole log is the conversation.
+    /// Defaulted and omitted on the wire when absent, so an attachment to a session that was never
+    /// compacted is byte-identical to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_boundary: Option<u64>,
+}
+
+/// What a maintenance request (a compaction or a handoff draft) cost, as the provider reported it.
+///
+/// Every counter is a count of tokens for that one request. A reader adds it to nothing: the log
+/// already has the same figures for the turn, and this is the cost of the draft alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct DraftUsage {
+    /// Tokens sent to the model.
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    /// Tokens the model generated, reasoning included.
+    #[serde(default)]
+    pub completion_tokens: u32,
+    /// The share of `completion_tokens` spent reasoning.
+    #[serde(default)]
+    pub reasoning_tokens: u32,
+    /// The share of `prompt_tokens` served from the provider's cache.
+    #[serde(default)]
+    pub cache_hit_tokens: u32,
+    /// The share of `prompt_tokens` that missed the cache.
+    #[serde(default)]
+    pub cache_miss_tokens: u32,
 }
 
 /// One frame of a running turn that the store does not hold yet, tagged with where it belongs.
@@ -433,6 +465,54 @@ pub enum Request {
         text: String,
     },
 
+    /// Draft a handoff from the managed session this connection is attached to.
+    ///
+    /// The agent reserves the session while the model writes the narrative, then answers with
+    /// [`Frame::HandoffDraft`] or [`Frame::Refused`]. Nothing is created yet: the draft is held
+    /// on the connection until [`Request::HandoffCommit`] or until it is discarded. `name` names
+    /// the new session when it is committed: one word, under the store's name rules, and free —
+    /// a name that breaks any of those is refused before any model call. The draft runs in its own
+    /// task, so [`Request::Interrupt`] from this connection stops it inside its model call; it is
+    /// then refused as `handoff_unavailable`. On a connection with no session, it is refused as
+    /// `handoff_unavailable` too.
+    HandoffDraft {
+        /// The name the new session will be recorded under, if any.
+        name: Option<String>,
+    },
+
+    /// Commit the handoff draft this connection holds, creating the new session.
+    ///
+    /// The commit runs in the order the change spec gives: the source is checked against the draft,
+    /// the new session is created and saved, the back-link is recorded in the source, and then this
+    /// connection is attached to the new session, which is sent [`Frame::Seeded`] after its
+    /// backlog. A mismatched or absent `draft_id` is refused as `stale_draft`, and the draft held
+    /// stays held.
+    HandoffCommit {
+        /// The id [`Frame::HandoffDraft`] named.
+        draft_id: String,
+    },
+
+    /// Draft a compaction of the legacy session this connection is attached to.
+    ///
+    /// Answered with [`Frame::CompactDraft`] or [`Frame::Refused`]. Writes nothing: the draft is
+    /// held on the connection until [`Request::CompactCommit`], or until it is discarded. The
+    /// draft runs in its own task, so [`Request::Interrupt`] from this connection stops it inside
+    /// its model call; it is then refused as `compact_unavailable`, as it is on a connection with
+    /// no session.
+    CompactDraft,
+
+    /// Commit the compaction draft this connection holds: the session is cut, saved, and every
+    /// viewer is sent [`Frame::Compacted`].
+    ///
+    /// A mismatched or absent `draft_id` is refused as `stale_draft`. A session that moved after
+    /// the draft is refused as `stale_draft` too, and the draft is discarded. A legacy body is
+    /// saved as it always is; a body that still holds managed records, from a period when the
+    /// session was managed, is saved through its checkpoint.
+    CompactCommit {
+        /// The id [`Frame::CompactDraft`] named.
+        draft_id: String,
+    },
+
     /// Stop the turn running in the session this connection is attached to.
     ///
     /// A *request* rather than a keystroke because the turn is not the client's: it runs
@@ -443,7 +523,9 @@ pub enum Request {
     /// Nothing is sent back. A turn that stops ends with the ending frame it always ends
     /// with, carrying [`TurnEnd::Interrupted`], and there is nothing an acknowledgement
     /// could add: a client that asked to stop a session which was not busy has asked for
-    /// something that is already true.
+    /// something that is already true. An approval the turn is waiting on is answered as
+    /// unavailable, so the wait ends with the turn; a maintenance draft that is running is
+    /// stopped too, and answers with its refusal.
     Interrupt,
 
     /// List the sessions the agent is holding open.
@@ -787,6 +869,84 @@ pub enum Frame {
         state: ApprovalState,
     },
 
+    /// A handoff draft is ready: the document the new session would open with, for the client to
+    /// show.
+    ///
+    /// The draft is held on the agent under `draft_id` until the client commits it or the
+    /// connection lets go. Nothing has been written to either session yet.
+    HandoffDraft {
+        /// The id a [`Request::HandoffCommit`] names.
+        draft_id: String,
+        /// The whole document: the deterministic header, then the model's narrative.
+        text: String,
+    },
+    /// A compaction draft is ready: the summary a cut would carry, for the client to show.
+    ///
+    /// Nothing has been written. The warning that earlier content leaves the model's reach is the
+    /// interface's to say; `dropped_turns` is non-zero when the request that wrote the summary
+    /// could not fit every turn, so the summary covers only the turns the model saw.
+    CompactDraft {
+        /// The id a [`Request::CompactCommit`] names.
+        draft_id: String,
+        /// The summary, which has passed the text rule.
+        text: String,
+        /// Whole turns the request left out, so the summary covers only what the model saw.
+        dropped_turns: u32,
+        /// What the summary request cost, when the provider reported it.
+        #[serde(default)]
+        usage: Option<DraftUsage>,
+        /// The event count the cut would be made at: the session's count when the draft was made,
+        /// which is the boundary the committed marker takes. Everything before it leaves the
+        /// model's prompt.
+        ///
+        /// `0` from an agent that predates the field, and never otherwise, because a cut needs a
+        /// completed turn before it: a reader shows a zero as an unknown count, not as a cut at
+        /// the start.
+        #[serde(default)]
+        boundary_event_count: u64,
+    },
+    /// This session was started from a handoff: its opening document.
+    ///
+    /// Sent after [`Frame::Backlog`] on every attachment to a session whose log opens with a
+    /// `context/seed`, so a reader always sees what it was started with, and on the attachment that
+    /// creates the session by [`Request::HandoffCommit`].
+    Seeded {
+        /// The seed's document, exactly as it was drafted and confirmed.
+        text: String,
+        /// The session the document came from.
+        source_session_id: String,
+        /// How many events the source held when the document was drawn, from its frontier.
+        source_event_count: u64,
+        /// The name the new session holds, when it holds one.
+        ///
+        /// `None` means the session is unnamed. A client that asked for a name and reads `None` (or
+        /// a different name) knows the session was created without it, which is what a naming
+        /// failure after the seed was saved looks like. Absent on the wire from an agent that
+        /// predates the field, and read as `None` there — which says nothing about whether the
+        /// session is named, so an interface that asked for a name should not treat an absent field
+        /// as a failure of that name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Whether the source session's log records this handoff.
+        ///
+        /// Read from the source's log — a `context/handoff` naming this session — whenever a
+        /// client attaches, so every attachment, from any agent, gets the same answer. `false`
+        /// when the source does not record it, which is what a back-link that could not be
+        /// written after the new session was saved leaves, and also when the source cannot be
+        /// read: the field claims only what was seen.
+        back_link_recorded: bool,
+    },
+    /// A compaction was committed: everything before `boundary_event_count` is out of the prompt.
+    ///
+    /// Sent live to every viewer of the session. A client attaching later sees the same boundary in
+    /// [`StreamMark::compaction_boundary`]. The pre-cut transcript stays on screen; the summary is
+    /// what the model now reads in its place.
+    Compacted {
+        /// The marker's boundary: the event count it cut at, which is its own sequence.
+        boundary_event_count: u64,
+        /// The summary the model now reads for everything before the boundary.
+        summary: String,
+    },
     /// Usage was reported for the request that just completed.
     ///
     /// Everything here describes *one* model request rather than the session: an
@@ -926,9 +1086,23 @@ pub enum Frame {
     /// `Failed` as the end of the turn in front of it: a refused model switch sent while a turn
     /// ran used to dismiss the turn's open approval and send the next queued prompt into a
     /// session that was still busy. A `Refused` is only a sentence to show.
+    ///
+    /// A refusal of a maintenance request (a handoff or a compaction, drafted or committed), and of
+    /// a context mode change the runner refused with a code (`compacted_session` for managed
+    /// context on a compacted session), carries that stable code in `code`, so an interface can
+    /// tell `stale_draft` from `compact_unavailable` without parsing the sentence. The sentence in
+    /// `message` never repeats the code.
     Refused {
-        /// The rendered reason, already user-facing.
+        /// The rendered reason, already user-facing. It does not repeat `code`.
         message: String,
+        /// The stable code the request was refused with, when it has one.
+        ///
+        /// Absent — read as `None` — from an agent that predates the field, and from every refusal
+        /// that has no code of its own. An interface that needs a code and finds none treats the
+        /// refusal as an ordinary sentence. Defaulted and omitted when absent, so the refusals that
+        /// carry no code keep their bytes, and `PROTOCOL_VERSION` does not move for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
 
     /// A reply to [`Request::Status`].
@@ -1060,7 +1234,14 @@ impl Frame {
 ///
 /// Version 11 adds explicit legacy/managed mode changes to [`ContextAction`]. An older agent
 /// cannot decode those requests, so it must be refused at the handshake rather than mid-session.
-pub const PROTOCOL_VERSION: u32 = 11;
+///
+/// Version 12 adds the handoff and compaction surface: [`Request::HandoffDraft`],
+/// [`Request::HandoffCommit`], [`Request::CompactDraft`] and [`Request::CompactCommit`], and the
+/// frames [`Frame::HandoffDraft`], [`Frame::CompactDraft`], [`Frame::Seeded`] and
+/// [`Frame::Compacted`]. An agent at 11 cannot parse those requests, so it is refused at the
+/// handshake. The attachment's stream mark also carries the compaction boundary, which an older
+/// client would discard without knowing it was there.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -1279,6 +1460,7 @@ mod tests {
             stream_epoch: "p1-t2-h3".to_owned(),
             stream_watermark: 41,
             frontier: frontier(),
+            compaction_boundary: None,
         }
     }
 
@@ -1995,6 +2177,7 @@ mod tests {
     fn a_refusal_round_trips_as_itself() {
         let frame = Frame::Refused {
             message: "no such model: x".to_owned(),
+            code: None,
         };
         let encoded = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
         let decoded = decode::<Frame>(&encoded).unwrap_or_else(|error| panic!("{error}"));
@@ -2021,10 +2204,254 @@ mod tests {
         assert!(!Frame::Step { step: 1 }.is_end_of_turn());
         assert!(
             !Frame::Refused {
-                message: String::new()
+                message: String::new(),
+                code: None,
             }
             .is_end_of_turn(),
             "a refused request ends no turn"
         );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    fn frontier() -> FrontierInfo {
+        FrontierInfo {
+            session_id: "s".to_owned(),
+            event_count: 9,
+            prefix_blake3: "ab".repeat(32),
+            projection_revision: 0,
+        }
+    }
+
+    /// Every maintenance request survives the wire, and each names the fields it carries.
+    #[test]
+    fn the_maintenance_requests_round_trip() {
+        let requests = [
+            Request::HandoffDraft { name: None },
+            Request::HandoffDraft {
+                name: Some("next".to_owned()),
+            },
+            Request::HandoffCommit {
+                draft_id: "d1".to_owned(),
+            },
+            Request::CompactDraft,
+            Request::CompactCommit {
+                draft_id: "d2".to_owned(),
+            },
+        ];
+        for request in requests {
+            let line = encode(&request).unwrap_or_else(|error| panic!("{error}"));
+            let decoded: Request = decode(&line).unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(decoded, request);
+        }
+        let commit = encode(&Request::HandoffCommit {
+            draft_id: "d1".to_owned(),
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(commit.contains(r#""request":"handoff_commit""#), "{commit}");
+    }
+
+    /// Every maintenance frame survives the wire, with its fields destructured so a new one is a
+    /// compile error here.
+    #[test]
+    fn the_maintenance_frames_round_trip_with_every_field() {
+        let frames = [
+            Frame::HandoffDraft {
+                draft_id: "d1".to_owned(),
+                text: "source_session: s\n\nthe narrative".to_owned(),
+            },
+            Frame::CompactDraft {
+                draft_id: "d2".to_owned(),
+                text: "the summary".to_owned(),
+                dropped_turns: 3,
+                usage: Some(DraftUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 20,
+                    reasoning_tokens: 4,
+                    cache_hit_tokens: 60,
+                    cache_miss_tokens: 40,
+                }),
+                boundary_event_count: 12,
+            },
+            Frame::Seeded {
+                text: "the seed".to_owned(),
+                source_session_id: "old".to_owned(),
+                source_event_count: 42,
+                name: Some("next".to_owned()),
+                back_link_recorded: false,
+            },
+            Frame::Compacted {
+                boundary_event_count: 17,
+                summary: "the summary".to_owned(),
+            },
+        ];
+        for frame in frames {
+            let line = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
+            let decoded: Frame = decode(&line).unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(decoded, frame);
+            match decoded {
+                Frame::HandoffDraft { draft_id, text } => {
+                    assert_eq!(draft_id, "d1");
+                    assert!(text.starts_with("source_session:"));
+                }
+                Frame::CompactDraft {
+                    draft_id,
+                    text,
+                    dropped_turns,
+                    usage,
+                    boundary_event_count,
+                } => {
+                    assert_eq!(
+                        (draft_id.as_str(), text.as_str(), dropped_turns),
+                        ("d2", "the summary", 3)
+                    );
+                    assert_eq!(boundary_event_count, 12);
+                    assert_eq!(usage.map(|usage| usage.cache_hit_tokens), Some(60));
+                }
+                Frame::Seeded {
+                    text,
+                    source_session_id,
+                    source_event_count,
+                    name,
+                    back_link_recorded,
+                } => {
+                    assert_eq!(text, "the seed");
+                    assert_eq!(source_session_id, "old");
+                    assert_eq!(source_event_count, 42);
+                    assert_eq!(name.as_deref(), Some("next"));
+                    assert!(
+                        !back_link_recorded,
+                        "a failed back-link is said, not assumed"
+                    );
+                }
+                Frame::Compacted {
+                    boundary_event_count,
+                    summary,
+                } => {
+                    assert_eq!(boundary_event_count, 17);
+                    assert_eq!(summary, "the summary");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A compaction draft with no usage and no cut count, from an agent that omits them, still
+    /// decodes: no usage, and a count of zero that a reader shows as unknown.
+    #[test]
+    fn a_compaction_draft_without_usage_decodes_as_no_usage() {
+        let line = r#"{"frame":"compact_draft","draft_id":"d1","text":"s","dropped_turns":0}"#;
+        let decoded: Frame = decode(line).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            decoded,
+            Frame::CompactDraft {
+                draft_id: "d1".to_owned(),
+                text: "s".to_owned(),
+                dropped_turns: 0,
+                usage: None,
+                boundary_event_count: 0,
+            }
+        );
+    }
+
+    /// An attachment with no cut is byte-identical to one from before the field existed, and a cut
+    /// is named on the wire.
+    #[test]
+    fn the_stream_mark_names_a_compaction_boundary_only_when_there_is_one() {
+        let uncut = StreamMark {
+            stream_epoch: "e".to_owned(),
+            stream_watermark: 1,
+            frontier: frontier(),
+            compaction_boundary: None,
+        };
+        let line = encode(&uncut).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!line.contains("compaction_boundary"), "{line}");
+        let decoded: StreamMark = decode(&line).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(decoded.compaction_boundary, None, "no cut reads as no cut");
+
+        let cut = StreamMark {
+            compaction_boundary: Some(8),
+            ..uncut
+        };
+        let line = encode(&cut).unwrap_or_else(|error| panic!("{error}"));
+        let decoded: StreamMark = decode(&line).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(decoded.compaction_boundary, Some(8));
+    }
+
+    /// A seed's name round-trips, and an unnamed session's seed carries no name key at all.
+    #[test]
+    fn a_seed_names_the_session_it_holds_and_an_unnamed_one_omits_the_key() {
+        let named = Frame::Seeded {
+            text: "t".to_owned(),
+            source_session_id: "old".to_owned(),
+            source_event_count: 1,
+            name: Some("next".to_owned()),
+            back_link_recorded: true,
+        };
+        let line = encode(&named).unwrap_or_else(|error| panic!("{error}"));
+        let decoded: Frame = decode(&line).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(decoded, named);
+
+        let unnamed = Frame::Seeded {
+            text: "t".to_owned(),
+            source_session_id: "old".to_owned(),
+            source_event_count: 1,
+            name: None,
+            back_link_recorded: true,
+        };
+        let line = encode(&unnamed).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!line.contains(r#""name""#), "{line}");
+        let old_agent = concat!(
+            r#"{"frame":"seeded","text":"t","source_session_id":"old","#,
+            r#""source_event_count":1,"back_link_recorded":true}"#
+        );
+        let decoded: Frame = decode(old_agent).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            decoded, unnamed,
+            "an agent without the field is read as unnamed"
+        );
+    }
+
+    /// A refusal carries its stable code in `code`, and the sentence in `message` does not repeat
+    /// it.
+    #[test]
+    fn a_coded_refusal_round_trips_its_code_beside_its_sentence() {
+        let frame = Frame::Refused {
+            message: "the session changed after this summary was drafted".to_owned(),
+            code: Some("stale_draft".to_owned()),
+        };
+        let line = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
+        assert!(line.contains(r#""code":"stale_draft""#), "{line}");
+        let decoded: Frame = decode(&line).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(decoded, frame);
+        let Frame::Refused { message, code } = decoded else {
+            panic!("a refusal")
+        };
+        assert_eq!(code.as_deref(), Some("stale_draft"));
+        assert!(
+            !message.contains("stale_draft"),
+            "the code is not repeated in the sentence"
+        );
+        assert!(!Frame::Refused { message, code }.is_end_of_turn());
+    }
+
+    /// A refusal with no code, from an agent that predates the field or a refusal that has none,
+    /// decodes to `None`, and encodes without the key so its bytes are unchanged.
+    #[test]
+    fn a_refusal_without_a_code_decodes_as_no_code_and_keeps_its_bytes() {
+        let uncoded = r#"{"frame":"refused","message":"no model is selected"}"#;
+        let decoded: Frame = decode(uncoded).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            decoded,
+            Frame::Refused {
+                message: "no model is selected".to_owned(),
+                code: None,
+            }
+        );
+        let encoded = encode(&decoded).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(encoded, uncoded, "no code, no key");
     }
 }

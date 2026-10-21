@@ -126,6 +126,25 @@ pub const DECISION_ID_MAX: usize = 96;
 /// record that does not fit.
 pub const CLOSING_RESERVE_BYTES: usize = 96 * 1024;
 
+/// Encoded bytes of one handoff document: the deterministic header plus the model narrative.
+pub const HANDOFF_DOCUMENT_BYTES_MAX: usize = 32 * 1024;
+
+/// Encoded bytes of a handoff's model-written narrative alone.
+pub const HANDOFF_NARRATIVE_BYTES_MAX: usize = 16 * 1024;
+
+/// Bytes of an id the harness stores as a reference: a session id, a model id, a handoff's new
+/// session id. Host-generated or model-named, and bounded either way so a record stays small.
+pub const REFERENCE_ID_BYTES_MAX: usize = 256;
+
+/// Drafts a connection may hold of each kind: one handoff draft, one compaction draft.
+///
+/// Drafts are the server's, keyed by connection and dropped on detach, replacement or commit,
+/// so a client cannot pile up model calls it never previews.
+pub const HANDOFF_DRAFTS_PER_CONNECTION: usize = 1;
+
+/// See [`HANDOFF_DRAFTS_PER_CONNECTION`].
+pub const COMPACT_DRAFTS_PER_CONNECTION: usize = 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;

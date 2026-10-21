@@ -71,6 +71,8 @@ pub enum CheckpointReason {
     Recovery,
     /// A person reset the session's context.
     Reset,
+    /// A handoff: the new session's opening records, or the old session's back-link to it.
+    Handoff,
 }
 
 /// A host-created proof that an archived object is finalized, immutable and quiescent.

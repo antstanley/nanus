@@ -173,6 +173,29 @@ fn apply(
             }
         }
         SessionEvent::StepEnd { .. } => {}
+        // A handoff's seed is the document the session opened with: drawn as generated data, where
+        // the session's history begins.
+        SessionEvent::ContextSeed { payload } => {
+            transcript.push(Entry::seed(
+                payload.source_session_id.clone(),
+                payload.text.clone(),
+            ));
+        }
+        // A compaction's cut is the divider: everything above it is out of the model's prompt from
+        // here on, and the summary the model reads in its place is drawn beneath it.
+        SessionEvent::ContextCompact { payload } => {
+            transcript.push(Entry::cut(
+                payload.boundary_event_count,
+                payload.summary.clone(),
+            ));
+        }
+        // The old session records where it handed off to, so a reader of it can follow the handoff.
+        SessionEvent::ContextHandoff { payload } => {
+            transcript.push(Entry::notice(format!(
+                "handed off to session {}",
+                payload.new_session_id
+            )));
+        }
         // A goal change is state rather than a message, but a reader browsing a recording should
         // still see it: this is the same line the live interface writes when the change arrives,
         // so the transcript reads the same whether it was watched or re-read. A clear is a record

@@ -169,6 +169,19 @@ the system prompt, because a ceiling nobody mentioned is not one it can pace aga
 the ending carries the reason it stopped, because a turn cut off at the budget used to
 reach the interface looking exactly like one that had finished.
 
+Maintenance requests are the other places a model call is made for a person. A handoff draft and a
+compaction draft each make one call that writes a summary, and the person reads that summary before
+anything changes. The call is spent before anyone sees its result: a draft that is cancelled, or
+refused for asking for a tool or for stopping at the output ceiling, has still been paid for. A
+handoff's draft is recorded as attempt records, and the session's totals count its finished
+attempt's usage under the model that wrote it — a draft has no assistant message to carry its cost,
+while a turn step's attempt is not counted, because its assistant message already is. A compaction's
+draft writes nothing, so its usage travels in the draft and reaches the session only when the cut is
+committed; a cancelled compaction draft's spend is reported in its preview and nowhere else. Neither
+counts against a turn's step budget, because neither is a step of a turn, so the bound on a turn
+does not bound these. Each one is one call per request a person makes, and the summary is shown to
+the person, and nothing is written from it until they confirm it.
+
 Managed requests use the selected adapter's own preparation of the exact body, with an explicit
 output reservation, to decide what fits. Original user messages and protected recent work survive
 fitting; completed assistant/tool fragments can be hidden, with the omission recorded and

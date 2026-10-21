@@ -92,7 +92,7 @@ impl AgentRunner {
         let (fitted_request, elision) = self.build_request(session)?;
         let mut request = fitted_request.clone();
         request.messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
-        request.messages.extend(session.derive_messages());
+        request.messages.extend(session.derive_prompt_messages());
         let llm = self.llm();
         let estimate = |request: &ChatRequest| llm.estimate_request(request);
         let projection = StepRecordProjection {

@@ -888,6 +888,11 @@
               "type": "null"
             }
           ]
+        },
+        "kind": {
+          "enum": [
+            "handoff"
+          ]
         }
       }
     },
@@ -921,6 +926,7 @@
         "reason": {
           "enum": [
             "settled_open_turn",
+            "settled_maintenance_attempt",
             "commit_reconciled"
           ]
         }
@@ -1472,6 +1478,38 @@
               "$ref": "#/$defs/RecoveryRecord"
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "context/seed"
+            },
+            "payload": {
+              "$ref": "#/$defs/HandoffSeed"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "context/handoff"
+            },
+            "payload": {
+              "$ref": "#/$defs/HandoffRecord"
+            }
+          }
         }
       ]
     },
@@ -1860,6 +1898,60 @@
           }
         }
       ]
+    },
+    "HandoffSeed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "document_blake3",
+        "source_session_id",
+        "source_frontier"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 32768,
+          "minLength": 1
+        },
+        "document_blake3": {
+          "$ref": "#/$defs/Digest"
+        },
+        "source_session_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "source_frontier": {
+          "$ref": "#/$defs/ContextFrontier"
+        }
+      }
+    },
+    "HandoffRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_frontier",
+        "new_session_id",
+        "document_blake3",
+        "confirmed"
+      ],
+      "properties": {
+        "source_frontier": {
+          "$ref": "#/$defs/ContextFrontier"
+        },
+        "new_session_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "document_blake3": {
+          "$ref": "#/$defs/Digest"
+        },
+        "confirmed": {
+          "const": true
+        }
+      }
     }
   },
   "$id": "https://github.com/antstanley/nanus/docs/context-management.schema.json"

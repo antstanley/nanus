@@ -86,6 +86,18 @@ pub(crate) const KEYS: &[(&str, &str)] = &[
         "/context status",
         "read context mode, readiness and selection counts",
     ),
+    (
+        "/clear",
+        "stop this conversation and start a new one, after a y; the old one is kept",
+    ),
+    (
+        "/handoff [name]",
+        "draft a handoff from a managed session into a new one, after a y",
+    ),
+    (
+        "/compact",
+        "summarise a legacy conversation and cut the prompt to the summary, after a y",
+    ),
     ("/copy", "put the newest answer on the clipboard"),
     ("?", "show this list, when the prompt is empty"),
     ("", "while an approval dialog is up"),

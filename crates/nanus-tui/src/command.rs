@@ -19,11 +19,13 @@ pub enum Command {
     /// The same overlay `?` opens, so a reader who reaches for a command rather than a key
     /// gets the same list rather than a second one that says almost the same thing.
     Help,
-    /// Empty the transcript.
+    /// Leave the conversation and start a new one, after a warning the reader confirms.
     ///
-    /// The keys and the draft survive, because this is about the conversation on screen and
-    /// not about what is being typed: the panel is a view, and the session it views is
-    /// untouched.
+    /// On a live session it stops the old session (interrupting a running turn first), keeps
+    /// its log so it can be resumed by id, and attaches a new, empty one. On a recording there
+    /// is no session to stop, so it only empties the transcript, as `Ctrl+L` does live. Either
+    /// way the draft and the toggles survive: this is about the conversation, not about what is
+    /// being typed.
     Clear,
     /// Switch the model: open the selector when no id is given, and switch to the named one when
     /// it is.
@@ -60,6 +62,17 @@ pub enum Command {
     /// `managed` and `reset` actions open an impact warning before anything changes. The agent
     /// persists confirmed changes and refuses them while a turn is running.
     Context,
+    /// Write a handoff from a managed session into a new one, optionally named.
+    ///
+    /// The optional word after it is the new session's name. The interface asks the agent for a
+    /// draft, shows it, and commits only on an explicit `y`; nothing is created until then.
+    Handoff,
+    /// Summarise the legacy conversation and cut the prompt down to the summary.
+    ///
+    /// The interface asks the agent for a draft, shows the summary and what it leaves out, and
+    /// commits only on an explicit `y`. Nothing before the cut is deleted, and the model cannot
+    /// read it back.
+    Compact,
     /// Put the newest answer on the clipboard.
     ///
     /// A command as well as a key, because the commonest thing a reader wants out of a transcript is
@@ -89,6 +102,8 @@ impl Command {
         (Self::Provider, &["/provider"]),
         (Self::Goal, &["/goal"]),
         (Self::Context, &["/context"]),
+        (Self::Handoff, &["/handoff"]),
+        (Self::Compact, &["/compact"]),
         (Self::Copy, &["/copy"]),
     ];
 
@@ -343,6 +358,8 @@ mod tests {
             Command::Provider,
             Command::Goal,
             Command::Context,
+            Command::Handoff,
+            Command::Compact,
             Command::Copy,
         ];
         for command in every {
@@ -377,6 +394,8 @@ mod tests {
                 "/provider",
                 "/goal",
                 "/context",
+                "/handoff",
+                "/compact",
                 "/copy"
             ]
         );
@@ -401,8 +420,8 @@ mod tests {
         // joining, and this is about what a reader who mistypes a command actually sees.
         assert_eq!(
             Command::names_sentence(),
-            "/exit, /quit, /stats, /help, /clear, /model, /effort, /provider, /goal, /context and \
-             /copy"
+            "/exit, /quit, /stats, /help, /clear, /model, /effort, /provider, /goal, /context, \
+             /handoff, /compact and /copy"
         );
     }
 
