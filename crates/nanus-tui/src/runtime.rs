@@ -1686,6 +1686,12 @@ async fn event_loop(
                 drain_received(&mut frames, source, &mut view);
             }
         }
+        // A switch that failed left the connection following nothing, so the interface leaves
+        // with the reason as its error: the terminal is restored by the guard, no summary is
+        // printed for a conversation the reader is no longer in, and the process exits non-zero.
+        if let Some(reason) = view.ended.take() {
+            return Err(io::Error::other(reason));
+        }
         // A turn ends with a frame and never with a keystroke, so this is the only place
         // the agent can become ready for the next prompt. Checked after every wake-up
         // rather than only after an ending, because it is a no-op unless a turn just
@@ -4054,11 +4060,19 @@ fn apply_from(frame: Frame, view: &mut ViewState, arrival: Arrival) {
 /// answer — the switch was asked for when nothing was running — so only an idle one ends it.
 ///
 /// The agent lets go of the conversation a connection was following before it opens the next one,
-/// so a switch that failed leaves the connection following nothing. The notice says so and names
-/// how to get back, rather than implying the old conversation is still on the other end.
+/// so a switch that failed leaves the connection following nothing. That is the end of this
+/// interface rather than a state to sit in: the view records why in [`ViewState::ended`], with
+/// the agent's reason and how to get back, and the event loop leaves with it as its error, so the
+/// process exits non-zero and says so on stderr. The agent itself keeps serving: the failure is
+/// this connection's, and the other sessions it holds have turns of their own.
 fn apply_failed(message: String, view: &mut ViewState) {
     let switch_failed = view.switch.is_some() && !view.busy;
-    let lost = view.switch.as_ref().map(switch_failure_notice);
+    if switch_failed {
+        view.ended = view
+            .switch
+            .as_ref()
+            .map(|switch| format!("{message}; {}", switch_failure_notice(switch)));
+    }
     view.drafting = false;
     view.context_asked = false;
     view.context_change_asked = None;
@@ -4070,9 +4084,6 @@ fn apply_failed(message: String, view: &mut ViewState) {
     view.transcript.push(Entry::notice(message));
     if switch_failed {
         view.switch = None;
-        if let Some(notice) = lost {
-            view.transcript.push(Entry::notice(notice));
-        }
     }
     closed(view);
     if switch_failed {
@@ -4080,7 +4091,8 @@ fn apply_failed(message: String, view: &mut ViewState) {
     }
 }
 
-/// What a reader is told when the agent could not attach the conversation a switch asked for.
+/// What a reader is told, on the way out, when the agent could not attach the conversation a
+/// switch asked for.
 fn switch_failure_notice(switch: &crate::maintenance::Switch) -> String {
     match switch {
         crate::maintenance::Switch::Clear { old_id, .. } => format!(
@@ -4088,8 +4100,8 @@ fn switch_failure_notice(switch: &crate::maintenance::Switch) -> String {
              {old_id}; open it again with `nanus tui --resume {old_id}`"
         ),
         crate::maintenance::Switch::Handoff { .. } => String::from(
-            "the handed-off session was created but could not be attached; `nanus sessions` \
-             lists it",
+            "the handed-off session was created but could not be attached, and this connection \
+             follows nothing; `nanus sessions` lists it",
         ),
     }
 }
@@ -10847,14 +10859,14 @@ mod tests {
         assert!(kept.has_queued(), "a draft alone discards nothing");
     }
 
-    /// An agent that cannot open the new conversation answers `New` with a failure: the switch is
-    /// over, the reader is told, and the queue moves again.
+    /// An agent that cannot open the new conversation answers `New` with a failure, and the
+    /// connection then follows nothing: the interface is told to end, with the agent's reason and
+    /// how to get back to the conversation it left.
     #[test]
-    fn a_failed_new_conversation_ends_the_switch_and_the_queue_moves_again() {
+    fn a_failed_new_conversation_ends_the_interface_with_the_reason_and_the_way_back() {
         let mut source = Scripted::new(Vec::new());
         let mut view = attached_view("e1", 0);
         ask_clear(String::from("s-old"), None, &mut source, &mut view);
-        send_or_queue(String::from("waiting"), &mut source, &mut view);
         apply(
             Frame::Failed {
                 message: String::from("the store could not open a session"),
@@ -10862,28 +10874,50 @@ mod tests {
             &mut view,
         );
         assert!(view.switch.is_none(), "the switch is over");
+        let ended = view.ended.clone().unwrap_or_default();
         assert!(
-            shown(&view).iter().any(|text| {
-                text.contains("new conversation was not started")
-                    && text.contains("no longer follows s-old")
-                    && text.contains("--resume s-old")
-            }),
-            "the notice says the old conversation was let go and how to get back: {:?}",
-            shown(&view)
+            ended.contains("the store could not open a session")
+                && ended.contains("no longer follows s-old")
+                && ended.contains("--resume s-old"),
+            "the interface ends with the agent's reason and the way back: {ended:?}"
         );
         assert!(
-            !shown(&view)
-                .iter()
-                .any(|text| text.contains("stays attached")),
+            !ended.contains("stays attached"),
             "nothing claims the old conversation is still attached"
         );
-        flush_queue(&mut source, &mut view);
-        assert_eq!(
-            source.requests.borrow().last(),
-            Some(&Request::Prompt {
-                text: String::from("waiting")
-            })
+    }
+
+    /// A handoff whose new session could not be attached ends the interface too, and points at
+    /// the listing where the created session can be found.
+    #[test]
+    fn a_handoff_that_could_not_be_attached_ends_the_interface() {
+        let mut view = attached_view("e1", 0);
+        view.switch = Some(crate::maintenance::Switch::Handoff { name: None });
+        apply(
+            Frame::Failed {
+                message: String::from("this connection has fallen too far behind"),
+            },
+            &mut view,
         );
+        let ended = view.ended.clone().unwrap_or_default();
+        assert!(
+            ended.contains("fallen too far behind") && ended.contains("nanus sessions"),
+            "{ended:?}"
+        );
+    }
+
+    /// A failure with no switch pending is an ordinary refusal or a turn's ending, and the
+    /// interface carries on.
+    #[test]
+    fn a_failure_with_no_switch_pending_does_not_end_the_interface() {
+        let mut view = attached_view("e1", 0);
+        apply(
+            Frame::Failed {
+                message: String::from("the model failed"),
+            },
+            &mut view,
+        );
+        assert!(view.ended.is_none());
     }
 
     /// A failure that ends a turn on screen is that turn's, not the switch's answer: the switch
@@ -10904,9 +10938,8 @@ mod tests {
         );
         assert!(view.switch.is_some());
         assert!(
-            !shown(&view)
-                .iter()
-                .any(|text| text.contains("new conversation was not started")),
+            view.ended.is_none(),
+            "a turn's failure does not end the interface"
         );
     }
 

@@ -606,9 +606,14 @@ What belongs to a session follows the attachment, not the screen: the title beco
 session's name (or its short id), the token count, goal and context lines are emptied, and the
 context mode is the new session's — managed after a handoff, and after a clear the agent's own
 answer, which the interface asks for at once and shows as a context-status notice. If the agent
-cannot start the new conversation, a notice says so. The agent let go of the old conversation before
-it tried, so the connection now follows none, and the notice names the old id and the
-`nanus tui --resume` that opens it again. A prompt typed while a draft is being made or a new
+cannot start the new conversation, or cannot attach the session a handoff created, the interface
+exits non-zero. The agent let go of the old conversation before it tried, so the connection follows
+none, and a screen that talks to nothing is not a state to leave a reader in. The error on stderr
+gives the agent's reason, the old id, and the `nanus tui --resume` that opens it again (for a
+handoff, `nanus sessions` lists the created session). For a clear this is rare: with no name to
+refuse, `New` fails only when the store cannot claim the new session or the connection has fallen
+too far behind. The agent keeps running, because its other sessions' turns are not this
+connection's to end. A prompt typed while a draft is being made or a new
 conversation is being attached is queued rather than sent, because the session is reserved by the
 draft, and a prompt sent into the conversation being left would be stopped or dropped. `/clear`,
 `/handoff` and `/compact` are each refused with a notice while another of them is under way.

@@ -349,6 +349,10 @@ pub struct ViewState {
     pub attached_id: Option<String>,
     /// The conversation switch a request asked for, which the attachment that follows completes.
     pub switch: Option<crate::maintenance::Switch>,
+    /// Why the interface has to end: a switch failed, and the agent had already let go of the
+    /// conversation the connection was following, so the connection follows nothing. The event loop
+    /// leaves with this as its error rather than keep a screen that no longer talks to anything.
+    pub ended: Option<String>,
     /// The name a handoff draft asked for, carried from the request to the draft's preview.
     pub handoff_name: Option<String>,
     /// The context decisions already in the transcript, by id and outcome.
@@ -748,6 +752,7 @@ impl Default for ViewState {
             drafting: false,
             attached_id: None,
             switch: None,
+            ended: None,
             handoff_name: None,
             decisions_shown: std::collections::BTreeSet::new(),
             step: 0,

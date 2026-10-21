@@ -939,7 +939,9 @@ it (crate and file in brackets).
     `a_prompt_typed_while_a_draft_runs_waits_until_the_draft_is_over`,
     `a_prompt_typed_while_a_switch_is_pending_is_sent_after_the_attachment`,
     `a_committed_handoff_discards_the_prompts_queued_for_the_old_conversation`,
-    `a_failed_new_conversation_ends_the_switch_and_the_queue_moves_again`,
+    `a_failed_new_conversation_ends_the_interface_with_the_reason_and_the_way_back`,
+    `a_handoff_that_could_not_be_attached_ends_the_interface`,
+    `a_failure_with_no_switch_pending_does_not_end_the_interface`,
     `a_turns_failure_during_a_switch_leaves_the_switch_pending`,
     `a_session_control_waits_for_a_pending_draft_or_switch`,
     `a_stray_attachment_changes_neither_the_view_nor_the_source`,
@@ -1030,6 +1032,11 @@ and no summary has been judged for quality.
   The seed is now kept as the legacy prompt's leading system message, until a cut supersedes it.
 - **Interrupt ownership.** A draft is stopped only by the connection that asked for it, which is
   what "from that connection" in the Flow meant; a turn is still stopped by any viewer.
-- **A failed `New`.** The agent releases the old conversation before it opens the next one, so a
-  clear whose `New` fails leaves the connection following none. The interface says so rather than
-  keeping the old one attached, which would need the agent to open before it releases.
+- **A failed switch ends the interface.** The agent releases the old conversation before it opens
+  the next one, so a clear whose `New` fails, or a handoff whose new session cannot be attached,
+  leaves the connection following none. For a clear, `New` carries no name, so it fails only when
+  the store cannot claim the new session (an I/O fault) or the connection has fallen too far
+  behind. The interface then exits non-zero, printing the agent's reason on stderr with the old
+  session's id and `nanus tui --resume <id>` (or, for a handoff, `nanus sessions`). The agent is
+  not stopped: the failure is this connection's, and stopping the agent would end every other
+  session's running turn unrecorded. A turn's own failure while a switch waits does not end it.
