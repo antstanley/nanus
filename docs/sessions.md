@@ -47,12 +47,16 @@ with a `kind`), version 4 when a user message carries typed content, version 3 w
 what it can read faithfully. Management is independent of the version: a version-4 or version-5
 header carries `"managed":true` when the session is managed, because the version no longer implies
 it, and no lower header may carry it. Readers — the store's listing as well as a load — accept
-versions 1 to 5; old
+versions 1 to 6; old
 text logs keep their sequence, usage and optional provenance without inferred pixels. Version 1
 cannot introduce typed content or signed replay via extra fields. Version 2 stores ordered image
 blocks inline beside display summaries, so resuming does not need the original image file. Signed
 Messages assistant blocks are retained for unchanged-prefix replay. Older binaries cannot read v2
-bodies; there is no destructive bulk migration or automatic downgrade.
+bodies; there is no destructive bulk migration or automatic downgrade. Version 6 is the lowest version that holds a `context/mode` record whose policy follows the
+model. A reader that predates version 6 refuses such a session at the header, and the field's
+presence — with any value — is refused in any body below version 6, on write and on read. A
+compaction marker's prefix digest is computed under the version-5 header whatever version the body
+later reaches, so a compacted session that gains a version-6 record still validates.
 
 The local Responses preparation additionally validates `openai.responses` replay in v2
 records. Its closed reasoning/message/function subset retains original ciphertext, phase,

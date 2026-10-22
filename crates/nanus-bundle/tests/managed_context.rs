@@ -19,6 +19,7 @@ use nanus_domain::context::managed::{
 };
 use nanus_domain::{Message, SessionEvent};
 use nanus_ports::{CheckpointReason, PersistenceState};
+use std::rc::Rc;
 
 /// T01: a session that never enabled managed context runs, encodes and saves exactly as before.
 #[test]
@@ -71,7 +72,7 @@ fn activation_refuses_an_unsupported_model_without_changing_the_session() {
     let before = session.clone();
     let refused = block(runner.set_context_policy(
         &mut session,
-        ContextPolicy::managed(),
+        explicit_managed(),
         ModeActor::Human,
         host(&disk, &context).runtime,
     ));
@@ -85,7 +86,7 @@ fn activation_refuses_an_unsupported_model_without_changing_the_session() {
     model.set_supported(true);
     let enabled = block(runner.set_context_policy(
         &mut session,
-        ContextPolicy::managed(),
+        explicit_managed(),
         ModeActor::Human,
         host(&disk, &context).runtime,
     ));
@@ -456,4 +457,193 @@ fn a_legacy_policy_change_leaves_a_version_two_body_alone() {
     assert!(matches!(changed, Ok(None)), "{changed:?}");
     assert!(!session.is_managed_body());
     assert_eq!(disk.commits(), 0);
+}
+
+/// The managed policy with the explicit 4,096 reservation this file was written against. The
+/// default policy follows the model, which is a version-6 body and has its own tests.
+fn explicit_managed() -> ContextPolicy {
+    ContextPolicy {
+        output_reserve_follows_model: false,
+        ..ContextPolicy::managed()
+    }
+}
+
+/// T19 and T18: enabling a following policy records the reservation in force, bounded by the
+/// configured budget, and recording the same setting again writes nothing.
+#[test]
+fn enabling_a_following_policy_records_its_resolved_reservation_once() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = runner(&model, 64_000);
+    let mut session = session();
+    let disk = Disk::new();
+    let context = context();
+    let enable = |session: &mut nanus_domain::Session| {
+        block(runner.set_context_policy(
+            session,
+            ContextPolicy::managed(),
+            ModeActor::Human,
+            host(&disk, &context).runtime,
+        ))
+        .unwrap()
+    };
+    enable(&mut session);
+    // The harness model declares an 8,192 ceiling; a 64,000 budget leaves it whole.
+    let recorded = nanus_bundle::AgentRunner::context_policy(&session);
+    assert!(recorded.output_reserve_follows_model);
+    assert_eq!(recorded.output_reserve_tokens, 8_192);
+    assert_eq!(session.body_version(), 6);
+    let commits = disk.commits();
+    enable(&mut session);
+    assert_eq!(disk.commits(), commits, "the same setting writes no record");
+}
+
+/// T18: a configured budget smaller than the window bounds a following reservation to a quarter
+/// of it, and an explicit reservation is never touched by the budget.
+#[test]
+fn a_configured_budget_bounds_a_following_reservation_and_an_explicit_one_is_kept() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = runner(&model, 16_000);
+    let mut session = session();
+    let disk = Disk::new();
+    let context = context();
+    block(runner.set_context_policy(
+        &mut session,
+        ContextPolicy::managed(),
+        ModeActor::Human,
+        host(&disk, &context).runtime,
+    ))
+    .unwrap();
+    let recorded = nanus_bundle::AgentRunner::context_policy(&session);
+    assert_eq!(recorded.output_reserve_tokens, 4_000, "a quarter of 16,000");
+
+    let status = runner
+        .context_status(&session, host(&disk, &context).runtime)
+        .unwrap();
+    assert_eq!(status.output_reserve_tokens, 4_000);
+    assert!(status.managed_ready);
+
+    let mut explicit_session = self::session();
+    block(runner.set_context_policy(
+        &mut explicit_session,
+        ContextPolicy {
+            output_reserve_tokens: 4_096,
+            output_reserve_follows_model: false,
+            ..ContextPolicy::managed()
+        },
+        ModeActor::Human,
+        host(&disk, &context).runtime,
+    ))
+    .unwrap();
+    let explicit = nanus_bundle::AgentRunner::context_policy(&explicit_session);
+    assert_eq!(explicit.output_reserve_tokens, 4_096);
+    assert!(!explicit.output_reserve_follows_model);
+}
+
+/// Case 17, the step transaction: a selection change requested while a proposal is staged waits for
+/// the step to settle. The step that staged the proposal is judged under the profile it was prepared
+/// under, so the proposal is accepted; the switch lands after that settle, and the attempts before and
+/// after it record the two models.
+#[test]
+fn a_selection_change_while_a_proposal_is_staged_lands_after_the_step_settles() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = Rc::new(runner(&model, 64_000));
+    let (mut session, disk, context) = managed(&runner);
+    model.push(call("w1", "echo", r#"{"size": 10}"#));
+    model.push(call("w2", "echo", r#"{"size": 10}"#));
+    model.push(call("w3", "echo", r#"{"size": 10}"#));
+    model.push(call("i1", "context_manage", INSPECT));
+    // The model's answer proposes, and asks for a different model while the step is still open.
+    let switcher = Rc::clone(&runner);
+    let propose = propose_oldest("i2");
+    model.push_with(move |request| {
+        switcher.set_model("m-after");
+        propose(request)
+    });
+    model.push(text("tidied"));
+    let outcome = block(runner.run_turn_with_runtime(
+        &mut session,
+        "work, then tidy up",
+        &mut Silent,
+        host(&disk, &context),
+    ));
+    assert!(outcome.outcome.is_ok(), "{:?}", outcome.outcome);
+
+    let accepted = session.log().events().iter().any(|event| {
+        matches!(event, SessionEvent::ContextDecision { payload }
+            if payload.outcome == DecisionOutcome::Accepted)
+    });
+    assert!(
+        accepted,
+        "the proposal was judged under its own step's profile, and accepted"
+    );
+    assert!(
+        disk.reasons_since(0)
+            .contains(&CheckpointReason::ContextRevision),
+        "the step settled with the revision"
+    );
+
+    let models: Vec<String> = session
+        .log()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::RequestAttempt { payload } => Some(payload.selection.model.clone()),
+            _ => None,
+        })
+        .collect();
+    let first_after = models.iter().position(|model| model == "m-after");
+    assert!(first_after.is_some(), "the switch took effect: {models:?}");
+    assert!(
+        models[..first_after.unwrap_or(0)]
+            .iter()
+            .all(|model| model == "m"),
+        "every step before the settle ran under the model it was prepared with: {models:?}"
+    );
+    assert_eq!(runner.model(), "m-after");
+}
+
+/// Case 22, the record: a resumed session with an explicit reservation that asks for `model`
+/// records a following policy, its number resolved on the model in force, at version 6.
+#[test]
+fn a_resumed_explicit_session_that_asks_for_model_records_a_following_policy_at_version_six() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = runner(&model, 64_000);
+    let mut session = session();
+    let disk = Disk::new();
+    let context = context();
+    let explicit = ContextPolicy {
+        output_reserve_tokens: 4_096,
+        output_reserve_follows_model: false,
+        ..ContextPolicy::managed()
+    };
+    block(runner.set_context_policy(
+        &mut session,
+        explicit,
+        ModeActor::Human,
+        host(&disk, &context).runtime,
+    ))
+    .unwrap();
+    assert_eq!(
+        session.body_version(),
+        3,
+        "an explicit reservation is version three"
+    );
+
+    // What `--context-output-reserve model` on the resume asks for: the same policy, following.
+    let mut asked = nanus_bundle::AgentRunner::context_policy(&session);
+    asked.output_reserve_follows_model = true;
+    block(runner.set_context_policy(
+        &mut session,
+        asked,
+        ModeActor::Human,
+        host(&disk, &context).runtime,
+    ))
+    .unwrap();
+    let recorded = nanus_bundle::AgentRunner::context_policy(&session);
+    assert!(recorded.output_reserve_follows_model);
+    assert_eq!(
+        recorded.output_reserve_tokens, 8_192,
+        "resolved on the model in force"
+    );
+    assert_eq!(session.body_version(), 6);
 }

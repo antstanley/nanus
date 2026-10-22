@@ -147,6 +147,21 @@ impl Decoder {
 pub struct OpenAiLlm {
     client: reqwest::Client,
     config: OpenAiConfig,
+    /// A test-only origin the transport sends to, instead of the configured base URL.
+    #[cfg(feature = "test-endpoint")]
+    test_origin: Option<String>,
+}
+
+#[cfg(feature = "test-endpoint")]
+impl OpenAiLlm {
+    /// Sends every request to `origin` instead of the configured base URL, so a test can serve the
+    /// wire from a local listener. Only the transport moves: every support decision, limit and
+    /// digest is still the configured endpoint's.
+    #[must_use]
+    pub fn with_test_origin(mut self, origin: &str) -> Self {
+        self.test_origin = Some(origin.to_owned());
+        self
+    }
 }
 
 impl core::fmt::Debug for OpenAiLlm {
@@ -191,7 +206,14 @@ impl OpenAiLlm {
         let client = builder
             .build()
             .map_err(|source| OpenAiError::client(&source))?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            // The binary's end-to-end tests name their listener in the environment; see the feature's
+            // manifest comment. Read here, once, so a request never consults the environment.
+            #[cfg(feature = "test-endpoint")]
+            test_origin: std::env::var("NANUS_TEST_OPENAI_ORIGIN").ok(),
+        })
     }
 
     /// Builds an adapter for `model`, reading the key from the vendor's variable.
@@ -257,6 +279,8 @@ impl OpenAiLlm {
 
     fn url(&self, protocol: Protocol) -> String {
         let base = self.config.base_url().trim_end_matches('/');
+        #[cfg(feature = "test-endpoint")]
+        let base = self.test_origin.as_deref().unwrap_or(base);
         // Postcondition: a usable base URL is absolute, so a misconfigured one fails
         // here rather than as a confusing transport error later.
         assert!(base.starts_with("http"), "a base URL is absolute");

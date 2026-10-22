@@ -51,6 +51,15 @@ impl LlmPort for ScriptedLlm {
         "scripted"
     }
 
+    // A following managed policy resolves to a declared ceiling, so this model declares one: the
+    // 4,096 the policy reserved before reservations followed the model.
+    fn capabilities(&self, _model: &str) -> nanus_ports::ModelCapabilities {
+        nanus_ports::ModelCapabilities {
+            max_output_tokens: Some(4_096),
+            ..nanus_ports::ModelCapabilities::default()
+        }
+    }
+
     fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
         Box::pin(futures::stream::iter(vec![
             LlmEvent::TextDelta("hello back".to_owned()),
@@ -3585,6 +3594,13 @@ impl LlmPort for ManagedLlm {
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
         ScriptedLlm.stream_chat(request)
     }
+    fn capabilities(&self, _model: &str) -> nanus_ports::ModelCapabilities {
+        nanus_ports::ModelCapabilities {
+            max_output_tokens: Some(4_096),
+            ..nanus_ports::ModelCapabilities::default()
+        }
+    }
+
     fn managed_support(&self, _: &str) -> nanus_ports::ManagedSupport {
         nanus_ports::ManagedSupport::Supported { policy_version: 1 }
     }
@@ -3626,6 +3642,7 @@ fn selected_session(id: &SessionId) -> Session {
         payload: Box::new(ContextModeRecord {
             policy: ContextPolicy {
                 output_reserve_tokens: 1024,
+                output_reserve_follows_model: false,
                 ..ContextPolicy::managed()
             },
             actor: ModeActor::Human,
@@ -3743,6 +3760,11 @@ fn context_modes_switch_over_the_link_without_resetting_the_saved_projection() {
             );
             assert_eq!(payload.hidden_fragments, hidden);
             assert_eq!(payload.output_reserve_tokens, 1024);
+            assert!(
+                !AgentRunner::context_policy(&store.load(&id).await.expect("after"))
+                    .output_reserve_follows_model,
+                "a recorded explicit reservation is kept"
+            );
             let mut observed = context_answer(&mut watcher).await;
             if matches!(observed, Frame::Checkpoint { .. }) {
                 observed = context_answer(&mut watcher).await;
@@ -3804,8 +3826,11 @@ fn a_legacy_session_can_enable_managed_context_and_continue_after_disabling() {
             let first = context_answer(&mut client).await;
             assert!(matches!(first, Frame::Checkpoint { .. }), "{first:?}");
             let disk = store.load(&id).await.expect("already saved");
-            assert_eq!(disk.body_version(), 3);
+            assert_eq!(disk.body_version(), 6);
             assert_eq!(AgentRunner::context_policy(&disk).mode, mode);
+            // Acceptance 23: the interface records a following policy for a session with no recorded
+            // policy, and an explicit recorded reservation is kept.
+            assert!(AgentRunner::context_policy(&disk).output_reserve_follows_model);
             assert!(
                 matches!(disk.log().events().last(), Some(SessionEvent::ContextMode { payload })
                 if payload.actor == ModeActor::Human && payload.reason == if mode == ContextMode::Managed {
@@ -4489,8 +4514,8 @@ fn a_handoff_commit_attaches_a_seeded_session_and_records_the_back_link() {
     let created = stored(&store, &new);
     assert_eq!(
         created.body_version(),
-        5,
-        "a seeded managed session is a version-5 body"
+        6,
+        "a seeded managed session enabled by default is a version-6 body"
     );
     assert!(matches!(
         created.log().events()[0],

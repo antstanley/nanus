@@ -5,8 +5,8 @@
 use nanus_domain::context::managed::HANDOFF_SEED_LABEL;
 use nanus_domain::context::managed::limits::HANDOFF_NARRATIVE_BYTES_MAX;
 use nanus_domain::context::managed::{
-    AttemptOutcome, AttemptPhase, ContextFrontier, ContextModeRecord, ContextPolicy, Digest,
-    ErrorCode, HandoffRecord, HandoffSeed, MaintenanceAttemptKind, ManagedState, ModeActor,
+    AttemptOutcome, AttemptPhase, ContextFrontier, ContextMode, ContextModeRecord, ContextPolicy,
+    Digest, ErrorCode, HandoffRecord, HandoffSeed, MaintenanceAttemptKind, ManagedState, ModeActor,
     ModeReason, RequestAttemptRecord, SelectionIdentity, UsageObservation,
 };
 use nanus_domain::{Message, Session, SessionError, SessionEvent, SessionId, TurnEndReason, Usage};
@@ -21,7 +21,14 @@ fn managed_session(id: &str) -> Session {
 fn mode() -> SessionEvent {
     SessionEvent::ContextMode {
         payload: Box::new(ContextModeRecord {
-            policy: ContextPolicy::managed(),
+            // An explicit reservation: a following one is version 6, which is not under test here.
+            policy: ContextPolicy {
+                mode: ContextMode::Managed,
+                output_reserve_tokens: 4_096,
+                output_reserve_follows_model: false,
+                capture_shell: false,
+                policy_version: 1,
+            },
             actor: ModeActor::Host,
             reason: ModeReason::Enable,
             previous_revision: 0,

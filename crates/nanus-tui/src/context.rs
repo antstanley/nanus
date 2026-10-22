@@ -47,7 +47,8 @@ impl ContextChoice {
                 and notes; it does not start fresh. The model may see a different history on the \
                 next request.\n\n\
                 This is opt-in and has not been live-provider or quality/cost validated. The \
-                agent refuses unsupported model paths (including Responses) or output reserves. \
+                agent refuses model paths without managed support, and an explicit reserve above \
+                the model's ceiling. \
                 Changing history can invalidate prompt caches, lose prior reasoning replay, and \
                 change token use, cost and answer continuity.\n\n\
                 Enabling upgrades the stored session format; disabling cannot downgrade it. \
@@ -170,6 +171,19 @@ pub(crate) fn warning_rows(choice: ContextChoice, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Case 24: the activation warning names the refusals a model path can meet, and no longer
+    /// names Responses, which is supported now.
+    #[test]
+    fn the_activation_warning_no_longer_names_responses() {
+        use super::ContextChoice;
+        let warning = ContextChoice::Managed.warning();
+        assert!(
+            warning.contains("refuses model paths without managed support"),
+            "{warning}"
+        );
+        assert!(!warning.contains("Responses"), "{warning}");
+    }
+
     use super::*;
 
     #[test]

@@ -268,6 +268,11 @@ impl AgentRunner {
             },
         );
         let policy = Self::context_policy(session);
+        let reserve = if policy.output_reserve_follows_model {
+            String::from("model")
+        } else {
+            policy.output_reserve_tokens.to_string()
+        };
         let effort = self.effort().map_or("none", |effort| effort.as_str());
         format!(
             "source_session: {}\n\
@@ -282,7 +287,7 @@ impl AgentRunner {
             base.prefix_blake3.as_str(),
             base.projection_revision,
             policy.mode.as_str(),
-            policy.output_reserve_tokens,
+            reserve,
             policy.capture_shell,
             one_line(&self.model()),
             one_line(session.cwd()),

@@ -35,7 +35,12 @@
         "output_reserve_tokens": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 4294967295
+          "maximum": 4294967295,
+          "description": "Explicit reservation, or the reservation resolved when a following policy was recorded."
+        },
+        "output_reserve_follows_model": {
+          "const": true,
+          "description": "Present only when the reservation follows the model in force; absent means explicit. Only a version-6 body may carry the key at all, and false is refused."
         },
         "capture_shell": {
           "type": "boolean"

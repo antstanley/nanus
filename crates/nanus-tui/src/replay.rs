@@ -231,7 +231,11 @@ pub fn context_line(event: &SessionEvent) -> Option<String> {
             _ => format!(
                 "context: {} (output reserve {}, shell capture {})",
                 payload.policy.mode.as_str(),
-                payload.policy.output_reserve_tokens,
+                if payload.policy.output_reserve_follows_model {
+                    String::from("model")
+                } else {
+                    payload.policy.output_reserve_tokens.to_string()
+                },
                 if payload.policy.capture_shell {
                     "on"
                 } else {
@@ -347,6 +351,38 @@ fn truncate(text: &str, max: usize) -> String {
 mod tests {
     use nanus_domain::{Session, SessionEvent, SessionId, ToolCallId, ToolName, TurnEndReason};
     use serde_json::json;
+
+    /// A following mode record is replayed as `model`, and an explicit one as its number.
+    #[test]
+    fn a_following_reserve_is_replayed_as_model_and_an_explicit_one_as_its_number() {
+        use super::context_line;
+        use nanus_domain::context::managed::{
+            ContextMode, ContextModeRecord, ContextPolicy, ModeActor, ModeReason,
+        };
+        let record = |policy| SessionEvent::ContextMode {
+            payload: Box::new(ContextModeRecord {
+                policy,
+                actor: ModeActor::Human,
+                reason: ModeReason::Enable,
+                previous_revision: 0,
+            }),
+        };
+        let following = ContextPolicy::managed();
+        let explicit = ContextPolicy {
+            output_reserve_tokens: 8_000,
+            output_reserve_follows_model: false,
+            ..ContextPolicy::managed()
+        };
+        assert_eq!(
+            context_line(&record(following)).as_deref(),
+            Some("context: managed (output reserve model, shell capture off)")
+        );
+        assert_eq!(
+            context_line(&record(explicit)).as_deref(),
+            Some("context: managed (output reserve 8000, shell capture off)")
+        );
+        assert_eq!(ContextMode::Managed.as_str(), "managed");
+    }
 
     use super::*;
 

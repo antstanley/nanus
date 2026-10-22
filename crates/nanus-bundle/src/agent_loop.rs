@@ -483,12 +483,17 @@ impl AgentRunner {
 
     /// Returns the budget the ordinary text path fits a conversation's messages into.
     ///
+    /// The budget the legacy path fits a conversation's messages into: the configured one, or, when the
+    /// runner was built to follow the model's window, three quarters of the window's room (the window
+    /// less the output ceiling, and no more than the input limit). For `OpenAI`'s offered models that is
+    /// 691,500 tokens, and the configured budget is 64,000.
+    ///
     /// The configured budget as it is. A model's window is not: that path counts only the
     /// messages, at characters over four, and the request asks for the model's whole output
     /// ceiling beside them. So the room is the window less that ceiling (and no more than the
     /// input limit), and a quarter of it is left unspent for code and JSON, which tokenize closer
     /// to three characters a token than four, and for the tool schemas sent outside the count.
-    fn prompt_budget(&self) -> u32 {
+    pub fn prompt_budget(&self) -> u32 {
         let Some(caps) = self.model_limits() else {
             return self.config.context_budget;
         };
@@ -1878,6 +1883,40 @@ mod tests {
             });
         }
         session
+    }
+
+    /// Acceptance 21: an exact-chat `OpenAI` runner fitted to the model's window has a legacy prompt
+    /// budget of 691,500 — 922,000 less a quarter — where the configured budget gave 64,000.
+    #[test]
+    fn an_exact_chat_openai_runner_fits_its_legacy_prompt_to_the_model_window() {
+        let mut config = nanus_adapter_openai::OpenAiConfig::new(
+            nanus_adapter_openai::Vendor::OpenAi,
+            "gpt-6-astra",
+            "test-key",
+        );
+        config
+            .set_protocol_preference(nanus_adapter_openai::ProtocolPreference::Exact(
+                nanus_adapter_openai::Protocol::ChatCompletions,
+            ))
+            .unwrap_or_else(|error| unreachable!("the preference: {error}"));
+        let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(
+            nanus_adapter_openai::OpenAiLlm::new(config)
+                .unwrap_or_else(|error| unreachable!("the adapter: {error}")),
+        ));
+        let configured = runner(Rc::clone(&llm), registry_with_echo())
+            .unwrap_or_else(|| unreachable!("the runner builds"));
+        configured.set_model("gpt-6-astra");
+        assert_eq!(
+            configured.prompt_budget(),
+            nanus_domain::DEFAULT_CONTEXT_BUDGET
+        );
+
+        let fitted = runner(llm, registry_with_echo())
+            .unwrap_or_else(|| unreachable!("the runner builds"))
+            .with_model_context_budget();
+        fitted.set_model("gpt-6-astra");
+        assert_eq!(fitted.context_budget(), 1_050_000);
+        assert_eq!(fitted.prompt_budget(), 691_500);
     }
 
     /// An unconfigured budget is the window of the model in force, read per request: a switch to

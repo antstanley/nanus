@@ -33,21 +33,36 @@ encoded-byte, role, reference, quota and provider rule below is checked in code.
 
 ## Configuration, activation and limits
 
-`ContextPolicy` has four fields: `mode` (`legacy` | `managed`), `output_reserve_tokens`,
-`capture_shell` and `policy_version`. The defaults are legacy, 4,096, false and 1. Capture is
-valid only in managed mode, and nothing turns managed mode on implicitly.
+`ContextPolicy` has five fields: `mode` (`legacy` | `managed`), `output_reserve_tokens`,
+`output_reserve_follows_model`, `capture_shell` and `policy_version`. The defaults are legacy, a
+following reservation, false and 1. A *following* reservation is resolved at each request from the
+model in force, so it moves with a model or provider switch:
+
+- when requests are fitted to the model's window (the stock default, with no `context_budget`
+  configured), it is the model's declared output ceiling;
+- when they are fitted to a smaller budget — a configured `context_budget`, or a library host's
+  default of 64,000 — it is the smaller of the ceiling and a quarter of that budget, as for image
+  requests, so at least three quarters of the budget stays for input.
+
+`output_reserve_tokens` then records the reservation resolved when the policy was recorded, for a
+reader, and is not otherwise used. An *explicit* reservation is the recorded number and does not
+move. Capture is valid only in managed mode, and nothing turns managed mode on implicitly.
 
 A policy change is a human or host action taken while the session is idle. It is recorded as a
 `context/mode` record and checkpointed before it is acknowledged. Enabling makes the body managed
-through the checkpoint — version 3, or version 4 marked managed when it holds typed user content;
+through the checkpoint — version 3, or version 4, 5 or 6 marked managed; a default enable writes version 6, because its
+policy follows the model;
 disabling never downgrades it and never deletes past records. Activation refuses — without changing the session — when the selected model path has no
-managed preparation, when its declared output ceiling is below the reservation, when a
+managed preparation, when the reservation is explicit and the model's declared output ceiling is below it, or when the
+reservation follows the model and the model declares no output ceiling, when a
 registered tool already uses a context tool's name, or, for capture, when there is no archive or
 the shell cannot capture.
 
-`nanus run` takes `--context-mode legacy|managed`, `--context-output-reserve <tokens>` and
-`--capture-shell-evidence`. Absent flags keep a resumed session's recorded policy, or legacy for
-a new one; a capture or reserve flag on a new session without `--context-mode managed` is refused.
+`nanus run` takes `--context-mode legacy|managed`, `--context-output-reserve <tokens>|model` and
+`--capture-shell-evidence`. `model` selects a following reservation and a number an explicit one.
+Absent flags keep a resumed session's recorded policy, or legacy for a new one. A session recorded
+with an explicit reservation keeps it until a human changes it; a new managed session follows the
+model. A capture or reserve flag on a new session without `--context-mode managed` is refused.
 
 The policy-1 limits are fixed (`nanus_domain::context::managed::limits`). They are engineering
 defaults, not measured optima, and any future tunable keeps an absolute bound inside the snapshot
@@ -71,6 +86,11 @@ profile.
 The admissible input allowance is the smaller of the configured context budget and the model's
 window, less the output reservation and any separate reasoning reservation, and never above the
 model's input ceiling.
+
+With a following reservation and the model's window as the budget, the allowance is the window less
+the output ceiling. On every supported model that leaves at least 78,000 tokens (`mercury-2`:
+128,000 − 50,000); for OpenAI it is 922,000, the declared input ceiling. With a smaller budget the
+allowance is at least three quarters of it.
 
 ## Fragments, frontiers and revisions
 
@@ -208,8 +228,15 @@ decoders apply the context tools' raw argument limits once a call's name is know
 name that arrives after its arguments — and before anything is parsed.
 
 The supported matrix is recorded with the provider work (see [Providers](#provider-matrix) below).
-Stateless and ordinary Responses paths stay unsupported: activation and provider switches refuse
-before HTTP, with no wire, model or effort switch and no opaque item deleted or rewritten.
+The chat-completions, Messages and Responses wires are supported at their official endpoints for
+known models. All of them send history plain. Anthropic's may also send signed replay, under the
+rule below. The opt-in stateless Responses replay mode stays unsupported. Activation and provider
+switches refuse it before HTTP, with no wire, model or effort switch, and no opaque item is
+deleted or rewritten.
+
+A model's limits — window, input ceiling and output ceiling — are the model's. They are declared
+once per model id and apply on every plan and endpoint that serves it, so a subscription has the
+same budget as API access to the same model.
 
 A model or provider switch to an unsupported path makes the session unready; the next request is
 refused before HTTP, the shared selection is not reverted, and the host chooses a supported
@@ -224,9 +251,12 @@ Support requires the official endpoint and a known model; anything else is unsup
 | Provider | Endpoint and plan | Protocol label | Models | Support |
 |---|---|---|---|---|
 | DeepSeek | `https://api.deepseek.com` | `deepseek.chat` | `deepseek-flash`, `deepseek-v4-pro` | Supported |
-| OpenAI | API plan, `https://api.openai.com/v1`, with an exact Chat Completions preference | `openai.chat` | The offered models whose chat tool support is not refused (`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) | Supported |
-| OpenAI | Any id the vendor does not offer, which has no declared output ceiling | — | — | Unsupported |
-| OpenAI | Anything routed to Responses: automatic `gpt-5.6`+, the `subscription` plan, exact Responses, stateless Responses | — | All | Unsupported; refused before HTTP |
+| OpenAI | API plan, `https://api.openai.com/v1`, exact Chat Completions preference | `openai.chat` | The offered models whose chat tool support is not refused (`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) | Supported |
+| OpenAI | API plan, `https://api.openai.com/v1`, automatic routing or an exact Responses preference | `openai.responses` | Every offered model | Supported |
+| OpenAI | `subscription` plan, `https://chatgpt.com/backend-api/codex`, automatic routing with the Responses fallback | `openai.responses` | Every offered model | Supported; the reservation is enforced by nanus's accounting and not sent |
+| OpenAI | `subscription` endpoint under any exact preference, or an automatic preference whose fallback is chat | — | All | Unsupported: an exact preference promises a ceiling the endpoint refuses, and the chat fallback would send one |
+| OpenAI | Stateless Responses replay | — | All | Unsupported; refused before HTTP |
+| OpenAI | Any id the vendor does not offer, or any other endpoint | — | — | Unsupported |
 | z.ai | API plan, `https://api.z.ai/api/paas/v4` | `openai.chat` | The known API models | Supported |
 | z.ai | Coding Plan, gateways | — | — | Unsupported |
 | Inception | API plan, `https://api.inceptionlabs.ai/v1` | `openai.chat` | `mercury-3`, `mercury-2.5`, `mercury-2` | Supported |
@@ -257,6 +287,65 @@ earlier reasoning and the prompt cache, never correctness.
 
 These rest on wire and reload fixtures — a local server receives exactly the prepared bytes — not
 on live provider evidence; see [what is verified](#what-is-and-is-not-verified).
+
+#### The Responses wire
+
+A managed Responses request is encoded by the same encoder as an ordinary one, so the two differ
+only in what the managed compiler selected:
+
+- The leading system messages (the harness prompt, the notice, and a seeded session's handoff
+  seed) are joined in order into `instructions` and are not repeated in `input`.
+- A user turn is a `user` item, with `input_image` parts when it carries images.
+- An assistant turn is an `assistant` item of `output_text`, then one `function_call` item per
+  call, keyed by `call_id` and carrying no item id.
+- A result is a `function_call_output`. A result that carries images is answered with its label,
+  and the original text and pixels follow as one `user` item once the whole group of results has
+  been answered.
+- The generated working-data message is an `assistant` item directly after the first user item,
+  and never last.
+
+History is always plain. The body carries `store: false` and never `previous_response_id`,
+`include`, a reasoning item, or any other protocol's replay. An assistant turn recorded with replay
+blocks (Anthropic's, or stateless Responses items) is sent as its text and calls. A turn that only
+replay can express refuses preparation with `protocol_incompatible`, as it does on chat
+completions. Earlier reasoning is therefore never sent back to the model. The ordinary Responses
+path already works this way, so managed context costs no continuity the session had.
+
+On the API plan the reservation is sent as `max_output_tokens`. The `subscription` endpoint
+refuses that field, so there the reservation is enforced by nanus's accounting alone. It must
+still be present and within the model's declared ceiling. The estimator charges it against the
+budget as on every other path, and the input allowance is reduced by it. With the default
+following reservation and the model's window as the budget it is the model's whole ceiling, so
+nothing the backend can return exceeds what was reserved. A smaller reservation — explicit, or a
+following one bounded by a configured budget — is not sent either. A reply longer than it is
+recorded at its real size in the attempt's usage, and the next step's fit counts it as history.
+The subscription endpoint under an exact preference is unsupported, because an exact preference
+promises that a ceiling is sent and honoured.
+
+The decoder applies the context tools' raw argument limits on this wire too:
+
+- It checks a call once its name is known, whether the name arrives in
+  `response.output_item.added` or only in `response.output_item.done`.
+- Before the name is known, it bounds the buffer at one record.
+- A call over its limit keeps `OVERSIZED_ARGUMENTS`, and the whole arguments string an item's
+  `done` event carries cannot restore it.
+
+The selection identity names:
+
+- provider `openai`;
+- the digest of the exact `/responses` URL;
+- protocol `openai.responses`;
+- the model;
+- the effort the body's `reasoning.effort` carries.
+
+A prepared call holds the bearer token and account id captured when its adapter was built, as an
+ordinary dispatch does, and its `Debug` renders neither. A token that expires between
+composition and the send fails that attempt, and renewal happens when the adapter is next built.
+
+A managed session that moves between `openai.chat` and `openai.responses` needs no reset, because
+both send plain history. Stock routing never makes that move, since every offered id resolves to
+Responses. A library host can make it by preparing with a differently configured adapter. Each
+step's selection is recorded with its attempt.
 
 ## Checkpoints and recovery
 
@@ -297,14 +386,22 @@ does not promise exactly-once external effects.
 
 Version 3 adds six records — `context/mode`, `context/revision`, `context/decision`,
 `artifact/published`, `request/attempt`, `context/recovery` — each validated on write and on read.
-A managed session is version 3, or version 4 or 5 with `"managed":true` in its header when it also
-holds typed user content or a maintenance record. Version 5 is written whenever a body carries a
+A managed session is version 3, or version 4, 5 or 6 with `"managed":true` in its header when it also
+holds typed user content or a maintenance record. A version-6 body always holds a `context/mode`
+record, which only `change_policy` writes after upgrading the body, so its header always says
+`"managed":true`. Version 5 is written whenever a body carries a
 record of a maintenance request: a `context/compact` marker, a `context/seed`, a
 `context/handoff`, or a `request/attempt` with a `kind` (what a handoff draft writes). A reader
 that predates those would fail part-way through the body, so it refuses the session at the header
 instead; those records, and an attempt's `kind`, are refused in any body below version 5, on write
-and on read. Readers accept versions 1 to 5; a body that is not managed and carries one of the
+and on read. Readers accept versions 1 to 6; a body that is not managed and carries one of the
 managed records is refused, and a future version is refused before anything is mutated.
+
+Version 6 is the lowest version that holds a `context/mode` record whose policy follows the
+model. A reader that predates version 6 refuses such a session at the header, and the field's
+presence — with any value — is refused in any body below version 6, on write and on read. A
+compaction marker's prefix digest is computed under the version-5 header whatever version the
+body later reaches, so a compacted session that gains a version-6 record still validates.
 
 ## Evidence, recall and file windows
 
@@ -586,7 +683,7 @@ failed context edit never invalidates an earlier result or retries a command.
 ## What is and is not verified
 
 Verified by deterministic tests against the real runner, store, shell, link, interface and the
-three adapters' encoders and decoders, on macOS:
+three adapter crates' encoders and decoders, including OpenAI's Responses wire, on macOS:
 
 - legacy sessions keep their request bytes, schemas, event trace and save path (each adapter pins
   its ordinary body; the runner compares a legacy run through both entry points);
@@ -613,7 +710,16 @@ three adapters' encoders and decoders, on macOS:
   compacted through its checkpoint and then taking a turn, and that a compacted session cannot
   enable managed context, from `nanus run`, the link and the interface;
 - each adapter's fixtures for a leading compaction summary in a legacy request and a leading seed in
-  a managed one.
+  a managed one;
+- the Responses managed body on the API and subscription plans, sent through the real adapter and
+  runner to a local listener. The tests cover the order of `instructions`, plain history with no
+  replay and no `include`, `max_output_tokens` present and equal to the reservation on the API plan
+  and absent on the subscription plan, images and image results, exact bytes and the same digest
+  after a reload, argument limits including a name that arrives only at `output_item.done`, and a
+  following reservation across a model switch;
+- a following reservation's arithmetic, its record, and body version 6: the field's serde rules, a
+  present `false` refused, the header and its refusal below version 6 on read, and a configured
+  budget bounding the reservation a host's enable records.
 
 Not verified, and not claimed:
 
@@ -621,6 +727,9 @@ Not verified, and not claimed:
   call built and read the way a managed turn's is. The tests show the request is built and its
   response is read and refused correctly; they do not show that a provider's summary is good, or
   that its cost is what the usage record says.
+- **The subscription reservation is not enforced by the provider.** The tests show the reservation
+  is charged and that the body omits it. The window the subscription is fitted to is the model's
+  declared window, by decision, and has not been measured against the backend.
 - **No live provider has been sent a managed request.** The provider matrix rests on wire and
   reload fixtures; in particular, nothing yet proves a provider accepts the generated assistant
   message followed by an original one, or DeepSeek, z.ai and Inception a generated turn without

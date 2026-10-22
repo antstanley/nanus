@@ -248,6 +248,9 @@ struct PartialCall {
     call_id: String,
     name: String,
     arguments: String,
+    /// Set once the call is over its tool's raw limit. Its arguments are released at that moment,
+    /// and nothing later restores them: a `done` event that carries the whole string cannot.
+    oversized: bool,
 }
 
 /// Accumulates Responses events into the events the agent loop consumes.
@@ -263,6 +266,8 @@ pub struct StreamAccumulator {
     finish: Option<FinishReason>,
     closed: bool,
     replay: Option<replay::Replay>,
+    /// Raw per-tool argument limits; empty for an ordinary stream, which decodes unchanged.
+    argument_limits: nanus_ports::ToolArgumentLimits,
 }
 
 impl StreamAccumulator {
@@ -301,6 +306,16 @@ impl StreamAccumulator {
         if self.replay.is_none() {
             self.limits = limits;
         }
+    }
+
+    /// Installs the raw argument limits a managed call is decoded under, before any frame.
+    ///
+    /// A call whose final name has a limit and whose buffered arguments pass it is reported with
+    /// [`nanus_ports::OVERSIZED_ARGUMENTS`] instead of its arguments, so the oversized text never
+    /// reaches a JSON parser. The same rule as the chat decoder: judged when the name is known,
+    /// and bounded at one record before it is.
+    pub fn set_argument_limits(&mut self, limits: nanus_ports::ToolArgumentLimits) {
+        self.argument_limits = limits;
     }
     /// Responses has its own terminal payload and need not send a transport sentinel.
     #[must_use]
@@ -399,9 +414,14 @@ impl StreamAccumulator {
                 if let (Some(id), Some(delta)) = (
                     non_empty_str(frame, "item_id"),
                     frame.get("delta").and_then(Value::as_str),
-                ) && let Some(call) = self.calls.iter_mut().find(|call| call.item_id == id)
+                ) && let Some(index) = self.calls.iter().position(|call| call.item_id == id)
                 {
-                    call.arguments.push_str(delta);
+                    if let Some(call) = self.calls.get_mut(index)
+                        && !call.oversized
+                    {
+                        call.arguments.push_str(delta);
+                    }
+                    self.judge_arguments(index);
                 }
             }
             "response.output_item.done" => self.observe_item_done(frame.get("item")),
@@ -503,7 +523,38 @@ impl StreamAccumulator {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+            oversized: false,
         });
+        self.judge_arguments(self.calls.len().saturating_sub(1));
+    }
+
+    /// Judges one call against its tool's raw limit, and releases its arguments at once when it is
+    /// over.
+    ///
+    /// Before the name is known there is no tool to judge by, so a managed stream bounds the
+    /// unnamed buffer at one record: a call whose name never comes cannot hold more. Judged
+    /// whenever the name is known, so a name that arrives after its arguments is checked against
+    /// everything already buffered.
+    fn judge_arguments(&mut self, index: usize) {
+        if self.argument_limits.is_empty() {
+            return;
+        }
+        let Some(call) = self.calls.get_mut(index) else {
+            return;
+        };
+        if call.oversized {
+            return;
+        }
+        let unnamed_over =
+            call.name.is_empty() && call.arguments.len() > nanus_domain::content::RECORD_BYTES_MAX;
+        let over = self
+            .argument_limits
+            .limit_for(&call.name)
+            .is_some_and(|limit| call.arguments.len() > limit);
+        if unnamed_over || over {
+            call.oversized = true;
+            call.arguments = String::new();
+        }
     }
 
     /// Completes a partial call when its item is done.
@@ -527,8 +578,15 @@ impl StreamAccumulator {
         if let Some(name) = non_empty_str(item, "name") {
             name.clone_into(&mut call.name);
         }
-        if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+        // A call already over its limit stays so: the whole string this event carries cannot
+        // restore what the limit released.
+        if !call.oversized
+            && let Some(arguments) = item.get("arguments").and_then(Value::as_str)
+        {
             arguments.clone_into(&mut call.arguments);
+        }
+        if let Some(index) = self.calls.iter().position(|call| call.item_id == id) {
+            self.judge_arguments(index);
         }
     }
 
@@ -573,7 +631,11 @@ impl StreamAccumulator {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 id: Some(nanus_domain::ToolCallId::new(call.call_id)),
                 name: Some(name),
-                arguments_delta: call.arguments,
+                arguments_delta: if call.oversized {
+                    nanus_ports::OVERSIZED_ARGUMENTS.to_owned()
+                } else {
+                    call.arguments
+                },
             });
         }
         if let Some(usage) = self.usage.take() {
@@ -906,3 +968,82 @@ mod tests {
 #[cfg(test)]
 #[path = "responses_bounds_tests.rs"]
 mod bounds_tests;
+
+#[cfg(test)]
+mod argument_limit_tests {
+    use nanus_domain::context::managed::limits::MANAGE_ARGUMENT_BYTES_MAX;
+    use nanus_ports::{LlmEvent, OVERSIZED_ARGUMENTS, ToolArgumentLimits};
+    use serde_json::{Value, json};
+
+    use super::StreamAccumulator;
+
+    /// The events a Responses stream decodes to, after its terminal event.
+    fn decode(limits: Option<ToolArgumentLimits>, frames: &[Value]) -> Vec<LlmEvent> {
+        let mut accumulator = StreamAccumulator::default();
+        if let Some(limits) = limits {
+            accumulator.set_argument_limits(limits);
+        }
+        for frame in frames {
+            accumulator.observe_frame(frame);
+        }
+        accumulator.close();
+        let mut events = Vec::new();
+        while let Some(event) = accumulator.take_ready() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn arguments_of(events: &[LlmEvent]) -> Option<&str> {
+        events.iter().find_map(|event| match event {
+            LlmEvent::ToolCallDelta {
+                arguments_delta, ..
+            } => Some(arguments_delta.as_str()),
+            _ => None,
+        })
+    }
+
+    /// A call whose name arrives only at `output_item.done`, with arguments over the context
+    /// tool's limit, with the given `done` item.
+    fn late_name_frames(arguments: &str, done_arguments: &str) -> Vec<Value> {
+        vec![
+            json!({"type": "response.output_item.added", "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "call_1", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta",
+                "item_id": "fc_1", "delta": arguments}),
+            json!({"type": "response.output_item.done", "item": {
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "context_manage", "arguments": done_arguments}}),
+            json!({"type": "response.completed", "response": {}}),
+        ]
+    }
+
+    #[test]
+    fn a_managed_call_over_its_limit_is_cut_even_when_its_name_arrives_last() {
+        let big = "x".repeat(MANAGE_ARGUMENT_BYTES_MAX + 1);
+        let frames = late_name_frames(&big, &big);
+        let events = decode(Some(ToolArgumentLimits::managed()), &frames);
+        assert_eq!(arguments_of(&events), Some(OVERSIZED_ARGUMENTS));
+    }
+
+    #[test]
+    fn a_done_event_carrying_the_whole_string_does_not_restore_an_oversized_call() {
+        let big = "x".repeat(MANAGE_ARGUMENT_BYTES_MAX + 1);
+        let frames = late_name_frames(&big, &big);
+        let events = decode(Some(ToolArgumentLimits::managed()), &frames);
+        assert_eq!(arguments_of(&events), Some(OVERSIZED_ARGUMENTS));
+    }
+
+    #[test]
+    fn a_call_at_its_limit_is_kept_and_an_ordinary_stream_decodes_unchanged() {
+        let at_limit = "x".repeat(MANAGE_ARGUMENT_BYTES_MAX);
+        let frames = late_name_frames(&at_limit, &at_limit);
+        let managed = decode(Some(ToolArgumentLimits::managed()), &frames);
+        assert_eq!(arguments_of(&managed), Some(at_limit.as_str()));
+
+        let over = "x".repeat(MANAGE_ARGUMENT_BYTES_MAX + 1);
+        let frames = late_name_frames(&over, &over);
+        let ordinary = decode(None, &frames);
+        assert_eq!(arguments_of(&ordinary), Some(over.as_str()));
+    }
+}

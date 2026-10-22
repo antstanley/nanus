@@ -287,13 +287,19 @@ pub fn host<'a>(disk: &'a Disk, context: &'a SessionContext) -> TurnHost<'a> {
 }
 
 /// A session with managed context enabled, its disk and its context.
+///
+/// The reservation is explicit at the 4,096 these fixtures were written against. The default
+/// policy follows the model, which is a version-6 body and is tested where it is named.
 pub fn managed(runner: &AgentRunner) -> (Session, Disk, SessionContext) {
     let mut session = session();
     let disk = Disk::new();
     let context = context();
     block(runner.set_context_policy(
         &mut session,
-        ContextPolicy::managed(),
+        ContextPolicy {
+            output_reserve_follows_model: false,
+            ..ContextPolicy::managed()
+        },
         ModeActor::Human,
         host(&disk, &context).runtime,
     ))

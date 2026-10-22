@@ -15,7 +15,14 @@ categories.workspace = true
 name = "nanus"
 path = "src/main.rs"
 
+[features]
+# Test-only: points the OpenAI transport at a local listener named by NANUS_TEST_OPENAI_ORIGIN, so the
+# binary's managed path can be driven end to end offline. The support decisions still read the official
+# endpoint. Nothing in a release build enables it.
+test-endpoint = ["dep:nanus-adapter-openai", "nanus-adapter-openai/test-endpoint"]
+
 [dependencies]
+nanus-adapter-openai = { path = "../nanus-adapter-openai", optional = true }
 nanus-bundle = { workspace = true }
 # The interface is a separate program, so this binary reaches it through the local link
 # and by running it — never by linking it. That is what keeps the core small enough to

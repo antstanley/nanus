@@ -240,7 +240,15 @@ fn local_adapter(config: OpenAiConfig) -> (OpenAiLlm, TcpListener) {
         .resolve("api.openai.com", listener.local_addr().expect("address"))
         .build()
         .expect("fictional local client");
-    (OpenAiLlm { client, config }, listener)
+    (
+        OpenAiLlm {
+            client,
+            config,
+            #[cfg(feature = "test-endpoint")]
+            test_origin: None,
+        },
+        listener,
+    )
 }
 
 async fn refused(llm: &OpenAiLlm, listener: &TcpListener, request: ChatRequest) {

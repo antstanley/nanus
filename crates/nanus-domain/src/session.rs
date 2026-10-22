@@ -90,11 +90,19 @@ pub const SESSION_FORMAT_VERSION_USER_CONTENT: u32 = 4;
 /// it means at version 4. See [`SessionEvent::needs_version_five`].
 pub const SESSION_FORMAT_VERSION_COMPACTED: u32 = 5;
 
+/// The body version of a session whose managed policy follows the model's output ceiling.
+///
+/// The field is the only thing it adds, and an older reader refuses the whole session at the
+/// header, as it must: a reader that predates the field would fail part-way through the body. The
+/// field is refused by its raw presence below this version, whatever its value, because the writer
+/// never emits `false`. See [`SessionEvent::needs_version_six`].
+pub const SESSION_FORMAT_VERSION_RESERVE_FOLLOWS_MODEL: u32 = 6;
+
 /// The oldest session file format version this crate still reads.
 pub const OLDEST_SESSION_FORMAT_VERSION: u32 = 1;
 
 /// The newest session file format version this crate writes and reads.
-pub const NEWEST_SESSION_FORMAT_VERSION: u32 = SESSION_FORMAT_VERSION_COMPACTED;
+pub const NEWEST_SESSION_FORMAT_VERSION: u32 = SESSION_FORMAT_VERSION_RESERVE_FOLLOWS_MODEL;
 
 /// Whether this crate reads a session whose header names `version`.
 ///
@@ -457,6 +465,16 @@ impl SessionEvent {
             | Self::ContextSeed { .. }
             | Self::ContextHandoff { .. } => true,
             Self::RequestAttempt { payload } => payload.kind.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` for a record only a version-6 body may hold: a `context/mode` record whose
+    /// policy follows the model's output ceiling.
+    #[must_use]
+    pub const fn needs_version_six(&self) -> bool {
+        match self {
+            Self::ContextMode { payload } => payload.policy.output_reserve_follows_model,
             _ => false,
         }
     }
@@ -1098,16 +1116,24 @@ impl Session {
     /// Returns the lowest body version a reader must understand to read this session faithfully,
     /// which is the version it is written as.
     ///
-    /// Version 5 when the log carries a record of a maintenance request (see
-    /// [`SessionEvent::needs_version_five`]), because an older reader cannot read one; otherwise
-    /// version 4 when any user message carries typed content, because an older reader would drop it
-    /// silently; otherwise version 3 once managed context is enabled, because an older reader would
-    /// drop those records; otherwise version 2, the bytes every legacy session has always had. A
-    /// version is chosen by what the session holds, so an older build can open everything it can
-    /// read faithfully and refuses the rest.
+    /// Version 6 when the log carries a managed policy that follows the model (see
+    /// [`SessionEvent::needs_version_six`]); version 5 when the log carries a record of a
+    /// maintenance request (see [`SessionEvent::needs_version_five`]), because an older reader cannot
+    /// read one; otherwise version 4 when any user message carries typed content, because an older
+    /// reader would drop it silently; otherwise version 3 once managed context is enabled, because an
+    /// older reader would drop those records; otherwise version 2, the bytes every legacy session has
+    /// always had. A version is chosen by what the session holds, so an older build can open
+    /// everything it can read faithfully and refuses the rest.
     #[must_use]
     pub fn body_version(&self) -> u32 {
         if self
+            .log
+            .events()
+            .iter()
+            .any(SessionEvent::needs_version_six)
+        {
+            SESSION_FORMAT_VERSION_RESERVE_FOLLOWS_MODEL
+        } else if self
             .log
             .events()
             .iter()
@@ -1394,8 +1420,9 @@ impl Session {
     /// The header is the one a body has once it holds a marker, which is version
     /// [`SESSION_FORMAT_VERSION_COMPACTED`]; the marker is what moves the body there, so the digest
     /// names that header whether or not the marker exists yet. It equals [`Session::prefix_digest`]
-    /// once the marker is in the log. It never uses the encoding cache, which is keyed to the
-    /// header the session has now.
+    /// while the body is at version 5; a later version-6 record does not change it, so a marker
+    /// still validates after its session gains a following policy. It never uses the encoding
+    /// cache, which is keyed to the header the session has now.
     ///
     /// # Errors
     ///
@@ -1598,6 +1625,7 @@ impl Session {
             self.check_event(index, event)?;
             let line = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2);
             check_version_five(event, Some(version), line)?;
+            check_version_six(event, Some(version), line)?;
             let seq = SessionSeq::new(u64::try_from(index).unwrap_or(u64::MAX));
             let size = crate::content::serialized_size(
                 &SessionLineRef { seq, event },
@@ -1772,6 +1800,7 @@ impl Session {
             }
             if let Some(header) = &header {
                 validate_body_version(header.version, line, number)?;
+                validate_follows_field(header.version, line, number)?;
             }
             let parsed: SessionLine =
                 serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
@@ -1780,6 +1809,7 @@ impl Session {
                 })?;
             check_managed_record(&parsed.event, header.as_ref(), number)?;
             check_version_five(&parsed.event, header.as_ref().map(|h| h.version), number)?;
+            check_version_six(&parsed.event, header.as_ref().map(|h| h.version), number)?;
             validate_event_replay(&parsed.event, number)?;
             if parsed.seq.value() != expected {
                 return Err(SessionError::NonContiguousSequence {
@@ -1903,6 +1933,27 @@ fn check_version_five(
         return Err(SessionError::MalformedEvent {
             line,
             detail: format!("version-{version} records cannot contain a maintenance record"),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a record whose policy follows the model in a body below version 6, which an older
+/// reader does not know. `version` is the header's on read and the body's own on write.
+fn check_version_six(
+    event: &SessionEvent,
+    version: Option<u32>,
+    line: u64,
+) -> Result<(), SessionError> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+    if event.needs_version_six() && version < SESSION_FORMAT_VERSION_RESERVE_FOLLOWS_MODEL {
+        return Err(SessionError::MalformedEvent {
+            line,
+            detail: format!(
+                "version-{version} records cannot hold a reserve that follows the model"
+            ),
         });
     }
     Ok(())
@@ -2180,6 +2231,42 @@ fn validate_body_version(version: u32, line: &str, number: u64) -> Result<(), Se
         return Err(SessionError::MalformedEvent {
             line: number,
             detail: format!("version-{version} records cannot contain this typed content"),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses the `output_reserve_follows_model` field in a `context/mode` record below version 6, by
+/// its raw presence, whatever its value.
+///
+/// Read on the raw line, before the record is parsed, because the parser would otherwise refuse a
+/// present `false` with a message about the value rather than the version, and an older reader
+/// would fail part-way through the body. The substring test keeps this off the parse path of every
+/// legacy line: a key the JSON spells with escapes still reaches the parser, which refuses `false`
+/// itself and [`SessionEvent::needs_version_six`] refuses `true`.
+fn validate_follows_field(version: u32, line: &str, number: u64) -> Result<(), SessionError> {
+    if version >= SESSION_FORMAT_VERSION_RESERVE_FOLLOWS_MODEL
+        || !line.contains("output_reserve_follows_model")
+    {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
+            line: number,
+            detail: error.to_string(),
+        })?;
+    let present = value.get("event").is_some_and(|event| {
+        event["type"] == "context/mode"
+            && event["payload"]["policy"]
+                .get("output_reserve_follows_model")
+                .is_some()
+    });
+    if present {
+        return Err(SessionError::MalformedEvent {
+            line: number,
+            detail: format!(
+                "version-{version} records cannot hold a reserve that follows the model"
+            ),
         });
     }
     Ok(())
