@@ -651,6 +651,16 @@ impl ToolAdmission for FullHistory {
             !old(projection.fitted_base),
             "ordinary whole-turn fitting still removes an old group"
         );
+        // C15: the fitted base says what it left out in its tail; the raw view left out nothing,
+        // so it carries none and is costed as a legacy request of the same messages.
+        assert!(
+            projection
+                .fitted_base
+                .context_tail
+                .as_deref()
+                .is_some_and(|tail| tail.contains("not shown"))
+        );
+        assert_eq!(projection.request.context_tail, None);
         assert!(projection.events.iter().any(|event| matches!(event,
             SessionEvent::UserMessage { text, .. } if text.len() > 100_000)));
         assert!(projection.events.iter().all(|event| !matches!(event,

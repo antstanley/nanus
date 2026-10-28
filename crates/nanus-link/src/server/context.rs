@@ -27,7 +27,7 @@ use nanus_domain::context::managed::{
     CheckpointReceipt, ContextDecision, ContextFrontier, ContextMode, ContextStatus,
     DecisionOutcome, Digest, Durability, ErrorCode, ManagedState, ModeActor,
 };
-use nanus_domain::{Session, SessionId};
+use nanus_domain::{Session, SessionId, Usage};
 use nanus_ports::{
     CheckpointError, CheckpointReason, CheckpointView, ExpectedCheckpoint, PersistenceState,
     Reconciled, SessionCheckpoint, StoreHandle, TurnRuntime,
@@ -183,8 +183,11 @@ pub(super) fn wire_decision(decision: &ContextDecision) -> ContextDecisionInfo {
     }
 }
 
-/// Renders a context status in the link's vocabulary.
-pub(super) fn wire_status(status: &ContextStatus) -> ContextStatusInfo {
+/// Renders a context status in the link's vocabulary, with the last request's usage beside it.
+///
+/// The cache share is the link's, not the domain's: the domain status is what the model reads in
+/// a `context_manage` result, and a number that moves on every step would be noise to it.
+pub(super) fn wire_status(status: &ContextStatus, last: Option<&Usage>) -> ContextStatusInfo {
     ContextStatusInfo {
         mode: wire_mode(status.mode),
         revision: status.revision,
@@ -205,6 +208,8 @@ pub(super) fn wire_status(status: &ContextStatus) -> ContextStatusInfo {
         unavailable_reason: status
             .unavailable_reason
             .map(|code| code.as_str().to_owned()),
+        last_prompt_tokens: last.map(|usage| u64::from(usage.prompt_tokens)),
+        last_cache_hit_tokens: last.map(|usage| u64::from(usage.cache_hit_tokens)),
     }
 }
 
@@ -730,7 +735,10 @@ fn published(held: &Held) -> Result<Frame, String> {
     let id = held.next_frame_id();
     Ok(Frame::ContextStatus {
         envelope: held.envelope(snapshot.turn, snapshot.step, id),
-        payload: wire_status(&snapshot.status),
+        payload: Box::new(wire_status(
+            &snapshot.status,
+            held.last_usage.get().as_ref(),
+        )),
     })
 }
 
@@ -754,7 +762,7 @@ fn fresh(registry: &Registry, held: &Held) -> Result<Frame, String> {
     let id = held.next_frame_id();
     let frame = Frame::ContextStatus {
         envelope: held.envelope(None, None, id),
-        payload: wire_status(&status),
+        payload: Box::new(wire_status(&status, held.last_usage.get().as_ref())),
     };
     *held.context.borrow_mut() = Some(Published {
         status,
@@ -1462,7 +1470,12 @@ mod tests {
             managed_ready: false,
             unavailable_reason: Some(ErrorCode::ProtocolIncompatible),
         };
-        let wire = wire_status(&status);
+        let wire = wire_status(&status, None);
+        assert_eq!(wire.last_prompt_tokens, None);
+        assert_eq!(wire.last_cache_hit_tokens, None);
+        let reported = wire_status(&status, Some(&Usage::new(400, 5, 0, 300, 100)));
+        assert_eq!(reported.last_prompt_tokens, Some(400));
+        assert_eq!(reported.last_cache_hit_tokens, Some(300));
         assert_eq!(wire.mode, ContextModeState::Managed);
         assert_eq!(wire.revision, 4);
         assert_eq!(wire.frontier.event_count, 2);
@@ -1479,10 +1492,13 @@ mod tests {
         let decision = wire.last_decision.unwrap_or_else(|| panic!("a decision"));
         assert_eq!(decision.outcome, DecisionState::Rejected);
         assert_eq!(decision.error_code.as_deref(), Some("stale_base"));
-        let legacy = wire_status(&ContextStatus {
-            mode: ContextMode::Legacy,
-            ..status
-        });
+        let legacy = wire_status(
+            &ContextStatus {
+                mode: ContextMode::Legacy,
+                ..status
+            },
+            None,
+        );
         assert_eq!(legacy.mode, ContextModeState::Legacy);
     }
 

@@ -8,7 +8,11 @@
 /// The only policy version this build reads and writes.
 pub const POLICY_VERSION: u32 = 1;
 
-/// The version of the generated-memory and notice rendering, bound into the notes digest.
+/// The renderer version bound into every recorded revision's notes digest.
+///
+/// The digest is checked when a revision is read, so moving this number would make every existing
+/// managed session unreadable. Where the notice and the working data are rendered is versioned by
+/// [`LAYOUT_VERSION`] instead, which no session records.
 pub const RENDERER_VERSION: u32 = 1;
 
 /// The placeholder reservation of a following policy, which no model has resolved yet.
@@ -62,6 +66,20 @@ pub const RECENT_PROTECTED: usize = 2;
 
 /// Encoded bytes of the generated recovery catalog.
 pub const CATALOG_BYTES_MAX: usize = 2 * 1024;
+
+/// Encoded bytes of a managed request's tail: the notice line and the catalog.
+///
+/// The notice line is numbers, enums and opaque ids, well under a kilobyte at every field's widest,
+/// and the catalog has its own bound.
+pub const TAIL_BYTES_MAX: usize = CATALOG_BYTES_MAX + 1024;
+
+/// The managed request layout this build compiles: the per-step notice and the catalog travel in
+/// `ChatRequest::context_tail`, which the adapter places after the newest message.
+///
+/// An adapter declares it beside the policy version it implements, so one built for the earlier
+/// layout — which knew nothing of the tail and would drop it — cannot claim support. It is not
+/// recorded in a session, so moving it costs no session anything.
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// Encoded bytes of one inspect result.
 pub const INSPECT_BYTES_MAX: usize = 8 * 1024;

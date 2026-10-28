@@ -39,6 +39,8 @@
 
 mod config;
 mod error;
+#[cfg(test)]
+mod layout_tests;
 mod managed;
 #[cfg(test)]
 mod managed_tests;
@@ -50,7 +52,7 @@ mod wire;
 
 pub use config::{
     API_KEY_ENV, API_VERSION, AnthropicConfig, DEFAULT_BASE_URL, MAX_OUTPUT_TOKENS, PROVIDER,
-    effort_levels, model_max_output_tokens,
+    effort_levels, model_max_output_tokens, replay_across_tail,
 };
 pub use error::AnthropicError;
 pub use nanus_ports::ReasoningEffort;
@@ -127,9 +129,34 @@ impl AnthropicLlm {
     ///
     /// Exposed so tests and diagnostics can inspect the exact wire payload without
     /// performing a request.
+    ///
+    /// # Panics
+    ///
+    /// When the request carries a tail but does not end with a user message or tool results;
+    /// [`ChatRequest::check_tail`] says so first, and every dispatch checks it.
     #[must_use]
     pub fn encode(&self, request: &ChatRequest) -> serde_json::Value {
         wire::build_request(&self.config, request)
+    }
+
+    /// Encodes an ordinary request under a chosen signed-replay fingerprint rule, returning the
+    /// body and the digest a reply to it binds its signed blocks to.
+    ///
+    /// `across_tail` true leaves the request's tail out of the digest. Production requests take the
+    /// rule from [`replay_across_tail`]; this is what the live acceptance case uses to ask the
+    /// provider whether the relaxed rule is accepted for a model before it is promoted.
+    ///
+    /// # Panics
+    ///
+    /// As [`AnthropicLlm::encode`].
+    #[must_use]
+    pub fn encode_with_replay_rule(
+        &self,
+        request: &ChatRequest,
+        across_tail: bool,
+    ) -> (serde_json::Value, String) {
+        let encoded = wire::encode_with(&self.config, request, wire::Layout::Ordinary, across_tail);
+        (encoded.body, encoded.prefix_digest)
     }
 }
 
@@ -191,6 +218,7 @@ impl LlmPort for AnthropicLlm {
             self.tool_call_support(&request.model, request.reasoning_effort),
             request,
         )?;
+        request.check_tail()?;
         nanus_ports::capabilities::estimate_payload(
             self.capabilities(&request.model),
             request,
@@ -199,6 +227,9 @@ impl LlmPort for AnthropicLlm {
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        if let Err(error) = request.check_tail() {
+            return error_stream(&error.to_string());
+        }
         if let Err(error) = nanus_ports::capabilities::validate_image_input(
             self.capabilities(&request.model),
             &request,
@@ -225,9 +256,11 @@ impl LlmPort for AnthropicLlm {
                 return error_stream(&error.to_string());
             }
         }
-        let payload = self.encode(&request);
-
-        let prefix_digest = wire::request_prefix(&payload);
+        let wire::Encoded {
+            body: payload,
+            prefix_digest,
+            ..
+        } = wire::encode(&self.config, &request, wire::Layout::Ordinary);
         let Ok(body) = serde_json::to_string(&payload) else {
             return error_stream("could not encode the request as JSON");
         };

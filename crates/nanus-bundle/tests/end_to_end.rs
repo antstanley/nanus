@@ -254,16 +254,25 @@ async fn a_conversation_longer_than_the_budget_is_trimmed_with_a_notice() {
         said.iter().any(|text| text.contains("the newest question")),
         "{said:?}"
     );
+    // The notice is the request's tail, after the newest message, so a drop costs a provider's
+    // cache only from the first kept turn; it is never one of the messages.
+    let tail = requests[0].context_tail.clone().unwrap_or_default();
     assert!(
-        said.iter().any(|text| text.contains("not shown")),
-        "the model is told what is missing: {said:?}"
+        tail.contains("not shown"),
+        "the model is told what is missing: {tail:?}"
     );
+    assert!(
+        !said.iter().any(|text| text.contains("not shown")),
+        "{said:?}"
+    );
+    assert!(matches!(
+        requests[0].messages.last(),
+        Some(nanus_domain::Message::User { .. })
+    ));
     // And what was sent is inside the budget, notice included.
-    assert!(
-        nanus_domain::estimate(&requests[0].messages) <= budget,
-        "{} > {budget}",
-        nanus_domain::estimate(&requests[0].messages)
-    );
+    let sent = nanus_domain::estimate(&requests[0].messages)
+        .saturating_add(nanus_domain::context::estimate_tail(&tail));
+    assert!(sent <= budget, "{sent} > {budget}");
 }
 
 #[tokio::test]

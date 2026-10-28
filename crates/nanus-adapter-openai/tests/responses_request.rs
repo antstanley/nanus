@@ -193,20 +193,37 @@ fn whole_turn_fit_preserves_complete_source_and_original_prefix_receipts() {
     let mut request = continuation(&adapter);
     request.messages.push(Message::user("New fictional turn"));
     let source: Arc<[Message]> = request.messages.clone().into();
-    request.messages = nanus_domain::context::fit_with_source(&source, 64_000, |messages| {
-        if messages.len() > 3 { 100_000 } else { 100 }
+    // The notice is the candidate's tail, not one of its messages.
+    let fitted = nanus_domain::context::fit_with_source(&source, 64_000, |messages, _| {
+        if messages.len() > 2 { 100_000 } else { 100 }
     })
-    .unwrap()
-    .messages;
+    .unwrap();
+    request.messages = fitted.messages;
+    request.context_tail = fitted.elision.map(|elision| elision.notice());
     request.source_history = Some(Arc::clone(&source));
     let prepared = adapter.prepare_responses(&request).unwrap();
     assert_eq!(prepared.context_receipt.dropped_turns, 1);
     assert_eq!(prepared.context_receipt.dropped_messages, 4);
+    // The newest turn alone; the prompt stays in `instructions`, which this mode's receipts seal,
+    // and the notice joins it there, as this mode always sent it.
     assert_eq!(prepared.body["input"].as_array().unwrap().len(), 1);
+    assert!(
+        prepared.body["instructions"]
+            .as_str()
+            .unwrap()
+            .ends_with(request.context_tail.as_deref().unwrap())
+    );
     assert_eq!(source.len(), 6);
     let mut rewritten = request.clone();
-    rewritten.messages[1] = Message::system("Invented fitting notice");
+    rewritten.context_tail = Some("Invented fitting notice".into());
     assert!(adapter.prepare_responses(&rewritten).is_err());
+    rewritten = request.clone();
+    let notice = rewritten.context_tail.take().unwrap();
+    rewritten.messages.insert(1, Message::system(notice));
+    assert!(
+        adapter.prepare_responses(&rewritten).is_err(),
+        "a notice among the messages proves no elision"
+    );
     rewritten = request.clone();
     rewritten.context_budget = Some(63_999);
     assert!(adapter.prepare_responses(&rewritten).is_err());

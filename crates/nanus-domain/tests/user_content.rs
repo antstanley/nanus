@@ -266,22 +266,30 @@ fn context_projection_cannot_change_pixels_or_split_a_human_turn() {
         Message::assistant(Some("old answer".into()), None, vec![]),
         input.clone(),
     ];
-    let fitted = nanus_domain::context::fit_with(source.clone(), 4, |messages| {
-        u32::try_from(messages.len().saturating_mul(2)).unwrap()
-    })
-    .unwrap_err();
+    // The tail is charged as one more message, as the notice was when it was one.
+    let cost = |messages: &[Message], tail: Option<&str>| {
+        u32::try_from(
+            messages
+                .len()
+                .saturating_add(usize::from(tail.is_some()))
+                .saturating_mul(2),
+        )
+        .unwrap()
+    };
+    let fitted = nanus_domain::context::fit_with(source.clone(), 4, cost).unwrap_err();
     assert!(matches!(
         fitted,
         nanus_domain::context::FitError::TooLarge { .. }
     ));
-    let kept = nanus_domain::context::fit_with(source.clone(), 6, |messages| {
-        u32::try_from(messages.len().saturating_mul(2)).unwrap()
-    })
-    .unwrap();
+    let kept = nanus_domain::context::fit_with(source.clone(), 6, cost).unwrap();
     assert_eq!(kept.messages.last(), Some(&input));
-    assert!(nanus_domain::context::identify_projection(&source, &kept.messages, 6).is_ok());
+    let tail = kept.elision.map(|elision| elision.notice());
+    assert!(
+        nanus_domain::context::identify_projection(&source, &kept.messages, tail.as_deref(), 6)
+            .is_ok()
+    );
     let mut changed = source.clone();
     changed[3] = Message::user("image omitted");
-    assert!(nanus_domain::context::identify_projection(&source, &changed, 100).is_err());
-    assert!(nanus_domain::context::identify_projection(&source, &source, 100).is_ok());
+    assert!(nanus_domain::context::identify_projection(&source, &changed, None, 100).is_err());
+    assert!(nanus_domain::context::identify_projection(&source, &source, None, 100).is_ok());
 }

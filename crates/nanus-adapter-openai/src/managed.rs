@@ -31,8 +31,9 @@
 //!
 //! ## The grammar
 //!
-//! Leading system messages only (the harness prompt, then the fixed-schema notice); a
-//! conversation that opens with a user message; at most one generated working-data message,
+//! Leading system messages only (the harness prompt, then a seeded session's handoff seed); a
+//! conversation that opens with a user message and ends with a user message or tool results,
+//! which is where the tail goes; at most one generated working-data message,
 //! directly after the first user message and never last, so it is never an assistant prefill;
 //! every surviving call answered once, in place; and no turn only another protocol's replay can
 //! express, which the encoders would otherwise skip silently. A generated message next to an
@@ -48,7 +49,7 @@ use std::collections::BTreeSet;
 
 use nanus_domain::Message;
 use nanus_domain::context::managed::compile::MEMORY_LABEL;
-use nanus_domain::context::managed::limits::POLICY_VERSION;
+use nanus_domain::context::managed::limits::{LAYOUT_VERSION, POLICY_VERSION};
 use nanus_domain::context::managed::{Digest, ErrorCode, SelectionIdentity};
 use nanus_ports::{
     LlmError, LlmPort as _, LlmResult, LlmStream, ManagedRequest, ManagedSupport,
@@ -105,6 +106,7 @@ pub fn support(config: &OpenAiConfig, model: &str) -> ManagedSupport {
     if (chat && exact) || responses_supported(config, model) {
         ManagedSupport::Supported {
             policy_version: POLICY_VERSION,
+            layout_version: LAYOUT_VERSION,
         }
     } else {
         ManagedSupport::Unsupported
@@ -234,7 +236,9 @@ pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCa
         selection_epoch,
     } = managed;
     let config = llm.config();
-    if config.stateless_responses() || !support(config, &request.model).supports(POLICY_VERSION) {
+    if config.stateless_responses()
+        || !support(config, &request.model).supports(POLICY_VERSION, LAYOUT_VERSION)
+    {
         return Err(refuse(
             ErrorCode::UnsupportedMode,
             "managed context is not supported for this model, endpoint or wire",
@@ -256,11 +260,11 @@ pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCa
     )?;
 
     // Encoded once: the estimate, the digest and the dispatch all read this one value. Both
-    // encoders are the ordinary ones, so a managed Responses body differs from an ordinary one
-    // only in what the managed compiler selected.
+    // encoders are the ordinary ones, so a managed body differs from an ordinary one only in what
+    // the managed compiler selected, the tail, and the head breakpoint.
     let payload = match protocol {
         Protocol::ChatCompletions => crate::wire::build_request(config, &request),
-        Protocol::Responses => crate::responses::build_request(config, &request),
+        Protocol::Responses => crate::responses::encode(config, &request, crate::Layout::Managed),
     };
     let estimate = nanus_ports::capabilities::estimate_managed_payload(caps, &request, &payload)?;
     if !estimate.fits(caps, &request) {
@@ -319,7 +323,7 @@ fn check_output(requested: Option<u32>, ceiling: u32) -> LlmResult<()> {
 }
 
 /// Whether `message` is the generated working-data message the runner inserts.
-fn is_generated(message: &Message) -> bool {
+pub fn is_generated(message: &Message) -> bool {
     matches!(
         message,
         Message::Assistant {
@@ -364,7 +368,17 @@ pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
     if anchor_generated && conversation.len() <= 2 {
         return Err(incompatible("generated data is never the last message"));
     }
-    validate_pairs(conversation)
+    validate_pairs(conversation)?;
+    // The tail is placed after the newest message, so there must be one it can follow.
+    if !matches!(
+        conversation.last(),
+        Some(Message::User { .. } | Message::Tool { .. })
+    ) {
+        return Err(incompatible(
+            "the conversation ends with a user message or tool results",
+        ));
+    }
+    Ok(())
 }
 
 /// Every surviving call is answered once, in place; every result answers a surviving call.

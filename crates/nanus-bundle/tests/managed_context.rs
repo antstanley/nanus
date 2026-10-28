@@ -15,7 +15,7 @@ use harness::*;
 use nanus_bundle::{Silent, TurnHost};
 use nanus_domain::context::managed::{
     AttemptOutcome, AttemptPhase, ContextMode, ContextPolicy, DecisionOutcome, ErrorCode,
-    MEMORY_LABEL, ModeActor, RevisionAuthor,
+    MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, MEMORY_LABEL, ModeActor, RevisionAuthor, limits,
 };
 use nanus_domain::{Message, SessionEvent};
 use nanus_ports::{CheckpointReason, PersistenceState};
@@ -101,6 +101,80 @@ fn activation_refuses_an_unsupported_model_without_changing_the_session() {
             .to_jsonl()
             .starts_with(r#"{"format":"nanus.session","version":3,"#)
     );
+}
+
+/// C13: an adapter built for the earlier layout, which would drop the tail, cannot carry a
+/// managed session: enabling is refused and a session already managed is unready, both with
+/// `unsupported_mode`.
+#[test]
+fn an_adapter_declaring_the_earlier_layout_is_unsupported() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = runner(&model, 64_000);
+    let disk = Disk::new();
+    let context = context();
+    model.set_layout(1);
+    let mut session = session();
+    let refused = block(runner.set_context_policy(
+        &mut session,
+        explicit_managed(),
+        ModeActor::Human,
+        host(&disk, &context).runtime,
+    ));
+    assert_eq!(
+        refused.err().and_then(|error| error.managed_code()),
+        Some(ErrorCode::UnsupportedMode)
+    );
+    model.set_layout(2);
+    let (managed, _, _) = managed(&runner);
+    model.set_layout(1);
+    let status = runner
+        .context_status(&managed, host(&disk, &context).runtime)
+        .unwrap();
+    assert!(!status.managed_ready);
+    assert_eq!(status.unavailable_reason, Some(ErrorCode::UnsupportedMode));
+}
+
+/// C13/C11: the managed system prompt ends with the request guide after the unchanged policy, the
+/// notice and catalog travel as the tail, and the tail is never recorded in the session.
+#[test]
+fn the_guide_closes_the_prompt_and_the_tail_is_never_recorded() {
+    const { assert!(limits::POLICY_VERSION == 1) };
+    assert!(MANUAL_POLICY_V1.starts_with("Context management (policy 1)."));
+    let model = <Model as ModelExt>::new(vec![calls(&[("e1", "echo", "{}")]), text("done")]);
+    let runner = runner(&model, 64_000);
+    let (mut session, disk, context) = managed(&runner);
+    block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)))
+        .outcome
+        .unwrap();
+    for request in model.sent() {
+        let Some(Message::System { text }) = request.messages.first() else {
+            panic!("the system prompt leads")
+        };
+        assert!(
+            text.ends_with(&format!("{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}")),
+            "{text}"
+        );
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| matches!(message, Message::System { .. }))
+                .count(),
+            1,
+            "no notice among the messages"
+        );
+        assert!(
+            request
+                .context_tail
+                .as_deref()
+                .is_some_and(|tail| tail.starts_with("[nanus context] mode=managed")),
+            "{:?}",
+            request.context_tail
+        );
+    }
+    let recorded = session.to_jsonl();
+    assert!(!recorded.contains("[nanus context]"), "{recorded}");
+    assert!(!disk.last().to_jsonl().contains("[nanus context]"));
 }
 
 /// T02/T03/T31: a long turn is fitted by hiding whole old fragments, every user message stays,
@@ -350,13 +424,21 @@ fn a_valid_proposal_is_staged_then_accepted_after_its_step_settles() {
             .iter()
             .any(|message| matches!(message, Message::User { .. }))
     );
-    assert!(matches!(last.messages.get(2), Some(Message::User { .. })));
+    assert!(matches!(last.messages.get(1), Some(Message::User { .. })));
+    // A hide-only revision with no notes and no goal has no working data: what is hidden is
+    // named by the catalog in the tail, after the newest message.
     assert!(
-        last.messages
-            .get(3)
-            .and_then(Message::text)
-            .is_some_and(|text| text.starts_with(MEMORY_LABEL)),
-        "generated data follows the first user message"
+        !last.messages.iter().any(|message| message
+            .text()
+            .is_some_and(|text| text.starts_with(MEMORY_LABEL))),
+        "no generated data without notes or a goal"
+    );
+    assert!(
+        last.context_tail
+            .as_deref()
+            .is_some_and(|tail| tail.contains("\nHidden history: 1 of")),
+        "{:?}",
+        last.context_tail
     );
     assert_eq!(&disk.last(), &session);
 }

@@ -155,16 +155,31 @@ pub struct Elision {
     pub dropped_messages: u32,
     /// How many turns those messages made up.
     pub dropped_turns: u32,
-    /// The estimated size of the prompt that was sent, notice included.
+    /// The estimated size of the prompt that was sent, its notice included.
     pub kept_tokens: u32,
     /// The budget it was fitted into.
     pub budget: u32,
 }
 
+impl Elision {
+    /// The notice the model reads about this elision.
+    ///
+    /// It is the request's tail (`ChatRequest::context_tail`): the adapter places it after the
+    /// newest message, not at the gap. A notice at the gap sat ahead of every kept turn, so each
+    /// drop rewrote the prefix a provider cache could serve — on a wire that joins system
+    /// messages, the system prompt's own entry included. The sentence already says the oldest
+    /// thing shown is not the start, which reads the same at the end of the request.
+    #[must_use]
+    pub fn notice(&self) -> String {
+        notice_for(self.dropped_messages, self.dropped_turns, self.budget)
+    }
+}
+
 /// A conversation that fits, and what was dropped to make it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fitted {
-    /// The messages to send, with the notice already in place.
+    /// The messages to send. The notice is not among them: it is [`Elision::notice`], which the
+    /// request carries as its tail.
     pub messages: Vec<Message>,
     /// What was left out, when anything was.
     pub elision: Option<Elision>,
@@ -248,38 +263,55 @@ pub fn estimate_message(message: &Message) -> u32 {
 /// The leading run of non-human messages — the system prompt — is never dropped, because
 /// everything after it depends on it, and the newest turn is never dropped, because it is the
 /// question. Everything between is dropped whole, oldest first, until what remains fits along
-/// with the notice that says so.
+/// with the notice that says so. The notice is the request's tail rather than a message, and it is
+/// costed as [`estimate`] costs a system message of the same text.
 ///
 /// # Errors
 ///
 /// Returns [`FitError::TooLarge`] when the prompt that cannot be shortened further does not fit.
 pub fn fit(messages: Vec<Message>, budget: u32) -> Result<Fitted, FitError> {
-    fit_with(messages, budget, estimate)
+    fit_with(messages, budget, |messages, tail| {
+        estimate(messages).saturating_add(tail.map_or(0, estimate_tail))
+    })
+}
+
+/// Estimates the tokens a request's tail costs: as a system message of the same text.
+#[must_use]
+pub fn estimate_tail(tail: &str) -> u32 {
+    let tokens = tail
+        .chars()
+        .count()
+        .checked_div(CHARS_PER_TOKEN)
+        .unwrap_or_default();
+    TOKENS_PER_MESSAGE.saturating_add(u32::try_from(tokens).unwrap_or(u32::MAX))
 }
 
 /// Fits whole original turns using the caller's provider-aware cost function.
 ///
-/// The estimator must include schemas, translated framing and output reservation.
+/// The estimator must include schemas, translated framing and output reservation, and the tail it
+/// is passed: the elision notice the candidate would carry, or `None` when nothing was dropped.
 /// It returns an upward-bounded cost; `u32::MAX` means the candidate cannot fit.
 /// # Errors
 /// Returns [`FitError::TooLarge`] if the newest turn cannot fit.
 pub fn fit_with(
     messages: Vec<Message>,
     budget: u32,
-    cost: impl FnMut(&[Message]) -> u32,
+    cost: impl FnMut(&[Message], Option<&str>) -> u32,
 ) -> Result<Fitted, FitError> {
     let source: std::sync::Arc<[Message]> = messages.into();
     fit_with_source(&source, budget, cost)
 }
 
 /// Fits a borrowed immutable source without deleting the original history.
-/// The result owns only its fitted message projection; notices and whole-turn policy are unchanged.
+///
+/// The result owns only its fitted message projection; the notice is the result's
+/// [`Elision::notice`], costed by `cost` as the candidate's tail, and whole-turn policy is unchanged.
 /// # Errors
 /// Returns [`FitError::TooLarge`] if the newest complete turn cannot fit.
 pub fn fit_with_source(
     messages: &[Message],
     budget: u32,
-    mut cost: impl FnMut(&[Message]) -> u32,
+    mut cost: impl FnMut(&[Message], Option<&str>) -> u32,
 ) -> Result<Fitted, FitError> {
     let head = leading_prompt(messages);
     let tail = &messages[head..];
@@ -287,7 +319,7 @@ pub fn fit_with_source(
     if turns.is_empty() {
         // No human turn at all: there is nothing to drop and nothing to answer, so the only
         // question is whether the prompt itself fits.
-        let estimated = cost(messages);
+        let estimated = cost(messages, None);
         if estimated > budget {
             return Err(FitError::TooLarge { estimated, budget });
         }
@@ -303,13 +335,11 @@ pub fn fit_with_source(
         let kept = &tail[turns[dropped_turns]..];
         let dropped_messages = u32::try_from(turns[dropped_turns]).unwrap_or(u32::MAX);
         let turns_dropped = u32::try_from(dropped_turns).unwrap_or(u32::MAX);
-        let notice = notice_for(dropped_messages, turns_dropped, budget);
+        let notice =
+            (dropped_messages > 0).then(|| notice_for(dropped_messages, turns_dropped, budget));
         let mut candidate: Vec<Message> = messages[..head].to_vec();
-        if let Some(notice) = &notice {
-            candidate.push(notice.clone());
-        }
         candidate.extend_from_slice(kept);
-        let kept_tokens = cost(&candidate);
+        let kept_tokens = cost(&candidate, notice.as_deref());
         if kept_tokens <= budget {
             let elision = notice.map(|_| Elision {
                 dropped_messages,
@@ -359,21 +389,21 @@ fn split_turns(messages: &[Message]) -> Vec<usize> {
         .collect()
 }
 
-/// Builds the notice a trimmed prompt carries, or `None` when nothing was dropped.
+/// Builds the notice a trimmed prompt carries.
 ///
-/// A system message rather than an aside in the newest turn: it is the harness speaking about
-/// the conversation, and a model that reads it knows the gap is there rather than inferring a
-/// beginning that was never shown.
-fn notice_for(dropped_messages: u32, dropped_turns: u32, budget: u32) -> Option<Message> {
-    if dropped_messages == 0 {
-        return None;
-    }
-    Some(Message::system(format!(
+/// It is the request's tail, after the newest message, rather than a system message at the gap.
+/// At the gap it sat ahead of every kept turn — on Anthropic, inside the system field itself — so
+/// every drop cost the cached prefix from the tool schemas on; at the end a drop costs only from
+/// the first kept turn, which changed anyway. The wording is unchanged: it tells the model the
+/// oldest thing shown is not the start, so the model does not infer a beginning it never saw,
+/// wherever the sentence sits. The reader is still told at the gap, by the elision report.
+fn notice_for(dropped_messages: u32, dropped_turns: u32, budget: u32) -> String {
+    format!(
         "Earlier parts of this conversation are not shown: {dropped_messages} messages \
          ({dropped_turns} turns) were left out because the prompt budget of {budget} estimated \
          tokens was reached. The oldest thing shown is where the drop ends, not the start of \
          the conversation.",
-    )))
+    )
 }
 
 #[cfg(test)]
@@ -613,7 +643,8 @@ mod tests {
         );
     }
 
-    /// The model is told, at the point where the gap is, and the report says the same thing.
+    /// The model is told, in the request's tail rather than at the gap, and the report says the
+    /// same thing.
     #[test]
     fn a_trimmed_prompt_carries_a_notice_and_a_report() {
         let messages = conversation(4, 400);
@@ -621,24 +652,19 @@ mod tests {
         let fitted = fit(messages, budget).expect("it fits once trimmed");
         let elision = fitted.elision.expect("something was dropped");
 
-        let notice = fitted
-            .messages
-            .iter()
-            .find(|message| {
-                message
-                    .text()
-                    .is_some_and(|text| text.contains("not shown"))
-            })
-            .expect("the model is told");
-        // Between the prompt and the oldest thing kept, which is where the gap is.
-        assert!(matches!(notice, Message::System { .. }));
-        assert_eq!(
-            fitted.messages.get(1).and_then(Message::text),
-            notice.text(),
-            "the notice sits where the drop ends"
+        // The notice is not a message: nothing between the prompt and the oldest kept turn, and
+        // nothing anywhere else, says it.
+        assert!(
+            !fitted.messages.iter().any(|message| message
+                .text()
+                .is_some_and(|text| text.contains("not shown"))),
+            "{:?}",
+            fitted.messages
         );
+        assert!(matches!(fitted.messages.get(1), Some(Message::User { .. })));
         // The report agrees with the notice about what was left out.
-        let text = notice.text().unwrap_or_default();
+        let text = elision.notice();
+        assert!(text.contains("not shown"), "{text}");
         assert!(
             text.contains(&elision.dropped_messages.to_string()),
             "{text} / {elision:?}"
@@ -649,8 +675,8 @@ mod tests {
         );
     }
 
-    /// The notice costs tokens, and the policy pays for it: a prompt that only fits without one
-    /// drops another turn rather than quietly exceeding the budget.
+    /// The notice costs tokens as the tail, and the policy pays for it: a prompt that only fits
+    /// without one drops another turn rather than quietly exceeding the budget.
     #[test]
     fn the_notice_is_counted_against_the_budget() {
         let messages = conversation(6, 100);
@@ -663,11 +689,91 @@ mod tests {
             fitted.elision.map(|_| (budget, fitted))
         });
         let (budget, fitted) = trimmed.expect("some budget trims this conversation");
+        let notice = fitted.elision.map(|elision| elision.notice());
+        let sent = estimate(&fitted.messages)
+            .saturating_add(estimate_tail(notice.as_deref().unwrap_or_default()));
         assert!(
-            estimate(&fitted.messages) <= budget,
-            "the sent prompt is inside the budget, notice included: {} > {budget}",
-            estimate(&fitted.messages)
+            sent <= budget,
+            "the sent prompt is inside the budget, notice included: {sent} > {budget}"
         );
+    }
+
+    /// Costed as the tail, the notice costs exactly what it cost as a system message, so the
+    /// stock fitter keeps the same turns for the same budget as it did when the notice was one.
+    #[test]
+    fn the_fitter_keeps_the_same_turns_it_kept_with_the_notice_as_a_message() {
+        for (turns, size) in [(4, 400), (6, 100), (7, 200), (12, 50)] {
+            let messages = conversation(turns, size);
+            let full = estimate(&messages);
+            for cut in (1..full).step_by(7) {
+                let budget = full.saturating_sub(cut);
+                let tailed = fit(messages.clone(), budget).ok();
+                let as_message = fit_with(messages.clone(), budget, |candidate, tail| {
+                    let mut sent = candidate.to_vec();
+                    if let Some(tail) = tail {
+                        sent.insert(1, Message::system(tail));
+                    }
+                    estimate(&sent)
+                })
+                .ok();
+                assert_eq!(tailed, as_message, "{turns} turns at {budget}");
+            }
+        }
+    }
+
+    /// The tail's framing decides a boundary case each way: an adapter that charges the tail one
+    /// token more than a message drops a turn the stock cost keeps, and one that charges it one
+    /// token less keeps a turn the stock cost drops.
+    #[test]
+    fn the_tail_framing_decides_a_boundary_case_each_way() {
+        let messages = conversation(8, 800);
+        let framed = |extra: i64| {
+            move |candidate: &[Message], tail: Option<&str>| {
+                let base = i64::from(estimate(candidate))
+                    .saturating_add(i64::from(tail.map_or(0, estimate_tail)));
+                let cost = if tail.is_some() {
+                    base.saturating_add(extra)
+                } else {
+                    base
+                };
+                u32::try_from(cost).unwrap_or(u32::MAX)
+            }
+        };
+        let dropped = |budget: u32, extra: i64| {
+            fit_with(messages.clone(), budget, framed(extra))
+                .ok()
+                .and_then(|fitted| fitted.elision)
+                .map(|elision| elision.dropped_turns)
+        };
+        // Every candidate's stock cost under `budget`, oldest drop first. The notice names the
+        // budget, so a cost is only exact under the budget it was recorded for.
+        let costs_at = |budget: u32| {
+            let mut costs = Vec::new();
+            let _ = fit_with(messages.clone(), budget, |candidate, tail| {
+                costs.push(framed(0)(candidate, tail));
+                u32::MAX
+            });
+            costs
+        };
+        // The budget that is exactly the cost of the candidate with `drops` turns dropped.
+        let exact = |drops: usize, offset: u32| {
+            let mut budget = 1_000_u32;
+            for _ in 0..4 {
+                budget = costs_at(budget)[drops].saturating_sub(offset);
+            }
+            assert_eq!(costs_at(budget)[drops].saturating_sub(offset), budget);
+            budget
+        };
+        // Exactly at the cost of the candidate with two turns dropped: one more framing token
+        // drops a third.
+        let two = exact(2, 0);
+        assert_eq!(dropped(two, 0), Some(2));
+        assert_eq!(dropped(two, 1), Some(3));
+        // One token under the cost of the candidate with one turn dropped: one fewer framing
+        // token keeps that turn.
+        let under_one = exact(1, 1);
+        assert_eq!(dropped(under_one, 0), Some(2));
+        assert_eq!(dropped(under_one, -1), Some(1));
     }
 
     /// The same input gives the same answer, which is what makes two runs comparable.

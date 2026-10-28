@@ -414,16 +414,20 @@ fn notes_bound_to_an_older_goal_are_marked_stale() {
     let last = model.sent().pop().unwrap();
     let memory = last
         .messages
-        .get(3)
+        .get(2)
         .and_then(nanus_domain::Message::text)
         .unwrap_or_default()
         .to_owned();
     assert!(memory.contains("n:echo"), "{memory}");
-    assert!(
-        memory.contains("STALE"),
-        "the goal moved after the notes: {memory}"
-    );
     assert!(memory.contains("a new direction"));
+    // Staleness moves with the goal, so it is stated in the tail rather than in the working data
+    // that heads the cached prefix.
+    assert!(!memory.contains("STALE"), "{memory}");
+    let tail = last.context_tail.unwrap_or_default();
+    assert!(
+        tail.contains("notes_stale=true"),
+        "the goal moved after the notes: {tail}"
+    );
 }
 
 /// What one reservation was shown: the original request's length, and the managed revision and

@@ -102,6 +102,20 @@ pub fn model_max_output_tokens(model: &str) -> u32 {
     }
 }
 
+/// Whether a signed thinking block survives the removal of the tail it was produced under.
+///
+/// A step's tail is gone from the next request, so a reply's signed blocks are replayed on the
+/// next step only when the provider does not bind them to it. Whether it does is not documented,
+/// and a wrong guess turns every managed step after the first into a refusal, so it is `false` for
+/// every model until a live case (`nanus-bundle/tests/live_cache.rs`) records an acceptance for
+/// that model. Until then the replay fingerprint includes the tail, and such a reply is sent in its
+/// neutral form — text and tool calls, without its thinking.
+#[must_use]
+pub const fn replay_across_tail(model: &str) -> bool {
+    let _ = model;
+    false
+}
+
 /// The adapter's settings.
 ///
 /// `Debug` is implemented by hand so the API key cannot leak into a log line; this

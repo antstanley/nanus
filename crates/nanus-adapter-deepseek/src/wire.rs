@@ -3,6 +3,17 @@
 //! This module is the only place that knows `DeepSeek`'s JSON shapes. Keeping it
 //! separate means the precise — and occasionally surprising — rules can be read in
 //! one sitting and tested without a network.
+//!
+//! ## The tail
+//!
+//! A request's tail is appended to the final message's content: a trailing text part when the
+//! content is a list, otherwise after a blank line. A new trailing user message after tool
+//! results would read as the person interrupting the tool loop, and would open a new turn in
+//! thinking mode; a mid-conversation system message is not established here. `DeepSeek` caches
+//! in whole units ending at the end of the input and of the output, so both of a step's end units
+//! hold that step's tail and its hits come about one step behind a tail-free conversation. Every
+//! other message, an assistant's `reasoning_content` included, encodes to the same bytes whether
+//! or not it is the newest.
 
 use nanus_domain::{Message, ToolSchema, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, ReasoningEffort};
@@ -66,12 +77,32 @@ pub fn build_request(config: &DeepSeekConfig, request: &ChatRequest) -> Value {
     if !request.tools.is_empty() {
         body.insert("tools".to_owned(), encode_tools(&request.tools));
     }
-    let encoded = Value::Object(body);
+    let mut encoded = Value::Object(body);
+    if let Some(tail) = request.context_tail.as_deref() {
+        append_tail(&mut encoded["messages"], tail);
+    }
     // Postcondition: the mandatory fields are present, so a silently empty request
     // cannot be produced by a later edit.
     assert!(encoded.get("model").is_some());
     assert!(encoded.get("messages").is_some());
     encoded
+}
+
+/// Appends the tail to the final message's content.
+fn append_tail(messages: &mut Value, tail: &str) {
+    let last = messages.as_array_mut().and_then(|turns| turns.last_mut());
+    assert!(last.is_some(), "a tail follows a message");
+    let Some(last) = last else {
+        return;
+    };
+    match &mut last["content"] {
+        Value::Array(parts) => parts.push(json!({ "type": "text", "text": tail })),
+        Value::String(text) => {
+            text.push_str("\n\n");
+            text.push_str(tail);
+        }
+        other => *other = json!(tail),
+    }
 }
 
 /// Writes the thinking-mode fields.

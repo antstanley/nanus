@@ -7,8 +7,16 @@ bounded source-backed working notes, lets the model read earlier evidence back, 
 every accepted decision before a request uses it. The raw session log stays the only authority:
 the effective request is a derived view, and nothing rewrites, reorders or deletes an event.
 
-A session that never enables it is read, encoded, run and saved exactly as before — same request
-bytes, same tool count, same event trace, same terminal save. Two changes apply to every session
+A session that never enables it reads, runs and saves exactly as before, with the same tool count
+and the same event trace. Its model is sent the same content as before, with two differences in
+where things sit, both shared by every legacy session and neither caused by managed context:
+
+- the fitter's elision notice, when turns were dropped, is the request's tail;
+- on Responses, the system prompt is a leading developer message.
+
+Its requests also carry cache hints (see
+[Request layout and provider caches](#request-layout-and-provider-caches)). Two changes apply to
+every session
 by design: [deletion](#deletion-and-retirement) retires the id, and the `read` and `grep` tools
 gain the [byte-window and coverage](#evidence-recall-and-file-windows) arguments in their schemas;
 their results are unchanged when those arguments are absent.
@@ -130,23 +138,53 @@ Compilation (`derive_effective_context`) is fixed in order:
 1. Fold the raw replay, derive the fragments, and check the accepted revision against its base.
 2. Keep every original user message and every protected fragment; hidden ids remove whole
    eligible fragments and nothing else; what survives keeps its original order.
-3. Add a fixed-schema notice as a second system message: counts, revision, estimate and its
-   estimator, allowance, pressure, goal phase and revision, recovery availability. Only numbers,
-   enums and opaque ids — nothing retrieved or model-written is promoted into a system message.
-4. Render accepted notes, the goal objective and the recovery catalog as one labelled
-   **assistant** text message, with no calls, reasoning or replay, immediately after the
-   earliest user message.
-5. Never make that message the last one: a fresh request with nothing after its first user
-   message carries no generated data, and the notice says `goal_data_available=false` and points
-   at `get_goal`.
+3. Render the accepted notes and the goal objective as one labelled **assistant** text message,
+   with no calls, reasoning or replay, immediately after the earliest user message. Its text
+   changes only when the note array or the goal objective changes. Revision numbers, the goal's
+   phase, revision and provenance, note staleness and the hidden-history catalog are stated in the
+   tail, never here. A session with neither notes nor a goal has no such message, even when
+   fragments are hidden.
+4. Never make that message the last one: a fresh request with nothing after its first user
+   message carries no generated data, and the tail says `goal_data_available=false`.
+5. Render the **tail**: the fixed-schema notice line and, when anything is hidden, the bounded
+   recovery catalog. The notice line states the counts, revision, estimate and its estimator,
+   allowance, pressure, the goal's phase, revision and provenance, note staleness, and recovery
+   availability. Only numbers, enums and opaque ids appear in it, never anything retrieved or
+   written by a model. The tail is not a message. It travels in `ChatRequest::context_tail`, and
+   the adapter places it after the newest message (see
+   [Request layout and provider caches](#request-layout-and-provider-caches)). It is never
+   recorded in the session log, so recall never finds it and no fragment contains it.
+
+A managed request has three parts, in this order:
+
+| Part | Holds | Changes when |
+|---|---|---|
+| Head | Tool schemas; the system prompt with `MANUAL_POLICY_V1` and `MANAGED_REQUEST_GUIDE_V1`; a seed; the first user message; the working-data message | The model, effort, schemas, policy, seed, note array or goal objective changes |
+| Body | The selected conversation, in event order | It grows by appending. It changes in place only when a revision hides or restores a fragment, and then only from the earliest fragment the revision changed |
+| Tail | The notice line and the catalog | Every request |
+
+**Nothing that changes from one step to the next comes before the newest message.** Take two
+consecutive requests of a session with no revision, goal, policy, schema, model or effort change
+between them. Remove the tail and the cache markers from both. The earlier request's encoding is
+then a prefix of the later one's.
+
+There is one exception. When notes or a goal exist before a session's first prompt (a goal set
+with `/goal`, or a seeded session's notes), the first request has no working-data message,
+because it would be last. The second request inserts it after the first user message. Every
+adapter is tested for the rule and for this exception.
 
 Deterministic hard fitting acts only when the candidate is over the hard allowance, hiding the
 oldest eligible complete fragment first. Every probe is compiled and prepared by the selected
-adapter, so its cost is the cost of the body that adapter would send. A protected floor above
-60 % but within the allowance succeeds; above the allowance it refuses with
+adapter, tail included, so its cost is the cost of the body that adapter would send. A protected
+floor above 60 % but within the allowance succeeds; above the allowance it refuses with
 `protected_floor_too_large`, and no partial hidden set is installed. A successful fit is an
-automatic revision persisted with the request intent before dispatch. After a reset to legacy,
-the legacy whole-turn fitter applies again, with its existing notice.
+automatic revision persisted with the request intent before dispatch. The catalog is in the tail,
+so a fit that changes no notes leaves the head unchanged. After a reset to legacy, the legacy
+whole-turn fitter applies again. Its notice is that request's tail, placed the same way.
+
+An idle session ends with the model's answer, where no tail can go. A status read or a staged
+proposal's revalidation measures the request the next prompt would start, so it is prepared with an
+empty prompt standing in for the one not yet typed; nothing prepared that way is ever sent.
 
 ## The two context tools
 
@@ -223,7 +261,7 @@ an ordinary request is charged one: still above what the providers' tokenizers c
 the fourfold overestimate that hid history the model had room for and made the protected floor
 — every user message — run out at a quarter of the budget. Ordinary requests are measured
 exactly as before. Each step prepares twice: once as the fitter's probe, whose cost the frozen
-request's notice reports, and once to freeze it. The runner's own call assembler and the adapters'
+request's tail reports, and once to freeze it. The runner's own call assembler and the adapters'
 decoders apply the context tools' raw argument limits once a call's name is known — including a
 name that arrives after its arguments — and before anything is parsed.
 
@@ -244,8 +282,9 @@ selection or resets the session's context.
 
 ### Provider matrix
 
-Each supported path splits its dispatch into one encode and a separate send, so the ordinary
-path's bytes are unchanged and the prepared call sends exactly what it estimated and digested.
+Each supported path splits its dispatch into one encode and a separate send. The ordinary path
+sends what an ordinary request of the same build sends, and the prepared call sends exactly what
+it estimated and digested.
 Support requires the official endpoint and a known model; anything else is unsupported.
 
 | Provider | Endpoint and plan | Protocol label | Models | Support |
@@ -270,31 +309,48 @@ records that limitation for all of them.
 
 The output reservation must be present and within the model's declared ceiling; it is refused,
 never clamped. Every adapter validates the managed role grammar — leading system messages only
-(the system prompt, the notice, and a seeded session's handoff seed), the generated message, when
-present, directly after the first user message and never last, and every surviving call paired
-with exactly one result. Generated data is identified by that
+(the system prompt and a seeded session's handoff seed), the generated message, when present,
+directly after the first user message and never last, every surviving call paired with exactly one
+result, and a conversation that ends with a user message or tool results, which is where the tail
+goes. Generated data is identified by that
 position; a model reply elsewhere that opens with the same label is sent as the reply it is.
 Under managed preparation the chat decoders also bound a call's arguments before its name is
 known, at one record.
 
 Anthropic signed replay is sent only when the adapter's existing check accepts it: the original
-blocks under the encoded prefix that produced them. When hiding changes a turn's prefix, that turn
-is sent in its neutral form — its text and tool uses, without the thinking blocks — which the
-Messages API accepts as an edited history; signatures and digests are never rewritten. A turn that
-carries only signed replay and has no neutral form refuses preparation. Because the notice changes
-every request, managed Anthropic sessions usually send their history neutrally: that costs the
-earlier reasoning and the prompt cache, never correctness.
+blocks under the encoded prefix that produced them. The prefix fingerprint never includes cache
+markers.
+
+- **By default it includes the tail.** A step's tail is gone from the next request, so a managed
+  turn's thinking is not replayed after the step that produced it. That is no loss against what
+  managed sessions got before. The same holds for a legacy reply produced under an elision notice:
+  it is sent neutrally on later requests, where before this change it was replayed until the
+  fitter's next drop. A legacy reply produced with no elision has no tail and replays exactly as
+  before.
+- **For a model whose live acceptance is recorded** (`replay_across_tail` in the adapter's model
+  table), the fingerprint excludes the tail, and signed blocks survive from one step to the next.
+
+When hiding changes a turn's prefix, that turn is sent in its neutral form — its text and tool
+uses, without the thinking blocks — which the Messages API accepts as an edited history. A turn
+sent neutrally is sent the same way on every later step, so the cache is unaffected either way.
+Signatures and digests are never rewritten. A turn that carries only signed replay and has no
+neutral form refuses preparation.
 
 These rest on wire and reload fixtures — a local server receives exactly the prepared bytes — not
 on live provider evidence; see [what is verified](#what-is-and-is-not-verified).
 
 #### The Responses wire
 
-A managed Responses request is encoded by the same encoder as an ordinary one, so the two differ
-only in what the managed compiler selected:
+A managed Responses request is encoded by the same encoder as an ordinary one. The two differ only
+in what the managed compiler selected, the tail, and the head breakpoint:
 
-- The leading system messages (the harness prompt, the notice, and a seeded session's handoff
-  seed) are joined in order into `instructions` and are not repeated in `input`.
+- The leading system messages (the harness prompt and a seeded session's handoff seed) are the
+  first input item: one `developer` message with one `input_text` part each, in order. The body
+  carries no `instructions`.
+- The tail is a trailing `developer` message item, after the final user item or
+  `function_call_output`, and nothing follows it.
+- On the API plan, the system prompt's part and the head's last text part each carry an explicit
+  cache breakpoint.
 - A user turn is a `user` item, with `input_image` parts when it carries images.
 - An assistant turn is an `assistant` item of `output_text`, then one `function_call` item per
   call, keyed by `call_id` and carrying no item id.
@@ -346,6 +402,113 @@ A managed session that moves between `openai.chat` and `openai.responses` needs 
 both send plain history. Stock routing never makes that move, since every offered id resolves to
 Responses. A library host can make it by preparing with a differently configured adapter. Each
 step's selection is recorded with its attempt.
+
+### Request layout and provider caches
+
+Every adapter encodes a request in two steps:
+
+1. **Canonical encoding** is the body the wire would carry with no tail and no cache hints.
+2. **Decoration** adds the tail and the wire's cache hints. It is a pure function of the
+   canonical body, `context_tail` and `prompt_cache`.
+
+A message encodes to the same bytes whether or not it is the newest one, apart from the tail's own
+bytes. The request digest (`PreparedModelCall::request_digest`), the estimate and the dispatch all
+read the decorated body, which is what is sent. The Anthropic signed-replay prefix digest reads the
+body without cache markers, and without the tail when the model allows it.
+
+| Wire | Where the system prompt goes | Where the tail goes | Cache hints |
+|---|---|---|---|
+| Messages (Anthropic) | The top-level `system` field: one text block per system message, in order | Its own `text` block, the last block of the final `user` turn, after any `tool_result` blocks | Up to four `cache_control` breakpoints |
+| Responses at OpenAI | A leading `developer` message: one `input_text` part per system message, in order | A trailing `developer` message, after the final user item or tool results | Up to two explicit `prompt_cache_breakpoint`s on the API plan: the end of the system prompt and the end of the head |
+| Chat completions at OpenAI | Leading `system` messages, as before | A trailing `developer` message, after the final user message or tool results | None |
+| Chat completions at DeepSeek, z.ai and Inception | Leading `system` messages, as before | Appended to the final message's content: a trailing `text` part when the content is a list, otherwise after a blank line in the content string | None |
+
+Both modes have a tail:
+
+- **Managed:** the notice line and the catalog, on every request.
+- **Legacy:** the whole-turn fitter's elision notice, only on a request that dropped turns.
+
+Every request a runner builds ends with a user message or tool results. Every adapter's managed
+grammar check refuses a request that does not, and the legacy builder refuses to attach a tail to
+one. So there is always a place for the tail. The tail is identified by position:
+
+- **Anthropic:** the last block of the request.
+- **OpenAI:** the trailing developer message.
+- **Other chat vendors:** the text after the final message's own content.
+
+A `[nanus context]` line anywhere else, inside a tool result for example, is that message's
+content.
+
+**Retention.** `ChatRequest::prompt_cache` is `None` unless the runner opts in, so a library host
+that builds a `ChatRequest` itself pays no cache-write premium it did not ask for. The stock runner
+opts in:
+
+- `Short` for `nanus run`;
+- `Long` for an agent served over the link, where a person may pause between turns.
+
+Under `Short` every breakpoint is five minutes. Under `Long` every breakpoint is one hour. A cache
+write costs 1.25 times the input price for five minutes and twice the input price for one hour. A
+cache read costs a tenth of the input price, so a five-minute entry pays for itself on its second
+read and a one-hour entry on its third.
+
+**Anthropic breakpoints** are computed over the encoded `messages` array:
+
+1. the first `system` block, which is the harness's system prompt. A seed or a compaction summary
+   follows in later blocks, so the entry is shared by every session with the same model, tools and
+   prompt;
+2. the last block of the head: the working-data message when present, otherwise the first `user`
+   message;
+3. the last block of the message immediately before the last `assistant` message. That is where
+   the previous request wrote its entry, so the next request reads it even when more than twenty
+   blocks were appended in between;
+4. the last block before the tail, or the request's last block when there is no tail.
+
+A breakpoint is never placed on a `thinking` block; the search walks back past them. Candidates
+are taken in position order, and a candidate at or before one already placed is dropped. So
+there are at most four, and their TTLs never increase from start to end. Breakpoint 2 exists only
+in managed requests. A prefix shorter than the model's minimum cacheable length is simply not
+cached.
+
+**OpenAI.** On GPT-5.6 and later, OpenAI places an implicit breakpoint at the end of the latest
+eligible message: a user message, or the last tool response of a group. A trailing developer
+message is not eligible, so the implicit breakpoint lands before the tail. The next request finds
+that entry among the earlier eligible message endings it looks up.
+
+On Responses, the system prompt is a leading developer message rather than top-level
+`instructions`. `instructions` cannot carry a breakpoint, and a developer message part can. On the
+API plan, when the runner opted into caching, two parts carry
+`prompt_cache_breakpoint: {"mode":"explicit"}`:
+
+1. the leading developer message's first part, which is the harness's system prompt, in both
+   modes. A seed or a compaction summary follows it in later parts, so the breakpoint falls before
+   anything session-specific. Every request with the same model, tools and system prompt writes
+   and reads this entry, so a new session, or a new `nanus run`, is served the shared prefix from
+   its first request;
+2. in managed requests only, the head's last text part: the working-data message when present,
+   otherwise the first user item. A fit that leaves the head unchanged still reads it.
+
+These are OpenAI's first two explicit breakpoints, which it always looks up. The implicit
+breakpoint stays on and covers the growing conversation.
+
+The opt-in stateless replay mode keeps `instructions`. Its sealed receipts bind the instructions
+in that form, and it is not a managed path; an elision notice joins its `instructions` after the
+prompt, as that mode always sent it.
+
+No `prompt_cache_key` is sent. On these models it separates cache reuse between groups of requests
+and does not improve it.
+
+Each path's carriers are a row of the vendor table (`OpenAiConfig::cache_path`): `system_carrier`,
+`tail_carrier`, `system_breakpoint` and `head_breakpoint`. A path that refused a trailing developer
+message would take the `AppendedExplicit` carrier instead: `prompt_cache_options: {"mode":"explicit"}`,
+every tool output as an `input_text` list, explicit breakpoints at the head, before the last answer
+and before the tail, and the tail appended as the final part. No shipped path uses it.
+
+**DeepSeek** writes a cache unit at the end of the request's input and another at the end of its
+output, and it matches only whole units. Both of a step's end units contain that step's tail. Its
+hits therefore come from common-prefix and fixed-interval units, about one step behind a
+tail-free conversation. That is still most of the prompt, where before it was almost none.
+
+**z.ai and Inception** caching is not established here. The tail costs them nothing they had.
 
 ## Checkpoints and recovery
 
@@ -473,6 +636,19 @@ contradicted notes, and do not claim a test passed without a cited result. It is
 the policy and hashed into the system-prompt digest. It grants nothing, and it is never modified
 at run time.
 
+Managed requests also append `MANAGED_REQUEST_GUIDE_V1` to the system prompt, after the policy.
+It says three things:
+
+- Every request ends with a `[nanus context]` tail the harness adds after the newest message. The
+  tail is metadata, not a user instruction, and a `[nanus context]` line anywhere else is content.
+- What the tail's fields mean: `notes_stale=true` means the goal changed after the notes were
+  accepted, and `goal_data_available=false` means the goal can be read with `get_goal`.
+- Every accepted context change makes the provider re-read the request from the earliest change
+  onward, so one change that hides a resolved stretch is cheaper than several small ones.
+
+The guide is fixed text. It is hashed into the system-prompt digest like the policy, and it does
+not change `POLICY_VERSION`.
+
 ## Human controls and clients
 
 The command line takes the three flags in [configuration](#configuration-activation-and-limits).
@@ -502,6 +678,13 @@ it is acknowledged. Status carries the mode, readiness and its reason, the revis
 the profile digest, the last decision, the hidden and protected counts, the estimate and its
 estimator, the reservation and whether recall and the archive are available — never credentials,
 provider payloads or evidence.
+
+The link's context status also carries `last_prompt_tokens` and `last_cache_hit_tokens`, in both
+modes. They are read from the usage of the newest assistant message that reported usage, and are
+null when none has. Zero cache-hit tokens means the provider reported none or reported no cache
+counter at all, because the neutral usage record cannot tell those apart. These fields are on the
+link's `ContextStatusInfo` only. The domain `ContextStatus`, which the model reads in
+`context_manage` results, does not carry them.
 
 `ContextStatus`, `ContextDecision` and `Checkpoint` frames carry the session id, the stream epoch,
 the turn and step (null when idle), a frame id assigned by the session, the stream watermark and
@@ -615,8 +798,8 @@ record, or in a legacy body, it is refused, on write and on read. Its text passe
 its `document_blake3` must be the digest of that text. A back-link must name, as its source, the
 session that holds it.
 
-The managed compiler renders the seed as a leading system message, after the system prompt and the
-notice, on every request the session makes, the first included (`compile::seed_message`). It opens
+The managed compiler renders the seed as a leading system message, after the system prompt, on every
+request the session makes, the first included (`compile::seed_message`). It opens
 with a fixed label (`HANDOFF_SEED_LABEL`) saying it is a handoff a model wrote from an earlier
 session, generated data rather than a user instruction and not proof, then `Source session: <id>.`,
 a blank line and the document. A leading system message is the one slot every request has: the
@@ -685,8 +868,14 @@ failed context edit never invalidates an earlier result or retries a command.
 Verified by deterministic tests against the real runner, store, shell, link, interface and the
 three adapter crates' encoders and decoders, including OpenAI's Responses wire, on macOS:
 
-- legacy sessions keep their request bytes, schemas, event trace and save path (each adapter pins
-  its ordinary body; the runner compares a legacy run through both entry points);
+- legacy sessions send the same content, schemas, event trace and save path as before, with the
+  elision notice in the tail and, on Responses, the system prompt as a leading developer message.
+  Each adapter pins its ordinary body. The differences from the previous build are:
+  - Anthropic: the `system` block form and the breakpoints the stock runner opts into;
+  - Responses: the developer system message and, on the API plan, its breakpoint;
+  - every wire: the placement of the elision tail.
+
+  The runner compares a legacy run through both entry points;
 - fragment derivation, protection, compilation, hard fitting, proposal staging and revalidation,
   the reset barrier and the boundary schema (a test checks every payload against
   `context-management.schema.json`);
@@ -712,16 +901,48 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
 - each adapter's fixtures for a leading compaction summary in a legacy request and a leading seed in
   a managed one;
 - the Responses managed body on the API and subscription plans, sent through the real adapter and
-  runner to a local listener. The tests cover the order of `instructions`, plain history with no
-  replay and no `include`, `max_output_tokens` present and equal to the reservation on the API plan
-  and absent on the subscription plan, images and image results, exact bytes and the same digest
+  runner to a local listener. The tests cover the order of the developer system parts, plain
+  history with no replay and no `include`, `max_output_tokens` present and equal to the
+  reservation on the API plan and absent on the subscription plan, images and image results, exact bytes and the same digest
   after a reload, argument limits including a name that arrives only at `output_item.done`, and a
   following reservation across a model switch;
 - a following reservation's arithmetic, its record, and body version 6: the field's serde rules, a
   present `false` refused, the header and its refusal below version 6 on read, and a configured
-  budget bounding the reservation a host's enable records.
+  budget bounding the reservation a host's enable records;
+- the three-part layout. On every adapter and wire:
+  - three consecutive steps of a managed turn encode with a stable prefix;
+  - the first-turn exception breaks only after the first user message;
+  - a fit leaves the head unchanged when it changes no notes;
+  - the tail is always the last content and is never recorded;
+  - a message encodes identically whether or not it is the newest;
+- Anthropic breakpoint placement, order and TTLs on managed and ordinary bodies, none without
+  opt-in;
+- signed replay under both fingerprint rules, and a legacy reply digest recorded by the previous
+  build still matching;
+- the OpenAI trailing developer tail, the Responses developer system message, both explicit
+  breakpoints, and no `prompt_cache_key`;
+- the legacy fitter: its elision notice is costed and carried as the tail, never as a message, on
+  every wire, and the fitter's choice of turns is the same as before for the same budget;
+- live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
+  developer system message and no `instructions` is accepted and answers as the system prompt
+  directs, and three managed steps with a trailing developer tail after tool output are accepted.
 
 Not verified, and not claimed:
+
+- **Cache hit rates are not measured by the gates.** The `#[ignore]`d live cases in
+  `nanus-bundle/tests/live_cache.rs` check them:
+  - that each provider serves a managed step's prefix from cache at the stated thresholds;
+  - that a second session's first Responses request reads the shared system-prompt entry;
+  - that OpenAI accepts a trailing developer message after tool results, and a request with a
+    developer system message and no `instructions`, on both plans and wires;
+  - per Anthropic model, whether signed replay is accepted with an earlier step's tail removed.
+
+  They need credentials, and a pass is evidence for that day and model only. Only the
+  subscription's acceptance case has been run. Its cache-read case failed on its one run: the
+  second step reported no cached tokens although the first step read the prefix an earlier run
+  wrote. In a three-request probe that day, identical subscription requests were served from cache
+  irregularly with or without a `prompt_cache_key`, so the subscription's cache routing is not
+  understood and no claim is made about its hit rate.
 
 - **No live provider has been sent a maintenance request.** A handoff or compaction draft is a model
   call built and read the way a managed turn's is. The tests show the request is built and its
@@ -730,10 +951,10 @@ Not verified, and not claimed:
 - **The subscription reservation is not enforced by the provider.** The tests show the reservation
   is charged and that the body omits it. The window the subscription is fitted to is the model's
   declared window, by decision, and has not been measured against the backend.
-- **No live provider has been sent a managed request.** The provider matrix rests on wire and
-  reload fixtures; in particular, nothing yet proves a provider accepts the generated assistant
-  message followed by an original one, or DeepSeek, z.ai and Inception a generated turn without
-  `reasoning_content`.
+- **Only the subscription plan has been sent a managed request live.** The rest of the provider
+  matrix rests on wire and reload fixtures; in particular, nothing yet proves a provider accepts the
+  generated assistant message followed by an original one, or DeepSeek, z.ai and Inception a
+  generated turn without `reasoning_content`.
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
   is no claim that managed context improves anything, and the default stays legacy.

@@ -1,8 +1,8 @@
 //! Managed preparation over a real socket: the bytes that leave are the bytes that were measured.
 //!
 //! The request each fixture prepares is compiled by the domain's own managed compiler from a
-//! session — two leading system messages, the generated working-data message after the first
-//! user message, and one hidden fragment absent — so the grammar under test is the one the
+//! session — the system prompt, the generated working-data message after the first user
+//! message, one hidden fragment absent, and the tail — so the grammar under test is the one the
 //! runner produces rather than a hand-written imitation of it. The server captures the body it
 //! received, which is what lets the assertions be about what was sent.
 
@@ -15,6 +15,7 @@ use std::net::TcpListener;
 use futures::StreamExt as _;
 use nanus_domain::context::managed::compile::{NoticeFacts, Selection, derive_effective_context};
 use nanus_domain::context::managed::{Digest, FragmentId, fragments, state};
+use nanus_domain::goal::Goal;
 use nanus_domain::{
     Message, Session, SessionEvent, SessionId, ToolCall, ToolCallId, ToolName, ToolSchema,
 };
@@ -91,14 +92,23 @@ fn compiled(session: &Session) -> ChatRequest {
         input_allowance: 100_000,
         ..NoticeFacts::default()
     };
-    let effective =
-        derive_effective_context(session, &derived, &protected, selection, None, &facts).unwrap();
-    assert!(effective.memory, "the catalog makes a generated message");
-    let mut messages = vec![Message::system("you are nanus"), effective.notice];
+    let goal = Goal::new("ship the parser", 1).unwrap();
+    let effective = derive_effective_context(
+        session,
+        &derived,
+        &protected,
+        selection,
+        Some(&goal),
+        &facts,
+    )
+    .unwrap();
+    assert!(effective.memory, "the goal makes a generated message");
+    let mut messages = vec![Message::system("you are nanus")];
     messages.extend(effective.messages);
     ChatRequest::new(MODEL_FLASH, messages)
         .with_tools(vec![schema("read"), schema("context_manage")])
         .with_max_tokens(4_096)
+        .with_context_tail(effective.tail)
 }
 
 fn schema(name: &str) -> ToolSchema {
@@ -260,15 +270,20 @@ async fn a_managed_request_sends_exactly_the_bytes_it_prepared() {
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        &roles[..5],
-        ["system", "system", "user", "assistant", "assistant"]
-    );
+    assert_eq!(&roles[..4], ["system", "user", "assistant", "assistant"]);
     assert!(
-        sent["messages"][3]["content"]
+        sent["messages"][2]["content"]
             .as_str()
             .unwrap()
             .starts_with("[nanus working data")
+    );
+    // The tail is appended to the final tool result, after a blank line.
+    let last = sent["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["role"], "tool");
+    let content = last["content"].as_str().unwrap();
+    assert!(
+        content.starts_with("kept output d\n\n[nanus context] "),
+        "{content}"
     );
     assert!(
         !body.contains("OBSOLETE EARLY OUTPUT"),
@@ -384,7 +399,10 @@ fn only_the_official_endpoint_and_current_models_are_supported() {
     let official = llm();
     assert_eq!(
         official.managed_support(MODEL_PRO),
-        ManagedSupport::Supported { policy_version: 1 }
+        ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2
+        }
     );
     assert_eq!(
         official.managed_support("deepseek-chat"),
@@ -431,9 +449,15 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     assert!(prepare(&llm(), managed(valid.clone())).is_ok());
 
     let mut last = valid.clone();
-    last.messages.truncate(4);
-    assert!(matches!(&last.messages[3], Message::Assistant { .. }));
+    last.messages.truncate(3);
+    assert!(matches!(&last.messages[2], Message::Assistant { .. }));
     refused_with(last, "generated data is never the last message");
+
+    let mut answered = valid.clone();
+    answered
+        .messages
+        .push(Message::assistant(Some("done".into()), None, Vec::new()));
+    refused_with(answered, "ends with a user message or tool results");
 
     let mut orphan = valid.clone();
     orphan.messages.retain(|message| {
@@ -455,8 +479,8 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     // F15: text that opens with the label anywhere but directly after the first user message
     // is the model's own reply, sent as it is; refusing it would let one reply wedge a session.
     let mut moved = valid;
-    let generated = moved.messages.remove(3);
-    moved.messages.insert(5, generated);
+    let generated = moved.messages.remove(2);
+    moved.messages.insert(4, generated);
     assert!(
         prepare(&llm(), managed(moved)).is_ok(),
         "a labelled reply elsewhere is sent"
@@ -514,7 +538,7 @@ const LEGACY_BODY: &str = concat!(
 );
 
 /// A session a handoff started, on the managed wire: the seed is a leading system message after the
-/// notice on every request, the first included, and a session with no seed sends none.
+/// system prompt on every request, the first included, and a session with no seed sends none.
 mod seeded {
     use nanus_domain::context::managed::{
         ContextFrontier, ContextModeRecord, ContextPolicy, HANDOFF_SEED_LABEL, HandoffSeed,
@@ -570,8 +594,8 @@ mod seeded {
         session
     }
 
-    /// The request the runner composes for a seeded session: the system prompt, the notice, the
-    /// seed, then the conversation, with nothing hidden.
+    /// The request the runner composes for a seeded session: the system prompt, the seed, then
+    /// the conversation, with nothing hidden, and the tail.
     fn compiled_seeded(session: &Session) -> ChatRequest {
         let derived = fragments::derive(session.log()).unwrap();
         let protected = state::protected(session.log(), &derived);
@@ -592,12 +616,13 @@ mod seeded {
             effective.seed.is_some(),
             "a seeded session carries its seed"
         );
-        let mut messages = vec![Message::system("you are nanus"), effective.notice];
+        let mut messages = vec![Message::system("you are nanus")];
         messages.extend(effective.seed);
         messages.extend(effective.messages);
         ChatRequest::new(MODEL_FLASH, messages)
             .with_tools(vec![schema("read"), schema("context_manage")])
             .with_max_tokens(4_096)
+            .with_context_tail(effective.tail)
     }
 
     /// The roles and the leading messages of a prepared seeded request.
@@ -615,22 +640,20 @@ mod seeded {
     }
 
     #[test]
-    fn a_seeded_sessions_first_request_carries_the_seed_after_the_notice() {
+    fn a_seeded_sessions_first_request_carries_the_seed_after_the_system_prompt() {
         let request = compiled_seeded(&seeded_session(&["continue the parser"]));
         let (roles, messages, body) = prepared(request);
-        assert_eq!(roles, ["system", "system", "system", "user"]);
-        assert!(
-            messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("[nanus context]")
-        );
-        let seed = messages[2]["content"].as_str().unwrap();
+        assert_eq!(roles, ["system", "system", "user"]);
+        let seed = messages[1]["content"].as_str().unwrap();
         assert!(
             seed.starts_with(HANDOFF_SEED_LABEL) && seed.ends_with(DOCUMENT),
             "{seed}"
         );
-        assert_eq!(messages[3]["content"], json!("continue the parser"));
+        let prompt = messages[2]["content"].as_str().unwrap();
+        assert!(
+            prompt.starts_with("continue the parser\n\n[nanus context] "),
+            "{prompt}"
+        );
         assert!(!body.contains("[nanus working data"));
     }
 
@@ -638,8 +661,8 @@ mod seeded {
     fn a_seeded_sessions_later_request_still_leads_with_the_seed() {
         let request = compiled_seeded(&seeded_session(&["first", "second"]));
         let (roles, messages, _) = prepared(request);
-        assert_eq!(&roles[..4], ["system", "system", "system", "user"]);
-        assert!(messages[2]["content"].as_str().unwrap().ends_with(DOCUMENT));
+        assert_eq!(&roles[..3], ["system", "system", "user"]);
+        assert!(messages[1]["content"].as_str().unwrap().ends_with(DOCUMENT));
         assert_eq!(roles.last().map(String::as_str), Some("user"));
     }
 
@@ -647,7 +670,7 @@ mod seeded {
     fn a_managed_session_with_no_seed_sends_no_seed() {
         let request = compiled(&session());
         let (roles, _, body) = prepared(request);
-        assert_eq!(&roles[..3], ["system", "system", "user"]);
+        assert_eq!(&roles[..2], ["system", "user"]);
         assert!(!body.contains(HANDOFF_SEED_LABEL));
     }
 }

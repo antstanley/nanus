@@ -555,12 +555,10 @@ async fn assembled_fit_drops_whole_image_turns_and_refuses_the_current_turn_befo
                 .any(|m| matches!(m, Message::Tool { .. }))
         );
         assert!(sent[0].messages.iter().all(|m| m.tool_calls().is_empty()));
-        assert!(
-            sent[0]
-                .messages
-                .iter()
-                .any(|m| m.text().is_some_and(|s| s.contains("were left out")))
-        );
+        // The notice is the request's tail, never one of its messages.
+        let told = |text: Option<&str>| text.is_some_and(|s| s.contains("were left out"));
+        assert!(told(sent[0].context_tail.as_deref()));
+        assert!(!sent[0].messages.iter().any(|m| told(m.text())));
         assert!(
             session
                 .derive_messages()

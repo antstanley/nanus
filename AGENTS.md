@@ -416,9 +416,14 @@ design docs too.
   native Windows validates this subset independently. Stock shell/link/service have their own
   Linux/macOS/Windows matrix in `.github/workflows/local-transports.yml`.
 - **Managed context is opt-in, and a legacy session must not notice it exists.** A session that
-  never records a `context/mode` record keeps its version-2 body, request bytes, schemas, tool count
-  and terminal save; tests pin each adapter's ordinary body and compare a legacy run through both
-  runner entry points. A managed session (version 3, or version 4, 5 or 6 marked managed) is saved only
+  never records a `context/mode` record keeps its version-2 body, the content its model is sent,
+  schemas, tool count and terminal save. Its request bytes differ from the previous build in three
+  ways, none of them caused by managed context:
+  - the cache hints every runner-built request carries;
+  - the elision notice, which is the request's tail;
+  - on Responses, the system prompt, which is a leading developer message.
+
+  Tests pin each adapter's ordinary body and compare a legacy run through both runner entry points. A managed session (version 3, or version 4, 5 or 6 marked managed) is saved only
   through its `SessionCheckpoint`:
   `nanus run` and the link never call `StorePort::save` for one, and act on the returned
   `PersistenceState` (no duplicate save after `Acknowledged`, nothing after `Unsaved`, only
@@ -432,6 +437,21 @@ design docs too.
   may be compacted; its body still holds managed records, so the cut is saved through its
   `SessionCheckpoint`, never `StorePort::save`.
   See `docs/context-management.md` and its schema, which `context_schema.rs` checks.
+- **A request's prefix is stable.** Nothing that changes from one step to the next comes before
+  the newest message.
+  - The managed notice and catalog, and the legacy elision notice, are the request's tail
+    (`ChatRequest::context_tail`), which the adapter places last and never records.
+  - The system prompt is its own cache entry, ahead of a seed or compaction summary: the first
+    Anthropic `system` block, or the first part of the Responses developer system message, never
+    `instructions`. The stateless replay mode is the exception.
+  - The working-data message changes only with the notes or the goal objective. The one exception
+    is its first appearance in a session that has notes or a goal before its first prompt.
+  - Adapters encode canonically and then decorate. Cache markers never enter a signed-replay
+    fingerprint, and the tail enters it unless the model's live evidence says otherwise.
+  - OpenAI's tail is a trailing developer message, because an appended tail would be inside every
+    implicit cache write.
+  - Each adapter has a prefix-stability test. A change that puts a per-step value ahead of the
+    conversation fails it.
 - **Deletion retires the id.** `delete` takes exclusive ownership and refuses a held session; a
   save, checkpoint, claim or name for a retired id is refused, so a stale writer cannot resurrect
   a deleted conversation.

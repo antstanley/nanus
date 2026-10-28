@@ -189,6 +189,36 @@ recallable. Every model call — context management included — consumes the sa
 is accounted for. The adapter, model and effort a request was prepared under are held through its
 dispatch, its context validation and its checkpoint.
 
+### Requests are laid out for provider caches
+
+A provider's prompt cache is most of what a long agent session costs, and it matches by prefix.
+So a request is ordered by how often its parts change:
+
+1. the parts that never change: schemas, the system prompt and the seed;
+2. the parts that change on a deliberate decision: the first prompt and the working data;
+3. the conversation, which only grows;
+4. last, the one part that changes every request: the context notice, or in a legacy session the
+   elision notice.
+
+Both notices used to be system messages, where they carried the harness's voice. They moved to
+the end because that voice cost the cache: the managed notice cost the whole conversation's on
+every step, and the legacy notice cost even the system prompt's on every drop.
+
+The system prompt is marked as a cache entry of its own, ahead of anything session-specific, so
+sessions that share a model, tools and prompt share it. On Anthropic it is the first `system`
+block. On Responses it is the first part of a leading developer message, because `instructions`
+cannot be marked.
+
+At the end, the notice takes whatever form lets that wire's cache work around it. On Anthropic it
+is its own block behind an explicit breakpoint. On OpenAI it is a developer message, which the
+implicit breakpoint skips, so OpenAI keeps the harness's voice. Elsewhere it is appended text.
+
+It holds only numbers, enums and opaque ids, so placing it in a user turn promotes no model-written
+text. It is identified by its position, so a copy inside a tool result is read as content.
+
+Model-written notes stay in an assistant message near the start, and are kept stable instead of
+being moved. Moving them to the end would put them in the user's voice.
+
 ### The current model ids, and no aliases for the dead ones
 
 `deepseek-chat` and `deepseek-reasoner` were discontinued on **2026-07-24**. The

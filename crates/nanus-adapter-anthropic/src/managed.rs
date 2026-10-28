@@ -7,14 +7,14 @@
 //!
 //! ## Signed replay
 //!
-//! Hiding a fragment, inserting the generated working-data message or changing the notice all
-//! change the encoded prefix of every assistant turn after the change, and a thinking block's
-//! signature is bound to the prefix that produced it. The decision here is to apply the
+//! Hiding a fragment or inserting the generated working-data message changes the encoded prefix
+//! of every assistant turn after the change, and a thinking block's signature is bound to the
+//! prefix that produced it. The decision here is to apply the
 //! adapter's **existing** checked replay unchanged, per message:
 //!
 //! - an assistant turn whose retained blocks match its neutral text and calls *and* whose
-//!   recorded prefix digest equals the digest of the encoded system, tools and preceding turns of
-//!   this very body is sent as its original signed blocks;
+//!   recorded prefix digest equals the digest of the canonically encoded system, tools and
+//!   preceding turns of this very body is sent as its original signed blocks;
 //! - any other turn with replay is sent as its neutral text and tool calls, without thinking.
 //!
 //! That neutral form is the adapter's own, already used whenever the ordinary fitter elides a
@@ -31,18 +31,20 @@
 //! request must not drop a message the projection kept, so preparation refuses it as
 //! `protocol_incompatible` instead.
 //!
-//! In practice the fixed-schema notice changes between requests (its revision, counts and
-//! estimate), and it travels in the top-level system field, so a managed conversation usually
-//! sends its history neutrally. That costs earlier reasoning and the prompt cache, never
-//! correctness.
+//! The digest a reply binds to is the canonical body's: never a cache marker, and the request's
+//! tail unless [`crate::config::replay_across_tail`] holds for the model. A step's tail is gone
+//! from the next request, so by default a managed turn's thinking is replayed on no later step and
+//! the turn is sent neutrally — the same on every later step, so the cache is unaffected. A model
+//! whose live evidence is recorded keeps its signed blocks from one step to the next.
 //!
 //! ## The grammar
 //!
-//! Leading system messages only — both are joined, in order, into the top-level system field,
-//! exactly as the ordinary path joins its elision notice; a conversation that opens with a user
-//! message; at most one generated working-data message, directly after the first user message and
-//! never last, so it is never an assistant prefill, which these models refuse; and every
-//! surviving call answered once, in place. A generated message beside an original assistant turn
+//! Leading system messages only — the system prompt and a seeded session's handoff seed, each its
+//! own block of the top-level system field, in order; a conversation that opens with a user
+//! message and ends with a user message or tool results, which is where the tail goes; at most one
+//! generated working-data message, directly after the first user message and never last, so it is
+//! never an assistant prefill, which these models refuse; and every surviving call answered once,
+//! in place. A generated message beside an original assistant turn
 //! is two consecutive assistant messages, which the Messages API accepts and reads as one turn:
 //! nothing is merged here, no call is invented, and no generated text changes role.
 //!
@@ -56,7 +58,7 @@ use std::collections::BTreeSet;
 
 use nanus_domain::Message;
 use nanus_domain::context::managed::compile::MEMORY_LABEL;
-use nanus_domain::context::managed::limits::POLICY_VERSION;
+use nanus_domain::context::managed::limits::{LAYOUT_VERSION, POLICY_VERSION};
 use nanus_domain::context::managed::{Digest, ErrorCode, SelectionIdentity};
 use nanus_ports::{
     LlmError, LlmPort as _, LlmResult, LlmStream, ManagedRequest, ManagedSupport,
@@ -78,6 +80,7 @@ pub fn support(config: &AnthropicConfig, model: &str) -> ManagedSupport {
     {
         ManagedSupport::Supported {
             policy_version: POLICY_VERSION,
+            layout_version: LAYOUT_VERSION,
         }
     } else {
         ManagedSupport::Unsupported
@@ -143,6 +146,11 @@ impl PreparedMessages {
         &self.body
     }
 
+    /// The digest a reply to this call binds its signed blocks to.
+    pub fn prefix_digest(&self) -> &str {
+        &self.prefix_digest
+    }
+
     /// Points the call at a local fixture server. The body, digest and identity are untouched,
     /// which is the point: a fixture proves what is sent, not where the official host is.
     pub fn retarget(&mut self, endpoint: String) {
@@ -163,7 +171,7 @@ pub fn prepare(llm: &AnthropicLlm, managed: ManagedRequest) -> LlmResult<Prepare
         selection_epoch,
     } = managed;
     let config = llm.config();
-    if !support(config, &request.model).supports(POLICY_VERSION) {
+    if !support(config, &request.model).supports(POLICY_VERSION, LAYOUT_VERSION) {
         return Err(refuse(
             ErrorCode::UnsupportedMode,
             "managed context is not supported for this model and endpoint",
@@ -183,7 +191,11 @@ pub fn prepare(llm: &AnthropicLlm, managed: ManagedRequest) -> LlmResult<Prepare
     )?;
 
     // Encoded once: the estimate, the digest and the dispatch all read this one value.
-    let (payload, skipped) = wire::build_counted(config, &request);
+    let wire::Encoded {
+        body: payload,
+        skipped,
+        prefix_digest,
+    } = wire::encode(config, &request, wire::Layout::Managed);
     if skipped > 0 {
         return Err(incompatible(
             "a kept assistant turn carries only replay this request cannot admit",
@@ -214,7 +226,7 @@ pub fn prepare(llm: &AnthropicLlm, managed: ManagedRequest) -> LlmResult<Prepare
     };
     Ok(PreparedMessages {
         transport,
-        prefix_digest: wire::request_prefix(&payload),
+        prefix_digest,
         digest: Digest::of(body.as_bytes()),
         body,
         estimate,
@@ -240,7 +252,7 @@ fn check_output(requested: Option<u32>, ceiling: u32) -> LlmResult<()> {
 }
 
 /// Whether `message` is the generated working-data message the runner inserts.
-fn is_generated(message: &Message) -> bool {
+pub fn is_generated(message: &Message) -> bool {
     matches!(
         message,
         Message::Assistant {
@@ -283,7 +295,17 @@ pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
     if anchor_generated && conversation.len() <= 2 {
         return Err(incompatible("generated data is never the last message"));
     }
-    validate_pairs(conversation)
+    validate_pairs(conversation)?;
+    // The tail is placed after the newest message, in the final user turn, so there must be one.
+    if !matches!(
+        conversation.last(),
+        Some(Message::User { .. } | Message::Tool { .. })
+    ) {
+        return Err(incompatible(
+            "the conversation ends with a user message or tool results",
+        ));
+    }
+    Ok(())
 }
 
 /// Every surviving call is answered once, in place; every result answers a surviving call.

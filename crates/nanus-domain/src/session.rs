@@ -1479,6 +1479,25 @@ impl Session {
         self.log.usage_totals()
     }
 
+    /// The usage of the newest assistant message that reported one.
+    ///
+    /// It is what the last model request of the conversation cost, read where every wire records
+    /// it, in both context modes. A maintenance request's usage is not a conversation step's, so it
+    /// is not read here. `None` when no assistant message has reported usage yet.
+    #[must_use]
+    pub fn last_reported_usage(&self) -> Option<&Usage> {
+        self.log
+            .events()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                SessionEvent::AssistantMessage {
+                    usage: Some(usage), ..
+                } => Some(usage),
+                _ => None,
+            })
+    }
+
     /// Sums usage per model, in first-seen order.
     #[must_use]
     pub fn usage_by_model(&self) -> Vec<(Option<String>, Usage)> {
@@ -2599,6 +2618,38 @@ mod tests {
         assert_eq!(total.prompt_tokens, 30);
         assert_eq!(total.completion_tokens, 12);
         assert_eq!(total.total_tokens(), 42);
+    }
+
+    #[test]
+    fn the_last_reported_usage_is_the_newest_assistant_message_that_carries_one() {
+        let mut session = session();
+        assert_eq!(session.last_reported_usage(), None, "nothing reported yet");
+        let assistant = |usage: Option<Usage>| SessionEvent::AssistantMessage {
+            replay: None,
+            text: Some("a".to_owned()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            usage,
+            interrupted: false,
+            model: None,
+            effort: None,
+        };
+        session.append(assistant(None));
+        assert_eq!(session.last_reported_usage(), None, "an unreported step");
+        session.append(assistant(Some(Usage::new(400, 5, 0, 300, 100))));
+        session.append(assistant(None));
+        assert_eq!(
+            session.last_reported_usage(),
+            Some(&Usage::new(400, 5, 0, 300, 100)),
+            "a later step that reported nothing does not hide the last one that did"
+        );
+        session.append(assistant(Some(Usage::new(500, 5, 0, 0, 500))));
+        assert_eq!(
+            session
+                .last_reported_usage()
+                .map(|usage| usage.cache_hit_tokens),
+            Some(0)
+        );
     }
 
     #[test]

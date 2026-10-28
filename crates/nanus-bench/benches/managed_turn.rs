@@ -171,7 +171,10 @@ impl LlmPort for Model {
         self.script.respond(&request)
     }
     fn managed_support(&self, _: &str) -> ManagedSupport {
-        ManagedSupport::Supported { policy_version: 1 }
+        ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2,
+        }
     }
     fn prepare_managed(&self, request: ManagedRequest) -> LlmResult<Box<dyn PreparedModelCall>> {
         let body = encode(&request.request);

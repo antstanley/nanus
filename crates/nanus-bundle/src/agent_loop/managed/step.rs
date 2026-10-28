@@ -324,6 +324,8 @@ impl AgentRunner {
             return Ok(None);
         };
         let mut request = effective.clone();
+        // The raw view carries every message, so nothing is hidden and it has no tail.
+        request.context_tail = None;
         request.messages = vec![nanus_domain::Message::system(self.managed_system_prompt())];
         request.messages.extend(session.derive_messages());
         let llm = self.llm();

@@ -2,9 +2,17 @@
 //!
 //! A subscription-backed request is not a chat completion. The conversation goes as a flat list of
 //! *items* — a user turn, the assistant's output, the function calls it made, and their results —
-//! with the system prompt lifted into a top-level `instructions` field, and the reasoning control
-//! moved under a `reasoning` object. Streaming is a sequence of named events rather than a stream
-//! of `choices` deltas, so the decoder dispatches on each payload's own `type`.
+//! with the system prompt as the first item, a `developer` message with one `input_text` part per
+//! system message, and the reasoning control moved under a `reasoning` object. Streaming is a
+//! sequence of named events rather than a stream of `choices` deltas, so the decoder dispatches on
+//! each payload's own `type`.
+//!
+//! The system prompt is a developer message rather than the top-level `instructions` field because
+//! a part can carry an explicit cache breakpoint and `instructions` cannot: on the API plan the
+//! harness's prompt, the first part, is marked as an entry every session with the same tools and
+//! prompt shares. The opt-in stateless replay mode is the one that keeps `instructions`, because
+//! its sealed receipts bind the prompt in that form. A request's tail is a trailing developer
+//! message, after the final user item or tool output, which `OpenAI`'s implicit breakpoint skips.
 //!
 //! Only what the harness uses is encoded: the seven tools, the reasoning step, the output ceiling,
 //! and the conversation. Sampling fields nobody reads, and the several Responses-only features the
@@ -14,7 +22,8 @@ use nanus_domain::{Message, ToolSchema, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, ReasoningEffort};
 use serde_json::{Map, Value, json};
 
-use crate::config::OpenAiConfig;
+use crate::Layout;
+use crate::config::{CachePath, OpenAiConfig, Protocol, SystemCarrier, TailCarrier};
 
 mod replay;
 mod request;
@@ -25,13 +34,33 @@ pub(crate) use request::{estimate as estimate_request, prepare as prepare_reques
 /// The most tool calls one response may carry.
 const MAX_TOOL_CALLS: usize = 256;
 
-/// Builds the JSON body for a Responses request.
+/// Builds the JSON body for an ordinary Responses request.
 #[must_use]
 pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
-    build_with_input(config, request, encode_input(&request.messages))
+    encode(config, request, Layout::Ordinary)
 }
 
-fn build_with_input(config: &OpenAiConfig, request: &ChatRequest, input: Value) -> Value {
+/// Encodes a request: canonically, then decorated with its tail and cache hints.
+///
+/// The canonical body is the request with no tail and no breakpoint, its system prompt in the
+/// path's carrier; decoration appends the tail and, when the runner asked for caching, places the
+/// path's explicit breakpoints. What is sent, estimated and digested is the decorated body.
+#[must_use]
+pub fn encode(config: &OpenAiConfig, request: &ChatRequest, layout: Layout) -> Value {
+    let path = config.cache_path(Protocol::Responses);
+    let explicit = path.tail_carrier == TailCarrier::AppendedExplicit;
+    let input = Value::Array(encode_items(&request.messages, false, explicit));
+    let mut body = build_with_input(config, request, input, path.system_carrier);
+    decorate(&mut body, request, layout, path);
+    body
+}
+
+pub(crate) fn build_with_input(
+    config: &OpenAiConfig,
+    request: &ChatRequest,
+    mut input: Value,
+    system: SystemCarrier,
+) -> Value {
     assert!(
         !request.messages.is_empty(),
         "a request carries at least one message"
@@ -45,8 +74,19 @@ fn build_with_input(config: &OpenAiConfig, request: &ChatRequest, input: Value) 
     // Nothing is kept server-side: the session log is the record, and a stored response would be a
     // second one that outlives the conversation it belongs to.
     body.insert("store".to_owned(), json!(false));
-    if let Some(instructions) = instructions(&request.messages) {
-        body.insert("instructions".to_owned(), json!(instructions));
+    match system {
+        SystemCarrier::Developer => {
+            if let (Some(item), Some(items)) =
+                (developer_system(&request.messages), input.as_array_mut())
+            {
+                items.insert(0, item);
+            }
+        }
+        SystemCarrier::Instructions | SystemCarrier::System => {
+            if let Some(instructions) = instructions(&request.messages) {
+                body.insert("instructions".to_owned(), json!(instructions));
+            }
+        }
     }
     body.insert("input".to_owned(), input);
     // The provider's ceiling, not the configured budget: a request above it is refused rather than
@@ -84,6 +124,188 @@ fn build_with_input(config: &OpenAiConfig, request: &ChatRequest, input: Value) 
     encoded
 }
 
+/// The leading developer item that carries the system messages: one part each, in order.
+///
+/// `None` when there are none, so an absent prompt is absent rather than an empty message. An
+/// empty system message has no part, as it would have added nothing to `instructions`.
+fn developer_system(messages: &[Message]) -> Option<Value> {
+    let parts: Vec<Value> = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System { text } if !text.is_empty() => {
+                Some(json!({ "type": "input_text", "text": text }))
+            }
+            _ => None,
+        })
+        .collect();
+    (!parts.is_empty()).then(|| json!({ "role": "developer", "content": parts }))
+}
+
+/// Places the tail after the newest item, in the form `carrier` names.
+pub(crate) fn place_tail(input: &mut Vec<Value>, tail: &str, carrier: TailCarrier) {
+    let part = json!({ "type": "input_text", "text": tail });
+    match carrier {
+        TailCarrier::TrailingDeveloper => {
+            input.push(json!({ "role": "developer", "content": [part] }));
+        }
+        TailCarrier::Appended | TailCarrier::AppendedExplicit => {
+            let last = input.last_mut();
+            assert!(last.is_some(), "a tail follows an item");
+            if let Some(last) = last {
+                let parts = if last.get("output").is_some() {
+                    &mut last["output"]
+                } else {
+                    &mut last["content"]
+                };
+                match parts {
+                    Value::Array(parts) => parts.push(part),
+                    Value::String(text) => {
+                        text.push_str("\n\n");
+                        text.push_str(tail);
+                    }
+                    other => *other = json!([part]),
+                }
+            }
+        }
+    }
+}
+
+/// The explicit breakpoint marker a part carries.
+fn marker() -> Value {
+    json!({ "mode": "explicit" })
+}
+
+/// Appends the tail and places the path's breakpoints.
+pub(crate) fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, path: CachePath) {
+    let Some(input) = body["input"].as_array_mut() else {
+        return;
+    };
+    let before_tail = input.len();
+    if let Some(tail) = request.context_tail.as_deref() {
+        place_tail(input, tail, path.tail_carrier);
+    }
+    if request.prompt_cache == nanus_ports::PromptCacheRetention::None {
+        return;
+    }
+    let explicit = path.tail_carrier == TailCarrier::AppendedExplicit;
+    // The system prompt's own part, the first of the leading developer item, in both modes.
+    if path.system_breakpoint
+        && path.system_carrier == SystemCarrier::Developer
+        && input
+            .first()
+            .is_some_and(|item| item["role"] == "developer")
+        && let Some(first) = input[0]["content"].get_mut(0)
+    {
+        first["prompt_cache_breakpoint"] = marker();
+    }
+    let mut candidates: Vec<Option<(usize, usize)>> = Vec::new();
+    if (path.head_breakpoint || explicit) && layout == Layout::Managed {
+        candidates
+            .push(head_item(input, &request.messages).and_then(|at| last_text_part(input, at)));
+    }
+    if explicit {
+        let answer = input
+            .iter()
+            .rposition(|item| item["role"] == "assistant" || item["type"] == "function_call");
+        // The start of the last answer's group: its message and the calls that follow it.
+        let answering =
+            |item: &Value| item["role"] == "assistant" || item["type"] == "function_call";
+        let group = answer.map(|at| {
+            input[..at]
+                .iter()
+                .rposition(|item| !answering(item))
+                .map_or(0, |before| before.saturating_add(1))
+        });
+        candidates.push(
+            group
+                .and_then(|at| at.checked_sub(1))
+                .and_then(|at| last_part_at_or_before(input, at, None)),
+        );
+        let tailed = request.context_tail.is_some();
+        let end = before_tail.checked_sub(1).map(|at| {
+            let parts = parts_of(&input[at]).map_or(0, Vec::len);
+            (
+                at,
+                if tailed {
+                    parts.checked_sub(1)
+                } else {
+                    Some(parts)
+                },
+            )
+        });
+        candidates.push(end.and_then(|(at, upto)| last_part_at_or_before(input, at, upto)));
+        body["prompt_cache_options"] = json!({ "mode": "explicit" });
+    }
+    let Some(input) = body["input"].as_array_mut() else {
+        return;
+    };
+    let mut placed: Option<(usize, usize)> = None;
+    for (item, part) in candidates.into_iter().flatten() {
+        if placed.is_some_and(|last| (item, part) <= last) {
+            continue;
+        }
+        let parts = if input[item].get("output").is_some() {
+            &mut input[item]["output"]
+        } else {
+            &mut input[item]["content"]
+        };
+        if let Some(target) = parts.get_mut(part) {
+            target["prompt_cache_breakpoint"] = marker();
+            placed = Some((item, part));
+        }
+    }
+}
+
+/// The head's last item: the working-data message when the managed grammar admitted one, the
+/// first user item otherwise.
+fn head_item(input: &[Value], messages: &[Message]) -> Option<usize> {
+    let first = input.iter().position(|item| item["role"] == "user")?;
+    let memory = messages
+        .iter()
+        .skip_while(|message| matches!(message, Message::System { .. }))
+        .nth(1)
+        .is_some_and(crate::managed::is_generated);
+    Some(if memory {
+        first.saturating_add(1)
+    } else {
+        first
+    })
+}
+
+/// The parts of an item that has them: a message's content, or an output given as a list.
+fn parts_of(item: &Value) -> Option<&Vec<Value>> {
+    item.get("output")
+        .and_then(Value::as_array)
+        .or_else(|| item["content"].as_array())
+}
+
+/// The last text part of the item at `at`, or its last part when it has no text.
+fn last_text_part(input: &[Value], at: usize) -> Option<(usize, usize)> {
+    let parts = parts_of(input.get(at)?)?;
+    let part = parts
+        .iter()
+        .rposition(|part| matches!(part["type"].as_str(), Some("input_text" | "output_text")))
+        .or_else(|| parts.len().checked_sub(1))?;
+    Some((at, part))
+}
+
+/// The last part at or before item `at` (and before `upto` within it) that can carry a marker.
+fn last_part_at_or_before(
+    input: &[Value],
+    at: usize,
+    upto: Option<usize>,
+) -> Option<(usize, usize)> {
+    let mut limit = upto;
+    for index in (0..=at).rev() {
+        let count = parts_of(&input[index]).map_or(0, Vec::len);
+        let end = limit.take().unwrap_or(count).min(count);
+        if let Some(part) = end.checked_sub(1) {
+            return Some((index, part));
+        }
+    }
+    None
+}
+
 /// Joins the system turns into the single `instructions` string the API expects.
 ///
 /// The API has one instruction field rather than a system role, so several system turns are joined
@@ -112,14 +334,16 @@ fn instructions(messages: &[Message]) -> Option<String> {
 /// result that answers it.
 #[must_use]
 pub fn encode_input(messages: &[Message]) -> Value {
-    encode_items(messages, false)
+    Value::Array(encode_items(messages, false, false))
 }
 
 fn encode_replay_input(messages: &[Message]) -> Value {
-    encode_items(messages, true)
+    Value::Array(encode_items(messages, true, false))
 }
 
-fn encode_items(messages: &[Message], original: bool) -> Value {
+/// Encodes the items; `explicit` gives every tool output as an `input_text` list, which the
+/// [`TailCarrier::AppendedExplicit`] fallback needs for a part to mark or append to.
+pub(crate) fn encode_items(messages: &[Message], original: bool, explicit: bool) -> Vec<Value> {
     let mut items: Vec<Value> = Vec::new();
     // Pixels are not a tool output on this wire: a result that carries an image is answered with
     // a label, and the original ordered text and pixels follow as a user item once the whole group
@@ -130,7 +354,7 @@ fn encode_items(messages: &[Message], original: bool) -> Value {
             items.append(&mut attachments);
         }
         match message {
-            // Lifted into `instructions`; not repeated here.
+            // Lifted into the leading developer item or `instructions`; not repeated here.
             Message::System { .. } => {}
             Message::User {
                 text,
@@ -163,16 +387,37 @@ fn encode_items(messages: &[Message], original: bool) -> Value {
                 .any(|block| matches!(block, nanus_domain::ContentBlock::Image { .. })) =>
             {
                 encode_attachment(&mut items, &mut attachments, call_id, blocks, *is_error);
+                if explicit && let Some(item) = items.last_mut() {
+                    let label = item["output"].take();
+                    item["output"] = output(label.as_str().unwrap_or_default().to_owned(), true);
+                }
             }
-            Message::Tool { call_id, .. } => items.push(json!({
-                "type": "function_call_output",
-                "call_id": call_id.as_str(),
-                "output": message.tool_text().unwrap_or_default(),
-            })),
+            Message::Tool { call_id, .. } => {
+                let mut item = json!({
+                    "type": "function_call_output",
+                    "call_id": call_id.as_str(),
+                });
+                // Assigned rather than written into the literal, which would copy the text again.
+                item["output"] = output(message.tool_text().unwrap_or_default(), explicit);
+                items.push(item);
+            }
         }
     }
     items.append(&mut attachments);
-    Value::Array(items)
+    items
+}
+
+/// A tool output: its text, or a one-part `input_text` list under the explicit fallback. The text
+/// is moved into the value, never copied.
+fn output(text: String, explicit: bool) -> Value {
+    if explicit {
+        let mut part = Map::new();
+        part.insert("type".to_owned(), json!("input_text"));
+        part.insert("text".to_owned(), Value::String(text));
+        Value::Array(vec![Value::Object(part)])
+    } else {
+        Value::String(text)
+    }
 }
 
 fn encode_input_block(block: &nanus_domain::ContentBlock) -> Value {
@@ -754,7 +999,7 @@ mod tests {
         let api = build_request(&config(), &request(messages.clone()));
         assert!(api["max_output_tokens"].as_u64().is_some(), "{api}");
         let mut backend = config();
-        backend.set_protocol(crate::Protocol::Responses);
+        backend.set_protocol(Protocol::Responses);
         let body = build_request(&backend, &request(messages));
         assert!(body.get("max_output_tokens").is_none(), "{body}");
     }
@@ -787,7 +1032,8 @@ mod tests {
         assert_eq!(body["model"], json!("gpt-6-astra"), "{body}");
     }
 
-    /// The prompt is lifted into `instructions` and the turns become flat input items.
+    /// The prompt is a leading developer item, one part per system message, rather than
+    /// `instructions`, and the turns become flat input items.
     #[test]
     fn the_request_lifts_the_prompt_and_flattens_the_turns() {
         let body = build_request(
@@ -798,11 +1044,18 @@ mod tests {
                 Message::user("hello"),
             ]),
         );
-        assert_eq!(body["instructions"], json!("be terse\n\nand kind"));
-        assert_eq!(body["input"][0]["role"], json!("user"));
-        assert_eq!(body["input"][0]["content"][0]["type"], json!("input_text"));
+        assert!(body.get("instructions").is_none());
+        assert_eq!(
+            body["input"][0],
+            json!({ "role": "developer", "content": [
+                { "type": "input_text", "text": "be terse" },
+                { "type": "input_text", "text": "and kind" },
+            ] })
+        );
+        assert_eq!(body["input"][1]["role"], json!("user"));
+        assert_eq!(body["input"][1]["content"][0]["type"], json!("input_text"));
         assert!(body.get("messages").is_none(), "the chat shape is not sent");
-        assert_eq!(body["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(2));
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["store"], json!(false));
         assert!(body["max_output_tokens"].as_u64().is_some());

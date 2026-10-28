@@ -10,8 +10,9 @@ use std::collections::BTreeSet;
 
 use nanus_domain::context::managed::{
     ContextFrontier, ContextMode, ContextPolicy, ContextStatus, Digest, ErrorCode, FragmentId,
-    Fragments, MANUAL_POLICY_V1, ManagedState, NoticeFacts, ProjectionRevision, ReserveBudget,
-    Selection, SnapshotProfile, derive_effective_context, fit, fragments, limits, proposal, state,
+    Fragments, MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, ManagedState, NoticeFacts,
+    ProjectionRevision, ReserveBudget, Selection, SnapshotProfile, derive_effective_context, fit,
+    fragments, limits, proposal, state,
 };
 use nanus_domain::{Goal, Message, Session};
 use nanus_ports::{ChatRequest, ManagedRequest, ModelCapabilities, PreparedModelCall, TurnRuntime};
@@ -89,6 +90,19 @@ pub(in crate::agent_loop) fn probe_facts(allowance: u32) -> NoticeFacts {
     }
 }
 
+/// The request a dry preparation measures: the next one this session would send.
+///
+/// A step's request always ends with a user message or tool results, which is where the adapter
+/// places the tail. An idle session between turns ends with the model's answer, and the request
+/// its next prompt starts is that conversation and the prompt: it is measured with an empty prompt
+/// standing in for the one not yet typed, so the tail has its place and nothing is sent.
+fn next_request(mut request: ChatRequest) -> ChatRequest {
+    if matches!(request.messages.last(), Some(Message::Assistant { .. })) {
+        request.messages.push(Message::user(""));
+    }
+    request
+}
+
 /// Maps a managed refusal into the bundle error.
 pub(in crate::agent_loop) fn refusal(code: ErrorCode) -> BundleError {
     let message = match code {
@@ -111,9 +125,13 @@ pub(in crate::agent_loop) fn refusal(code: ErrorCode) -> BundleError {
 }
 
 impl AgentRunner {
-    /// The system prompt a managed request carries: the runner's, then the manual policy.
+    /// The system prompt a managed request carries: the runner's, the manual policy, then the
+    /// guide to the tail the adapter places after the newest message.
     pub(in crate::agent_loop) fn managed_system_prompt(&self) -> String {
-        format!("{}\n\n{MANUAL_POLICY_V1}", self.system_prompt)
+        format!(
+            "{}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}",
+            self.system_prompt
+        )
     }
 
     /// Every schema a managed request offers: registered, goal, then context tools.
@@ -170,7 +188,15 @@ impl AgentRunner {
         }
         let model = self.model();
         let llm = self.llm();
-        if !llm.managed_support(&model).supports(limits::POLICY_VERSION) {
+        // An adapter built for an earlier layout would drop the tail, so it is not a managed path
+        // whatever policy it implements.
+        let support = llm.managed_support(&model);
+        if let nanus_ports::ManagedSupport::Supported { layout_version, .. } = support
+            && layout_version != limits::LAYOUT_VERSION
+        {
+            return Some(ErrorCode::UnsupportedMode);
+        }
+        if !support.supports(limits::POLICY_VERSION, limits::LAYOUT_VERSION) {
             return Some(ErrorCode::ProtocolIncompatible);
         }
         let caps = llm.capabilities(&model);
@@ -247,6 +273,7 @@ impl AgentRunner {
             .request_reservation
             .map_or(0, |(_, reasoning)| reasoning);
         request.context_budget = Some(self.context_budget());
+        request.prompt_cache = self.prompt_cache();
         let mut source = vec![Message::system(self.managed_system_prompt())];
         source.extend(session.derive_messages());
         request.source_history = Some(source.into());
@@ -271,15 +298,17 @@ impl AgentRunner {
             facts,
         )?;
         let mut request = base.clone();
-        request.messages = Vec::with_capacity(effective.messages.len().saturating_add(3));
+        request.messages = Vec::with_capacity(effective.messages.len().saturating_add(2));
         request
             .messages
             .push(Message::system(self.managed_system_prompt()));
-        request.messages.push(effective.notice);
         // A seeded session's handoff document leads every request, the first included, after the
-        // notice. It is composed here, so every probe the fitter measures carries it too.
+        // system prompt. It is composed here, so every probe the fitter measures carries it too.
         request.messages.extend(effective.seed);
         request.messages.extend(effective.messages);
+        // The notice and catalog are the tail, which the adapter places after the newest message
+        // and which every probe carries too, so each is costed as what would be sent.
+        request.context_tail = Some(effective.tail);
         Ok(request)
     }
 
@@ -301,7 +330,7 @@ impl AgentRunner {
         &self,
         request: ChatRequest,
     ) -> Result<Box<dyn PreparedModelCall>, ErrorCode> {
-        self.prepare_call(request)
+        self.prepare_call(next_request(request))
     }
 
     /// Prepares a candidate and reads only its cost, for the fitter's probes.
@@ -716,7 +745,7 @@ impl AgentRunner {
         let base = self.base_request(session, policy);
         let prepared = self
             .compose(session, snapshot, selection, &facts, &base)
-            .and_then(|request| self.prepare_call(request));
+            .and_then(|request| self.prepare_call(next_request(request)));
         match prepared {
             Ok(call) => {
                 status.estimate_input_tokens = Some(u64::from(call.estimate().input_tokens));

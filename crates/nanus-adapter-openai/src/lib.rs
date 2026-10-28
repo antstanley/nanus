@@ -47,6 +47,8 @@ mod function_policy;
 mod inception;
 #[cfg(test)]
 mod inception_tests;
+#[cfg(test)]
+mod layout_tests;
 mod managed;
 #[cfg(test)]
 mod managed_tests;
@@ -65,11 +67,20 @@ mod zai;
 mod zai_tests;
 
 pub use config::{
-    INCEPTION_API_KEY_ENV, INCEPTION_BASE_URL, OPENAI_API_KEY_ENV, OPENAI_BASE_URL,
-    OPENAI_SUBSCRIPTION_BASE_URL, OpenAiConfig, Protocol, ProtocolPreference, Vendor,
-    ZAI_API_KEY_ENV, ZAI_BASE_URL, ZAI_CODING_BASE_URL, effort_spelling, openai_effort_levels,
-    zai_effort_levels,
+    CachePath, INCEPTION_API_KEY_ENV, INCEPTION_BASE_URL, OPENAI_API_KEY_ENV, OPENAI_BASE_URL,
+    OPENAI_SUBSCRIPTION_BASE_URL, OpenAiConfig, Protocol, ProtocolPreference, SystemCarrier,
+    TailCarrier, Vendor, ZAI_API_KEY_ENV, ZAI_BASE_URL, ZAI_CODING_BASE_URL, effort_spelling,
+    openai_effort_levels, zai_effort_levels,
 };
+
+/// Which request a body is decorated for: the head breakpoint marks a managed request only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// A request the ordinary path sends, legacy context included.
+    Ordinary,
+    /// A managed request, whose head ends at the working-data message or the first user item.
+    Managed,
+}
 pub use error::OpenAiError;
 pub use nanus_ports::ReasoningEffort;
 
@@ -345,6 +356,7 @@ impl OpenAiLlm {
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<(Protocol, serde_json::Value, Decoder)> {
+        request.check_tail()?;
         let protocol = self.checked_protocol(request)?;
         if self.config.stateless_responses() {
             let prepared = self.prepare_responses(request)?;
@@ -517,6 +529,7 @@ impl LlmPort for OpenAiLlm {
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        request.check_tail()?;
         if self.config.stateless_responses() {
             return self.estimate_responses(request);
         }

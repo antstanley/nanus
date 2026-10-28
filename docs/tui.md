@@ -512,7 +512,10 @@ unsupported model paths are refused by the agent.
 
 `/context status` reaches the agent and draws a `context:` notice — the mode, revision, hidden
 and protected counts, and whether managed requests can be prepared, with the reason when they
-cannot. The agent persists mode changes and resets before acknowledging them to every viewer.
+cannot. The `context:` line ends with `cache N%` when the newest assistant message reported usage:
+the share of its prompt the provider served from cache. When no usage has been reported, the line
+leaves it out. `0%` is drawn as reported, and includes a provider that reports no cache counter.
+The share does not make a step's status a new line: like the estimates, it moves with every step. The agent persists mode changes and resets before acknowledging them to every viewer.
 A managed turn sends its own status when a step's request is prepared, drawn only when something
 changed, and each accepted or rejected proposal in the replay's words. See
 [managed context](context-management.md) for the policy and supported provider paths.

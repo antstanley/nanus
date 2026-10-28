@@ -44,6 +44,7 @@ pub struct Shared {
     sent: RefCell<Vec<ChatRequest>>,
     digests: RefCell<Vec<Digest>>,
     supported: Cell<bool>,
+    layout: Cell<u32>,
     echoes: Cell<usize>,
 }
 
@@ -57,6 +58,7 @@ pub trait ModelExt {
     fn sent(&self) -> Vec<ChatRequest>;
     fn digests(&self) -> Vec<Digest>;
     fn set_supported(&self, supported: bool);
+    fn set_layout(&self, layout: u32);
     fn echoes(&self) -> usize;
 }
 
@@ -67,6 +69,7 @@ impl ModelExt for Model {
             sent: RefCell::new(Vec::new()),
             digests: RefCell::new(Vec::new()),
             supported: Cell::new(true),
+            layout: Cell::new(2),
             echoes: Cell::new(0),
         })
     }
@@ -86,6 +89,9 @@ impl ModelExt for Model {
     }
     fn set_supported(&self, supported: bool) {
         self.supported.set(supported);
+    }
+    fn set_layout(&self, layout: u32) {
+        self.layout.set(layout);
     }
     fn echoes(&self) -> usize {
         self.echoes.get()
@@ -122,7 +128,10 @@ impl LlmPort for Port {
     }
     fn managed_support(&self, _: &str) -> ManagedSupport {
         if self.0.supported.get() {
-            ManagedSupport::Supported { policy_version: 1 }
+            ManagedSupport::Supported {
+                policy_version: 1,
+                layout_version: self.0.layout.get(),
+            }
         } else {
             ManagedSupport::Unsupported
         }

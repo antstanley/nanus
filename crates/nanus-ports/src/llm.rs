@@ -157,18 +157,30 @@ pub enum ManagedSupport {
     /// No pure preparation or fixtures exist for this path.
     #[default]
     Unsupported,
-    /// Preparation exists for this policy version.
+    /// Preparation exists for this policy version and request layout.
     Supported {
         /// The context policy version the preparation implements.
         policy_version: u32,
+        /// The managed request layout the preparation places
+        /// (`nanus_domain::context::managed::limits::LAYOUT_VERSION`).
+        ///
+        /// Layout 2 carries the per-step notice in [`ChatRequest::context_tail`], which the
+        /// adapter must place after the newest message. An adapter written before it would drop
+        /// the tail, so the field is required rather than defaulted: it cannot claim support
+        /// without declaring that it places it.
+        layout_version: u32,
     },
 }
 
 impl ManagedSupport {
-    /// Whether `policy_version` is supported.
+    /// Whether `policy_version` is supported with the request layout `layout_version`.
     #[must_use]
-    pub const fn supports(self, policy_version: u32) -> bool {
-        matches!(self, Self::Supported { policy_version: supported } if supported == policy_version)
+    pub const fn supports(self, policy_version: u32, layout_version: u32) -> bool {
+        matches!(
+            self,
+            Self::Supported { policy_version: policy, layout_version: layout }
+                if policy == policy_version && layout == layout_version
+        )
     }
 }
 
@@ -339,6 +351,22 @@ impl fmt::Display for ReasoningEffort {
     }
 }
 
+/// How long a provider may keep the cache entries a request asks it to write.
+///
+/// `None` asks for no entries, so a host that builds a request itself pays no cache-write premium
+/// it did not choose. An adapter whose provider caches implicitly sends nothing either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptCacheRetention {
+    /// No cache hints.
+    #[default]
+    None,
+    /// The provider's short retention: five minutes on Anthropic.
+    Short,
+    /// The provider's long retention: one hour on Anthropic, for a person who pauses between
+    /// turns.
+    Long,
+}
+
 /// One chat completion request.
 ///
 /// The fields are the whole of what an adapter may send. There is no catch-all
@@ -367,6 +395,15 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The sampling temperature.
     pub temperature: Option<f32>,
+    /// What the adapter places after the newest message: a managed request's context notice and
+    /// catalog, or a legacy request's elision notice.
+    ///
+    /// It is the one part of a request that changes on every step, so it is not a message: the
+    /// adapter puts it where its wire's prompt cache can work around it, and it is never recorded.
+    /// A request that carries one ends with a user message or tool results.
+    pub context_tail: Option<String>,
+    /// How long the provider may keep the cache entries this request marks.
+    pub prompt_cache: PromptCacheRetention,
 }
 
 impl ChatRequest {
@@ -383,6 +420,8 @@ impl ChatRequest {
             context_budget: None,
             reasoning_effort: None,
             temperature: None,
+            context_tail: None,
+            prompt_cache: PromptCacheRetention::None,
         }
     }
 
@@ -411,6 +450,49 @@ impl ChatRequest {
     #[must_use]
     pub const fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// Whether the tail, when there is one, has a place: after a final user message or tool
+    /// results. A request with no tail always has.
+    #[must_use]
+    pub fn tail_is_placeable(&self) -> bool {
+        self.context_tail.is_none()
+            || matches!(
+                self.messages.last(),
+                Some(Message::User { .. } | Message::Tool { .. })
+            )
+    }
+
+    /// Refuses a request whose tail has no place, before an adapter encodes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Unsupported`] with the `protocol_incompatible` code as its first word
+    /// when the request carries a tail and does not end with a user message or tool results.
+    pub fn check_tail(&self) -> LlmResult<()> {
+        if self.tail_is_placeable() {
+            Ok(())
+        } else {
+            Err(LlmError::Unsupported {
+                feature: "protocol_incompatible: a request that carries a tail ends with a user \
+                          message or tool results"
+                    .into(),
+            })
+        }
+    }
+
+    /// Sets the text placed after the newest message.
+    #[must_use]
+    pub fn with_context_tail(mut self, tail: impl Into<String>) -> Self {
+        self.context_tail = Some(tail.into());
+        self
+    }
+
+    /// Sets how long the provider may keep the cache entries this request marks.
+    #[must_use]
+    pub const fn with_prompt_cache(mut self, retention: PromptCacheRetention) -> Self {
+        self.prompt_cache = retention;
         self
     }
 }

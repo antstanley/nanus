@@ -62,10 +62,16 @@ fn prepare_mode(
         .unwrap_or(&request.messages);
     nanus_ports::capabilities::validate_history_image_input(caps, &request.model, source)?;
     let budget = request.context_budget.ok_or_else(refused)?;
+    let tail = request.context_tail.as_deref();
     let projection = if prospective {
-        nanus_domain::context::identify_tool_result_projection(source, &request.messages, budget)
+        nanus_domain::context::identify_tool_result_projection(
+            source,
+            &request.messages,
+            tail,
+            budget,
+        )
     } else {
-        nanus_domain::context::identify_projection(source, &request.messages, budget)
+        nanus_domain::context::identify_projection(source, &request.messages, tail, budget)
     }
     .map_err(|_| refused())?;
     nanus_domain::content::serialized_size(source, nanus_domain::content::SESSION_BYTES_MAX)
@@ -74,11 +80,22 @@ fn prepare_mode(
     let controls = controls(config, request, source)?;
     let source_digest = source_prefixes(source, &controls, instructions.as_deref())?;
     crate::function_policy::validate(config, request)?;
+    // Stateless replay keeps `instructions`: its receipts seal the prompt in that form, and the
+    // mode is about sealed replay rather than a provider cache. The elision notice, the request's
+    // tail, joins `instructions` after the prompt — the bytes this mode sent when the notice was a
+    // system message — and the wire digest below is taken over the body that carries it.
     let mut body = super::build_with_input(
         config,
         request,
         super::encode_replay_input(&request.messages),
+        crate::SystemCarrier::Instructions,
     );
+    if let Some(tail) = tail {
+        let joined = body["instructions"]
+            .as_str()
+            .map_or_else(|| tail.to_owned(), |prompt| format!("{prompt}\n\n{tail}"));
+        body["instructions"] = json!(joined);
+    }
     body["include"] = json!(["reasoning.encrypted_content"]);
     let wire_digest = digest::json(&body, nanus_domain::content::RECORD_BYTES_MAX)?;
     let context_receipt = ReplayContext {

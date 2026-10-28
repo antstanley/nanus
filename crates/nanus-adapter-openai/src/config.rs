@@ -266,6 +266,50 @@ impl Protocol {
     }
 }
 
+/// Where a path sends the request's leading system messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemCarrier {
+    /// Leading `system` messages, as chat completions has always sent them.
+    System,
+    /// One leading `developer` input item with one `input_text` part per system message, in
+    /// order. A part can carry an explicit cache breakpoint, so the harness's prompt — the first
+    /// part, ahead of any seed or summary — can be an entry every session shares.
+    Developer,
+    /// The top-level `instructions` string, which cannot carry a breakpoint.
+    Instructions,
+}
+
+/// Where a path places the request's tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailCarrier {
+    /// A trailing `developer` message. `OpenAI`'s implicit cache breakpoint lands at the end of
+    /// the latest *eligible* message — a user message or the last tool response of a group — and a
+    /// trailing developer message is not one, so the entry is written before the tail and the next
+    /// request can read it. A tail appended inside the eligible message would be inside every write.
+    TrailingDeveloper,
+    /// Appended to the final message: a trailing text part when its content is a list, otherwise
+    /// after a blank line. For vendors with no established mid-conversation system or developer
+    /// message, where a new user message would read as the person interrupting the tool loop.
+    Appended,
+    /// The fallback if a Responses path refuses a trailing developer message: explicit-only caching
+    /// (`prompt_cache_options`), every tool output as an `input_text` list, breakpoints at the head,
+    /// before the last answer and before the tail, and the tail appended as a trailing part.
+    AppendedExplicit,
+}
+
+/// How one path lays a request out for the provider's prompt cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachePath {
+    /// Where the leading system messages go.
+    pub system_carrier: SystemCarrier,
+    /// Where the tail goes.
+    pub tail_carrier: TailCarrier,
+    /// Whether the system prompt's part carries an explicit breakpoint when caching is asked for.
+    pub system_breakpoint: bool,
+    /// Whether a managed request's head carries an explicit breakpoint when caching is asked for.
+    pub head_breakpoint: bool,
+}
+
 /// The adapter's settings.
 ///
 /// `Debug` is implemented by hand so the API key cannot leak into a log line; this
@@ -488,6 +532,44 @@ impl OpenAiConfig {
             ProtocolPreference::Exact(_) => {
                 self.base_url.trim_end_matches('/') != OPENAI_SUBSCRIPTION_BASE_URL
             }
+        }
+    }
+
+    /// How a request on `protocol` is laid out for the provider's prompt cache.
+    ///
+    /// Every Responses path at `OpenAI` sends its system prompt as a leading developer message and
+    /// its tail as a trailing one; the explicit breakpoints are sent only to the API endpoint,
+    /// the one whose acceptance of them the live cases check. Chat completions keeps its system
+    /// messages; `OpenAI`'s takes the trailing developer tail, and the other vendors', which have
+    /// no established developer role mid-conversation, take it appended to the final message.
+    #[must_use]
+    pub fn cache_path(&self, protocol: Protocol) -> CachePath {
+        let api = self.base_url.trim_end_matches('/') == OPENAI_BASE_URL;
+        match (self.vendor, protocol) {
+            (Vendor::OpenAi, Protocol::Responses) => CachePath {
+                system_carrier: SystemCarrier::Developer,
+                tail_carrier: TailCarrier::TrailingDeveloper,
+                system_breakpoint: api,
+                head_breakpoint: api,
+            },
+            (Vendor::OpenAi, Protocol::ChatCompletions) => CachePath {
+                system_carrier: SystemCarrier::System,
+                tail_carrier: TailCarrier::TrailingDeveloper,
+                system_breakpoint: false,
+                head_breakpoint: false,
+            },
+            (Vendor::Zai | Vendor::Inception, Protocol::Responses) => CachePath {
+                system_carrier: SystemCarrier::Instructions,
+                tail_carrier: TailCarrier::TrailingDeveloper,
+                system_breakpoint: false,
+                head_breakpoint: false,
+            },
+            (Vendor::Zai | Vendor::Inception, Protocol::ChatCompletions) => CachePath {
+                system_carrier: SystemCarrier::System,
+                tail_carrier: TailCarrier::Appended,
+                system_breakpoint: false,
+                head_breakpoint: false,
+            },
         }
     }
 

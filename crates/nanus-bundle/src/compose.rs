@@ -1040,6 +1040,10 @@ fn build_runner(
         agent,
         clock.clone(),
     )?;
+    // The stock runner asks providers to cache what its requests mark: a `nanus run` reads its
+    // own prefix again on every step within minutes, so the short retention pays for itself on
+    // its second read. An agent served over the link asks for the long one instead (`serve`).
+    let runner = runner.with_prompt_cache(nanus_ports::PromptCacheRetention::Short);
     // An unset budget is the model's own window, resolved per request so it follows a switch;
     // a model without a documented window keeps the domain's conservative default.
     let runner = if config.context_budget.is_none() {

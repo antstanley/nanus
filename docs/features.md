@@ -37,7 +37,7 @@ that runs a turn.
   model switch — the conversation is fitted into that window less the model's output
   ceiling, with a quarter left unspent for the estimate's error — and a model with no
   documented window keeps 64000 estimated tokens. Past it the _oldest turns_ are
-  dropped, whole, with a notice the model reads where the gap is, and the reader is told —
+  dropped, whole, with a notice the model reads at the end of the request, and the reader is told —
   the CLI on stderr and the interface as a notice in the transcript. A turn whose
   _newest_ part does not fit is refused with a sentence naming the field rather
   than sent to a provider that would refuse the request. The estimate is
@@ -815,8 +815,10 @@ context](context-management.md).
 
 ## Legacy context
 
-A legacy session replays its whole log and drops the oldest whole turns when the budget is spent,
-with a notice where the gap is. It can also be compacted (`/compact`): the agent drafts a summary of
+A legacy session replays its whole log and drops the oldest whole turns when the budget is spent.
+The model is told at the end of the request, after the newest message: the notice says how many
+messages and turns were left out and that the oldest thing shown is not the start of the
+conversation. The interface still draws the gap where it is. It can also be compacted (`/compact`): the agent drafts a summary of
 the conversation, the reader reads it with what it leaves out, and a confirmed cut keeps only the
 summary and what follows it in the prompt. Nothing is deleted, and the model cannot read the cut
 part back; the preview says so before anything changes. A compacted session cannot become managed.

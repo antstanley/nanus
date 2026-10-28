@@ -3498,6 +3498,74 @@ fn a_context_status_on_an_idle_legacy_session_is_legacy_or_refused() {
     });
 }
 
+/// C14: a legacy session's status carries the last request's prompt and cache-hit counts — null
+/// before any usage was reported, then the newest assistant message's — and a served agent asks
+/// providers for the long retention.
+#[test]
+fn a_status_carries_the_last_requests_cache_share_in_a_legacy_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let metered = MeteredLlm {
+        step: std::cell::Cell::new(0),
+    };
+    let (agent, _store) = agent_over(dir.path(), Rc::new(Box::new(metered)), "metered");
+    let runner = Rc::clone(agent.runner());
+    assert_eq!(
+        runner.prompt_cache(),
+        nanus_ports::PromptCacheRetention::None
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let _ = client.start(None).await.expect("a session starts");
+        assert_eq!(
+            runner.prompt_cache(),
+            nanus_ports::PromptCacheRetention::Long
+        );
+        let status = |frame: Frame| match frame {
+            Frame::ContextStatus { payload, .. } => {
+                (payload.last_prompt_tokens, payload.last_cache_hit_tokens)
+            }
+            other => panic!("expected a status, got {other:?}"),
+        };
+        client
+            .send(&Request::Context {
+                action: ContextAction::Status,
+            })
+            .await
+            .expect("the read is sent");
+        assert_eq!(status(context_answer(&mut client).await), (None, None));
+        client
+            .send(&Request::Prompt {
+                text: "do something".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let _ = turn_frames(&mut client).await;
+        client
+            .send(&Request::Context {
+                action: ContextAction::Status,
+            })
+            .await
+            .expect("the read is sent");
+        assert_eq!(
+            status(context_answer(&mut client).await),
+            (Some(30), Some(28)),
+            "the newest assistant message's usage"
+        );
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
 /// A managed session whose store cannot checkpoint takes no turn: it is never run on the
 /// legacy path and never saved by the host, because a managed body is saved through its bound
 /// checkpoint or not at all.
@@ -3602,7 +3670,10 @@ impl LlmPort for ManagedLlm {
     }
 
     fn managed_support(&self, _: &str) -> nanus_ports::ManagedSupport {
-        nanus_ports::ManagedSupport::Supported { policy_version: 1 }
+        nanus_ports::ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2,
+        }
     }
     fn prepare_managed(
         &self,

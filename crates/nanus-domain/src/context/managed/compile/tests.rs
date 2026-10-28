@@ -236,10 +236,17 @@ fn a_fresh_request_has_no_prefill_and_points_at_get_goal() {
     .unwrap_or_else(|code| panic!("{code}"));
     assert!(!effective.memory);
     assert_eq!(effective.messages.len(), 1);
-    let notice = effective.notice.text().unwrap_or_default();
-    assert!(notice.contains("goal_data_available=false"), "{notice}");
-    assert!(notice.contains("get_goal"), "{notice}");
-    assert!(matches!(effective.notice, Message::System { .. }));
+    let tail = &effective.tail;
+    assert!(tail.contains("goal_data_available=false"), "{tail}");
+    // What the field means is said once, in the guide, rather than on every request.
+    assert!(MANAGED_REQUEST_GUIDE_V1.contains("get_goal"));
+    assert!(
+        !effective
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::System { .. })),
+        "the tail is not a message"
+    );
 }
 
 /// T08/T07: generated data sits after the first user message, labelled, never last, and carries
@@ -308,12 +315,12 @@ fn generated_data_is_a_labelled_assistant_message_after_the_first_user_message()
             == 0,
         "nothing a model wrote becomes a system message"
     );
-    let notice = effective.notice.text().unwrap_or_default();
+    let tail = &effective.tail;
     assert!(
-        !notice.contains("root"),
-        "the notice carries no note text: {notice}"
+        !tail.contains("root"),
+        "the tail carries no note text: {tail}"
     );
-    assert!(notice.contains("budget_hint=reduce") && notice.contains("pressure_percent=75"));
+    assert!(tail.contains("budget_hint=reduce") && tail.contains("pressure_percent=75"));
 }
 
 /// The catalog is bounded however many fragments are hidden.
@@ -544,4 +551,223 @@ fn session_without_seed() -> Session {
         content_blocks: None,
     });
     session
+}
+
+/// The working data's text for one goal and one note array, compiled over `session`.
+fn memory_text(
+    session: &Session,
+    goal: Option<&Goal>,
+    hidden: &[FragmentId],
+    notes: &[WorkingNote],
+    revision: u64,
+) -> Option<String> {
+    let fragments = derive(session.log()).unwrap_or_default();
+    let protected = protected(session.log(), &fragments);
+    let effective = derive_effective_context(
+        session,
+        &fragments,
+        &protected,
+        Selection {
+            revision,
+            hidden,
+            notes,
+            notes_goal_revision: goal.map(Goal::revision),
+        },
+        goal,
+        &facts(),
+    )
+    .unwrap_or_else(|code| panic!("{code}"));
+    effective
+        .memory
+        .then(|| {
+            effective
+                .messages
+                .get(1)
+                .and_then(Message::text)
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
+fn note(id: &str, claim: &str) -> WorkingNote {
+    WorkingNote {
+        id: NoteId::parse(id).unwrap_or_else(|| unreachable!("valid")),
+        claim: claim.into(),
+        category: NoteCategory::Observed,
+        sources: vec![SourceRef {
+            kind: SourceKind::Event,
+            event_seq: Some(2),
+            block_index: None,
+            artifact_id: None,
+            offset: 0,
+            length: 1,
+            source_digest: Digest::of(b"x"),
+            field: SourceField::ToolText,
+        }],
+    }
+}
+
+/// C2: the working data heads the cached prefix, so it changes only with the note array or the
+/// goal objective — never with the goal's phase or revision, a hide, or the context revision.
+#[test]
+fn the_working_data_changes_only_with_the_notes_or_the_objective() {
+    let mut session = session();
+    session.append(SessionEvent::UserMessage {
+        text: "first".into(),
+        content_blocks: None,
+    });
+    for index in 0..4 {
+        work(&mut session, &format!("w{index}"), "evidence");
+    }
+    session.append(SessionEvent::UserMessage {
+        text: "second".into(),
+        content_blocks: None,
+    });
+    let fragments = derive(session.log()).unwrap_or_default();
+    let oldest: Vec<FragmentId> = fragments.all().iter().take(1).map(|f| f.id).collect();
+    let goal = Goal::new("ship it", 1).unwrap_or_else(|error| panic!("{error}"));
+    let paused = goal
+        .paused(None, 2)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let notes = [note("n:one", "the parser is done")];
+    let base = memory_text(&session, Some(&goal), &[], &notes, 1);
+    assert!(base.is_some());
+    // A phase change, a later revision of the same objective, a hide and a new context revision
+    // leave the text byte-identical.
+    assert_ne!(goal.revision(), paused.revision());
+    let same_bound = |goal: &Goal| {
+        let fragments = derive(session.log()).unwrap_or_default();
+        let protected = protected(session.log(), &fragments);
+        derive_effective_context(
+            &session,
+            &fragments,
+            &protected,
+            Selection {
+                revision: 1,
+                hidden: &[],
+                notes: &notes,
+                notes_goal_revision: Some(1),
+            },
+            Some(goal),
+            &facts(),
+        )
+        .unwrap_or_else(|code| panic!("{code}"))
+    };
+    let stale = same_bound(&paused);
+    assert_eq!(
+        stale.messages.get(1).and_then(Message::text),
+        base.as_deref()
+    );
+    assert!(stale.tail.contains("notes_stale=true"), "{}", stale.tail);
+    assert!(stale.tail.contains("goal_phase=paused"), "{}", stale.tail);
+    assert_eq!(memory_text(&session, Some(&goal), &oldest, &notes, 7), base);
+    // A new note array, or a new objective, changes it.
+    let more = [notes[0].clone(), note("n:two", "the lexer is done")];
+    assert_ne!(memory_text(&session, Some(&goal), &[], &more, 1), base);
+    let renamed = goal
+        .with_objective("ship it twice", 3)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_ne!(memory_text(&session, Some(&renamed), &[], &notes, 1), base);
+    // Hidden fragments alone are no working data: the catalog is in the tail.
+    assert_eq!(memory_text(&session, None, &oldest, &[], 1), None);
+    assert!(!MEMORY_LABEL.contains("catalog"));
+}
+
+/// C1: the tail states every key, the catalog exactly when something is hidden, and fits its
+/// bound at the hidden-id cap.
+#[test]
+fn the_tail_states_every_key_and_the_catalog_only_when_something_is_hidden() {
+    let mut session = session();
+    session.append(SessionEvent::GoalChange {
+        goal: Some(Goal::new("ship it", 1).unwrap_or_else(|error| panic!("{error}"))),
+    });
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
+    for index in 0..600 {
+        work(&mut session, &format!("c{index}"), "x");
+    }
+    session.append(SessionEvent::UserMessage {
+        text: "again".into(),
+        content_blocks: None,
+    });
+    let goal = session.goal();
+    let fragments = derive(session.log()).unwrap_or_default();
+    let protected = protected(session.log(), &fragments);
+    let compiled = |hidden: &[FragmentId]| {
+        derive_effective_context(
+            &session,
+            &fragments,
+            &protected,
+            Selection {
+                revision: 3,
+                hidden,
+                notes: &[],
+                notes_goal_revision: None,
+            },
+            goal.as_ref(),
+            &NoticeFacts {
+                estimate_input_tokens: Some(u32::MAX),
+                estimator: "a-long-estimator-name".into(),
+                input_allowance: u32::MAX,
+                budget_hint: true,
+                recovery_available: true,
+            },
+        )
+        .unwrap_or_else(|code| panic!("{code}"))
+    };
+    let clear = compiled(&[]);
+    for key in [
+        "mode=managed",
+        "policy_version=1",
+        "revision=3",
+        "hidden_fragments=0",
+        "protected_fragments=",
+        "notes=0",
+        "notes_stale=false",
+        "estimate_input_tokens=",
+        "estimate_age=previous_candidate",
+        "estimator=",
+        "input_allowance=",
+        "pressure_percent=",
+        "budget_hint=reduce",
+        "goal_phase=active",
+        "goal_revision=1",
+        "goal_set_by=host",
+        "goal_data_available=true",
+        "recovery_available=true",
+    ] {
+        assert!(clear.tail.contains(key), "{key}: {}", clear.tail);
+    }
+    assert!(clear.tail.starts_with("[nanus context] "));
+    assert_eq!(clear.tail.lines().count(), 1, "{}", clear.tail);
+    let hidden: Vec<FragmentId> = fragments
+        .all()
+        .iter()
+        .filter(|fragment| fragment.settled && !protected.contains(&fragment.id))
+        .map(|fragment| fragment.id)
+        .collect();
+    let catalogued = compiled(&hidden);
+    assert_eq!(catalogued.tail.lines().count(), 2, "{}", catalogued.tail);
+    assert!(
+        catalogued
+            .tail
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.starts_with("Hidden history:"))
+    );
+    assert!(catalogued.tail.len() <= limits::TAIL_BYTES_MAX);
+    // No goal: the provenance is `none`, not a guess.
+    let mut bare = self::session();
+    bare.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
+    let compiled = compile(&bare, &[], &[]);
+    assert!(
+        compiled.tail.contains("goal_set_by=none"),
+        "{}",
+        compiled.tail
+    );
 }

@@ -622,7 +622,13 @@ fn a_legacy_fit_keeps_the_summary_when_it_drops_turns() {
             if text.starts_with(COMPACTION_LABEL)),
         "the summary is the leading prompt and is never dropped"
     );
-    assert!(matches!(&fitted.messages[1], Message::System { .. }));
+    // The notice is the request's tail, so the oldest kept turn follows the summary directly.
+    assert!(matches!(&fitted.messages[1], Message::User { .. }));
+    assert!(
+        fitted
+            .elision
+            .is_some_and(|elision| elision.notice().contains("not shown"))
+    );
 }
 
 #[test]

@@ -151,8 +151,17 @@ async fn nine_original_images_fit_after_whole_turn_elision_without_deleting_the_
             .count(),
         8
     );
+    // The runner sent the elision notice as the request's tail, never among its messages.
+    let tail = request.context_tail.as_deref();
+    assert!(tail.is_some_and(|tail| tail.contains("not shown")));
+    assert!(!request.messages.iter().any(|message| {
+        message
+            .text()
+            .is_some_and(|text| text.contains("not shown"))
+    }));
     let projection =
-        nanus_domain::context::identify_projection(source, &request.messages, 900_000).unwrap();
+        nanus_domain::context::identify_projection(source, &request.messages, tail, 900_000)
+            .unwrap();
     assert_eq!(
         (projection.dropped_turns, projection.dropped_messages),
         (1, 3)

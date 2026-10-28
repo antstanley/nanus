@@ -500,6 +500,12 @@ struct Held {
     /// a question nobody answers a *denial* rather than a hang: the approver's receiver
     /// ends and it reports `Unavailable`.
     approvals: RefCell<BTreeMap<String, Question>>,
+    /// The usage of the newest assistant message that reported one: what the last model request
+    /// cost, and how much of it the provider served from cache.
+    ///
+    /// Cached for the same reason as the goal: a step's status is published while the turn holds
+    /// the session. Refreshed with the session, and moved by every usage record a turn reports.
+    last_usage: Cell<Option<Usage>>,
     /// The event count of the session's active compaction marker, when one exists.
     ///
     /// Cached for the same reason as the headline: an attachment reads it without borrowing the
@@ -567,6 +573,7 @@ impl Held {
             approved: RefCell::new(BTreeSet::new()),
             approval_seq: Cell::new(0),
             compaction: Cell::new(None),
+            last_usage: Cell::new(None),
             seed: RefCell::new(seed),
             touched: Cell::new(touched),
         };
@@ -669,6 +676,7 @@ impl Held {
             events: u64::try_from(session.event_count()).unwrap_or(u64::MAX),
         };
         *self.goal.borrow_mut() = session.goal().as_ref().map(wire_goal);
+        self.last_usage.set(session.last_reported_usage().copied());
     }
 
     /// Assigns the next frame id in this session's stream.
@@ -1805,7 +1813,10 @@ impl Progress for Broadcast<'_> {
         let id = self.held.next_frame_id();
         let frame = Frame::ContextStatus {
             envelope: self.held.envelope(turn, step, id),
-            payload: context::wire_status(status),
+            payload: Box::new(context::wire_status(
+                status,
+                self.held.last_usage.get().as_ref(),
+            )),
         };
         self.keep_and_send(id, &frame);
     }
@@ -1855,7 +1866,8 @@ impl Progress for Broadcast<'_> {
     }
 
     fn usage(&mut self, usage: &Usage) {
-        // The usage is held by the step's assistant record.
+        // The usage is held by the step's assistant record, so it is the newest one reported.
+        self.held.last_usage.set(Some(*usage));
         self.produced = true;
         let now = Instant::now();
         let started = self.started.take();
@@ -2000,6 +2012,12 @@ pub async fn serve(
         || format!("a nanus agent (pid {})", std::process::id()),
         |endpoint| format!("nanus at {}", endpoint.display()),
     );
+    // A person at an interface may pause between turns for longer than the short retention, so
+    // a served agent's requests ask for the long one: a one-hour entry pays for itself on its
+    // third read, and a turn after a coffee is a read rather than a rewrite.
+    agent
+        .runner()
+        .set_prompt_cache(nanus_ports::PromptCacheRetention::Long);
     let registry = Rc::new(Registry::new(agent, owner));
     let shutdown = Rc::new(Notify::new());
     let mut connections: JoinSet<()> = JoinSet::new();

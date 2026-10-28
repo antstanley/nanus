@@ -417,6 +417,18 @@ pub struct ContextStatusInfo {
     pub managed_ready: bool,
     /// The stable code saying why it cannot, when it cannot.
     pub unavailable_reason: Option<String>,
+    /// The prompt tokens of the newest assistant message that reported usage, in either mode.
+    ///
+    /// Null when none has, and exactly when [`Self::last_cache_hit_tokens`] is. Absent from an
+    /// older agent's frame, which a reader treats as "no usage reported".
+    #[serde(default)]
+    pub last_prompt_tokens: Option<u64>,
+    /// The share of those tokens the provider served from its prompt cache.
+    ///
+    /// Zero means the provider reported none, or reported no cache counter at all: the neutral
+    /// usage record cannot tell the two apart. Null exactly when [`Self::last_prompt_tokens`] is.
+    #[serde(default)]
+    pub last_cache_hit_tokens: Option<u64>,
 }
 
 /// What a successful checkpoint proved.
@@ -1146,7 +1158,10 @@ pub enum Frame {
         #[serde(flatten)]
         envelope: ContextEnvelope,
         /// The status.
-        payload: ContextStatusInfo,
+        ///
+        /// Boxed because it is the largest payload a frame carries, and every other frame would
+        /// otherwise be as large as it is. A box is transparent on the wire.
+        payload: Box<ContextStatusInfo>,
     },
 
     /// A context decision settled: a proposal accepted, rejected or cancelled, or a fit made.
@@ -1500,6 +1515,8 @@ mod tests {
             profile_digest: "cd".repeat(32),
             managed_ready: false,
             unavailable_reason: Some("protocol_incompatible".to_owned()),
+            last_prompt_tokens: Some(400),
+            last_cache_hit_tokens: Some(300),
         }
     }
 
@@ -1539,16 +1556,18 @@ mod tests {
             },
             Frame::ContextStatus {
                 envelope: envelope(None, None, 42),
-                payload: status_info(),
+                payload: Box::new(status_info()),
             },
             Frame::ContextStatus {
                 envelope: envelope(Some(4), Some(2), 43),
-                payload: ContextStatusInfo {
+                payload: Box::new(ContextStatusInfo {
                     mode: ContextModeState::Legacy,
                     last_decision: None,
                     unavailable_reason: None,
+                    last_prompt_tokens: None,
+                    last_cache_hit_tokens: None,
                     ..status_info()
-                },
+                }),
             },
             Frame::ContextDecision {
                 envelope: envelope(Some(4), Some(2), 44),
@@ -1592,6 +1611,31 @@ mod tests {
             let decoded = decode::<Frame>(&encoded);
             assert_eq!(decoded.ok(), Some(frame.clone()), "round trip of {frame:?}");
         }
+    }
+
+    /// C14: a status from an older agent, which carries no usage fields, decodes with both null:
+    /// the fields are defaulted, so the protocol version does not move for them.
+    #[test]
+    fn a_status_without_the_usage_fields_decodes_with_both_null() {
+        let frame = Frame::ContextStatus {
+            envelope: envelope(None, None, 9),
+            payload: Box::new(status_info()),
+        };
+        let encoded = encode(&frame).unwrap_or_else(|error| panic!("{error}"));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&encoded).unwrap_or_else(|error| panic!("{error}"));
+        let payload = value["payload"]
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("a payload object"));
+        assert!(payload.remove("last_prompt_tokens").is_some());
+        assert!(payload.remove("last_cache_hit_tokens").is_some());
+        let decoded = decode::<Frame>(&value.to_string()).unwrap_or_else(|error| panic!("{error}"));
+        let Frame::ContextStatus { payload, .. } = decoded else {
+            panic!("a status frame")
+        };
+        assert_eq!(payload.last_prompt_tokens, None);
+        assert_eq!(payload.last_cache_hit_tokens, None);
+        assert_eq!(payload.revision, status_info().revision);
     }
 
     /// The envelope is flat on the wire, as the contract writes it: a reader that does not know

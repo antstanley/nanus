@@ -116,22 +116,29 @@ fn a_chat_session_with_no_marker_sends_no_summary() {
 }
 
 #[test]
-fn a_compaction_summary_joins_the_responses_instructions_after_the_prompt() {
+fn a_compaction_summary_is_the_responses_developer_part_after_the_prompt() {
     let body = crate::responses::build_request(&config(), &legacy_request(true));
+    assert!(body.get("instructions").is_none());
     assert_eq!(
-        body["instructions"],
-        json!(format!("you are nanus\n\n{COMPACTION_LABEL}\n{SUMMARY}"))
+        body["input"][0]["content"],
+        json!([
+            { "type": "input_text", "text": "you are nanus" },
+            { "type": "input_text", "text": format!("{COMPACTION_LABEL}\n{SUMMARY}") },
+        ])
     );
     let input = body["input"].as_array().cloned().unwrap_or_default();
-    assert_eq!(input.len(), 1, "only the prompt after the cut: {input:?}");
-    assert_eq!(input[0]["role"], json!("user"));
+    assert_eq!(input.len(), 2, "only the prompt after the cut: {input:?}");
+    assert_eq!(input[1]["role"], json!("user"));
     assert!(!body.to_string().contains("first question"));
 }
 
 #[test]
 fn a_responses_session_with_no_marker_sends_no_summary() {
     let body = crate::responses::build_request(&config(), &legacy_request(false));
-    assert_eq!(body["instructions"], json!("you are nanus"));
+    assert_eq!(
+        body["input"][0]["content"],
+        json!([{ "type": "input_text", "text": "you are nanus" }])
+    );
     assert!(!body.to_string().contains("Compacted history"));
     assert_eq!(
         body.to_string(),

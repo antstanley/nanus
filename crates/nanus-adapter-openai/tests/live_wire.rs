@@ -355,7 +355,14 @@ fn the_subscription_speaks_the_responses_api() {
     );
     assert!(body.get("messages").is_none(), "not the chat shape: {body}");
     assert!(body.get("input").is_some(), "the items shape: {body}");
-    assert!(body.get("instructions").is_some(), "the prompt is lifted");
+    assert!(
+        body.get("instructions").is_none(),
+        "the prompt is not `instructions`"
+    );
+    assert_eq!(
+        body["input"][0]["role"], "developer",
+        "the prompt is the leading developer item: {body}"
+    );
 
     assert!(
         collected

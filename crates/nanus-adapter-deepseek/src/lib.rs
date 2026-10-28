@@ -40,6 +40,8 @@
 
 mod config;
 mod error;
+#[cfg(test)]
+mod layout_tests;
 mod managed;
 #[cfg(test)]
 mod managed_tests;
@@ -211,6 +213,7 @@ impl LlmPort for DeepSeekLlm {
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
+        request.check_tail()?;
         metadata::validate_output(&self.config, request)?;
         nanus_ports::capabilities::estimate_payload(
             self.capabilities(&request.model),
@@ -220,6 +223,9 @@ impl LlmPort for DeepSeekLlm {
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        if let Err(error) = request.check_tail() {
+            return error_stream(&error.to_string());
+        }
         if let Err(error) = nanus_ports::capabilities::validate_image_input(
             self.capabilities(&request.model),
             &request,

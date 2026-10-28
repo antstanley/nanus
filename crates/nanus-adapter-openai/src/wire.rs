@@ -16,6 +16,13 @@
 //!   `response_format`, `tool_choice`, `seed`, and `user` are absent: the harness
 //!   has no use for them, and a field nobody reads is a field nobody reviews.
 //!
+//! ## The tail
+//!
+//! A request's tail goes after the newest message in the form its path names
+//! ([`crate::TailCarrier`]): a trailing `developer` message at `OpenAI`, whose implicit cache
+//! breakpoint skips it, and appended to the final message's content at the other vendors. Every
+//! other message encodes to the same bytes whether or not it is the newest.
+//!
 //! ## Why an empty assistant turn sends `content: ""`
 //!
 //! The same rule the domain enforces for `DeepSeek` holds here, and is asserted
@@ -27,7 +34,7 @@ use nanus_domain::{Message, ToolSchema, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, ReasoningEffort};
 use serde_json::{Map, Value, json};
 
-use crate::config::{OpenAiConfig, Vendor};
+use crate::config::{OpenAiConfig, Protocol, TailCarrier, Vendor};
 
 /// The most tool calls one response may carry.
 ///
@@ -87,12 +94,52 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
         crate::function_policy::apply(config.function_strictness(), &mut tools, true);
         body.insert("tools".to_owned(), tools);
     }
-    let encoded = Value::Object(body);
+    let mut encoded = Value::Object(body);
+    if let Some(tail) = request.context_tail.as_deref() {
+        let carrier = config.cache_path(Protocol::ChatCompletions).tail_carrier;
+        place_tail(&mut encoded["messages"], tail, carrier);
+    }
     // Postcondition: the mandatory fields are present, so a later edit cannot
     // produce a silently empty request.
     assert!(encoded.get("model").is_some());
     assert!(encoded.get("messages").is_some());
     encoded
+}
+
+/// Places the tail after the newest message, in the form `carrier` names.
+///
+/// # Panics
+///
+/// When there is no message to place it after; a request always has one.
+pub fn place_tail(messages: &mut Value, tail: &str, carrier: TailCarrier) {
+    let Some(turns) = messages.as_array_mut() else {
+        return;
+    };
+    match carrier {
+        TailCarrier::TrailingDeveloper => {
+            turns.push(json!({ "role": "developer", "content": tail }));
+        }
+        TailCarrier::Appended | TailCarrier::AppendedExplicit => {
+            let last = turns.last_mut();
+            assert!(last.is_some(), "a tail follows a message");
+            if let Some(last) = last {
+                append_text(&mut last["content"], tail);
+            }
+        }
+    }
+}
+
+/// Appends `tail` to one message's content: a trailing text part when the content is a list,
+/// otherwise after a blank line in the string.
+pub fn append_text(content: &mut Value, tail: &str) {
+    match content {
+        Value::Array(parts) => parts.push(json!({ "type": "text", "text": tail })),
+        Value::String(text) => {
+            text.push_str("\n\n");
+            text.push_str(tail);
+        }
+        other => *other = json!(tail),
+    }
 }
 
 /// Writes the reasoning control the vendor understands.

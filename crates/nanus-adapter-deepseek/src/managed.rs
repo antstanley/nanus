@@ -13,9 +13,10 @@
 //! whose output ceiling is declared (see [`crate::metadata`]) and for which this crate carries
 //! wire fixtures. The request must be in the managed grammar the runner compiles:
 //!
-//! - one or more leading system messages (the harness prompt, then the fixed-schema notice), and
-//!   no system message after the conversation begins;
-//! - a conversation that opens with a user message;
+//! - one or more leading system messages (the harness prompt, then a seeded session's handoff
+//!   seed), and no system message after the conversation begins;
+//! - a conversation that opens with a user message and ends with a user message or tool results,
+//!   whose content the tail is appended to;
 //! - at most one generated working-data message — an assistant text turn with no calls, no
 //!   reasoning and no replay, opening with the domain's provenance label — directly after the
 //!   first user message and never last, so it can never be an assistant prefill;
@@ -38,7 +39,7 @@ use std::collections::BTreeSet;
 
 use nanus_domain::Message;
 use nanus_domain::context::managed::compile::MEMORY_LABEL;
-use nanus_domain::context::managed::limits::POLICY_VERSION;
+use nanus_domain::context::managed::limits::{LAYOUT_VERSION, POLICY_VERSION};
 use nanus_domain::context::managed::{Digest, ErrorCode, SelectionIdentity};
 use nanus_ports::{
     LlmError, LlmResult, LlmStream, ManagedRequest, ManagedSupport, PreparedModelCall,
@@ -58,6 +59,7 @@ pub fn support(config: &DeepSeekConfig, model: &str) -> ManagedSupport {
     {
         ManagedSupport::Supported {
             policy_version: POLICY_VERSION,
+            layout_version: LAYOUT_VERSION,
         }
     } else {
         ManagedSupport::Unsupported
@@ -136,7 +138,7 @@ pub fn prepare(llm: &DeepSeekLlm, managed: ManagedRequest) -> LlmResult<Prepared
         selection_epoch,
     } = managed;
     let config = llm.config();
-    if !support(config, &request.model).supports(POLICY_VERSION) {
+    if !support(config, &request.model).supports(POLICY_VERSION, LAYOUT_VERSION) {
         return Err(refuse(
             ErrorCode::UnsupportedMode,
             "managed context is not supported for this model and endpoint",
@@ -251,7 +253,17 @@ pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
     if anchor_generated && conversation.len() <= 2 {
         return Err(incompatible("generated data is never the last message"));
     }
-    validate_pairs(conversation)
+    validate_pairs(conversation)?;
+    // The tail is appended to the newest message, so it must be one the tail can follow.
+    if !matches!(
+        conversation.last(),
+        Some(Message::User { .. } | Message::Tool { .. })
+    ) {
+        return Err(incompatible(
+            "the conversation ends with a user message or tool results",
+        ));
+    }
+    Ok(())
 }
 
 /// Every surviving call is answered once, in place; every result answers a surviving call.

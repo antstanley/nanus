@@ -296,7 +296,10 @@ fn exact_chat_models_can_carry_a_managed_projection() {
     for model in crate::inception::MODELS {
         assert_eq!(
             llm.managed_support(model),
-            ManagedSupport::Supported { policy_version: 1 },
+            ManagedSupport::Supported {
+                policy_version: 1,
+                layout_version: 2
+            },
             "{model}"
         );
     }

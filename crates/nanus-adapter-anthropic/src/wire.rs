@@ -16,6 +16,29 @@
 //!   JSON string, so nothing has to be double-encoded and nothing has to be parsed
 //!   on the way in or out.
 //!
+//! ## Canonical encoding, then decoration
+//!
+//! A request is encoded in two steps. The **canonical** body is the one this adapter always sent:
+//! a joined `system` string, no tail, no cache hints. **Decoration** then rewrites `system` as one
+//! text block per system message, appends the request's tail as the last block of the final
+//! `user` turn, and — when the runner opted into caching — places `cache_control` breakpoints.
+//! What is sent, estimated and digested is the decorated body; what a signed thinking block is
+//! bound to is the canonical one, so a cache marker can never invalidate a signature and a
+//! digest an earlier build recorded still matches.
+//!
+//! The breakpoints, in position order, each dropped when it is at or before one already placed:
+//!
+//! 1. the first `system` block, the harness's prompt alone, so sessions with the same model,
+//!    tools and prompt share it whatever seed or summary follows;
+//! 2. in a managed request, the head's last block: the working-data message, or the first user
+//!    turn when there is none;
+//! 3. the last block of the turn before the last assistant turn, which is where the previous
+//!    request wrote its entry, so a step that appended a wide batch still reads it;
+//! 4. the last block before the tail, or the request's last block when there is none.
+//!
+//! None lands on a thinking block: the search walks back past them. Every breakpoint of a request
+//! has the same TTL, so the provider's rule that longer TTLs come first holds trivially.
+//!
 //! ## Streaming is event-typed rather than sentinel-terminated
 //!
 //! Every frame carries a `type`, and the stream ends at `message_stop` — there is no
@@ -29,20 +52,104 @@ use serde_json::{Map, Value, json};
 
 use crate::config::AnthropicConfig;
 
-/// Builds the JSON body for a message request.
-#[must_use]
-pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
-    build_counted(config, request).0
+/// Which request a body is decorated for: breakpoint 2 marks a managed request's head only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// A request the ordinary path sends, legacy context included.
+    Ordinary,
+    /// A managed request, whose head ends at the working-data message or the first user turn.
+    Managed,
 }
 
-/// Builds the JSON body, and counts the assistant turns it had no way to say.
+/// A request encoded for the Messages API.
+#[derive(Clone, Debug)]
+pub struct Encoded {
+    /// The decorated body: exactly what is estimated, digested and sent.
+    pub body: Value,
+    /// Kept assistant turns that had no way to be said.
+    pub skipped: usize,
+    /// The digest a reply to this request binds its signed blocks to.
+    pub prefix_digest: String,
+}
+
+/// Builds the JSON body for an ordinary message request.
+///
+/// The body alone: no replay digest is computed, because only a dispatch needs one, and taking it
+/// serialises the whole conversation a second time.
+#[must_use]
+pub fn build_request(config: &AnthropicConfig, request: &ChatRequest) -> Value {
+    let (mut body, _) = encode_canonical(config, request);
+    let tailed = request.context_tail.as_deref().is_some_and(|tail| {
+        append_tail(&mut body, tail);
+        true
+    });
+    decorate(&mut body, request, Layout::Ordinary, tailed);
+    body
+}
+
+/// Encodes a request: canonically, then decorated with its tail and cache hints.
+///
+/// The replay prefix digest is read from the canonical body, without cache markers, and with the
+/// tail unless the model's live evidence says a signature survives the tail's removal
+/// ([`crate::config::replay_across_tail`]). By default, then, a reply produced under a tail is
+/// sent neutrally on the next request, whose prefix no longer carries that tail.
+///
+/// # Panics
+///
+/// When the request carries a tail but does not end with a user message or tool results. Both
+/// builders refuse that request before encoding, and the port entry points check it too.
+#[must_use]
+pub fn encode(config: &AnthropicConfig, request: &ChatRequest, layout: Layout) -> Encoded {
+    encode_with(
+        config,
+        request,
+        layout,
+        crate::config::replay_across_tail(&request.model),
+    )
+}
+
+/// [`encode`], with the fingerprint rule given rather than read from the model table.
+///
+/// `across` true leaves the tail out of the replay prefix digest. Only a model whose live
+/// acceptance is recorded is encoded that way in production; tests use it to pin both rules.
+///
+/// # Panics
+///
+/// As [`encode`].
+#[must_use]
+pub fn encode_with(
+    config: &AnthropicConfig,
+    request: &ChatRequest,
+    layout: Layout,
+    across: bool,
+) -> Encoded {
+    let (mut body, skipped) = encode_canonical(config, request);
+    let untailed = (request.context_tail.is_none() || across).then(|| request_prefix(&body));
+    let tailed = request.context_tail.as_deref().is_some_and(|tail| {
+        append_tail(&mut body, tail);
+        true
+    });
+    let prefix_digest = untailed.unwrap_or_else(|| request_prefix(&body));
+    decorate(&mut body, request, layout, tailed);
+    Encoded {
+        body,
+        skipped,
+        prefix_digest,
+    }
+}
+
+/// Builds the canonical JSON body, and counts the assistant turns it had no way to say.
+///
+/// This is the body with no tail and no cache hints, with every system message joined into one
+/// `system` string — the body every earlier build sent, which is what keeps a recorded replay
+/// digest matching.
 ///
 /// A turn that carries only signed or opaque replay — no text, no calls — is sent as its
 /// original blocks when they are admitted for this exact prefix, and otherwise skipped, because
 /// it has no neutral form. The ordinary path accepts the skip; a managed preparation refuses it,
 /// because a message the projection kept must not vanish from the request.
 #[must_use]
-pub fn build_counted(config: &AnthropicConfig, request: &ChatRequest) -> (Value, usize) {
+pub fn encode_canonical(config: &AnthropicConfig, request: &ChatRequest) -> (Value, usize) {
     // Precondition: a request without messages is meaningless, so it is asserted
     // here rather than sent and rejected upstream.
     assert!(
@@ -106,21 +213,134 @@ pub fn build_counted(config: &AnthropicConfig, request: &ChatRequest) -> (Value,
     (Value::Object(body), skipped)
 }
 
+/// Appends the tail as its own text block, the last block of the final `user` turn.
+///
+/// After any `tool_result` blocks, which the Messages API accepts, so the turn a model answers is
+/// unchanged and the tail is identified by its position alone.
+fn append_tail(body: &mut Value, tail: &str) {
+    let last = body["messages"]
+        .as_array_mut()
+        .and_then(|turns| turns.last_mut());
+    let content = last
+        .filter(|turn| turn["role"] == "user")
+        .and_then(|turn| turn["content"].as_array_mut());
+    // Precondition, checked by every builder before encoding: a tailed request ends on a user
+    // message or tool results, so its final turn is a user turn with a block list.
+    assert!(content.is_some(), "a tailed request ends on a user turn");
+    if let Some(content) = content {
+        content.push(json!({ "type": "text", "text": tail }));
+    }
+}
+
+/// Rewrites `system` as one block per system message and places the cache breakpoints.
+fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, tailed: bool) {
+    let blocks: Vec<Value> = system_parts(&request.messages)
+        .map(|text| json!({ "type": "text", "text": text }))
+        .collect();
+    if !blocks.is_empty() {
+        body["system"] = Value::Array(blocks);
+    }
+    let ttl = match request.prompt_cache {
+        nanus_ports::PromptCacheRetention::None => return,
+        nanus_ports::PromptCacheRetention::Short => "5m",
+        nanus_ports::PromptCacheRetention::Long => "1h",
+    };
+    let marker = json!({ "type": "ephemeral", "ttl": ttl });
+    if let Some(first) = body["system"].get_mut(0) {
+        first["cache_control"] = marker.clone();
+    }
+    let Some(turns) = body["messages"].as_array_mut() else {
+        return;
+    };
+    let candidates = breakpoints(turns, &request.messages, layout, tailed);
+    let mut placed: Option<(usize, usize)> = None;
+    for (turn, block) in candidates.into_iter().flatten() {
+        if placed.is_some_and(|last| (turn, block) <= last) {
+            continue;
+        }
+        if let Some(target) = turns
+            .get_mut(turn)
+            .and_then(|turn| turn["content"].get_mut(block))
+        {
+            target["cache_control"] = marker.clone();
+            placed = Some((turn, block));
+        }
+    }
+}
+
+/// The message breakpoints 2, 3 and 4, as `(turn, block)` positions, in that order.
+fn breakpoints(
+    turns: &[Value],
+    messages: &[Message],
+    layout: Layout,
+    tailed: bool,
+) -> [Option<(usize, usize)>; 3] {
+    let head = (layout == Layout::Managed).then(|| {
+        let conversation = messages
+            .iter()
+            .skip_while(|message| matches!(message, Message::System { .. }));
+        // The working-data message, when the managed grammar admitted one, is the second turn.
+        let memory = conversation
+            .clone()
+            .nth(1)
+            .is_some_and(crate::managed::is_generated);
+        usize::from(memory)
+    });
+    let head = head.and_then(|turn| last_cacheable(turns, turn, None));
+    let before_answer = turns
+        .iter()
+        .rposition(|turn| turn["role"] == "assistant")
+        .and_then(|answer| answer.checked_sub(1))
+        .and_then(|turn| last_cacheable(turns, turn, None));
+    let end = turns.len().checked_sub(1).and_then(|last| {
+        let blocks = turns[last]["content"].as_array().map_or(0, Vec::len);
+        let before_tail = if tailed {
+            blocks.checked_sub(1)
+        } else {
+            Some(blocks)
+        };
+        last_cacheable(turns, last, before_tail)
+    });
+    [head, before_answer, end]
+}
+
+/// The last block at or before `turn` (and before `end` within it) that may carry a marker.
+///
+/// A thinking block may not, so the search walks back past them, into earlier turns if it must.
+fn last_cacheable(turns: &[Value], turn: usize, end: Option<usize>) -> Option<(usize, usize)> {
+    let mut limit = end;
+    for index in (0..=turn).rev() {
+        let blocks = turns.get(index)?["content"].as_array();
+        let blocks = blocks.map_or(&[][..], Vec::as_slice);
+        let upto = limit.take().unwrap_or(blocks.len()).min(blocks.len());
+        let found = blocks[..upto].iter().rposition(|block| {
+            !matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        });
+        if let Some(block) = found {
+            return Some((index, block));
+        }
+    }
+    None
+}
+
+/// Every non-empty system message, trimmed, in order.
+fn system_parts(messages: &[Message]) -> impl Iterator<Item = &str> {
+    messages.iter().filter_map(|message| match message {
+        Message::System { text } => Some(text.trim()).filter(|text| !text.is_empty()),
+        _ => None,
+    })
+}
+
 /// Lifts the system instructions out of the conversation.
 ///
 /// Several system messages are joined with a blank line, which is the closest thing
 /// to "in this order" the top-level field can express.
 #[must_use]
 pub fn system_text(messages: &[Message]) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    for message in messages {
-        if let Message::System { text } = message {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                parts.push(trimmed);
-            }
-        }
-    }
+    let parts: Vec<&str> = system_parts(messages).collect();
     if parts.is_empty() {
         return None;
     }
@@ -132,14 +352,29 @@ pub fn request_prefix(payload: &Value) -> String {
     let messages = payload
         .get("messages")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    prefix_fingerprint(&payload["system"], &payload["tools"], &messages)
+        .map_or(&[][..], Vec::as_slice);
+    prefix_fingerprint(&payload["system"], &payload["tools"], messages)
+}
+
+/// The fields a fingerprint is taken over, borrowed rather than copied into a new value.
+///
+/// Declared in the order a JSON object's keys serialise in (sorted), so the bytes are exactly the
+/// ones `json!({ "system", "tools", "messages" })` produced, and every digest an earlier build
+/// recorded still matches.
+#[derive(serde::Serialize)]
+struct Prefix<'a> {
+    messages: &'a [Value],
+    system: &'a Value,
+    tools: &'a Value,
 }
 
 fn prefix_fingerprint(system: &Value, tools: &Value, messages: &[Value]) -> String {
-    let prefix = json!({ "system": system, "tools": tools, "messages": messages });
-    let raw = prefix.to_string();
+    let prefix = Prefix {
+        messages,
+        system,
+        tools,
+    };
+    let raw = serde_json::to_string(&prefix).unwrap_or_default();
     blake3::hash(raw.as_bytes()).to_hex().as_str().to_owned()
 }
 
@@ -983,7 +1218,10 @@ mod tests {
             Message::tool(ToolCallId::new("toolu_1"), "contents", false),
         ];
         let body = build_request(&config(), &request(messages));
-        assert_eq!(body["system"], json!("you are nanus"));
+        assert_eq!(
+            body["system"],
+            json!([{ "type": "text", "text": "you are nanus" }])
+        );
         let turns = body["messages"].as_array().cloned().unwrap_or_default();
         assert_eq!(turns.len(), 3, "{turns:?}");
         // The system turn is not among them.
@@ -1165,7 +1403,36 @@ mod tests {
         assert_eq!(body["max_tokens"], json!(64_000));
     }
 
-    /// Several system turns join; several tool results gather into one user turn.
+    /// The fingerprint borrows instead of copying, and its bytes are exactly the ones the earlier
+    /// `json!` form produced, so a digest an earlier build recorded still matches.
+    #[test]
+    fn the_borrowed_fingerprint_is_the_earlier_one_byte_for_byte() {
+        let messages = vec![
+            json!({ "role": "user", "content": [{ "type": "text", "text": "hi \u{e9}" }] }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "ok" }] }),
+        ];
+        let system = json!("you are nanus");
+        let tools = json!([{ "name": "read", "input_schema": { "type": "object" } }]);
+        let earlier = json!({ "system": system, "tools": tools, "messages": messages }).to_string();
+        let earlier = blake3::hash(earlier.as_bytes())
+            .to_hex()
+            .as_str()
+            .to_owned();
+        assert_eq!(prefix_fingerprint(&system, &tools, &messages), earlier);
+        assert_eq!(
+            prefix_fingerprint(&Value::Null, &Value::Null, &[]),
+            blake3::hash(
+                json!({ "system": null, "tools": null, "messages": [] })
+                    .to_string()
+                    .as_bytes()
+            )
+            .to_hex()
+            .as_str()
+        );
+    }
+
+    /// Several system turns are one block each in the sent body and join in the canonical one;
+    /// several tool results gather into one user turn.
     #[test]
     fn system_turns_join_and_tool_results_gather() {
         let messages = vec![
@@ -1182,8 +1449,16 @@ mod tests {
             Message::tool(ToolCallId::new("a"), "one", false),
             Message::tool(ToolCallId::new("b"), "two", true),
         ];
+        let canonical = encode_canonical(&config(), &request(messages.clone())).0;
+        assert_eq!(canonical["system"], json!("first\n\nsecond"));
         let body = build_request(&config(), &request(messages));
-        assert_eq!(body["system"], json!("first\n\nsecond"));
+        assert_eq!(
+            body["system"],
+            json!([
+                { "type": "text", "text": "first" },
+                { "type": "text", "text": "second" },
+            ])
+        );
         let turns = body["messages"].as_array().cloned().unwrap_or_default();
         // Two turns, not three: both results are one user turn.
         assert_eq!(turns.len(), 2, "{turns:?}");

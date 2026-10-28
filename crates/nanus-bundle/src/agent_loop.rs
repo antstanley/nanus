@@ -363,6 +363,10 @@ pub struct AgentRunner {
     /// host gets. `true` is a configuration that named no budget: the model's documented window
     /// is the budget, and a model with none keeps the configured value as its fallback.
     model_context: bool,
+    /// How long the provider may keep the cache entries a request marks; copied into every
+    /// request this runner builds. `None` for a library host, which pays no cache-write premium
+    /// it did not ask for.
+    prompt_cache: core::cell::Cell<nanus_ports::PromptCacheRetention>,
 }
 
 impl core::fmt::Debug for AgentRunner {
@@ -420,6 +424,7 @@ impl AgentRunner {
             selection: selection::Selection::default(),
             capture: None,
             model_context: false,
+            prompt_cache: core::cell::Cell::new(nanus_ports::PromptCacheRetention::None),
         })
     }
 
@@ -457,6 +462,32 @@ impl AgentRunner {
     pub fn with_capture(mut self, broker: crate::CaptureBroker) -> Self {
         self.capture = Some(broker);
         self
+    }
+
+    /// Asks the provider to keep the cache entries every request marks for `retention`.
+    ///
+    /// Off by default: a cache write costs more than an ordinary input token, so a host opts in
+    /// knowing its requests are read again. The stock composition asks for the short retention,
+    /// and an agent served over the link for the long one, since a person may pause between
+    /// turns.
+    #[must_use]
+    pub fn with_prompt_cache(self, retention: nanus_ports::PromptCacheRetention) -> Self {
+        self.prompt_cache.set(retention);
+        self
+    }
+
+    /// Changes the retention later requests ask for, on a runner already shared.
+    ///
+    /// What an agent served over the link uses: the runner is composed once and handed to the
+    /// server, which asks for the long retention because a person may pause between turns.
+    pub fn set_prompt_cache(&self, retention: nanus_ports::PromptCacheRetention) {
+        self.prompt_cache.set(retention);
+    }
+
+    /// The retention every request this runner builds asks for.
+    #[must_use]
+    pub fn prompt_cache(&self) -> nanus_ports::PromptCacheRetention {
+        self.prompt_cache.get()
     }
 
     /// Makes the context budget the documented window of the model in force.
@@ -931,8 +962,8 @@ impl AgentRunner {
     /// Assembles the request the model sees, fitted to the prompt budget.
     ///
     /// The whole log is replayed and then trimmed: the oldest turns are dropped when the
-    /// conversation no longer fits, with a notice the model reads, and the turn is *refused*
-    /// when even the newest turn does not fit. See [`nanus_domain::context`] for the policy and
+    /// conversation no longer fits, with a notice the model reads as the request's tail, and the
+    /// turn is *refused* when even the newest turn does not fit. See [`nanus_domain::context`] for the policy and
     /// why it is a policy rather than a tokenizer.
     ///
     /// # Errors
@@ -952,14 +983,36 @@ impl AgentRunner {
     /// Fits `messages` into a legacy request: the schemas, reservations and budget a turn carries.
     ///
     /// The one assembly both a turn and a maintenance request go through, so a maintenance request
-    /// is fitted by exactly the rules that fit a turn.
+    /// is fitted by exactly the rules that fit a turn. A request that dropped turns carries the
+    /// elision notice as its tail, after the newest message, so a drop costs the cached prefix
+    /// only from the first kept turn; one that dropped none has no tail.
     fn build_request_for(
+        &self,
+        messages: Vec<nanus_domain::Message>,
+    ) -> Result<(ChatRequest, Option<nanus_domain::Elision>), BundleError> {
+        let (mut request, elision) = self.fit_request(messages)?;
+        request.context_tail = elision.as_ref().map(nanus_domain::Elision::notice);
+        // Every request this runner builds ends with a user message or tool results, so the tail
+        // always has a place. Stated as a refusal rather than an assertion: a request that broke it
+        // is one this turn cannot send, not a reason to take the process down.
+        if !request.tail_is_placeable() {
+            return Err(BundleError::context(
+                "a request whose turns were left out ends with neither a user message nor tool \
+                 results, so the notice that says so has no place",
+            ));
+        }
+        Ok((request, elision))
+    }
+
+    /// Fits `messages` into a legacy request, without placing the elision's notice.
+    fn fit_request(
         &self,
         messages: Vec<nanus_domain::Message>,
     ) -> Result<(ChatRequest, Option<nanus_domain::Elision>), BundleError> {
         let mut request = ChatRequest::new(self.model(), Vec::new());
         request.tools = self.offered_schemas();
         request.reasoning_effort = self.effort.get();
+        request.prompt_cache = self.prompt_cache.get();
         let images = nanus_ports::capabilities::has_images(&messages);
         let reservation = self
             .request_reservation
@@ -985,9 +1038,15 @@ impl AgentRunner {
             let fitted = nanus_domain::context::fit_with_source(
                 &source,
                 self.context_budget().min(u32::MAX.saturating_sub(1)),
-                |candidate| {
+                |candidate, tail| {
+                    // The probe carries the tail the candidate would, so it costs exactly what is
+                    // sent. A candidate whose tail has no place is not one that fits.
                     let mut probe = request.clone();
                     probe.messages = candidate.to_vec();
+                    probe.context_tail = tail.map(str::to_owned);
+                    if !probe.tail_is_placeable() {
+                        return u32::MAX;
+                    }
                     match model.estimate_request(&probe) {
                         Ok(estimate) if estimate.fits(caps, &probe) => estimate.input_tokens,
                         Ok(_) => u32::MAX,
@@ -1929,7 +1988,12 @@ mod tests {
         let follows = runner(Rc::clone(&llm), registry_with_echo())
             .unwrap_or_else(|| unreachable!("the runner builds"))
             .with_model_context_budget();
-        let session = long_session();
+        let mut session = long_session();
+        // A request is built at the start of a step, after the question it answers.
+        session.append(SessionEvent::UserMessage {
+            content_blocks: None,
+            text: String::from("the next question"),
+        });
 
         assert_eq!(
             follows.context_budget(),
@@ -1945,7 +2009,18 @@ mod tests {
         let (request, elision) = follows.build_request(&session).unwrap();
         let elision = elision.unwrap_or_else(|| panic!("a small window trims the conversation"));
         assert_eq!(elision.budget, 600);
-        assert!(nanus_domain::estimate(&request.messages) <= 600);
+        // The notice is the request's tail, costed with the messages.
+        assert_eq!(request.context_tail, Some(elision.notice()));
+        let sent = nanus_domain::estimate(&request.messages)
+            .saturating_add(nanus_domain::context::estimate_tail(&elision.notice()));
+        assert!(sent <= 600, "{sent}");
+        // C15: a request whose turns were left out but which ends on an answer has no place for
+        // the notice, and is refused rather than sent or panicked over.
+        let refused = follows.build_request(&long_session());
+        assert!(
+            matches!(&refused, Err(BundleError::Context(reason)) if reason.contains("no place")),
+            "{refused:?}"
+        );
 
         // A runner told nothing keeps its configured budget whatever the model.
         let fixed =

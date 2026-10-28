@@ -98,6 +98,37 @@ fn a_compaction_request_ends_with_the_fixed_instruction_and_offers_the_schemas_u
     );
 }
 
+/// C18: a compaction draft the fitter trims carries the elision notice as its tail, after its fixed
+/// instruction, and never among its messages.
+#[test]
+fn a_trimmed_compaction_request_carries_the_notice_as_its_tail() {
+    let long = "y".repeat(2_000);
+    let model = <Model as ModelExt>::new(vec![text(&long), text(&long), text(&long)]);
+    let runner = runner(&model, 1_200);
+    let mut session = session();
+    legacy_turns(&runner, &mut session, 3);
+    model.push(text("The user asked three questions."));
+    block(runner.draft_compaction(&session)).unwrap_or_else(|error| panic!("{error}"));
+    let sent = model.sent();
+    let last = sent.last().unwrap();
+    assert_eq!(
+        last.messages.last(),
+        Some(&Message::user(
+            nanus_bundle::agent_loop::COMPACTION_INSTRUCTION
+        ))
+    );
+    let tail = last.context_tail.as_deref().unwrap_or_default();
+    assert!(
+        tail.contains("not shown"),
+        "the draft was trimmed: {tail:?}"
+    );
+    assert!(!last.messages.iter().any(|message| {
+        message
+            .text()
+            .is_some_and(|text| text.contains("not shown"))
+    }));
+}
+
 #[test]
 fn drafting_a_compaction_writes_nothing_to_the_session() {
     let (model, runner, session) = legacy_session();
@@ -472,7 +503,7 @@ fn the_first_request_of_a_seeded_session_leads_with_the_seed_as_a_system_message
     let sent = model.sent();
     for request in &sent {
         let (at, seed) = seed_in(request).expect("every request carries the seed");
-        assert_eq!(at, 2, "after the system prompt and the notice");
+        assert_eq!(at, 1, "after the system prompt");
         assert!(seed.contains("Source session: s."), "{seed}");
         assert!(seed.contains("ship the parser"));
         assert!(
@@ -510,8 +541,15 @@ fn a_managed_session_with_no_seed_sends_the_request_it_always_did() {
     block(runner.run_turn_with_runtime(&mut session, "hi", &mut Silent, host(&disk, &context)));
     let request = model.sent().pop().unwrap();
     assert!(seed_in(&request).is_none());
-    assert_eq!(request.messages.len(), 3, "system prompt, notice, prompt");
-    assert_eq!(request.messages[2], Message::user("hi"));
+    assert_eq!(request.messages.len(), 2, "system prompt, prompt");
+    assert_eq!(request.messages[1], Message::user("hi"));
+    // The notice is the request's tail, after the prompt.
+    assert!(
+        request
+            .context_tail
+            .as_deref()
+            .is_some_and(|tail| tail.starts_with("[nanus context] mode=managed"))
+    );
 }
 
 #[test]

@@ -51,6 +51,9 @@ impl AgentRunner {
             None => self.build_request(&prospective)?.0,
         };
         let mut request = fitted_base.clone();
+        // The raw view is costed as a legacy request of the same messages would be: it carries
+        // every message, so nothing was left out and there is no tail to say so.
+        request.context_tail = None;
         request.messages = vec![nanus_domain::Message::system(self.system_prompt.clone())];
         request
             .messages

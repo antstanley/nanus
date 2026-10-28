@@ -126,11 +126,12 @@ fn successive_revisions_reload_original_completed_sessions_and_fit_whole_turns()
     assert_eq!(third.messages[1], original);
     assert_eq!(third.messages[3], next);
     let source: Arc<[Message]> = third.messages.clone().into();
-    third.messages = nanus_domain::context::fit_with_source(&source, 64_000, |messages| {
-        if messages.len() > 2 { 100_000 } else { 100 }
+    let projected = nanus_domain::context::fit_with_source(&source, 64_000, |messages, _| {
+        if messages.len() > 1 { 100_000 } else { 100 }
     })
-    .unwrap()
-    .messages;
+    .unwrap();
+    third.messages = projected.messages;
+    third.context_tail = projected.elision.map(|elision| elision.notice());
     third.source_history = Some(Arc::clone(&source));
     let fitted = adapter.prepare_responses(&third).unwrap();
     assert_eq!(fitted.context_receipt.dropped_turns, 2);

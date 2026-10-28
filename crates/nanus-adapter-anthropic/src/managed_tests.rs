@@ -1,8 +1,8 @@
 //! Managed preparation over a real socket, the argument limits, and signed replay under edits.
 //!
 //! The request each wire fixture prepares is compiled by the domain's own managed compiler from
-//! a session — two leading system messages, the generated working-data message after the first
-//! user message, and one hidden fragment absent — so the grammar under test is the one the
+//! a session — the system prompt, the generated working-data message after the first user
+//! message, one hidden fragment absent, and the tail — so the grammar under test is the one the
 //! runner produces. The server captures the body it received, which is what lets the assertions
 //! be about what was sent rather than what was encoded.
 
@@ -15,6 +15,7 @@ use std::net::TcpListener;
 use futures::StreamExt as _;
 use nanus_domain::context::managed::compile::{NoticeFacts, Selection, derive_effective_context};
 use nanus_domain::context::managed::{Digest, FragmentId, fragments, state};
+use nanus_domain::goal::Goal;
 use nanus_domain::message::AssistantReplay;
 use nanus_domain::{
     Message, Session, SessionEvent, SessionId, ToolCall, ToolCallId, ToolName, ToolSchema,
@@ -99,12 +100,22 @@ fn compiled(session: &Session) -> ChatRequest {
         input_allowance: 100_000,
         ..NoticeFacts::default()
     };
-    let effective =
-        derive_effective_context(session, &derived, &protected, selection, None, &facts).unwrap();
-    assert!(effective.memory, "the catalog makes a generated message");
-    let mut messages = vec![Message::system("you are nanus"), effective.notice];
+    let goal = Goal::new("ship the parser", 1).unwrap();
+    let effective = derive_effective_context(
+        session,
+        &derived,
+        &protected,
+        selection,
+        Some(&goal),
+        &facts,
+    )
+    .unwrap();
+    assert!(effective.memory, "the goal makes a generated message");
+    let mut messages = vec![Message::system("you are nanus")];
     messages.extend(effective.messages);
     request(messages)
+        .with_context_tail(effective.tail)
+        .with_prompt_cache(nanus_ports::PromptCacheRetention::Short)
 }
 
 fn request(messages: Vec<Message>) -> ChatRequest {
@@ -307,10 +318,19 @@ async fn a_managed_request_sends_exactly_the_bytes_it_prepared() {
             .any(|event| matches!(event, LlmEvent::Finished { .. }))
     );
 
-    let system = sent["system"].as_str().unwrap();
+    assert_eq!(
+        sent["system"],
+        json!([{ "type": "text", "text": "you are nanus",
+            "cache_control": { "type": "ephemeral", "ttl": "5m" } }])
+    );
+    let last = sent["messages"].as_array().unwrap().last().unwrap();
+    let tail = last["content"].as_array().unwrap().last().unwrap();
     assert!(
-        system.starts_with("you are nanus\n\n[nanus context]"),
-        "both, in order"
+        tail["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[nanus context]"),
+        "the tail is the request's last block: {tail}"
     );
     let roles: Vec<&str> = sent["messages"]
         .as_array()
@@ -458,44 +478,62 @@ fn signed_turn(prefix_digest: String, with_call: bool) -> Message {
     }
 }
 
-/// The head of a managed conversation with `notice` as its fixed-schema notice.
-fn head(notice: &str) -> Vec<Message> {
-    vec![
-        Message::system("you are nanus"),
-        Message::system(notice),
-        Message::user("go"),
-    ]
+/// The head of a managed conversation: the system prompt and the first prompt.
+fn head() -> Vec<Message> {
+    vec![Message::system("you are nanus"), Message::user("go")]
 }
 
-/// The digest a response to `messages` would carry: the prefix of exactly that request.
-fn produced_under(messages: Vec<Message>) -> String {
-    let prepared = prepare(&llm(), managed(request(messages))).unwrap();
-    crate::wire::request_prefix(&serde_json::from_str(prepared.body()).unwrap())
+/// The digest a response to `messages` under `tail` would carry.
+fn produced_under(messages: Vec<Message>, tail: Option<&str>) -> String {
+    let mut request = request(messages);
+    request.context_tail = tail.map(str::to_owned);
+    prepare(&llm(), managed(request))
+        .unwrap()
+        .prefix_digest()
+        .to_owned()
 }
 
-/// T21: an unchanged prefix sends the checked signed blocks; a changed one sends the neutral
-/// form; and neither ever carries a signature the prefix did not produce.
+/// The next step after a signed reply bound to `digest`: its tool result, under `tail`.
+fn follow(digest: &str, tail: Option<&str>) -> ChatRequest {
+    let mut messages = head();
+    messages.push(signed_turn(digest.to_owned(), true));
+    messages.push(Message::tool(ToolCallId::new("t1"), "out", false));
+    let mut request = request(messages);
+    request.context_tail = tail.map(str::to_owned);
+    request
+}
+
+fn is_signed(body: &str) -> bool {
+    let sent: Value = serde_json::from_str(body).unwrap();
+    sent["messages"][1]["content"][0]["signature"] == SIGNATURE
+}
+
+/// T21/C8: a reply's signed blocks are sent only under the canonical prefix that produced it —
+/// which, by default, includes the tail it was produced under, so a managed turn's thinking is
+/// sent neutrally from the next step on; and a reply produced with no tail replays as before.
 #[tokio::test]
 async fn signed_replay_is_sent_only_under_the_prefix_that_produced_it() {
-    let digest = produced_under(head("[nanus context] revision=1"));
-    let follow = |notice: &str| {
-        let mut messages = head(notice);
-        messages.push(signed_turn(digest.clone(), true));
-        messages.push(Message::tool(ToolCallId::new("t1"), "out", false));
-        request(messages)
-    };
-
-    let unchanged = prepare(&llm(), managed(follow("[nanus context] revision=1"))).unwrap();
+    let untailed = produced_under(head(), None);
+    let unchanged = prepare(
+        &llm(),
+        managed(follow(&untailed, Some("[nanus context] r=2"))),
+    )
+    .unwrap();
     let body = unchanged.body().to_owned();
     let (received, _) = exchange(unchanged, messages_stream(&[])).await;
     assert_eq!(received, body.as_bytes());
-    let sent: Value = serde_json::from_slice(&received).unwrap();
-    assert_eq!(sent["messages"][1]["content"][0]["signature"], SIGNATURE);
+    assert!(is_signed(&body), "a reply produced with no tail replays");
 
-    let changed = prepare(&llm(), managed(follow("[nanus context] revision=2"))).unwrap();
-    let sent: Value = serde_json::from_str(changed.body()).unwrap();
+    let tailed = produced_under(head(), Some("[nanus context] r=1"));
+    assert_ne!(tailed, untailed, "the tail is in the default fingerprint");
+    let next = prepare(
+        &llm(),
+        managed(follow(&tailed, Some("[nanus context] r=2"))),
+    )
+    .unwrap();
+    let sent: Value = serde_json::from_str(next.body()).unwrap();
     assert!(
-        !changed.body().contains(SIGNATURE),
+        !next.body().contains(SIGNATURE),
         "no forged or stale signature"
     );
     let blocks = sent["messages"][1]["content"].as_array().unwrap();
@@ -505,23 +543,83 @@ async fn signed_replay_is_sent_only_under_the_prefix_that_produced_it() {
     );
     assert_eq!(sent["messages"][1]["content"][0]["type"], "tool_use");
     assert_eq!(sent["messages"][1]["content"][0]["id"], "t1");
+    // And identically on every step after: the cache is unaffected either way.
+    let later = prepare(
+        &llm(),
+        managed(follow(&tailed, Some("[nanus context] r=3"))),
+    )
+    .unwrap();
+    let later: Value = serde_json::from_str(later.body()).unwrap();
+    assert_eq!(later["messages"][1], sent["messages"][1]);
+}
+
+/// C8: under a model whose live evidence lets the fingerprint exclude the tail, the signed blocks
+/// survive from one step to the next and into the next human turn — and still not across a hide.
+#[test]
+fn signed_replay_survives_the_tail_where_the_model_allows_it() {
+    let config = AnthropicConfig::new(MODEL, "k");
+    let across = |request: &ChatRequest| {
+        crate::wire::encode_with(&config, request, crate::wire::Layout::Managed, true)
+    };
+    let mut first = request(head());
+    first.context_tail = Some("[nanus context] r=1".into());
+    let digest = across(&first).prefix_digest;
+    let next = across(&follow(&digest, Some("[nanus context] r=2")));
+    assert!(
+        is_signed(&next.body.to_string()),
+        "replayed on the next step"
+    );
+    let mut turn = follow(&digest, None).messages;
+    turn.push(Message::assistant(Some("done".into()), None, Vec::new()));
+    turn.push(Message::user("next turn"));
+    let mut next_turn = request(turn);
+    next_turn.context_tail = Some("[nanus context] r=3".into());
+    assert!(
+        is_signed(&across(&next_turn).body.to_string()),
+        "and on the first step of the next turn"
+    );
+    // A hide ahead of the reply changes its prefix under either rule.
+    let mut long = head();
+    long.push(Message::assistant(None, None, vec![call("h")]));
+    long.push(Message::tool(ToolCallId::new("h"), "hidden later", false));
+    long.push(Message::user("again"));
+    let mut produced = request(long.clone());
+    produced.context_tail = Some("[nanus context] r=1".into());
+    let digest = across(&produced).prefix_digest;
+    let mut hidden = vec![long[0].clone(), long[1].clone(), long[4].clone()];
+    hidden.push(signed_turn(digest, true));
+    hidden.push(Message::tool(ToolCallId::new("t1"), "out", false));
+    let mut hidden = request(hidden);
+    hidden.context_tail = Some("[nanus context] r=2".into());
+    let body = across(&hidden).body.to_string();
+    assert!(!body.contains(SIGNATURE), "a hide sends it neutrally");
 }
 
 #[test]
 fn a_kept_turn_with_only_unadmitted_replay_is_refused_rather_than_dropped() {
-    let digest = produced_under(head("[nanus context] revision=1"));
-    let follow = |notice: &str| {
-        let mut messages = head(notice);
-        messages.push(signed_turn(digest.clone(), false));
+    let follow = |digest: &str, tail: Option<&str>| {
+        let mut messages = head();
+        messages.push(signed_turn(digest.to_owned(), false));
         messages.push(Message::user("and then"));
-        request(messages)
+        let mut request = request(messages);
+        request.context_tail = tail.map(str::to_owned);
+        request
     };
-    let unchanged = prepare(&llm(), managed(follow("[nanus context] revision=1"))).unwrap();
+    let untailed = produced_under(head(), None);
+    let unchanged = prepare(
+        &llm(),
+        managed(follow(&untailed, Some("[nanus context] r=2"))),
+    )
+    .unwrap();
     assert!(
         unchanged.body().contains(SIGNATURE),
         "admitted, it is sent as signed"
     );
-    match prepare(&llm(), managed(follow("[nanus context] revision=2"))) {
+    let tailed = produced_under(head(), Some("[nanus context] r=1"));
+    match prepare(
+        &llm(),
+        managed(follow(&tailed, Some("[nanus context] r=2"))),
+    ) {
         Err(error) => assert!(
             error.to_string().contains("protocol_incompatible"),
             "{error}"
@@ -536,7 +634,10 @@ fn only_the_official_endpoint_and_adaptive_models_are_supported() {
     for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
         assert_eq!(
             official.managed_support(model),
-            ManagedSupport::Supported { policy_version: 1 }
+            ManagedSupport::Supported {
+                policy_version: 1,
+                layout_version: 2
+            }
         );
     }
     assert_eq!(
@@ -582,8 +683,14 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     assert!(prepare(&llm(), managed(valid.clone())).is_ok());
 
     let mut last = valid.clone();
-    last.messages.truncate(4);
+    last.messages.truncate(3);
     refused_with(last, "generated data is never the last message");
+
+    let mut answered = valid.clone();
+    answered
+        .messages
+        .push(Message::assistant(Some("done".into()), None, Vec::new()));
+    refused_with(answered, "ends with a user message or tool results");
 
     let mut orphan = valid.clone();
     orphan.messages.retain(|message| {
@@ -605,15 +712,17 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     // F15: text that opens with the label anywhere but directly after the first user message
     // is the model's own reply, sent as it is; refusing it would let one reply wedge a session.
     let mut moved = valid;
-    let generated = moved.messages.remove(3);
-    moved.messages.insert(5, generated);
+    let generated = moved.messages.remove(2);
+    moved.messages.insert(4, generated);
     assert!(
         prepare(&llm(), managed(moved)).is_ok(),
         "a labelled reply elsewhere is sent"
     );
 }
 
-/// T01: the ordinary path sends the body it always sent, and streams without managed limits.
+/// T01: the ordinary path sends the body it always sent — but for the system prompt, which is one
+/// block per system message — and streams without managed limits. With no retention asked for,
+/// it carries no cache marker and, with no elision, no tail.
 #[tokio::test]
 async fn the_ordinary_request_bytes_and_decoding_are_unchanged() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -644,18 +753,20 @@ async fn the_ordinary_request_bytes_and_decoding_are_unchanged() {
     );
 }
 
-/// The body the ordinary path sent for the request above before managed preparation existed.
+/// The body the ordinary path sends for the request above: the body it sent before managed
+/// preparation existed, with `system` as a block list.
 const LEGACY_BODY: &str = concat!(
     r#"{"max_tokens":64000,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"#,
     r#""user"},{"content":[{"id":"c1","input":{"path":"c1"},"name":"read","type":"tool_"#,
     r#"use"}],"role":"assistant"},{"content":[{"content":"out","is_error":false,"tool_u"#,
     r#"se_id":"c1","type":"tool_result"}],"role":"user"}],"model":"claude-opus-5-5","st"#,
-    r#"ream":true,"system":"sys","thinking":{"type":"adaptive"},"tools":[{"description""#,
+    r#"ream":true,"system":[{"text":"sys","type":"text"}],"thinking":{"type":"adaptive"},"#,
+    r#""tools":[{"description""#,
     r#":"the read tool","input_schema":{"type":"object"},"name":"read"}]}"#,
 );
 
 /// A session a handoff started, on the managed wire: the seed is a leading system message after the
-/// notice on every request, the first included, and a session with no seed sends none.
+/// system prompt on every request, the first included, and a session with no seed sends none.
 mod seeded {
     use nanus_domain::context::managed::{
         ContextFrontier, ContextModeRecord, ContextPolicy, HANDOFF_SEED_LABEL, HandoffSeed,
@@ -711,8 +822,8 @@ mod seeded {
         session
     }
 
-    /// The request the runner composes for a seeded session: the system prompt, the notice, the
-    /// seed, then the conversation, with nothing hidden.
+    /// The request the runner composes for a seeded session: the system prompt, the seed, then
+    /// the conversation, with nothing hidden, and the tail.
     fn compiled_seeded(session: &Session) -> ChatRequest {
         let derived = fragments::derive(session.log()).unwrap();
         let protected = state::protected(session.log(), &derived);
@@ -733,14 +844,14 @@ mod seeded {
             effective.seed.is_some(),
             "a seeded session carries its seed"
         );
-        let mut messages = vec![Message::system("you are nanus"), effective.notice];
+        let mut messages = vec![Message::system("you are nanus")];
         messages.extend(effective.seed);
         messages.extend(effective.messages);
-        request(messages)
+        request(messages).with_context_tail(effective.tail)
     }
 
-    /// The `system` field and the conversation's roles of a prepared seeded request.
-    fn prepared(request: ChatRequest) -> (String, Vec<String>, String) {
+    /// The `system` blocks' texts and the conversation's roles of a prepared seeded request.
+    fn prepared(request: ChatRequest) -> (Vec<String>, Vec<String>, String) {
         let prepared = prepare(&llm(), managed(request)).unwrap();
         let body = prepared.body().to_owned();
         let sent: Value = serde_json::from_str(&body).unwrap();
@@ -750,21 +861,24 @@ mod seeded {
             .iter()
             .map(|message| message["role"].as_str().unwrap().to_owned())
             .collect();
-        (sent["system"].as_str().unwrap().to_owned(), roles, body)
+        let system = sent["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["text"].as_str().unwrap().to_owned())
+            .collect();
+        (system, roles, body)
     }
 
     #[test]
-    fn a_seeded_sessions_first_request_carries_the_seed_after_the_notice() {
+    fn a_seeded_sessions_first_request_carries_the_seed_after_the_system_prompt() {
         let request = compiled_seeded(&seeded_session(&["continue the parser"]));
         let (system, roles, body) = prepared(request);
-        assert!(
-            system.starts_with("you are nanus\n\n[nanus context]"),
-            "{system}"
-        );
-        let notice = system.find("[nanus context]").unwrap();
-        let seed = system.find(HANDOFF_SEED_LABEL).unwrap();
-        assert!(notice < seed, "the seed follows the notice");
-        assert!(system.ends_with(DOCUMENT), "{system}");
+        assert_eq!(system.len(), 2, "{system:?}");
+        assert_eq!(system[0], "you are nanus");
+        assert!(system[1].starts_with(HANDOFF_SEED_LABEL), "{system:?}");
+        assert!(system[1].ends_with(DOCUMENT), "{system:?}");
+        assert!(!system.iter().any(|block| block.contains("[nanus context]")));
         assert_eq!(
             roles,
             ["user"],
@@ -777,7 +891,7 @@ mod seeded {
     fn a_seeded_sessions_later_request_still_leads_with_the_seed() {
         let request = compiled_seeded(&seeded_session(&["first", "second"]));
         let (system, roles, body) = prepared(request);
-        assert!(system.ends_with(DOCUMENT), "{system}");
+        assert!(system[1].ends_with(DOCUMENT), "{system:?}");
         assert_eq!(roles.first().map(String::as_str), Some("user"));
         assert!(body.contains("seeded output a") && body.contains("second"));
     }

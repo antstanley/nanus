@@ -1,8 +1,8 @@
 //! Managed preparation over a real socket, and its refusal on every Responses route.
 //!
 //! The request each fixture prepares is compiled by the domain's own managed compiler from a
-//! session — two leading system messages, the generated working-data message after the first
-//! user message, and one hidden fragment absent — so the grammar under test is the one the
+//! session — the system prompt, the generated working-data message after the first user
+//! message, one hidden fragment absent, and the tail — so the grammar under test is the one the
 //! runner produces. The server captures the body it received, which is what lets the
 //! assertions be about what was sent rather than what was encoded.
 
@@ -15,6 +15,7 @@ use std::net::TcpListener;
 use futures::StreamExt as _;
 use nanus_domain::context::managed::compile::{NoticeFacts, Selection, derive_effective_context};
 use nanus_domain::context::managed::{Digest, FragmentId, fragments, state};
+use nanus_domain::goal::Goal;
 use nanus_domain::{
     Message, Session, SessionEvent, SessionId, ToolCall, ToolCallId, ToolName, ToolSchema,
 };
@@ -101,14 +102,23 @@ fn compiled(session: &Session) -> ChatRequest {
         input_allowance: 100_000,
         ..NoticeFacts::default()
     };
-    let effective =
-        derive_effective_context(session, &derived, &protected, selection, None, &facts).unwrap();
-    assert!(effective.memory, "the catalog makes a generated message");
-    let mut messages = vec![Message::system("you are nanus"), effective.notice];
+    let goal = Goal::new("ship the parser", 1).unwrap();
+    let effective = derive_effective_context(
+        session,
+        &derived,
+        &protected,
+        selection,
+        Some(&goal),
+        &facts,
+    )
+    .unwrap();
+    assert!(effective.memory, "the goal makes a generated message");
+    let mut messages = vec![Message::system("you are nanus")];
     messages.extend(effective.messages);
     ChatRequest::new(MODEL, messages)
         .with_tools(vec![schema("read"), schema("context_manage")])
         .with_max_tokens(4_096)
+        .with_context_tail(effective.tail)
 }
 
 fn schema(name: &str) -> ToolSchema {
@@ -285,11 +295,8 @@ async fn sends_exactly_what_it_prepared(llm: &OpenAiLlm, request: ChatRequest) -
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        &roles[..5],
-        ["system", "system", "user", "assistant", "assistant"]
-    );
-    let generated = sent["messages"][3]["content"].as_str().unwrap();
+    assert_eq!(&roles[..4], ["system", "user", "assistant", "assistant"]);
+    let generated = sent["messages"][2]["content"].as_str().unwrap();
     assert!(generated.starts_with("[nanus working data"));
     assert!(
         !body.contains("OBSOLETE EARLY OUTPUT"),
@@ -303,6 +310,18 @@ async fn sends_exactly_what_it_prepared(llm: &OpenAiLlm, request: ChatRequest) -
 async fn a_managed_openai_chat_request_sends_exactly_the_bytes_it_prepared() {
     let sent = sends_exactly_what_it_prepared(&llm(), compiled(&session())).await;
     assert_eq!(sent["max_completion_tokens"], json!(4_096));
+    // The tail is a trailing developer message, after the final tool result.
+    let messages = sent["messages"].as_array().unwrap();
+    let tail = messages.last().unwrap();
+    assert_eq!(tail["role"], "developer");
+    assert!(
+        tail["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[nanus context] ")
+    );
+    assert_eq!(messages[messages.len() - 2]["role"], "tool");
+    assert_eq!(messages[messages.len() - 2]["content"], "kept output d");
 }
 
 #[tokio::test]
@@ -311,6 +330,15 @@ async fn a_managed_zai_request_sends_exactly_the_bytes_it_prepared() {
     request.model = "glm-5.2".into();
     let sent = sends_exactly_what_it_prepared(&zai(), request).await;
     assert_eq!(sent["max_tokens"], json!(4_096));
+    // No developer message at z.ai: the tail is appended to the final tool result.
+    let last = sent["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["role"], "tool");
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("kept output d\n\n[nanus context] ")
+    );
 }
 
 #[test]
@@ -507,7 +535,10 @@ fn the_responses_wire_is_supported_on_the_api_plan_and_the_stock_subscription() 
     let automatic = automatic();
     assert_eq!(
         automatic.managed_support(MODEL),
-        ManagedSupport::Supported { policy_version: 1 }
+        ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2
+        }
     );
     assert!(automatic.endpoint_for(MODEL).ends_with("/responses"));
     assert!(prepare(&automatic, managed(with_model(MODEL))).is_ok());
@@ -519,7 +550,10 @@ fn the_responses_wire_is_supported_on_the_api_plan_and_the_stock_subscription() 
     let exact = OpenAiLlm::new(exact).unwrap();
     assert_eq!(
         exact.managed_support(MODEL),
-        ManagedSupport::Supported { policy_version: 1 }
+        ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2
+        }
     );
     assert!(prepare(&exact, managed(with_model(MODEL))).is_ok());
 
@@ -534,7 +568,10 @@ fn the_responses_wire_is_supported_on_the_api_plan_and_the_stock_subscription() 
     let subscription = OpenAiLlm::new(subscription).unwrap();
     assert_eq!(
         subscription.managed_support(MODEL),
-        ManagedSupport::Supported { policy_version: 1 }
+        ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2
+        }
     );
     assert!(prepare(&subscription, managed(with_model(MODEL))).is_ok());
 }
@@ -548,7 +585,10 @@ fn an_exact_chat_preference_is_supported_only_where_tools_are_not_refused() {
     let chat = OpenAiLlm::new(config).unwrap();
     assert_eq!(
         chat.managed_support("gpt-5.6-sol"),
-        ManagedSupport::Supported { policy_version: 1 }
+        ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2
+        }
     );
     assert!(prepare(&chat, managed(with_model("gpt-5.6-sol"))).is_ok());
     // The flagship's chat wire refuses function tools, so a managed session cannot run there.
@@ -564,7 +604,10 @@ fn zai_is_supported_on_its_api_models_only() {
     let api = zai();
     assert_eq!(
         api.managed_support("glm-5.3"),
-        ManagedSupport::Supported { policy_version: 1 }
+        ManagedSupport::Supported {
+            policy_version: 1,
+            layout_version: 2
+        }
     );
     assert_eq!(api.managed_support("glm-4.5"), ManagedSupport::Unsupported);
     let coding = OpenAiLlm::new(OpenAiConfig::with_base_url(
@@ -600,7 +643,10 @@ fn inception_is_supported_on_its_api_models_only() {
     for model in ["mercury-3", "mercury-2.5", "mercury-2"] {
         assert_eq!(
             api.managed_support(model),
-            ManagedSupport::Supported { policy_version: 1 },
+            ManagedSupport::Supported {
+                policy_version: 1,
+                layout_version: 2
+            },
             "{model}"
         );
     }
@@ -654,8 +700,14 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     assert!(prepare(&llm(), managed(valid.clone())).is_ok());
 
     let mut last = valid.clone();
-    last.messages.truncate(4);
+    last.messages.truncate(3);
     refused_with(last, "generated data is never the last message");
+
+    let mut answered = valid.clone();
+    answered
+        .messages
+        .push(Message::assistant(Some("done".into()), None, Vec::new()));
+    refused_with(answered, "ends with a user message or tool results");
 
     let mut orphan = valid.clone();
     orphan.messages.retain(|message| {
@@ -677,8 +729,8 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     // F15: text that opens with the label anywhere but directly after the first user message
     // is the model's own reply, sent as it is; refusing it would let one reply wedge a session.
     let mut moved = valid;
-    let generated = moved.messages.remove(3);
-    moved.messages.insert(5, generated);
+    let generated = moved.messages.remove(2);
+    moved.messages.insert(4, generated);
     assert!(
         prepare(&llm(), managed(moved)).is_ok(),
         "a labelled reply elsewhere is sent"
@@ -736,7 +788,7 @@ const LEGACY_BODY: &str = concat!(
 );
 
 /// A session a handoff started, on the managed wire: the seed is a leading system message after the
-/// notice on every request, the first included, and a session with no seed sends none.
+/// system prompt on every request, the first included, and a session with no seed sends none.
 mod seeded {
     use nanus_domain::context::managed::{
         ContextFrontier, ContextModeRecord, ContextPolicy, HANDOFF_SEED_LABEL, HandoffSeed,
@@ -792,8 +844,8 @@ mod seeded {
         session
     }
 
-    /// The request the runner composes for a seeded session: the system prompt, the notice, the
-    /// seed, then the conversation, with nothing hidden.
+    /// The request the runner composes for a seeded session: the system prompt, the seed, then
+    /// the conversation, with nothing hidden, and the tail.
     fn compiled_seeded(session: &Session) -> ChatRequest {
         let derived = fragments::derive(session.log()).unwrap();
         let protected = state::protected(session.log(), &derived);
@@ -814,12 +866,13 @@ mod seeded {
             effective.seed.is_some(),
             "a seeded session carries its seed"
         );
-        let mut messages = vec![Message::system("you are nanus"), effective.notice];
+        let mut messages = vec![Message::system("you are nanus")];
         messages.extend(effective.seed);
         messages.extend(effective.messages);
         ChatRequest::new(MODEL, messages)
             .with_tools(vec![schema("read"), schema("context_manage")])
             .with_max_tokens(4_096)
+            .with_context_tail(effective.tail)
     }
 
     /// The roles and the leading messages of a prepared seeded request.
@@ -837,22 +890,22 @@ mod seeded {
     }
 
     #[test]
-    fn a_seeded_sessions_first_request_carries_the_seed_after_the_notice() {
+    fn a_seeded_sessions_first_request_carries_the_seed_after_the_system_prompt() {
         let request = compiled_seeded(&seeded_session(&["continue the parser"]));
         let (roles, messages, body) = prepared(request);
-        assert_eq!(roles, ["system", "system", "system", "user"]);
-        assert!(
-            messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .starts_with("[nanus context]")
-        );
-        let seed = messages[2]["content"].as_str().unwrap();
+        assert_eq!(roles, ["system", "system", "user", "developer"]);
+        let seed = messages[1]["content"].as_str().unwrap();
         assert!(
             seed.starts_with(HANDOFF_SEED_LABEL) && seed.ends_with(DOCUMENT),
             "{seed}"
         );
-        assert_eq!(messages[3]["content"], json!("continue the parser"));
+        assert_eq!(messages[2]["content"], json!("continue the parser"));
+        assert!(
+            messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[nanus context]")
+        );
         assert!(!body.contains("[nanus working data"));
     }
 
@@ -860,16 +913,16 @@ mod seeded {
     fn a_seeded_sessions_later_request_still_leads_with_the_seed() {
         let request = compiled_seeded(&seeded_session(&["first", "second"]));
         let (roles, messages, _) = prepared(request);
-        assert_eq!(&roles[..4], ["system", "system", "system", "user"]);
-        assert!(messages[2]["content"].as_str().unwrap().ends_with(DOCUMENT));
-        assert_eq!(roles.last().map(String::as_str), Some("user"));
+        assert_eq!(&roles[..3], ["system", "system", "user"]);
+        assert!(messages[1]["content"].as_str().unwrap().ends_with(DOCUMENT));
+        assert_eq!(roles.last().map(String::as_str), Some("developer"));
     }
 
     #[test]
     fn a_managed_session_with_no_seed_sends_no_seed() {
         let request = compiled(&session());
         let (roles, _, body) = prepared(request);
-        assert_eq!(&roles[..3], ["system", "system", "user"]);
+        assert_eq!(&roles[..2], ["system", "user"]);
         assert!(!body.contains(HANDOFF_SEED_LABEL));
     }
 }
@@ -880,8 +933,8 @@ fn sent(prepared: &PreparedCall) -> Value {
 }
 
 /// On the API plan a managed Responses body is the ordinary encoding with plain history: the
-/// reservation is sent as the output ceiling, the prompt is `instructions`, and no replay field
-/// or reasoning item is present.
+/// reservation is sent as the output ceiling, the prompt is a leading developer message rather
+/// than `instructions`, and no replay field or reasoning item is present.
 #[test]
 fn a_managed_responses_body_on_the_api_plan_is_plain_and_sends_its_reservation() {
     let llm = automatic();
@@ -890,12 +943,15 @@ fn a_managed_responses_body_on_the_api_plan_is_plain_and_sends_its_reservation()
     assert_eq!(body["store"], json!(false));
     assert_eq!(body["max_output_tokens"], json!(4_096));
     assert_eq!(prepared.estimate().reservation, 4_096);
-    assert!(
-        body["instructions"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("you are nanus")),
-        "the prompt leads the instructions"
+    assert!(body.get("instructions").is_none());
+    assert_eq!(
+        body["input"][0],
+        json!({ "role": "developer",
+            "content": [{ "type": "input_text", "text": "you are nanus" }] }),
+        "the prompt leads the input"
     );
+    let last = body["input"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["role"], "developer", "the tail trails the input");
     assert!(body.get("include").is_none());
     assert!(body.get("previous_response_id").is_none());
     let items = body["input"].as_array().expect("input items");
@@ -1184,8 +1240,9 @@ fn the_generated_message_is_in_place_and_never_last() {
     .with_max_tokens(4_096);
     let prepared = prepare(&automatic(), managed(placed)).unwrap();
     let body = sent(&prepared);
+    assert_eq!(body["input"][1]["role"], json!("user"));
     assert_eq!(
-        body["input"][1]["role"],
+        body["input"][2]["role"],
         json!("assistant"),
         "after the first user item"
     );
@@ -1202,37 +1259,41 @@ fn the_generated_message_is_in_place_and_never_last() {
     refused_by(&automatic(), last, "protocol_incompatible");
 }
 
-/// Case 5: the seed is a system message and joins `instructions` after the notice; a session with
-/// no seed carries none of it.
+/// Case 5: the seed is a system message and the developer system message's second part, after
+/// the prompt; a session with no seed carries none of it.
 #[test]
-fn a_seed_leads_the_instructions_after_the_notice() {
+fn a_seed_follows_the_prompt_in_the_developer_system_message() {
     let seeded = ChatRequest::new(
         MODEL,
         vec![
             Message::system("you are nanus"),
-            Message::system("the notice"),
             Message::system("SEED: continue the parser"),
             Message::user("hi"),
         ],
     )
-    .with_max_tokens(4_096);
+    .with_max_tokens(4_096)
+    .with_context_tail("[nanus context] mode=managed");
     let body = sent(&prepare(&automatic(), managed(seeded)).unwrap());
+    assert!(body.get("instructions").is_none());
     assert_eq!(
-        body["instructions"],
-        json!("you are nanus\n\nthe notice\n\nSEED: continue the parser")
+        body["input"][0]["content"],
+        json!([
+            { "type": "input_text", "text": "you are nanus" },
+            { "type": "input_text", "text": "SEED: continue the parser" },
+        ])
     );
 
     let unseeded = ChatRequest::new(
         MODEL,
-        vec![
-            Message::system("you are nanus"),
-            Message::system("the notice"),
-            Message::user("hi"),
-        ],
+        vec![Message::system("you are nanus"), Message::user("hi")],
     )
-    .with_max_tokens(4_096);
+    .with_max_tokens(4_096)
+    .with_context_tail("[nanus context] mode=managed");
     let body = sent(&prepare(&automatic(), managed(unseeded)).unwrap());
-    assert_eq!(body["instructions"], json!("you are nanus\n\nthe notice"));
+    assert_eq!(
+        body["input"][0]["content"],
+        json!([{ "type": "input_text", "text": "you are nanus" }])
+    );
 }
 
 /// Case 6, tool results: an image result is answered with its label, and its pixels follow as one

@@ -77,5 +77,10 @@ required-features = ["stock-compose"]
 name = "resume_across_providers"
 required-features = ["stock-compose"]
 
+# The live cache checks name the stock adapters and credential stores, like the vision checks.
+[[test]]
+name = "live_cache"
+required-features = ["stock-compose"]
+
 [lints]
 workspace = true

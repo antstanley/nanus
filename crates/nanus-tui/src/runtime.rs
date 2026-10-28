@@ -4622,7 +4622,9 @@ fn apply_context_status(
 }
 
 /// What makes one step's context status worth a second line: the parts that change what the
-/// model is answering from, and not the estimates, which move with every step.
+/// model is answering from, and not the estimates or the last request's cache share, which move
+/// with every step. Read by name, so a field added to the status is left out here unless it is
+/// named; `last_prompt_tokens` and `last_cache_hit_tokens` are left out on purpose.
 fn context_status_key(payload: &ContextStatusInfo) -> String {
     format!(
         "{:?}/{}/{}/{}/{}/{:?}",
@@ -4658,6 +4660,8 @@ fn context_status_line(payload: &ContextStatusInfo) -> String {
         profile_digest: _,
         managed_ready,
         unavailable_reason,
+        last_prompt_tokens,
+        last_cache_hit_tokens,
     } = payload;
     let mut parts = vec![match mode {
         ContextModeState::Legacy => format!("context: legacy replay · revision {revision}"),
@@ -4683,7 +4687,19 @@ fn context_status_line(payload: &ContextStatusInfo) -> String {
         });
     }
     parts.push(format!("{} events saved", frontier.event_count));
+    if let Some(share) = cache_share(*last_prompt_tokens, *last_cache_hit_tokens) {
+        parts.push(format!("cache {share}%"));
+    }
     parts.join(" · ")
+}
+
+/// The share of the last request's prompt the provider served from cache, as a floor percentage.
+///
+/// `None` when no usage has been reported, or when the prompt count is zero and there is no share
+/// to state. A zero is drawn as it was reported, which includes a provider with no cache counter.
+fn cache_share(prompt: Option<u64>, hit: Option<u64>) -> Option<u64> {
+    let (prompt, hit) = (prompt?, hit?);
+    hit.checked_mul(100)?.checked_div(prompt)
 }
 
 /// Draws a context decision with the words the replayed log draws its record with.
@@ -8721,6 +8737,8 @@ mod tests {
             profile_digest: "ab".repeat(32),
             managed_ready: true,
             unavailable_reason: None,
+            last_prompt_tokens: None,
+            last_cache_hit_tokens: None,
         }
     }
 
@@ -8840,7 +8858,7 @@ mod tests {
                     4,
                     Frame::ContextStatus {
                         envelope: envelope("e1", Some(0), 4),
-                        payload: status(ContextModeState::Managed, 2, 1),
+                        payload: Box::new(status(ContextModeState::Managed, 2, 1)),
                     },
                 )],
             },
@@ -8854,13 +8872,13 @@ mod tests {
 
         let changed = || Frame::ContextStatus {
             envelope: envelope("e1", Some(0), 7),
-            payload: status(ContextModeState::Managed, 3, 2),
+            payload: Box::new(status(ContextModeState::Managed, 3, 2)),
         };
         // At the watermark: already accounted for.
         apply(
             Frame::ContextStatus {
                 envelope: envelope("e1", Some(0), 5),
-                payload: status(ContextModeState::Managed, 3, 2),
+                payload: Box::new(status(ContextModeState::Managed, 3, 2)),
             },
             &mut view,
         );
@@ -8882,7 +8900,7 @@ mod tests {
         apply(
             Frame::ContextStatus {
                 envelope: envelope("e2", Some(0), 99),
-                payload: status(ContextModeState::Legacy, 0, 0),
+                payload: Box::new(status(ContextModeState::Legacy, 0, 0)),
             },
             &mut view,
         );
@@ -8903,7 +8921,7 @@ mod tests {
         let mut view = attached_view("e1", 0);
         let step = |frame_id: u64, revision: u64| Frame::ContextStatus {
             envelope: envelope("e1", Some(0), frame_id),
-            payload: status(ContextModeState::Managed, revision, 1),
+            payload: Box::new(status(ContextModeState::Managed, revision, 1)),
         };
         apply(step(1, 2), &mut view);
         apply(step(2, 2), &mut view);
@@ -8926,6 +8944,51 @@ mod tests {
             "an asked status is always drawn"
         );
         assert!(!view.context_asked, "and the question is answered");
+    }
+
+    /// C14: the line ends with the last request's cache share, drawn as reported, and leaves it
+    /// out when no usage has been reported.
+    #[test]
+    fn the_status_line_shows_the_cache_share_of_the_last_request() {
+        let with = |prompt: Option<u64>, hit: Option<u64>| {
+            context_status_line(&ContextStatusInfo {
+                last_prompt_tokens: prompt,
+                last_cache_hit_tokens: hit,
+                ..status(ContextModeState::Managed, 1, 0)
+            })
+        };
+        assert!(with(Some(400), Some(300)).ends_with(" · cache 75%"));
+        assert!(with(Some(400), Some(0)).ends_with(" · cache 0%"));
+        assert!(with(Some(3), Some(2)).ends_with(" · cache 66%"), "a floor");
+        assert!(!with(None, None).contains("cache"));
+        assert!(
+            !with(Some(0), Some(0)).contains("cache"),
+            "no prompt, no share"
+        );
+        let legacy = context_status_line(&ContextStatusInfo {
+            last_prompt_tokens: Some(1_000),
+            last_cache_hit_tokens: Some(900),
+            ..status(ContextModeState::Legacy, 0, 0)
+        });
+        assert!(legacy.ends_with(" · cache 90%"), "{legacy}");
+    }
+
+    /// C14: two step statuses that differ only in the cache share draw one line: like the
+    /// estimates, it moves with every step.
+    #[test]
+    fn a_step_status_differing_only_in_cache_share_is_one_line() {
+        let mut view = attached_view("e1", 0);
+        let step = |frame_id: u64, hit: u64| Frame::ContextStatus {
+            envelope: envelope("e1", Some(0), frame_id),
+            payload: Box::new(ContextStatusInfo {
+                last_prompt_tokens: Some(400),
+                last_cache_hit_tokens: Some(hit),
+                ..status(ContextModeState::Managed, 2, 1)
+            }),
+        };
+        apply(step(1, 0), &mut view);
+        apply(step(2, 300), &mut view);
+        assert_eq!(view.transcript.entries().len(), 1);
     }
 
     /// A checkpoint draws nothing for a viewer who already shows what it covers; it moves the
@@ -9096,7 +9159,7 @@ mod tests {
             apply(
                 Frame::ContextStatus {
                     envelope: envelope("e1", None, 1),
-                    payload: status(ContextModeState::Legacy, 0, 0),
+                    payload: Box::new(status(ContextModeState::Legacy, 0, 0)),
                 },
                 &mut view,
             );
@@ -9211,7 +9274,7 @@ mod tests {
         apply(
             Frame::ContextStatus {
                 envelope: envelope("e1", None, 2),
-                payload: status(ContextModeState::Managed, 0, 0),
+                payload: Box::new(status(ContextModeState::Managed, 0, 0)),
             },
             &mut view,
         );

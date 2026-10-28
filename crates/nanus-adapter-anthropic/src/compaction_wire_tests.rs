@@ -71,13 +71,26 @@ fn prompt_request(compact: bool, fold: fn(&Session) -> Vec<Message>) -> ChatRequ
 }
 
 #[test]
-fn a_compaction_summary_joins_the_system_field_after_the_prompt() {
+fn a_compaction_summary_is_the_system_block_after_the_prompt() {
     let body = build_request(
         &AnthropicConfig::new(MODEL, "test-key"),
         &legacy_request(true),
     );
+    // Its own block after the prompt's, so the prompt's block can be a cache entry every session
+    // shares; the canonical form a signature binds to still joins them.
     assert_eq!(
         body["system"],
+        json!([
+            { "type": "text", "text": "you are nanus" },
+            { "type": "text", "text": format!("{COMPACTION_LABEL}\n{SUMMARY}") },
+        ])
+    );
+    assert_eq!(
+        super::encode_canonical(
+            &AnthropicConfig::new(MODEL, "test-key"),
+            &legacy_request(true)
+        )
+        .0["system"],
         json!(format!("you are nanus\n\n{COMPACTION_LABEL}\n{SUMMARY}"))
     );
     let turns = body["messages"].as_array().cloned().unwrap_or_default();
@@ -95,7 +108,10 @@ fn a_session_with_no_marker_sends_no_summary() {
         &AnthropicConfig::new(MODEL, "test-key"),
         &legacy_request(false),
     );
-    assert_eq!(body["system"], json!("you are nanus"));
+    assert_eq!(
+        body["system"],
+        json!([{ "type": "text", "text": "you are nanus" }])
+    );
     let turns = body["messages"].as_array().cloned().unwrap_or_default();
     assert_eq!(turns.len(), 3, "{turns:?}");
     assert!(!body.to_string().contains("Compacted history"));

@@ -233,8 +233,12 @@ fn the_request_carries_the_messages_shape() {
     assert!(lowered.contains("anthropic-version: 2023-06-01"), "{head}");
     assert!(lowered.contains("accept: text/event-stream"), "{head}");
 
-    // The system turn is lifted to the top level rather than being a message.
-    assert_eq!(body["system"], serde_json::json!("you are nanus"));
+    // The system turn is lifted to the top level rather than being a message, one block per
+    // system message.
+    assert_eq!(
+        body["system"],
+        serde_json::json!([{ "type": "text", "text": "you are nanus" }])
+    );
     assert_eq!(body["max_tokens"], serde_json::json!(64_000));
     assert_eq!(body["stream"], serde_json::json!(true));
     let turns = body["messages"].as_array().cloned().unwrap_or_default();
