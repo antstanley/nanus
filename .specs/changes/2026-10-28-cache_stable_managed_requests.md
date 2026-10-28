@@ -1172,11 +1172,18 @@ the follow-up commit.
    - The shipped default is sound under those rules: a reply produced under a tail is sent without
      its thinking (stripping thinking blocks is the documented recovery), and in a managed session
      every reply is, so no invalidated block is ever replayed.
-   - The documentation names an append-only alternative that keeps both the cache and earlier
-     thinking: keep each step's tail in place, as a text block after that step's tool results, or
-     send it as a mid-conversation `role: "system"` message with `clear_at: "next_user_message"`
-     (a beta). That is a design change — the tail would become part of every later prefix and its
-     bytes would accumulate — and is an **open question for the owner**, not implemented here.
+   - Sending such a reply neutrally is accepted: the same documentation gives "strip every
+     `thinking` and `redacted_thinking` block from the history (each turn's `text` and `tool_use`
+     blocks stay), then retry" as its recovery, so no live run is needed to rely on it. What it
+     costs is that reply's reasoning on later requests, which this spec already accepts.
+   - **Decision: the append-only alternative is not adopted.** The documentation keeps earlier
+     thinking valid by leaving each step's reminder in place — a text block after that step's tool
+     results, or a `role: "system"` message with `clear_at: "next_user_message"` (a beta). Either
+     would make every step's tail a permanent part of the conversation: recorded in the session so
+     it can be re-sent byte for byte, ahead of every later message, and accumulating up to
+     `TAIL_BYTES_MAX` per step. That contradicts this change's invariants (the tail is never
+     recorded; nothing that changes per step precedes the newest message), so it would be a change
+     of its own, with its own spec, if reasoning continuity on Anthropic is ever worth that cost.
    - The multi-message `system` risk is resolved conservatively (see *Deviations as built*).
 4. **AGENTS.md and the documentation's introduction understated legacy changes**: Anthropic's
    per-message `system` blocks and the loss of thinking for a legacy reply produced under an
