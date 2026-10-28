@@ -527,7 +527,14 @@ output, and it matches only whole units. Both of a step's end units contain that
 hits therefore come from common-prefix and fixed-interval units, about one step behind a
 tail-free conversation. That is still most of the prompt, where before it was almost none.
 
-**z.ai and Inception** caching is not established here. The tail costs them nothing they had.
+**Inception** caches automatically and documents nothing of how. Measured live with `mercury-3`
+on 2026-10-29 (`inception_reads_the_previous_step_from_cache`), a managed step reads the previous
+step's prompt less a few hundred to about a thousand tokens. An untailed conversation loses the
+same, so the tail costs it nothing measurable. Two of twelve step-to-step reads in that run were
+total misses, which read not even the system prompt. Sessions recorded on mercury in ordinary
+mode show such misses on about 2% of steps.
+
+**z.ai** caching is not established here. The tail costs it nothing it had.
 
 ## Checkpoints and recovery
 

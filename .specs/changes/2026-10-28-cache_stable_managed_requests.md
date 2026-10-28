@@ -1282,3 +1282,26 @@ that a `prompt_cache_key` is sent. As built:
   Reads now happen within a session, but irregularly, so the key does not make the subscription's
   cache dependable. No hit-rate claim is made.
 
+## Inception live evidence (2026-10-29)
+
+Managed sessions on `mercury-3` recorded before this change read only about 3,400 tokens per
+step, roughly the system prompt and tools, because the per-step notice sat right after the
+system prompt. Ordinary sessions on the same model read about 95–97%.
+
+`inception_reads_the_previous_step_from_cache` was added. Each run starts with a nonce, so an
+earlier run's entries cannot stand in for its own. It sends four managed steps, each growing the
+request by about 4,000 tokens, and asserts that each step reads at least 90% of the previous
+step's prompt.
+
+- **Results over four runs.** Of twelve step-to-step reads, ten read 96–99% of the previous step's
+  prompt. The other two were total misses, which read not even the system prompt.
+- **Pass rate.** Two runs passed and two failed, each failure on one of those misses.
+- **The tail costs nothing measurable.** A probe with the same steps sent untailed fell short of
+  the previous prompt by about as much: a few hundred to about a thousand tokens.
+- **Even an identical request falls short.** Sent twice, it is not read to its end, and its
+  reported `prompt_tokens` differed between the two sends.
+
+The layout works on Inception. Whether its occasional total miss comes from steps sent about two
+seconds apart is not established. The recorded ordinary sessions show such misses on about 2% of
+steps.
+

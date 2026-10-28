@@ -441,3 +441,71 @@ async fn deepseek_reads_a_step_two_behind() {
     // Whole units only: step N+2 reads at least what step N sent.
     assert_reads(model, &first, &third, 0, 64);
 }
+
+// --- Inception ---------------------------------------------------------------------------------
+
+/// A step that reads a file and is then handed a long listing, so each request grows by thousands
+/// of tokens: a read of the system prompt alone is then plainly not a read of the conversation.
+fn listing(session: &mut Session, id: &str) {
+    work(session, id);
+    let mut content = String::new();
+    for line in 0..300_u32 {
+        let _ = write!(
+            content,
+            "{id}.txt line {line}: value {} of the record. ",
+            line.saturating_mul(7)
+        );
+    }
+    session.append(SessionEvent::UserMessage {
+        text: format!("Also note this listing:\n{content}"),
+        content_blocks: None,
+    });
+}
+
+/// Inception documents a cached-input price and nothing of how its cache works.
+///
+/// Measured on 2026-10-29 with `mercury-3`: a step reads the previous one less a few hundred to
+/// about a thousand tokens, with or without the tail, and even an identical request repeated is
+/// not read to its end. So the floor is a share of the previous prompt rather than the previous
+/// prompt less its tail. The prompt starts with a nonce, so an earlier run's entries cannot
+/// stand in for this run's.
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn inception_reads_the_previous_step_from_cache() {
+    let model = "mercury-3";
+    let llm = nanus_adapter_openai::OpenAiLlm::new(nanus_adapter_openai::OpenAiConfig::new(
+        nanus_adapter_openai::Vendor::Inception,
+        model,
+        key("inception").await,
+    ))
+    .unwrap();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prompt = format!("Run {nonce}. {}", long_prompt());
+    let mut session = Session::new(SessionId::new(format!("live-{nonce}")), 0, "/live");
+    session.upgrade_to_managed_body();
+    session.append(SessionEvent::UserMessage {
+        text: "Read the files, then say done.".into(),
+        content_blocks: None,
+    });
+    let mut earlier: Option<Usage> = None;
+    for id in ["a", "b", "c", "d"] {
+        listing(&mut session, id);
+        let (usage, _) = managed(&llm, step(model, &session, &prompt)).await;
+        if let Some(earlier) = earlier {
+            let floor = earlier
+                .prompt_tokens
+                .saturating_mul(9)
+                .checked_div(10)
+                .unwrap_or(0);
+            eprintln!(
+                "[{model}] earlier prompt {} / later prompt {} cache hit {} (floor {floor})",
+                earlier.prompt_tokens, usage.prompt_tokens, usage.cache_hit_tokens
+            );
+            assert!(usage.cache_hit_tokens >= floor, "{model}: below {floor}");
+        }
+        earlier = Some(usage);
+    }
+}
