@@ -323,7 +323,7 @@ fn check_output(requested: Option<u32>, ceiling: u32) -> LlmResult<()> {
 }
 
 /// Whether `message` is the generated working-data message the runner inserts.
-pub fn is_generated(message: &Message) -> bool {
+fn is_generated(message: &Message) -> bool {
     matches!(
         message,
         Message::Assistant {

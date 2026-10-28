@@ -208,10 +208,7 @@ pub(crate) fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, 
             .then(|| parts_of(&input[at]).map_or(0, Vec::len).saturating_sub(1))
     };
     if (path.head_breakpoint || explicit) && layout == Layout::Managed {
-        candidates.push(
-            head_item(input, &request.messages)
-                .and_then(|at| last_text_part(input, at, tail_part(at))),
-        );
+        candidates.push(head_item(input).and_then(|at| last_text_part(input, at, tail_part(at))));
     }
     if explicit {
         let answer = input
@@ -266,20 +263,14 @@ pub(crate) fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, 
     }
 }
 
-/// The head's last item: the working-data message when the managed grammar admitted one, the
-/// first user item otherwise.
-fn head_item(input: &[Value], messages: &[Message]) -> Option<usize> {
-    let first = input.iter().position(|item| item["role"] == "user")?;
-    let memory = messages
-        .iter()
-        .skip_while(|message| matches!(message, Message::System { .. }))
-        .nth(1)
-        .is_some_and(crate::managed::is_generated);
-    Some(if memory {
-        first.saturating_add(1)
-    } else {
-        first
-    })
+/// The item that holds the head's last `input_text` part: the first user item.
+///
+/// The working-data message, when the head has one, is an `assistant` item whose part is
+/// `output_text`, and a breakpoint is documented only on an `input_text` part. So the head's entry
+/// ends at the first user message: the working data after it is re-read on every step, which costs
+/// its few hundred bytes and never risks a refused request.
+fn head_item(input: &[Value]) -> Option<usize> {
+    input.iter().position(|item| item["role"] == "user")
 }
 
 /// The parts of an item that has them: a message's content, or an output given as a list.
@@ -289,15 +280,13 @@ fn parts_of(item: &Value) -> Option<&Vec<Value>> {
         .or_else(|| item["content"].as_array())
 }
 
-/// The last text part of the item at `at` (before `upto` within it), or its last part when it has
-/// no text.
+/// The last `input_text` part of the item at `at` (before `upto` within it).
 fn last_text_part(input: &[Value], at: usize, upto: Option<usize>) -> Option<(usize, usize)> {
     let parts = parts_of(input.get(at)?)?;
     let parts = &parts[..upto.unwrap_or(parts.len()).min(parts.len())];
     let part = parts
         .iter()
-        .rposition(|part| matches!(part["type"].as_str(), Some("input_text" | "output_text")))
-        .or_else(|| parts.len().checked_sub(1))?;
+        .rposition(|part| part["type"] == "input_text")?;
     Some((at, part))
 }
 

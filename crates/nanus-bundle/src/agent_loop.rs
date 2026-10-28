@@ -2030,7 +2030,38 @@ mod tests {
                 "{prompt}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}"
             ))
         );
-        assert_ne!(current, under(&format!("{prompt}\n\n{MANUAL_POLICY_V1}")));
+        let old = under(&format!("{prompt}\n\n{MANUAL_POLICY_V1}"));
+        assert_ne!(current, old);
+        // And a proposal made against the pre-guide profile is refused as stale by the proposal
+        // stage itself, while the same proposal against the current one is staged.
+        let frontier = nanus_domain::context::managed::state::frontier(&session, 0)
+            .unwrap_or_else(|code| panic!("{code}"));
+        let none = |_: &nanus_domain::context::managed::ArtifactId| None;
+        let check = nanus_domain::context::managed::proposal::Snapshot {
+            session: &session,
+            state: &snapshot.state,
+            fragments: &snapshot.fragments,
+            protected: &snapshot.protected,
+            profile_digest: &current,
+            goal_revision: None,
+            artifacts: &none,
+        };
+        let proposal = |profile: &Digest| nanus_domain::context::managed::ContextManageInput {
+            action: nanus_domain::context::managed::ManageAction::Propose,
+            base_revision: Some(0),
+            base_frontier: Some(frontier.clone()),
+            hide: Vec::new(),
+            restore: Vec::new(),
+            notes: Vec::new(),
+            cursor: None,
+            base_profile_digest: Some(profile.clone()),
+        };
+        let stage = nanus_domain::context::managed::proposal::stage;
+        assert_eq!(
+            stage(&check, &proposal(&old)).err(),
+            Some(nanus_domain::context::managed::ErrorCode::StaleBase)
+        );
+        assert!(stage(&check, &proposal(&current)).is_ok());
     }
 
     /// An unconfigured budget is the window of the model in force, read per request: a switch to

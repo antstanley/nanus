@@ -440,8 +440,9 @@ fn the_responses_breakpoints_follow_the_plan_and_the_mode() {
     let managed = api.encode(&seeded, Layout::Managed);
     assert!(managed.get("instructions").is_none());
     assert_eq!(managed["input"][0]["content"].as_array().unwrap().len(), 2);
-    // [developer: prompt, seed] [first] [working data] [call] [result] [developer tail]
-    assert_eq!(marked(&managed), [(0, 0), (2, 0)]);
+    // [developer: prompt, seed] [first] [working data] [call] [result] [developer tail]: the head's
+    // last `input_text` part is the first user item's, never the working data's `output_text`.
+    assert_eq!(marked(&managed), [(0, 0), (1, 0)]);
     let ordinary = api.encode(&seeded, Layout::Ordinary);
     assert_eq!(marked(&ordinary), [(0, 0)]);
     let unasked = api.encode(
@@ -544,5 +545,36 @@ fn the_explicit_fallback_marks_three_places_and_appends_the_tail() {
         input[5]["content"][1]
             .get("prompt_cache_breakpoint")
             .is_none()
+    );
+}
+
+/// A gateway or local server configured as `OpenAI` has no established mid-conversation developer
+/// role, so its chat tail is appended to the final message, as at the other vendors; `OpenAI`'s own
+/// endpoint takes the trailing developer message.
+#[test]
+fn a_chat_gateway_takes_the_tail_appended() {
+    let [_, two, _] = three_steps(false);
+    let mut request = two;
+    "gpt-5".clone_into(&mut request.model);
+    let gateway =
+        OpenAiConfig::with_base_url(Vendor::OpenAi, "gpt-5", "k", "http://localhost:8000/v1");
+    let body = crate::wire::build_request(&gateway, &request);
+    let messages = body["messages"].as_array().unwrap();
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["role"] != "developer"),
+        "{body}"
+    );
+    assert!(
+        messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("output a\n\n[nanus context] ")
+    );
+    let official = crate::wire::build_request(&Path::OpenAiChat.config(), &request);
+    assert_eq!(
+        official["messages"].as_array().unwrap().last().unwrap()["role"],
+        "developer"
     );
 }

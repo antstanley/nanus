@@ -540,8 +540,9 @@ impl OpenAiConfig {
     /// Every Responses path at `OpenAI` sends its system prompt as a leading developer message and
     /// its tail as a trailing one; the explicit breakpoints are sent only to the API endpoint,
     /// the one whose acceptance of them the live cases check. Chat completions keeps its system
-    /// messages; `OpenAI`'s takes the trailing developer tail, and the other vendors', which have
-    /// no established developer role mid-conversation, take it appended to the final message.
+    /// messages; `OpenAI`'s own endpoint takes the trailing developer tail, while a gateway or local
+    /// server configured as `OpenAI` — like the other vendors, which have no established developer
+    /// role mid-conversation — takes it appended to the final message.
     #[must_use]
     pub fn cache_path(&self, protocol: Protocol) -> CachePath {
         let api = self.base_url.trim_end_matches('/') == OPENAI_BASE_URL;
@@ -554,7 +555,11 @@ impl OpenAiConfig {
             },
             (Vendor::OpenAi, Protocol::ChatCompletions) => CachePath {
                 system_carrier: SystemCarrier::System,
-                tail_carrier: TailCarrier::TrailingDeveloper,
+                tail_carrier: if api {
+                    TailCarrier::TrailingDeveloper
+                } else {
+                    TailCarrier::Appended
+                },
                 system_breakpoint: false,
                 head_breakpoint: false,
             },

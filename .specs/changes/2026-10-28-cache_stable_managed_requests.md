@@ -1102,10 +1102,14 @@ evidence, and their fallbacks are specified above.)
 - **Readiness codes.** An adapter that declares support with another `layout_version` makes the
   session unready with `unsupported_mode` (C13). An adapter that declares no support keeps today's
   `protocol_incompatible`.
-- **The Responses head breakpoint is on a text part, not only `input_text`.** The working-data
-  message is an `assistant` item whose part is `output_text`, so the head's breakpoint is placed on
-  the head item's last text part of either kind. Whether the API accepts a breakpoint there is part
-  of C17's not-yet-run API-plan case.
+- **The Responses head breakpoint is on the first user item.** The spec's reference documents a
+  breakpoint on an `input_text` part; the working-data message is an `assistant` item whose part is
+  `output_text`. So the head's breakpoint is on the head's last `input_text` part, the first user
+  item's, and the working data after it is re-read each step. (The first build marked the working
+  data's `output_text`; the second review flagged that placement as undocumented.)
+- **The OpenAI chat tail is a trailing developer message only at OpenAI's endpoint.** A gateway or
+  local server configured as `OpenAI` has no established mid-conversation developer role, so it
+  takes the appended carrier, like z.ai and Inception (`a_chat_gateway_takes_the_tail_appended`).
 - **The carrier table.** `OpenAiConfig::cache_path(protocol)` returns a `CachePath` with the four
   per-path fields. `SystemCarrier` has a third value, `System`, for chat completions. The breakpoint
   flags are true only at the official API base URL. A z.ai or Inception path on Responses, which no
@@ -1128,7 +1132,7 @@ evidence, and their fallbacks are specified above.)
   signature to "the top-level `system` prompt" and is silent on whether `"A\n\nB"` and `[A, B]` are
   the same prompt, and a block replayed under a prompt the provider considers rebuilt is a 400 on
   every later request for an enforced account. An earlier build's signed reply in such a session is
-  therefore sent neutrally once on resume (`a_joined_system_digest_from_the_previous_build_is_sent_neutrally`).
+  therefore sent neutrally on every later request (`a_joined_system_digest_from_the_previous_build_is_sent_neutrally`).
 - **A public evidence hook.** `AnthropicLlm::encode_with_replay_rule` returns the body and the
   replay digest under either fingerprint rule, for C16's replay case. `replay_across_tail` is
   exported.
@@ -1197,11 +1201,31 @@ the follow-up commit.
 7. **Minor**: the interface's cache share is clamped at 100%; the link's usage cache, set as usage
    streams, is documented as such.
 
+## Second review (2026-10-28)
+
+A second semi-formal review, of the cumulative change through 006e473d, found every finding above
+resolved and no correctness defect in the core changes. It raised four lesser findings, resolved
+in the commit that follows it:
+
+1. **Undocumented and unaccepted wire placements.** The Responses head breakpoint sat on the
+   working data's `output_text` part; it is now on the first user item's `input_text` part (see
+   *Deviations as built*). The system-part breakpoint, on a developer message's `input_text` part,
+   is the placement the spec's reference documents and stays on the API plan, with C17's API-plan
+   case still to be run before it is relied on as evidence.
+2. **A developer-role tail at an OpenAI-compatible gateway.** It is now appended there.
+3. **Documentation inaccuracies**: the tail is harness-written text, not only numbers and ids; a
+   joined-`system` reply is sent neutrally on every later request, not once; breakpoint
+   candidates are considered in listed order; a cache read can cost less than a tenth.
+4. **Weak coverage**: C1 now has a test at the hidden-id cap with every field at its widest
+   (`the_tail_fits_its_bound_at_the_hidden_id_cap`), and C13's test stages a proposal under the
+   pre-guide profile and sees it refused `stale_base`, beside one under the current profile that is
+   staged.
+
 ## Coverage
 
 | # | Tests |
 |---|---|
-| C1 | `compile/tests.rs`: `the_tail_states_every_key_and_the_catalog_only_when_something_is_hidden`, `a_fresh_request_has_no_prefill_and_points_at_get_goal` |
+| C1 | `compile/tests.rs`: `the_tail_states_every_key_and_the_catalog_only_when_something_is_hidden`, `the_tail_fits_its_bound_at_the_hidden_id_cap`, `a_fresh_request_has_no_prefill_and_points_at_get_goal` |
 | C2 | `compile/tests.rs`: `the_working_data_changes_only_with_the_notes_or_the_objective` |
 | C3 | each adapter's `layout_tests.rs`: three managed steps, the goal-first exception and a legacy session between two drops — Anthropic; OpenAI chat, Responses on both plans, z.ai and Inception; DeepSeek |
 | C4 | each adapter's `layout_tests.rs`: `a_fit_breaks_only_the_body…` |
@@ -1213,7 +1237,7 @@ the follow-up commit.
 | C10 | `openai/layout_tests.rs`: `the_responses_breakpoints_follow_the_plan_and_the_mode`, `the_explicit_fallback_marks_three_places_and_appends_the_tail`; `tests/ordinary_responses_bytes.rs` |
 | C11 | `bundle/tests/managed_context.rs`: `the_guide_closes_the_prompt_and_the_tail_is_never_recorded` (the log, the checkpoint, and a `context_recall` search for the tail that finds nothing beside one for the prompt that does) |
 | C12 | each adapter's `layout_tests.rs`: `a_forged_notice_in_a_tool_result_is_content…` |
-| C13 | `bundle/tests/managed_context.rs`: `an_adapter_declaring_the_earlier_layout_is_unsupported`, `the_guide_closes_the_prompt_and_the_tail_is_never_recorded`; `bundle/src/agent_loop.rs`: `a_profile_taken_before_the_guide_is_not_the_current_one` (the profile a proposal echoes differs from the pre-guide one; the existing stale-base tests refuse a proposal naming another profile) |
+| C13 | `bundle/tests/managed_context.rs`: `an_adapter_declaring_the_earlier_layout_is_unsupported`, `the_guide_closes_the_prompt_and_the_tail_is_never_recorded`; `bundle/src/agent_loop.rs`: `a_profile_taken_before_the_guide_is_not_the_current_one` (a proposal staged under the pre-guide profile is refused `stale_base`; one under the current profile is staged) |
 | C14 | `link/server/context.rs` (`wire_status`), `link/src/protocol.rs` (round trip with and without the fields), `link/tests/link.rs`: `a_status_carries_the_last_requests_cache_share_in_a_legacy_session`, `a_status_carries_the_last_requests_cache_share_in_a_managed_session`, `tui/src/runtime.rs`: the cache-share line and one-line tests, `domain/src/session.rs`: `the_last_reported_usage_is_…`, `domain/tests/context_schema.rs`: `the_model_visible_status_carries_no_cache_share` |
 | C15 | `bundle/src/agent_loop.rs`: `an_unconfigured_budget_follows_the_window_of_the_model_in_force` (tail and refusal), `bundle/tests/managed_context.rs`: `a_legacy_session_is_untouched_by_the_managed_entry_point`, `bundle/tests/admission/host.rs`: `projection_keeps_full_history_…`, `bundle/tests/end_to_end.rs`, `bundle/tests/embedding.rs` |
 | C16, C17 | `bundle/tests/live_cache.rs` (`#[ignore]`d); results above |

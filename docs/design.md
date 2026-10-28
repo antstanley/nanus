@@ -213,8 +213,8 @@ At the end, the notice takes whatever form lets that wire's cache work around it
 is its own block behind an explicit breakpoint. On OpenAI it is a developer message, which the
 implicit breakpoint skips, so OpenAI keeps the harness's voice. Elsewhere it is appended text.
 
-It holds only numbers, enums and opaque ids, so placing it in a user turn promotes no model-written
-text. It is identified by its position, so a copy inside a tool result is read as content.
+It holds only harness-written text, numbers, enums and opaque ids — never model-written text — so
+placing it in a user turn promotes nothing a model wrote. It is identified by its position, so a copy inside a tool result is read as content.
 
 Model-written notes stay in an assistant message near the start, and are kept stable instead of
 being moved. Moving them to the end would put them in the user's voice.

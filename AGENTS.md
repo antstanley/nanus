@@ -455,8 +455,8 @@ design docs too.
     fingerprint, and the tail enters it unless the model's live evidence says otherwise — which
     Anthropic's preserved-thinking rules say it will not, for a tail that is removed. Two or more
     system messages are fingerprinted in the block form they are sent in.
-  - OpenAI's tail is a trailing developer message, because an appended tail would be inside every
-    implicit cache write.
+  - OpenAI's tail is a trailing developer message at OpenAI's endpoint, because an appended tail
+    would be inside every implicit cache write; a gateway configured as OpenAI takes it appended.
   - Each adapter has a prefix-stability test. A change that puts a per-step value ahead of the
     conversation fails it.
 - **Deletion retires the id.** `delete` takes exclusive ownership and refuses a held session; a

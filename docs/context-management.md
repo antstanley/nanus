@@ -340,7 +340,7 @@ The fingerprint binds `system` as the joined string the previous build sent when
 system message — the same prompt as the one block now sent — and as the block list when there are
 two or more (a seed or a compaction summary), since whether a signature binds the two forms alike is
 not documented. A reply an earlier build recorded under a joined multi-message `system` is
-therefore sent neutrally once rather than risk a refusal.
+therefore sent neutrally on every later request rather than risk a refusal.
 
 When hiding changes a turn's prefix, that turn is sent in its neutral form — its text and tool
 uses, without the thinking blocks — which the Messages API accepts as an edited history. A turn
@@ -361,8 +361,8 @@ in what the managed compiler selected, the tail, and the head breakpoint:
   carries no `instructions`.
 - The tail is a trailing `developer` message item, after the final user item or
   `function_call_output`, and nothing follows it.
-- On the API plan, the system prompt's part and the head's last text part each carry an explicit
-  cache breakpoint.
+- On the API plan, the system prompt's part and the first user item's last `input_text` part each
+  carry an explicit cache breakpoint.
 - A user turn is a `user` item, with `input_image` parts when it carries images.
 - An assistant turn is an `assistant` item of `output_text`, then one `function_call` item per
   call, keyed by `call_id` and carrying no item id.
@@ -432,7 +432,7 @@ body without cache markers, and without the tail when the model allows it.
 |---|---|---|---|
 | Messages (Anthropic) | The top-level `system` field: one text block per system message, in order | Its own `text` block, the last block of the final `user` turn, after any `tool_result` blocks | Up to four `cache_control` breakpoints |
 | Responses at OpenAI | A leading `developer` message: one `input_text` part per system message, in order | A trailing `developer` message, after the final user item or tool results | Up to two explicit `prompt_cache_breakpoint`s on the API plan: the end of the system prompt and the end of the head |
-| Chat completions at OpenAI | Leading `system` messages, as before | A trailing `developer` message, after the final user message or tool results | None |
+| Chat completions at OpenAI | Leading `system` messages, as before | At OpenAI's endpoint, a trailing `developer` message, after the final user message or tool results; at a gateway or local server configured as OpenAI, appended as below | None |
 | Chat completions at DeepSeek, z.ai and Inception | Leading `system` messages, as before | Appended to the final message's content: a trailing `text` part when the content is a list, otherwise after a blank line in the content string | None |
 
 Both modes have a tail:
@@ -460,8 +460,8 @@ opts in:
 
 Under `Short` every breakpoint is five minutes. Under `Long` every breakpoint is one hour. A cache
 write costs 1.25 times the input price for five minutes and twice the input price for one hour. A
-cache read costs a tenth of the input price, so a five-minute entry pays for itself on its second
-read and a one-hour entry on its third.
+cache read costs a tenth of the input price or less (a twentieth on Opus 5.5), so a five-minute
+entry pays for itself on its second read and a one-hour entry on its third.
 
 **Anthropic breakpoints** are computed over the encoded `messages` array:
 
@@ -475,9 +475,10 @@ read and a one-hour entry on its third.
    blocks were appended in between;
 4. the last block before the tail, or the request's last block when there is no tail.
 
-A breakpoint is never placed on a `thinking` block; the search walks back past them. Candidates
-are taken in position order, and a candidate at or before one already placed is dropped. So
-there are at most four, and their TTLs never increase from start to end. Breakpoint 2 exists only
+A breakpoint is never placed on a `thinking` block, nor on the tail; the search walks back past
+them. Candidates are considered in the order listed, and one at or before a breakpoint already
+placed is dropped — as breakpoint 3 is when it would fall on or before the head, which covers it.
+So there are at most four, in position order, and their TTLs never increase from start to end. Breakpoint 2 exists only
 in managed requests. A prefix shorter than the model's minimum cacheable length is simply not
 cached.
 
@@ -496,8 +497,10 @@ API plan, when the runner opted into caching, two parts carry
    anything session-specific. Every request with the same model, tools and system prompt writes
    and reads this entry, so a new session, or a new `nanus run`, is served the shared prefix from
    its first request;
-2. in managed requests only, the head's last text part: the working-data message when present,
-   otherwise the first user item. A fit that leaves the head unchanged still reads it.
+2. in managed requests only, the head's last `input_text` part, which is the first user item's.
+   The working-data message after it is an `assistant` item whose part is `output_text`, which no
+   breakpoint is documented on, so it is re-read on every step. A fit that leaves the head
+   unchanged still reads the entry.
 
 These are OpenAI's first two explicit breakpoints, which it always looks up. The implicit
 breakpoint stays on and covers the growing conversation.

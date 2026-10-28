@@ -771,3 +771,65 @@ fn the_tail_states_every_key_and_the_catalog_only_when_something_is_hidden() {
         compiled.tail
     );
 }
+
+/// C1: at the hidden-id cap, with every notice field at its widest, the tail is within its bound.
+#[test]
+fn the_tail_fits_its_bound_at_the_hidden_id_cap() {
+    let mut session = session();
+    session.append(SessionEvent::GoalChange {
+        goal: Some(Goal::new("ship it", 1).unwrap_or_else(|error| panic!("{error}"))),
+    });
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
+    let extra = limits::RECENT_PROTECTED.saturating_add(4);
+    for index in 0..limits::HIDDEN_MAX.saturating_add(extra) {
+        work(&mut session, &format!("c{index}"), "x");
+    }
+    session.append(SessionEvent::UserMessage {
+        text: "again".into(),
+        content_blocks: None,
+    });
+    let fragments = derive(session.log()).unwrap_or_default();
+    let protected = protected(session.log(), &fragments);
+    let hidden: Vec<FragmentId> = fragments
+        .all()
+        .iter()
+        .filter(|fragment| fragment.settled && !protected.contains(&fragment.id))
+        .map(|fragment| fragment.id)
+        .take(limits::HIDDEN_MAX)
+        .collect();
+    assert_eq!(hidden.len(), limits::HIDDEN_MAX);
+    let goal = session.goal();
+    let effective = derive_effective_context(
+        &session,
+        &fragments,
+        &protected,
+        Selection {
+            revision: u64::MAX,
+            hidden: &hidden,
+            notes: &[],
+            notes_goal_revision: Some(u64::MAX),
+        },
+        goal.as_ref(),
+        &NoticeFacts {
+            estimate_input_tokens: Some(u32::MAX),
+            estimator: "adapter-serialized-body/3".into(),
+            input_allowance: u32::MAX,
+            budget_hint: true,
+            recovery_available: true,
+        },
+    )
+    .unwrap_or_else(|code| panic!("{code}"));
+    assert!(
+        effective.tail.contains("(+"),
+        "the catalog is truncated at the cap"
+    );
+    assert!(
+        effective.tail.len() <= limits::TAIL_BYTES_MAX,
+        "{} > {}",
+        effective.tail.len(),
+        limits::TAIL_BYTES_MAX
+    );
+}
