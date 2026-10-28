@@ -274,6 +274,7 @@ impl AgentRunner {
             .map_or(0, |(_, reasoning)| reasoning);
         request.context_budget = Some(self.context_budget());
         request.prompt_cache = self.prompt_cache();
+        request.prompt_cache_key = Some(session.id().as_str().to_owned());
         let mut source = vec![Message::system(self.managed_system_prompt())];
         source.extend(session.derive_messages());
         request.source_history = Some(source.into());

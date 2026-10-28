@@ -371,9 +371,8 @@ Replace the Anthropic signed-replay paragraph ("Anthropic signed replay is sent 
 >
 > 1. the leading developer message's first part, which is the harness's system prompt, in both
 >    modes. A seed or a compaction summary follows it in later parts, so the breakpoint falls before
->    anything session-specific. Every request with the same model, tools and system prompt writes
->    and reads this entry, so a new session, or a new `nanus run`, is served the shared prefix from
->    its first request;
+>    anything session-specific. A session's requests write and read this entry, so a seed, a
+>    summary or a change to the head after it still reads the prompt from cache;
 > 2. in managed requests only, the head's last `input_text` part: the working-data message when
 >    present, otherwise the first user item. A fit that leaves the head unchanged still reads it.
 >
@@ -383,8 +382,13 @@ Replace the Anthropic signed-replay paragraph ("Anthropic signed replay is sent 
 > The opt-in stateless replay mode keeps `instructions`. Its sealed receipts bind the instructions
 > in that form, and it is not a managed path.
 >
-> No `prompt_cache_key` is sent. On these models it separates cache reuse between groups of requests
-> and does not improve it.
+> The session's id is sent as `prompt_cache_key` whenever the runner opted into caching, on
+> both plans and on both wires at OpenAI's own endpoints: a plan changes who pays, not how a
+> session's requests reach its cache. On models before GPT-5.6 a stable key is how related requests
+> are routed to the same cache; on later ones routing is automatic and the key separates cache
+> groups. So one session's requests are kept together as its conversation grows, and a session does
+> not read another's entries, the system prompt's included. A gateway configured as OpenAI, z.ai and
+> Inception are sent no key, and the opt-in stateless replay mode sends none.
 >
 > **DeepSeek** writes a cache unit at the end of the request's input and another at the end of its
 > output, and it matches only whole units. Both of a step's end units contain that step's tail. Its
@@ -469,7 +473,8 @@ Add to the verified list:
 > - signed replay under both fingerprint rules, and a legacy reply digest recorded by the previous
 >   build still matching;
 > - the OpenAI trailing developer tail, the Responses developer system message, both explicit
->   breakpoints, and no `prompt_cache_key`;
+>   breakpoints, and the session's `prompt_cache_key` on both plans at OpenAI's endpoints and on no
+>   other path;
 > - the legacy fitter: its elision notice is costed and carried as the tail, never as a message, on
 >   every wire, and the fitter's choice of turns is the same as before for the same budget.
 
@@ -478,8 +483,7 @@ Add to the not-verified list:
 > - **Cache hit rates are not measured by the gates.** The `#[ignore]`d live cases in
 >   `nanus-bundle/tests/live_cache.rs` check them:
 >   - that each provider serves a managed step's prefix from cache at the stated thresholds;
->   - that a second session's first Responses request reads the shared system-prompt entry;
->   - that OpenAI accepts a trailing developer message after tool results, and a request with a
+   - that OpenAI accepts a trailing developer message after tool results, and a request with a
 >     developer system message and no `instructions`, on both plans and wires;
 >   - per Anthropic model, whether signed replay is accepted with an earlier step's tail removed.
 >
@@ -909,14 +913,14 @@ Each case is a deterministic test unless it is marked *live*.
 | C7 | *Anthropic breakpoints* on ordinary bodies: 1, 3 and 4 only; a first request has 1 and 4. Breakpoint 1 is on the first `system` block even when a seed or compaction summary follows it. `PromptCacheRetention::None` emits no marker, but still the per-message `system` blocks. |
 | C8 | *Signed replay*: <ul><li>With `replay_across_tail` false, a managed turn's signed blocks are sent neutrally on the next step, and identically on every step after.</li><li>With it true, they are replayed on the next step and on the first step of the next turn.</li><li>Under either setting, they are sent neutrally after a hide that changes their prefix.</li><li>A legacy-session reply digest recorded by the previous build still replays.</li><li>A legacy reply produced under an elision tail is sent neutrally on the next request when `replay_across_tail` is false, and replayed when it is true. A legacy reply produced with no tail replays as before.</li></ul> |
 | C9 | *Digest and estimate*: the decorated body is what `estimate.request_bytes`, the request digest and the frozen dispatch all see. The local listener receives exactly those bytes. |
-| C10 | *OpenAI hints*: <ul><li>The system breakpoint is on the developer system message's first part, in both modes.</li><li>The head breakpoint is on the last `input_text` part of the working-data message, or of the first user item when there is none, in managed requests only.</li><li>Both are on the Responses API plan only, and neither appears under `PromptCacheRetention::None`.</li><li>No body anywhere carries `prompt_cache_key` or `prompt_cache_options`, except under `AppendedExplicit`, which has its own fixtures for its three breakpoints and array outputs.</li></ul> |
+| C10 | *OpenAI hints*: <ul><li>The system breakpoint is on the developer system message's first part, in both modes.</li><li>The head breakpoint is on the last `input_text` part of the working-data message, or of the first user item when there is none, in managed requests only.</li><li>Both are on the Responses API plan only, and neither appears under `PromptCacheRetention::None`.</li><li>No body anywhere carries `prompt_cache_options`, except under `AppendedExplicit`, which has its own fixtures for its three breakpoints and array outputs.</li><li>With caching asked for, the session's `prompt_cache_key` is on both plans' Responses bodies and on chat at OpenAI's endpoint, the same on both plans, and on no gateway, z.ai or Inception body; never under `PromptCacheRetention::None`.</li></ul> |
 | C11 | *The tail is not recorded*: after a managed turn, no event in the log and no `context_recall search` hit contains `[nanus context]` unless a tool result produced it. |
 | C12 | *A forged notice*: a tool result containing a `[nanus context]` line compiles and encodes with the real tail after it, on each carrier. Grammar validation is unaffected. |
 | C13 | *The guide and versions*: <ul><li>The managed system prompt ends with `MANAGED_REQUEST_GUIDE_V1`.</li><li>`MANUAL_POLICY_V1` and `POLICY_VERSION` are unchanged.</li><li>A proposal staged under the old system-prompt digest is stale.</li><li>An adapter declaring `layout_version: 1` makes the session unready with `unsupported_mode`.</li></ul> |
 | C14 | *Status*: <ul><li>`last_prompt_tokens` and `last_cache_hit_tokens` are null before any usage, then set from the newest assistant message with usage, in a managed and in a legacy session.</li><li>The domain `ContextStatus` and `ManageResult` serialise exactly as before.</li><li>The link round-trips a status with and without the fields.</li><li>The TUI line shows `cache 75%` for 300 of 400, `cache 0%` for 0 of 400, and nothing when null.</li><li>Two step statuses differing only in these fields draw one line.</li></ul> |
 | C15 | *Legacy*: <ul><li>A legacy request that dropped no turns has no `context_tail`. One that dropped turns has the elision notice as its tail, and no notice among its messages.</li><li>The runner's two-entry-point comparison matches.</li><li>The admission view's raw request carries no tail.</li><li>`build_request_for` refuses a tailed request whose last message is an assistant message, without panicking.</li><li>The `elided` frame, the CLI line and the TUI's gap entry are unchanged.</li></ul> |
 | C16 | *live*, per Anthropic model (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1`): <ul><li>Step 2 of a managed turn reports `cache_read_input_tokens` of at least the previous request's input, less its tail.</li><li>A request replaying the previous step's signed blocks with that step's tail removed is accepted. A pass sets `replay_across_tail` for that model; a failure leaves it false and is recorded here.</li></ul> |
-| C17 | *live*, OpenAI, on the API and subscription plans, chat (API plan) and Responses: <ul><li>A trailing developer message after `function_call_output` or tool messages is accepted.</li><li>A Responses body with a developer system message and no `instructions` is accepted, and answers as the system prompt directs.</li><li>The system and head breakpoints are accepted where they are sent.</li><li>Step N+1 of a managed turn reports cached tokens of at least step N's input, less its tail, rounded down to the provider's cache granularity.</li><li>On the API plan, a second session's first request, with the same model, tools and system prompt, reports cached tokens of at least the system prompt's prefix.</li></ul> *live*, DeepSeek: step N+2 reports `prompt_cache_hit_tokens` of at least step N's input. A miss on any path applies D6's fallback and is recorded here. |
+| C17 | *live*, OpenAI, on the API and subscription plans, chat (API plan) and Responses: <ul><li>A trailing developer message after `function_call_output` or tool messages is accepted.</li><li>A Responses body with a developer system message and no `instructions` is accepted, and answers as the system prompt directs.</li><li>The system and head breakpoints are accepted where they are sent.</li><li>Step N+1 of a managed turn reports cached tokens of at least step N's input, less its tail, rounded down to the provider's cache granularity.</li></ul> *live*, DeepSeek: step N+2 reports `prompt_cache_hit_tokens` of at least step N's input. A miss on any path applies D6's fallback and is recorded here. |
 | C18 | *The legacy fitter*: <ul><li>For the existing fitter fixtures, the kept turns are the same as before for the same budget.</li><li>One boundary fixture each way shows the tail's framing deciding a drop.</li><li>Every probe is costed with its tail.</li><li>A compaction or handoff draft request that the fitter trims carries the notice as its tail, after its fixed instruction.</li></ul> |
 | C19 | *The Responses system carrier*: <ul><li>An ordinary and a managed Responses body, on both plans, carry no `instructions`. Their first input item is a developer message with one part per system message, in order: the system prompt, then a seed or a compaction summary.</li><li>An `Instructions` path, and the stateless replay mode, still send `instructions`, and `stateless_tests.rs` passes unchanged.</li><li>The two ordinary goldens are replaced with the developer form.</li></ul> |
 
@@ -1011,10 +1015,13 @@ machine that day was not, and is not used.
   after tool results would read as the user interrupting the tool loop, and would open a new turn
   in DeepSeek's thinking mode. A mid-conversation system or developer message is not established
   for DeepSeek, z.ai or Inception.
-- *No `prompt_cache_key`.* **Dropped.** On every offered OpenAI model, the key separates cache reuse
-  between groups and does not improve it. A per-session key would stop sessions and `nanus run`
-  invocations from sharing the system-prompt entry this change marks for them. No other provider
-  uses one.
+- *`prompt_cache_key`.* **The session's id, on both plans** (owner's decision, 2026-10-28,
+  superseding "dropped"). A subscription request is an API call like any other, so both plans send
+  the same key at OpenAI's endpoints. Per session, because a session's requests are the ones that
+  share a growing prefix; on models before GPT-5.6 a stable key is what routes them to one cache,
+  and on the subscription the session's later steps missed without one. The cost is that sessions
+  and `nanus run` invocations no longer share the system-prompt entry: separate keys are separate
+  cache groups. No other provider uses one.
 - *The working-data message stays near the start.* **Stabilised in place, not moved.** It holds
   model-written notes, which must not appear in a user turn, and an assistant message cannot be
   last. Moving it later would also move it every turn.
@@ -1148,8 +1155,8 @@ evidence, and their fallbacks are specified above.)
     identical requests per arm, the subscription served from cache irregularly with or without a
     `prompt_cache_key`: developer form 0/3 without a key and 1/3 with one, `instructions` form 1/3
     without and 2/3 with. This is not a carrier refusal, so D6's fallback does not apply. Whether the
-    subscription needs `prompt_cache_key` to route a session's requests to its cache is an open
-    question for the owner; the decision to send no key is unchanged.
+    subscription needs `prompt_cache_key` to route a session's requests to its cache was put to the
+    owner, who decided that both plans send the session's key (see Owner decision below).
   - C17, API plan (Responses and chat), and DeepSeek: not run (API credit). No path fell back.
 
 ## Review (2026-10-28)
@@ -1244,3 +1251,34 @@ in the commit that follows it:
 | Idle dry preparation (deviation) | `anthropic/managed_tests.rs`: `an_idle_sessions_next_request_is_measurable`; `bundle/tests/managed_responses_wire.rs`: `status_reports_the_effective_reservation_across_a_switch_and_for_legacy_sessions` (the status after a turn, through the real OpenAI adapter) |
 | C18 | `domain/src/context.rs`: `the_fitter_keeps_the_same_turns_it_kept_with_the_notice_as_a_message`, `the_tail_framing_decides_a_boundary_case_each_way`, `the_notice_is_counted_against_the_budget`; `bundle/tests/maintenance.rs`: `a_trimmed_compaction_request_carries_the_notice_as_its_tail` |
 | C19 | `openai/managed_tests.rs`, `openai/responses.rs` and `compaction_wire_tests.rs`, `tests/ordinary_responses_bytes.rs`; `stateless_tests.rs` unchanged |
+
+## Owner decision (2026-10-28): the session's cache key on both plans
+
+The owner decided that a subscription request should be no different from an API request, and
+that a `prompt_cache_key` is sent. As built:
+
+- `ChatRequest::prompt_cache_key` names a request's cache group. The runner sets it to the session's
+  id on every request it builds: legacy turns, managed steps and compaction drafts.
+- The `OpenAI` adapter sends it, under any retention but `None`, wherever `CachePath::cache_key`
+  says so: Responses at the API and subscription endpoints, and chat completions at the API
+  endpoint. A gateway configured as `OpenAI`, z.ai and Inception are sent none, since they document
+  no such field. The opt-in stateless replay mode sends none: its receipts seal its body.
+- The key is per session, the conventional grain on the subscription backend. Separate keys are
+  separate cache groups, so the system-prompt entry is no longer shared across sessions. The live
+  case that claimed it was (`a_second_session_reads_the_shared_prompt`) is removed, with its row in
+  C17.
+- Tests: `the_cache_key_goes_to_openai_on_both_plans_and_nowhere_else`,
+  `both_plans_send_the_session_cache_key_when_caching_is_asked_for`,
+  `a_request_names_its_session_as_its_cache_group`, and the key asserted on a managed step and a
+  compaction draft.
+- Live, subscription, `gpt-5.6-sol`, 2026-10-28, after the change:
+  - the keyed layout was accepted;
+  - the cache-read case was run three times, plus the acceptance case once:
+    - twice, step 2 read nothing;
+    - once, step 2 read 7,168 of 7,265 prompt tokens (floor 6,912), and step 3 read 6,912 of
+      7,419 (floor 7,040);
+    - the acceptance case's step 3 read 6,656.
+
+  Reads now happen within a session, but irregularly, so the key does not make the subscription's
+  cache dependable. No hit-rate claim is made.
+

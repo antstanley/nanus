@@ -103,6 +103,7 @@ fn step(model: &str, session: &Session, prompt: &str) -> ChatRequest {
         .with_max_tokens(2_048)
         .with_context_tail(effective.tail)
         .with_prompt_cache(PromptCacheRetention::Short)
+        .with_prompt_cache_key(session.id().as_str())
 }
 
 /// Three consecutive managed steps of one turn over synthetic history.
@@ -381,34 +382,12 @@ async fn managed_steps_read_the_previous_step(llm: &dyn LlmPort, model: &str) {
     assert_reads(model, &second, &third, tail_tokens(&two), 128);
 }
 
-/// A second session's first request reads the shared system-prompt entry.
-async fn a_second_session_reads_the_shared_prompt(llm: &dyn LlmPort, model: &str) {
-    let prompt = long_prompt();
-    let ask = |question: &str| {
-        ChatRequest::new(
-            model,
-            vec![Message::system(prompt.clone()), Message::user(question)],
-        )
-        .with_tools(vec![schema()])
-        .with_prompt_cache(PromptCacheRetention::Short)
-    };
-    let _ = usage_of(llm.stream_chat(ask("What is fixture 3?"))).await;
-    let (second, _) = usage_of(llm.stream_chat(ask("What is fixture 7?"))).await;
-    let floor = u32::try_from(prompt.len().checked_div(6).unwrap_or(0)).unwrap_or(0);
-    eprintln!(
-        "[{model}] second session cache hit {} (floor {floor})",
-        second.cache_hit_tokens
-    );
-    assert!(second.cache_hit_tokens >= floor);
-}
-
 #[tokio::test]
 #[ignore = "live: spends API credit"]
 async fn openai_api_responses_accepts_the_layout_and_reads_its_cache() {
     let llm = api(RESPONSES_MODEL, key("openai").await);
     obeys_the_developer_system_message(&llm, RESPONSES_MODEL).await;
     managed_steps_read_the_previous_step(&llm, RESPONSES_MODEL).await;
-    a_second_session_reads_the_shared_prompt(&llm, RESPONSES_MODEL).await;
 }
 
 #[tokio::test]

@@ -117,6 +117,11 @@ fn a_trimmed_compaction_request_carries_the_notice_as_its_tail() {
             nanus_bundle::agent_loop::COMPACTION_INSTRUCTION
         ))
     );
+    assert_eq!(
+        last.prompt_cache_key.as_deref(),
+        Some(session.id().as_str()),
+        "a draft is in its session's cache group"
+    );
     let tail = last.context_tail.as_deref().unwrap_or_default();
     assert!(
         tail.contains("not shown"),

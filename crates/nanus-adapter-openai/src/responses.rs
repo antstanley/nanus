@@ -177,6 +177,7 @@ fn marker() -> Value {
 
 /// Appends the tail and places the path's breakpoints.
 pub(crate) fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, path: CachePath) {
+    insert_cache_key(body, request, path);
     let Some(input) = body["input"].as_array_mut() else {
         return;
     };
@@ -260,6 +261,19 @@ pub(crate) fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, 
             target["prompt_cache_breakpoint"] = marker();
             placed = Some((item, part));
         }
+    }
+}
+
+/// Names the request's cache group, on a path that takes one and when caching is asked for.
+///
+/// A session's key keeps its requests together as its conversation grows; it is a hint, so a
+/// request without one is still answered, and a canonical body never carries it.
+pub(crate) fn insert_cache_key(body: &mut Value, request: &ChatRequest, path: CachePath) {
+    if !path.cache_key || request.prompt_cache == nanus_ports::PromptCacheRetention::None {
+        return;
+    }
+    if let (Some(key), Some(fields)) = (request.prompt_cache_key.as_deref(), body.as_object_mut()) {
+        fields.insert("prompt_cache_key".to_owned(), json!(key));
     }
 }
 

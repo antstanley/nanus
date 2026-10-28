@@ -494,9 +494,8 @@ API plan, when the runner opted into caching, two parts carry
 
 1. the leading developer message's first part, which is the harness's system prompt, in both
    modes. A seed or a compaction summary follows it in later parts, so the breakpoint falls before
-   anything session-specific. Every request with the same model, tools and system prompt writes
-   and reads this entry, so a new session, or a new `nanus run`, is served the shared prefix from
-   its first request;
+   anything session-specific. A session's requests write and read this entry, so a seed, a
+   summary or a change to the head after it still reads the prompt from cache;
 2. in managed requests only, the head's last `input_text` part, which is the first user item's.
    The working-data message after it is an `assistant` item whose part is `output_text`, which no
    breakpoint is documented on, so it is re-read on every step. A fit that leaves the head
@@ -509,8 +508,13 @@ The opt-in stateless replay mode keeps `instructions`. Its sealed receipts bind 
 in that form, and it is not a managed path; an elision notice joins its `instructions` after the
 prompt, as that mode always sent it.
 
-No `prompt_cache_key` is sent. On these models it separates cache reuse between groups of requests
-and does not improve it.
+The session's id is sent as `prompt_cache_key` whenever the runner opted into caching, on
+both plans and on both wires at OpenAI's own endpoints: a plan changes who pays, not how a
+session's requests reach its cache. On models before GPT-5.6 a stable key is how related requests
+are routed to the same cache; on later ones routing is automatic and the key separates cache
+groups. So one session's requests are kept together as its conversation grows, and a session does
+not read another's entries, the system prompt's included. A gateway configured as OpenAI, z.ai and
+Inception are sent no key, and the opt-in stateless replay mode sends none.
 
 Each path's carriers are a row of the vendor table (`OpenAiConfig::cache_path`): `system_carrier`,
 `tail_carrier`, `system_breakpoint` and `head_breakpoint`. A path that refused a trailing developer
@@ -935,7 +939,8 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
 - signed replay under both fingerprint rules, and a legacy reply digest recorded by the previous
   build still matching;
 - the OpenAI trailing developer tail, the Responses developer system message, both explicit
-  breakpoints, and no `prompt_cache_key`;
+  breakpoints, and the session's `prompt_cache_key` on both plans at OpenAI's endpoints and on no
+  other path;
 - the legacy fitter: its elision notice is costed and carried as the tail, never as a message, on
   every wire, and the fitter's choice of turns is the same as before for the same budget;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
@@ -947,7 +952,6 @@ Not verified, and not claimed:
 - **Cache hit rates are not measured by the gates.** The `#[ignore]`d live cases in
   `nanus-bundle/tests/live_cache.rs` check them:
   - that each provider serves a managed step's prefix from cache at the stated thresholds;
-  - that a second session's first Responses request reads the shared system-prompt entry;
   - that OpenAI accepts a trailing developer message after tool results, and a request with a
     developer system message and no `instructions`, on both plans and wires;
   - per Anthropic model, whether signed replay is accepted with an earlier step's tail removed.
@@ -956,8 +960,9 @@ Not verified, and not claimed:
   subscription's acceptance case has been run. Its cache-read case failed on its one run: the
   second step reported no cached tokens although the first step read the prefix an earlier run
   wrote. In a three-request probe that day, identical subscription requests were served from cache
-  irregularly with or without a `prompt_cache_key`, so the subscription's cache routing is not
-  understood and no claim is made about its hit rate.
+  irregularly with or without a `prompt_cache_key`. With the session's key sent, three more runs
+  of the case the same day read the previous step in one run and nothing at step 2 in two. The
+  subscription's cache routing is not understood, and no claim is made about its hit rate.
 
 - **No live provider has been sent a maintenance request.** A handoff or compaction draft is a model
   call built and read the way a managed turn's is. The tests show the request is built and its

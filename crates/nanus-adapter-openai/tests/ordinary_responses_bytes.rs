@@ -1,7 +1,8 @@
 //! The ordinary Responses bytes, pinned: a request that is not managed encodes its system prompt
 //! as a leading developer item rather than `instructions`, and otherwise exactly as it did before
 //! managed context learned the Responses wire. With caching asked for, the API plan marks the
-//! prompt's part and the subscription marks nothing, so any drift in the shared encoder fails here.
+//! prompt's part and the subscription marks nothing, and both send the session's cache key, so any
+//! drift in the shared encoder fails here.
 #![allow(clippy::unwrap_used)]
 
 use nanus_adapter_openai::{
@@ -53,4 +54,32 @@ fn only_the_api_plan_marks_the_prompt_when_caching_is_asked_for() {
     assert_eq!(subscription_bytes, SUBSCRIPTION_GOLDEN);
     assert!(!api_bytes.contains("prompt_cache_key"));
     assert!(!api_bytes.contains("prompt_cache_options"));
+}
+
+/// The cache key the runner names a session's requests with goes to both plans alike, beside the
+/// API plan's breakpoint; asked for no caching, neither plan sends it.
+#[test]
+fn both_plans_send_the_session_cache_key_when_caching_is_asked_for() {
+    let (api, subscription) = plans();
+    let keyed = request()
+        .with_prompt_cache(PromptCacheRetention::Short)
+        .with_prompt_cache_key("0192f1c4-7d3e-7a10-9b2c-5d6e7f809a1b");
+    let api_bytes = serde_json::to_string(&api.encode(&keyed)).unwrap();
+    let subscription_bytes = serde_json::to_string(&subscription.encode(&keyed)).unwrap();
+    let key = r#""model":"gpt-5.6-sol","prompt_cache_key":"0192f1c4-7d3e-7a10-9b2c-5d6e7f809a1b","#;
+    let unkeyed = |golden: &str| golden.replace(key, r#""model":"gpt-5.6-sol","#);
+    assert!(api_bytes.contains(key), "{api_bytes}");
+    assert!(subscription_bytes.contains(key), "{subscription_bytes}");
+    assert_eq!(unkeyed(&api_bytes), API_CACHED_GOLDEN);
+    assert_eq!(unkeyed(&subscription_bytes), SUBSCRIPTION_GOLDEN);
+
+    let unasked = keyed.with_prompt_cache(PromptCacheRetention::None);
+    assert_eq!(
+        serde_json::to_string(&api.encode(&unasked)).unwrap(),
+        API_GOLDEN
+    );
+    assert_eq!(
+        serde_json::to_string(&subscription.encode(&unasked)).unwrap(),
+        SUBSCRIPTION_GOLDEN
+    );
 }

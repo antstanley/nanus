@@ -969,7 +969,8 @@ impl AgentRunner {
     /// The whole log is replayed and then trimmed: the oldest turns are dropped when the
     /// conversation no longer fits, with a notice the model reads as the request's tail, and the
     /// turn is *refused* when even the newest turn does not fit. See [`nanus_domain::context`] for the policy and
-    /// why it is a policy rather than a tokenizer.
+    /// why it is a policy rather than a tokenizer. The session's id names the request's cache group,
+    /// so a provider that routes by one keeps the conversation's requests together.
     ///
     /// # Errors
     ///
@@ -982,7 +983,11 @@ impl AgentRunner {
         // After a compaction cut the prompt is the summary plus what follows it; with no cut this
         // is exactly the whole fold.
         messages.extend(session.derive_prompt_messages());
-        self.build_request_for(messages)
+        let (request, elision) = self.build_request_for(messages)?;
+        Ok((
+            request.with_prompt_cache_key(session.id().as_str()),
+            elision,
+        ))
     }
 
     /// Fits `messages` into a legacy request: the schemas, reservations and budget a turn carries.
@@ -1950,6 +1955,30 @@ mod tests {
             });
         }
         session
+    }
+
+    /// A runner names each request's cache group by its session: every request of one session
+    /// carries the same key, and another session's carry its own.
+    #[test]
+    fn a_request_names_its_session_as_its_cache_group() {
+        let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(WindowedLlm));
+        let runner =
+            runner(llm, registry_with_echo()).unwrap_or_else(|| unreachable!("the runner builds"));
+        let ask = |id: &str| {
+            let mut session = Session::new(SessionId::new(id), 0, "/w");
+            session.append(SessionEvent::UserMessage {
+                content_blocks: None,
+                text: String::from("a question"),
+            });
+            session
+        };
+        let first = ask("first-session");
+        let (one, _) = runner.build_request(&first).unwrap();
+        let (again, _) = runner.build_request(&first).unwrap();
+        let (other, _) = runner.build_request(&ask("other-session")).unwrap();
+        assert_eq!(one.prompt_cache_key.as_deref(), Some("first-session"));
+        assert_eq!(again.prompt_cache_key, one.prompt_cache_key);
+        assert_eq!(other.prompt_cache_key.as_deref(), Some("other-session"));
     }
 
     /// Acceptance 21: an exact-chat `OpenAI` runner fitted to the model's window has a legacy prompt

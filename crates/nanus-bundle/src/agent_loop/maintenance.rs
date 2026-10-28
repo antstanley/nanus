@@ -200,6 +200,7 @@ impl AgentRunner {
         messages.extend(session.derive_prompt_messages());
         messages.push(Message::user(COMPACTION_INSTRUCTION));
         let (request, elision) = self.build_request_for(messages)?;
+        let request = request.with_prompt_cache_key(session.id().as_str());
         // The instruction is the newest turn, so the fitter keeps it even when it has to drop every
         // real turn to make room. A summary of nothing is refused rather than compacted.
         let real_turns = session

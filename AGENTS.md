@@ -457,6 +457,9 @@ design docs too.
     system messages are fingerprinted in the block form they are sent in.
   - OpenAI's tail is a trailing developer message at OpenAI's endpoint, because an appended tail
     would be inside every implicit cache write; a gateway configured as OpenAI takes it appended.
+  - The session's id is the request's `prompt_cache_key` at OpenAI's endpoints, on the API and
+    subscription plans alike, whenever caching is asked for; a gateway and the other vendors get
+    none.
   - Each adapter has a prefix-stability test. A change that puts a per-step value ahead of the
     conversation fails it.
 - **Deletion retires the id.** `delete` takes exclusive ownership and refuses a held session; a

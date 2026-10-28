@@ -408,7 +408,8 @@ fn a_forged_notice_in_a_tool_result_is_content_on_every_path() {
 
 /// C10/C19: the Responses system prompt is a leading developer message with one part per system
 /// message, marked on the API plan only; the head breakpoint marks a managed request's working
-/// data on the API plan only; no request carries a cache key or options.
+/// data on the API plan only; a request the runner did not key carries no cache key, and none
+/// carries options.
 #[test]
 fn the_responses_breakpoints_follow_the_plan_and_the_mode() {
     let [_, two, _] = three_steps(true);
@@ -464,6 +465,45 @@ fn the_responses_breakpoints_follow_the_plan_and_the_mode() {
         assert!(!body.contains("prompt_cache_key"), "{path:?}");
         assert!(!body.contains("prompt_cache_options"), "{path:?}");
     }
+}
+
+/// The session's cache key goes to `OpenAI`'s own endpoints on both plans alike, in either layout,
+/// whenever caching is asked for: never unasked, and never to a gateway or another vendor.
+#[test]
+fn the_cache_key_goes_to_openai_on_both_plans_and_nowhere_else() {
+    let [_, two, _] = three_steps(true);
+    let keyed = two.with_prompt_cache_key("session-1");
+    let unasked = keyed.clone().with_prompt_cache(PromptCacheRetention::None);
+    for path in PATHS {
+        let sent = matches!(
+            path,
+            Path::OpenAiChat | Path::ResponsesApi | Path::ResponsesSubscription
+        );
+        for layout in [Layout::Managed, Layout::Ordinary] {
+            let body = path.encode(&keyed, layout);
+            let key = body.get("prompt_cache_key");
+            assert_eq!(key.is_some(), sent, "{path:?} {layout:?}");
+            assert!(key.is_none_or(|key| key == "session-1"), "{path:?}");
+            let body = path.encode(&unasked, layout);
+            assert!(
+                body.get("prompt_cache_key").is_none(),
+                "{path:?} {layout:?}"
+            );
+        }
+    }
+    let api = Path::ResponsesApi.encode(&keyed, Layout::Managed);
+    let subscription = Path::ResponsesSubscription.encode(&keyed, Layout::Managed);
+    assert_eq!(api["prompt_cache_key"], subscription["prompt_cache_key"]);
+    // A gateway configured as `OpenAI` documents no such field, on either wire.
+    let mut gateway =
+        OpenAiConfig::with_base_url(Vendor::OpenAi, "gpt-5", "k", "http://127.0.0.1:8080/v1");
+    let mut request = keyed;
+    "gpt-5".clone_into(&mut request.model);
+    let chat = crate::wire::build_request(&gateway, &request);
+    assert!(chat.get("prompt_cache_key").is_none(), "{chat}");
+    gateway.set_protocol(Protocol::Responses);
+    let responses = crate::responses::encode(&gateway, &request, Layout::Managed);
+    assert!(responses.get("prompt_cache_key").is_none(), "{responses}");
 }
 
 /// C10: the explicit-only fallback, for a path that refuses a trailing developer message: cache

@@ -273,7 +273,8 @@ pub enum SystemCarrier {
     System,
     /// One leading `developer` input item with one `input_text` part per system message, in
     /// order. A part can carry an explicit cache breakpoint, so the harness's prompt — the first
-    /// part, ahead of any seed or summary — can be an entry every session shares.
+    /// part, ahead of any seed or summary — can be an entry of its own, still read after a change
+    /// that follows it.
     Developer,
     /// The top-level `instructions` string, which cannot carry a breakpoint.
     Instructions,
@@ -308,6 +309,8 @@ pub struct CachePath {
     pub system_breakpoint: bool,
     /// Whether a managed request's head carries an explicit breakpoint when caching is asked for.
     pub head_breakpoint: bool,
+    /// Whether the request's `prompt_cache_key` is sent when caching is asked for.
+    pub cache_key: bool,
 }
 
 /// The adapter's settings.
@@ -543,15 +546,22 @@ impl OpenAiConfig {
     /// messages; `OpenAI`'s own endpoint takes the trailing developer tail, while a gateway or local
     /// server configured as `OpenAI` — like the other vendors, which have no established developer
     /// role mid-conversation — takes it appended to the final message.
+    ///
+    /// The cache key goes to `OpenAI`'s own endpoints, the API and the subscription alike: a plan
+    /// changes who pays, not how a session's requests are routed to its cache. A gateway configured
+    /// as `OpenAI` and the other vendors are sent none, since they document no such field.
     #[must_use]
     pub fn cache_path(&self, protocol: Protocol) -> CachePath {
-        let api = self.base_url.trim_end_matches('/') == OPENAI_BASE_URL;
+        let base = self.base_url.trim_end_matches('/');
+        let api = base == OPENAI_BASE_URL;
+        let subscription = base == OPENAI_SUBSCRIPTION_BASE_URL;
         match (self.vendor, protocol) {
             (Vendor::OpenAi, Protocol::Responses) => CachePath {
                 system_carrier: SystemCarrier::Developer,
                 tail_carrier: TailCarrier::TrailingDeveloper,
                 system_breakpoint: api,
                 head_breakpoint: api,
+                cache_key: api || subscription,
             },
             (Vendor::OpenAi, Protocol::ChatCompletions) => CachePath {
                 system_carrier: SystemCarrier::System,
@@ -562,18 +572,21 @@ impl OpenAiConfig {
                 },
                 system_breakpoint: false,
                 head_breakpoint: false,
+                cache_key: api,
             },
             (Vendor::Zai | Vendor::Inception, Protocol::Responses) => CachePath {
                 system_carrier: SystemCarrier::Instructions,
                 tail_carrier: TailCarrier::TrailingDeveloper,
                 system_breakpoint: false,
                 head_breakpoint: false,
+                cache_key: false,
             },
             (Vendor::Zai | Vendor::Inception, Protocol::ChatCompletions) => CachePath {
                 system_carrier: SystemCarrier::System,
                 tail_carrier: TailCarrier::Appended,
                 system_breakpoint: false,
                 head_breakpoint: false,
+                cache_key: false,
             },
         }
     }

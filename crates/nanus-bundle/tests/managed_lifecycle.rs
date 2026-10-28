@@ -423,6 +423,11 @@ fn notes_bound_to_an_older_goal_are_marked_stale() {
     // Staleness moves with the goal, so it is stated in the tail rather than in the working data
     // that heads the cached prefix.
     assert!(!memory.contains("STALE"), "{memory}");
+    assert_eq!(
+        last.prompt_cache_key.as_deref(),
+        Some(session.id().as_str()),
+        "a managed request names its session's cache group"
+    );
     let tail = last.context_tail.unwrap_or_default();
     assert!(
         tail.contains("notes_stale=true"),

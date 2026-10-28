@@ -95,10 +95,11 @@ pub fn build_request(config: &OpenAiConfig, request: &ChatRequest) -> Value {
         body.insert("tools".to_owned(), tools);
     }
     let mut encoded = Value::Object(body);
+    let path = config.cache_path(Protocol::ChatCompletions);
     if let Some(tail) = request.context_tail.as_deref() {
-        let carrier = config.cache_path(Protocol::ChatCompletions).tail_carrier;
-        place_tail(&mut encoded["messages"], tail, carrier);
+        place_tail(&mut encoded["messages"], tail, path.tail_carrier);
     }
+    crate::responses::insert_cache_key(&mut encoded, request, path);
     // Postcondition: the mandatory fields are present, so a later edit cannot
     // produce a silently empty request.
     assert!(encoded.get("model").is_some());

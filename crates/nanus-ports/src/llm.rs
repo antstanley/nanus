@@ -404,6 +404,12 @@ pub struct ChatRequest {
     pub context_tail: Option<String>,
     /// How long the provider may keep the cache entries this request marks.
     pub prompt_cache: PromptCacheRetention,
+    /// The name of the group of requests that share this request's reusable prefix: the runner
+    /// names the session, whose requests grow one conversation.
+    ///
+    /// An adapter whose provider routes its cache by such a key sends it whenever caching is asked
+    /// for, and never under [`PromptCacheRetention::None`]. Another adapter ignores it.
+    pub prompt_cache_key: Option<String>,
 }
 
 impl ChatRequest {
@@ -422,6 +428,7 @@ impl ChatRequest {
             temperature: None,
             context_tail: None,
             prompt_cache: PromptCacheRetention::None,
+            prompt_cache_key: None,
         }
     }
 
@@ -493,6 +500,13 @@ impl ChatRequest {
     #[must_use]
     pub const fn with_prompt_cache(mut self, retention: PromptCacheRetention) -> Self {
         self.prompt_cache = retention;
+        self
+    }
+
+    /// Names the group of requests that share this request's reusable prefix.
+    #[must_use]
+    pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(key.into());
         self
     }
 }
