@@ -14,7 +14,9 @@ where things sit, both shared by every legacy session and neither caused by mana
 - the fitter's elision notice, when turns were dropped, is the request's tail;
 - on Responses, the system prompt is a leading developer message.
 
-Its requests also carry cache hints (see
+On Anthropic, `system` is one text block per system message, and a reply produced under an elision
+notice is sent without its thinking on later requests (see
+[signed replay](#providers)). Its requests also carry cache hints (see
 [Request layout and provider caches](#request-layout-and-provider-caches)). Two changes apply to
 every session
 by design: [deletion](#deletion-and-retirement) retires the id, and the `read` and `grep` tools
@@ -329,6 +331,16 @@ markers.
   before.
 - **For a model whose live acceptance is recorded** (`replay_across_tail` in the adapter's model
   table), the fingerprint excludes the tail, and signed blocks survive from one step to the next.
+  Anthropic's preserved-thinking rules for Opus 5.5, Sonnet 5.5 and Fable 5.1 say a block is bound
+  to every message before it and that removing a per-request reminder invalidates it (a 400 for
+  accounts created on or after 2026-08-31), so no model is expected to qualify while the tail is
+  removed; the documented append-only form keeps earlier reminders in place.
+
+The fingerprint binds `system` as the joined string the previous build sent when there is one
+system message — the same prompt as the one block now sent — and as the block list when there are
+two or more (a seed or a compaction summary), since whether a signature binds the two forms alike is
+not documented. A reply an earlier build recorded under a joined multi-message `system` is
+therefore sent neutrally once rather than risk a refusal.
 
 When hiding changes a turn's prefix, that turn is sent in its neutral form — its text and tool
 uses, without the thinking blocks — which the Messages API accepts as an edited history. A turn

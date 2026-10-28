@@ -379,6 +379,11 @@ impl core::fmt::Debug for AgentRunner {
     }
 }
 
+/// Why a legacy request that had to leave turns out cannot be sent: it ends on an answer, so the
+/// notice that says turns were left out, its tail, has nowhere to go.
+const NO_PLACE_FOR_THE_NOTICE: &str = "a request whose turns were left out ends with neither a \
+user message nor tool results, so the notice that says so has no place";
+
 impl AgentRunner {
     /// Builds a runner over the shared tool registry.
     ///
@@ -996,15 +1001,15 @@ impl AgentRunner {
         // always has a place. Stated as a refusal rather than an assertion: a request that broke it
         // is one this turn cannot send, not a reason to take the process down.
         if !request.tail_is_placeable() {
-            return Err(BundleError::context(
-                "a request whose turns were left out ends with neither a user message nor tool \
-                 results, so the notice that says so has no place",
-            ));
+            return Err(BundleError::context(NO_PLACE_FOR_THE_NOTICE));
         }
         Ok((request, elision))
     }
 
     /// Fits `messages` into a legacy request, without placing the elision's notice.
+    ///
+    /// The provider-aware fit refuses a candidate whose notice would have no place with
+    /// [`NO_PLACE_FOR_THE_NOTICE`], as [`Self::build_request_for`] does on the plain fit.
     fn fit_request(
         &self,
         messages: Vec<nanus_domain::Message>,
@@ -1045,6 +1050,9 @@ impl AgentRunner {
                     probe.messages = candidate.to_vec();
                     probe.context_tail = tail.map(str::to_owned);
                     if !probe.tail_is_placeable() {
+                        // The refusal names why no shorter candidate can be sent, rather than
+                        // reading as a budget the conversation could not be fitted into.
+                        failure = Some(String::from(NO_PLACE_FOR_THE_NOTICE));
                         return u32::MAX;
                     }
                     match model.estimate_request(&probe) {
@@ -1978,6 +1986,53 @@ mod tests {
         assert_eq!(fitted.prompt_budget(), 691_500);
     }
 
+    /// C13: the snapshot profile a proposal must echo binds the managed system prompt, which now
+    /// ends with the request guide. A profile taken under the prompt before the guide — the policy
+    /// alone — is a different digest, so a proposal staged under it is refused as stale by the
+    /// profile check every proposal already passes.
+    #[test]
+    fn a_profile_taken_before_the_guide_is_not_the_current_one() {
+        use nanus_domain::context::managed::{
+            ContextPolicy, Digest, MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, SelectionIdentity,
+            SnapshotProfile,
+        };
+        let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(WindowedLlm));
+        let runner =
+            runner(llm, registry_with_echo()).unwrap_or_else(|| unreachable!("the runner builds"));
+        let mut session = session();
+        session.upgrade_to_managed_body();
+        let snapshot = AgentRunner::snapshot(&session).unwrap_or_else(|error| panic!("{error}"));
+        let selection = SelectionIdentity {
+            provider: String::from("test"),
+            endpoint_digest: Digest::of(b"local"),
+            protocol: String::from("test.chat"),
+            model: runner.model(),
+            effort: None,
+            epoch: 0,
+        };
+        let policy = ContextPolicy::managed();
+        let current = runner.profile(selection.clone(), policy, &snapshot);
+        let schemas = serde_json::to_string(&runner.managed_schemas()).unwrap_or_default();
+        let under = |prompt: &str| {
+            SnapshotProfile {
+                selection: selection.clone(),
+                system_prompt_digest: Digest::of(prompt.as_bytes()),
+                tool_schema_digest: Digest::of(schemas.as_bytes()),
+                policy,
+                goal_revision: None,
+            }
+            .digest()
+        };
+        let prompt = &runner.system_prompt;
+        assert_eq!(
+            current,
+            under(&format!(
+                "{prompt}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}"
+            ))
+        );
+        assert_ne!(current, under(&format!("{prompt}\n\n{MANUAL_POLICY_V1}")));
+    }
+
     /// An unconfigured budget is the window of the model in force, read per request: a switch to
     /// a model with a small window trims the conversation, the prompt is fitted inside the window
     /// less the output ceiling and the estimate's margin, and a model with no documented window
@@ -2017,6 +2072,18 @@ mod tests {
         // C15: a request whose turns were left out but which ends on an answer has no place for
         // the notice, and is refused rather than sent or panicked over.
         let refused = follows.build_request(&long_session());
+        assert!(
+            matches!(&refused, Err(BundleError::Context(reason)) if reason.contains("no place")),
+            "{refused:?}"
+        );
+        // The provider-aware fit, which a request reservation selects, gives the same reason
+        // rather than one about a budget.
+        let reserved = runner(Rc::clone(&llm), registry_with_echo())
+            .unwrap_or_else(|| unreachable!("the runner builds"))
+            .with_model_context_budget()
+            .with_request_budget(100, 0);
+        reserved.set_model("small-model");
+        let refused = reserved.build_request(&long_session());
         assert!(
             matches!(&refused, Err(BundleError::Context(reason)) if reason.contains("no place")),
             "{refused:?}"

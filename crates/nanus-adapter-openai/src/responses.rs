@@ -199,9 +199,19 @@ pub(crate) fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, 
         first["prompt_cache_breakpoint"] = marker();
     }
     let mut candidates: Vec<Option<(usize, usize)>> = Vec::new();
+    // A tail appended as a part sits in the last item before decoration; the head's search must
+    // stop short of it, or a first request's head entry would end in the tail and never be read.
+    let appended =
+        request.context_tail.is_some() && path.tail_carrier != TailCarrier::TrailingDeveloper;
+    let tail_part = |at: usize| {
+        (appended && at.saturating_add(1) == before_tail)
+            .then(|| parts_of(&input[at]).map_or(0, Vec::len).saturating_sub(1))
+    };
     if (path.head_breakpoint || explicit) && layout == Layout::Managed {
-        candidates
-            .push(head_item(input, &request.messages).and_then(|at| last_text_part(input, at)));
+        candidates.push(
+            head_item(input, &request.messages)
+                .and_then(|at| last_text_part(input, at, tail_part(at))),
+        );
     }
     if explicit {
         let answer = input
@@ -279,9 +289,11 @@ fn parts_of(item: &Value) -> Option<&Vec<Value>> {
         .or_else(|| item["content"].as_array())
 }
 
-/// The last text part of the item at `at`, or its last part when it has no text.
-fn last_text_part(input: &[Value], at: usize) -> Option<(usize, usize)> {
+/// The last text part of the item at `at` (before `upto` within it), or its last part when it has
+/// no text.
+fn last_text_part(input: &[Value], at: usize, upto: Option<usize>) -> Option<(usize, usize)> {
     let parts = parts_of(input.get(at)?)?;
+    let parts = &parts[..upto.unwrap_or(parts.len()).min(parts.len())];
     let part = parts
         .iter()
         .rposition(|part| matches!(part["type"].as_str(), Some("input_text" | "output_text")))

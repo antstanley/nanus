@@ -1121,6 +1121,14 @@ evidence, and their fallbacks are specified above.)
   does not move.
 - **A served agent's retention is set on the shared runner.** The link holds the runner behind an
   `Rc`, so `AgentRunner` also has `set_prompt_cache`, which `serve` calls with `Long`.
+- **Two or more system messages are fingerprinted as the block list.** D5 kept the joined `system`
+  string in the canonical form so no recorded fingerprint changes. With one system message it still
+  is, and an earlier build's digest still replays (C8). With two or more (a seed or a compaction
+  summary), the canonical form is the block list actually sent: Anthropic's documentation binds a
+  signature to "the top-level `system` prompt" and is silent on whether `"A\n\nB"` and `[A, B]` are
+  the same prompt, and a block replayed under a prompt the provider considers rebuilt is a 400 on
+  every later request for an enforced account. An earlier build's signed reply in such a session is
+  therefore sent neutrally once on resume (`a_joined_system_digest_from_the_previous_build_is_sent_neutrally`).
 - **A public evidence hook.** `AnthropicLlm::encode_with_replay_rule` returns the body and the
   replay digest under either fingerprint rule, for C16's replay case. `replay_across_tail` is
   exported.
@@ -1140,6 +1148,48 @@ evidence, and their fallbacks are specified above.)
     question for the owner; the decision to send no key is unchanged.
   - C17, API plan (Responses and chat), and DeepSeek: not run (API credit). No path fell back.
 
+## Review (2026-10-28)
+
+A semi-formal review of the implementing commit (57fbfb03) found the following. Each is resolved in
+the follow-up commit.
+
+1. **Anthropic breakpoint 2 landed on the tail of a first request** (confirmed by execution). On a
+   request whose head is also its final turn — every managed session's first step — the head
+   search did not stop short of the tail, so the only conversation entry written ended in a tail no
+   later request carries, and breakpoint 4 was dropped behind it. Every breakpoint search now stops
+   before the tail; the unshipped `AppendedExplicit` head had the same flaw and is fixed alike.
+   Pinned by `a_first_requests_head_breakpoint_stops_before_the_tail` and the explicit fallback's
+   first-request case.
+2. **`"system": null` on a cached request with no system message** (confirmed). Indexing a missing
+   key inserted it. Fixed; pinned by `caching_a_request_with_no_system_message_adds_no_system_field`.
+3. **Signed replay against Anthropic's preserved thinking** (confirmed from the provider's
+   documentation, not executed). For Opus 5.5, Sonnet 5.5 and Fable 5.1 a thinking block's signature
+   binds `system`, `tools` and every earlier message; removing a per-request reminder invalidates
+   every later block, and accounts created on or after 2026-08-31 are refused (400) on such a
+   replay. So:
+   - C16's relaxed rule is not expected to pass for any model while the tail is removed from the
+     next request; `replay_across_tail` stays `false`, and its documentation says why.
+   - The shipped default is sound under those rules: a reply produced under a tail is sent without
+     its thinking (stripping thinking blocks is the documented recovery), and in a managed session
+     every reply is, so no invalidated block is ever replayed.
+   - The documentation names an append-only alternative that keeps both the cache and earlier
+     thinking: keep each step's tail in place, as a text block after that step's tool results, or
+     send it as a mid-conversation `role: "system"` message with `clear_at: "next_user_message"`
+     (a beta). That is a design change — the tail would become part of every later prefix and its
+     bytes would accumulate — and is an **open question for the owner**, not implemented here.
+   - The multi-message `system` risk is resolved conservatively (see *Deviations as built*).
+4. **AGENTS.md and the documentation's introduction understated legacy changes**: Anthropic's
+   per-message `system` blocks and the loss of thinking for a legacy reply produced under an
+   elision notice. Both are now listed.
+5. **A misleading refusal from the provider-aware legacy fit** for a request ending on an answer:
+   it read as a budget too small. It now names the missing place for the notice; pinned in
+   `an_unconfigured_budget_follows_the_window_of_the_model_in_force`.
+6. **Coverage gaps**: a recall search for the tail (C11), a managed-mode link status (C14), the
+   model-visible status shape (C14), the idle dry preparation, and the stale profile (C13). Each now
+   has a test (below).
+7. **Minor**: the interface's cache share is clamped at 100%; the link's usage cache, set as usage
+   streams, is documented as such.
+
 ## Coverage
 
 | # | Tests |
@@ -1149,16 +1199,17 @@ evidence, and their fallbacks are specified above.)
 | C3 | each adapter's `layout_tests.rs`: three managed steps, the goal-first exception and a legacy session between two drops — Anthropic; OpenAI chat, Responses on both plans, z.ai and Inception; DeepSeek |
 | C4 | each adapter's `layout_tests.rs`: `a_fit_breaks_only_the_body…` |
 | C5 | each adapter's `layout_tests.rs` (tail placement) and each adapter's `managed_tests.rs` (`a_request_outside_the_managed_grammar_is_refused` refuses an answer-ending request) |
-| C6 | `anthropic/layout_tests.rs`: `managed_breakpoints_follow_the_layout`, `a_breakpoint_at_or_before_one_placed_is_dropped`, `a_breakpoint_walks_back_past_thinking` |
-| C7 | `anthropic/layout_tests.rs`: `ordinary_breakpoints_follow_the_layout` |
-| C8 | `anthropic/managed_tests.rs`: `signed_replay_is_sent_only_under_the_prefix_that_produced_it`, `signed_replay_survives_the_tail_where_the_model_allows_it`; `anthropic/layout_tests.rs`: `a_digest_recorded_by_the_previous_build_still_replays`, `a_legacy_reply_under_an_elision_tail_replays_only_where_the_model_allows` |
+| C6 | `anthropic/layout_tests.rs`: `managed_breakpoints_follow_the_layout`, `a_first_requests_head_breakpoint_stops_before_the_tail`, `a_breakpoint_at_or_before_one_placed_is_dropped`, `a_breakpoint_walks_back_past_thinking` |
+| C7 | `anthropic/layout_tests.rs`: `ordinary_breakpoints_follow_the_layout`, `caching_a_request_with_no_system_message_adds_no_system_field` |
+| C8 | `anthropic/managed_tests.rs`: `signed_replay_is_sent_only_under_the_prefix_that_produced_it`, `signed_replay_survives_the_tail_where_the_model_allows_it`; `anthropic/layout_tests.rs`: `a_digest_recorded_by_the_previous_build_still_replays` (one system message), `a_joined_system_digest_from_the_previous_build_is_sent_neutrally`, `a_legacy_reply_under_an_elision_tail_replays_only_where_the_model_allows` |
 | C9 | each adapter's `a_managed_request_sends_exactly_the_bytes_it_prepared` (the decorated body, tail and markers included) |
 | C10 | `openai/layout_tests.rs`: `the_responses_breakpoints_follow_the_plan_and_the_mode`, `the_explicit_fallback_marks_three_places_and_appends_the_tail`; `tests/ordinary_responses_bytes.rs` |
-| C11 | `bundle/tests/managed_context.rs`: `the_guide_closes_the_prompt_and_the_tail_is_never_recorded` (the log and the checkpoint; recall reads only the log) |
+| C11 | `bundle/tests/managed_context.rs`: `the_guide_closes_the_prompt_and_the_tail_is_never_recorded` (the log, the checkpoint, and a `context_recall` search for the tail that finds nothing beside one for the prompt that does) |
 | C12 | each adapter's `layout_tests.rs`: `a_forged_notice_in_a_tool_result_is_content…` |
-| C13 | `bundle/tests/managed_context.rs`: `an_adapter_declaring_the_earlier_layout_is_unsupported`, `the_guide_closes_the_prompt_and_the_tail_is_never_recorded`. The stale-proposal clause rests on the system-prompt digest including the guide (`prepare.rs`), with the existing stale-base tests; no test stages a proposal under the old prompt. |
-| C14 | `link/server/context.rs` (`wire_status`), `link/src/protocol.rs` (round trip with and without the fields), `link/tests/link.rs`: `a_status_carries_the_last_requests_cache_share_in_a_legacy_session`, `tui/src/runtime.rs`: the cache-share line and one-line tests, `domain/src/session.rs`: `the_last_reported_usage_is_…`. The managed-mode status reads the same `Held` cache and is covered by the unit test, not by a link test. |
+| C13 | `bundle/tests/managed_context.rs`: `an_adapter_declaring_the_earlier_layout_is_unsupported`, `the_guide_closes_the_prompt_and_the_tail_is_never_recorded`; `bundle/src/agent_loop.rs`: `a_profile_taken_before_the_guide_is_not_the_current_one` (the profile a proposal echoes differs from the pre-guide one; the existing stale-base tests refuse a proposal naming another profile) |
+| C14 | `link/server/context.rs` (`wire_status`), `link/src/protocol.rs` (round trip with and without the fields), `link/tests/link.rs`: `a_status_carries_the_last_requests_cache_share_in_a_legacy_session`, `a_status_carries_the_last_requests_cache_share_in_a_managed_session`, `tui/src/runtime.rs`: the cache-share line and one-line tests, `domain/src/session.rs`: `the_last_reported_usage_is_…`, `domain/tests/context_schema.rs`: `the_model_visible_status_carries_no_cache_share` |
 | C15 | `bundle/src/agent_loop.rs`: `an_unconfigured_budget_follows_the_window_of_the_model_in_force` (tail and refusal), `bundle/tests/managed_context.rs`: `a_legacy_session_is_untouched_by_the_managed_entry_point`, `bundle/tests/admission/host.rs`: `projection_keeps_full_history_…`, `bundle/tests/end_to_end.rs`, `bundle/tests/embedding.rs` |
 | C16, C17 | `bundle/tests/live_cache.rs` (`#[ignore]`d); results above |
+| Idle dry preparation (deviation) | `anthropic/managed_tests.rs`: `an_idle_sessions_next_request_is_measurable`; `bundle/tests/managed_responses_wire.rs`: `status_reports_the_effective_reservation_across_a_switch_and_for_legacy_sessions` (the status after a turn, through the real OpenAI adapter) |
 | C18 | `domain/src/context.rs`: `the_fitter_keeps_the_same_turns_it_kept_with_the_notice_as_a_message`, `the_tail_framing_decides_a_boundary_case_each_way`, `the_notice_is_counted_against_the_budget`; `bundle/tests/maintenance.rs`: `a_trimmed_compaction_request_carries_the_notice_as_its_tail` |
 | C19 | `openai/managed_tests.rs`, `openai/responses.rs` and `compaction_wire_tests.rs`, `tests/ordinary_responses_bytes.rs`; `stateless_tests.rs` unchanged |

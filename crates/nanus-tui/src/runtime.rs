@@ -4697,9 +4697,12 @@ fn context_status_line(payload: &ContextStatusInfo) -> String {
 ///
 /// `None` when no usage has been reported, or when the prompt count is zero and there is no share
 /// to state. A zero is drawn as it was reported, which includes a provider with no cache counter.
+/// A provider that reports more hits than prompt tokens is drawn at 100%, never above.
 fn cache_share(prompt: Option<u64>, hit: Option<u64>) -> Option<u64> {
     let (prompt, hit) = (prompt?, hit?);
-    hit.checked_mul(100)?.checked_div(prompt)
+    hit.checked_mul(100)?
+        .checked_div(prompt)
+        .map(|share| share.min(100))
 }
 
 /// Draws a context decision with the words the replayed log draws its record with.
@@ -8964,6 +8967,10 @@ mod tests {
         assert!(
             !with(Some(0), Some(0)).contains("cache"),
             "no prompt, no share"
+        );
+        assert!(
+            with(Some(100), Some(250)).ends_with(" · cache 100%"),
+            "never above"
         );
         let legacy = context_status_line(&ContextStatusInfo {
             last_prompt_tokens: Some(1_000),

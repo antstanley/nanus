@@ -492,6 +492,16 @@ fn the_explicit_fallback_marks_three_places_and_appends_the_tail() {
         crate::responses::decorate(&mut body, &request, Layout::Managed, explicit);
         body
     };
+    // A first request: the head is the final item, and its marker stops short of the tail part.
+    let [one, _, _] = three_steps(false);
+    let first = encode(&one);
+    let parts = first["input"][1]["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 2, "the prompt and the tail");
+    assert!(parts[0].get("prompt_cache_breakpoint").is_some());
+    assert!(
+        parts[1].get("prompt_cache_breakpoint").is_none(),
+        "never the tail"
+    );
     let body = encode(&two);
     assert_eq!(body["prompt_cache_options"], json!({ "mode": "explicit" }));
     let input = body["input"].as_array().unwrap();

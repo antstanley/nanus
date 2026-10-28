@@ -18,8 +18,9 @@
 //!
 //! ## Canonical encoding, then decoration
 //!
-//! A request is encoded in two steps. The **canonical** body is the one this adapter always sent:
-//! a joined `system` string, no tail, no cache hints. **Decoration** then rewrites `system` as one
+//! A request is encoded in two steps. The **canonical** body is the one this adapter always sent —
+//! no tail, no cache hints — except that two or more system messages are a block list rather than
+//! a joined string (see `canonical_system`). **Decoration** then rewrites `system` as one
 //! text block per system message, appends the request's tail as the last block of the final
 //! `user` turn, and — when the runner opted into caching — places `cache_control` breakpoints.
 //! What is sent, estimated and digested is the decorated body; what a signed thinking block is
@@ -179,8 +180,8 @@ pub fn encode_canonical(config: &AnthropicConfig, request: &ChatRequest) -> (Val
     ) {
         body.insert("thinking".to_owned(), json!({ "type": "adaptive" }));
     }
-    if let Some(system) = system_text(&request.messages) {
-        body.insert("system".to_owned(), json!(system));
+    if let Some(system) = canonical_system(&request.messages) {
+        body.insert("system".to_owned(), system);
     }
     let tools = if request.tools.is_empty() {
         Value::Null
@@ -246,7 +247,9 @@ fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, tailed: boo
         nanus_ports::PromptCacheRetention::Long => "1h",
     };
     let marker = json!({ "type": "ephemeral", "ttl": ttl });
-    if let Some(first) = body["system"].get_mut(0) {
+    // Not `body["system"]`: indexing a missing key would insert a `"system": null` the body never
+    // had, for a request that carries no system message.
+    if let Some(first) = body.get_mut("system").and_then(|system| system.get_mut(0)) {
         first["cache_control"] = marker.clone();
     }
     let Some(turns) = body["messages"].as_array_mut() else {
@@ -286,21 +289,25 @@ fn breakpoints(
             .is_some_and(crate::managed::is_generated);
         usize::from(memory)
     });
-    let head = head.and_then(|turn| last_cacheable(turns, turn, None));
+    // Every search stops short of the tail: on a first request the head is also the final turn,
+    // and an entry that ended in the tail could never be read by the next request.
+    let last = turns.len().checked_sub(1);
+    let before_tail = |turn: usize| {
+        let blocks = turns[turn]["content"].as_array().map_or(0, Vec::len);
+        if tailed && Some(turn) == last {
+            Some(blocks.saturating_sub(1))
+        } else {
+            None
+        }
+    };
+    let search = |turn: usize| last_cacheable(turns, turn, before_tail(turn));
+    let head = head.and_then(search);
     let before_answer = turns
         .iter()
         .rposition(|turn| turn["role"] == "assistant")
         .and_then(|answer| answer.checked_sub(1))
-        .and_then(|turn| last_cacheable(turns, turn, None));
-    let end = turns.len().checked_sub(1).and_then(|last| {
-        let blocks = turns[last]["content"].as_array().map_or(0, Vec::len);
-        let before_tail = if tailed {
-            blocks.checked_sub(1)
-        } else {
-            Some(blocks)
-        };
-        last_cacheable(turns, last, before_tail)
-    });
+        .and_then(search);
+    let end = last.and_then(search);
     [head, before_answer, end]
 }
 
@@ -334,17 +341,25 @@ fn system_parts(messages: &[Message]) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Lifts the system instructions out of the conversation.
+/// The `system` value a signed block is bound to.
 ///
-/// Several system messages are joined with a blank line, which is the closest thing
-/// to "in this order" the top-level field can express.
-#[must_use]
-pub fn system_text(messages: &[Message]) -> Option<String> {
+/// One system message is the joined string every earlier build sent — the same prompt as the one
+/// text block decoration sends — so a digest an earlier build recorded still matches. Two or more
+/// (a seed or a compaction summary after the prompt) are the block list actually sent: whether the
+/// provider binds a signature to `"A\n\nB"` and to `[A, B]` alike is not documented, and a block
+/// replayed under a prompt the provider considers changed is refused. An earlier build's digest
+/// over the joined form therefore no longer matches there, and its blocks are sent neutrally.
+fn canonical_system(messages: &[Message]) -> Option<Value> {
     let parts: Vec<&str> = system_parts(messages).collect();
-    if parts.is_empty() {
-        return None;
+    match parts.as_slice() {
+        [] => None,
+        [only] => Some(json!(only)),
+        many => Some(Value::Array(
+            many.iter()
+                .map(|text| json!({ "type": "text", "text": text }))
+                .collect(),
+        )),
     }
-    Some(parts.join("\n\n"))
 }
 
 /// Fingerprints only the fields Anthropic binds signed thinking to.
@@ -401,7 +416,7 @@ fn encode_messages_with_prefix(
     let mut results: Vec<Value> = Vec::new();
     for message in messages {
         match message {
-            // Lifted to the top level by `system_text`.
+            // Lifted to the top level by `canonical_system`.
             Message::System { .. } => {}
             Message::Tool {
                 content_blocks,
@@ -1431,7 +1446,7 @@ mod tests {
         );
     }
 
-    /// Several system turns are one block each in the sent body and join in the canonical one;
+    /// Several system turns are one block each in the sent body and in the canonical one;
     /// several tool results gather into one user turn.
     #[test]
     fn system_turns_join_and_tool_results_gather() {
@@ -1450,7 +1465,13 @@ mod tests {
             Message::tool(ToolCallId::new("b"), "two", true),
         ];
         let canonical = encode_canonical(&config(), &request(messages.clone())).0;
-        assert_eq!(canonical["system"], json!("first\n\nsecond"));
+        assert_eq!(
+            canonical["system"],
+            json!([
+                { "type": "text", "text": "first" },
+                { "type": "text", "text": "second" },
+            ])
+        );
         let body = build_request(&config(), &request(messages));
         assert_eq!(
             body["system"],

@@ -460,3 +460,21 @@ fn an_attempt_record_without_a_kind_serializes_without_the_key() {
     handoff.kind = Some(MaintenanceAttemptKind::Handoff);
     assert_eq!(serde_json::to_value(handoff).unwrap()["kind"], "handoff");
 }
+
+/// C14: the cache share is the link's alone. The status the model reads in a `context_manage`
+/// result serialises exactly the properties its definition lists — none of the link's usage fields
+/// — so the model never sees a number that moves with every step.
+#[test]
+fn the_model_visible_status_carries_no_cache_share() {
+    let value = serde_json::to_value(status()).unwrap();
+    let names = keys(&value);
+    assert!(!names.contains("last_prompt_tokens"), "{names:?}");
+    assert!(!names.contains("last_cache_hit_tokens"), "{names:?}");
+    let listed: BTreeSet<String> = schema()["$defs"]["ContextStatus"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(names, listed);
+}

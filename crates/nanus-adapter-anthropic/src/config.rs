@@ -110,6 +110,10 @@ pub fn model_max_output_tokens(model: &str) -> u32 {
 /// every model until a live case (`nanus-bundle/tests/live_cache.rs`) records an acceptance for
 /// that model. Until then the replay fingerprint includes the tail, and such a reply is sent in its
 /// neutral form — text and tool calls, without its thinking.
+///
+/// Anthropic's preserved-thinking rules for these models bind a block to every message before it
+/// and name a removed per-request reminder as an edit that invalidates it, so no acceptance is
+/// expected while the tail is removed from the next request.
 #[must_use]
 pub const fn replay_across_tail(model: &str) -> bool {
     let _ = model;

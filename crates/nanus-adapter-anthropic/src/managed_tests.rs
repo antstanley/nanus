@@ -720,6 +720,29 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     );
 }
 
+/// An idle session ends on the model's answer. The runner measures the request its next prompt
+/// would start — that answer, then an empty stand-in prompt and the tail — which the grammar
+/// admits, while the answer-ending request itself has no place for the tail and is refused.
+#[test]
+fn an_idle_sessions_next_request_is_measurable() {
+    let mut idle = compiled(&session());
+    idle.messages
+        .push(Message::assistant(Some("done".into()), None, Vec::new()));
+    refused_with(idle.clone(), "ends with a user message or tool results");
+    idle.messages.push(Message::user(""));
+    let prepared = prepare(&llm(), managed(idle)).unwrap();
+    let sent: Value = serde_json::from_str(prepared.body()).unwrap();
+    let last = sent["messages"].as_array().unwrap().last().unwrap();
+    let blocks = last["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["text"], "");
+    assert!(
+        blocks[1]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[nanus context]")
+    );
+}
+
 /// T01: the ordinary path sends the body it always sent — but for the system prompt, which is one
 /// block per system message — and streams without managed limits. With no retention asked for,
 /// it carries no cache marker and, with no elision, no tail.

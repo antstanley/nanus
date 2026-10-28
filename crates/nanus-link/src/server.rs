@@ -1866,7 +1866,10 @@ impl Progress for Broadcast<'_> {
     }
 
     fn usage(&mut self, usage: &Usage) {
-        // The usage is held by the step's assistant record, so it is the newest one reported.
+        // The usage is held by the step's assistant record, so it is the newest one reported. It
+        // is cached as it streams, before that record exists: a step that fails after reporting
+        // usage still cost what it reports, and the next refresh from the session replaces it
+        // with what the log holds.
         self.held.last_usage.set(Some(*usage));
         self.produced = true;
         let now = Instant::now();

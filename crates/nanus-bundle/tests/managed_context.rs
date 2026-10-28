@@ -140,7 +140,19 @@ fn an_adapter_declaring_the_earlier_layout_is_unsupported() {
 fn the_guide_closes_the_prompt_and_the_tail_is_never_recorded() {
     const { assert!(limits::POLICY_VERSION == 1) };
     assert!(MANUAL_POLICY_V1.starts_with("Context management (policy 1)."));
-    let model = <Model as ModelExt>::new(vec![calls(&[("e1", "echo", "{}")]), text("done")]);
+    let recall = |id: &str, query: &str| {
+        let arguments = format!(
+            r#"{{"action": "search", "query": "{query}", "target": null, "cursor": null,
+                "limit": 5, "max_bytes": 8192, "encoding": "text"}}"#
+        );
+        calls(&[(id, "context_recall", arguments.as_str())])
+    };
+    let model = <Model as ModelExt>::new(vec![
+        calls(&[("e1", "echo", "{}")]),
+        recall("r1", "mode=managed"),
+        recall("r2", "go"),
+        text("done"),
+    ]);
     let runner = runner(&model, 64_000);
     let (mut session, disk, context) = managed(&runner);
     block(runner.run_turn_with_runtime(&mut session, "go", &mut Silent, host(&disk, &context)))
@@ -172,6 +184,17 @@ fn the_guide_closes_the_prompt_and_the_tail_is_never_recorded() {
             request.context_tail
         );
     }
+    // Recall searches the log, where no request's tail was ever written: a search for the tail's
+    // first field finds nothing, while a search for the user's own prompt finds it.
+    let hits = |id: &str| {
+        let result = tool_result_json(&session, id);
+        result["hits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a search result: {result}"))
+            .len()
+    };
+    assert_eq!(hits("r1"), 0, "the tail is never recalled");
+    assert!(hits("r2") > 0, "the search itself finds what the log holds");
     let recorded = session.to_jsonl();
     assert!(!recorded.contains("[nanus context]"), "{recorded}");
     assert!(!disk.last().to_jsonl().contains("[nanus context]"));

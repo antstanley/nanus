@@ -372,6 +372,35 @@ fn managed_breakpoints_follow_the_layout() {
     assert_eq!(markers(&long).len(), 4);
 }
 
+/// C6: on a first request the head is also the final turn. Its breakpoint is the user's own block,
+/// never the tail after it, which no later request could read; breakpoint 4 is the same block.
+#[test]
+fn a_first_requests_head_breakpoint_stops_before_the_tail() {
+    for goal_first in [false, true] {
+        let [one, _, _] = three_steps(goal_first);
+        let body = managed(&one);
+        // [first, tail]
+        assert_eq!(
+            markers(&body),
+            [(None, "5m".to_owned()), (Some((0, 0)), "5m".to_owned())]
+        );
+        assert!(
+            body["messages"][0]["content"][1]
+                .get("cache_control")
+                .is_none()
+        );
+    }
+}
+
+/// A request with no system message gains no `system` field when caching is asked for.
+#[test]
+fn caching_a_request_with_no_system_message_adds_no_system_field() {
+    let bare = request(vec![Message::user("hi")]).with_prompt_cache(PromptCacheRetention::Short);
+    let body = ordinary(&bare);
+    assert!(body.get("system").is_none(), "{body}");
+    assert_eq!(markers(&body), [(Some((0, 0)), "5m".to_owned())]);
+}
+
 /// C6: at step 2 of a first turn with working data, the turn before the last answer is the
 /// working data itself, so breakpoint 3 coincides with breakpoint 2 and is dropped.
 #[test]
@@ -492,31 +521,62 @@ fn replayed(body: &Value) -> bool {
     body["messages"][1]["content"][0]["signature"] == "SIG"
 }
 
-/// C8: a digest the previous build recorded — over its sent body, a joined `system` string and no
-/// markers — still matches, so a legacy session's thinking replays on the decorated body.
-#[test]
-fn a_digest_recorded_by_the_previous_build_still_replays() {
-    let previous: Value = serde_json::from_str(concat!(
+/// The body the previous build sent for `[system…, "go"]`, with `system` as the joined string.
+fn previous_body(system: &str) -> Value {
+    let mut body: Value = serde_json::from_str(concat!(
         r#"{"max_tokens":64000,"messages":[{"content":[{"text":"go","type":"text"}],"role":"#,
-        r#""user"}],"model":"claude-opus-5-5","stream":true,"system":"you are nanus\n\nsecond","#,
+        r#""user"}],"model":"claude-opus-5-5","stream":true,"system":"","#,
         r#""thinking":{"type":"adaptive"},"tools":[{"description":"read","input_schema":{"type":"#,
         r#""object"},"name":"read"}]}"#,
     ))
     .unwrap();
-    let digest = request_prefix(&previous);
-    let next = request(vec![
+    body["system"] = json!(system);
+    body
+}
+
+/// The next ordinary request after a signed reply bound to `digest`, under `system`.
+fn after_signed(system: &[&str], digest: String) -> Value {
+    let mut messages: Vec<Message> = system.iter().map(|text| Message::system(*text)).collect();
+    messages.push(Message::user("go"));
+    messages.push(signed_reply(digest));
+    messages.push(Message::tool(ToolCallId::new("t1"), "out", false));
+    let mut next = request(messages).with_prompt_cache(PromptCacheRetention::Long);
+    next.max_tokens = None;
+    ordinary(&next)
+}
+
+/// C8: a digest the previous build recorded — over its sent body, a `system` string and no
+/// markers — still matches when there is one system message, the same prompt as the one block
+/// now sent, so a legacy session's thinking replays on the decorated body.
+#[test]
+fn a_digest_recorded_by_the_previous_build_still_replays() {
+    let digest = request_prefix(&previous_body("you are nanus"));
+    let body = after_signed(&["you are nanus"], digest);
+    assert!(body["system"].is_array());
+    assert!(replayed(&body), "{body}");
+}
+
+/// With a seed or a summary after the prompt, the previous build sent one joined string and this
+/// one sends a block per message. Whether the provider binds a signature to both alike is not
+/// documented, so the earlier reply is sent neutrally rather than risk a refused request; a reply
+/// produced by this build under the block form replays.
+#[test]
+fn a_joined_system_digest_from_the_previous_build_is_sent_neutrally() {
+    let digest = request_prefix(&previous_body("you are nanus\n\nsecond"));
+    let body = after_signed(&["you are nanus", "second"], digest);
+    assert!(!replayed(&body), "{body}");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    let mut current = request(vec![
         Message::system("you are nanus"),
         Message::system("second"),
         Message::user("go"),
-        signed_reply(digest),
-        Message::tool(ToolCallId::new("t1"), "out", false),
-    ])
-    .with_prompt_cache(PromptCacheRetention::Long);
-    let mut next = next;
-    next.max_tokens = None;
-    let body = ordinary(&next);
-    assert!(body["system"].is_array());
-    assert!(replayed(&body), "{body}");
+    ]);
+    current.max_tokens = None;
+    let digest = encode(&config(), &current, Layout::Ordinary).prefix_digest;
+    assert!(replayed(&after_signed(
+        &["you are nanus", "second"],
+        digest
+    )));
 }
 
 /// C8: a legacy reply produced under an elision tail is sent neutrally on the next request by

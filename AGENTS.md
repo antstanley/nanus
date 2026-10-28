@@ -417,11 +417,16 @@ design docs too.
   Linux/macOS/Windows matrix in `.github/workflows/local-transports.yml`.
 - **Managed context is opt-in, and a legacy session must not notice it exists.** A session that
   never records a `context/mode` record keeps its version-2 body, the content its model is sent,
-  schemas, tool count and terminal save. Its request bytes differ from the previous build in three
+  schemas, tool count and terminal save. Its request bytes differ from the previous build in four
   ways, none of them caused by managed context:
   - the cache hints every runner-built request carries;
   - the elision notice, which is the request's tail;
-  - on Responses, the system prompt, which is a leading developer message.
+  - on Responses, the system prompt, which is a leading developer message;
+  - on Anthropic, `system` as one text block per system message, sent whatever the retention.
+
+  One difference reaches what the model reads: an Anthropic reply produced under an elision
+  notice is sent without its thinking on later requests, because its signature is bound to the
+  tail the next request no longer carries.
 
   Tests pin each adapter's ordinary body and compare a legacy run through both runner entry points. A managed session (version 3, or version 4, 5 or 6 marked managed) is saved only
   through its `SessionCheckpoint`:
@@ -447,7 +452,9 @@ design docs too.
   - The working-data message changes only with the notes or the goal objective. The one exception
     is its first appearance in a session that has notes or a goal before its first prompt.
   - Adapters encode canonically and then decorate. Cache markers never enter a signed-replay
-    fingerprint, and the tail enters it unless the model's live evidence says otherwise.
+    fingerprint, and the tail enters it unless the model's live evidence says otherwise — which
+    Anthropic's preserved-thinking rules say it will not, for a tail that is removed. Two or more
+    system messages are fingerprinted in the block form they are sent in.
   - OpenAI's tail is a trailing developer message, because an appended tail would be inside every
     implicit cache write.
   - Each adapter has a prefix-stability test. A change that puts a per-step value ahead of the

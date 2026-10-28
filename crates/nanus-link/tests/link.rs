@@ -3566,6 +3566,68 @@ fn a_status_carries_the_last_requests_cache_share_in_a_legacy_session() {
     });
 }
 
+/// C14: a managed session's status carries the last request's prompt and cache-hit counts too —
+/// null before its first turn, the newest assistant message's afterwards — both on an idle read and
+/// on the status a step publishes.
+#[test]
+fn a_status_carries_the_last_requests_cache_share_in_a_managed_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = managed_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let (before, step, after) = over_socket(&socket, agent, {
+        let socket = socket.clone();
+        async move {
+            let share = |frame: &Frame| match frame {
+                Frame::ContextStatus { payload, .. } => {
+                    (payload.last_prompt_tokens, payload.last_cache_hit_tokens)
+                }
+                other => panic!("expected a status, got {other:?}"),
+            };
+            let mut client = Client::connect(&socket).await.expect("connects");
+            client.start(None).await.expect("starts");
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Managed,
+                })
+                .await
+                .expect("sent");
+            let enabled =
+                frames_until(&mut client, |f| matches!(f, Frame::ContextStatus { .. })).await;
+            let before = share(last(&enabled));
+            client
+                .send(&Request::Prompt {
+                    text: "say hello".to_owned(),
+                })
+                .await
+                .expect("sent");
+            let frames = turn_frames(&mut client).await;
+            let step = frames
+                .iter()
+                .find(|frame| matches!(frame, Frame::ContextStatus { .. }))
+                .map(share);
+            client
+                .send(&Request::Context {
+                    action: ContextAction::Status,
+                })
+                .await
+                .expect("sent");
+            let after = share(&context_answer(&mut client).await);
+            (before, step, after)
+        }
+    });
+    assert_eq!(before, (None, None), "nothing reported yet");
+    assert_eq!(
+        step,
+        Some((None, None)),
+        "the first step's request had no predecessor"
+    );
+    assert_eq!(
+        after,
+        (Some(40), Some(30)),
+        "the newest assistant message's usage"
+    );
+}
+
 /// A managed session whose store cannot checkpoint takes no turn: it is never run on the
 /// legacy path and never saved by the host, because a managed body is saved through its bound
 /// checkpoint or not at all.
@@ -3651,7 +3713,14 @@ impl nanus_ports::PreparedModelCall for ManagedCall {
         &self.selection
     }
     fn stream(self: Box<Self>) -> LlmStream {
-        ScriptedLlm.stream_chat(ChatRequest::new("scripted", Vec::new()))
+        // Reports usage, as a provider does, so a managed session's status has a cache share.
+        Box::pin(futures::stream::iter(vec![
+            LlmEvent::TextDelta("hello back".to_owned()),
+            LlmEvent::Usage(Usage::new(40, 2, 0, 30, 10)),
+            LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ]))
     }
 }
 

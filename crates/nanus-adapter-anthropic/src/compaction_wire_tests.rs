@@ -77,7 +77,7 @@ fn a_compaction_summary_is_the_system_block_after_the_prompt() {
         &legacy_request(true),
     );
     // Its own block after the prompt's, so the prompt's block can be a cache entry every session
-    // shares; the canonical form a signature binds to still joins them.
+    // shares; a signature binds to that block form too.
     assert_eq!(
         body["system"],
         json!([
@@ -85,14 +85,12 @@ fn a_compaction_summary_is_the_system_block_after_the_prompt() {
             { "type": "text", "text": format!("{COMPACTION_LABEL}\n{SUMMARY}") },
         ])
     );
-    assert_eq!(
-        super::encode_canonical(
-            &AnthropicConfig::new(MODEL, "test-key"),
-            &legacy_request(true)
-        )
-        .0["system"],
-        json!(format!("you are nanus\n\n{COMPACTION_LABEL}\n{SUMMARY}"))
-    );
+    let canonical = super::encode_canonical(
+        &AnthropicConfig::new(MODEL, "test-key"),
+        &legacy_request(true),
+    )
+    .0;
+    assert_eq!(canonical["system"], body["system"]);
     let turns = body["messages"].as_array().cloned().unwrap_or_default();
     assert_eq!(turns.len(), 1, "only the prompt after the cut: {turns:?}");
     assert_eq!(turns[0]["role"], json!("user"));
