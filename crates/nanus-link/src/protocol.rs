@@ -822,9 +822,9 @@ pub enum Frame {
     /// The provider (and plan) the agent is talking to now.
     ///
     /// Sent whenever a client changes it, so every viewer agrees about where the next request goes.
-    /// The model list and the models' effort steps travel with it because a provider change
-    /// replaces both, and a client that kept the old list would offer models the agent no longer
-    /// has.
+    /// The model list, the models' effort steps and their image input travel with it because a
+    /// provider change replaces all three, and a client that kept the old list would offer models
+    /// the agent no longer has.
     ProviderChanged {
         /// The provider's name.
         provider: String,
@@ -835,6 +835,12 @@ pub enum Frame {
         /// The effort steps each offered model takes.
         #[serde(default)]
         model_efforts: Vec<ModelEfforts>,
+        /// Whether each offered model reads images, as [`AgentInfo::model_inputs`] says it.
+        ///
+        /// Defaulted on the way in, so a frame from an agent that predates the field decodes with
+        /// every model's image input unknown.
+        #[serde(default)]
+        model_inputs: Vec<ModelInputs>,
     },
 
     /// A provider switch could not go ahead because no credential is configured.
@@ -1299,6 +1305,20 @@ pub struct AgentInfo {
     /// the effort in force.
     #[serde(default)]
     pub model_efforts: Vec<ModelEfforts>,
+    /// Whether each offered model reads images, one entry per model in [`AgentInfo::models`].
+    ///
+    /// Carried so a client can say, before a reader attaches an image, that the model in force
+    /// will not be able to read it — without keeping a list of model names of its own, which
+    /// would go stale the first time a provider changed a model or a composition offered another
+    /// set. The answer is the adapter's, for the exact model on the endpoint and wire in force.
+    ///
+    /// A sibling of [`AgentInfo::model_efforts`] rather than a field of [`ModelEfforts`] because
+    /// adding a defaulted list changes nothing an older peer reads, so the protocol version stands;
+    /// growing the existing entry would have changed its shape. Defaulted on the way in, so a
+    /// handshake from an agent that predates the field decodes, and every model's image input is
+    /// then unknown — see [`ModelInputs::images`] for why that is not the same as "text only".
+    #[serde(default)]
+    pub model_inputs: Vec<ModelInputs>,
     /// The provider the agent is talking to.
     ///
     /// Defaulted on the way in so a handshake from an agent that predates providers decodes; a
@@ -1336,6 +1356,30 @@ pub struct ModelEfforts {
     pub model: String,
     /// The effort steps it takes, in increasing order.
     pub efforts: Vec<EffortState>,
+}
+
+/// What one model accepts as input besides text.
+///
+/// Carried beside [`AgentInfo::models`] because whether a model reads images is a fact about the
+/// exact model on the endpoint and wire in force, and an interface that kept its own list of
+/// text-only models would warn about the wrong ones.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ModelInputs {
+    /// The model id.
+    pub model: String,
+    /// Whether the model reads images: `Some(true)` when the agent would put one in front of it,
+    /// `Some(false)` when the model is known not to read them, and `None` when nobody has said.
+    ///
+    /// Three states rather than a flag because "unknown" and "text only" are different facts. A
+    /// model is reported as reading images only once the adapter has evidence that it does — the
+    /// harness refuses an image for anything less — and a model with no evidence either way is
+    /// unknown, not text-only: a client that warned on unknown would warn about a model it knows
+    /// nothing about. A client treats `None`, an entry that is missing, and a list that is missing
+    /// alike, as "do not warn". An `Option<bool>` rather than an enum of its own so that a state
+    /// the harness grows later cannot become a frame an older client fails to decode: the agent
+    /// decides which of the three it is, and the wire only ever carries those three.
+    #[serde(default)]
+    pub images: Option<bool>,
 }
 
 /// One provider a client may switch to, and the plans it offers.
@@ -1423,6 +1467,22 @@ mod tests {
             models: vec!["deepseek-flash".to_owned(), "deepseek-v4-pro".to_owned()],
             effort: Some(EffortState::Medium),
             model_efforts: Vec::new(),
+            // All three states, so the round trip shows that "unknown" survives as itself rather
+            // than collapsing into "text only" on the way through.
+            model_inputs: vec![
+                ModelInputs {
+                    model: "deepseek-flash".to_owned(),
+                    images: Some(true),
+                },
+                ModelInputs {
+                    model: "deepseek-v4-pro".to_owned(),
+                    images: Some(false),
+                },
+                ModelInputs {
+                    model: "an-unverified-model".to_owned(),
+                    images: None,
+                },
+            ],
             provider: "deepseek".to_owned(),
             plan: "api".to_owned(),
             providers: vec![ProviderInfo {
@@ -1879,12 +1939,27 @@ mod tests {
                     model: "glm-5.3-flashx".to_owned(),
                     efforts: vec![EffortState::High, EffortState::Max],
                 }],
+                model_inputs: vec![ModelInputs {
+                    model: "glm-5.3-flashx".to_owned(),
+                    images: None,
+                }],
+            },
+            Frame::ProviderChanged {
+                provider: "inception".to_owned(),
+                plan: "api".to_owned(),
+                models: vec!["mercury-3".to_owned()],
+                model_efforts: Vec::new(),
+                model_inputs: vec![ModelInputs {
+                    model: "mercury-3".to_owned(),
+                    images: Some(false),
+                }],
             },
             Frame::ProviderChanged {
                 provider: "deepseek".to_owned(),
                 plan: "api".to_owned(),
                 models: Vec::new(),
                 model_efforts: Vec::new(),
+                model_inputs: Vec::new(),
             },
             Frame::NoCredential {
                 provider: "zai".to_owned(),
@@ -2098,6 +2173,7 @@ mod tests {
                 models: Vec::new(),
                 effort: None,
                 model_efforts: Vec::new(),
+                model_inputs: Vec::new(),
                 provider: String::new(),
                 plan: String::new(),
                 providers: Vec::new(),
@@ -2107,6 +2183,111 @@ mod tests {
         );
         // And zero is not the current version, so a client cannot read it as compatible.
         assert_ne!(0, PROTOCOL_VERSION);
+    }
+
+    /// A handshake from an agent that reports effort steps but predates image input decodes, and
+    /// it decodes with every model's image input unknown rather than refused or text-only.
+    ///
+    /// The field was added without moving the protocol version, which is only sound if an agent
+    /// at version 12 that never sends it is still read correctly: as one that said nothing.
+    #[test]
+    fn a_handshake_from_an_agent_without_image_input_decodes_as_unknown() {
+        let line = format!(
+            r#"{{"frame":"ready","workspace":"/w","model":"m","models":["m"],
+                "model_efforts":[{{"model":"m","efforts":["high"]}}],
+                "provider":"p","plan":"api","providers":[],"tools":7,"version":{PROTOCOL_VERSION}}}"#
+        );
+        let decoded = decode::<Frame>(&line);
+        let Ok(Frame::Ready(info)) = decoded else {
+            panic!("an older agent's handshake decodes: {decoded:?}");
+        };
+        assert!(info.model_inputs.is_empty(), "{info:?}");
+        assert_eq!(info.version, PROTOCOL_VERSION, "and is not refused for it");
+
+        // The same of a provider change, which carries the list for the same reason.
+        let decoded = decode::<Frame>(
+            r#"{"frame":"provider_changed","provider":"p","plan":"api","models":["m"]}"#,
+        );
+        assert!(
+            matches!(decoded, Ok(Frame::ProviderChanged { ref model_inputs, .. })
+                if model_inputs.is_empty()),
+            "{decoded:?}"
+        );
+
+        // An entry that names the model and says nothing about images is unknown too, and an
+        // explicit `null` is the same fact: neither is read as "text only".
+        for entry in [r#"{"model":"m"}"#, r#"{"model":"m","images":null}"#] {
+            let decoded = decode::<ModelInputs>(entry);
+            assert_eq!(
+                decoded.ok(),
+                Some(ModelInputs {
+                    model: "m".to_owned(),
+                    images: None,
+                }),
+                "{entry}"
+            );
+        }
+        // While a stated answer is kept as stated, in both directions.
+        for (entry, images) in [
+            (r#"{"model":"m","images":true}"#, Some(true)),
+            (r#"{"model":"m","images":false}"#, Some(false)),
+        ] {
+            assert_eq!(
+                decode::<ModelInputs>(entry)
+                    .ok()
+                    .and_then(|inputs| inputs.images),
+                images,
+                "{entry}"
+            );
+        }
+    }
+
+    /// The other direction: a client that predates image input still reads a handshake and a
+    /// provider change that carry it, which is the half of leaving the version alone that the
+    /// test above does not reach.
+    ///
+    /// An older client is this decoder without the field, so what it meets is a key it does not
+    /// know. Renaming the key to one no build knows puts this decoder in exactly that position:
+    /// the frame must decode, and say nothing about images, rather than be refused for the key.
+    #[test]
+    fn a_client_without_image_input_reads_an_agent_that_sends_it() {
+        let unknown_to_the_reader = |frame: &Frame| {
+            let line = encode(frame).expect("the frame encodes");
+            assert!(line.contains(r#""model_inputs":[{"#), "{line}");
+            line.replace(r#""model_inputs":"#, r#""a_key_from_a_later_build":"#)
+        };
+
+        let sent = info();
+        let decoded = decode::<Frame>(&unknown_to_the_reader(&Frame::Ready(sent.clone())));
+        let Ok(Frame::Ready(read)) = decoded else {
+            panic!("a newer agent's handshake decodes: {decoded:?}");
+        };
+        assert!(read.model_inputs.is_empty(), "{read:?}");
+        assert_eq!(
+            AgentInfo {
+                model_inputs: Vec::new(),
+                ..sent
+            },
+            read,
+            "and every field the reader does know is read as sent"
+        );
+
+        let changed = Frame::ProviderChanged {
+            provider: "inception".to_owned(),
+            plan: "api".to_owned(),
+            models: vec!["mercury-3".to_owned()],
+            model_efforts: Vec::new(),
+            model_inputs: vec![ModelInputs {
+                model: "mercury-3".to_owned(),
+                images: Some(false),
+            }],
+        };
+        let decoded = decode::<Frame>(&unknown_to_the_reader(&changed));
+        assert!(
+            matches!(decoded, Ok(Frame::ProviderChanged { ref models, ref model_inputs, .. })
+                if model_inputs.is_empty() && models == &["mercury-3"]),
+            "{decoded:?}"
+        );
     }
 
     #[test]

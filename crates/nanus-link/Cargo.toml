@@ -43,6 +43,9 @@ getrandom = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
+# A real adapter's own model table, so the handshake's image input is tested against what a
+# provider knows rather than against a stub that says whatever the test wants.
+nanus-adapter-deepseek = { workspace = true }
 nanus-adapter-local = { workspace = true }
 nanus-adapter-store = { workspace = true }
 nanus-kernel = { workspace = true }

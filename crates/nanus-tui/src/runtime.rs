@@ -3956,6 +3956,11 @@ fn apply_from(frame: Frame, view: &mut ViewState, arrival: Arrival) {
             plan,
             models,
             model_efforts,
+            // Named so that the frame's fields are all accounted for, and unread because this
+            // interface draws nothing from it: a pasted image is a path the model is asked to read,
+            // and `read_image` is what refuses it for a model that cannot. The field is for a client
+            // that warns before the paste; this one does not.
+            model_inputs: _,
         } => apply_provider_changed(&provider, &plan, &models, &model_efforts, view),
         Frame::NoCredential {
             provider,
@@ -7306,6 +7311,10 @@ mod tests {
                     model: String::from("glm-5.3-flashx"),
                     efforts: vec![EffortState::High, EffortState::Max],
                 }],
+                model_inputs: vec![nanus_link::protocol::ModelInputs {
+                    model: String::from("glm-5.3-flashx"),
+                    images: None,
+                }],
             },
             &mut view,
         );
@@ -8440,6 +8449,7 @@ mod tests {
                 models: Vec::new(),
                 effort: None,
                 model_efforts: Vec::new(),
+                model_inputs: Vec::new(),
                 provider: String::new(),
                 plan: String::new(),
                 providers: Vec::new(),

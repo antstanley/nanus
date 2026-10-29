@@ -359,7 +359,7 @@ A session is the agent's; a client's view of it is a handful of frames.
 
 | Frame | Meaning |
 |---|---|
-| `Ready` | What the agent is — workspace, model, tool count. |
+| `Ready` | What the agent is — workspace, model, tool count, and the models it offers with each one's effort steps and image input. |
 | `Attached` | Which session this connection is now a view of. |
 | `Backlog` | The turn that was already running, so a client that attached in the middle of one has the whole turn rather than its tail. |
 | `Sessions` | The sessions the agent is holding. |

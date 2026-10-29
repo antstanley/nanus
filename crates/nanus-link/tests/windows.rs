@@ -27,6 +27,7 @@ fn info(version: u32) -> AgentInfo {
         models: Vec::new(),
         effort: None,
         model_efforts: Vec::new(),
+        model_inputs: Vec::new(),
         provider: String::new(),
         plan: String::new(),
         providers: Vec::new(),

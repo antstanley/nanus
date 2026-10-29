@@ -70,6 +70,11 @@ impl Selection {
         self.pending.borrow_mut().llm = Some(llm.clone());
         true
     }
+
+    /// The adapter a held step has queued, which the next request will be sent through.
+    pub(super) fn pending_llm(&self) -> Option<LlmHandle> {
+        self.pending.borrow().llm.clone()
+    }
 }
 
 impl AgentRunner {

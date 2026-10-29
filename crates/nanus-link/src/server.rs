@@ -64,8 +64,8 @@ use tokio::time::sleep;
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
     AgentInfo, ApprovalState, BacklogSegment, ContextEnvelope, EffortState, Frame, GoalAction,
-    GoalInfo, GoalState, ModelEfforts, PlanInfo, ProviderInfo, Request, SessionInfo, StreamMark,
-    TurnEnd,
+    GoalInfo, GoalState, ModelEfforts, ModelInputs, PlanInfo, ProviderInfo, Request, SessionInfo,
+    StreamMark, TurnEnd,
 };
 use crate::wire::{read_request, write_frame};
 
@@ -242,6 +242,7 @@ impl Agent {
             models: self.models(),
             effort: self.effort(),
             model_efforts: self.model_efforts(),
+            model_inputs: self.model_inputs(),
             provider: self
                 .switch
                 .as_ref()
@@ -273,6 +274,22 @@ impl Agent {
                     .copied()
                     .map(wire_effort)
                     .collect(),
+            })
+            .collect()
+    }
+
+    /// Returns whether each offered model reads images, read from the runner's adapter.
+    ///
+    /// Asked for the same reason [`Agent::model_efforts`] asks: the adapter is what knows, for the
+    /// exact model on the endpoint and wire in force, and the runner is what refuses an image the
+    /// adapter has no evidence for. A list kept here would be a second answer that could drift
+    /// from the one a request obeys.
+    fn model_inputs(&self) -> Vec<ModelInputs> {
+        self.models()
+            .iter()
+            .map(|model| ModelInputs {
+                model: model.clone(),
+                images: wire_images(self.runner.image_input(model)),
             })
             .collect()
     }
@@ -1215,15 +1232,16 @@ impl Registry {
 
     /// Tells every attached client which provider the agent is talking to now.
     ///
-    /// Sent for the same reason the model is: the provider is the agent's, and the model list and
-    /// the models' effort steps change with it, so a client that kept the old ones would offer
-    /// models and steps the agent no longer has.
+    /// Sent for the same reason the model is: the provider is the agent's, and the model list, the
+    /// models' effort steps and their image input change with it, so a client that kept the old
+    /// ones would offer models and steps the agent no longer has.
     async fn broadcast_provider(
         &self,
         provider: String,
         plan: String,
         models: Vec<String>,
         model_efforts: Vec<ModelEfforts>,
+        model_inputs: Vec<ModelInputs>,
     ) {
         let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
         for entry in held {
@@ -1234,6 +1252,7 @@ impl Registry {
                     plan: plan.clone(),
                     models: models.clone(),
                     model_efforts: model_efforts.clone(),
+                    model_inputs: model_inputs.clone(),
                 },
                 None,
             )
@@ -1319,6 +1338,19 @@ const fn wire_effort(effort: nanus_ports::ReasoningEffort) -> EffortState {
         nanus_ports::ReasoningEffort::High => EffortState::High,
         nanus_ports::ReasoningEffort::XHigh => EffortState::XHigh,
         nanus_ports::ReasoningEffort::Max => EffortState::Max,
+    }
+}
+
+/// Renders a model's image input in the link's vocabulary.
+///
+/// An exhaustive match, so a state the ports grow is a decision made here rather than one a
+/// client is left to guess at. Unknown crosses as the absence it is, never as `false`: a model
+/// with no evidence either way is not a text-only model.
+const fn wire_images(support: nanus_ports::ImageInputSupport) -> Option<bool> {
+    match support {
+        nanus_ports::ImageInputSupport::Supported => Some(true),
+        nanus_ports::ImageInputSupport::Unsupported => Some(false),
+        nanus_ports::ImageInputSupport::Unknown => None,
     }
 }
 
@@ -2678,12 +2710,13 @@ async fn set_provider(
             let provider = switch.provider();
             let plan = switch.plan();
             let model_efforts = registry.agent.model_efforts();
+            let model_inputs = registry.agent.model_inputs();
             // The lists first, then the two facts that changed with them. A provider change replaces
             // the model and the effort in force, so the frames that say so follow — otherwise a
             // client would keep the old provider's model, and look the new models' steps up under
             // the old id and find none.
             registry
-                .broadcast_provider(provider, plan, models, model_efforts)
+                .broadcast_provider(provider, plan, models, model_efforts, model_inputs)
                 .await;
             registry.broadcast_model(&switch.model()).await;
             if let Some(effort) = registry.agent.effort() {

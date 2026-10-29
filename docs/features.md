@@ -733,6 +733,11 @@ The only thing the core and the interface share. See
   to arrive in — a step sends every call before any result, and its results arrive in
   the order the tools finished. A frame from an agent too old to send one leaves the
   client to pair by name and order, which is what it did before the field existed.
+- **Each offered model's image input.** The handshake, and a provider change, carry whether
+  each offered model reads images — yes, no, or unknown — as the adapter knows it for the exact
+  model on the endpoint and wire in force, so a client can warn before an image is attached
+  without keeping a list of model names. Unknown is not text-only, and an agent that predates the
+  field reads as unknown for every model.
 - **Local only by construction.** No port, no TLS, no remote mode; the
   reachable set is processes already running as the same user.
 - **The session log is the authority.** The link carries what happened; history
