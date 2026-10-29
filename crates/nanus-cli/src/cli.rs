@@ -42,7 +42,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use nanus_adapter_config::NanusConfig;
 use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::open_store;
-use nanus_bundle::{Harness, Provider, Selection, authorize, compose};
+use nanus_bundle::{Harness, LastSelection, Provider, Selection, authorize, compose};
 use nanus_domain::ApprovalPolicy;
 use nanus_kernel::runtime::block_on as kernel_block_on;
 use std::ffi::OsString;
@@ -1785,15 +1785,8 @@ async fn read_credential() -> Result<String, String> {
 /// Prints the effective configuration.
 async fn show_config(args: &Options) -> Result<(), String> {
     let mut config = load(args)?;
-    // A selection a live change left behind is what a run begins from, so it is applied here
-    // as well: this command claims to print the *effective* configuration, and the file alone
-    // would name the default the reader has already moved away from. The returned effort is the
-    // one exception to the overlay, because a model's scale has steps the configuration cannot
-    // spell — `none` and `max` among them — and is printed from the record when it has one. A
-    // home that cannot be resolved is not fatal here: there is then no record to read, and the
-    // configuration is the whole answer, exactly as it was before there was ever a record.
-    let remembered_effort =
-        compose::store_home().map_or(None, |home| compose::apply_remembered(&mut config, &home));
+    let home = compose::store_home().ok();
+    let (remembered_effort, selection_file) = apply_selection_record(&mut config, home.as_deref())?;
     // Resolved rather than echoed: the file may name none of the provider, plan, or
     // model, and what a run will actually use is the useful answer. A configuration
     // that cannot resolve is refused here, with the same sentence a run would give.
@@ -1808,6 +1801,7 @@ async fn show_config(args: &Options) -> Result<(), String> {
     );
     let credential = credential_state(&selection).await;
     println!("config file: {path}");
+    println!("selection file: {selection_file}");
     println!(
         "provider: {} (plan {})",
         selection.provider(),
@@ -1858,6 +1852,39 @@ async fn show_config(args: &Options) -> Result<(), String> {
         selection.credential_account()
     );
     Ok(())
+}
+
+/// Applies the selection record a run would start from, and names the file it is kept in.
+///
+/// A selection a live change left behind is what a run begins from, so it is applied here as
+/// well: `nanus config` claims to print the *effective* configuration, and the file alone would
+/// name the default the reader has already moved away from. The returned effort is the one
+/// exception to the overlay, because a model's scale has steps the configuration cannot spell —
+/// `none` and `max` among them — and is printed from the record when it has one.
+///
+/// Where the record is comes from the configuration, by the same rule a run follows, and is
+/// printed so a reader can see which file a change will be written to, or that none will be. A
+/// home that cannot be resolved is not fatal here: there is then no record to read, and the
+/// configuration is the whole answer, exactly as it was before there was ever a record. The home
+/// is the caller's to resolve, so what this prints can be tested against a home of the test's own.
+fn apply_selection_record(
+    config: &mut NanusConfig,
+    home: Option<&Path>,
+) -> Result<(Option<nanus_ports::ReasoningEffort>, String), String> {
+    let Some(home) = home else {
+        return Ok((
+            None,
+            String::from("unknown (the nanus home cannot be resolved)"),
+        ));
+    };
+    // An empty `selection_file` is refused with the sentence a run would give.
+    let file = LastSelection::location(config, home).map_err(|error| error.to_string())?;
+    let effort = compose::apply_remembered(config, file.as_deref());
+    let shown = file.map_or_else(
+        || String::from("none (remember_selection = false)"),
+        |file| file.display().to_string(),
+    );
+    Ok((effort, shown))
 }
 
 /// Reports whether a credential is present, without printing it.
@@ -2736,5 +2763,58 @@ mod tests {
         // A name this build does not have is refused by name, as `auth set` refuses it.
         assert!(authorization_target("gemini").is_err());
         assert!(authorization_target("openai:enterprise").is_err());
+    }
+
+    /// `nanus config` names the file a run reads and writes, applies the record a run would start
+    /// from, and says so when there is none — in each of the configuration's three answers.
+    #[test]
+    fn the_configuration_report_names_the_selection_file_a_run_would_use() {
+        let home = tempfile::tempdir().expect("a home");
+        let record = |model: &str| LastSelection {
+            model: Some(model.to_owned()),
+            ..LastSelection::default()
+        };
+        let in_home = record("deepseek-v4-pro")
+            .save(home.path())
+            .expect("home record");
+        let named = home.path().join("host").join("selection.toml");
+        record("deepseek-flash")
+            .save_to(&named)
+            .expect("named record");
+
+        let mut default = NanusConfig::default();
+        let shown = apply_selection_record(&mut default, Some(home.path())).expect("default");
+        assert_eq!(shown.1, in_home.display().to_string());
+        assert_eq!(default.model.as_deref(), Some("deepseek-v4-pro"));
+
+        let mut moved = NanusConfig {
+            selection_file: Some(PathBuf::from("host/selection.toml")),
+            ..NanusConfig::default()
+        };
+        let shown = apply_selection_record(&mut moved, Some(home.path())).expect("named");
+        assert_eq!(
+            shown.1,
+            named.display().to_string(),
+            "relative is inside the home"
+        );
+        assert_eq!(moved.model.as_deref(), Some("deepseek-flash"));
+
+        let mut off = NanusConfig {
+            remember_selection: false,
+            ..NanusConfig::default()
+        };
+        let shown = apply_selection_record(&mut off, Some(home.path())).expect("off");
+        assert_eq!(shown.1, "none (remember_selection = false)");
+        assert_eq!(off.model, None, "neither record is applied");
+
+        let mut empty = NanusConfig {
+            selection_file: Some(PathBuf::new()),
+            ..NanusConfig::default()
+        };
+        assert!(apply_selection_record(&mut empty, Some(home.path())).is_err());
+        let mut homeless = NanusConfig::default();
+        let shown = apply_selection_record(&mut homeless, None).expect("no home");
+        assert!(shown.1.starts_with("unknown"), "{}", shown.1);
+        assert_eq!(homeless.model, None);
     }
 }

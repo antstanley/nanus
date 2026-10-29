@@ -1953,6 +1953,7 @@ dependencies = [
  "etcetera",
  "futures",
  "getrandom 0.4.3",
+ "nanus-adapter-config",
  "nanus-adapter-deepseek",
  "nanus-adapter-local",
  "nanus-adapter-store",

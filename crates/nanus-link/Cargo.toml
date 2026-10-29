@@ -43,6 +43,8 @@ getrandom = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
+# The remembered-selection test composes a real agent from a configuration it writes itself.
+nanus-adapter-config = { workspace = true }
 # A real adapter's own model table, so the handshake's image input is tested against what a
 # provider knows rather than against a stub that says whatever the test wants.
 nanus-adapter-deepseek = { workspace = true }

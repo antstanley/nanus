@@ -12,7 +12,7 @@
 //! requirements appear. That is what makes a different filesystem or a different
 //! model a one-line change here rather than a refactor.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -166,7 +166,7 @@ impl Harness {
     /// because the earlier part of the conversation really was produced by the earlier
     /// configuration and rewriting that would be a lie about the past.
     #[must_use]
-    pub fn new_session(&self, workspace: &std::path::Path) -> Session {
+    pub fn new_session(&self, workspace: &Path) -> Session {
         new_session(&self.clock, workspace).with_origin(self.origin.clone())
     }
 
@@ -221,6 +221,10 @@ pub struct Pending {
     /// interface can choose and the configuration cannot name. Applied in [`Pending::start`],
     /// where the runner it belongs to exists.
     remembered_effort: Option<ReasoningEffort>,
+    /// Where the selection was read from and where a change will be written, or `None` when the
+    /// configuration keeps no record. Handed to the [`ProviderSwitch`], which is what an agent
+    /// serving a link reaches when a client changes the selection.
+    selection_file: Option<PathBuf>,
     /// The one tool registry this composition has: the runner's and the published service's.
     /// The broker the runner hands archive leases to the `bash` tool through.
     capture: crate::CaptureBroker,
@@ -308,6 +312,7 @@ impl Pending {
             secrets: self.secrets.clone(),
             runner: Rc::clone(&runner),
             selection: core::cell::RefCell::new(self.selection),
+            selection_file: self.selection_file,
         });
         // Optional tools go on after the switch exists, because the one there is routes
         // through it. The stock seven are already registered and are not touched.
@@ -341,9 +346,22 @@ pub struct ProviderSwitch {
     secrets: SecretHandle,
     runner: Rc<AgentRunner>,
     selection: core::cell::RefCell<Selection>,
+    /// Where a change of selection is remembered, or `None` when it is not.
+    selection_file: Option<PathBuf>,
 }
 
 impl ProviderSwitch {
+    /// Returns where a change of provider, model, or effort is remembered for the next start.
+    ///
+    /// The same file this composition read its starting selection from — see
+    /// [`LastSelection::location`] — so a writer that asks here cannot record a default the next
+    /// start will not read. `None` means the configuration turned remembering off, and a change
+    /// is in force for this agent's life only.
+    #[must_use]
+    pub fn selection_file(&self) -> Option<&Path> {
+        self.selection_file.as_deref()
+    }
+
     /// Returns the name of the provider in force.
     #[must_use]
     pub fn provider(&self) -> String {
@@ -549,16 +567,15 @@ fn origin_of(
 ///
 /// The record is written when an interface changes the provider, model, or effort of a running
 /// agent (see [`LastSelection`]); this is the read that makes the next start begin there. A
-/// configuration is complete without it, so an absent or unreadable record changes nothing.
+/// configuration is complete without it, so an absent or unreadable record changes nothing, and
+/// so does `file` being `None` — the configuration's own `remember_selection = false`, which
+/// [`LastSelection::location`] answers.
 ///
 /// Returns the remembered effort, which is *not* folded into the configuration: the
 /// configuration's field has four steps and a model's scale can have seven, so `none` and `max`
 /// have nowhere to go. The caller puts it on the runner instead.
-pub fn apply_remembered(
-    config: &mut NanusConfig,
-    home: &std::path::Path,
-) -> Option<ReasoningEffort> {
-    let remembered = LastSelection::load(home).unwrap_or_default();
+pub fn apply_remembered(config: &mut NanusConfig, file: Option<&Path>) -> Option<ReasoningEffort> {
+    let remembered = file.and_then(LastSelection::load_from).unwrap_or_default();
     remembered.apply(config);
     remembered.effort()
 }
@@ -576,10 +593,13 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
     let home = store_home()?;
     // The default this start begins from is the selection the last *change* left behind, when
     // there is one: the configuration resolves everything else, and resolves all of it when
-    // nothing was recorded. Read before the selection is resolved because that is the one place
-    // a provider, plan, or model is decided.
+    // nothing was recorded or the configuration keeps no record. Read before the selection is
+    // resolved because that is the one place a provider, plan, or model is decided. Where the
+    // record is was decided by the configuration, and the same answer goes to the switch, which
+    // is where a change is written: the sessions stay in the home either way.
+    let selection_file = LastSelection::location(config, &home)?;
     let mut config = config.clone();
-    let remembered_effort = apply_remembered(&mut config, &home);
+    let remembered_effort = apply_remembered(&mut config, selection_file.as_deref());
     let workspace = workspace_root(&config)?;
     // Which provider, plan, model, and endpoint this run uses is decided before
     // anything is built, because a configuration that cannot resolve is a sentence
@@ -632,6 +652,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         store,
         llm,
         remembered_effort,
+        selection_file,
         capture,
         tools,
     })
@@ -780,7 +801,7 @@ pub async fn open_store() -> Result<StoreHandle, BundleError> {
 /// and it must start them the same way: a transcript that depended on which door a
 /// session came through would not be a transcript of the agent.
 #[must_use]
-pub fn new_session(clock: &ClockHandle, workspace: &std::path::Path) -> Session {
+pub fn new_session(clock: &ClockHandle, workspace: &Path) -> Session {
     Session::new(
         nanus_adapter_store::new_session_id(),
         clock.now_ms(),
@@ -1003,7 +1024,7 @@ fn build_runner(
     tools: &ToolRegistryHandle,
     config: &NanusConfig,
     selection: &Selection,
-    workspace: &std::path::Path,
+    workspace: &Path,
     clock: &ClockHandle,
 ) -> Result<AgentRunner, BundleError> {
     let prompt = config

@@ -37,6 +37,11 @@
 //! deserialised. Version 0 files used `max_output_tokens`; the 0 → 1 step renames
 //! it to `max_tokens`. Running migrations on the raw document — rather than on the
 //! typed struct — is what lets a genuinely old shape be read at all.
+//!
+//! A *new* field with a default is not a migration. Every field defaults at the struct level, so
+//! a file written before the field existed reads as the default, and an older build ignores the
+//! key it does not know; the version moves only when an existing field changes its name or its
+//! meaning, which is the one change a default cannot absorb.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

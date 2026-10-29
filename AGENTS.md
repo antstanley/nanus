@@ -237,7 +237,11 @@ Contract to preserve:
   *changed*, written by the agent when a client switches and applied as the default at the
   next start. It is never written on a start, so editing the configuration is not overridden
   by merely opening the interface; deleting it returns the configuration to being the whole
-  answer. See `docs/features.md`.
+  answer. `selection_file` moves it (a relative path is inside the nanus home) and
+  `remember_selection = false` turns it off: nothing is read or written. Both halves ask
+  `LastSelection::location` — `compose` for the read, and the link server through
+  `ProviderSwitch::selection_file` for the write — so the write never depends on
+  `StorePort::home()`. `nanus config` prints the file a run would use. See `docs/features.md`.
 - `nanus run --context-mode legacy|managed`, `--context-output-reserve <tokens>`,
   `--capture-shell-evidence` — a session's context policy, recorded in the session before the turn
   that uses it. Absent flags keep a resumed session's policy; a new session is legacy, and capture

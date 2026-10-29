@@ -26,6 +26,15 @@
 //! The record is the *default*, not a lock. A start applies it and the configuration resolves
 //! the rest, so a provider the record names but this build no longer offers is reported the
 //! same way a configuration naming one is.
+//!
+//! ## Where it lives, and when there is none
+//!
+//! [`LastSelection::location`] is the one answer to where the record is, and both halves ask it:
+//! the composition that reads the record at a start and the link server that writes it on a
+//! change. The configuration decides — `<nanus home>/selection.toml` by default, the file
+//! `selection_file` names, or nothing at all when `remember_selection` is off. One answer for
+//! both halves is the point: a host that moved only the write would still start from the home's
+//! record, and one that moved only the read would overwrite a terminal's default with its own.
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +42,9 @@ use nanus_adapter_config::NanusConfig;
 use nanus_ports::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
-/// The file, inside the nanus home, that remembers the last selection.
+use crate::error::BundleError;
+
+/// The file, inside the nanus home, that remembers the last selection by default.
 pub const SELECTION_FILE: &str = "selection.toml";
 
 /// A provider, plan, model, and effort as a run left them.
@@ -60,21 +71,73 @@ pub struct LastSelection {
 }
 
 impl LastSelection {
-    /// Returns where the record lives, given a nanus home.
+    /// Returns where the record lives by default, given a nanus home.
     #[must_use]
     pub fn path(home: &Path) -> PathBuf {
         home.join(SELECTION_FILE)
     }
 
-    /// Reads the record, or `None` when nothing is stored or the file cannot be read.
+    /// Returns where a configuration keeps the record, or `None` when it keeps none.
+    ///
+    /// `None` is `remember_selection = false`: nothing is read at a start and nothing is written
+    /// on a change, whatever `selection_file` says. Otherwise it is `selection_file`, taken
+    /// inside `home` when it is relative — the working directory differs between a service and a
+    /// terminal, and the record has to be one file for both — or [`LastSelection::path`] when
+    /// the configuration names none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Config`] when `selection_file` is empty: that names the home
+    /// directory itself, which no record can be written over, and reading it as "the default"
+    /// would hide a configuration that says something it did not mean. The same when, on
+    /// Windows, it is drive-relative (`C:selection.toml`) and so not inside the home either.
+    pub fn location(config: &NanusConfig, home: &Path) -> Result<Option<PathBuf>, BundleError> {
+        if !config.remember_selection {
+            return Ok(None);
+        }
+        let Some(file) = config.selection_file.as_deref() else {
+            return Ok(Some(Self::path(home)));
+        };
+        if file.as_os_str().is_empty() {
+            return Err(BundleError::config(
+                "`selection_file` is empty: remove it to keep the selection in the nanus home, \
+                 or set `remember_selection = false` to keep none",
+            ));
+        }
+        // `join` keeps an absolute path as it is and puts a relative one inside the home.
+        let path = home.join(file);
+        // A refusal rather than an assertion, because the configuration reaches it: on Windows a
+        // drive-relative path such as `C:selection.toml` replaces the home outright and is still
+        // relative — to that drive's working directory, which is the per-process answer this
+        // rule exists to avoid. Nothing on Unix can produce it.
+        if home.is_absolute() && !path.is_absolute() {
+            return Err(BundleError::config(format!(
+                "`selection_file` = {} is relative to a drive's working directory: name the \
+                 whole path, or one relative to the nanus home",
+                file.display()
+            )));
+        }
+        Ok(Some(path))
+    }
+
+    /// Reads the record from the default place in `home`.
+    ///
+    /// The same as [`LastSelection::load_from`] at [`LastSelection::path`]; a configuration
+    /// that may have moved the record or turned it off is read through
+    /// [`LastSelection::location`] instead.
+    #[must_use]
+    pub fn load(home: &Path) -> Option<Self> {
+        Self::load_from(&Self::path(home))
+    }
+
+    /// Reads the record at `path`, or `None` when nothing is stored or the file cannot be read.
     ///
     /// A record that cannot be read is not a reason to refuse a run: it is a preference, and
     /// the configuration is a complete answer without it. The failure is logged rather than
     /// swallowed, because a record that keeps failing to load is a file to look at.
     #[must_use]
-    pub fn load(home: &Path) -> Option<Self> {
-        let path = Self::path(home);
-        let text = std::fs::read_to_string(&path).ok()?;
+    pub fn load_from(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
         match toml::from_str::<Self>(&text) {
             Ok(selection) => Some(selection),
             Err(error) => {
@@ -84,15 +147,25 @@ impl LastSelection {
         }
     }
 
-    /// Writes the record, so the next start begins where this one left off.
+    /// Writes the record to the default place in `home`.
+    ///
+    /// # Errors
+    ///
+    /// As [`LastSelection::save_to`].
+    pub fn save(&self, home: &Path) -> std::io::Result<PathBuf> {
+        self.save_to(&Self::path(home))
+    }
+
+    /// Writes the record to `path`, so the next start begins where this one left off.
     ///
     /// # Errors
     ///
     /// Returns an I/O error when the record cannot be encoded or written. A caller is free to
     /// ignore it — the selection is in force either way — which is why this is not a
-    /// [`BundleError`](crate::BundleError).
-    pub fn save(&self, home: &Path) -> std::io::Result<PathBuf> {
-        let path = Self::path(home);
+    /// [`BundleError`].
+    pub fn save_to(&self, path: &Path) -> std::io::Result<PathBuf> {
+        assert!(!path.as_os_str().is_empty(), "a record's path is named");
+        let path = path.to_path_buf();
         let body = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -241,5 +314,106 @@ mod tests {
         assert_eq!(effort(Some("none")).effort(), Some(ReasoningEffort::None));
         assert_eq!(effort(Some("not-a-step")).effort(), None);
         assert_eq!(effort(None).effort(), None);
+    }
+
+    #[test]
+    fn a_configuration_that_names_no_file_keeps_the_record_in_the_home() {
+        let home = home("location-default");
+        let location = LastSelection::location(&NanusConfig::default(), &home);
+        assert_eq!(location.ok(), Some(Some(home.join(SELECTION_FILE))));
+    }
+
+    #[test]
+    fn a_named_file_is_used_as_it_is_or_inside_the_home_when_relative() {
+        let home = home("location-named");
+        let elsewhere = std::env::temp_dir()
+            .join("an-embedding-host")
+            .join("selection.toml");
+        let absolute = NanusConfig {
+            selection_file: Some(elsewhere.clone()),
+            ..NanusConfig::default()
+        };
+        assert_eq!(
+            LastSelection::location(&absolute, &home).ok(),
+            Some(Some(elsewhere)),
+            "an absolute path is the file"
+        );
+        // Relative to the home rather than to whichever directory the process started in, so a
+        // service and a terminal agree on one file.
+        let relative = NanusConfig {
+            selection_file: Some(PathBuf::from("desktop-selection.toml")),
+            ..NanusConfig::default()
+        };
+        assert_eq!(
+            LastSelection::location(&relative, &home).ok(),
+            Some(Some(home.join("desktop-selection.toml")))
+        );
+    }
+
+    #[test]
+    fn remembering_turned_off_keeps_no_record_even_where_a_file_is_named() {
+        let home = home("location-off");
+        let off = NanusConfig {
+            remember_selection: false,
+            selection_file: Some(home.join("named-but-unused.toml")),
+            ..NanusConfig::default()
+        };
+        assert_eq!(LastSelection::location(&off, &home).ok(), Some(None));
+    }
+
+    #[test]
+    fn an_empty_file_name_is_refused_rather_than_read_as_the_default() {
+        let home = home("location-empty");
+        let empty = NanusConfig {
+            selection_file: Some(PathBuf::new()),
+            ..NanusConfig::default()
+        };
+        let refused = LastSelection::location(&empty, &home);
+        assert!(
+            matches!(&refused, Err(BundleError::Config(reason)) if reason.contains("selection_file")),
+            "the refusal names the field: {refused:?}"
+        );
+    }
+
+    /// A drive-relative path replaces the home in `join` and is still relative, so it is refused
+    /// rather than left to the process's working directory on that drive.
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_relative_file_is_refused_rather_than_read_from_the_working_directory() {
+        let home = home("location-drive-relative");
+        let drive_relative = NanusConfig {
+            selection_file: Some(PathBuf::from("C:selection.toml")),
+            ..NanusConfig::default()
+        };
+        let refused = LastSelection::location(&drive_relative, &home);
+        assert!(
+            matches!(&refused, Err(BundleError::Config(reason)) if reason.contains("drive")),
+            "{refused:?}"
+        );
+        let rooted = NanusConfig {
+            selection_file: Some(PathBuf::from(r"C:\host\selection.toml")),
+            ..NanusConfig::default()
+        };
+        assert_eq!(
+            LastSelection::location(&rooted, &home).ok(),
+            Some(Some(PathBuf::from(r"C:\host\selection.toml")))
+        );
+    }
+
+    #[test]
+    fn a_record_saved_to_a_named_file_is_read_from_it_and_not_from_the_home() {
+        let home = home("named-round-trip");
+        let file = home.join("elsewhere").join("host.toml");
+        let selection = LastSelection {
+            provider: Some(String::from("deepseek")),
+            model: Some(String::from("deepseek-v4-pro")),
+            ..LastSelection::default()
+        };
+        assert_eq!(selection.save_to(&file).ok(), Some(file.clone()));
+        assert_eq!(LastSelection::load_from(&file), Some(selection));
+        assert!(
+            LastSelection::load(&home).is_none(),
+            "the home's own record was never written"
+        );
     }
 }
