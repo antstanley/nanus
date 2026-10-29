@@ -1196,7 +1196,7 @@ impl Registry {
     async fn broadcast_approval(&self, state: ApprovalState) {
         let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
         for entry in held {
-            broadcast_awaited(&entry, Frame::ApprovalChanged { state }, None).await;
+            broadcast_agent(&entry, Frame::ApprovalChanged { state }).await;
         }
     }
 
@@ -1208,12 +1208,11 @@ impl Registry {
     async fn broadcast_model(&self, model: &str) {
         let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
         for entry in held {
-            broadcast_awaited(
+            broadcast_agent(
                 &entry,
                 Frame::ModelChanged {
                     model: model.to_owned(),
                 },
-                None,
             )
             .await;
         }
@@ -1226,7 +1225,7 @@ impl Registry {
     async fn broadcast_effort(&self, state: EffortState) {
         let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
         for entry in held {
-            broadcast_awaited(&entry, Frame::EffortChanged { state }, None).await;
+            broadcast_agent(&entry, Frame::EffortChanged { state }).await;
         }
     }
 
@@ -1245,7 +1244,7 @@ impl Registry {
     ) {
         let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
         for entry in held {
-            broadcast_awaited(
+            broadcast_agent(
                 &entry,
                 Frame::ProviderChanged {
                     provider: provider.clone(),
@@ -1254,7 +1253,6 @@ impl Registry {
                     model_efforts: model_efforts.clone(),
                     model_inputs: model_inputs.clone(),
                 },
-                None,
             )
             .await;
         }
@@ -1987,15 +1985,61 @@ async fn broadcast_end(held: &Held, frame: Frame) {
 ///
 /// A client that does not make room within [`ENDING_TIMEOUT`] is detached, and the next
 /// request it makes is refused rather than acted on.
+///
+/// The list of viewers is read once, but every send is awaited, so by the time a later viewer's
+/// turn comes the list may be out of date by as many timeouts as there are slow clients ahead of
+/// it. In that time a connection can let this session go and attach to another, and its queue is
+/// the same queue either way: a frame sent from the stale list would arrive after the other
+/// session's `Attached` and be read as part of that session — a turn ending there that never
+/// ran, or one that is still running. So each viewer is asked about again at the last moment,
+/// and that moment is *after* the room is reserved rather than before the wait for it: the
+/// check and the queueing are then one synchronous step, and an attachment, which registers and
+/// queues its reply in one synchronous step too, is either wholly before this frame or wholly
+/// after it. A viewer that left while its room was being waited for hands the room back.
 async fn broadcast_awaited(held: &Held, frame: Frame, except: Option<u64>) {
+    broadcast_scoped(held, frame, except, Scope::Session).await;
+}
+
+/// Sends a frame about the agent to a session's viewers, waiting for room as
+/// [`broadcast_awaited`] does.
+///
+/// The approval state, the model, the effort and the provider are the agent's, so they are as
+/// true in the session a connection moved to as in the one it left, and are sent to every
+/// viewer the list was read with. Asking again would be worse rather than safer: the agent's
+/// broadcasts walk the held sessions one after another, and a connection that moved to one
+/// already told would then be told by neither — and nothing else sends it the provider.
+async fn broadcast_agent(held: &Held, frame: Frame) {
+    broadcast_scoped(held, frame, None, Scope::Agent).await;
+}
+
+/// Whose fact a frame sent to a session's viewers is, which decides whether a viewer that let
+/// the session go while the frame was on its way is still sent it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// The session's: a prompt, an ending, a question, a checkpoint. A connection's queue is
+    /// one queue whatever it watches, so a viewer that left would read it as the next session's.
+    Session,
+    /// The agent's, and true whichever session the connection is watching now.
+    Agent,
+}
+
+/// The loop behind [`broadcast_awaited`] and [`broadcast_agent`].
+async fn broadcast_scoped(held: &Held, frame: Frame, except: Option<u64>, scope: Scope) {
     let viewers: Vec<(u64, mpsc::Sender<Frame>)> = held.viewers.borrow().clone();
     let mut stale: Vec<u64> = Vec::new();
+    let addressed = |viewer: u64| scope == Scope::Agent || held.is_watching(viewer);
     for (viewer, sender) in &viewers {
-        if Some(*viewer) == except {
+        if Some(*viewer) == except || !addressed(*viewer) {
             continue;
         }
-        match tokio::time::timeout(ENDING_TIMEOUT, sender.send(frame.clone())).await {
-            Ok(Ok(())) => {}
+        match tokio::time::timeout(ENDING_TIMEOUT, sender.reserve()).await {
+            Ok(Ok(permit)) => {
+                // Asked again with the room in hand and queued with no await in between, so an
+                // attachment elsewhere is wholly before this frame or wholly after it.
+                if addressed(*viewer) {
+                    permit.send(frame.clone());
+                }
+            }
             Ok(Err(_)) => stale.push(*viewer),
             Err(_) => {
                 tracing::warn!(viewer, "a client did not make room for the end of a turn");
@@ -4083,6 +4127,268 @@ mod tests {
             !session.is_watching(3),
             "a watcher that could not be told is detached rather than left guessing"
         );
+    }
+
+    /// Three connections watching one session while its turn ends: the first has a full queue
+    /// that nobody is reading, the second is about to move to another session, and the third
+    /// stays where it is.
+    struct Crowd {
+        registry: Rc<Registry>,
+        left: Rc<Held>,
+        joined: Rc<Held>,
+        stalled: u64,
+        stalled_queue: mpsc::Receiver<Frame>,
+        mover: mpsc::Sender<Frame>,
+        mover_queue: mpsc::Receiver<Frame>,
+        watching: Option<(u64, Rc<Held>)>,
+        stayer: u64,
+        stayer_queue: mpsc::Receiver<Frame>,
+    }
+
+    impl Crowd {
+        /// Attaches the three through the paths a connection takes, and empties what the two
+        /// that were answered were told, so what is queued afterwards is the ending alone.
+        async fn gather(dir: &Path) -> Self {
+            let registry = registry_over(dir).await;
+            let left = held("left");
+            let (stalled_sender, stalled_queue) = mpsc::channel(1);
+            stalled_sender
+                .try_send(Frame::Bye)
+                .expect("one frame fits in a queue of one");
+            // Registered without an answer, because there is no room for one: what matters is
+            // that it is first in the list, so the ending waits on it before the others.
+            let stalled = registry.view(&left, &stalled_sender);
+            let (mover, mut mover_queue) = mpsc::channel(FRAME_BUFFER);
+            let watching = attach(&registry, &left, &mover).await.expect("attached");
+            let (stayer_sender, mut stayer_queue) = mpsc::channel(FRAME_BUFFER);
+            let (stayer, _) = attach(&registry, &left, &stayer_sender)
+                .await
+                .expect("attached");
+            drained(&mut mover_queue);
+            drained(&mut stayer_queue);
+            Self {
+                registry,
+                left,
+                joined: held("joined"),
+                stalled,
+                stalled_queue,
+                mover,
+                mover_queue,
+                watching: Some(watching),
+                stayer,
+                stayer_queue,
+            }
+        }
+
+        /// Ends the turn, and moves the second connection while the ending waits on the first.
+        ///
+        /// The move is what a connection does on `new` or `attach`: release the session it was
+        /// watching, then attach to the other. The first connection makes room afterwards when
+        /// `room` is set, and never otherwise.
+        async fn end_while_moving(&mut self, ending: Frame, room: bool) {
+            self.send_while_moving(ending, Scope::Session, room).await;
+        }
+
+        /// Sends `frame` the way a frame of `scope` goes out — the session's through the
+        /// ending's path, the agent's through the agent's — and moves the second connection
+        /// while it waits on the first, as [`Self::end_while_moving`] describes.
+        async fn send_while_moving(&mut self, frame: Frame, scope: Scope, room: bool) {
+            let left = Rc::clone(&self.left);
+            let mut broadcast = std::pin::pin!(async move {
+                match scope {
+                    Scope::Session => broadcast_end(&left, frame).await,
+                    Scope::Agent => broadcast_agent(&left, frame).await,
+                }
+            });
+            assert!(
+                futures::poll!(broadcast.as_mut()).is_pending(),
+                "the frame waits for room in the first connection's queue"
+            );
+            release(&mut self.watching);
+            let moved = attach(&self.registry, &self.joined, &self.mover).await;
+            self.watching = Some(moved.expect("attached to the other session"));
+            if room {
+                assert!(matches!(self.stalled_queue.try_recv(), Ok(Frame::Bye)));
+            }
+            broadcast.await;
+        }
+
+        /// What the moved connection was sent, which must begin with its new attachment and
+        /// must not hold the session's ending anywhere.
+        fn assert_mover_saw_only_the_session_it_joined(&mut self) {
+            let seen = drained(&mut self.mover_queue);
+            assert!(
+                matches!(seen.first(), Some(Frame::Attached { session, .. })
+                    if session.session == "joined"),
+                "{seen:?}"
+            );
+            assert!(
+                !seen
+                    .iter()
+                    .any(|frame| matches!(frame, Frame::Done { .. } | Frame::Failed { .. })),
+                "the session it left must not end a turn in the one it joined: {seen:?}"
+            );
+            assert!(
+                self.joined
+                    .is_watching(self.watching.as_ref().expect("watching").0)
+            );
+        }
+    }
+
+    /// Every frame queued for a connection, oldest first.
+    fn drained(queue: &mut mpsc::Receiver<Frame>) -> Vec<Frame> {
+        core::iter::from_fn(|| queue.try_recv().ok()).collect()
+    }
+
+    /// A connection that leaves a session while the session's ending waits on a slower viewer
+    /// is not sent that ending once the wait is over — and the viewers that stayed still are.
+    ///
+    /// The ending is sent from a list read before the wait, and the connection's queue is the
+    /// same queue in either session, so without asking again the ending would arrive after the
+    /// other session's `Attached` and close a turn there that never ran.
+    #[tokio::test(start_paused = true)]
+    async fn an_ending_does_not_follow_a_connection_into_the_session_it_moved_to() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut crowd = Crowd::gather(dir.path()).await;
+        let ending = Frame::Done {
+            answer: "done".to_owned(),
+            reason: TurnEnd::Completed,
+        };
+
+        crowd.end_while_moving(ending, true).await;
+
+        crowd.assert_mover_saw_only_the_session_it_joined();
+        // The other direction: the viewers still watching were waited for and told.
+        assert!(
+            matches!(crowd.stalled_queue.try_recv(), Ok(Frame::Done { .. })),
+            "a slow viewer that made room in time is sent the ending"
+        );
+        assert!(crowd.left.is_watching(crowd.stalled), "and stays attached");
+        assert!(
+            matches!(
+                drained(&mut crowd.stayer_queue).as_slice(),
+                [Frame::Done { .. }]
+            ),
+            "a viewer that stayed is sent the ending once"
+        );
+        assert!(crowd.left.is_watching(crowd.stayer));
+    }
+
+    /// A failed turn is an ending too, and a viewer that never makes room is still detached
+    /// while a connection moves away behind it.
+    // Paused time, as above: the timeout is the production constant and still fires.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_does_not_follow_a_connection_that_moved_while_a_viewer_timed_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut crowd = Crowd::gather(dir.path()).await;
+        let ending = Frame::Failed {
+            message: "the model went away".to_owned(),
+        };
+
+        crowd.end_while_moving(ending, false).await;
+
+        crowd.assert_mover_saw_only_the_session_it_joined();
+        assert!(
+            !crowd.left.is_watching(crowd.stalled),
+            "a viewer that never made room is detached"
+        );
+        assert!(
+            matches!(crowd.stalled_queue.try_recv(), Ok(Frame::Bye)),
+            "and was sent nothing past what already filled its queue"
+        );
+        assert!(crowd.stalled_queue.try_recv().is_err());
+        assert!(
+            matches!(
+                drained(&mut crowd.stayer_queue).as_slice(),
+                [Frame::Failed { .. }]
+            ),
+            "a viewer that stayed is sent the ending even after another timed out"
+        );
+        assert!(crowd.left.is_watching(crowd.stayer));
+    }
+
+    /// The agent's state is not the session's, so it does follow a connection that moved while
+    /// it waited on a slower viewer: the agent tells its sessions one after another, and a
+    /// connection that moved to one already told would otherwise hear it from neither.
+    // Paused time, as above: the timeout is the production constant and still fires.
+    #[tokio::test(start_paused = true)]
+    async fn the_agents_state_follows_a_connection_into_the_session_it_moved_to() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut crowd = Crowd::gather(dir.path()).await;
+        let switched = || Frame::ModelChanged {
+            model: "switched".to_owned(),
+        };
+        let is_switched = |frame: Option<&Frame>| matches!(frame, Some(Frame::ModelChanged { model }) if model == "switched");
+
+        crowd
+            .send_while_moving(switched(), Scope::Agent, true)
+            .await;
+
+        let seen = drained(&mut crowd.mover_queue);
+        assert!(
+            matches!(seen.first(), Some(Frame::Attached { session, .. })
+                if session.session == "joined"),
+            "{seen:?}"
+        );
+        assert!(
+            is_switched(seen.last()),
+            "the moved connection is told: {seen:?}"
+        );
+        assert!(is_switched(crowd.stalled_queue.try_recv().ok().as_ref()));
+        let stayed = drained(&mut crowd.stayer_queue);
+        assert!(
+            stayed.len() == 1 && is_switched(stayed.first()),
+            "{stayed:?}"
+        );
+    }
+
+    /// A connection whose own queue is full when the ending goes out, and which moves once it
+    /// has made room, is not sent the ending in the session it moved to; one that stays is.
+    ///
+    /// Asking before the wait cannot catch this: the ending was already waiting on this very
+    /// connection when it moved, and the room it is handed is room the move left too.
+    #[tokio::test(start_paused = true)]
+    async fn an_ending_waiting_on_a_connections_own_queue_does_not_follow_it_when_it_moves() {
+        for moves in [true, false] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let registry = registry_over(dir.path()).await;
+            let left = held("left");
+            let (frames, mut queue) = mpsc::channel(8);
+            let mut watching = Some(attach(&registry, &left, &frames).await.expect("attached"));
+            drained(&mut queue);
+            while frames.try_send(Frame::Bye).is_ok() {}
+            let ending = Frame::Done {
+                answer: "done".to_owned(),
+                reason: TurnEnd::Completed,
+            };
+            let mut broadcast = std::pin::pin!(broadcast_end(&left, ending));
+            assert!(futures::poll!(broadcast.as_mut()).is_pending());
+            // The client reads its queue: the first slot freed is handed to the waiting ending,
+            // and the rest are free for whatever the connection does next.
+            assert!(drained(&mut queue).iter().all(|f| matches!(f, Frame::Bye)));
+            if moves {
+                release(&mut watching);
+                let joined = held("joined");
+                let moved = attach(&registry, &joined, &frames).await.expect("moved");
+                assert!(joined.is_watching(moved.0));
+            }
+            broadcast.await;
+            let seen = drained(&mut queue);
+            if moves {
+                assert!(
+                    matches!(seen.first(), Some(Frame::Attached { session, .. })
+                        if session.session == "joined"),
+                    "{seen:?}"
+                );
+                assert!(
+                    !seen.iter().any(|f| matches!(f, Frame::Done { .. })),
+                    "{seen:?}"
+                );
+            } else {
+                assert!(matches!(seen.as_slice(), [Frame::Done { .. }]), "{seen:?}");
+                assert!(left.is_watching(watching.expect("still watching").0));
+            }
+        }
     }
 
     /// A question reaches every client attached to the session, and the first answer settles

@@ -321,7 +321,13 @@ session: 01a09a9d-8aa2-7736-86a6-7c6d3dedaa7a  shared-work  idle  2 attached  3 
   by the session, so closing a terminal mid-turn no longer abandons the work.
 - **A session is one conversation with many views.** Every attached client sees the same
   frames: prompts from other clients, streamed answers, tool calls, and the ending. Two
-  terminals can watch one conversation.
+  terminals can watch one conversation. A connection that moves to another session stops
+  being sent this one's frames at once, even an ending that was already on its way: the
+  ending waits for room in each client's queue in turn, and every client is asked about
+  again at the moment its frame is queued, so a slow client ahead of it cannot delay the
+  ending into the next session's transcript. The agent's own state — approval, model,
+  effort, provider — is not this session's, so a change to it still reaches a connection
+  that moved while it was on its way.
 - **One turn at a time.** A session's log can only be written by one turn, so a prompt to
   a busy session is refused with a message rather than queued — the model has not seen the
   first answer yet, and pretending otherwise would reorder the conversation.
