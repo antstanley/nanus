@@ -503,6 +503,84 @@ fn a_host_installer_cannot_take_a_held_name_and_its_failure_stops_the_start() {
     assert!(own.to_string().contains("host refused"), "{own}");
 }
 
+/// The configuration's standing approvals are on the runner every mode drives once the harness
+/// starts — `nanus run`, the link and a service all run turns through it — and they are read after
+/// the host's tools are in, so a host's own tool can be approved by name.
+#[test]
+fn configured_standing_approvals_are_on_the_runner_once_the_harness_starts() {
+    in_child_process("configured_standing_approvals_are_on_the_runner_once_the_harness_starts");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let settings = NanusConfig {
+        approved_tools: vec![String::from("host_send"), String::from("bash")],
+        ..config(dir.path())
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let harness = runtime
+        .block_on(compose(&settings))
+        .expect("composes")
+        .with_tools(|host| host.register(host_tool("host_send")))
+        .start()
+        .expect("mounts with its approvals");
+    let approved: Vec<String> = harness
+        .runner
+        .approved_tools()
+        .iter()
+        .map(|tool| tool.as_str().to_owned())
+        .collect();
+    assert_eq!(approved, ["bash", "host_send"]);
+    assert_eq!(
+        harness.runner.approval(),
+        nanus_domain::ApprovalPolicy::PerCall,
+        "approving tools does not move the state"
+    );
+
+    // Nothing named, nothing approved: the default configuration asks as it always has.
+    let plain = runtime
+        .block_on(compose(&config(dir.path())))
+        .expect("composes")
+        .start()
+        .expect("mounts");
+    assert!(plain.runner.approved_tools().is_empty());
+
+    let shutdown = harness.shutdown();
+    assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
+}
+
+/// The other direction: a name no tool of the started agent has stops the start with a sentence
+/// naming it — a misspelling, a tool the loop runs itself, an optional tool that is not offered —
+/// rather than standing as an approval that grants nothing.
+#[test]
+fn a_standing_approval_for_a_tool_the_agent_does_not_offer_stops_the_start() {
+    in_child_process("a_standing_approval_for_a_tool_the_agent_does_not_offer_stops_the_start");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    for name in ["Bash", "create_goal", "read_video", "not a name"] {
+        let settings = NanusConfig {
+            approved_tools: vec![String::from("bash"), String::from(name)],
+            ..config(dir.path())
+        };
+        let started = runtime
+            .block_on(compose(&settings))
+            .expect("composes: the names are checked when the tools are known")
+            .start();
+        let Err(error) = started else {
+            panic!("`{name}` is not a tool this agent offers, so it must not start");
+        };
+        let sentence = error.to_string();
+        assert!(sentence.contains("approved_tools"), "{sentence}");
+        assert!(
+            sentence.contains(name),
+            "the sentence names `{name}`: {sentence}"
+        );
+    }
+}
+
 #[test]
 fn mounting_from_inside_a_runtime_fails_loudly() {
     in_child_process("mounting_from_inside_a_runtime_fails_loudly");

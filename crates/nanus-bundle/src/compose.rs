@@ -23,7 +23,7 @@ use nanus_adapter_local::{LocalFs, LocalShell, SystemClock};
 use nanus_adapter_openai::{OpenAiConfig, OpenAiLlm, Protocol, Vendor, oauth};
 use nanus_adapter_secret::Secrets;
 use nanus_adapter_store::JsonlStore;
-use nanus_domain::{AgentConfig, Origin, Session};
+use nanus_domain::{AgentConfig, Origin, Session, ToolName};
 use nanus_kernel::{Context, Kernel, MountContext, Plugin, PluginId};
 use nanus_ports::{
     ClockHandle, FsHandle, LlmEvent, LlmHandle, LlmPort, LlmStream, ReasoningEffort, SandboxPolicy,
@@ -324,7 +324,9 @@ impl Pending {
     ///
     /// # Errors
     ///
-    /// Returns [`BundleError::Kernel`] when a plugin fails to mount.
+    /// Returns [`BundleError::Kernel`] when a plugin fails to mount, an installer's own error when
+    /// one fails, and [`BundleError::Config`] when `approved_tools` names a tool the started agent
+    /// does not offer.
     pub fn start(self) -> Result<Harness, BundleError> {
         let context = mount(&self)?;
         let runner = build_runner(
@@ -386,6 +388,9 @@ impl Pending {
         for install in self.installers {
             install(&mut host)?;
         }
+        // The standing approvals go on after every tool is in, because which names exist is only
+        // known now: a host's tool may be approved, and `read_video` only when it is offered.
+        approve_configured(&runner, &self.config.approved_tools)?;
         Ok(Harness {
             context,
             runner,
@@ -396,6 +401,35 @@ impl Pending {
             origin,
         })
     }
+}
+
+/// Puts the configuration's standing approvals on the runner.
+///
+/// Refused rather than warned about, a name at a time: an approval that names no tool grants
+/// nothing, so the agent is no less safe for running with it, but its author believes something is
+/// in force that is not, and a warning in a log nobody reads is how that belief survives. The start
+/// fails with the name, and the tools the agent does offer, instead.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] for a name that is not a tool name, or that no registered tool
+/// has — a tool turned off, a misspelling, or one the loop runs itself.
+fn approve_configured(runner: &AgentRunner, names: &[String]) -> Result<(), BundleError> {
+    for name in names {
+        let tool = ToolName::new(name.as_str()).map_err(|error| {
+            BundleError::config(format!(
+                "approved_tools: `{name}` is not a tool name: {error}"
+            ))
+        })?;
+        runner
+            .approve_tool(&tool)
+            .map_err(|error| BundleError::config(format!("approved_tools: {error}")))?;
+    }
+    assert!(
+        runner.approved_tools().len() <= names.len(),
+        "nothing is approved that the configuration did not name"
+    );
+    Ok(())
 }
 
 /// The provider a harness is talking to, and how to change it.

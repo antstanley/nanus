@@ -85,6 +85,10 @@ fn the_built_in_defaults_are_the_documented_ones() {
         nanus_ports::ReasoningEffort::Medium
     );
     assert_eq!(config.approval_policy, ApprovalPolicy::PerCall);
+    assert!(
+        config.approved_tools.is_empty(),
+        "no tool is approved for every session unless the file names it"
+    );
     assert_eq!(config.sandbox_mode, SandboxMode::ReadOnly);
     assert_eq!(
         config.tui_detail,
@@ -218,6 +222,35 @@ fn markdown_rendering_can_be_turned_off() {
     let reloaded = NanusConfig::load(Some(&written)).expect("reload");
     assert!(!reloaded.markdown);
     assert!(!reloaded.mermaid);
+}
+
+#[test]
+fn standing_tool_approvals_are_read_and_survive_a_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "approved_tools = [\"bash\", \"write\"]\n").expect("seed");
+    let config = NanusConfig::load(Some(&path)).expect("load");
+    assert_eq!(config.approved_tools, ["bash", "write"]);
+    assert_eq!(
+        config.approval_policy,
+        ApprovalPolicy::PerCall,
+        "naming tools does not move the state"
+    );
+    config.save_to(&path).expect("save");
+    assert_eq!(NanusConfig::load_from(&path).expect("reload"), config);
+
+    // A file written before the field existed approves nothing, at the same version.
+    std::fs::write(&path, "config_version = 1\nmodel = \"deepseek-flash\"\n").expect("seed");
+    let older = NanusConfig::load(Some(&path)).expect("load");
+    assert!(older.approved_tools.is_empty());
+    assert_eq!(older.config_version, CONFIG_VERSION);
+
+    // The other direction: a single name rather than a list is refused, not read as one entry.
+    std::fs::write(&path, "approved_tools = \"bash\"\n").expect("seed invalid");
+    assert!(
+        NanusConfig::load_from(&path).is_err(),
+        "a tool list that is not a list is refused rather than guessed at"
+    );
 }
 
 #[test]

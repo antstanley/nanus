@@ -1007,7 +1007,8 @@ fn run_turn(
     let mut reporter = StderrProgress::new(verbose, verbose).stopping_when(Rc::clone(&stop.raised));
     // A headless run is the one mode with no interface to press a key in, so the approval
     // gate asks *here*. With no terminal on stdin there is nobody to ask, and the loop
-    // denies what the sandbox does not already permit rather than proceeding unasked. An
+    // denies what the sandbox does not already permit — and the configuration's
+    // `approved_tools` did not approve in advance — rather than proceeding unasked. An
     // interrupt abandons a question that is open, so `Ctrl-C` stops a run that is waiting to
     // be asked something rather than having to be answered first.
     let approver =
@@ -1820,6 +1821,7 @@ async fn show_config(args: &Options) -> Result<(), String> {
         );
     }
     println!("approval policy: {}", config.approval_policy);
+    println!("approved tools: {}", approved_tools_display(&config));
     println!("sandbox mode: {:?}", config.sandbox_mode);
     println!("max steps per turn: {}", config.max_steps_per_turn);
     println!(
@@ -1940,6 +1942,17 @@ fn resolved(path: &Result<PathBuf, String>) -> String {
         |_| String::from("<the nanus home> is unavailable"),
         |path| path.display().to_string(),
     )
+}
+
+/// Names the tools approved for every session, or says that none are.
+///
+/// Echoed rather than checked: which tools exist is decided when an agent starts, and a name no
+/// tool has is refused there, with the same names, rather than here.
+fn approved_tools_display(config: &NanusConfig) -> String {
+    if config.approved_tools.is_empty() {
+        return String::from("none (every call outside the sandbox is decided by the policy)");
+    }
+    config.approved_tools.join(", ")
 }
 
 /// Renders the configured workspace root, or the default.
@@ -2602,6 +2615,16 @@ mod tests {
 
         let version = Args::try_parse_from(["nanus", "--version"]);
         assert!(version.is_err());
+    }
+
+    /// `nanus config` names the standing approvals a run starts with, and says so when there
+    /// are none rather than printing an empty line a reader could take for a missing field.
+    #[test]
+    fn the_approved_tools_display_names_each_tool_or_says_there_are_none() {
+        let mut config = NanusConfig::default();
+        assert!(approved_tools_display(&config).starts_with("none"));
+        config.approved_tools = vec![String::from("bash"), String::from("write")];
+        assert_eq!(approved_tools_display(&config), "bash, write");
     }
 
     #[test]

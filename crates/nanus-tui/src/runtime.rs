@@ -79,10 +79,10 @@ use nanus_adapter_config::{NanusConfig, TuiDetail, TuiTheme};
 use nanus_domain::{ApprovalPolicy, Session, SessionId};
 use nanus_link::Client;
 use nanus_link::protocol::{
-    ApprovalState, BacklogSegment, CheckpointInfo, ContextAction, ContextDecisionInfo,
-    ContextEnvelope, ContextModeState, ContextStatusInfo, DecisionState, EffortState, Frame,
-    FrontierInfo, GoalAction, GoalInfo, GoalState, ProviderInfo, Request, SessionInfo, StreamMark,
-    TurnEnd,
+    ApprovalScope, ApprovalState, BacklogSegment, CheckpointInfo, ContextAction,
+    ContextDecisionInfo, ContextEnvelope, ContextModeState, ContextStatusInfo, DecisionState,
+    EffortState, Frame, FrontierInfo, GoalAction, GoalInfo, GoalState, ProviderInfo, Request,
+    SessionInfo, StreamMark, TurnEnd,
 };
 use nanus_ports::{ReasoningEffort, StoreError, StoreHandle};
 use ratatui::DefaultTerminal;
@@ -1023,10 +1023,13 @@ impl SessionSource for Remote {
     }
 
     fn answer(&mut self, call_id: &str, allow: bool, always: bool) {
+        // This interface offers the session's "always" and not the agent's: an approval for every
+        // session is a host's to offer, beside a configuration it can record the set in.
         self.send(Request::Approve {
             call_id: call_id.to_owned(),
             allow,
             always,
+            scope: ApprovalScope::Session,
         });
     }
 
@@ -3944,6 +3947,7 @@ fn apply_from(frame: Frame, view: &mut ViewState, arrival: Arrival) {
             // startup is drawn without the reader pressing anything.
             view.approval = view_policy(state);
         }
+        Frame::ApprovedToolsChanged { tools } => apply_approved_tools(tools, view),
         Frame::EffortChanged { state } => {
             // Applied even to the client that asked, for the same reason the model is: the agent
             // is what fills an unset effort in, and it is the authority on what the next request
@@ -4305,6 +4309,10 @@ fn apply_attached(session: &SessionInfo, stream: &StreamMark, view: &mut ViewSta
         return;
     };
     view.transcript.clear();
+    // The agent's standing approvals are not the session's, but the notice that told the reader
+    // about them was in the transcript just cleared. Forgetting the set means the copy the agent
+    // repeats on this attachment is drawn again, so the new conversation says what is in force.
+    view.approved_tools.clear();
     view.clear_selection();
     view.stream = StreamCursor::attached(
         stream.stream_epoch.clone(),
@@ -4983,6 +4991,28 @@ fn apply_provider_changed(
     view.pending_switch = None;
     view.close_auth();
     view.status = format!("provider: {provider}");
+}
+
+/// Says which tools the agent now runs without asking in every session, when that changed.
+///
+/// A notice rather than a status-line field, because the set is a list and the status line has
+/// room for a word; and only on a change, because the agent repeats the set to every client that
+/// attaches and a reader told once has been told.
+fn apply_approved_tools(tools: Vec<String>, view: &mut ViewState) {
+    if tools == view.approved_tools {
+        return;
+    }
+    let notice = if tools.is_empty() {
+        String::from("no tool is approved for every session any more")
+    } else {
+        format!(
+            "approved for every session, without asking: {}",
+            tools.join(", ")
+        )
+    };
+    view.transcript.push(Entry::notice(notice));
+    view.approved_tools = tools;
+    view.follow();
 }
 
 /// Draws the notice that part of the conversation was left out of the prompt.
@@ -9366,6 +9396,78 @@ mod tests {
             &mut view,
         );
         assert_eq!(view.approval, ApprovalPolicy::PerCall);
+    }
+
+    /// A standing approval for every session is drawn as a notice when it comes into force, so a
+    /// reader is told rather than left to infer it from a question that never comes.
+    #[test]
+    fn an_approved_tools_frame_is_drawn_once_when_the_set_changes() {
+        let mut view = ViewState::new();
+        let set = || Frame::ApprovedToolsChanged {
+            tools: vec!["bash".to_owned()],
+        };
+        apply(set(), &mut view);
+        assert_eq!(view.approved_tools, ["bash"]);
+        let said: Vec<&str> = view.transcript.entries().iter().map(Entry::text).collect();
+        assert!(
+            matches!(said.as_slice(), [notice] if notice.contains("bash")),
+            "{said:?}"
+        );
+        assert_eq!(
+            view.transcript.entries().first().map(Entry::kind),
+            Some(&EntryKind::Notice)
+        );
+
+        // The other direction: the same set again — a second attachment repeats it — draws
+        // nothing new.
+        apply(set(), &mut view);
+        assert_eq!(view.transcript.entries().len(), 1);
+    }
+
+    /// A conversation the interface moves to starts with an empty transcript, so the standing
+    /// approvals the agent repeats on that attachment are drawn there again rather than taken as
+    /// already said by a notice that was cleared away with the old conversation.
+    #[test]
+    fn the_standing_approvals_are_drawn_again_in_the_conversation_moved_to() {
+        let mut view = attached_view("e1", 0);
+        view.attached_id = Some(String::from("s-old"));
+        let set = || Frame::ApprovedToolsChanged {
+            tools: vec!["bash".to_owned()],
+        };
+        apply(set(), &mut view);
+        let mut source = Scripted::new(Vec::new());
+        begin_new_conversation(
+            crate::maintenance::Switch::Clear {
+                old_id: String::from("s-old"),
+                name: None,
+            },
+            &mut source,
+            &mut view,
+        );
+        apply(
+            Frame::Attached {
+                session: session_info("s-new"),
+                stream: mark("p2-h1", 0, 0),
+            },
+            &mut view,
+        );
+        assert!(
+            !shown(&view).iter().any(|text| text.contains("bash")),
+            "the old notice went with the old transcript"
+        );
+        apply(set(), &mut view);
+        let approved = |view: &ViewState| {
+            shown(view)
+                .iter()
+                .filter(|text| text.contains("approved for every session"))
+                .count()
+        };
+        assert_eq!(approved(&view), 1, "{:?}", shown(&view));
+        assert_eq!(view.approved_tools, ["bash"]);
+
+        // The other direction: within the conversation moved to, a repeat is still not news.
+        apply(set(), &mut view);
+        assert_eq!(approved(&view), 1, "{:?}", shown(&view));
     }
 
     /// A turn that ends takes any open question with it, so the reader is not asked to decide

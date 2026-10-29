@@ -9,7 +9,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput};
 use nanus_bench::{Metric, fixtures};
-use nanus_link::protocol::TurnEnd;
+use nanus_link::protocol::{ApprovalScope, TurnEnd};
 use nanus_link::{Frame, LinkResult, Request, decode, encode};
 use serde_json::json;
 use std::hint::black_box;
@@ -141,6 +141,7 @@ fn requests<M: Metric>(c: &mut Criterion<M>) {
                 call_id: "call-0-bash".to_owned(),
                 allow: true,
                 always: false,
+                scope: ApprovalScope::Session,
             },
         ),
     ] {

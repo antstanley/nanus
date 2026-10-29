@@ -47,7 +47,10 @@ pub struct TerminalApprover {
     /// Tools granted for the rest of the run with an "always" answer.
     ///
     /// A run is a session, so a grant lasts as long as the process does: a reader who says
-    /// "always allow `bash`" is not asked about `bash` again for this task.
+    /// "always allow `bash`" is not asked about `bash` again for this task. The configuration's
+    /// `approved_tools` are not here: they are the runner's, decided by the gate before this
+    /// approver is consulted, so a configured approval holds in a run whether or not stdin is a
+    /// terminal, exactly as it does over the link.
     approved: RefCell<BTreeSet<String>>,
 }
 

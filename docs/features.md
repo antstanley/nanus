@@ -550,6 +550,7 @@ this build offers.
 | `max_tokens`            | the model's output ceiling        | per-response budget, capped at the model's ceiling                                                                        |
 | `reasoning_effort`      | the plan's default, then `medium` | `minimal`, `low`, `medium`, `high`                                                                                        |
 | `approval_policy`       | `per_call`                        | `per_call`, `permitted`, `all_calls`                                                                                      |
+| `approved_tools`        | `[]`                              | tool names approved for every session; a name the started agent does not offer stops the start ([safety](#safety-and-verification)) |
 | `sandbox_mode`          | `read_only`                       | `read_only`, `workspace_write`, `danger_full_access`                                                                      |
 | `max_steps_per_turn`    | `512`                             | steps in one turn                                                                                                         |
 | `context_budget`        | the model's window, else `64000`  | estimated prompt tokens for one request                                                                                   |
@@ -798,6 +799,22 @@ The Cordis-style kernel is the framework underneath. See
   tool for the session, so a person answering the same question for the fourth
   time can say yes once for the rest of the conversation. The record is per session
   and in memory, so it is not written to the log and does not outlive the agent.
+- **Standing approvals for every session.** `approved_tools` in
+  the configuration names tools the agent treats as if every session had already answered
+  "always" for them: a call to one that the sandbox does not permit and the approval state does
+  not grant runs without anyone being asked, in `nanus run`, the interface and a service alike. It
+  covers exactly what an "always" answer covers — every such call to the tool, a destructive one
+  included — and nothing the sandbox, the state, or a host's `ToolPolicy` had already decided; it
+  does not change the state. Which tools exist is known only once the agent has started, after
+  `read_video` and a host's tools are installed, so a name is checked then and a name no tool has
+  (a misspelling, `read_video` while it is off, a goal tool) stops the start with a sentence naming
+  it, rather than standing as an approval that grants nothing. `nanus config` prints the list.
+  A client can add to the set live: an `approve` request with `"scope": "agent"` approves the
+  tool for every session the agent holds, and every attached client is sent
+  `approved_tools_changed` with the whole set. The agent keeps it in memory and never writes the
+  configuration; a host that wants the approval to outlive the agent records the set in its own
+  configuration's `approved_tools`. The interface offers only the session's "always" and draws a
+  notice when the agent-wide set changes.
 - **Someone to ask, wherever a person is watching.** `nanus run` prompts on the
   terminal when stdin is one, and the interface draws a dialog over the
   conversation and answers the agent over the link. Both deny when nobody is

@@ -55,6 +55,16 @@ asking, including a destructive one. In the TUI, `a` reviews this grant and `y` 
 other key withdraws it. Every new approval selects Deny. A chord (Ctrl+Y, Alt+Y, Super+Y, any
 modified Enter) does not count as consent, and a hidden dialog never receives input.
 
+`approved_tools` in the configuration is the same grant made in advance for every session:
+`approved_tools = ["bash"]` means every `bash` call the sandbox refuses runs without asking, in
+every conversation, in `nanus run` (whether or not stdin is a terminal) and in a service with
+nobody attached. Treat it as you would `all_calls` for that one tool. It is empty by default, it
+names tools one at a time, and a name the agent does not offer stops the start rather than being
+ignored. A client can add to the agent's set while it runs — an `approve` request with the
+`agent` scope — and every attached client is told; the agent never writes that back to the
+configuration file, so it ends with the agent unless a host records it. The interface offers
+only the session's "always"; an agent-wide grant is a host's to offer.
+
 The approval dialog opens over a keyboard that is usually in use, and its answers are letters. So
 it takes no answer until the keyboard has been quiet for half a second with the question on screen
 — text being typed or pasted when it arrives cannot answer it — and the same quiet is required

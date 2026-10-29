@@ -63,9 +63,9 @@ use tokio::time::sleep;
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
-    AgentInfo, ApprovalState, BacklogSegment, ContextEnvelope, EffortState, Frame, GoalAction,
-    GoalInfo, GoalState, ModelEfforts, ModelInputs, PlanInfo, ProviderInfo, Request, SessionInfo,
-    StreamMark, TurnEnd,
+    AgentInfo, ApprovalScope, ApprovalState, BacklogSegment, ContextEnvelope, EffortState, Frame,
+    GoalAction, GoalInfo, GoalState, ModelEfforts, ModelInputs, PlanInfo, ProviderInfo, Request,
+    SessionInfo, StreamMark, TurnEnd,
 };
 use crate::wire::{read_request, write_frame};
 
@@ -358,6 +358,28 @@ struct Question {
     reason: Option<String>,
     /// How the answer reaches the turn.
     sender: oneshot::Sender<ApprovalOutcome>,
+}
+
+/// How far an allowing answer reaches past the call its question was about.
+#[derive(Clone, Copy)]
+enum Grant<'a> {
+    /// The one call.
+    Once,
+    /// Every later call to the tool in this session.
+    Session,
+    /// Every later call to the tool in every session, recorded on the runner every session's
+    /// turns are gated by.
+    Agent(&'a AgentRunner),
+}
+
+/// What a client's answer to an approval question did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Answered {
+    /// Whether the turn waiting on the question received it.
+    delivered: bool,
+    /// Whether it added a tool to the agent's standing approvals, which every attached client is
+    /// then told.
+    widened: bool,
 }
 
 /// What a session was started from, when a handoff started it.
@@ -885,24 +907,44 @@ impl Held {
     /// another client already settled — or one the turn abandoned — is dropped rather than
     /// reported, because by then there is nothing left to decide.
     ///
-    /// An `always` answer also records the tool, which is what makes the next call to it run
-    /// without asking for the rest of the session. Recording happens even if the receiver is
-    /// gone: the grant is about the session, not about the one call the question named, and
-    /// a turn that ended a moment before the answer arrived should still leave the session
-    /// remembering what a person granted.
-    fn answer(&self, call_id: &str, allow: bool, always: bool) -> bool {
+    /// A standing answer also records the tool, which is what makes the next call to it run
+    /// without asking: for the rest of the session, or — [`Grant::Agent`] — in every session the
+    /// agent holds. Recording happens before the answer is delivered, so the turn's next call
+    /// already sees it, and even if the receiver is gone: the grant is about the tool, not about
+    /// the one call the question named, and a turn that ended a moment before the answer arrived
+    /// should still leave the agent remembering what a person granted.
+    fn answer(&self, call_id: &str, allow: bool, grant: Grant<'_>) -> Answered {
         let Some(question) = self.approvals.borrow_mut().remove(call_id) else {
-            return false;
+            return Answered::default();
         };
-        if allow && always {
-            self.approved.borrow_mut().insert(question.tool);
+        let mut widened = false;
+        if allow {
+            match grant {
+                Grant::Once => {}
+                Grant::Session => {
+                    self.approved.borrow_mut().insert(question.tool.clone());
+                }
+                Grant::Agent(runner) => match runner.approve_tool(&question.tool) {
+                    Ok(added) => widened = added,
+                    // The question named a tool the gate validated, so this is a registry that
+                    // lost it since. The session still gets what the person granted it, which is
+                    // less than they asked for and never more.
+                    Err(error) => {
+                        tracing::warn!(%error, "an agent-wide approval could not be recorded");
+                        self.approved.borrow_mut().insert(question.tool.clone());
+                    }
+                },
+            }
         }
         let outcome = if allow {
             ApprovalOutcome::AllowedOnce
         } else {
             ApprovalOutcome::Rejected
         };
-        question.sender.send(outcome).is_ok()
+        Answered {
+            delivered: question.sender.send(outcome).is_ok(),
+            widened,
+        }
     }
 
     /// Abandons every question still open.
@@ -1200,6 +1242,21 @@ impl Registry {
         }
     }
 
+    /// Tells every attached client which tools the agent now runs without asking in any session.
+    ///
+    /// Sent to every session's viewers for the same reason the approval state is: the set is the
+    /// agent's, and a host recording it in its own configuration may be watching any session.
+    async fn broadcast_approved_tools(&self) {
+        let tools = approved_tool_names(self.agent.runner());
+        let held: Vec<Rc<Held>> = self.held.borrow().values().map(Rc::clone).collect();
+        for entry in held {
+            let frame = Frame::ApprovedToolsChanged {
+                tools: tools.clone(),
+            };
+            broadcast_agent(&entry, frame).await;
+        }
+    }
+
     /// Tells every attached client which model the agent is using now.
     ///
     /// Sent to every session's viewers for the same reason the approval state is: the model is
@@ -1415,6 +1472,15 @@ fn provider_catalogue() -> Vec<ProviderInfo> {
                 })
                 .collect(),
         })
+        .collect()
+}
+
+/// Names the tools the runner approves for every session, in name order, as the link sends them.
+fn approved_tool_names(runner: &AgentRunner) -> Vec<String> {
+    runner
+        .approved_tools()
+        .iter()
+        .map(|tool| tool.as_str().to_owned())
         .collect()
 }
 
@@ -2291,7 +2357,15 @@ async fn serve_connection(
                 call_id,
                 allow,
                 always,
-            } => answer_approval(watching.as_ref(), &call_id, allow, always),
+                scope,
+            } => {
+                let grant = match (always, scope) {
+                    (false, _) => Grant::Once,
+                    (true, ApprovalScope::Session) => Grant::Session,
+                    (true, ApprovalScope::Agent) => Grant::Agent(registry.agent.runner()),
+                };
+                answer_approval(&registry, watching.as_ref(), &call_id, allow, grant).await;
+            }
             Request::SetApproval { state } => {
                 // The state belongs to the agent rather than to the session: the runner the
                 // gate consults is one object shared by every session the agent holds, and a
@@ -2355,10 +2429,24 @@ async fn serve_connection(
 /// session asked, and a connection that is not attached has not been asked anything. An id
 /// nobody is waiting on is dropped rather than refused — the first answer has already settled
 /// it, or the turn ended — and saying so would only be noise on a client's screen.
-fn answer_approval(watching: Option<&(u64, Rc<Held>)>, call_id: &str, allow: bool, always: bool) {
-    let delivered = watching.is_some_and(|(_, held)| held.answer(call_id, allow, always));
-    if !delivered {
+///
+/// An answer that approved its tool for every session is told to every attached client, whether or
+/// not the turn was still waiting: the approval stands either way.
+async fn answer_approval(
+    registry: &Registry,
+    watching: Option<&(u64, Rc<Held>)>,
+    call_id: &str,
+    allow: bool,
+    grant: Grant<'_>,
+) {
+    let answered = watching.map_or_else(Answered::default, |(_, held)| {
+        held.answer(call_id, allow, grant)
+    });
+    if !answered.delivered {
         tracing::debug!(call = %call_id, "an approval answer matched no open question");
+    }
+    if answered.widened {
+        registry.broadcast_approved_tools().await;
     }
 }
 
@@ -3059,6 +3147,12 @@ async fn attach(
     // client reads frames until the attachment and would discard one that arrived first.
     let state = wire_state(registry.agent.runner().approval());
     send(frames, Frame::ApprovalChanged { state }).await;
+    // The agent's standing approvals follow the state they qualify, and only when there are
+    // some: an empty set is what a client that has been told nothing already assumes.
+    let tools = approved_tool_names(registry.agent.runner());
+    if !tools.is_empty() {
+        send(frames, Frame::ApprovedToolsChanged { tools }).await;
+    }
     // The model follows for the same reason: it is the agent's rather than the session's, it
     // can be switched by any client, and a reader should see which one is answering before
     // they type rather than after the first answer.
@@ -3486,7 +3580,7 @@ mod tests {
             "{questions:?}"
         );
         // Answered, it is over, and it must not be asked a second time.
-        assert!(session.answer(&call_id, true, false));
+        assert!(session.answer(&call_id, true, Grant::Once).delivered);
         assert!(session.open_questions().is_empty());
     }
 
@@ -4431,12 +4525,12 @@ mod tests {
                 "and so is the second: every client sees the question"
             );
             assert!(
-                session.answer(&call_id, true, false),
+                session.answer(&call_id, true, Grant::Once).delivered,
                 "the first answer settles the question"
             );
             // The first answer wins: a second one finds nothing to settle.
             assert!(
-                !session.answer(&call_id, false, false),
+                !session.answer(&call_id, false, Grant::Once).delivered,
                 "the question is already settled"
             );
         };
@@ -4456,9 +4550,13 @@ mod tests {
         let (sender, _receiver) = oneshot::channel();
         let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
         let call_id = session.ask(bash.clone(), None, sender);
-        assert!(
-            session.answer(&call_id, true, true),
-            "the answer settles the question"
+        assert_eq!(
+            session.answer(&call_id, true, Grant::Session),
+            Answered {
+                delivered: true,
+                widened: false,
+            },
+            "the answer settles the question, and grants nothing beyond the session"
         );
         assert!(session.is_approved(&bash), "the tool is granted");
         let read = ToolName::new("read").unwrap_or_else(|_| panic!("a valid tool name"));
@@ -4484,8 +4582,91 @@ mod tests {
         let (sender, _receiver) = oneshot::channel();
         let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
         let call_id = session.ask(bash.clone(), None, sender);
-        assert!(session.answer(&call_id, false, true));
+        assert!(session.answer(&call_id, false, Grant::Session).delivered);
         assert!(!session.is_approved(&bash), "a refusal grants nothing");
+    }
+
+    /// A tool that is never run: the agent-wide grant only needs the registry to hold its name.
+    struct NeverRun;
+
+    impl nanus_domain::ToolExecutor for NeverRun {
+        fn execute(&self, call: nanus_domain::ToolCall) -> nanus_domain::ToolFuture {
+            Box::pin(async move { nanus_domain::ToolResult::failure(call.id, "never run") })
+        }
+    }
+
+    /// A runner whose registry holds `bash`, which is what an agent-wide grant is recorded on.
+    fn runner_with_bash() -> AgentRunner {
+        let mut registry = ToolRegistry::new();
+        let schema = nanus_domain::ToolSchema {
+            name: ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name")),
+            description: "a test tool".to_owned(),
+            parameters: serde_json::json!({ "type": "object" }),
+        };
+        assert!(
+            registry
+                .register(nanus_domain::ToolDefinition::new(schema, NeverRun))
+                .is_ok()
+        );
+        let config = AgentConfig::new(4, 1, "silent", 4096).expect("a valid config");
+        AgentRunner::new(
+            Rc::new(Box::new(SilentLlm)),
+            nanus_bundle::ToolRegistryHandle::new(registry),
+            "a test",
+            config,
+            SystemClock::new().handle(),
+        )
+        .expect("a valid runner")
+    }
+
+    /// An agent-wide answer is recorded on the runner every session is gated by, not in the
+    /// session that asked, and it says it widened the set only the first time.
+    #[tokio::test]
+    async fn an_agent_wide_answer_records_the_tool_on_the_runner() {
+        let runner = runner_with_bash();
+        let session = held("agent-wide");
+        let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let (sender, _receiver) = oneshot::channel();
+        let call_id = session.ask(bash.clone(), None, sender);
+        assert_eq!(
+            session.answer(&call_id, true, Grant::Agent(&runner)),
+            Answered {
+                delivered: true,
+                widened: true,
+            }
+        );
+        assert_eq!(runner.approved_tools(), vec![bash.clone()]);
+        assert!(
+            !session.is_approved(&bash),
+            "the grant is the agent's, so it is not kept a second time in the session"
+        );
+
+        let (sender, _receiver) = oneshot::channel();
+        let call_id = session.ask(bash, None, sender);
+        assert!(
+            !session
+                .answer(&call_id, true, Grant::Agent(&runner))
+                .widened,
+            "a second agent-wide answer for the same tool changes nothing to announce"
+        );
+    }
+
+    /// The other direction: a refusal, or an allow-once answer, approves nothing on the agent
+    /// whatever scope it names.
+    #[tokio::test]
+    async fn a_refusal_or_a_one_call_answer_approves_nothing_on_the_agent() {
+        let runner = runner_with_bash();
+        let session = held("not-agent-wide");
+        let bash = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let (sender, _receiver) = oneshot::channel();
+        let call_id = session.ask(bash.clone(), None, sender);
+        let refused = session.answer(&call_id, false, Grant::Agent(&runner));
+        assert!(refused.delivered && !refused.widened, "{refused:?}");
+        let (sender, _receiver) = oneshot::channel();
+        let call_id = session.ask(bash.clone(), None, sender);
+        assert!(!session.answer(&call_id, true, Grant::Once).widened);
+        assert!(runner.approved_tools().is_empty());
+        assert!(!session.is_approved(&bash));
     }
 
     /// Nobody attached means nobody to answer, and the turn is told so rather than left
@@ -4515,7 +4696,7 @@ mod tests {
         assert_eq!(session.approvals.borrow().len(), 1, "the question is open");
         session.abandon_approvals();
         assert!(
-            !session.answer(&call_id, true, false),
+            !session.answer(&call_id, true, Grant::Once).delivered,
             "the abandoned question is gone"
         );
         assert!(

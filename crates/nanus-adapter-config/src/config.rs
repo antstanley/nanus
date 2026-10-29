@@ -237,6 +237,20 @@ pub struct NanusConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Whether a tool call needs a human decision.
     pub approval_policy: ApprovalPolicy,
+    /// Tools approved for every session: the agent's standing "always allow", by tool name.
+    ///
+    /// A call to one of these that the sandbox does not permit and `approval_policy` does not
+    /// grant runs without anyone being asked, exactly as if a person had already answered
+    /// "always" for it in every session. It does not change the state, and it grants nothing the
+    /// sandbox or the state had already settled. Empty by default, so a file that names none
+    /// asks as it always has.
+    ///
+    /// Names, not a shape this schema checks: which tools exist is decided when the agent starts,
+    /// after its optional and host tools are installed, so a name no tool has is refused there —
+    /// the start fails with a sentence naming it — rather than here or silently. The agent reads
+    /// this field and never writes it: a host that wants an approval given live to outlive the
+    /// agent records it in its own configuration.
+    pub approved_tools: Vec<String>,
     /// What a tool call may touch.
     pub sandbox_mode: SandboxMode,
     /// How many model steps one turn may take.
@@ -333,6 +347,7 @@ impl Default for NanusConfig {
             max_tokens: None,
             reasoning_effort: None,
             approval_policy: ApprovalPolicy::default(),
+            approved_tools: Vec::new(),
             sandbox_mode: SandboxMode::default(),
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,
             context_budget: None,

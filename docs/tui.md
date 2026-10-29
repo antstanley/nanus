@@ -153,6 +153,14 @@ placed in front of the person deciding, and the transcript already shows what th
 A client answers with an `approve` request naming the question; the first answer wins, and
 denying is the safe reading of everything else. An answer may be standing: the "always
 allow" option records the tool for the session, so the same question is not asked again.
+An `approve` request's `scope` can widen that to the agent — `agent` approves the tool in every
+session it holds, as `approved_tools` in the configuration does from the start — and the agent
+then sends every attached client `approved_tools_changed` with the whole set, which is also sent
+on attaching whenever the set is not empty. The agent keeps the set in memory and never writes the
+configuration: a host offering "always allow, every session" records the set in its own. This
+interface offers only the session's answer, and draws a notice when the agent-wide set changes.
+The scope and the frame moved the protocol to version 13, because an older agent would read an
+agent-wide answer as a session's and grant less than the person chose without saying so.
 Nobody attached, or a last client that detaches while a question is open, is an unavailable
 answerer — the call is denied rather than left waiting for a decision that cannot arrive.
 `all calls` never reaches the link at all: it grants every exception without asking.

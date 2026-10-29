@@ -219,6 +219,11 @@ Contract to preserve:
   `high_contrast`) and whether it captures the mouse (`true` by default; `false` keeps the
   terminal's own selection and never asks for the mouse at all). Read by the interface itself,
   like `tui_detail`; `NO_COLOR` is applied on top of whichever palette was chosen. See `docs/tui.md`.
+- `approved_tools` — tool names the approval gate grants in every session, as if each had already
+  answered "always" for them. Empty by default. Checked once the agent has started (after
+  `read_video` and host tools), and a name no tool has stops the start. A client adds to the set
+  live with an `agent`-scoped `approve`, and every client is sent `ApprovedToolsChanged`; the agent
+  never writes the configuration. See `docs/design.md`.
 - `read_video` / `ffmpeg_dir` — whether the agent offers the optional `read_video` tool, and where
   `ffmpeg` and `ffprobe` live when they are not on `PATH`. Off by default. See `docs/features.md`.
 - `markdown` / `mermaid` — whether the interface renders the model's answers as markdown
@@ -381,7 +386,9 @@ design docs too.
 - **Approval is fail-closed by default:** only `AllowedOnce` proceeds, `per_call` is
   the default state and denies when nobody can answer, and the permissive states
   (`permitted`, `all_calls`) are names a human chooses. `all_calls` grants every
-  exception; it is not the default and must not become one.
+  exception; it is not the default and must not become one. A standing approval
+  (`approved_tools`, or an `agent`-scoped answer) names one registered tool at a time, is
+  consulted only where the answerer would be, and is empty unless something named it.
 - **An approval is answered by a deliberate key, not by whatever was being typed.** The
   interface's dialog takes nothing but `Esc` until the keyboard has been quiet for
   `APPROVAL_SETTLE` with the question on screen, asks for that quiet again whenever the question

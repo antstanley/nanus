@@ -23,7 +23,8 @@ use tokio::io::{AsyncWriteExt as _, BufReader};
 
 use crate::error::{LinkError, LinkResult};
 use crate::protocol::{
-    AgentInfo, ApprovalState, Frame, PROTOCOL_VERSION, Request, SessionInfo, StreamMark, encode,
+    AgentInfo, ApprovalScope, ApprovalState, Frame, PROTOCOL_VERSION, Request, SessionInfo,
+    StreamMark, encode,
 };
 use crate::wire::read_message;
 
@@ -213,6 +214,27 @@ impl Client {
             call_id: call_id.to_owned(),
             allow,
             always,
+            scope: ApprovalScope::Session,
+        })
+        .await
+    }
+
+    /// Allows the call a question is about, and every later call to its tool in every session
+    /// the agent holds.
+    ///
+    /// The option an interface offers as "always allow, every session". The agent answers every
+    /// attached client with [`Frame::ApprovedToolsChanged`], which is what a host records in its
+    /// own configuration if the approval should outlive the agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Io`] when the write fails.
+    pub async fn approve_for_agent(&mut self, call_id: &str) -> LinkResult<()> {
+        self.send(&Request::Approve {
+            call_id: call_id.to_owned(),
+            allow: true,
+            always: true,
+            scope: ApprovalScope::Agent,
         })
         .await
     }
@@ -606,11 +628,11 @@ mod tests {
         }
     }
 
-    /// A version-12 client against a version-11 agent is refused at the handshake, by name: an
-    /// agent at 11 cannot parse the handoff and compaction requests, so the mismatch must end the
-    /// connection before any request is sent.
+    /// A version-13 client against a version-12 agent is refused at the handshake, by name: an
+    /// agent at 12 would read an agent-wide approval as a session's, granting less than the person
+    /// chose without saying so, so the mismatch must end the connection before any request is sent.
     #[tokio::test]
-    async fn a_v12_client_is_refused_by_an_agent_at_11() {
+    async fn a_v13_client_is_refused_by_an_agent_at_12() {
         let (agent, client) = pair();
         let mut agent = agent;
         let mut line = encode(&Frame::Ready(AgentInfo {
@@ -633,9 +655,9 @@ mod tests {
 
         match Client::open(client).await {
             Err(LinkError::Version { agent, client }) => {
-                assert_eq!(agent, 11, "the agent names its own version");
+                assert_eq!(agent, 12, "the agent names its own version");
                 assert_eq!(client, PROTOCOL_VERSION);
-                assert_eq!(client, 12);
+                assert_eq!(client, 13);
             }
             other => panic!("expected a version refusal, got {other:?}"),
         }
