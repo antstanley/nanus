@@ -36,7 +36,10 @@ and the **approval policy** decides what happens to a call _outside_ it.
 - `permitted` — a call that cannot destroy anything runs without asking. A call
   that looks destructive — a command that deletes or overwrites — still prompts,
   _unless_ every path it names is inside a temporary directory, where a destructive
-  command is the ordinary way to clean up. Prefer this over `per_call` when you
+  command is the ordinary way to clean up. A tool says whether it can destroy anything: the
+  stock filesystem tools say they cannot, `bash` is judged by its command, and a tool an
+  embedding application registered that does not say is treated as destructive, so it is
+  always asked about here ([host tools](docs/host-tools.md#when-a-person-is-asked)). Prefer this over `per_call` when you
   want the agent to work without being asked about every read-only shell command,
   but still want a person in the loop for a deletion.
 - `all_calls` — every call the sandbox does not permit runs without asking. This is

@@ -383,7 +383,124 @@ fn read_video_is_offered_only_when_the_configuration_asks_for_it() {
             .get(&name)
             .map(nanus_domain::ToolDefinition::access);
         assert_eq!(access, Some(nanus_domain::ToolAccess::Execute));
+        let destructive = harness
+            .runner
+            .tools()
+            .borrow()
+            .get(&name)
+            .map(nanus_domain::ToolDefinition::destructive);
+        assert_eq!(
+            destructive,
+            Some(nanus_domain::Destructive::Never),
+            "it deletes nothing, so `permitted` runs it as it did before tools declared this"
+        );
     }
+}
+
+/// Builds a host tool named `name` that reads nothing and destroys nothing.
+fn host_tool(name: &str) -> nanus_domain::ToolDefinition {
+    let schema = nanus_domain::ToolSchema {
+        name: nanus_domain::ToolName::new(name).expect("a valid tool name"),
+        description: "a host's own tool".to_owned(),
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+    };
+    nanus_domain::ToolDefinition::new(schema, Unused)
+        .with_access(nanus_domain::ToolAccess::Read)
+        .with_destructive(nanus_domain::Destructive::Never)
+}
+
+/// A host's installer runs inside `start`, so its tool is in the count the link advertises and
+/// in the registry the runner dispatches from before anything can serve the harness. It is
+/// handed the composition's own handles to build over.
+#[test]
+fn a_host_installer_registers_its_tools_before_the_harness_is_returned() {
+    in_child_process("a_host_installer_registers_its_tools_before_the_harness_is_returned");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let settings = config(dir.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let workspace = dir.path().canonicalize().expect("the root resolves");
+    let seen = std::rc::Rc::new(core::cell::RefCell::new(None));
+    let seen_by_installer = std::rc::Rc::clone(&seen);
+    let pending = runtime
+        .block_on(compose(&settings))
+        .expect("composes")
+        .with_tools(move |host| {
+            // The stock tools are already in; the installer can see them but not take them.
+            assert!(host.contains("bash"));
+            assert!(host.switch().upgrade().is_some(), "the switch is live");
+            *seen_by_installer.borrow_mut() = Some(host.workspace().to_path_buf());
+            host.register(host_tool("host_first"))
+        })
+        .with_tools(|host| {
+            // Installers run in order, so the second sees the first's tool.
+            assert!(host.contains("host_first"));
+            host.register(host_tool("host_second"))
+        });
+    let harness = pending.start().expect("mounts with the host's tools");
+
+    assert_eq!(
+        harness.tool_count(),
+        14,
+        "twelve stock and goal tools, and two of the host's"
+    );
+    let published = harness
+        .context
+        .get(nanus_bundle::tools_key())
+        .expect("the tools service resolves");
+    for name in ["host_first", "host_second"] {
+        let name = nanus_domain::ToolName::new(name).expect("a valid name");
+        assert!(published.borrow().contains(&name), "{name} is published");
+    }
+    let seen = seen.borrow().clone().expect("the installer ran");
+    assert_eq!(
+        seen.canonicalize().expect("the root resolves"),
+        workspace,
+        "the installer was handed the composition's workspace"
+    );
+
+    let shutdown = harness.shutdown();
+    assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
+}
+
+/// The other direction: an installer cannot take a name the stock set holds or one the loop
+/// runs itself, and an installer's own failure stops the start rather than leaving a harness
+/// that offers less than its host asked for.
+#[test]
+fn a_host_installer_cannot_take_a_held_name_and_its_failure_stops_the_start() {
+    in_child_process("a_host_installer_cannot_take_a_held_name_and_its_failure_stops_the_start");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let settings = config(dir.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let start_with = |install: fn(
+        &mut nanus_bundle::host_tools::HostTools<'_>,
+    ) -> Result<(), nanus_bundle::BundleError>| {
+        runtime
+            .block_on(compose(&settings))
+            .expect("composes")
+            .with_tools(install)
+            .start()
+    };
+
+    let Err(stock) = start_with(|host| host.register(host_tool("bash"))) else {
+        panic!("a host tool must not replace a stock one");
+    };
+    assert!(stock.to_string().contains("bash"), "{stock}");
+
+    let Err(goal) = start_with(|host| host.register(host_tool("create_goal"))) else {
+        panic!("a host tool must not shadow a tool the loop runs itself");
+    };
+    assert!(goal.to_string().contains("create_goal"), "{goal}");
+
+    let Err(own) = start_with(|_| Err(nanus_bundle::BundleError::config("host refused"))) else {
+        panic!("an installer's failure must stop the start");
+    };
+    assert!(own.to_string().contains("host refused"), "{own}");
 }
 
 #[test]

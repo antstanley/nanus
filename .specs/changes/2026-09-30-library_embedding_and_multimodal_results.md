@@ -40,6 +40,8 @@ Nanus currently documents its canonical architecture and behavior in `docs/`, no
 >
 > `UseDefault` follows the existing `SandboxMode`/`ApprovalPolicy`/`Approver` path. `AllowOnce` grants only this exact invocation, never a standing tool grant or a permission-mode change. `Deny` records an ordinary failed tool result paired with the original call ID and explains the refusal to the model. Unknown tools and malformed inputs still fail registry validation, regardless of a host grant. No input editing is implied by this contract. All tools retain truthful Read/Write/Execute classes.
 >
+> **Note, 2026-10-29.** "Absence of a policy preserves today's default gate exactly" no longer holds for one case: the [host tools change](2026-10-29-host_tools.md) makes `permitted` read each tool's `Destructive` declaration, and an undeclared tool is destructive, so a host's undeclared `Write`/`Execute` tool outside the sandbox is now asked about under `permitted` where it previously ran. `per_call`, `all_calls`, reads and every stock tool are unchanged, and a policy's `UseDefault` follows the new default gate.
+>
 > Policy futures do not hold a registry borrow. Decide each call in model order, then execute only allowed calls with the existing configured concurrency limit. A host can enforce tighter argument/path/network policy than the stock gate and request its own UI decision. Executor ports still recheck live filesystem scope immediately before effects; an approval is not an OS sandbox. Loop-internal goal tools remain internal session bookkeeping, with no new process/filesystem authority.
 
 ### N3. Features → The agent; Composition and the kernel (Modify)

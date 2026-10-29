@@ -6,6 +6,8 @@ Current behavior and architecture remain documented in [the documentation index]
 
 ## Change specs
 
+- [Host tools — a supported registration hook and declared destructiveness](changes/2026-10-29-host_tools.md) — Implemented locally 2026-10-29, unpublished: `Pending::with_tools` and `host_tools::register` give an embedding host a checked way to add its own tools, run inside `start` so the count and first request agree; tools declare `Destructive::{Never, ByCommand, Always}` and an undeclared one is asked about under `permitted` (owner decision: fail closed). Stock tools are declared so their behaviour is unchanged. Guide in [`docs/host-tools.md`](../docs/host-tools.md); worked example in `examples/embedded/tests/host_tool.rs`. Native Windows not run.
+
 - [Bounded, recoverable context management](changes/2026-10-05-context_management.md) — Implemented locally, unpublished: opt-in managed context with fragment selection, context tools, checkpoints, recall, shell archives and retiring deletion; deterministic acceptance on macOS; live provider acceptance and the held-out evaluation (T34) not run. Contract in [`docs/context-management.md`](../docs/context-management.md).
 
 - [Clear, handoff and compact — session-level context controls](changes/2026-10-21-context_management_clear_handoff_compact.md) — Proposed: `/clear` promotes to a clean session (interrupt, clear the TUI, start new); `/handoff` seeds a new session with a bounded handoff document; `/compact` writes a `context/compact` marker the compiler excludes everything before, with the compacted summary added after it. Protocol v12, two-phase draft/commit flows, and deterministic acceptance cases are specified; nothing is implemented.

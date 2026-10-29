@@ -62,7 +62,9 @@ not part of this design's count. `read_video` is the first: `nanus-tool-video` i
 `build_toolset` never mentions it, and the stock composition installs it only when the
 configuration says `read_video = true`. It earns its place the same way — a decoder is a
 mechanism the shell cannot hand a model — but it is optional because it needs a program most
-machines do not have and costs a schema in every request.
+machines do not have and costs a schema in every request. An embedding application adds its
+own the same way, through `Pending::with_tools` or `host_tools::register`, and its tools are held to
+the same bar; [host tools](host-tools.md) is how.
 
 Beside them are five more the model is offered: `get_goal` · `create_goal` · `update_goal`
 · `pause_goal` · `abandon_goal`. The rule above is not relaxed for them — no shell command
@@ -126,6 +128,15 @@ all inside a temporary directory is granted too — that is where a destructive 
 the ordinary way to clean up. `AllCalls` grants every exception without asking, and it is
 for an environment that enforces its own containment: a container, a virtual machine, a
 machine whose contents are disposable.
+
+`Permitted` needs to know which calls can destroy something, and only a tool knows that, so a
+tool declares it as it declares its access: `Destructive::Never` for the filesystem tools,
+`Destructive::ByCommand` for `bash`, whose command is read for a deleting word, and
+`Destructive::Always` for one that can lose something on any call. An undeclared tool is
+`Always`. The classifier used to be the only answer, and it read a `command` argument whatever
+the tool was, so a host's tool that sent or deleted something ran under `Permitted` because
+nothing said it was dangerous. The default now fails closed, the same way an undeclared access
+is `Execute`; [host tools](host-tools.md#when-a-person-is-asked) is the guide for an author.
 
 The two permissive states are explicit names a human has to choose, and the default is the
 restrictive one, which is the part of "fail closed" that still holds. `AllCalls` is the

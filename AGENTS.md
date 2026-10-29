@@ -26,6 +26,7 @@ should read the relevant page before changing a subsystem:
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Changing a hot path, or claiming something got faster or leaner. |
 | [`docs/status.md`](docs/status.md) | Depending on something; includes known limits. |
 | [`docs/features.md`](docs/features.md) | Checking whether a capability exists before relying on it. |
+| [`docs/host-tools.md`](docs/host-tools.md) | Writing a tool for an application that embeds `nanus-bundle`. |
 | [`docs/roadmap.md`](docs/roadmap.md) | Picking up planned work, or checking whether something is intended. |
 | [`docs/style.md`](docs/style.md) | Writing any Rust. |
 | [`docs/tui.md`](docs/tui.md) | Changing the interface, or the link between it and the core. |
@@ -351,6 +352,19 @@ design docs too.
   component. It declares `Execute` access, and its analysis model is on the **same provider, plan,
   endpoint and credential account** as the conversation (`ProviderSwitch::adapter_for`): only the
   model id differs. A provider with no model that has live image evidence has no analysis route.
+- **A host's tool goes in through the checked door, before anything is served.**
+  `Pending::with_tools` queues an installer that `Pending::start` runs after the stock seven and
+  `read_video`, before the harness is returned, so the tool is in the handshake's count and the
+  first request's prefix; a runner built without `stock-compose` uses `host_tools::register`.
+  Both refuse a taken name and a name the loop runs itself (the goal and context tools), and a
+  failed installer fails the start. `build_toolset` still returns seven.
+- **Whether a call can destroy something is the tool's declaration, and undeclared is
+  destructive.** `ToolDefinition::with_destructive` takes `Destructive::{Never, ByCommand,
+  Always}`, defaulting to `Always`, so `permitted` asks about a host's tool that says nothing.
+  The stock filesystem tools and `read_video` declare `Never`; `bash` declares `ByCommand`,
+  the only declaration the command classifier in `guard.rs` reads, and the only one the
+  temporary-directory exemption applies to. A stock tool added later must declare it;
+  `every_stock_tool_declares_whether_it_destroys` checks.
 - **Exactly five goal tools, offered beside them and *not* registered:**
   `get_goal`, `create_goal`, `update_goal`, `pause_goal`, `abandon_goal`. Their
   effect is a `goal/change` record in the session log, which a `'static` tool
@@ -511,10 +525,18 @@ design docs too.
 existing tool (e.g. `read.rs`), read arguments through
 `crate::args::Arguments` so a bad argument is a model-visible `ToolOutcome::Failure`
 rather than a panic, export the factory from `tools/mod.rs`, and register it in
-`build_toolset` in `nanus-bundle/src/lib.rs`. You must also update the size-7
+`build_toolset` in `nanus-bundle/src/lib.rs`. Declare its access and its destructiveness
+(`with_access`, `with_destructive`). You must also update the size-7
 array type, the `assert_eq!(registry.len(), 7, ...)` postcondition, and the
 name-list test — and you should seriously consider whether the tool meets the bar
 in `docs/design.md` (a mechanism the shell cannot do as well, not a convenience).
+
+**Add a host tool (for an embedding application).** Nothing in this repository changes: the
+tool lives in the host's own crate, depends on `nanus-domain` (and `nanus-bundle` for
+`args::Arguments`), and is registered with `Pending::with_tools` or `host_tools::register`.
+[`docs/host-tools.md`](docs/host-tools.md) is the guide and
+`examples/embedded/tests/host_tool.rs` the worked example. A change to *how* a host tool is
+registered or gated is a change here, and it should keep that example passing.
 
 **Add a model provider.** Implement `nanus_ports::LlmPort` in a new adapter crate. If
 the provider speaks OpenAI's chat-completions shape, add a `Vendor` entry to

@@ -65,7 +65,10 @@ that runs a turn.
   [architecture](architecture.md).
 
 Library hosts use `nanus-bundle` without default features, supply trusted prompt text and
-ports, and register ordinary tool executors. `with_tool_policy` adds exact-call checks;
+ports, and register ordinary tool executors. A host's own tool is registered with
+`host_tools::register` on a runner it builds, or queued with `Pending::with_tools` on the stock
+composition, which runs it inside `start` so the tool is counted and offered from the first
+request; [host tools](host-tools.md) is the guide. `with_tool_policy` adds exact-call checks;
 `run_turn_with_control` races a sticky caller signal against idle model, policy, approval
 and tool futures. Cancellation settles unfinished calls once and closes the turn; the
 host remains responsible for stopping detached processes when their futures are dropped.
@@ -785,7 +788,9 @@ The Cordis-style kernel is the framework underneath. See
   A call outside that standing permission needs an exception: `per_call` puts it to
   an answerer and denies it when there is none, `permitted` grants the ones that
   cannot destroy anything (and destructive ones aimed only at a temporary
-  directory), and `all_calls` grants every exception. The default is `per_call`, so
+  directory), and `all_calls` grants every exception. Whether a call can destroy
+  something is the tool's own declaration (`Destructive`), and a tool that makes none —
+  a host's, say — is asked about under `permitted`. The default is `per_call`, so
   a harness that cannot obtain an answer denies; `ApprovalOutcome` allows only
   `AllowedOnce`; and a denial is a tool result the model can read rather than a
   dropped call. See [SAFETY.md](../SAFETY.md).

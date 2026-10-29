@@ -32,8 +32,8 @@ use nanus_domain::context::managed::{
     ArtifactReceipt, CaptureReason, CaptureStatus, CaptureStream, RECALL_TOOL, RawEncoding,
 };
 use nanus_domain::{
-    ContentBlock, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture,
-    ToolName, ToolOutcome, ToolResult, ToolSchema,
+    ContentBlock, Destructive, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor,
+    ToolFuture, ToolName, ToolOutcome, ToolResult, ToolSchema,
 };
 use nanus_ports::{
     CaptureFinalization, CaptureLease, Captured, CapturedOutcome, ShellCapture, ShellError,
@@ -96,7 +96,11 @@ fn definition(shell: ShellHandle, capture: Option<CaptureBroker>) -> ToolDefinit
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, BashExecutor { shell, capture }).with_access(ToolAccess::Execute)
+    // Destructive by command: `ls` is a `bash` call and so is `rm -rf`, and only the command
+    // tells them apart.
+    ToolDefinition::new(schema, BashExecutor { shell, capture })
+        .with_access(ToolAccess::Execute)
+        .with_destructive(Destructive::ByCommand)
 }
 
 /// Executes `bash`.

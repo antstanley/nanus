@@ -48,6 +48,16 @@ Its boundary payloads are in [`context-management.schema.json`](context-manageme
 
 Start here if a long session outgrows its context, or before depending on managed mode.
 
+## [Host tools](host-tools.md)
+
+Writing a tool of your own for an agent you embed: when a tool is the right answer, the two
+ways to register one (`Pending::with_tools` on the stock composition, `host_tools::register`
+on a runner you build), the schema and executor, the access and destructiveness declarations
+that decide when a person is asked, the rules a tool keeps, and how to test it. The worked
+example is a test in `examples/embedded`.
+
+Start here if you are adding a capability of your application's to the agent.
+
 ## [Design decisions](design.md)
 
 One section per deliberate choice — safe Rust as a hard constraint, the seven-tool

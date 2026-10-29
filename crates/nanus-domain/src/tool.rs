@@ -19,7 +19,7 @@ use core::pin::Pin;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::approval::ToolAccess;
+use crate::approval::{Destructive, ToolAccess};
 use crate::message::ToolCallId;
 
 /// Maximum length, in bytes, of a tool name.
@@ -555,6 +555,8 @@ pub struct ToolDefinition {
     schema: ToolSchema,
     /// What a call to this tool can touch, for the sandbox and the approval gate.
     access: ToolAccess,
+    /// Whether a call can destroy something, for the `permitted` approval state.
+    destructive: Destructive,
     /// The images a result may carry, when the tool declares it.
     result_images: Option<ImageEnvelope>,
     /// The executable half.
@@ -581,7 +583,9 @@ impl ToolDefinition {
     ///
     /// The access defaults to [`ToolAccess::Execute`], the most restrictive class, so a
     /// tool that does not declare what it can do is gated like one that can do anything.
-    /// Declare a narrower access with [`with_access`](Self::with_access).
+    /// Declare a narrower access with [`with_access`](Self::with_access). Destructiveness
+    /// defaults to [`Destructive::Always`] for the same reason; declare it with
+    /// [`with_destructive`](Self::with_destructive).
     pub fn new(schema: ToolSchema, executor: impl ToolExecutor + 'static) -> Self {
         // Precondition: the schema's own name passed validation, which is what
         // lets the registry index it without re-validating.
@@ -589,6 +593,7 @@ impl ToolDefinition {
         Self {
             schema,
             access: ToolAccess::default(),
+            destructive: Destructive::default(),
             result_images: None,
             executor: Box::new(executor),
         }
@@ -601,6 +606,17 @@ impl ToolDefinition {
     /// is gated by every mode short of full access.
     pub const fn with_access(mut self, access: ToolAccess) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Declares whether a call to this tool can destroy something; see [`Destructive`].
+    ///
+    /// The declaration matters only to a call the sandbox does not already permit, under the
+    /// `permitted` approval state: `never` runs it without asking, `always` asks, and
+    /// `by_command` asks when the call's shell command deletes something outside a temporary
+    /// directory.
+    pub const fn with_destructive(mut self, destructive: Destructive) -> Self {
+        self.destructive = destructive;
         self
     }
 
@@ -623,6 +639,12 @@ impl ToolDefinition {
     #[must_use]
     pub const fn access(&self) -> ToolAccess {
         self.access
+    }
+
+    /// Returns whether a call to this tool can destroy something.
+    #[must_use]
+    pub const fn destructive(&self) -> Destructive {
+        self.destructive
     }
 
     /// Returns the tool's wire schema.
@@ -657,6 +679,7 @@ impl fmt::Debug for ToolDefinition {
         f.debug_struct("ToolDefinition")
             .field("schema", &self.schema)
             .field("access", &self.access)
+            .field("destructive", &self.destructive)
             .field("result_images", &self.result_images)
             .field("executor", &"<boxed>")
             .finish()

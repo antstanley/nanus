@@ -25,8 +25,8 @@
 use core::fmt::Write as _;
 use nanus_domain::context::managed::Digest;
 use nanus_domain::{
-    ContentBlock, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture,
-    ToolName, ToolOutcome, ToolResult, ToolSchema,
+    ContentBlock, Destructive, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor,
+    ToolFuture, ToolName, ToolOutcome, ToolResult, ToolSchema,
 };
 use nanus_ports::{FileIdentity, FsHandle, RANGE_READ_MAX_BYTES, RangeRead};
 use serde_json::{Value, json};
@@ -124,7 +124,10 @@ pub fn read_tool(fs: FsHandle) -> ToolDefinition {
             "additionalProperties": false
         }),
     };
-    ToolDefinition::new(schema, ReadExecutor { fs }).with_access(ToolAccess::Read)
+    ToolDefinition::new(schema, ReadExecutor { fs })
+        .with_access(ToolAccess::Read)
+        .with_destructive(Destructive::Never)
+        .with_destructive(Destructive::Never)
 }
 
 /// Builds the `read_image` tool over `fs`.
@@ -149,6 +152,7 @@ pub fn read_image_tool(fs: FsHandle) -> ToolDefinition {
     };
     ToolDefinition::new(schema, ReadImageExecutor { fs })
         .with_access(ToolAccess::Read)
+        .with_destructive(Destructive::Never)
         .with_result_images(
             1,
             u32::try_from(nanus_domain::content::IMAGE_BYTES_MAX).unwrap_or(u32::MAX),

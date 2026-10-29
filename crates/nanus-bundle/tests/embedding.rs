@@ -10,9 +10,9 @@ use std::task::Poll;
 
 use nanus_bundle::{AgentRunner, Approver, Silent, ToolRegistryHandle};
 use nanus_domain::{
-    AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Session, SessionEvent,
-    SessionId, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture,
-    ToolName, ToolRegistry, ToolResult, ToolSchema, TurnEndReason,
+    AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, Destructive, Session,
+    SessionEvent, SessionId, ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor,
+    ToolFuture, ToolName, ToolRegistry, ToolResult, ToolSchema, TurnEndReason,
 };
 use nanus_ports::{
     ChatRequest, ClockPort, FinishReason, LlmEvent, LlmHandle, LlmPort, LlmStream, LocalBoxFuture,
@@ -147,6 +147,15 @@ fn policy(answer: Result<ToolPolicyDecision, PolicyError>, pending: bool) -> Rc<
 }
 
 fn runner(effects: &Rc<Effects>, access: ToolAccess, silent: bool) -> AgentRunner {
+    runner_declared(effects, access, Destructive::default(), silent)
+}
+
+fn runner_declared(
+    effects: &Rc<Effects>,
+    access: ToolAccess,
+    destructive: Destructive,
+    silent: bool,
+) -> AgentRunner {
     let mut tools = ToolRegistry::new();
     tools
         .register(
@@ -158,7 +167,8 @@ fn runner(effects: &Rc<Effects>, access: ToolAccess, silent: bool) -> AgentRunne
                 },
                 Executor(Rc::clone(effects)),
             )
-            .with_access(access),
+            .with_access(access)
+            .with_destructive(destructive),
         )
         .unwrap();
     let llm: LlmHandle = Rc::new(Box::new(Model {
@@ -252,27 +262,38 @@ async fn one_call_grant_does_not_change_default_approval() {
 
 #[tokio::test]
 async fn policy_delegation_preserves_approval_modes_and_errors_refuse_reads() {
-    for approval in [
-        ApprovalPolicy::PerCall,
-        ApprovalPolicy::Permitted,
-        ApprovalPolicy::AllCalls,
-    ] {
-        let effects = Rc::new(Effects::default());
-        let policy = policy(Ok(ToolPolicyDecision::UseDefault), false);
-        let runner = runner(&effects, ToolAccess::Write, false).with_tool_policy(policy);
-        runner.set_approval(approval);
-        runner
-            .run_turn(&mut session(), "write", &mut Silent, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            effects.started.borrow().len(),
-            if approval == ApprovalPolicy::PerCall {
-                0
-            } else {
-                3
-            }
-        );
+    // With nobody to answer, a call that would be asked about is denied, so what starts is
+    // what each state grants without asking. A host's tool declared never destructive is
+    // granted by `permitted`; one that declares nothing is destructive by default, so
+    // `permitted` asks and only `all_calls` runs it.
+    for (destructive, permitted_runs) in
+        [(Destructive::Never, true), (Destructive::default(), false)]
+    {
+        for approval in [
+            ApprovalPolicy::PerCall,
+            ApprovalPolicy::Permitted,
+            ApprovalPolicy::AllCalls,
+        ] {
+            let effects = Rc::new(Effects::default());
+            let policy = policy(Ok(ToolPolicyDecision::UseDefault), false);
+            let runner = runner_declared(&effects, ToolAccess::Write, destructive, false)
+                .with_tool_policy(policy);
+            runner.set_approval(approval);
+            runner
+                .run_turn(&mut session(), "write", &mut Silent, None)
+                .await
+                .unwrap();
+            let granted = match approval {
+                ApprovalPolicy::PerCall => false,
+                ApprovalPolicy::Permitted => permitted_runs,
+                ApprovalPolicy::AllCalls => true,
+            };
+            assert_eq!(
+                effects.started.borrow().len(),
+                if granted { 3 } else { 0 },
+                "{destructive} under {approval}"
+            );
+        }
     }
     let effects = Rc::new(Effects::default());
     let policy = policy(

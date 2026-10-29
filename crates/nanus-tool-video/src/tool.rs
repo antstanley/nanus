@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use nanus_domain::{
-    ContentBlock, ToolAccess, ToolCall, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
-    ToolOutcome, ToolResult, ToolSchema,
+    ContentBlock, Destructive, ToolAccess, ToolCall, ToolDefinition, ToolExecutor, ToolFuture,
+    ToolName, ToolOutcome, ToolResult, ToolSchema,
 };
 use serde_json::{Value, json};
 
@@ -84,6 +84,9 @@ pub fn read_video_tool(services: VideoServices) -> Result<ToolDefinition, VideoE
     let jpeg_bytes = u32::try_from(nanus_domain::content::IMAGE_BYTES_MAX).unwrap_or(u32::MAX);
     Ok(ToolDefinition::new(schema, ReadVideoExecutor { services })
         .with_access(ToolAccess::Execute)
+        // It runs FFprobe and FFmpeg over a copy of one file and deletes nothing of the
+        // caller's, so `permitted` runs it as it did before tools declared this.
+        .with_destructive(Destructive::Never)
         .with_result_images(FRAMES_MAX, jpeg_bytes))
 }
 

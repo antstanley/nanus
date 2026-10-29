@@ -171,6 +171,53 @@ impl fmt::Display for ToolAccess {
     }
 }
 
+/// Whether a call can destroy something, which is what the `permitted` approval state asks.
+///
+/// [`ToolAccess`] says what a call can reach; this says whether what it does there can be
+/// undone. They are separate because the answers are: `write` reaches the filesystem and
+/// replaces a file, which another `write` puts back, while a deletion cannot be edited away.
+/// [`ApprovalPolicy::Permitted`] runs a call outside the sandbox without asking unless the call
+/// is destructive, so the declaration decides whether a person is asked at all.
+///
+/// A tool declares it, as it declares its access, because only the tool knows what it does.
+/// One that declares nothing is [`Destructive::Always`], the most restrictive: a tool written
+/// outside this repository is asked about under `permitted` until its author says otherwise,
+/// rather than run because nobody said it was dangerous.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Destructive {
+    /// No call removes or irrecoverably overwrites anything: a read, a write another write can
+    /// put back, or a lookup. `permitted` runs it without asking.
+    Never,
+    /// Decided per call by the harness's shell-command classifier, which reads the call's
+    /// `command` argument. This is how `bash` is declared: `ls` is harmless and `rm -rf` is not,
+    /// and a destructive command aimed only inside a temporary directory is let through.
+    ByCommand,
+    /// Any call may destroy something. `permitted` asks about every one.
+    #[default]
+    Always,
+}
+
+impl Destructive {
+    /// Returns the configuration-style name of the declaration.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::ByCommand => "by_command",
+            Self::Always => "always",
+        }
+    }
+}
+
+impl fmt::Display for Destructive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a tool call may touch.
 ///
 /// Two questions are answered together here, and they are not the same one: whether a call
@@ -637,6 +684,23 @@ mod tests {
         // do anything, so it is gated like a program rather than allowed like a read.
         assert_eq!(ToolAccess::default(), ToolAccess::Execute);
         assert!(!SandboxMode::WorkspaceWrite.permits(ToolAccess::default()));
+    }
+
+    #[test]
+    fn an_undeclared_destructiveness_is_the_most_restrictive_one() {
+        // Fail-closed in the same way: a tool that does not say whether it can destroy
+        // something is asked about under `permitted`, not waved through.
+        assert_eq!(Destructive::default(), Destructive::Always);
+        for (declared, name) in [
+            (Destructive::Never, "never"),
+            (Destructive::ByCommand, "by_command"),
+            (Destructive::Always, "always"),
+        ] {
+            assert_eq!(declared.as_str(), name);
+            assert_eq!(declared.to_string(), name);
+            let encoded = serde_json::to_string(&declared).unwrap_or_default();
+            assert_eq!(encoded, format!("\"{name}\""));
+        }
     }
 
     #[test]

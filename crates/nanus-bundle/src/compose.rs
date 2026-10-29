@@ -229,6 +229,8 @@ pub struct Pending {
     /// The broker the runner hands archive leases to the `bash` tool through.
     capture: crate::CaptureBroker,
     tools: ToolRegistryHandle,
+    /// The host's tool installers, in the order they were queued; run by [`Pending::start`].
+    installers: Vec<crate::host_tools::ToolInstaller>,
 }
 
 impl core::fmt::Debug for Pending {
@@ -236,11 +238,62 @@ impl core::fmt::Debug for Pending {
         f.debug_struct("Pending")
             .field("model", &self.llm.model())
             .field("tools", &self.tools.borrow().len())
+            .field("installers", &self.installers.len())
             .finish_non_exhaustive()
     }
 }
 
 impl Pending {
+    /// Queues an installer for a host's own tools, run when the harness starts.
+    ///
+    /// The installer is handed a [`HostTools`](crate::host_tools::HostTools): the registry, and
+    /// the composition's filesystem, shell, clock, workspace and provider switch to build tools
+    /// over. It runs inside [`Pending::start`] after the stock tools and any configured optional
+    /// tool are registered and before the harness is returned, so what it registers is in the
+    /// count the link handshake advertises and in the first request's schemas. Installers run
+    /// in the order they were queued.
+    ///
+    /// ```no_run
+    /// # use nanus_adapter_config::NanusConfig;
+    /// # use nanus_bundle::compose::compose;
+    /// # use nanus_domain::{Destructive, ToolAccess, ToolCall, ToolDefinition, ToolExecutor,
+    /// #     ToolFuture, ToolName, ToolResult, ToolSchema};
+    /// struct Clock;
+    /// impl ToolExecutor for Clock {
+    ///     fn execute(&self, call: ToolCall) -> ToolFuture {
+    ///         Box::pin(async move { ToolResult::success(call.id, serde_json::json!("noon")) })
+    ///     }
+    /// }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let pending = nanus_kernel::runtime::block_on(compose(&NanusConfig::default()))?
+    ///     .with_tools(|host| {
+    ///         let schema = ToolSchema {
+    ///             name: ToolName::new("host_time").map_err(|e| {
+    ///                 nanus_bundle::BundleError::config(e.to_string())
+    ///             })?,
+    ///             description: "Return the host's wall-clock time.".to_owned(),
+    ///             parameters: serde_json::json!({ "type": "object", "properties": {} }),
+    ///         };
+    ///         host.register(
+    ///             ToolDefinition::new(schema, Clock)
+    ///                 .with_access(ToolAccess::Read)
+    ///                 .with_destructive(Destructive::Never),
+    ///         )
+    ///     });
+    /// let harness = pending.start()?;
+    /// assert_eq!(harness.tool_count(), 13);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_tools(
+        mut self,
+        install: impl FnOnce(&mut crate::host_tools::HostTools<'_>) -> Result<(), BundleError> + 'static,
+    ) -> Self {
+        self.installers.push(Box::new(install));
+        self
+    }
+
     /// Returns whether a provider credential was found for the selected provider.
     ///
     /// `false` is the unconfigured agent: it will mount, and every request through it fails
@@ -318,6 +371,20 @@ impl Pending {
         // through it. The stock seven are already registered and are not touched.
         if self.config.read_video {
             crate::video::install(&switch, &self.config, Rc::clone(&self.fs))?;
+        }
+        // A host's tools go on last, so a name a stock or optional tool holds is refused rather
+        // than taken. A failed installer fails the start: a harness without a tool its host
+        // asked for would offer the model less than the host promised it.
+        let mut host = crate::host_tools::HostTools {
+            tools: switch.runner_tools(),
+            fs: &self.fs,
+            shell: &self.shell,
+            clock: &self.clock,
+            workspace: &self.workspace,
+            switch: &switch,
+        };
+        for install in self.installers {
+            install(&mut host)?;
         }
         Ok(Harness {
             context,
@@ -655,6 +722,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
         selection_file,
         capture,
         tools,
+        installers: Vec::new(),
     })
 }
 

@@ -21,6 +21,14 @@
 //! command names has to be under a temporary root, and a command whose targets cannot all
 //! be read that way is treated as touching something that matters.
 //!
+//! ## Who is classified
+//!
+//! A tool says which question applies to it through its [`Destructive`] declaration. `bash`
+//! declares [`Destructive::ByCommand`], and only such a tool is read by the command classifier
+//! below. The filesystem tools declare [`Destructive::Never`]. A tool that declares nothing —
+//! a host's own, registered beside the stock seven — is [`Destructive::Always`], so `permitted`
+//! asks about it until its author says it cannot destroy anything.
+//!
 //! ## Why this is a heuristic
 //!
 //! The command is a string a model wrote, and a shell has more ways to delete a file than
@@ -30,7 +38,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use nanus_domain::ToolCall;
+use nanus_domain::{Destructive, ToolCall};
 
 /// Command words that delete or overwrite data without asking.
 ///
@@ -63,11 +71,41 @@ pub fn temp_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Returns whether a call can destroy something.
+/// Returns whether a call to a tool that declared `declared` can destroy something.
 ///
-/// Only a `bash` call can: the filesystem tools read, write, and edit, and none of them
-/// deletes. A tool added later that does delete must be named here, or the `permitted`
-/// state will run it without asking.
+/// This is the question the approval gate asks: a declaration of `never` or `always` is the
+/// answer, and `by_command` defers to [`is_destructive`] on the call's own command.
+#[must_use]
+pub fn call_is_destructive(declared: Destructive, call: &ToolCall) -> bool {
+    match declared {
+        Destructive::Never => false,
+        Destructive::ByCommand => is_destructive(call),
+        Destructive::Always => true,
+    }
+}
+
+/// Returns whether the `permitted` state runs a call to a tool that declared `declared`
+/// without asking.
+///
+/// A tool that cannot destroy anything runs, and one that always can is asked about. A
+/// command-classified call runs when its command deletes nothing, or when everything it names
+/// is inside a temporary directory. The temporary exemption is for commands only: it reads
+/// paths out of a command line, and a tool that is destructive by declaration has no command
+/// line to read them from.
+#[must_use]
+pub fn permitted_runs(declared: Destructive, call: &ToolCall) -> bool {
+    match declared {
+        Destructive::Never => true,
+        Destructive::ByCommand => !is_destructive(call) || targets_are_temporary(call),
+        Destructive::Always => false,
+    }
+}
+
+/// Returns whether a call's shell command can destroy something.
+///
+/// The classifier for a tool that declares [`Destructive::ByCommand`], which is `bash`. It
+/// reads the call's `command` argument and nothing else, so a call with no command is not
+/// destructive by this test: the gate asks it only of a tool that said its calls carry one.
 #[must_use]
 pub fn is_destructive(call: &ToolCall) -> bool {
     let Some(command) = command_of(call) else {
@@ -198,6 +236,26 @@ mod tests {
         for command in ["ls -la", "cargo test", "grep -rn todo ."] {
             assert!(!is_destructive(&bash(command)), "{command} is harmless");
         }
+    }
+
+    #[test]
+    fn a_declaration_decides_and_only_a_command_tool_is_read() {
+        let deleting = bash("rm -rf /work/src");
+        let harmless = bash("ls");
+        let scratch = bash("rm -rf /tmp/build");
+        // `never` and `always` are the answer whatever the arguments say.
+        for call in [&deleting, &harmless, &scratch] {
+            assert!(!call_is_destructive(Destructive::Never, call));
+            assert!(permitted_runs(Destructive::Never, call));
+            assert!(call_is_destructive(Destructive::Always, call));
+            assert!(!permitted_runs(Destructive::Always, call));
+        }
+        // `by_command` reads the command, and keeps the temporary-directory exemption.
+        assert!(call_is_destructive(Destructive::ByCommand, &deleting));
+        assert!(!permitted_runs(Destructive::ByCommand, &deleting));
+        assert!(!call_is_destructive(Destructive::ByCommand, &harmless));
+        assert!(permitted_runs(Destructive::ByCommand, &harmless));
+        assert!(permitted_runs(Destructive::ByCommand, &scratch));
     }
 
     #[test]

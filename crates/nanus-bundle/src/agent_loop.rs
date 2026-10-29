@@ -51,9 +51,9 @@ mod selection;
 mod stream;
 
 use nanus_domain::{
-    AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ContentBlock, SandboxMode,
-    Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId, ToolName,
-    ToolResult, TurnEndReason, TurnMachine, Usage,
+    AgentConfig, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ContentBlock, Destructive,
+    SandboxMode, Session, SessionEvent, SessionId, StepOutcome, ToolAccess, ToolCall, ToolCallId,
+    ToolName, ToolResult, TurnEndReason, TurnMachine, Usage,
 };
 #[cfg(test)]
 use nanus_ports::LlmEvent;
@@ -1414,10 +1414,10 @@ impl AgentRunner {
         // The access is copied out and the borrow released before anything is awaited: the
         // decision below can take as long as a person takes, and a registry borrow held that
         // long would refuse the registration that answers it.
-        let access = {
+        let (access, destructive) = {
             let registry = self.tools.borrow();
             match registry.validate(call) {
-                Ok(definition) => definition.access(),
+                Ok(definition) => (definition.access(), definition.destructive()),
                 Err(error) => return Some(ToolResult::failure(call.id.clone(), error.to_string())),
             }
         };
@@ -1452,10 +1452,14 @@ impl AgentRunner {
             return None;
         }
         let policy = self.approval();
-        if exempt(policy, call) {
+        if exempt(policy, destructive, call) {
             return None;
         }
-        let reason = approval_reason(sandbox, access, guard::is_destructive(call));
+        let reason = approval_reason(
+            sandbox,
+            access,
+            guard::call_is_destructive(destructive, call),
+        );
         let outcome = match approver {
             Some(approver) => {
                 let request = ApprovalRequest::new(call.name.clone())
@@ -1582,16 +1586,16 @@ fn interrupted_result(call: &ToolCall) -> ToolResult {
 /// Returns whether an approval state grants a call the sandbox refused, without asking.
 ///
 /// `per_call` grants nothing, so every exception goes to a person. `all_calls` grants every
-/// exception. `permitted` grants one unless it looks destructive, and grants even that when
-/// every path it names is inside a temporary directory — which is where a destructive
-/// command is the ordinary way to clean up rather than something to be asked about.
-fn exempt(policy: ApprovalPolicy, call: &ToolCall) -> bool {
+/// exception. `permitted` grants one unless it is destructive by the tool's own declaration,
+/// and grants a destructive *command* when every path it names is inside a temporary
+/// directory — which is where a destructive command is the ordinary way to clean up rather
+/// than something to be asked about. A tool that declared nothing is destructive, so a host's
+/// tool is asked about until its author says otherwise.
+fn exempt(policy: ApprovalPolicy, destructive: Destructive, call: &ToolCall) -> bool {
     match policy {
         ApprovalPolicy::PerCall => false,
         ApprovalPolicy::AllCalls => true,
-        ApprovalPolicy::Permitted => {
-            !guard::is_destructive(call) || guard::targets_are_temporary(call)
-        }
+        ApprovalPolicy::Permitted => guard::permitted_runs(destructive, call),
     }
 }
 
@@ -3318,6 +3322,15 @@ mod tests {
         name: &str,
         access: ToolAccess,
     ) -> (ToolRegistryHandle, Rc<std::cell::Cell<u32>>) {
+        registry_with_declared(name, access, Destructive::default())
+    }
+
+    /// As [`registry_with_counted`], with the tool's destructiveness declared.
+    fn registry_with_declared(
+        name: &str,
+        access: ToolAccess,
+        destructive: Destructive,
+    ) -> (ToolRegistryHandle, Rc<std::cell::Cell<u32>>) {
         let runs = Rc::new(std::cell::Cell::new(0));
         let schema = ToolSchema {
             name: ToolName::new(name).unwrap_or_else(|_| unreachable!("a valid test tool name")),
@@ -3335,6 +3348,7 @@ mod tests {
                         },
                     )
                     .with_access(access)
+                    .with_destructive(destructive)
                 )
                 .is_ok()
         );
@@ -3532,10 +3546,122 @@ mod tests {
         );
     }
 
+    /// A counted tool declared the way the stock `bash` is: destructive by its command.
+    fn bash_stand_in() -> (ToolRegistryHandle, Rc<std::cell::Cell<u32>>) {
+        registry_with_declared("bash", ToolAccess::Execute, Destructive::ByCommand)
+    }
+
+    /// A host's tool that declares nothing about destruction is asked about under `permitted`.
+    ///
+    /// This is the fail-closed half of the declaration. Before tools declared it, the classifier
+    /// knew only `bash`'s command, so a host's tool that posted, sent or deleted something ran
+    /// under `permitted` without anyone being asked, because nothing said it was dangerous.
+    #[tokio::test]
+    async fn permitted_asks_about_a_host_tool_that_declares_nothing() {
+        let (tools, runs) = registry_with_counted("host_send", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers("host_send"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Permitted,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "the refused call does not run");
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 1, "the call was put to a human");
+        assert!(
+            asked
+                .first()
+                .and_then(|request| request.reason.as_deref())
+                .is_some_and(|reason| reason.contains("destructive")),
+            "the reason says why it was asked: {asked:?}"
+        );
+    }
+
+    /// The other direction: a host's tool that declares it destroys nothing runs under
+    /// `permitted` without asking, exactly as `write` does.
+    #[tokio::test]
+    async fn permitted_grants_a_host_tool_declared_never_destructive() {
+        let (tools, runs) =
+            registry_with_declared("host_lookup", ToolAccess::Execute, Destructive::Never);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers("host_lookup"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Permitted,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 1, "the declared-harmless call runs");
+        assert!(approver.asked().is_empty(), "nobody was asked");
+    }
+
+    /// The temporary-directory exemption reads paths out of a command line, so it is for a
+    /// tool classified by its command only. A tool destructive by declaration is asked about
+    /// even when an argument named `command` happens to mention `/tmp`.
+    #[tokio::test]
+    async fn a_temporary_path_does_not_exempt_a_tool_destructive_by_declaration() {
+        let (tools, runs) =
+            registry_with_declared("host_purge", ToolAccess::Execute, Destructive::Always);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers_with("host_purge", &json!({ "command": "rm -rf /tmp/scratch" })),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::Permitted,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "the refused call does not run");
+        assert_eq!(approver.asked().len(), 1, "the call was put to a human");
+    }
+
+    /// A tool declared never destructive is still gated by the sandbox and by `per_call`: the
+    /// declaration answers `permitted`'s question and no other.
+    #[tokio::test]
+    async fn a_never_destructive_declaration_does_not_bypass_per_call() {
+        let (tools, runs) =
+            registry_with_declared("host_lookup", ToolAccess::Execute, Destructive::Never);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers("host_lookup"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::PerCall,
+        ) else {
+            return;
+        };
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "`per_call` asked, and the refusal held");
+        assert_eq!(approver.asked().len(), 1);
+    }
+
     /// `permitted` runs a call that cannot destroy anything without asking.
     #[tokio::test]
     async fn permitted_grants_a_non_destructive_call() {
-        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let (tools, runs) = bash_stand_in();
         let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
         let Some(runner) = gated_runner(
             calls_then_answers_with("bash", &json!({ "command": "ls -la" })),
@@ -3558,7 +3684,7 @@ mod tests {
     /// about, and a refusal stops it. This is what `permitted` is holding back.
     #[tokio::test]
     async fn permitted_asks_about_a_destructive_call() {
-        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let (tools, runs) = bash_stand_in();
         let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
         let Some(runner) = gated_runner(
             calls_then_answers_with("bash", &json!({ "command": "rm -rf /work/src" })),
@@ -3589,7 +3715,7 @@ mod tests {
     /// ordinary way to clean up, and `permitted` runs it without asking.
     #[tokio::test]
     async fn permitted_grants_a_destructive_call_in_a_temporary_directory() {
-        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let (tools, runs) = bash_stand_in();
         let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
         let Some(runner) = gated_runner(
             calls_then_answers_with("bash", &json!({ "command": "rm -rf /tmp/nanus-build" })),
@@ -3613,7 +3739,7 @@ mod tests {
     /// was built with.
     #[tokio::test]
     async fn the_approval_state_can_be_changed_after_construction() {
-        let (tools, runs) = registry_with_counted("bash", ToolAccess::Execute);
+        let (tools, runs) = bash_stand_in();
         let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
         let Some(runner) = gated_runner(
             calls_then_answers_with("bash", &json!({ "command": "rm -rf /work/src" })),

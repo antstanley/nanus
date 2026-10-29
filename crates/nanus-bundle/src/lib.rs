@@ -83,6 +83,13 @@
 //! ```
 //! The downstream fixture in `examples/embedded` exercises cancellation/policy with
 //! caller ports and explicitly chosen provider dependencies on native library targets.
+//!
+//! ## A host's own tools
+//!
+//! A host adds a tool of its own through [`host_tools`]: `host_tools::register` on a registry
+//! it builds, or `compose::Pending::with_tools` on the stock composition. Either refuses a name
+//! the loop runs itself or one already taken. `docs/host-tools.md` is the guide, and
+//! `examples/embedded/tests/host_tool.rs` the worked example.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -108,6 +115,7 @@ pub mod context_tools;
 pub mod error;
 pub mod goal_tools;
 pub mod guard;
+pub mod host_tools;
 #[cfg(feature = "stock-compose")]
 pub mod provider;
 mod recall;
@@ -355,6 +363,24 @@ mod tests {
                 "write"
             ]
         );
+    }
+
+    /// Every stock tool says whether it can destroy something, so none of them falls back to
+    /// the default a host's undeclared tool gets. `bash` is the one decided by its command.
+    #[test]
+    fn every_stock_tool_declares_whether_it_destroys() {
+        let Ok(registry) = build_toolset(&fs_handle(), &shell_handle()) else {
+            return;
+        };
+        for name in registry.names() {
+            let declared = registry.get(name).map(ToolDefinition::destructive);
+            let expected = if name.as_str() == "bash" {
+                nanus_domain::Destructive::ByCommand
+            } else {
+                nanus_domain::Destructive::Never
+            };
+            assert_eq!(declared, Some(expected), "{name}");
+        }
     }
 
     /// What the model is offered is the registered set *and* the goal tools, and they are
