@@ -147,6 +147,35 @@ badge/transcript and `docs/testing.md`); agents should not chase those numbers u
 `a_configuration_without_a_key_still_composes_unconfigured` expects a machine with no provider
 credential stored, so it fails on one that has them: that is the environment, not a regression.
 
+### Blaze, when it is installed
+
+[Blaze](https://github.com/indexable-inc/blaze) is a daemon that keeps the workspace compiled
+and takes cargo's commands and flags. When `command -v blaze` finds it, use it for the inner
+loop and fall back to cargo for whatever it refuses. It is optional: nothing here requires it,
+and nothing should be written that only works under it.
+
+```sh
+blaze check --workspace --all-targets   # the fast answer to "does it still compile"
+blaze test -p nanus-kernel              # where it can build the crate; else cargo nextest
+blaze status                            # what the daemon holds, and what fell back
+```
+
+What it does not replace, and why:
+
+- **It is not a gate.** Blaze builds with its own pinned nightly and ignores
+  `rust-toolchain.toml`, so a clean Blaze run says nothing about Rust 1.98. The gates above
+  are run with cargo, as written, before a change is done.
+- **`blaze clippy` is not clippy.** It runs a few dozen of clippy's lints ported onto its own
+  analysis, and a lint it has not ported is silently not run; this workspace enables `all`,
+  `pedantic`, `nursery` and `cargo`. Use `cargo clippy` for anything that counts.
+- **It has no nextest** and no `bench`; those stay cargo's.
+- **It cannot build most of the workspace's tests or binaries yet.** Blaze refuses to build a
+  program that reaches a function it cannot compile, rather than handing it to rustc, and on
+  Apple silicon `zune_jpeg`'s NEON colour conversion (reached through image decoding) is one —
+  so `blaze build` of `nanus`/`nanus-tui` and `blaze test` of `nanus-domain` and everything
+  above it fail with "reaches functions blaze could not compile". That is Blaze's limit, not a
+  defect in the change: run the same command with cargo. `blaze check` is unaffected.
+
 ## Running the binary
 
 ```sh
