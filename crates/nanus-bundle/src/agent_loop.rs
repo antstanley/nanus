@@ -660,6 +660,33 @@ impl AgentRunner {
         self.llm.borrow().effort_levels(model)
     }
 
+    /// Returns whether the adapter the next request goes through would let `model` be shown an
+    /// image.
+    ///
+    /// A fact about the exact model on the adapter's endpoint and wire, read from the adapter for
+    /// the reason [`AgentRunner::effort_levels`] is: a client that kept its own list of text-only
+    /// models would warn about the wrong ones. `Supported` is reported only when an image would
+    /// actually be admitted — the adapter claims it *and* names a profile for the model, which is
+    /// what [`nanus_ports::ModelCapabilities::require_image_profile`] demands before a request
+    /// carries pixels. A claim without its profile is not evidence the model is text-only, so it
+    /// is reported as unknown rather than either answer.
+    ///
+    /// The adapter a held step has queued is asked before the one still sending that step. A
+    /// provider switch made mid-step lands only when the step ends, but the new provider's models
+    /// are offered at once, and asking the outgoing adapter about them would answer for a wire
+    /// no request to them will travel — z.ai's API plan says text-only of a model its coding plan
+    /// has no evidence for.
+    #[must_use]
+    pub fn image_input(&self, model: &str) -> nanus_ports::ImageInputSupport {
+        use nanus_ports::ImageInputSupport::{Supported, Unknown};
+        let llm = self.selection.pending_llm().unwrap_or_else(|| self.llm());
+        let capabilities = llm.capabilities(model);
+        match capabilities.image_input {
+            Supported if capabilities.require_image_profile(model).is_err() => Unknown,
+            support => support,
+        }
+    }
+
     /// Points every later request at another adapter.
     ///
     /// The switch a provider change is: the loop keeps running, the session keeps its log, and only
@@ -2946,6 +2973,131 @@ mod tests {
             None,
             "a model that takes no effort steps has none in force, whatever the adapter was built for"
         );
+    }
+
+    /// The image input a runner reports is the adapter's verdict for the model asked about, and
+    /// `Supported` only where an image would be admitted. A claim of support with no profile for
+    /// the model is the case that matters: the harness would refuse the image, so it must not be
+    /// reported as readable — and it is not evidence of a text-only model either, so it is unknown.
+    #[test]
+    fn image_input_is_the_adapters_verdict_and_supported_only_where_an_image_is_admitted() {
+        use nanus_ports::{ImageInputSupport, ImageProfile, ModelCapabilities};
+
+        struct SightedLlm;
+
+        impl LlmPort for SightedLlm {
+            fn model(&self) -> &'static str {
+                "deepseek-flash"
+            }
+
+            fn capabilities(&self, model: &str) -> ModelCapabilities {
+                let (image_input, image_profile) = match model {
+                    // The one profile, claimed for the model it belongs to and for another: a
+                    // profile for another model is no profile for this one.
+                    "deepseek-flash" | "claims-another-profile" => (
+                        ImageInputSupport::Supported,
+                        Some(ImageProfile::DeepSeekFlashAreaV1),
+                    ),
+                    "claims-without-profile" => (ImageInputSupport::Supported, None),
+                    "text-only" => (ImageInputSupport::Unsupported, None),
+                    _ => (ImageInputSupport::Unknown, None),
+                };
+                ModelCapabilities {
+                    image_input,
+                    image_profile,
+                    ..ModelCapabilities::default()
+                }
+            }
+
+            fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        // Built or failed, never skipped: a runner that did not build would pass every assertion
+        // below by asserting none of them.
+        let Some(runner) = runner(Rc::new(Box::new(SightedLlm)), registry_with_echo()) else {
+            panic!("the runner builds");
+        };
+        for (model, expected) in [
+            ("deepseek-flash", ImageInputSupport::Supported),
+            ("text-only", ImageInputSupport::Unsupported),
+            ("never-heard-of-it", ImageInputSupport::Unknown),
+            ("claims-without-profile", ImageInputSupport::Unknown),
+            ("claims-another-profile", ImageInputSupport::Unknown),
+        ] {
+            assert_eq!(runner.image_input(model), expected, "{model}");
+        }
+        // Asked about a model, not the one in force: a switch changes nothing about the answer.
+        runner.set_model("text-only");
+        assert_eq!(
+            runner.image_input("deepseek-flash"),
+            ImageInputSupport::Supported
+        );
+    }
+
+    /// A provider switch made while a step holds the selection is answered for at once. The step
+    /// keeps the adapter it was prepared under, but the switch has already offered the new
+    /// provider's models, so their image input is the queued adapter's verdict — asking the
+    /// outgoing one would answer for a wire no request to them will travel. Both directions: the
+    /// queued adapter is asked while the hold stands, and it is still the one asked once it lands.
+    #[test]
+    fn image_input_answers_for_the_adapter_a_held_step_has_queued() {
+        use nanus_ports::{ImageInputSupport, ImageProfile, ModelCapabilities};
+
+        /// Reads images for the one model it names, with that model's profile.
+        struct Sighted;
+        /// Knows the same model not to read images.
+        struct Blind;
+
+        impl LlmPort for Sighted {
+            fn model(&self) -> &'static str {
+                "deepseek-flash"
+            }
+            fn capabilities(&self, _model: &str) -> ModelCapabilities {
+                ModelCapabilities {
+                    image_input: ImageInputSupport::Supported,
+                    image_profile: Some(ImageProfile::DeepSeekFlashAreaV1),
+                    ..ModelCapabilities::default()
+                }
+            }
+            fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        impl LlmPort for Blind {
+            fn model(&self) -> &'static str {
+                "deepseek-flash"
+            }
+            fn capabilities(&self, _model: &str) -> ModelCapabilities {
+                ModelCapabilities {
+                    image_input: ImageInputSupport::Unsupported,
+                    ..ModelCapabilities::default()
+                }
+            }
+            fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let Some(runner) = runner(Rc::new(Box::new(Sighted)), registry_with_echo()) else {
+            panic!("the runner builds");
+        };
+        let model = "deepseek-flash";
+        assert_eq!(runner.image_input(model), ImageInputSupport::Supported);
+        let Ok(Some(hold)) = runner.hold_selection(true) else {
+            panic!("a managed step holds the selection");
+        };
+        runner.set_llm(Rc::new(Box::new(Blind)));
+        // The switch is queued, not in force: the step still sends through the first adapter.
+        assert_eq!(
+            runner.llm().capabilities(model).image_input,
+            ImageInputSupport::Supported
+        );
+        assert_eq!(runner.image_input(model), ImageInputSupport::Unsupported);
+        drop(hold);
+        assert_eq!(runner.image_input(model), ImageInputSupport::Unsupported);
     }
 
     #[tokio::test]

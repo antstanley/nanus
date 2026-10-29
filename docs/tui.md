@@ -118,6 +118,22 @@ sentence naming both, and a build too old to send a version reads as version zer
 rather than assumed compatible. `nanus service status` prints the version the running agent
 reported.
 
+**The handshake says what each offered model can read.** Beside the models and their effort
+steps, `model_inputs` has one entry per offered model saying whether it reads images: `true` when
+the agent would put an image in front of it, `false` when the adapter knows it does not, and `null`
+when nobody has said. The adapter answers for the exact model on the endpoint and wire in force —
+the verdict `read_image` itself obeys — so a client can warn before a reader attaches an image the
+model cannot read, without a list of model names of its own that would go stale the first time a
+provider changed one. **Unknown is not text-only**: a model is reported as reading images only on
+recorded evidence, and one with no evidence either way is unknown, so a client that warned on
+unknown would warn about every model nobody has measured. A missing list, a missing entry, and
+`null` all read as unknown, which is what an agent that predates the field amounts to. A provider
+change carries the new provider's list with its models. The list is a defaulted sibling of the
+effort steps rather than a field inside their entries, so an older peer reads nothing different and
+the protocol version stands. This interface draws nothing from it: [a pasted
+image](#pasting-an-image) is a path the model is asked to read, and `read_image` refuses it for a
+model that cannot.
+
 **A refusal is not an ending.** `failed` ends the turn a client is showing — the turn failed,
 the prompt it sent was refused, or the connection stopped following the session — and the
 interface closes its view of the turn on it, taking an open approval with it and letting the

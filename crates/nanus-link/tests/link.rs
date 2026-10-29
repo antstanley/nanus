@@ -975,6 +975,89 @@ fn a_model_switch_reconciles_the_effort() {
     );
 }
 
+/// The handshake says which offered models read images, and the answer is the adapter's.
+///
+/// A real adapter rather than a stub, because the claim is about where the fact comes from: the
+/// adapter for `deepseek` has live evidence that Flash reads a picture and that Pro does not, and
+/// has nothing at all to say about an id it does not know. All three cross as themselves — and the
+/// last as unknown rather than text-only, which a client would otherwise warn about.
+#[test]
+fn the_handshake_reports_each_offered_models_image_input_from_the_adapter() {
+    use nanus_adapter_deepseek::{DeepSeekConfig, DeepSeekLlm, MODEL_FLASH, MODEL_PRO};
+    use nanus_link::protocol::ModelInputs;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = nanus_kernel::runtime::block_on(async {
+        JsonlStore::new(dir.path().to_path_buf())
+            .await
+            .expect("the store opens")
+            .handle()
+    });
+    // A credential is never read to answer a capability question, so a fictional one will do.
+    let llm = DeepSeekLlm::new(DeepSeekConfig::new(MODEL_FLASH, "fictional-key"))
+        .expect("the adapter builds");
+    let runner = AgentRunner::new(
+        Rc::new(Box::new(llm)),
+        nanus_bundle::ToolRegistryHandle::new(ToolRegistry::new()),
+        "you are a test",
+        AgentConfig::new(4, 1, MODEL_FLASH, 4096).expect("a valid agent config"),
+        SystemClock::new().handle(),
+    )
+    .expect("a valid runner");
+    let agent = Agent::from_parts(Parts {
+        runner: Rc::new(runner),
+        store,
+        clock: SystemClock::new().handle(),
+        workspace: dir.path().to_path_buf(),
+        models: vec![
+            MODEL_FLASH.to_owned(),
+            MODEL_PRO.to_owned(),
+            String::from("an-unlisted-model"),
+        ],
+        tools: 0,
+        switch: None,
+    });
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let info = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let info = client.info().clone();
+        let _ = stop_tx.send(());
+        let _ = serving.await;
+        info
+    });
+
+    let inputs = |model: &str, images: Option<bool>| ModelInputs {
+        model: model.to_owned(),
+        images,
+    };
+    assert_eq!(
+        info.model_inputs,
+        vec![
+            inputs(MODEL_FLASH, Some(true)),
+            inputs(MODEL_PRO, Some(false)),
+            inputs("an-unlisted-model", None),
+        ],
+        "one entry per offered model, in the order they are offered"
+    );
+    assert_eq!(
+        info.model_inputs
+            .iter()
+            .map(|entry| entry.model.as_str())
+            .collect::<Vec<_>>(),
+        info.models,
+        "the entries are the offered models, no more and no fewer"
+    );
+}
+
 /// The whole point of the request: a turn that would otherwise run to its budget stops
 /// when a client asks it to, and everyone watching is told why it stopped.
 ///
