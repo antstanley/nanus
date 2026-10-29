@@ -6,6 +6,8 @@ Current behavior and architecture remain documented in [the documentation index]
 
 ## Change specs
 
+- [A System One reviewer for tool-call approval (`reviewed`)](changes/2026-10-29-system_one_permission_reviewer.md) — Proposed 2026-10-29; nothing is implemented. Proposes a fourth approval state between `permitted` and `all_calls`. A call `permitted` would ask about is first put to a decision model as five yes/no questions, and nanus combines the answers against wide margins. The reviewer may grant the call once or pass it to the person; it never denies. A fixed list of credential, privilege, remote-code and force-push calls is never reviewed. Presets: `openai` (`gpt-6-luna` at `/v1/decisions`, platform key only) and `inception` (`mercury-decide`), both reusing the provider's own key and followed by default under `reviewer = "provider"`; `typesafe` (`jev-1.14.0`); `openrouter`; a local `laya`; and a custom endpoint. Adds the `DecisionPort`, a new crate `nanus-adapter-systemone` speaking the System One and OpenAI dialects, link protocol v13 with a `reviewed` frame and `SetApproval` refusals, a canary check, and an eval corpus with zero false grants as the bar.
+
 - [Host tools — a supported registration hook and declared destructiveness](changes/2026-10-29-host_tools.md) — Implemented locally 2026-10-29, unpublished: `Pending::with_tools` and `host_tools::register` give an embedding host a checked way to add its own tools, run inside `start` so the count and first request agree; tools declare `Destructive::{Never, ByCommand, Always}` and an undeclared one is asked about under `permitted` (owner decision: fail closed). Stock tools are declared so their behaviour is unchanged. Guide in [`docs/host-tools.md`](../docs/host-tools.md); worked example in `examples/embedded/tests/host_tool.rs`. Native Windows not run.
 
 - [Bounded, recoverable context management](changes/2026-10-05-context_management.md) — Implemented locally, unpublished: opt-in managed context with fragment selection, context tools, checkpoints, recall, shell archives and retiring deletion; deterministic acceptance on macOS; live provider acceptance and the held-out evaluation (T34) not run. Contract in [`docs/context-management.md`](../docs/context-management.md).
@@ -34,6 +36,8 @@ Current behavior and architecture remain documented in [the documentation index]
 - [read_video design review and verification](changes/2026-10-01-read_video_extension.review.md) — Independent semi-formal findings, fixes and successful recheck; records schema checks and repository gate results.
 
 ## Research
+
+- [System One decision-model research](research/2026-10-29-system_one_models.md) — Desk research on 2026-10-29. Of the five installed providers, OpenAI and Inception offer first-party decision APIs; Anthropic, DeepSeek and z.ai do not. Covers the two wire dialects (TypeSafe's System One shape, which Inception, Laya and OpenRouter share, and OpenAI's own), and speed, cost and accuracy figures, all vendor-reported or from a single third party. No paid request or local model run was made.
 
 - [Exact z.ai API admission review](changes/2026-10-03-zai_api_admission.review.md) — local
   model/endpoint effort, text/output and function-tool contracts; captured fixtures do not

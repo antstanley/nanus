@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dwarf jay — takeoff study</title>
+<style>
+:root{color-scheme:light;font-family:system-ui,sans-serif;background:#e7e9df;color:#2d4549}
+body{max-width:900px;margin:0 auto;padding:24px}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+h1{font:normal 26px Georgia,serif;margin:0 0 14px}header span{font-size:12px;color:#637b72}
+.stage{aspect-ratio:1;position:relative;background:#f5f1e7;box-shadow:0 8px 32px #2d454918}
+object{display:block;width:100%;height:100%}
+.controls{display:flex;gap:10px;align-items:center;padding:18px 0;flex-wrap:wrap}
+button,a{border:1px solid #a6b5a1;border-radius:5px;background:#f5f1e7;color:#2d4549;padding:9px 14px;font:inherit;font-size:13px;text-decoration:none;cursor:pointer}
+button:hover,a:hover{background:#d6e0d0}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #6488aa;outline-offset:3px}
+input{flex:1;min-width:100px;accent-color:#6488aa}output{font-size:12px;min-width:108px;font-variant-numeric:tabular-nums}
+p{font-size:13px;line-height:1.7;color:#637b72}.links{display:flex;gap:10px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<header><h1>Dwarf jay — takeoff study</h1><span>Fixed camera · 144 frames · 24 fps</span></header>
+<div class="stage"><object id="animation" type="image/svg+xml" data="dwarf-jay-takeoff.svg" aria-label="Dwarf jay taking off from a mossy branch"><img src="frames/frame-000.png" width="960" height="960" alt="Dwarf jay perched on a mossy branch"></object></div>
+<div class="controls">
+<button id="play" type="button" disabled>Pause</button>
+<button id="replay" type="button" disabled>Replay</button>
+<label for="scrub" hidden>Animation frame</label>
+<input id="scrub" type="range" min="0" max="143" value="0" step="1" aria-label="Animation frame" disabled>
+<output id="time" for="scrub">0.00s / 6.00s</output>
+</div>
+<p>The jay crouches, opens its wings, pushes away from the perch and flaps out of the upper-left edge. The branch, woodland, captions, view and scale stay fixed. After a pause on the empty branch, the six-second sequence repeats.</p>
+<div class="links"><a href="dwarf-jay-takeoff.svg">Animated SVG</a><a href="dwarf-jay-takeoff.gif">Looping GIF</a><a href="dwarf-jay-takeoff.mp4">MP4 video</a><a href="contact-sheet.png">Frame contact sheet</a></div>
+<p>Each frame was posed and rendered through <code>vectorcraft-cli mcp</code>. The SVG animates the vector path coordinates from those same poses; it contains no raster images.</p>
+<script>
+const object=document.getElementById('animation');
+const play=document.getElementById('play');
+const replay=document.getElementById('replay');
+const scrub=document.getElementById('scrub');
+const output=document.getElementById('time');
+let svg,paused=false;
+object.addEventListener('load',()=>{
+  try{svg=object.contentDocument.documentElement;if(!svg.setCurrentTime)throw Error('No SVG timeline');}
+  catch(e){output.textContent='Open SVG to play';return;}
+  play.disabled=replay.disabled=scrub.disabled=false;
+  paused=matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if(paused)svg.pauseAnimations();
+  play.textContent=paused?'Play':'Pause';
+  function tick(){
+    if(!paused){const t=svg.getCurrentTime()%6;scrub.value=Math.min(143,Math.floor(t*24));output.textContent=`${t.toFixed(2)}s / 6.00s`;}
+    requestAnimationFrame(tick);
+  }
+  tick();
+});
+play.addEventListener('click',()=>{paused=!paused;paused?svg.pauseAnimations():svg.unpauseAnimations();play.textContent=paused?'Play':'Pause';});
+replay.addEventListener('click',()=>{svg.setCurrentTime(0);svg.unpauseAnimations();paused=false;play.textContent='Pause';});
+scrub.addEventListener('input',()=>{svg.pauseAnimations();paused=true;play.textContent='Play';const t=Number(scrub.value)/24;svg.setCurrentTime(t);output.textContent=`${t.toFixed(2)}s / 6.00s`;});
+</script>
+</body>
+</html>
