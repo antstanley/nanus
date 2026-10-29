@@ -99,6 +99,14 @@ fn the_built_in_defaults_are_the_documented_ones() {
     assert_eq!(config.config_version, CONFIG_VERSION);
     assert!(config.system_prompt.is_none());
     assert!(config.workspace_root.is_none());
+    assert!(
+        config.remember_selection,
+        "a change of selection is remembered unless the file says otherwise"
+    );
+    assert!(
+        config.selection_file.is_none(),
+        "the record's place is the home's unless the file names one"
+    );
 }
 
 #[test]
@@ -210,6 +218,39 @@ fn markdown_rendering_can_be_turned_off() {
     let reloaded = NanusConfig::load(Some(&written)).expect("reload");
     assert!(!reloaded.markdown);
     assert!(!reloaded.mermaid);
+}
+
+#[test]
+fn the_remembered_selection_can_be_moved_or_turned_off_and_survives_a_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "remember_selection = false\nselection_file = \"/elsewhere/selection.toml\"\n",
+    )
+    .expect("seed");
+    let config = NanusConfig::load(Some(&path)).expect("load");
+    assert!(!config.remember_selection);
+    assert_eq!(
+        config.selection_file.as_deref(),
+        Some(Path::new("/elsewhere/selection.toml"))
+    );
+    config.save_to(&path).expect("save");
+    assert_eq!(NanusConfig::load_from(&path).expect("reload"), config);
+
+    // A file written before the fields existed reads as the defaults, at the same version: an
+    // added field with a default is not a migration.
+    std::fs::write(&path, "config_version = 1\nmodel = \"deepseek-flash\"\n").expect("seed");
+    let older = NanusConfig::load(Some(&path)).expect("load");
+    assert!(older.remember_selection);
+    assert_eq!(older.selection_file, None);
+    assert_eq!(older.config_version, CONFIG_VERSION);
+
+    std::fs::write(&path, "remember_selection = \"no\"\n").expect("seed invalid");
+    assert!(
+        NanusConfig::load_from(&path).is_err(),
+        "a switch that is not a boolean is refused rather than read as on"
+    );
 }
 
 #[test]

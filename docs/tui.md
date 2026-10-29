@@ -800,7 +800,8 @@ command to set one, because the switch *is* the setting.
 Nothing is written unless something is **changed**. Opening the interface and quitting leaves the
 configuration exactly as it was, which is what keeps a file edited later from being overridden by a
 run that asked for nothing different. Deleting `selection.toml` makes the configuration the whole
-answer again.
+answer again. The configuration can put the record elsewhere (`selection_file`) or keep none
+(`remember_selection = false`); see [features](features.md#what-the-next-start-begins-from).
 
 The stored effort is the step in force rather than the configuration's own field, so a step the
 configuration cannot name — `none`, `max` — is remembered as itself rather than rounded to a

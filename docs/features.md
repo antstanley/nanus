@@ -441,7 +441,16 @@ model in the interface and quitting is how the default is changed.
 The record is written on a **change** and never on a start: merely opening the interface does not
 pin the configuration, so a file edited afterwards is still what an untouched run uses. Deleting
 `selection.toml` makes the configuration the whole answer again, and `nanus config` reports the
-selection a run would actually use, record included.
+selection a run would actually use, record included, and the file it was read from.
+
+Where the record lives is the configuration's decision, and one decision covers both halves: the
+start that reads it and the change that writes it. `selection_file` names another file — an
+absolute path as it is, a relative one inside the nanus home rather than the working directory, so a
+service and a terminal agree — and `remember_selection = false` keeps none at all: nothing is read at
+a start, nothing is written on a change, and the configuration is the whole answer every time. The
+sessions stay in the nanus home either way. That is what lets an embedding host keep a default of its
+own: its model switches go to its file, a terminal's go to the home's, and both see the same
+sessions.
 
 Two details are deliberate. The record stores the plan with the provider and a model with either,
 because a provider without them would send the previous provider's model to the new host. And it
@@ -554,6 +563,8 @@ this build offers.
 | `workspace_root`        | the current directory             | root the tools are confined to                                                                                            |
 | `service_socket`        | `<nanus home>/run/agent.sock`     | where a service listens                                                                                                   |
 | `service_log`           | `<nanus home>/nanus-service.log`  | where a detached service writes                                                                                           |
+| `remember_selection`    | `true`                            | remember a change of provider, model or effort for the next start; false reads and writes no selection file              |
+| `selection_file`        | `<nanus home>/selection.toml`     | where that record is kept; a relative path is inside the nanus home                                                       |
 | `config_version`        | the build's version               | the schema the file was written with; a newer one is refused, and a missing one is read as the pre-1.0 shape and migrated |
 
 Environment variables:

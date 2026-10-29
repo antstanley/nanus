@@ -166,6 +166,7 @@ thinks it is:
 ```console
 $ nanus config
 config file: /Users/you/.config/nanus/config.toml
+selection file: /Users/you/.config/nanus/selection.toml
 provider: deepseek (plan api)
 model: deepseek-flash
 endpoint: https://api.deepseek.com

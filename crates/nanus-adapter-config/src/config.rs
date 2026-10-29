@@ -305,6 +305,21 @@ pub struct NanusConfig {
     /// A detached process has no terminal, so without this its diagnostics go nowhere at
     /// all. Defaults to `<nanus home>/nanus-service.log`.
     pub service_log: Option<PathBuf>,
+    /// Whether a change of provider, model, or effort is remembered for the next start.
+    ///
+    /// On by default: the interface changes the selection of a running agent, and the record of
+    /// that change is what the next start begins from. `false` means no selection file is read
+    /// or written at all, so this configuration is the whole answer at every start — for an
+    /// embedding host that keeps its own default, or a deployment that wants this file to be
+    /// the only durable state.
+    pub remember_selection: bool,
+    /// Where the remembered selection is read from and written to.
+    ///
+    /// Defaults to `<nanus home>/selection.toml`. Read only when `remember_selection` is on. A
+    /// relative path is taken inside the nanus home, not the working directory, so a service and
+    /// a terminal started in different directories still agree on one file. Setting it gives an
+    /// embedding host a default of its own while its sessions stay in the shared home.
+    pub selection_file: Option<PathBuf>,
 }
 
 impl Default for NanusConfig {
@@ -334,6 +349,8 @@ impl Default for NanusConfig {
             workspace_root: None,
             service_socket: None,
             service_log: None,
+            remember_selection: true,
+            selection_file: None,
         }
     }
 }
