@@ -183,6 +183,7 @@ dependencies = [
  "process-wrap",
  "thiserror",
  "tokio",
+ "windows",
  "winsafe",
 ]
 
