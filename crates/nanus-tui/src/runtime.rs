@@ -138,7 +138,8 @@ fn no_color_requested(value: Option<&OsStr>) -> bool {
 /// The file is the same one the core reads, resolved the same way — the explicit path is
 /// not a parameter because the interface is a separate process, given the socket and the
 /// conversation and nothing else, and `NANUS_CONFIG` and the platform location reach both
-/// programs equally.
+/// programs equally. `nanus tui` hands on a `--config` it was given as `NANUS_CONFIG`, so that
+/// path reaches both as well.
 ///
 /// # Errors
 ///

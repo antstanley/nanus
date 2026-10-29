@@ -28,6 +28,11 @@ reproducible rather than reconstructed.
       lock               the writer's pid    (optional, while held for writing)
 ```
 
+`<nanus home>` is the configuration's `home` when it names one, else `$NANUS_HOME`, else the
+platform's `<config dir>/nanus` — see [a home of its own](features.md#a-home-of-its-own). Every
+command that reads or writes sessions asks the same question, so a listing shows the sessions a
+run with the same configuration records.
+
 The key is a time-ordered uuid, so a directory listing sorts by creation. The name is a
 separate file beside the log, and that is deliberate:
 
@@ -449,4 +454,6 @@ each read back from the disk.
 - **Names are flat, and case does not distinguish them.** `Nightly` and `nightly` are one
   name and resolving either spelling finds it, while the spelling a session was named with is
   what a listing shows. There is no namespacing: grouping lives in the name itself.
-- **A name is per store, not per machine.** `$NANUS_HOME` decides which names exist.
+- **A name is per store, not per machine.** The nanus home decides which names exist: the
+  configuration's `home`, else `$NANUS_HOME`, else the platform default (see
+  [features](features.md#a-home-of-its-own)).

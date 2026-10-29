@@ -118,7 +118,8 @@ fn formats() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 async fn key(account: &str) -> String {
-    let secrets = nanus_bundle::compose::open_secrets().unwrap();
+    let secrets =
+        nanus_bundle::compose::open_secrets(&nanus_adapter_config::NanusConfig::default()).unwrap();
     let secret = secrets.get(account).await.unwrap().unwrap();
     assert!(!secret.is_blank(), "no credential stored for {account}");
     secret.expose().to_owned()

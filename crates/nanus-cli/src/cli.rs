@@ -504,8 +504,8 @@ pub async fn prepare() -> Result<Ready, String> {
         } => prepare_run(&options, &task, (resume, name), context).await,
         // Showing the configuration prints and is finished.
         Command::Config => show_config(&options).await.map(|()| Ready::Done),
-        Command::Auth { action } => prepare_auth(action).await,
-        Command::Sessions { action } => prepare_sessions(action).await,
+        Command::Auth { action } => prepare_auth(&options, action).await,
+        Command::Sessions { action } => prepare_sessions(&options, action).await,
         Command::Tui {
             session,
             scroll,
@@ -584,6 +584,10 @@ pub enum Ready {
         pending: Box<compose::Pending>,
         /// The workspace a session is created against.
         workspace: PathBuf,
+        /// The nanus home the agent runs in, where its socket is bound.
+        home: PathBuf,
+        /// The configuration file this command was given, for the interface to read too.
+        config_file: Option<PathBuf>,
         /// What to tell the interface beyond which socket to use.
         arguments: Vec<OsString>,
     },
@@ -591,6 +595,8 @@ pub enum Ready {
     Spawn {
         /// The arguments to hand the interface program.
         arguments: Vec<OsString>,
+        /// The configuration file this command was given, for the interface to read too.
+        config_file: Option<PathBuf>,
     },
     /// Serve an agent until a signal or a client asks it to stop.
     Serve {
@@ -657,9 +663,20 @@ pub fn finish(ready: Ready) -> Result<(), String> {
         Ready::Tui {
             pending,
             workspace,
+            home,
+            config_file,
             arguments,
-        } => crate::tui::attached(*pending, &workspace, &arguments),
-        Ready::Spawn { arguments } => crate::tui::alone(&arguments),
+        } => crate::tui::attached(
+            *pending,
+            &workspace,
+            &home,
+            config_file.as_deref(),
+            &arguments,
+        ),
+        Ready::Spawn {
+            arguments,
+            config_file,
+        } => crate::tui::alone(&arguments, config_file.as_deref()),
         Ready::Serve {
             pending,
             workspace,
@@ -739,7 +756,9 @@ async fn prepare_run(
     // the turn means a name somebody else holds costs a sentence instead of a turn, and
     // leaves no unnamed session behind as the evidence of it.
     if let Some(asked) = &name {
-        let store = open_store().await.map_err(|error| error.to_string())?;
+        let store = open_store(&config)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some(existing) = store
             .resolve(asked)
             .await
@@ -808,6 +827,7 @@ async fn prepare_tui(
         }
         return Ok(Ready::Spawn {
             arguments: with_approval(arguments, args.approval),
+            config_file: args.config.clone(),
         });
     }
     // Which conversation, carried through to the interface's own command line.
@@ -815,9 +835,12 @@ async fn prepare_tui(
     if !connect {
         let pending = compose(&config).await.map_err(|error| error.to_string())?;
         let workspace = compose::workspace_root(&config).map_err(|error| error.to_string())?;
+        let home = crate::service::home(&config)?;
         return Ok(Ready::Tui {
             pending: Box::new(pending),
             workspace,
+            home,
+            config_file: args.config.clone(),
             arguments: choice,
         });
     }
@@ -840,7 +863,10 @@ async fn prepare_tui(
     }
     let mut arguments = vec![OsString::from("--link"), OsString::from(socket.as_os_str())];
     arguments.extend(choice);
-    Ok(Ready::Spawn { arguments })
+    Ok(Ready::Spawn {
+        arguments,
+        config_file: args.config.clone(),
+    })
 }
 
 /// Builds the interface's instruction about which conversation to open.
@@ -1544,9 +1570,12 @@ fn finish_harness(harness: &Harness) -> Result<(), String> {
 /// Stores, removes, or reports the provider credentials.
 ///
 /// Needs no model and no session store, so it works before anything is configured —
-/// which is the point: the first thing a new install does is store a key.
-async fn prepare_auth(action: AuthAction) -> Result<Ready, String> {
-    let secrets = compose::open_secrets().map_err(|error| error.to_string())?;
+/// which is the point: the first thing a new install does is store a key. The configuration
+/// is read all the same, because it decides where a key goes — the home's file store and the
+/// platform store's service name — and a key filed anywhere else would not be found by a run.
+async fn prepare_auth(args: &Options, action: AuthAction) -> Result<Ready, String> {
+    let config = load(args)?;
+    let secrets = compose::open_secrets(&config).map_err(|error| error.to_string())?;
     match action {
         AuthAction::Set { provider } => {
             let account = key_account(&provider)?;
@@ -1786,7 +1815,13 @@ async fn read_credential() -> Result<String, String> {
 /// Prints the effective configuration.
 async fn show_config(args: &Options) -> Result<(), String> {
     let mut config = load(args)?;
-    let home = compose::store_home().ok();
+    // A configured home that is refused is refused here too, with the sentence a run would give;
+    // only a platform that cannot name a home at all is reported as unknown.
+    let home = match compose::store_home(&config) {
+        Ok(home) => Some(home),
+        Err(error @ nanus_bundle::BundleError::Config(_)) => return Err(error.to_string()),
+        Err(_) => None,
+    };
     let (remembered_effort, selection_file) = apply_selection_record(&mut config, home.as_deref())?;
     // Resolved rather than echoed: the file may name none of the provider, plan, or
     // model, and what a run will actually use is the useful answer. A configuration
@@ -1800,8 +1835,16 @@ async fn show_config(args: &Options) -> Result<(), String> {
         |_| String::from("<unavailable>"),
         |path| path.display().to_string(),
     );
-    let credential = credential_state(&selection).await;
+    // A service name the configuration spells unusably is refused as a run would refuse it; a
+    // store that is merely unavailable is reported in the credential's line instead.
+    let secrets = match compose::open_secrets(&config) {
+        Ok(secrets) => Some(secrets),
+        Err(error @ nanus_bundle::BundleError::Config(_)) => return Err(error.to_string()),
+        Err(_) => None,
+    };
+    let credential = credential_state(secrets.as_ref(), &selection).await;
     println!("config file: {path}");
+    println!("nanus home: {}", home_display(home.as_deref()));
     println!("selection file: {selection_file}");
     println!(
         "provider: {} (plan {})",
@@ -1853,7 +1896,32 @@ async fn show_config(args: &Options) -> Result<(), String> {
         "credential: {credential} for {} ({source})",
         selection.credential_account()
     );
+    println!(
+        "credential service: {}",
+        credential_service_display(&config)
+    );
     Ok(())
+}
+
+/// Renders the nanus home a run would use, or says it cannot be named.
+fn home_display(home: Option<&Path>) -> String {
+    home.map_or_else(
+        || String::from("unknown (no home directory can be determined)"),
+        |home| home.display().to_string(),
+    )
+}
+
+/// Renders the name credentials are filed under in the platform store.
+///
+/// Printed beside the credential because it is half of where a key is looked for: `security
+/// find-generic-password -s <service> -a <account>` is the item a reader would inspect.
+fn credential_service_display(config: &NanusConfig) -> String {
+    let service = compose::credential_service(config);
+    if config.credential_service.is_some() {
+        service.to_owned()
+    } else {
+        format!("{service} (the default)")
+    }
 }
 
 /// Applies the selection record a run would start from, and names the file it is kept in.
@@ -1890,8 +1958,11 @@ fn apply_selection_record(
 }
 
 /// Reports whether a credential is present, without printing it.
-async fn credential_state(selection: &Selection) -> String {
-    let Ok(secrets) = compose::open_secrets() else {
+async fn credential_state(
+    secrets: Option<&nanus_ports::SecretHandle>,
+    selection: &Selection,
+) -> String {
+    let Some(secrets) = secrets else {
         return String::from("unknown (the credential stores are unavailable)");
     };
     match secrets.get(selection.credential_account()).await {
@@ -1967,8 +2038,13 @@ fn workspace_display(config: &NanusConfig) -> String {
 ///
 /// No harness is composed: listing and naming sessions needs no model, so both work
 /// without a configured key.
-async fn prepare_sessions(action: Option<SessionsAction>) -> Result<Ready, String> {
-    let store = open_store().await.map_err(|error| error.to_string())?;
+async fn prepare_sessions(args: &Options, action: Option<SessionsAction>) -> Result<Ready, String> {
+    // The configuration decides which home the sessions are in, so the ones listed here are the
+    // ones a run with the same configuration records.
+    let config = load(args)?;
+    let store = open_store(&config)
+        .await
+        .map_err(|error| error.to_string())?;
     match action {
         None => Ok(Ready::List { store }),
         Some(SessionsAction::Name { name, session }) => Ok(Ready::Name {
@@ -2018,6 +2094,26 @@ fn print_sessions(store: &nanus_ports::StoreHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report says when the service is the shipped one rather than one the configuration
+    /// chose, and prints a chosen one exactly, as `security -s` would be given it.
+    #[test]
+    fn the_credential_service_is_reported_as_the_default_only_when_none_is_named() {
+        assert_eq!(
+            credential_service_display(&NanusConfig::default()),
+            "nanus (the default)"
+        );
+        let named = NanusConfig {
+            credential_service: Some(String::from("example-host")),
+            ..NanusConfig::default()
+        };
+        assert_eq!(credential_service_display(&named), "example-host");
+        let spelled_as_the_default = NanusConfig {
+            credential_service: Some(String::from("nanus")),
+            ..NanusConfig::default()
+        };
+        assert_eq!(credential_service_display(&spelled_as_the_default), "nanus");
+    }
 
     #[test]
     fn the_parser_accepts_a_run_with_a_multi_word_task() {

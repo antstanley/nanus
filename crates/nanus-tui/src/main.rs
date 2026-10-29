@@ -31,10 +31,11 @@
 #![allow(unreachable_pub)]
 
 use core::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use nanus_adapter_config::NanusConfig;
 use nanus_adapter_store::{JsonlStore, resolve_home};
 use nanus_domain::ApprovalPolicy;
 use nanus_link::paths::service_endpoint;
@@ -128,10 +129,11 @@ fn main() -> ExitCode {
 /// Returns a rendered message for any failure: a store that will not open, a session
 /// that does not exist, an agent that is not listening, or a terminal that is not there.
 fn run(args: &Args) -> Result<(), String> {
+    let home = configured_home()?;
     // One store for both modes: a recording is loaded from it, and a live conversation
     // reads its history out of it — the agent owns the session, but the store is where
     // what it has already said is written down.
-    let store = block_on(open_store())?;
+    let store = block_on(open_store(&home))?;
     // A live conversation has no history to open part way into, so `--scroll` without
     // `--session` is a request that cannot be honoured. Refused rather than ignored.
     if args.scroll > 0 && args.session.is_none() {
@@ -142,7 +144,7 @@ fn run(args: &Args) -> Result<(), String> {
     if let Some(requested) = &args.session {
         return view(&store, requested.as_deref(), args.scroll, args.approval);
     }
-    let socket = args.socket()?;
+    let socket = args.socket(&home)?;
     let target = args.resume.as_ref().map_or_else(
         || Target::New {
             name: args.name.clone(),
@@ -168,28 +170,64 @@ fn run(args: &Args) -> Result<(), String> {
 impl Args {
     /// Returns the socket to connect to.
     ///
-    /// `--link` names one; with no flag the service's socket is the only candidate, which
-    /// is why a bare `nanus-tui` needs no mode of its own.
+    /// `--link` names one; with no flag the service's socket in `home` is the only candidate,
+    /// which is why a bare `nanus-tui` needs no mode of its own.
     ///
     /// # Errors
     ///
-    /// Returns a message when the nanus home cannot be resolved.
-    fn socket(&self) -> Result<PathBuf, String> {
+    /// Returns a message when the service's endpoint cannot be named.
+    fn socket(&self, home: &Path) -> Result<PathBuf, String> {
         if let Some(path) = &self.link {
             return Ok(path.clone());
         }
-        let home = resolve_home(None).map_err(|error| error.to_string())?;
-        service_endpoint(&home).map_err(|error| error.to_string())
+        service_endpoint(home).map_err(|error| error.to_string())
     }
 }
 
-/// Opens the session store.
+/// Returns the nanus home the configuration names, by the rule the core follows.
+///
+/// The configuration's `home`, then `NANUS_HOME`, then the platform's default — the order the
+/// composition resolves it in, because this program reads the sessions an agent records and
+/// must open the store the agent opened. The file is the one the core reads: `NANUS_CONFIG`,
+/// which `nanus tui` sets when it was given `--config`, or the platform location.
 ///
 /// # Errors
 ///
-/// Returns a message when the home cannot be resolved or the store cannot be opened.
-async fn open_store() -> Result<StoreHandle, String> {
-    let home = resolve_home(None).map_err(|error| error.to_string())?;
+/// Returns a message when the configuration cannot be read, names a home that is refused, or
+/// no home can be determined at all.
+fn configured_home() -> Result<PathBuf, String> {
+    let config = NanusConfig::load(None)
+        .map_err(|error| format!("the configuration could not be read: {error}"))?;
+    home_of(&config)
+}
+
+/// Returns the nanus home `config` names, by the rule the core follows.
+///
+/// A function of the configuration rather than of the file, so the rule is testable without a
+/// file or an environment: the core's `compose::store_home` is the other half, and this
+/// program cannot link it.
+///
+/// # Errors
+///
+/// Returns a message naming `home` when the configuration's home is refused, and the
+/// resolver's own message when no home can be determined at all.
+fn home_of(config: &NanusConfig) -> Result<PathBuf, String> {
+    // Named as the core names it, so a refused `home` reads the same from either program.
+    resolve_home(config.home.as_deref()).map_err(|error| {
+        if config.home.is_some() {
+            format!("`home`: {error}")
+        } else {
+            error.to_string()
+        }
+    })
+}
+
+/// Opens the session store in `home`.
+///
+/// # Errors
+///
+/// Returns a message when the store cannot be opened.
+async fn open_store(home: &Path) -> Result<StoreHandle, String> {
     JsonlStore::new(home)
         .await
         .map(JsonlStore::handle)
@@ -202,4 +240,34 @@ async fn open_store() -> Result<StoreHandle, String> {
 /// follows owns its own task set. Doing both in one `block_on` would nest them.
 fn block_on<F: Future>(future: F) -> F::Output {
     nanus_kernel::runtime::block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A home the configuration names is the home this program opens its store in, whatever
+    /// `NANUS_HOME` says, and a relative one is refused with the field named, as the core
+    /// refuses it.
+    #[test]
+    fn a_configured_home_is_the_home_and_a_relative_one_is_refused() {
+        let chosen = std::env::temp_dir().join("nanus-test-example-host");
+        let named = NanusConfig {
+            home: Some(chosen.clone()),
+            ..NanusConfig::default()
+        };
+        assert_eq!(home_of(&named), Ok(chosen));
+        for relative in ["example-host", ""] {
+            let refused = home_of(&NanusConfig {
+                home: Some(PathBuf::from(relative)),
+                ..NanusConfig::default()
+            });
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|reason| reason.contains("`home`")),
+                "{relative:?}: {refused:?}"
+            );
+        }
+    }
 }

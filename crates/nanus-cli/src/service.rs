@@ -83,13 +83,17 @@ pub enum Start {
     },
 }
 
-/// Returns the nanus home, where sockets and the default log live.
+/// Returns the nanus home a configuration runs in, where sockets and the default log live.
+///
+/// The same answer the composition gives for its sessions, so a service's run directory is
+/// in the home whose sessions it serves.
 ///
 /// # Errors
 ///
-/// Returns a message when no home directory can be determined.
-pub fn home() -> Result<PathBuf, String> {
-    nanus_bundle::compose::store_home().map_err(|error| error.to_string())
+/// Returns a message when no home directory can be determined, or the configuration names
+/// one that is refused.
+pub fn home(config: &NanusConfig) -> Result<PathBuf, String> {
+    nanus_bundle::compose::store_home(config).map_err(|error| error.to_string())
 }
 
 /// Returns the socket a service should listen on.
@@ -101,7 +105,7 @@ pub fn socket_path(config: &NanusConfig, explicit: Option<&Path>) -> Result<Path
     if let Some(path) = explicit.or(config.service_socket.as_deref()) {
         return Ok(path.to_path_buf());
     }
-    service_endpoint(&home()?).map_err(|error| error.to_string())
+    service_endpoint(&home(config)?).map_err(|error| error.to_string())
 }
 
 /// Returns the file a detached service logs to.
@@ -113,7 +117,7 @@ pub fn log_path(config: &NanusConfig, explicit: Option<&Path>) -> Result<PathBuf
     if let Some(path) = explicit.or(config.service_log.as_deref()) {
         return Ok(path.to_path_buf());
     }
-    Ok(home()?.join(DEFAULT_LOG))
+    Ok(home(config)?.join(DEFAULT_LOG))
 }
 
 /// Starts the service, or decides to serve it here.
@@ -469,11 +473,42 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn with_neither_the_default_matches_the_sid_endpoint_the_client_computes() {
-        let expected = service_endpoint(&home().unwrap()).unwrap();
+        let expected = service_endpoint(&home(&config()).unwrap()).unwrap();
         let chosen = socket_path(&config(), None).unwrap();
         assert_eq!(chosen, expected);
         assert!(chosen.to_str().unwrap().starts_with(r"\\.\pipe\nanus-S-1-"));
         assert!(chosen.to_str().unwrap().ends_with("-agent"));
+    }
+
+    /// A configuration's home moves the socket and the log a service defaults to, so a service
+    /// started for an embedding host's home listens in that home rather than the terminal's.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_socket_and_log_follow_a_configured_home() {
+        let configured = NanusConfig {
+            home: Some(PathBuf::from("/srv/example-host/nanus")),
+            ..config()
+        };
+        assert_eq!(
+            socket_path(&configured, None).ok(),
+            Some(PathBuf::from("/srv/example-host/nanus/run/agent.sock"))
+        );
+        assert_eq!(
+            log_path(&configured, None).ok(),
+            Some(PathBuf::from("/srv/example-host/nanus").join(DEFAULT_LOG))
+        );
+        let relative = NanusConfig {
+            home: Some(PathBuf::from("example-host")),
+            ..config()
+        };
+        let refused = socket_path(&relative, None);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|reason| reason.contains("`home`")),
+            "a relative home is refused rather than put under the working directory: {refused:?}"
+        );
+        assert!(log_path(&relative, None).is_err());
     }
 
     #[test]

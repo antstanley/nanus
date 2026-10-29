@@ -36,6 +36,26 @@ text, not a tool: the system prompt is a plain string the host supplies.
 
 Both use the same tool types from `nanus-domain`, so a tool written for one works in the other.
 
+A stock composition keeps its state — sessions, the archive, file-backed credentials, the
+remembered selection — in a nanus home, shared by default with the terminal `nanus`. A host that
+wants its own sets two fields on the `NanusConfig` it passes to `compose`; no environment
+variable is needed:
+
+```rust
+let config = NanusConfig {
+    home: Some(host_data_dir.join("nanus")), // absolute; a relative one is refused
+    credential_service: Some(String::from("example-host")), // the keychain service name
+    ..NanusConfig::default()
+};
+let pending = compose(&config).await?;
+let store = nanus_bundle::compose::open_store(&config).await?; // the same sessions
+let secrets = nanus_bundle::compose::open_secrets(&config)?; // the same credential chain
+```
+
+The configuration's `home` wins over `NANUS_HOME`, so a host started from a terminal that
+exported it is not moved into the terminal's home. See
+[a home of its own](features.md#a-home-of-its-own).
+
 ### Stock composition: `Pending::with_tools`
 
 `compose(&config).await` builds the adapters, and `Pending::start()` mounts the kernel and

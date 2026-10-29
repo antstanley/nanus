@@ -6,6 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Write as _;
+use std::path::Path;
 
 use nanus_adapter_store::{JsonlStore, new_session_id};
 use nanus_domain::{Session, SessionEvent, SessionId, TurnEndReason, reads_session_version};
@@ -513,6 +514,17 @@ async fn resolve_home_prefers_its_explicit_argument() {
     let dir = tempfile::tempdir().expect("tempdir");
     let resolved = nanus_adapter_store::resolve_home(Some(dir.path())).expect("resolve");
     assert_eq!(resolved, dir.path());
+}
+
+#[test]
+fn an_explicit_home_that_is_relative_or_empty_is_refused() {
+    for named in ["nanus-home", "./nanus-home", ""] {
+        let refused = nanus_adapter_store::resolve_home(Some(Path::new(named)));
+        assert!(
+            matches!(refused, Err(StoreError::HomeUnavailable { .. })),
+            "{named:?} is refused rather than resolved against the working directory: {refused:?}"
+        );
+    }
 }
 
 proptest::proptest! {

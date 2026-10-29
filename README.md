@@ -166,6 +166,7 @@ thinks it is:
 ```console
 $ nanus config
 config file: /Users/you/.config/nanus/config.toml
+nanus home: /Users/you/.config/nanus
 selection file: /Users/you/.config/nanus/selection.toml
 provider: deepseek (plan api)
 model: deepseek-flash
@@ -184,6 +185,7 @@ workspace root: <the current directory>
 service socket: /Users/you/.config/nanus/run/agent.sock
 service log: /Users/you/.config/nanus/nanus-service.log
 credential: not set for deepseek (fallback DEEPSEEK_API_KEY)
+credential service: nanus (the default)
 
 $ nanus auth status
 credential stores: keychain+file+environment

@@ -183,7 +183,7 @@ fn without_the_option_a_change_is_remembered_in_the_home() {
     }
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = workspace(dir.path());
-    let home = store_home().expect("the child has a home");
+    let home = store_home(&config(&workspace)).expect("the child has a home");
     let settings = config(&workspace);
 
     let harness = start(&settings);
@@ -226,7 +226,7 @@ fn a_named_selection_file_takes_the_change_and_the_homes_record_is_untouched() {
     }
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = workspace(dir.path());
-    let home = store_home().expect("the child has a home");
+    let home = store_home(&config(&workspace)).expect("the child has a home");
     let before = the_homes_record(&home);
     let file = dir.path().join("host").join("selection.toml");
     let settings = NanusConfig {
@@ -282,7 +282,7 @@ fn with_remembering_off_no_selection_file_is_read_or_written() {
     }
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = workspace(dir.path());
-    let home = store_home().expect("the child has a home");
+    let home = store_home(&config(&workspace)).expect("the child has a home");
     let before = the_homes_record(&home);
     let unused = dir.path().join("host").join("selection.toml");
     let settings = NanusConfig {

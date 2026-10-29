@@ -197,50 +197,91 @@ impl SecretBackend for EnvBackend {
 /// The file is written atomically: a sibling temporary file, a sync, and a
 /// rename. A half-written secret would be a credential that authenticates as
 /// nothing, which is worse than a write that visibly failed.
+///
+/// The service name keeps credentials apart here as it does in the platform store.
+/// [`crate::DEFAULT_SERVICE`] files under `<home>/secrets`, where every install before
+/// service names existed already has its files; any other name files under
+/// `<home>/service-secrets/<service>`, a directory no default account can collide with,
+/// so two agents that share a home but not a service name never read each other's keys.
 #[derive(Clone, Debug)]
 pub struct FileBackend {
     root: PathBuf,
+    others: PathBuf,
 }
 
+/// The directory, under a home, that holds a directory per non-default service name.
+const SERVICE_SECRETS: &str = "service-secrets";
+
 impl FileBackend {
-    /// Creates a backend that files secrets under `<home>/secrets`.
+    /// Creates a backend that files secrets under `<home>/secrets`, or under
+    /// `<home>/service-secrets/<service>` for a service name other than the default.
     #[must_use]
     pub fn new(home: &Path) -> Self {
         Self {
             root: home.join("secrets"),
+            others: home.join(SERVICE_SECRETS),
         }
     }
 
-    /// Returns the directory secrets are filed under.
+    /// Returns the directory the default service's secrets are filed under.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Returns the file an account is stored in.
+    /// Returns the directory secrets filed under `service` are kept in.
+    ///
+    /// An unusable service name never becomes a directory outside the home: like an
+    /// unusable account in [`FileBackend::path`], it is refused before a store is asked
+    /// for it, and this fallback is the second line of defence.
     #[must_use]
-    pub fn path(&self, account: &str) -> PathBuf {
+    pub fn directory(&self, service: &str) -> PathBuf {
+        if service == crate::DEFAULT_SERVICE {
+            return self.root.clone();
+        }
+        if crate::valid_service(service) {
+            return self.others.join(service);
+        }
+        self.others.join("invalid")
+    }
+
+    /// Returns the file an account filed under `service` is stored in.
+    #[must_use]
+    pub fn path(&self, service: &str, account: &str) -> PathBuf {
         // An unusable name never becomes a path outside the secrets directory; the
         // name is validated before a store is asked for it, so this fallback is a
         // second line of defence rather than the first.
+        let directory = self.directory(service);
         if valid_account(account) {
-            return self.root.join(account);
+            return directory.join(account);
         }
-        self.root.join("invalid")
+        directory.join("invalid")
     }
 
-    /// Creates the secrets directory with owner-only permissions.
-    fn ensure_root(&self) -> Result<(), SecretError> {
-        std::fs::create_dir_all(&self.root).map_err(|error| {
+    /// Refuses a service name the file store cannot make a directory of.
+    fn usable(service: &str) -> Result<(), SecretError> {
+        if crate::valid_service(service) {
+            return Ok(());
+        }
+        Err(SecretError::invalid(format!(
+            "{service:?} is not a usable secret service name"
+        )))
+    }
+
+    /// Creates the directory `service` files under, with owner-only permissions.
+    fn ensure_directory(&self, service: &str) -> Result<PathBuf, SecretError> {
+        let directory = self.directory(service);
+        std::fs::create_dir_all(&directory).map_err(|error| {
             SecretError::refused(
                 "file",
                 "write",
                 "<store>",
-                format!("{}: {error}", self.root.display()),
+                format!("{}: {error}", directory.display()),
             )
         })?;
-        restrict(&self.root, 0o700)
-            .map_err(|error| SecretError::refused("file", "write", "<store>", error.to_string()))
+        restrict(&directory, 0o700)
+            .map_err(|error| SecretError::refused("file", "write", "<store>", error.to_string()))?;
+        Ok(directory)
     }
 }
 
@@ -251,11 +292,12 @@ impl SecretBackend for FileBackend {
 
     fn get<'a>(
         &'a self,
-        _service: &'a str,
+        service: &'a str,
         account: &'a str,
     ) -> LocalBoxFuture<'a, SecretResult<Option<Secret>>> {
         Box::pin(async move {
-            let path = self.path(account);
+            Self::usable(service)?;
+            let path = self.path(service, account);
             let bytes = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -281,13 +323,18 @@ impl SecretBackend for FileBackend {
 
     fn set<'a>(
         &'a self,
-        _service: &'a str,
+        service: &'a str,
         account: &'a str,
         secret: &'a str,
     ) -> LocalBoxFuture<'a, SecretResult<()>> {
         Box::pin(async move {
-            self.ensure_root()?;
-            let path = self.path(account);
+            Self::usable(service)?;
+            let directory = self.ensure_directory(service)?;
+            let path = self.path(service, account);
+            assert!(
+                path.starts_with(&directory),
+                "a secret is filed in its service's directory"
+            );
             write_private(&path, secret).map_err(|error| {
                 SecretError::refused(self.name(), "write", account, error.to_string())
             })?;
@@ -298,11 +345,12 @@ impl SecretBackend for FileBackend {
 
     fn clear<'a>(
         &'a self,
-        _service: &'a str,
+        service: &'a str,
         account: &'a str,
     ) -> LocalBoxFuture<'a, SecretResult<bool>> {
         Box::pin(async move {
-            let path = self.path(account);
+            Self::usable(service)?;
+            let path = self.path(service, account);
             match std::fs::remove_file(&path) {
                 Ok(()) => Ok(true),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -409,7 +457,11 @@ mod tests {
         // The file path follows: an unusable name never becomes a path outside the
         // secrets directory.
         let backend = FileBackend::new(Path::new("/tmp/nanus-test-home"));
-        assert!(backend.path("../elsewhere").starts_with(backend.root()));
+        assert!(
+            backend
+                .path("nanus", "../elsewhere")
+                .starts_with(backend.root())
+        );
     }
 
     /// The environment answers with the value when the variable is set, and with
@@ -473,6 +525,71 @@ mod tests {
         assert_eq!(again.ok(), Some(false));
     }
 
+    /// Two service names sharing a home share no file: a key filed under one is not
+    /// read, replaced, or cleared under the other, and the shipped name keeps the
+    /// layout every install before service names already has.
+    #[test]
+    fn a_file_secret_filed_under_one_service_is_not_read_under_another() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(home.path());
+        let host = "nanus-test-example-host";
+        let stored = futures::executor::block_on(backend.set(host, "openai", "sk-host"));
+        assert!(stored.is_ok(), "{stored:?}");
+        assert_eq!(
+            backend.path(host, "openai"),
+            home.path()
+                .join("service-secrets")
+                .join(host)
+                .join("openai")
+        );
+        assert_eq!(
+            futures::executor::block_on(backend.get("nanus", "openai")).ok(),
+            Some(None),
+            "the shipped name does not see the host's key"
+        );
+        assert_eq!(
+            futures::executor::block_on(backend.clear("nanus", "openai")).ok(),
+            Some(false),
+            "nor clear it"
+        );
+
+        assert!(futures::executor::block_on(backend.set("nanus", "openai", "sk-own")).is_ok());
+        assert_eq!(
+            backend.path("nanus", "openai"),
+            home.path().join("secrets").join("openai")
+        );
+        let read = |service| {
+            futures::executor::block_on(backend.get(service, "openai"))
+                .ok()
+                .flatten()
+                .map(|secret| secret.expose().to_owned())
+        };
+        assert_eq!(read(host), Some(String::from("sk-host")));
+        assert_eq!(read("nanus"), Some(String::from("sk-own")));
+    }
+
+    /// A service name the file store cannot make a directory of is refused by every
+    /// operation, and even the path it would have had stays inside the home.
+    #[test]
+    fn an_unusable_service_name_is_refused_by_the_file_store() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(home.path());
+        for service in ["", "..", "../elsewhere", "a/b", "Host", "-w"] {
+            assert!(backend.path(service, "openai").starts_with(home.path()));
+            let written = futures::executor::block_on(backend.set(service, "openai", "sk-x"));
+            assert!(
+                matches!(written, Err(SecretError::Invalid { .. })),
+                "{service:?}: {written:?}"
+            );
+            assert!(futures::executor::block_on(backend.get(service, "openai")).is_err());
+            assert!(futures::executor::block_on(backend.clear(service, "openai")).is_err());
+        }
+        assert!(
+            std::fs::read_dir(home.path()).is_ok_and(|mut entries| entries.next().is_none()),
+            "nothing was created for a refused name"
+        );
+    }
+
     /// The file a secret is written to is owner-only, which is the property that
     /// makes the fallback an acceptable place for a credential at all.
     #[cfg(unix)]
@@ -482,7 +599,8 @@ mod tests {
         let home = tempfile::tempdir().expect("temp dir");
         let backend = FileBackend::new(home.path());
         assert!(futures::executor::block_on(backend.set("nanus", "openai", "sk-perm")).is_ok());
-        let mode = std::fs::metadata(backend.path("openai")).map(|meta| meta.permissions().mode());
+        let mode = std::fs::metadata(backend.path("nanus", "openai"))
+            .map(|meta| meta.permissions().mode());
         assert_eq!(
             mode.ok().map(|mode| mode & 0o777),
             Some(0o600),
@@ -494,6 +612,14 @@ mod tests {
             Some(0o700),
             "the directory holding secrets is owner-only"
         );
+        let host = "nanus-test-example-host";
+        assert!(futures::executor::block_on(backend.set(host, "openai", "sk-perm")).is_ok());
+        let dir = std::fs::metadata(backend.directory(host)).map(|meta| meta.permissions().mode());
+        assert_eq!(
+            dir.ok().map(|mode| mode & 0o777),
+            Some(0o700),
+            "so is another service name's"
+        );
     }
 
     /// A blank value is not a credential, so a file containing whitespace reads as
@@ -503,7 +629,7 @@ mod tests {
         let home = tempfile::tempdir().expect("temp dir");
         let backend = FileBackend::new(home.path());
         assert!(futures::executor::block_on(backend.set("nanus", "openai", "sk-x")).is_ok());
-        assert!(std::fs::write(backend.path("openai"), "\n").is_ok());
+        assert!(std::fs::write(backend.path("nanus", "openai"), "\n").is_ok());
         assert_eq!(
             futures::executor::block_on(backend.get("nanus", "openai")).ok(),
             Some(None)
@@ -517,7 +643,7 @@ mod tests {
         let home = tempfile::tempdir().expect("temp dir");
         let backend = FileBackend::new(home.path());
         assert!(std::fs::create_dir_all(backend.root()).is_ok());
-        assert!(std::fs::write(backend.path("openai"), [0xff, 0xfe]).is_ok());
+        assert!(std::fs::write(backend.path("nanus", "openai"), [0xff, 0xfe]).is_ok());
         assert!(matches!(
             futures::executor::block_on(backend.get("nanus", "openai")),
             Err(SecretError::NotText { .. })

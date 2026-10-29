@@ -14,9 +14,12 @@
 //!
 //! | Precedence | Source |
 //! |---|---|
-//! | 1 | an explicit path passed to [`JsonlStore::new`] |
+//! | 1 | an explicit path given to [`JsonlStore::new`] or [`resolve_home`]: a config's `home` |
 //! | 2 | `$NANUS_HOME` |
 //! | 3 | `<config dir>/nanus` via [`etcetera`] |
+//!
+//! [`resolve_home`] refuses an explicit home that is empty or relative rather than resolving it
+//! against the working directory, which a service and a terminal do not share.
 //!
 //! ## The three guarantees
 //!
