@@ -334,6 +334,32 @@ pub struct NanusConfig {
     /// a terminal started in different directories still agree on one file. Setting it gives an
     /// embedding host a default of its own while its sessions stay in the shared home.
     pub selection_file: Option<PathBuf>,
+    /// The nanus home: where sessions, file-backed secrets, the archive, and the run directory
+    /// live, and what every `<nanus home>` default in this file is relative to.
+    ///
+    /// Unset, the home is `$NANUS_HOME` when that is set and `<config dir>/nanus` otherwise, which
+    /// is what every configuration written before this field existed still gets. Set, it wins over
+    /// both: a value written into a configuration is a decision about *this* agent, while the
+    /// variable is inherited by every process a shell starts. It must be an absolute path — a
+    /// relative one would name a different home in every working directory, so a service and a
+    /// terminal would disagree about which sessions exist — and a relative or empty one is
+    /// refused rather than resolved. Setting it gives an embedding host a home of its own,
+    /// without `NANUS_HOME`, which a process can only set for itself with `unsafe`.
+    pub home: Option<PathBuf>,
+    /// The service name a credential is filed under, in the platform's own store and the file
+    /// store.
+    ///
+    /// Defaults to `nanus`. The platform store is shared by every program the user runs, so two
+    /// agents with separate homes still read and write the same keychain items unless they file
+    /// them under different names: an embedding host that keeps its own credentials sets this
+    /// beside `home`. The file store keeps any other name's keys in a directory of their own
+    /// (`<nanus home>/service-secrets/<name>`), so two agents sharing a home but not a name
+    /// never read each other's either; the environment is the process's, and is read under any
+    /// name. A name is lowercase ASCII letters, digits, `-`, `_` and `.`, starting with a letter
+    /// or digit; anything else — an empty one included — is refused rather than read as the
+    /// default. Named for credentials rather than secrets because the configuration holds none:
+    /// nothing in its rendering or its file is spelled "secret", which a test asserts.
+    pub credential_service: Option<String>,
 }
 
 impl Default for NanusConfig {
@@ -366,6 +392,8 @@ impl Default for NanusConfig {
             service_log: None,
             remember_selection: true,
             selection_file: None,
+            home: None,
+            credential_service: None,
         }
     }
 }

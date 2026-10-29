@@ -111,6 +111,14 @@ fn the_built_in_defaults_are_the_documented_ones() {
         config.selection_file.is_none(),
         "the record's place is the home's unless the file names one"
     );
+    assert!(
+        config.home.is_none(),
+        "the home is the environment's or the platform's unless the file names one"
+    );
+    assert!(
+        config.credential_service.is_none(),
+        "credentials are filed under the shared name unless the file names another"
+    );
 }
 
 #[test]
@@ -283,6 +291,38 @@ fn the_remembered_selection_can_be_moved_or_turned_off_and_survives_a_save() {
     assert!(
         NanusConfig::load_from(&path).is_err(),
         "a switch that is not a boolean is refused rather than read as on"
+    );
+}
+
+#[test]
+fn a_home_and_a_credential_service_are_read_and_survive_a_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "home = \"/srv/example-host/nanus\"\ncredential_service = \"example-host\"\n",
+    )
+    .expect("seed");
+    let config = NanusConfig::load(Some(&path)).expect("load");
+    assert_eq!(
+        config.home.as_deref(),
+        Some(Path::new("/srv/example-host/nanus"))
+    );
+    assert_eq!(config.credential_service.as_deref(), Some("example-host"));
+    config.save_to(&path).expect("save");
+    assert_eq!(NanusConfig::load_from(&path).expect("reload"), config);
+
+    // A file written before the fields existed reads as the defaults, at the same version.
+    std::fs::write(&path, "config_version = 1\nmodel = \"deepseek-flash\"\n").expect("seed");
+    let older = NanusConfig::load(Some(&path)).expect("load");
+    assert_eq!(older.home, None);
+    assert_eq!(older.credential_service, None);
+    assert_eq!(older.config_version, CONFIG_VERSION);
+
+    std::fs::write(&path, "credential_service = 7\n").expect("seed invalid");
+    assert!(
+        NanusConfig::load_from(&path).is_err(),
+        "a service name that is not a string is refused rather than read as the default"
     );
 }
 

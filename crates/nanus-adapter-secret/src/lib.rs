@@ -13,7 +13,7 @@
 //! | Store | Right for | Wrong for |
 //! |---|---|---|
 //! | [`KeychainBackend`] (macOS) | an interactive user; the value leaves the environment and survives a reboot | a detached service with no unlocked keychain, or no graphical session at all |
-//! | [`FileBackend`] | that service or a container: a `0600` file under `<nanus home>/secrets`, mode checked | a machine where more than one user shares a home |
+//! | [`FileBackend`] | that service or a container: a `0600` file under `<nanus home>/secrets` (another service name's under `<nanus home>/service-secrets/<service>`), mode checked | a machine where more than one user shares a home |
 //! | [`EnvBackend`] | CI, where the secret is injected into the process | a person's shell, where it is in every subprocess's environment and in `ps` output |
 //!
 //! The default chain is keychain → file → environment. A **read** takes the first
@@ -65,13 +65,52 @@ pub use keychain::{DEFAULT_PROGRAM as KEYCHAIN_PROGRAM, KeychainBackend};
 
 use nanus_ports::{LocalBoxFuture, Secret, SecretError, SecretHandle, SecretPort, SecretResult};
 
-/// The service name a secret is filed under.
+/// The service name a secret is filed under, unless a configuration names another.
 ///
 /// One name for every account, so `security find-generic-password -s nanus -a
 /// openai` is the whole of what a user needs to inspect or remove an item by hand
 /// — which is the point of using the platform's own store rather than one only
-/// nanus understands.
+/// nanus understands. An embedding host that keeps credentials of its own files them
+/// under a name of its own with [`Secrets::new_in`]: the platform store is shared by
+/// every program the user runs, so a separate home alone does not separate them.
 pub const DEFAULT_SERVICE: &str = "nanus";
+
+/// The longest service name [`valid_service`] accepts, in bytes.
+///
+/// Far longer than a name a person would type, and far shorter than the 255 bytes a file
+/// name may be, which the file store makes of it.
+pub const MAX_SERVICE_LEN: usize = 64;
+
+/// Returns whether `service` is usable as the name secrets are filed under.
+///
+/// It has to name something: an empty or blank name would be a configuration saying
+/// nothing, and reading it as [`DEFAULT_SERVICE`] would put a host's credentials in the
+/// terminal agent's items without anyone having asked for that. Beyond that the name is
+/// narrow on purpose — lowercase ASCII letters and digits, `-`, `_` and `.`, starting with a
+/// letter or digit, not ending with `.`, at most [`MAX_SERVICE_LEN`] bytes — because it is
+/// used twice, and both uses have to keep two names apart:
+///
+/// - the platform store matches it exactly, and it is handed to `security` as an argument,
+///   where a leading `-` would read as an option;
+/// - the file store makes a directory of it, where a separator or `..` would climb out of
+///   the home, and a case-insensitive file system (the macOS default) would file `Host` and
+///   `host` in one directory while the keychain kept them apart.
+#[must_use]
+pub fn valid_service(service: &str) -> bool {
+    let allowed = |character: char| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '-' | '_' | '.')
+    };
+    let starts = service
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit());
+    starts
+        && service.len() <= MAX_SERVICE_LEN
+        && !service.ends_with('.')
+        && service.chars().all(allowed)
+}
 
 /// An ordered chain of secret stores.
 pub struct Secrets {
@@ -92,10 +131,44 @@ impl core::fmt::Debug for Secrets {
 }
 
 impl Secrets {
-    /// Builds the shipped chain: the platform keychain, a private file, and the
-    /// environment.
+    /// Builds the shipped chain for `home`, filed under [`DEFAULT_SERVICE`]: the
+    /// platform keychain, a private file, and the environment.
     #[must_use]
     pub fn new(home: &Path) -> Self {
+        Self::with_backends(DEFAULT_SERVICE, Self::shipped(home))
+    }
+
+    /// Builds the shipped chain for `home`, filed under `service` in the platform store.
+    ///
+    /// The chain a composition consults, for a host that chose its own home and service
+    /// name: reading a credential's presence through this is reading what a run would
+    /// find. The service reaches both stores that keep a value — the platform store files
+    /// the item under it, and the file store keeps any name but [`DEFAULT_SERVICE`] in a
+    /// directory of its own (see [`FileBackend`]) — so a credential stored under one name
+    /// is never read under another, even in a shared home. The environment is the
+    /// process's own and is read under every name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError::Invalid`] when `service` is not usable; see [`valid_service`].
+    pub fn new_in(home: &Path, service: &str) -> SecretResult<Self> {
+        if !valid_service(service) {
+            return Err(SecretError::invalid(format!(
+                "{service:?} is not a usable secret service name: use lowercase letters, \
+                 digits, `-`, `_` and `.`, starting with a letter or digit"
+            )));
+        }
+        let secrets = Self::with_backends(service, Self::shipped(home));
+        assert_eq!(
+            secrets.service(),
+            service,
+            "the chain files under the name asked for"
+        );
+        Ok(secrets)
+    }
+
+    /// The shipped stores for `home`, in precedence order.
+    fn shipped(home: &Path) -> Vec<Box<dyn SecretBackend>> {
         // The platform store is first when there is one, so the shipped order is
         // "the best store this platform has, then the private file, then the
         // environment".
@@ -110,7 +183,7 @@ impl Secrets {
             Box::new(FileBackend::new(home)),
             Box::new(EnvBackend::new()),
         ];
-        Self::with_backends(DEFAULT_SERVICE, backends)
+        backends
     }
 
     /// Builds a chain from an explicit set of stores, in precedence order.
@@ -545,6 +618,155 @@ mod tests {
             "none"
         );
         assert_eq!(secrets.service(), "nanus");
+    }
+
+    /// A store that remembers which service it was asked under, so the chain's
+    /// filing name can be pinned without a platform store being involved.
+    struct Witness {
+        asked: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl SecretBackend for Witness {
+        fn name(&self) -> &'static str {
+            "witness"
+        }
+
+        fn get<'a>(
+            &'a self,
+            service: &'a str,
+            _account: &'a str,
+        ) -> LocalBoxFuture<'a, SecretResult<Option<Secret>>> {
+            self.asked.borrow_mut().push(service.to_owned());
+            Box::pin(async { Ok(None) })
+        }
+
+        fn set<'a>(
+            &'a self,
+            service: &'a str,
+            _account: &'a str,
+            _secret: &'a str,
+        ) -> LocalBoxFuture<'a, SecretResult<()>> {
+            self.asked.borrow_mut().push(service.to_owned());
+            Box::pin(async { Ok(()) })
+        }
+
+        fn clear<'a>(
+            &'a self,
+            service: &'a str,
+            _account: &'a str,
+        ) -> LocalBoxFuture<'a, SecretResult<bool>> {
+            self.asked.borrow_mut().push(service.to_owned());
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    /// Every operation reaches a store under the chain's own service name, which is
+    /// what keeps a host's keychain items apart from the terminal agent's.
+    #[test]
+    fn every_store_is_asked_under_the_chains_service_name() {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let secrets = Secrets::with_backends(
+            "example-host",
+            vec![Box::new(Witness {
+                asked: Rc::clone(&asked),
+            })],
+        );
+        let _read = futures::executor::block_on(secrets.get("openai"));
+        let _written = futures::executor::block_on(secrets.set("openai", "sk-x"));
+        let _cleared = futures::executor::block_on(secrets.clear("openai"));
+        assert_eq!(
+            *asked.borrow(),
+            vec!["example-host"; 3],
+            "no operation fell back to {DEFAULT_SERVICE}"
+        );
+    }
+
+    /// A chain built in a chosen home under a chosen name reads what that home's file
+    /// store holds under that name, and nothing filed under another.
+    #[test]
+    fn a_chain_in_a_chosen_home_reads_that_homes_file_store() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        // Never the shipped name, so the platform store this chain also asks holds nothing
+        // a developer stored.
+        let service = "nanus-test-example-host";
+        let account = "nanus-test-chosen-home-account";
+        let filed = futures::executor::block_on(FileBackend::new(home.path()).set(
+            service,
+            account,
+            "sk-in-the-chosen-home",
+        ));
+        assert!(filed.is_ok(), "{filed:?}");
+
+        let chosen = Secrets::new_in(home.path(), service).expect("a usable name");
+        assert_eq!(chosen.service(), service);
+        assert_eq!(
+            value(futures::executor::block_on(chosen.get(account))),
+            Some(String::from("sk-in-the-chosen-home"))
+        );
+        // Another home's chain does not see it: the file store belongs to its home.
+        let other = Secrets::new_in(elsewhere.path(), service).expect("a usable name");
+        assert_eq!(
+            futures::executor::block_on(other.get(account)).ok(),
+            Some(None)
+        );
+        // Nor does the same home's file store under the shipped name. Built over the file
+        // store alone, so the developer's own keychain items are never asked.
+        let shipped = Secrets::with_backends(
+            DEFAULT_SERVICE,
+            vec![Box::new(FileBackend::new(home.path()))],
+        );
+        assert_eq!(
+            futures::executor::block_on(shipped.get(account)).ok(),
+            Some(None)
+        );
+        assert_eq!(Secrets::new(home.path()).service(), DEFAULT_SERVICE);
+    }
+
+    /// A service name that names nothing, or not what it seems to, is refused rather
+    /// than read as the default.
+    #[test]
+    fn an_unusable_service_name_is_refused() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let too_long = "a".repeat(MAX_SERVICE_LEN.saturating_add(1));
+        let refused = [
+            "",
+            "   ",
+            " example-host",
+            "example-host\n",
+            "ex\u{7}ample",
+            "Example-Host",
+            "-w",
+            ".hidden",
+            "host.",
+            "..",
+            "a/b",
+            "a\\b",
+            "example host",
+            too_long.as_str(),
+        ];
+        for service in refused {
+            assert!(!valid_service(service), "{service:?}");
+            let refused = Secrets::new_in(home.path(), service);
+            assert!(
+                matches!(refused, Err(SecretError::Invalid { .. })),
+                "{service:?} is refused"
+            );
+        }
+        let longest = "a".repeat(MAX_SERVICE_LEN);
+        for service in [
+            "nanus",
+            "example-host",
+            "com.example.host",
+            "host_2",
+            &longest,
+        ] {
+            assert!(valid_service(service), "{service:?}");
+        }
+        assert!(
+            valid_service(DEFAULT_SERVICE),
+            "the default is a usable name"
+        );
     }
 
     /// The shipped chain is usable without a keychain, a file, or a variable: it is

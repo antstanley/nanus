@@ -239,6 +239,19 @@ Contract to preserve:
   `NanusConfig`, serialised, or rendered by `Debug`.
 - `NANUS_HOME` — override the session-store home. Sessions live under
   `$NANUS_HOME/sessions/` (default: the platform config dir).
+- `home` / `credential_service` — the configuration's own nanus home and keychain service name,
+  for an embedding host that keeps its state apart from the terminal's. `home` beats `NANUS_HOME`,
+  which beats the platform default; it must be absolute (a relative or empty one is refused), and
+  everything under a home follows it: sessions, retired ids and trash, the archive, file-backed
+  secrets, the default `selection.toml`, and a service's run directory and log.
+  `compose::store_home(config)` is the one answer, and `open_store`, `open_secrets`, the CLI and
+  `nanus-tui` all ask it; `nanus tui` hands a `--config` on to the interface as `NANUS_CONFIG`.
+  `credential_service` (default `nanus`; lowercase letters, digits, `-`, `_`, `.`, else refused)
+  is the service name both the keychain and the file store file under — `nanus` in
+  `<home>/secrets/`, any other in `<home>/service-secrets/<service>/` — so a key stored under
+  one name is never read under another; `Secrets::new_in(home, service)` builds the chain
+  compose uses. `nanus config` prints both.
+  See `docs/features.md#a-home-of-its-own`.
 - `<nanus home>/selection.toml` — the provider, plan, model, and effort an interface last
   *changed*, written by the agent when a client switches and applied as the default at the
   next start. It is never written on a start, so editing the configuration is not overridden

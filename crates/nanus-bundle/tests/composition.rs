@@ -24,6 +24,7 @@
 #![cfg(feature = "stock-compose")]
 
 use nanus_adapter_config::NanusConfig;
+use nanus_adapter_secret::SecretBackend as _;
 use nanus_bundle::Selection;
 use nanus_bundle::compose::{Pending, compose};
 use nanus_domain::AgentConfig;
@@ -62,6 +63,22 @@ fn config(root: &std::path::Path) -> NanusConfig {
 /// tests in this file run beside each other and each parent deletes its own child's home when it
 /// returns.
 fn in_child_process(name: &str) {
+    in_child(name, true);
+}
+
+/// Every variable a provider's credential could be read from, so a child can be given none.
+const PROVIDER_KEY_ENVS: [&str; 6] = [
+    KEY_ENV,
+    "ZAI_API_KEY",
+    "ZAI_CODING_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "INCEPTION_API_KEY",
+];
+
+/// Runs `body` in a child process, with the placeholder key when `keyed` and with no provider
+/// variable at all otherwise — so whether a credential is found depends on the stores alone.
+fn in_child(name: &str, keyed: bool) {
     if std::env::var(CHILD_MARKER).is_ok() {
         // Already the child: nothing to do. Its home was pointed at a scratch directory
         // by the parent, so nothing it writes reaches the real one.
@@ -73,12 +90,18 @@ fn in_child_process(name: &str) {
     let home =
         std::env::temp_dir().join(format!("nanus-composition-{}-{name}", std::process::id()));
     let exe = std::env::current_exe().expect("the test binary has a path");
-    let status = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe);
+    for variable in PROVIDER_KEY_ENVS {
+        child.env_remove(variable);
+    }
+    if keyed {
+        child.env(KEY_ENV, PLACEHOLDER_KEY);
+    }
+    let status = child
         // Exact match, so the marker does not leak into sibling tests.
         .arg("--exact")
         .arg(name)
         .arg("--nocapture")
-        .env(KEY_ENV, PLACEHOLDER_KEY)
         .env(CHILD_MARKER, "1")
         // A harness home of its own. Without this the test writes sessions into the
         // developer's real store, which is a side effect a test must never have.
@@ -210,7 +233,7 @@ fn a_remembered_selection_is_the_default_it_starts_from() {
     let settings = config(dir.path());
     // Nothing in the settings names a model, so a change here can only have come from the
     // record. `max` is a step the configuration's four-value field cannot even spell.
-    let home = nanus_bundle::compose::store_home().expect("the child has a home");
+    let home = nanus_bundle::compose::store_home(&settings).expect("the child has a home");
     nanus_bundle::LastSelection {
         provider: Some(String::from("deepseek")),
         plan: Some(String::from("api")),
@@ -246,6 +269,154 @@ fn a_remembered_selection_is_the_default_it_starts_from() {
 
     let shutdown = harness.shutdown();
     assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
+}
+
+/// The service name the tests file a host's credentials under: never the shipped `nanus`, so a
+/// keychain lookup a test makes cannot find a developer's own key.
+const HOST_SERVICE: &str = "nanus-test-example-host";
+
+/// A configuration's home is where the sessions and the file-backed secrets are, not
+/// `NANUS_HOME`.
+///
+/// The child is given a scratch `NANUS_HOME` by its parent, which stands in for the home a
+/// terminal agent uses; the configuration names a second one. The credential is filed only in
+/// the configured home's file store — never the platform store — and no provider variable is
+/// set, so finding it is the proof that the secrets followed the home. A configuration naming a
+/// third, empty home composes unconfigured, which is the other direction of the same claim.
+#[test]
+fn a_configured_home_holds_the_sessions_and_file_secrets_rather_than_nanus_home() {
+    in_child(
+        "a_configured_home_holds_the_sessions_and_file_secrets_rather_than_nanus_home",
+        false,
+    );
+    let environment_home =
+        std::path::PathBuf::from(std::env::var_os(HOME_ENV).expect("the parent set a home"));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let chosen = tempfile::tempdir().expect("the host's home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let filed = runtime.block_on(nanus_adapter_secret::FileBackend::new(chosen.path()).set(
+        HOST_SERVICE,
+        "anthropic",
+        "sk-ant-placeholder",
+    ));
+    assert!(
+        filed.is_ok(),
+        "the key is filed in the host's home: {filed:?}"
+    );
+    let settings = NanusConfig {
+        provider: Some(String::from("anthropic")),
+        home: Some(chosen.path().to_path_buf()),
+        credential_service: Some(String::from(HOST_SERVICE)),
+        ..config(dir.path())
+    };
+    assert_eq!(
+        nanus_bundle::compose::store_home(&settings).ok(),
+        Some(chosen.path().to_path_buf()),
+        "the configuration's home wins over NANUS_HOME"
+    );
+
+    let pending = runtime.block_on(compose(&settings)).expect("composes");
+    assert!(
+        pending.configured(),
+        "the key in the configured home was found"
+    );
+    let harness = pending.start().expect("mounts");
+    let session = harness.new_session(dir.path());
+    let saved = runtime.block_on(harness.store.save(&session));
+    assert!(saved.is_ok(), "{saved:?}");
+    let listed = |config: &NanusConfig| {
+        runtime.block_on(async {
+            let store = nanus_bundle::compose::open_store(config)
+                .await
+                .expect("opens");
+            store.list().await.expect("lists").len()
+        })
+    };
+    assert_eq!(
+        listed(&settings),
+        1,
+        "the session is in the configured home"
+    );
+    let sessions = std::fs::read_dir(chosen.path().join("sessions")).expect("sessions");
+    assert_eq!(sessions.count(), 1, "and on disk there");
+    assert!(
+        !environment_home.join("sessions").exists(),
+        "nothing was written to NANUS_HOME"
+    );
+    assert!(harness.shutdown().is_ok());
+
+    let elsewhere = tempfile::tempdir().expect("another home");
+    let other = NanusConfig {
+        home: Some(elsewhere.path().to_path_buf()),
+        ..settings
+    };
+    let pending = runtime.block_on(compose(&other)).expect("composes");
+    assert!(
+        !pending.configured(),
+        "a home whose file store holds no key finds none"
+    );
+    assert_eq!(
+        listed(&other),
+        0,
+        "and lists none of the other home's sessions"
+    );
+}
+
+/// Whether `outcome` is a configuration refusal whose sentence names `field`.
+fn names(outcome: &Result<Pending, nanus_bundle::BundleError>, field: &str) -> bool {
+    matches!(outcome, Err(nanus_bundle::BundleError::Config(reason)) if reason.contains(field))
+}
+
+/// A home the configuration names relative, or a service name that names nothing, is refused
+/// before anything is opened, with a sentence naming the field.
+#[test]
+fn a_relative_home_or_an_empty_credential_service_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    for home in ["relative/nanus", ""] {
+        let relative = NanusConfig {
+            home: Some(std::path::PathBuf::from(home)),
+            ..config(dir.path())
+        };
+        let refused = runtime.block_on(compose(&relative));
+        assert!(
+            names(&refused, "`home`"),
+            "{home:?} is refused: {:?}",
+            refused.err()
+        );
+        assert!(nanus_bundle::compose::store_home(&relative).is_err());
+        assert!(
+            runtime
+                .block_on(nanus_bundle::compose::open_store(&relative))
+                .is_err()
+        );
+        assert!(nanus_bundle::compose::open_secrets(&relative).is_err());
+    }
+    let home = tempfile::tempdir().expect("a home");
+    for service in ["", "  ", "Example-Host", "-w", "../elsewhere"] {
+        let unnamed = NanusConfig {
+            home: Some(home.path().to_path_buf()),
+            credential_service: Some(String::from(service)),
+            ..config(dir.path())
+        };
+        let refused = runtime.block_on(compose(&unnamed));
+        assert!(
+            names(&refused, "credential_service"),
+            "{service:?} is refused: {:?}",
+            refused.err()
+        );
+        assert!(nanus_bundle::compose::open_secrets(&unnamed).is_err());
+    }
+    assert!(
+        !home.path().join("sessions").exists(),
+        "a refused configuration opened no store"
+    );
 }
 
 /// A tool registered through one door is visible through the other.
@@ -632,7 +803,7 @@ fn a_configuration_without_a_key_still_composes_unconfigured() {
         .credential_account()
         .to_owned();
     let had_key = std::env::var(KEY_ENV).is_ok_and(|value| !value.is_empty())
-        || runtime.block_on(stored_credential(&account));
+        || runtime.block_on(stored_credential(&settings, &account));
     if !had_key {
         let pending = runtime
             .block_on(compose(&settings))
@@ -644,8 +815,8 @@ fn a_configuration_without_a_key_still_composes_unconfigured() {
 /// Whether any store already holds a credential for `account`.
 ///
 /// Asked through the same chain a run uses, so the answer is the one composition will act on.
-async fn stored_credential(account: &str) -> bool {
-    let Ok(secrets) = nanus_bundle::compose::open_secrets() else {
+async fn stored_credential(settings: &NanusConfig, account: &str) -> bool {
+    let Ok(secrets) = nanus_bundle::compose::open_secrets(settings) else {
         return false;
     };
     matches!(secrets.get(account).await, Ok(Some(secret)) if !secret.is_blank())

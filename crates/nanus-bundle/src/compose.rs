@@ -691,7 +691,10 @@ pub fn apply_remembered(config: &mut NanusConfig, file: Option<&Path>) -> Option
 /// Returns [`BundleError::Config`] when the configuration or the API key is unusable,
 /// and [`BundleError::Session`] when the session store cannot be opened.
 pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
-    let home = store_home()?;
+    // Everything this composition keeps — sessions, file-backed secrets, the archive, the
+    // remembered selection by default — is under one home, and the configuration decides which:
+    // see [`store_home`]. Resolved once, so no two of them can disagree.
+    let home = store_home(config)?;
     // The default this start begins from is the selection the last *change* left behind, when
     // there is one: the configuration resolves everything else, and resolves all of it when
     // nothing was recorded or the configuration keeps no record. Read before the selection is
@@ -708,7 +711,7 @@ pub async fn compose(config: &NanusConfig) -> Result<Pending, BundleError> {
     let selection = Selection::resolve(&config)?;
     // The secret stores are consulted by *account*, which is the provider's name, so
     // a key stored for one provider can never be sent to another.
-    let secrets = Secrets::new(&home).handle();
+    let secrets = secrets_in(&config, &home)?.handle();
     // A missing credential is the one failure an agent may start *through*: the interface opens
     // so the reader can supply one with `/provider`, and the placeholder reports it on the first
     // request. Every other failure still refuses to compose.
@@ -868,28 +871,61 @@ async fn renew(
 ///
 /// `nanus auth` needs the stores and nothing else — no model, no tools, no session
 /// store — and demanding a credential in order to *store* one would be a circle. The
-/// chain is the same one a run uses, so a key written here is found there.
+/// chain is the same one [`compose`] builds from the same configuration — its home's file
+/// store and its service name in the platform store — so a key written here is found there,
+/// and a host can ask whether one is present without composing.
 ///
 /// # Errors
 ///
 /// Returns [`BundleError::Session`] when no home directory can be determined, which is
-/// where the private file store lives.
-pub fn open_secrets() -> Result<SecretHandle, BundleError> {
-    let home = store_home()?;
-    Ok(Secrets::new(&home).handle())
+/// where the private file store lives, and [`BundleError::Config`] when the configuration's
+/// `home` or `credential_service` is refused.
+pub fn open_secrets(config: &NanusConfig) -> Result<SecretHandle, BundleError> {
+    let home = store_home(config)?;
+    Ok(secrets_in(config, &home)?.handle())
+}
+
+/// Returns the name a configuration files credentials under in the platform store.
+///
+/// The configuration's `credential_service`, or `nanus` when it names none. The one place the
+/// field is read, so a composition, [`open_secrets`], and a report of either cannot name two
+/// different services. Whether the name is usable is decided where the chain is built.
+#[must_use]
+pub fn credential_service(config: &NanusConfig) -> &str {
+    config
+        .credential_service
+        .as_deref()
+        .unwrap_or(nanus_adapter_secret::DEFAULT_SERVICE)
+}
+
+/// Builds the credential chain a configuration asks for, in `home`.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] naming `credential_service` when the name is not usable.
+fn secrets_in(config: &NanusConfig, home: &Path) -> Result<Secrets, BundleError> {
+    let service = credential_service(config);
+    Secrets::new_in(home, service).map_err(|error| {
+        BundleError::config(format!(
+            "`credential_service`: {error}; remove it to file credentials under `{}`",
+            nanus_adapter_secret::DEFAULT_SERVICE
+        ))
+    })
 }
 
 /// Opens the session store without composing a harness.
 ///
 /// Listing sessions needs no model and no tools, and demanding an API key to read one's
 /// own transcripts would be a barrier with no purpose. This is the smallest composition
-/// that answers "what have I run".
+/// that answers "what have I run". The store is the one [`compose`] opens for the same
+/// configuration, so the sessions listed are the sessions a run records.
 ///
 /// # Errors
 ///
-/// Returns [`BundleError::Session`] when the store cannot be opened.
-pub async fn open_store() -> Result<StoreHandle, BundleError> {
-    let store = JsonlStore::new(store_home()?)
+/// Returns [`BundleError::Session`] when the store cannot be opened, and
+/// [`BundleError::Config`] when the configuration's `home` is refused.
+pub async fn open_store(config: &NanusConfig) -> Result<StoreHandle, BundleError> {
+    let store = JsonlStore::new(store_home(config)?)
         .await
         .map_err(|error| BundleError::session(error.to_string()))?;
     Ok(store.handle())
@@ -937,13 +973,35 @@ pub fn workspace_root(config: &NanusConfig) -> Result<PathBuf, BundleError> {
         .map_err(|error| BundleError::config(format!("the workspace root is unusable: {error}")))
 }
 
-/// Returns the harness home directory.
+/// Returns the nanus home a configuration runs in.
+///
+/// The configuration's `home` when it names one, then `$NANUS_HOME`, then the platform's
+/// `<config dir>/nanus` (see [`nanus_adapter_store::resolve_home`]). The configuration wins
+/// because it is the one answer an embedding host can give without touching its process's
+/// environment — which takes `unsafe` in this edition — and because the variable is inherited
+/// by everything a shell starts, so a host launched from a terminal would otherwise share that
+/// terminal's sessions. Everything that lives under a home asks this: the session store, the
+/// file-backed secrets, the default selection file, and the run directory and log a service
+/// uses.
 ///
 /// # Errors
 ///
-/// Returns [`BundleError::Session`] when no home directory can be determined.
-pub fn store_home() -> Result<PathBuf, BundleError> {
-    nanus_adapter_store::resolve_home(None).map_err(|error| BundleError::session(error.to_string()))
+/// Returns [`BundleError::Config`] naming `home` when the configuration's home is empty or
+/// relative, and [`BundleError::Session`] when no home directory can be determined.
+pub fn store_home(config: &NanusConfig) -> Result<PathBuf, BundleError> {
+    let explicit = config.home.as_deref();
+    let home = nanus_adapter_store::resolve_home(explicit).map_err(|error| {
+        if explicit.is_some() {
+            BundleError::config(format!("`home`: {error}"))
+        } else {
+            BundleError::session(error.to_string())
+        }
+    })?;
+    assert!(
+        explicit.is_none_or(|named| named == home),
+        "a home the configuration names is the home"
+    );
+    Ok(home)
 }
 
 /// Builds the model adapter the selection calls for.

@@ -12,7 +12,8 @@
 //! <home>/archive.lock                                 (the archive's cross-process quota lock)
 //! ```
 //!
-//! `<home>` is `$NANUS_HOME` when set, and `<config dir>/nanus` otherwise. The archive's own
+//! `<home>` is the explicit home when one is given (a configuration's `home`), then `$NANUS_HOME`
+//! when set, and `<config dir>/nanus` otherwise; see [`resolve_home`]. The archive's own
 //! layout is described in `archive`, deletion's in `retire`, and checkpoints' in `checkpoint`.
 //!
 //! ## Lock ordering
@@ -134,11 +135,33 @@ pub fn new_session_id() -> SessionId {
 
 /// Resolves the nanus home directory.
 ///
+/// An explicit home wins, then `$NANUS_HOME`, then `<config dir>/nanus`. The explicit one is
+/// what a configuration's `home` arrives as, and it beats the variable because it is a decision
+/// about one agent, while the variable is inherited by everything a shell starts — an embedding
+/// host started from a terminal that exported it for the terminal's own agent would otherwise
+/// share that agent's sessions.
+///
 /// # Errors
 ///
-/// Returns [`StoreError::HomeUnavailable`] when the platform lookup fails.
+/// Returns [`StoreError::HomeUnavailable`] when the platform lookup fails, and when the explicit
+/// home is empty or relative. A relative home is refused rather than resolved against the
+/// working directory, because the working directory differs between a service and a terminal,
+/// and a home that moved with it would show each a different set of sessions.
 pub fn resolve_home(explicit: Option<&Path>) -> StoreResult<PathBuf> {
     if let Some(path) = explicit {
+        if path.as_os_str().is_empty() {
+            return Err(StoreError::HomeUnavailable {
+                message: String::from("the nanus home is named but empty"),
+            });
+        }
+        if !path.is_absolute() {
+            return Err(StoreError::HomeUnavailable {
+                message: format!(
+                    "the nanus home {} is relative; name it as an absolute path",
+                    path.display()
+                ),
+            });
+        }
         return Ok(path.to_path_buf());
     }
     if let Some(raw) = std::env::var_os(HOME_ENV)

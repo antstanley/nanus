@@ -476,6 +476,9 @@ field of any type that reaches a log.
   (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). The
   first store holding a value answers, and a store that cannot answer — a locked
   keychain on a detached service — does not hide a value another store holds.
+- **Filed under a service name**, `nanus` unless the configuration's `credential_service` names
+  another, in the keychain and the file store alike, so a host with
+  [a home of its own](#a-home-of-its-own) keeps its keychain items apart from the terminal's too.
 - **The account names what the key is for**: the provider's name, or the provider and plan joined
   for a plan with a key of its own (`zai:coding`), so a key stored for one provider or plan can
   never be sent to another.
@@ -569,6 +572,8 @@ this build offers.
 | `service_log`           | `<nanus home>/nanus-service.log`  | where a detached service writes                                                                                           |
 | `remember_selection`    | `true`                            | remember a change of provider, model or effort for the next start; false reads and writes no selection file              |
 | `selection_file`        | `<nanus home>/selection.toml`     | where that record is kept; a relative path is inside the nanus home                                                       |
+| `home`                  | `$NANUS_HOME`, else `<config dir>/nanus` | the nanus home every `<nanus home>` above is in; must be absolute ([a home of its own](#a-home-of-its-own))        |
+| `credential_service`    | `nanus`                           | the service name credentials are filed under; lowercase letters, digits, `-`, `_`, `.`, else refused                      |
 | `config_version`        | the build's version               | the schema the file was written with; a newer one is refused, and a missing one is read as the pre-1.0 shape and migrated |
 
 Environment variables:
@@ -583,10 +588,54 @@ Environment variables:
 | not keyed: see `nanus auth login`. |
 | `INCEPTION_API_KEY`                | Inception Labs credential, for the `api` plan.                                                          |
 | `NANUS_CONFIG`                     | Override the configuration file path.                                                                   |
-| `NANUS_HOME`                       | Override the session-store home (and the default socket and log paths).                                 |
+| `NANUS_HOME`                       | Override the nanus home (sessions, file secrets, and the default socket and log paths), unless the configuration's `home` names one. |
 | `NANUS_TUI`                        | Override the path to the interface binary.                                                              |
 | `NO_COLOR`                         | Render with no colour at all, keeping bold and italic.                                                  |
 | `RUST_LOG`                         | Tracing filter for the service and core logs.                                                           |
+
+### A home of its own
+
+Everything nanus keeps is under one directory, the **nanus home**: the sessions and their
+archive, retired ids and the trash a deletion passes through, the file-backed secrets, the
+remembered selection by default, and a service's run directory and log. Which directory that is
+has three answers, tried in order:
+
+1. **The configuration's `home`.** An absolute path; a relative or empty one is refused with a
+   sentence naming the field rather than resolved against the working directory, which a service
+   and a terminal do not share.
+2. **`NANUS_HOME`**, when set and not empty.
+3. **`<config dir>/nanus`**, the platform's default.
+
+The configuration wins because it is a decision about one agent, while the variable is inherited
+by every process a shell starts: an application launched from a terminal that exported
+`NANUS_HOME` for the terminal's own agent would otherwise share that agent's conversations. It is
+also the only answer an embedding host can give without touching its process's environment,
+which takes `unsafe` in this edition and is process-global.
+
+A home separates the file store but not the platform's: the macOS keychain is shared by every
+program the user runs, and items are found by service name and account. `credential_service`
+names the service (`nanus` by default), so a host that keeps its own credentials sets both. The
+file store honours the name too — `<nanus home>/secrets/` holds `nanus`'s keys and
+`<nanus home>/service-secrets/<service>/` any other's — so a key filed under one name is never
+read under another even when two agents share a home. A name is lowercase ASCII letters,
+digits, `-`, `_` and `.`, starting with a letter or digit, at most 64 bytes: it is handed to
+`security` and made a directory, and a case-insensitive file system would otherwise merge two
+names the keychain keeps apart. Anything else, an empty name included, is refused rather than
+read as the default. The environment is the process's own and is read under any name.
+
+Every door asks the same question. `compose`, `compose::open_store` and `compose::open_secrets`
+take the configuration and resolve the home through `compose::store_home(config)`, and
+`Secrets::new_in(home, service)` builds the chain a composition consults, so a host can ask
+whether a credential is present without composing. `nanus sessions`, `nanus auth`,
+`nanus service`, `nanus config` and `nanus-tui` read the same configuration and land in the same
+home, and `nanus tui` hands a `--config` it was given to the interface as `NANUS_CONFIG`, so the
+interface reads its history from the home its agent records into. `nanus config` prints the home
+and the service name a run would use.
+
+On Windows the service's default endpoint is a named pipe per user, not a path under the home,
+so two homes' services both started with the default would ask for one pipe. A second home's
+service names its own with `service_socket`; a shell-scoped agent's pipe is per process and needs
+nothing.
 
 ## The command line
 

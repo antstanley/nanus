@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use nanus_adapter_config::CONFIG_ENV;
 use nanus_bundle::compose::Pending;
 use nanus_link::paths::attached_endpoint;
 use nanus_link::server::{Agent, bind, serve};
@@ -73,14 +74,24 @@ pub fn resolve_binary() -> Result<PathBuf, String> {
 
 /// Runs the interface with an agent this process owns.
 ///
+/// `home` is the nanus home the agent was composed in, where its socket is bound, and
+/// `config_file` the configuration this command was given, which the interface reads too: it
+/// opens the session store itself to show a conversation's history, so it has to open the
+/// store the agent records into.
+///
 /// # Errors
 ///
 /// Returns a message when the composition fails to mount, the socket cannot be bound, the
 /// interface cannot be started, or it exits non-zero.
-pub fn attached(pending: Pending, workspace: &Path, arguments: &[OsString]) -> Result<(), String> {
+pub fn attached(
+    pending: Pending,
+    workspace: &Path,
+    home: &Path,
+    config_file: Option<&Path>,
+    arguments: &[OsString],
+) -> Result<(), String> {
     let binary = resolve_binary()?;
-    let socket = attached_endpoint(&crate::service::home()?, std::process::id())
-        .map_err(|error| error.to_string())?;
+    let socket = attached_endpoint(home, std::process::id()).map_err(|error| error.to_string())?;
     let harness = pending.start().map_err(|error| error.to_string())?;
     let agent = Rc::new(Agent::new(&harness, workspace));
 
@@ -93,7 +104,7 @@ pub fn attached(pending: Pending, workspace: &Path, arguments: &[OsString]) -> R
             Ok(listener) => listener,
             Err(error) => return (Err(error.to_string()), None),
         };
-        let mut child = match spawn(&binary, &socket, arguments) {
+        let mut child = match spawn(&binary, &socket, config_file, arguments) {
             Ok(child) => child,
             Err(error) => return (Err(error), None),
         };
@@ -122,14 +133,17 @@ pub fn attached(pending: Pending, workspace: &Path, arguments: &[OsString]) -> R
 ///
 /// Used for a recorded session, which needs no model: a transcript that has already been
 /// written down is just a file, and demanding an agent to read one would be a barrier
-/// with no purpose.
+/// with no purpose. The configuration file goes to it as it does in [`spawn`], so the
+/// transcript is read from the home that configuration names.
 ///
 /// # Errors
 ///
 /// Returns a message when the interface cannot be started or exits non-zero.
-pub fn alone(arguments: &[OsString]) -> Result<(), String> {
+pub fn alone(arguments: &[OsString], config_file: Option<&Path>) -> Result<(), String> {
     let binary = resolve_binary()?;
-    let status = std::process::Command::new(&binary)
+    let mut command = std::process::Command::new(&binary);
+    hand_on_configuration(&mut command, config_file);
+    let status = command
         .args(arguments)
         // Inherited rather than piped: this child is the interface, and it owns the
         // terminal for as long as it runs.
@@ -143,21 +157,40 @@ pub fn alone(arguments: &[OsString]) -> Result<(), String> {
 /// `arguments` is what the interface was told about which conversation to open; the
 /// socket is this function's business and the choice is not, so the two are passed
 /// together rather than merged above.
+///
+/// The configuration file, when this command was given one with `--config`, goes to the
+/// interface as `NANUS_CONFIG`, the variable it already reads. Its display preferences and its
+/// nanus home are both in that file, and an interface that read the default file instead would
+/// draw with the wrong preferences and read history from a home the agent is not recording into.
 fn spawn(
     binary: &Path,
     socket: &Path,
+    config_file: Option<&Path>,
     arguments: &[OsString],
 ) -> Result<tokio::process::Child, String> {
+    let mut command = tokio::process::Command::new(binary);
+    hand_on_configuration(command.as_std_mut(), config_file);
     // Killed if this process gives up on it: an interface talking to an agent that no
     // longer exists would connect to nothing and look broken. `kill_on_drop` covers the
     // paths that exit early, and the ordinary path has already reaped the child.
-    tokio::process::Command::new(binary)
+    command
         .arg("--link")
         .arg(socket)
         .args(arguments)
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", binary.display()))
+}
+
+/// Gives the interface the configuration file this command was given, as `NANUS_CONFIG`.
+///
+/// Only when there was one: with no `--config`, the interface resolves the file exactly as
+/// this process did — an inherited `NANUS_CONFIG`, else the platform location — so the
+/// variable is left as it was rather than set to a path this process never named.
+fn hand_on_configuration(command: &mut std::process::Command, config_file: Option<&Path>) {
+    if let Some(file) = config_file {
+        command.env(CONFIG_ENV, file);
+    }
 }
 
 /// Turns a child's exit into this process's outcome.
@@ -177,6 +210,29 @@ fn report_exit(status: Option<std::process::ExitStatus>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// A `--config` reaches the interface as the variable it reads, and its absence leaves
+    /// the variable to be inherited rather than set or cleared.
+    #[test]
+    fn the_interface_is_given_the_configuration_this_command_was_given() {
+        let config_env = |command: &std::process::Command| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(CONFIG_ENV))
+                .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        };
+        let file = Path::new("/srv/example-host/config.toml");
+        let mut given = std::process::Command::new("nanus-tui");
+        hand_on_configuration(&mut given, Some(file));
+        assert_eq!(
+            config_env(&given),
+            Some(Some(file.as_os_str().to_os_string()))
+        );
+
+        let mut none = std::process::Command::new("nanus-tui");
+        hand_on_configuration(&mut none, None);
+        assert_eq!(config_env(&none), None, "nothing set and nothing removed");
+    }
+
     use super::*;
 
     #[test]

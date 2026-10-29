@@ -181,11 +181,25 @@ removes it, and `nanus auth status` reports which providers have one without
 printing any value.
 
 - The stores are tried in order: **the macOS keychain**, then **a `0600` file**
-  under `$NANUS_HOME/secrets/` (its directory is `0700`), then **the provider's
+  under `<nanus home>/secrets/` (its directory is `0700`), then **the provider's
   environment variable** (`DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY`). The first store holding a value answers. A store that cannot
   answer — a locked keychain on a detached service — does not hide a value another
   store holds, which is the case a service actually runs in.
+- **A home and a service name decide whose credentials these are.** The file store is the
+  nanus home's — the configuration's `home`, else `$NANUS_HOME`, else the platform default —
+  and both stores that keep a value file it by service name and account, the service being
+  `nanus` unless the configuration's `credential_service` names another: the keychain item's
+  service, and in the file store `<nanus home>/secrets/` for `nanus` and
+  `<nanus home>/service-secrets/<service>/` for any other. So a key stored under one name is
+  never read under another, even in a shared home; two agents with separate homes but the same
+  name still share their keychain items, so an embedding host that keeps credentials of its own
+  sets both. A service name is lowercase letters, digits, `-`, `_` and `.`, starting with a
+  letter or digit — it becomes a `security` argument and a directory, and a case-insensitive
+  file system must not merge two names the keychain keeps apart — and anything else, like a
+  relative home, is refused rather than read as the default. The environment is the process's
+  own and is read under any name. The service name is not a secret, and `nanus config` prints
+  it.
 - The value is read from **standard input**, never from an argument, so it does
   not appear in `ps` for the life of the command.
 - **One exception is stated rather than hidden:** the macOS keychain write runs
@@ -199,7 +213,7 @@ printing any value.
   the configuration has no field that could hold one. The wrapper a credential is
   carried in redacts its own `Debug`, and the read is a method named `expose` so
   every site that handles a raw value is greppable.
-- Session transcripts are stored under `$NANUS_HOME/sessions/`. A transcript
+- Session transcripts are stored under `<nanus home>/sessions/`. A transcript
   contains everything the model saw and produced, including any secret it read.
 
 The file store's `0600`/`0700` permissions apply on Unix. On Windows, files inherit
@@ -214,7 +228,7 @@ configuration file, not to defend it from the user's own processes.
 ## The agent's local link
 
 On Unix, an agent serving an interface — or a service — listens on a domain socket under
-`$NANUS_HOME/run/`. The socket is created `0600` inside a `0700` directory, so only
+`<nanus home>/run/`. The socket is created `0600` inside a `0700` directory, so only
 your user can connect to it, and it is a local socket: nothing listens on an address
 and no packet reaches a network interface.
 
