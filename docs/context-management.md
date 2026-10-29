@@ -715,7 +715,7 @@ link's `ContextStatusInfo` only. The domain `ContextStatus`, which the model rea
 `ContextStatus`, `ContextDecision` and `Checkpoint` frames carry the session id, the stream epoch,
 the turn and step (null when idle), a frame id assigned by the session, the stream watermark and
 the durable frontier. Attachment and backlog semantics are described in
-[sessions](sessions.md#what-travels-over-the-link); the link protocol is version 12. The interface
+[sessions](sessions.md#what-travels-over-the-link); the link protocol is version 13. The interface
 draws context notices with the replay's own wording, so a watched turn and the same turn read
 back say the same things. A managed session whose store cannot checkpoint, or whose recovery or
 reconciliation could not be settled, is held but takes no turn until it is reset.

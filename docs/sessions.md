@@ -371,7 +371,8 @@ A session is the agent's; a client's view of it is a handful of frames.
 | `Sessions` | The sessions the agent is holding. |
 | `User` | Somebody asked something, sent to every view but the one that asked. |
 | `Text`, `Reasoning`, `Step`, `Tool`, `ToolDone`, `Usage` | The turn, as it happens. |
-| `Approval` | A call outside the sandbox needs a decision; the client answers with an `approve` request. |
+| `Approval` | A call outside the sandbox needs a decision; the client answers with an `approve` request, whose `scope` (`session`, the default, or `agent`) says how far an "always" answer reaches. |
+| `ApprovedToolsChanged` | The tools the agent runs without asking in every session: sent to every view when an `agent`-scoped answer adds one, and on attaching when the set is not empty. |
 | `Goal` | The session's durable objective, or its absence: sent on attaching to a session that has one, on every change, and in answer to a `goal` request. |
 | `ContextStatus` | A managed session's context status: when a step's request is prepared, on a `context status` request, and after a reset. |
 | `ContextDecision` | A context proposal accepted, rejected or cancelled, or an automatic fit. |
@@ -402,7 +403,7 @@ from assistant output and goal changes. `Attached` and `Backlog` also carry the 
 that reads the log sees the same cut in the marker itself, and the field exists for clients that
 have no store to read.
 
-The protocol is version 12; an older peer is refused before any request.
+The protocol is version 13; an older peer is refused before any request.
 
 The maintenance requests are `HandoffDraft`, `HandoffCommit`, `CompactDraft` and `CompactCommit`. A
 draft runs in a task of its own, as a turn does, so the connection keeps reading while the model is

@@ -302,7 +302,8 @@ These appear on other projects' roadmaps. They are absent here on purpose, and
 the [design decisions](design.md) say why:
 
 - **A policy that means yes to everything** was on this list, and is now shipped as the
-  explicit `all_calls` state (and the session-scoped "always allow" answer). It is never
+  explicit `all_calls` state (and the per-tool "always allow", for a session or, through
+  `approved_tools`, for every session). It is never
   the default, the status line names it, and
   [design.md](design.md#approval-is-a-three-state-axis-fail-closed-at-the-default) argues
   the reversal.

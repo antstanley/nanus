@@ -318,6 +318,18 @@ pub struct AgentRunner {
     /// It is a `Cell` rather than an `Atomic` because the kernel is single-threaded by
     /// design and the runner is `!Send` with it.
     approval: Rc<core::cell::Cell<ApprovalPolicy>>,
+    /// Tools whose calls outside the sandbox run without asking, in every session this runner
+    /// serves: the *agent's* "always allow".
+    ///
+    /// The gate consults it exactly where it would otherwise put the call to the answerer, so a
+    /// standing approval is an "always" answered in advance and covers precisely what that answer
+    /// covers — every later call to the tool that the sandbox and the state left to a person,
+    /// a destructive one included. It grants nothing the sandbox or the state had already settled,
+    /// and nothing a host policy refused. Empty unless a caller fills it, which the stock
+    /// composition does from `approved_tools` and the link does when a person answers "always"
+    /// for every session; both go through [`AgentRunner::approve_tool`], which refuses a name the
+    /// registry does not hold.
+    approved_tools: core::cell::RefCell<std::collections::BTreeSet<ToolName>>,
     /// The model the next request will name, shared so a caller can switch it mid-session.
     ///
     /// [`AgentConfig`] carries the *startup* value, and this is that value as a cell the link
@@ -417,6 +429,7 @@ impl AgentRunner {
             tools,
             system_prompt,
             approval: Rc::new(core::cell::Cell::new(config.approval_policy)),
+            approved_tools: core::cell::RefCell::new(std::collections::BTreeSet::new()),
             model,
             effort: Rc::new(core::cell::Cell::new(None)),
             clock,
@@ -587,6 +600,52 @@ impl AgentRunner {
     /// case this exists for.
     pub fn set_approval(&self, policy: ApprovalPolicy) {
         self.approval.set(policy);
+    }
+
+    /// Returns the tools approved for every session, in name order.
+    ///
+    /// The agent-wide counterpart of a session's "always allow": a call to one of these that the
+    /// sandbox does not permit and the state does not grant runs without anyone being asked.
+    #[must_use]
+    pub fn approved_tools(&self) -> Vec<ToolName> {
+        self.approved_tools.borrow().iter().cloned().collect()
+    }
+
+    /// Approves `tool` for every session this runner serves, from the next call the gate decides.
+    ///
+    /// Returns whether the set changed, so a caller that tells others about it can say nothing
+    /// when a second answer granted what a first one already had. The change reaches a turn that
+    /// is already running, exactly as [`AgentRunner::set_approval`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Config`] when no registered tool has that name. A name the gate
+    /// will never be asked about — a misspelling, a tool this agent was not given, or one the
+    /// loop runs itself — is refused rather than kept, because a standing approval that silently
+    /// grants nothing is one its author believes is in force.
+    pub fn approve_tool(&self, tool: &ToolName) -> Result<bool, BundleError> {
+        {
+            let registry = self.tools.borrow();
+            if !registry.contains(tool) {
+                let offered: Vec<&str> =
+                    registry.names().into_iter().map(ToolName::as_str).collect();
+                return Err(BundleError::config(format!(
+                    "`{tool}` cannot be approved: it is not a tool this agent offers ({})",
+                    offered.join(", ")
+                )));
+            }
+        }
+        let added = self.approved_tools.borrow_mut().insert(tool.clone());
+        assert!(
+            self.approved_tools.borrow().contains(tool),
+            "an approved tool is in the set"
+        );
+        Ok(added)
+    }
+
+    /// Returns whether `tool` is approved for every session.
+    fn is_tool_approved(&self, tool: &ToolName) -> bool {
+        self.approved_tools.borrow().contains(tool)
     }
 
     /// Returns the model every later request will name.
@@ -1452,7 +1511,10 @@ impl AgentRunner {
             return None;
         }
         let policy = self.approval();
-        if exempt(policy, destructive, call) {
+        // A standing approval is an "always" answered before the question was asked, so it
+        // sits exactly where the answerer would be consulted: after everything that grants or
+        // refuses without a person, and only for the calls a person would have been asked about.
+        if exempt(policy, destructive, call) || self.is_tool_approved(&call.name) {
             return None;
         }
         let reason = approval_reason(
@@ -3544,6 +3606,93 @@ mod tests {
             approver.asked().is_empty(),
             "`all_calls` is a free for all and consults nobody"
         );
+    }
+
+    /// A standing approval is an "always" answered in advance: a call outside the sandbox runs
+    /// without the answerer being consulted, under the default state, and a second approval of
+    /// the same tool reports that nothing changed.
+    #[tokio::test]
+    async fn a_standing_approval_runs_a_call_outside_the_sandbox_without_asking() {
+        let (tools, runs) = registry_with_counted("runner", ToolAccess::Execute);
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers("runner"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::PerCall,
+        ) else {
+            return;
+        };
+        let name = ToolName::new("runner").unwrap_or_else(|_| unreachable!("valid"));
+        assert!(matches!(runner.approve_tool(&name), Ok(true)));
+        assert!(
+            matches!(runner.approve_tool(&name), Ok(false)),
+            "approving it again changes nothing"
+        );
+        assert_eq!(runner.approved_tools(), vec![name]);
+        assert_eq!(
+            runner.approval(),
+            ApprovalPolicy::PerCall,
+            "a standing approval does not move the state"
+        );
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok_and(|outcome| outcome.answer == "done"));
+        assert_eq!(runs.get(), 1, "the approved call ran");
+        assert!(
+            approver.asked().is_empty(),
+            "an approved tool is not a question, whatever the answerer would have said"
+        );
+    }
+
+    /// The other direction: a standing approval names one tool, so a call to another is still put
+    /// to the answerer and still refused, and a name the registry does not hold is refused rather
+    /// than kept as an approval that grants nothing.
+    #[tokio::test]
+    async fn a_standing_approval_grants_only_the_tool_it_names() {
+        let (tools, runs) = registry_with_counted("runner", ToolAccess::Execute);
+        let other = ToolName::new("other").unwrap_or_else(|_| unreachable!("valid"));
+        let schema = ToolSchema {
+            name: other.clone(),
+            description: "A second counted test tool".to_owned(),
+            parameters: json!({ "type": "object" }),
+        };
+        let counted = Counted {
+            runs: Rc::new(std::cell::Cell::new(0)),
+        };
+        let definition =
+            nanus_domain::ToolDefinition::new(schema, counted).with_access(ToolAccess::Execute);
+        assert!(tools.borrow_mut().register(definition).is_ok());
+        let approver = ScriptedApprover::new(ApprovalOutcome::Rejected);
+        let Some(runner) = gated_runner(
+            calls_then_answers("runner"),
+            tools,
+            SandboxMode::WorkspaceWrite,
+            ApprovalPolicy::PerCall,
+        ) else {
+            return;
+        };
+        assert!(matches!(runner.approve_tool(&other), Ok(true)));
+        let missing = ToolName::new("runer").unwrap_or_else(|_| unreachable!("valid"));
+        let refused = runner.approve_tool(&missing);
+        assert!(
+            matches!(&refused, Err(BundleError::Config(reason)) if reason.contains("`runer`")),
+            "a name no tool has is refused by name: {refused:?}"
+        );
+        assert_eq!(
+            runner.approved_tools(),
+            vec![other],
+            "the refusal added nothing"
+        );
+        let mut session = session();
+        let outcome = runner
+            .run_turn(&mut session, "go", &mut Silent, Some(&approver))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(runs.get(), 0, "the unapproved call was refused");
+        assert_eq!(approver.asked().len(), 1, "and a person was asked about it");
     }
 
     /// A counted tool declared the way the stock `bash` is: destructive by its command.

@@ -233,7 +233,10 @@ A call the sandbox does not permit needs an exception, and the approval policy d
 
 A person can grant a tool "always allow" for the rest of a session from the approval dialog; that
 is the person's decision, recorded in memory only. The approval request carries the tool's name and
-the reason, never its arguments.
+the reason, never its arguments. Your tool can also be named in `approved_tools`, which grants it in
+every session from the start; that list is checked after your installers run, so a host tool's name
+is accepted there and a name nobody registered stops the start. A runner you build yourself takes
+the same grant through `AgentRunner::approve_tool`.
 
 ### An exact-call policy
 

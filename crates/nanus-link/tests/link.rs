@@ -26,9 +26,9 @@ use nanus_adapter_local::SystemClock;
 use nanus_adapter_store::JsonlStore;
 use nanus_bundle::AgentRunner;
 use nanus_domain::{
-    AgentConfig, ApprovalPolicy, SandboxMode, Session, SessionEvent, SessionId, ToolAccess,
-    ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName, ToolRegistry,
-    ToolResult, ToolSchema, Usage,
+    AgentConfig, ApprovalPolicy, Message, SandboxMode, Session, SessionEvent, SessionId,
+    ToolAccess, ToolCall, ToolCallId, ToolDefinition, ToolExecutor, ToolFuture, ToolName,
+    ToolRegistry, ToolResult, ToolSchema, Usage,
 };
 use nanus_link::protocol::{
     ApprovalState, ContextAction, ContextModeState, EffortState, Frame, GoalAction, GoalInfo,
@@ -513,6 +513,40 @@ impl LlmPort for CallingLlm {
     }
 }
 
+/// A model that calls `runner` at the start of every turn, and answers once it has the result.
+///
+/// [`CallingLlm`] calls only in the first turn the agent runs, so a second session's turn would be
+/// no question whatever was approved; an approval that reaches another session needs a call there.
+struct EveryTurnLlm;
+
+impl LlmPort for EveryTurnLlm {
+    fn model(&self) -> &'static str {
+        "calling"
+    }
+
+    fn stream_chat(&self, request: ChatRequest) -> LlmStream {
+        if matches!(request.messages.last(), Some(Message::Tool { .. })) {
+            return Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta("finished".to_owned()),
+                LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ]));
+        }
+        Box::pin(futures::stream::iter(vec![
+            LlmEvent::ToolCallDelta {
+                index: 0,
+                id: Some(ToolCallId::new("call_1")),
+                name: Some(ToolName::new("runner").unwrap_or_else(|_| unreachable!("valid"))),
+                arguments_delta: "{}".to_owned(),
+            },
+            LlmEvent::Finished {
+                reason: FinishReason::ToolCalls,
+            },
+        ]))
+    }
+}
+
 /// A model that calls `create_goal` once and then answers.
 ///
 /// What makes a goal the *model* set observable over the link: the change is written by the
@@ -569,6 +603,18 @@ impl ToolExecutor for StubTool {
 /// exception: with `ask` the turn puts the question to a watching client, and with `never`
 /// it refuses the call outright.
 fn gated_agent(dir: &Path, approval: ApprovalPolicy) -> (Agent, StoreHandle) {
+    let llm = CallingLlm {
+        step: std::cell::Cell::new(0),
+    };
+    gated_agent_over(dir, approval, Box::new(llm))
+}
+
+/// As [`gated_agent`], over a model of the caller's choosing.
+fn gated_agent_over(
+    dir: &Path,
+    approval: ApprovalPolicy,
+    llm: Box<dyn LlmPort>,
+) -> (Agent, StoreHandle) {
     let store = nanus_kernel::runtime::block_on(async {
         JsonlStore::new(dir.to_path_buf())
             .await
@@ -589,9 +635,7 @@ fn gated_agent(dir: &Path, approval: ApprovalPolicy) -> (Agent, StoreHandle) {
         .with_sandbox(SandboxMode::WorkspaceWrite)
         .with_approval(approval);
     let runner = AgentRunner::new(
-        Rc::new(Box::new(CallingLlm {
-            step: std::cell::Cell::new(0),
-        })),
+        Rc::new(llm),
         nanus_bundle::ToolRegistryHandle::new(registry),
         "you are a test",
         config,
@@ -2622,6 +2666,7 @@ fn an_approval_question_reaches_the_client_and_its_answer_runs_the_call() {
                 call_id,
                 allow: true,
                 always: false,
+                scope: nanus_link::protocol::ApprovalScope::Session,
             })
             .await
             .expect("the answer is sent");
@@ -2679,6 +2724,7 @@ fn a_refused_approval_denies_the_call_and_the_turn_finishes() {
                 call_id,
                 allow: false,
                 always: false,
+                scope: nanus_link::protocol::ApprovalScope::Session,
             })
             .await
             .expect("the refusal is sent");
@@ -2788,6 +2834,7 @@ fn an_always_answer_is_not_asked_again_in_the_session() {
                 call_id,
                 allow: true,
                 always: true,
+                scope: nanus_link::protocol::ApprovalScope::Session,
             })
             .await
             .expect("the standing answer is sent");
@@ -2821,6 +2868,272 @@ fn an_always_answer_is_not_asked_again_in_the_session() {
             .iter()
             .any(|frame| matches!(frame, Frame::Approval { .. })),
         "the granted tool is not asked about again: {second:?}"
+    );
+}
+
+/// Reads frames until the agent's model is announced, which is the last state frame an attachment
+/// is always sent, and returns what came before it.
+async fn attachment_state(client: &mut Client) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    while let Some(frame) = client.next().await.expect("frames are readable") {
+        if matches!(frame, Frame::ModelChanged { .. }) {
+            break;
+        }
+        frames.push(frame);
+    }
+    frames
+}
+
+/// Reads frames until the agent announces its standing approvals, and returns the set.
+async fn until_approved_tools(client: &mut Client) -> Option<Vec<String>> {
+    while let Some(frame) = client.next().await.expect("frames are readable") {
+        if let Frame::ApprovedToolsChanged { tools } = frame {
+            return Some(tools);
+        }
+    }
+    None
+}
+
+/// An agent-wide "always" is the agent's: every attached client is told the new set — the one
+/// watching another conversation included — a call in another session runs without a question,
+/// and a client that attaches afterwards is told the set when it arrives.
+#[test]
+fn an_agent_wide_always_answer_reaches_every_session_and_every_client() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) =
+        gated_agent_over(dir.path(), ApprovalPolicy::PerCall, Box::new(EveryTurnLlm));
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (first, told, second, late) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut asking = Client::connect(&socket_for_client).await.expect("answers");
+        asking.start(None).await.expect("a session starts");
+        let mut elsewhere = Client::connect(&socket_for_client).await.expect("answers");
+        elsewhere
+            .start(None)
+            .await
+            .expect("a second session starts");
+
+        asking
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mut first = Vec::new();
+        let Some((call_id, _)) = until_approval(&mut asking, &mut first).await else {
+            panic!("the first call is asked about: {first:?}");
+        };
+        asking
+            .approve_for_agent(&call_id)
+            .await
+            .expect("the agent-wide answer is sent");
+        first.extend(turn_frames(&mut asking).await);
+
+        // The client watching the other conversation is told, and its own turn is not a question.
+        let told = until_approved_tools(&mut elsewhere).await;
+        elsewhere
+            .send(&Request::Prompt {
+                text: "run it here".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let second = turn_frames(&mut elsewhere).await;
+
+        let mut arriving = Client::connect(&socket_for_client).await.expect("answers");
+        arriving.start(None).await.expect("a third session starts");
+        let late = attachment_state(&mut arriving).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        (first, told, second, late)
+    });
+
+    let runner = vec![String::from("runner")];
+    assert!(
+        first.iter().any(
+            |frame| matches!(frame, Frame::ApprovedToolsChanged { tools } if *tools == runner)
+        ),
+        "the client that answered is told the set: {first:?}"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|frame| matches!(frame, Frame::ToolDone { error: false, .. })),
+        "the call it answered for ran: {first:?}"
+    );
+    assert_eq!(
+        told,
+        Some(runner.clone()),
+        "the other session's client is told"
+    );
+    assert!(
+        !second
+            .iter()
+            .any(|frame| matches!(frame, Frame::Approval { .. })),
+        "another session's call is not a question: {second:?}"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|frame| matches!(frame, Frame::ToolDone { error: false, .. })),
+        "and it ran: {second:?}"
+    );
+    assert!(
+        late.iter().any(
+            |frame| matches!(frame, Frame::ApprovedToolsChanged { tools } if *tools == runner)
+        ),
+        "a client that attaches later is told the set: {late:?}"
+    );
+}
+
+/// The other direction: an "always" for the session stays in the session. Another conversation
+/// on the same agent is still asked, and no client is told of an agent-wide set that did not
+/// change — nor, on attaching, of one that is empty.
+#[test]
+fn a_session_always_answer_does_not_reach_another_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) =
+        gated_agent_over(dir.path(), ApprovalPolicy::PerCall, Box::new(EveryTurnLlm));
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (first, arrived, second) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut asking = Client::connect(&socket_for_client).await.expect("answers");
+        asking.start(None).await.expect("a session starts");
+        let mut elsewhere = Client::connect(&socket_for_client).await.expect("answers");
+        elsewhere
+            .start(None)
+            .await
+            .expect("a second session starts");
+        let arrived = attachment_state(&mut elsewhere).await;
+
+        asking
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mut first = Vec::new();
+        let Some((call_id, _)) = until_approval(&mut asking, &mut first).await else {
+            panic!("the first call is asked about: {first:?}");
+        };
+        asking
+            .approve(&call_id, true, true)
+            .await
+            .expect("the session's answer is sent");
+        first.extend(turn_frames(&mut asking).await);
+
+        elsewhere
+            .send(&Request::Prompt {
+                text: "run it here".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let mut second = Vec::new();
+        let Some((call_id, _)) = until_approval(&mut elsewhere, &mut second).await else {
+            panic!("the other session's call is asked about: {second:?}");
+        };
+        elsewhere
+            .approve(&call_id, false, false)
+            .await
+            .expect("the refusal is sent");
+        second.extend(turn_frames(&mut elsewhere).await);
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        (first, arrived, second)
+    });
+
+    let announced = |frames: &[Frame]| {
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ApprovedToolsChanged { .. }))
+    };
+    assert!(
+        !announced(&arrived),
+        "nothing approved, nothing announced: {arrived:?}"
+    );
+    assert!(
+        !announced(&first),
+        "a session's grant is not the agent's: {first:?}"
+    );
+    assert!(!announced(&second), "{second:?}");
+    assert!(
+        second
+            .iter()
+            .any(|frame| matches!(frame, Frame::Approval { .. })),
+        "the other session is still asked: {second:?}"
+    );
+}
+
+/// A standing approval the agent started with — what `approved_tools` puts on the runner — is not
+/// a question in any session, and is announced to a client when it attaches.
+#[test]
+fn a_standing_approval_the_agent_started_with_is_not_asked_about() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
+    let runner = ToolName::new("runner").expect("a valid tool name");
+    assert!(matches!(agent.runner().approve_tool(&runner), Ok(true)));
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (arrived, frames) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client).await.expect("answers");
+        client.start(None).await.expect("a session starts");
+        let arrived = attachment_state(&mut client).await;
+        client
+            .send(&Request::Prompt {
+                text: "run it".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving
+            .await
+            .expect("the server task is joined")
+            .expect("serving ends cleanly");
+        (arrived, frames)
+    });
+
+    assert!(
+        arrived.iter().any(|frame| matches!(
+            frame,
+            Frame::ApprovedToolsChanged { tools } if *tools == [String::from("runner")]
+        )),
+        "{arrived:?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Approval { .. })),
+        "an approved tool is not a question: {frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::ToolDone { error: false, .. })),
+        "the call ran: {frames:?}"
     );
 }
 

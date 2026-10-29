@@ -101,6 +101,26 @@ pub enum ApprovalState {
     AllCalls,
 }
 
+/// How far an *always* answer to an approval question reaches.
+///
+/// Read only when the answer allows the call and is `always`: a one-call answer reaches no
+/// further than the call, whatever it says here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    /// The session the question was asked in, for as long as the agent holds it.
+    ///
+    /// The default, and what every *always* answer meant before the scope existed.
+    #[default]
+    Session,
+    /// Every session the agent holds, now and later, until the agent stops.
+    ///
+    /// The agent tells every attached client the new set with [`Frame::ApprovedToolsChanged`],
+    /// and keeps it in memory only: a host that wants it to outlive the agent records it in its
+    /// own configuration's `approved_tools`.
+    Agent,
+}
+
 /// How much reasoning effort an agent asks the model to spend.
 ///
 /// The link's own vocabulary rather than the ports enum, for the same reason [`ApprovalState`]
@@ -561,6 +581,14 @@ pub enum Request {
         /// the option sends an allow-once answer, which is what it always meant.
         #[serde(default)]
         always: bool,
+        /// How far an `always` answer reaches: this session, or every session the agent holds.
+        ///
+        /// Ignored unless the answer allows the call and is `always`. Defaulted on the way in to
+        /// [`ApprovalScope::Session`], so a client that predates the field means what it always
+        /// did. An older *agent* would ignore the field and grant the session alone, which is why
+        /// adding it moved [`PROTOCOL_VERSION`].
+        #[serde(default)]
+        scope: ApprovalScope,
     },
 
     /// Replace the agent's approval state for the rest of the session.
@@ -885,6 +913,22 @@ pub enum Frame {
     ApprovalChanged {
         /// The state the agent is using now.
         state: ApprovalState,
+    },
+
+    /// The tools the agent runs without asking in every session: its standing approvals.
+    ///
+    /// Sent to every attached client whenever the set grows — an *always* answer with
+    /// [`ApprovalScope::Agent`] — so a host can record it in its own configuration, which is the
+    /// durable copy: the agent never writes one. Sent when a client attaches, too, but only when
+    /// the set is not empty, as the effort is only sent when there is one: a frame announcing that
+    /// nothing is approved would be noise on every attachment, and an empty set is what a client
+    /// that has been told nothing assumes.
+    ///
+    /// The whole set rather than the tool just added, so a client that missed a change is
+    /// corrected by the next one rather than drifting.
+    ApprovedToolsChanged {
+        /// Every tool approved for every session, in name order.
+        tools: Vec<String>,
     },
 
     /// A handoff draft is ready: the document the new session would open with, for the client to
@@ -1262,7 +1306,12 @@ impl Frame {
 /// [`Frame::Compacted`]. An agent at 11 cannot parse those requests, so it is refused at the
 /// handshake. The attachment's stream mark also carries the compaction boundary, which an older
 /// client would discard without knowing it was there.
-pub const PROTOCOL_VERSION: u32 = 12;
+///
+/// Version 13 adds the agent's standing approvals: [`Frame::ApprovedToolsChanged`], and
+/// [`ApprovalScope`] on [`Request::Approve`]. An older client cannot decode the frame, and an
+/// older agent would read an agent-wide *always* as a session's — granting less than the person
+/// chose and never saying so — so both are refused at the handshake rather than misread.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The version a handshake that carries none is read as.
 ///
@@ -2048,16 +2097,25 @@ mod tests {
                 call_id: "call-1".to_owned(),
                 allow: true,
                 always: false,
+                scope: ApprovalScope::Session,
             },
             Request::Approve {
                 call_id: "call-1".to_owned(),
                 allow: true,
                 always: true,
+                scope: ApprovalScope::Session,
+            },
+            Request::Approve {
+                call_id: "call-1".to_owned(),
+                allow: true,
+                always: true,
+                scope: ApprovalScope::Agent,
             },
             Request::Approve {
                 call_id: "call-1".to_owned(),
                 allow: false,
                 always: false,
+                scope: ApprovalScope::Session,
             },
             Request::SetApproval {
                 state: ApprovalState::AllCalls,
@@ -2348,6 +2406,58 @@ mod tests {
                 arguments: serde_json::Value::Null,
             })
         );
+    }
+
+    /// The agent's standing approvals cross as the whole set, in order, and an empty set is a set
+    /// rather than an absence.
+    #[test]
+    fn the_approved_tools_frame_round_trips_the_whole_set() {
+        for tools in [vec!["bash".to_owned(), "write".to_owned()], Vec::new()] {
+            let frame = Frame::ApprovedToolsChanged { tools };
+            let line = encode(&frame).unwrap_or_else(|error| panic!("encodes: {error}"));
+            assert_eq!(decode::<Frame>(&line).ok(), Some(frame));
+        }
+        let wire = r#"{"frame":"approved_tools_changed","tools":["bash"]}"#;
+        assert_eq!(
+            decode::<Frame>(wire).ok(),
+            Some(Frame::ApprovedToolsChanged {
+                tools: vec!["bash".to_owned()],
+            }),
+            "the wire spelling is the one the docs give"
+        );
+    }
+
+    /// An answer that names no scope is a session's, which is what every `always` meant before
+    /// the scope existed: a client that predates it must not grant more than it asked for.
+    #[test]
+    fn an_approval_answer_without_a_scope_reaches_only_its_session() {
+        let decoded =
+            decode::<Request>(r#"{"request":"approve","call_id":"a1","allow":true,"always":true}"#);
+        assert_eq!(
+            decoded.ok(),
+            Some(Request::Approve {
+                call_id: "a1".to_owned(),
+                allow: true,
+                always: true,
+                scope: ApprovalScope::Session,
+            })
+        );
+        // The other direction: the agent-wide scope is its own spelling, and an unknown one is a
+        // decode error rather than a quiet session grant.
+        let agent = decode::<Request>(
+            r#"{"request":"approve","call_id":"a1","allow":true,"always":true,"scope":"agent"}"#,
+        );
+        assert!(matches!(
+            agent,
+            Ok(Request::Approve {
+                scope: ApprovalScope::Agent,
+                ..
+            })
+        ));
+        let unknown = decode::<Request>(
+            r#"{"request":"approve","call_id":"a1","allow":true,"always":true,"scope":"world"}"#,
+        );
+        assert!(unknown.is_err(), "{unknown:?}");
     }
 
     /// The ending used to say only that the turn had finished, so an agent too old to

@@ -151,6 +151,24 @@ session, so the same question is not asked again for the rest of that conversati
 record is per session and in memory, so nothing about it is written to the log or outlives
 the agent.
 
+A standing approval can also be the agent's. `approved_tools` in the configuration names tools
+the gate grants as if every session had already answered "always", and a client can add one live
+with an `agent`-scoped answer. The gate consults the set at exactly the point it would otherwise
+ask, so it covers what an "always" covers — every later call to that tool that the sandbox and the
+state left to a person, a destructive one included — and nothing else: it moves no state, it does
+not outrank a host's `ToolPolicy`, and an empty set, the default, is the gate as it was. That is
+what keeps it from being `AllCalls` by another name: it names tools one at a time, a person or a
+configuration names each, and nothing is approved unless something said so.
+
+A name no tool has is refused at start rather than warned about. Which tools exist is known only
+once the agent has started — `read_video` and a host's tools are installed last — so the check
+waits for them; then a misspelling, or `read_video` while it is off, stops the start with a sentence
+naming it. Ignoring the name would be safe, since an approval of nothing grants nothing, but its
+author would believe something was in force that was not, and a warning in a service log is how
+that belief survives. The agent never writes the configuration: the set it holds is in memory, every
+client is told when it changes, and a host that wants an approval given live to outlive the agent
+writes it into a configuration whose place it chose, as it chooses `selection_file`.
+
 An embedding host may install `ToolPolicy` on `AgentRunner`. It sees every registered call,
 including reads, with exact ID/arguments and its declared access before the default gate.
 `Deny` and policy errors refuse; `UseDefault` delegates; `AllowOnce` grants that call only.

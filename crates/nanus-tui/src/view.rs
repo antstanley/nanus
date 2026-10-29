@@ -485,6 +485,13 @@ pub struct ViewState {
     /// prompt appears.
     pub approval: ApprovalPolicy,
 
+    /// The tools the agent runs without asking in every session, as it last said.
+    ///
+    /// Kept so a change is drawn once rather than on every frame that repeats it: a standing
+    /// approval is wider than the state in the status line, and a reader should be told when
+    /// one is in force rather than infer it from a question that never comes.
+    pub approved_tools: Vec<String>,
+
     /// Prompts typed while a turn was running, oldest first.
     ///
     /// The agent serves one turn at a time and refuses a prompt to a busy session, so a
@@ -783,6 +790,7 @@ impl Default for ViewState {
             dialog_scroll: 0,
             dialog_focus: None,
             approval: ApprovalPolicy::default(),
+            approved_tools: Vec::new(),
             queue: Queue::new(),
             queue_open: false,
             queue_selection: 0,
