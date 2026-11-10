@@ -367,6 +367,70 @@ fn resident<M: Metric>(c: &mut Criterion<M>) {
     group.finish();
 }
 
+/// Lines in each answer of [`unsettled`]: a file's worth of code, or a long list.
+const UNSETTLED_LINES: usize = 300;
+
+/// The answers [`unsettled`] streams, each one a single run with no blank line to settle at.
+fn unsettled_answers() -> [(&'static str, String); 3] {
+    let lines = |line: fn(usize) -> String| -> String {
+        (0..UNSETTLED_LINES).map(line).collect::<Vec<_>>().concat()
+    };
+    let code = lines(|index| {
+        format!("    let value_{index} = compute(\"{index}\", {index} + 1); // a comment\n")
+    });
+    let items = lines(|index| format!("- item {index} with some `code` and a few words\n"));
+    let crlf = lines(|index| format!("Paragraph {index} of ordinary prose, a line long.\r\n\r\n"));
+    let fence = format!("Here is the file:\n\n```rust\n{code}");
+    let list = format!("The steps:\n\n{items}");
+    [("fence", fence), ("list", list), ("crlf", crlf)]
+}
+
+/// Cuts `text` into deltas of [`DELTA_BYTES`] characters.
+fn deltas_of(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(DELTA_BYTES)
+        .map(|piece| piece.iter().collect())
+        .collect()
+}
+
+/// An answer with nowhere to settle, streamed whole: a long code fence, a long list, and prose
+/// with carriage returns in it.
+///
+/// [`answer`] streams markdown with a blank line every few rows, which is the shape the cut
+/// rendering was built for. These are the shapes it had no cut for — a fence holds its blank
+/// lines, a list has none, and a carriage return stopped the search for cuts outright — so the
+/// whole answer was the tail and every delta rendered all of it again. A model writing a file
+/// into a fence is the ordinary case of the first.
+fn unsettled<M: Metric>(c: &mut Criterion<M>) {
+    let mut group = c.benchmark_group(M::group("tui/unsettled"));
+    group.sampling_mode(SamplingMode::Flat).sample_size(10);
+    for (name, text) in unsettled_answers() {
+        let deltas = deltas_of(&text);
+        group.throughput(Throughput::Elements(deltas.len() as u64));
+        group.bench_function(BenchmarkId::new(name, UNSETTLED_LINES), |b| {
+            b.iter_batched(
+                || view(10, COMPACT),
+                |(mut state, mut terminal)| {
+                    for (index, fragment) in deltas.iter().enumerate() {
+                        state
+                            .transcript
+                            .append_stream(Role::Assistant, fragment, false);
+                        state.follow();
+                        if index % BURST == BURST.saturating_sub(1) {
+                            draw(&mut terminal, &mut state);
+                        }
+                    }
+                    draw(&mut terminal, &mut state);
+                    (state, terminal)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
 /// A keystroke in the middle of a long prompt: one character typed and taken back, so the
 /// buffer is the same before every iteration. The composer holds characters, so an edit in
 /// the middle moves everything after it.
@@ -385,4 +449,7 @@ fn input<M: Metric>(c: &mut Criterion<M>) {
     group.finish();
 }
 
-nanus_bench::benches!(replay, stream, frame, scrolled, delta, answer, input; retained: resident);
+nanus_bench::benches!(
+    replay, stream, frame, scrolled, delta, answer, unsettled, input;
+    retained: resident
+);

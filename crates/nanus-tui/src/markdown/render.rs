@@ -153,6 +153,35 @@ fn code_block(lang: &str, code: &str, width: usize, theme: &MarkdownTheme) -> Ve
         out.push(Line::from(fit_span(heading, width, theme.aside)));
     }
     let mut highlighter = highlight::Highlighter::for_language(lang);
+    code_rows(&mut out, &mut highlighter, code, width, theme);
+    out
+}
+
+/// Renders the rest of a fence that was opened in an earlier part of a streaming answer.
+///
+/// The same rows [`code_block`] draws for these lines, without the heading the part that
+/// opened the fence already drew, and with the lexer started where that part's lines left it.
+pub(crate) fn code_rest(
+    lang: &str,
+    carry: highlight::Carry,
+    code: &str,
+    width: usize,
+    theme: &MarkdownTheme,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut highlighter = highlight::Highlighter::resumed(lang, carry);
+    code_rows(&mut out, &mut highlighter, code, width, theme);
+    out
+}
+
+/// Draws lines of code onto the end of `out`, one or more rows each.
+fn code_rows(
+    out: &mut Vec<Line<'static>>,
+    highlighter: &mut highlight::Highlighter,
+    code: &str,
+    width: usize,
+    theme: &MarkdownTheme,
+) {
     for source_line in code.split('\n') {
         let spans: Vec<Span<'static>> = highlighter
             .line(source_line)
@@ -161,7 +190,6 @@ fn code_block(lang: &str, code: &str, width: usize, theme: &MarkdownTheme) -> Ve
             .collect();
         out.extend(hard_wrap_spans(&spans, width, "│ ", theme.border));
     }
-    out
 }
 
 /// The style a run of code is drawn with.

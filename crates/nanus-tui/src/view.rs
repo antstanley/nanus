@@ -706,6 +706,9 @@ pub struct ViewState {
     /// good, so only the text after the latest is parsed for new ones, and the layout — refreshed
     /// more than once per token, to follow the bottom and then to draw — asks again for free.
     stream_cuts: RefCell<Option<StreamCuts>>,
+    /// Whether a burst of frames is being applied, and whether any of them asked to follow the
+    /// newest output: `None` outside a burst. See [`ViewState::begin_burst`].
+    follow_deferred: Option<bool>,
     /// The pairing of calls with results, and the tool entries it was worked out from.
     ///
     /// Pairing reads only the tool entries, and a token changes none of them, so it is worked
@@ -732,8 +735,8 @@ struct StreamCuts {
     width: u16,
     /// Whether diagrams were drawn, which decides the same for a `mermaid` fence.
     mermaid: bool,
-    /// The byte offsets of the cuts, in order.
-    cuts: Vec<usize>,
+    /// The cuts, in order.
+    cuts: Vec<markdown::Cut>,
 }
 
 impl Default for ViewState {
@@ -833,6 +836,7 @@ impl Default for ViewState {
             last_composer: None,
             layout: RefCell::new(TranscriptLayout::default()),
             stream_cuts: RefCell::new(None),
+            follow_deferred: None,
             pairing: RefCell::new(None),
         }
     }
@@ -1287,9 +1291,40 @@ impl ViewState {
     /// something, and dragging them back down on the next streamed token is how a
     /// transcript becomes unreadable while a turn is running.
     pub fn follow(&mut self) {
-        if self.following {
+        if !self.following {
+            return;
+        }
+        // Inside a burst the follow is only noted: finding the bottom lays the newest text
+        // out, and doing that for each of the frames a burst holds drew the growing answer
+        // once per frame for a screen that is drawn once per burst.
+        if let Some(wanted) = self.follow_deferred.as_mut() {
+            *wanted = true;
+            return;
+        }
+        self.scroll_to_bottom();
+    }
+
+    /// Starts a burst: the frames about to be applied are all applied before anything is drawn.
+    ///
+    /// Until [`ViewState::end_burst`], [`ViewState::follow`] records that the newest output is
+    /// wanted rather than scrolling to it. Nothing else changes: a caller that scrolls to the
+    /// bottom itself, or anywhere else, still does so at once.
+    pub fn begin_burst(&mut self) {
+        if self.follow_deferred.is_none() {
+            self.follow_deferred = Some(false);
+        }
+    }
+
+    /// Ends a burst, following the newest output once if anything in it asked to.
+    ///
+    /// A reader who stopped following part way through the burst is left where they are, which
+    /// is what each of those follows would have decided on its own.
+    pub fn end_burst(&mut self) {
+        if self.follow_deferred.take() == Some(true) && self.following {
             self.scroll_to_bottom();
         }
+        // Postcondition: nothing is left deferred, so a follow outside a burst acts at once.
+        assert!(self.follow_deferred.is_none());
     }
 
     /// Scrolls so the newest entry is visible.
@@ -2710,6 +2745,8 @@ impl ViewState {
     /// viewport has made stale, and a stale offset would render past the end of the
     /// transcript.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        // A burst that was never ended must not leave a frame drawn short of the newest output.
+        self.end_burst();
         let area = frame.area();
         // Explicit palettes own their background too; inherited terminal colours remain the default.
         if self.theme.assistant.fg.is_some() || self.theme.assistant.bg.is_some() {
@@ -3613,11 +3650,14 @@ impl ViewState {
                 let memo = self.stream_cuts.borrow();
                 let cuts = memo.as_ref().map_or(&[][..], |memo| memo.cuts.as_slice());
                 if let (Some(first), Some(last)) = (cuts.first(), cuts.last()) {
-                    visit(Piece::StreamHead(*first), index..end);
+                    visit(Piece::StreamHead(first.offset), index..end);
                     for pair in cuts.windows(2) {
-                        visit(Piece::StreamChunk(pair[0], pair[1]), index..end);
+                        visit(
+                            Piece::StreamChunk(pair[0].offset, pair[1].offset),
+                            index..end,
+                        );
                     }
-                    visit(Piece::StreamTail(*last), index..end);
+                    visit(Piece::StreamTail(last.offset), index..end);
                 }
             } else {
                 visit(piece, index..end);
@@ -3660,6 +3700,28 @@ impl ViewState {
             known.stamp = entry.stamp();
         }
         !known.cuts.is_empty()
+    }
+
+    /// The cut of a streaming answer at byte `offset`, with how the part after it joins the
+    /// part before.
+    ///
+    /// A piece carries the offset alone — it is compared on every refresh for every block, and
+    /// kept for every block — and the seam is read back from the cuts the piece was made from.
+    /// They are the cuts of the answer that is streaming, which is the only entry a piece like
+    /// this is ever made for. An offset they do not hold is drawn as following a blank line,
+    /// which is what every cut once was.
+    fn stream_cut(&self, entry: &Entry, offset: usize) -> markdown::Cut {
+        let memo = self.stream_cuts.borrow();
+        memo.as_ref()
+            .filter(|known| known.id == entry.id())
+            .and_then(|known| {
+                let found = known.cuts.binary_search_by_key(&offset, |cut| cut.offset);
+                found.ok().and_then(|index| known.cuts.get(index).copied())
+            })
+            .unwrap_or(markdown::Cut {
+                offset,
+                seam: markdown::Seam::Blank,
+            })
     }
 
     /// What the block starting at `index` is drawn as, and how many entries it covers.
@@ -3780,13 +3842,14 @@ impl ViewState {
             }
             Piece::StreamChunk(from, to) => {
                 let theme = MarkdownTheme::from_view(&self.theme);
-                let middle = entry.text().get(from..to).unwrap_or_default();
-                markdown::render_middle(middle, width, self.mermaid, &theme)
+                let from = self.stream_cut(entry, from);
+                markdown::render_middle(entry.text(), from, to, width, self.mermaid, &theme)
             }
             Piece::StreamTail(cut) => {
                 let theme = MarkdownTheme::from_view(&self.theme);
-                let tail = entry.text().get(cut..).unwrap_or_default();
-                let mut lines = markdown::render_tail(tail, width, self.mermaid, &theme);
+                let cut = self.stream_cut(entry, cut);
+                let mut lines =
+                    markdown::render_tail(entry.text(), cut, width, self.mermaid, &theme);
                 if let Some(last) = lines.last_mut() {
                     last.spans.push(Span::styled("▌", self.theme.assistant));
                 }
@@ -6734,6 +6797,42 @@ mod tests {
         );
     }
 
+    /// An answer with no blank line at the top level — a file in a fence, then a list — is cut
+    /// inside the fence and between the items, and at every step of its arrival it is drawn as
+    /// the whole of it would be, by a view that kept its layout and by one that did not.
+    #[test]
+    fn a_fence_and_a_list_streamed_without_a_blank_line_draw_as_they_would_whole() {
+        const ANSWER: &str = "```rust\nfn main() {\n    /* a comment\n       over two lines */\n    \
+                              let a = 1;\n    let b = 2;\n}\n```\n- first item\n- second `item`\n\
+                              - third item that is long enough to wrap at a narrow width\n";
+        let mut warm = ViewState::new();
+        warm.transcript.push(Entry::prose(Role::User, "write it"));
+        let characters: Vec<char> = ANSWER.chars().collect();
+        let mut cut = 0_usize;
+        for chunk in characters.chunks(5) {
+            let fragment: String = chunk.iter().collect();
+            warm.transcript
+                .append_stream(Role::Assistant, &fragment, false);
+            warm.follow();
+            assert_coherent(&mut warm, 44, 30, &format!("streaming {fragment:?}"));
+            let Some(entry) = warm.transcript.entries().last() else {
+                unreachable!("an answer is streaming")
+            };
+            let mut whole = vec![warm.header_for(entry)];
+            whole.extend(warm.lines_for(entry, 44));
+            whole.push(Line::from(""));
+            let drawn = warm.lines_of(core::slice::from_ref(entry), 44);
+            assert_eq!(drawn, whole, "after {fragment:?}");
+            cut = cut.max(
+                warm.stream_cuts
+                    .borrow()
+                    .as_ref()
+                    .map_or(0, |known| known.cuts.len()),
+            );
+        }
+        assert!(cut >= 6, "the fence and the list were both cut: {cut}");
+    }
+
     #[test]
     fn a_streaming_answer_cut_where_it_settled_draws_as_it_would_whole() {
         let mut state = ViewState::new();
@@ -6751,6 +6850,64 @@ mod tests {
         whole.extend(state.lines_for(&entry, 60));
         whole.push(Line::from(""));
         assert_eq!(state.transcript_lines(60), whole);
+    }
+
+    /// A burst of frames is applied whole before a frame is drawn, so the view follows once at
+    /// its end: the same place each follow would have reached, without laying the answer out
+    /// for every frame in between.
+    #[test]
+    fn follows_inside_a_burst_are_acted_on_once_at_its_end() {
+        let filled = || {
+            let mut state = ViewState::new();
+            for turn in 0..40 {
+                state
+                    .transcript
+                    .push(Entry::prose(Role::User, format!("question {turn}")));
+            }
+            let _ = rendered(&mut state, 60, 12);
+            state.scroll_to_bottom();
+            state
+        };
+        let mut state = filled();
+        let before = state.scroll_offset;
+        state.begin_burst();
+        for _ in 0..5 {
+            state
+                .transcript
+                .append_stream(Role::Assistant, "more\n\n", false);
+            state.follow();
+        }
+        assert_eq!(
+            state.scroll_offset, before,
+            "nothing moves inside the burst"
+        );
+        state.end_burst();
+        assert_eq!(
+            state.scroll_offset,
+            state.max_scroll(),
+            "and it ends at the bottom"
+        );
+        assert!(state.scroll_offset > before);
+
+        // The other direction: a reader who scrolled away is not followed for, burst or not.
+        let mut away = filled();
+        away.scroll(-10);
+        let held = away.scroll_offset;
+        away.begin_burst();
+        away.transcript
+            .append_stream(Role::Assistant, "more\n\n", false);
+        away.follow();
+        away.end_burst();
+        assert_eq!(away.scroll_offset, held);
+
+        // And a burst nobody ended is ended by the frame that draws it.
+        let mut open = filled();
+        open.begin_burst();
+        open.transcript
+            .append_stream(Role::Assistant, "more\n\n", false);
+        open.follow();
+        let _ = rendered(&mut open, 60, 12);
+        assert_eq!(open.scroll_offset, open.max_scroll());
     }
 
     #[test]

@@ -56,13 +56,21 @@ struct Rules {
 }
 
 /// A construct that outlives the line it started on.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Open {
     /// A block comment, waiting for this terminator.
     Block(&'static str),
     /// A triple-quoted string, waiting for this terminator.
     Triple(&'static str),
 }
+
+/// What a line of a fence left open for the line after it.
+///
+/// A streaming answer is drawn in parts, and a part may begin in the middle of a fence. The
+/// lexer's state at that line is all the part needs from the lines before it, so it is kept
+/// with the cut and the part's lexer is started from it ([`Highlighter::resumed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Carry(Option<Open>);
 
 /// Lexes one fence, one line at a time.
 pub(crate) struct Highlighter {
@@ -89,6 +97,20 @@ impl Highlighter {
             rules: rules_for(&head.to_ascii_lowercase()),
             open: None,
         }
+    }
+
+    /// Builds a highlighter that picks a fence up part way through, in the state `carry` holds.
+    #[must_use]
+    pub(crate) fn resumed(name: &str, carry: Carry) -> Self {
+        let mut highlighter = Self::for_language(name);
+        highlighter.open = carry.0;
+        highlighter
+    }
+
+    /// What the lines lexed so far leave open for the next one.
+    #[must_use]
+    pub(crate) const fn carry(&self) -> Carry {
+        Carry(self.open)
     }
 
     /// Classifies one line, in order, as runs of the same class.
