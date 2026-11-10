@@ -1441,6 +1441,15 @@ every frame that is waiting before it draws, so it brackets them (`ViewState::be
 `end_burst`) and the view follows once, at the end, to the place each follow would have
 reached.
 
+**A burst of keys is one frame too.** The loop used to draw after every terminal event, which
+is right for a key pressed and wrong for a hundred of them: a held key, a drag of the mouse, or
+a terminal that types its pastes delivers events faster than frames can be seen, and each one
+paid for a frame — and for the whole draft to be wrapped again. Thirty-two thousand typed
+characters took thirteen seconds to arrive. A wake-up now takes every event that is already
+waiting before it draws. Two things end the burst early: 256 events, so a flood still draws,
+and an event that opens or closes a dialog, because the keys behind it are for a dialog the
+reader has not been shown yet.
+
 The trade is residency for traffic. The view holds about 1.4 KiB per turn of measurements —
 146 KiB for a 100-turn session, where it used to hold nothing between frames — and in exchange
 no longer builds and holds every rendered line of the conversation, 1.6 MiB at 100 turns, on
