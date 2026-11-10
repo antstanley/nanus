@@ -573,9 +573,19 @@ impl Transcript {
     pub fn push(&mut self, entry: Entry) {
         self.settle_tail();
         self.entries.push(entry);
-        // Postcondition: at most the last entry streams, which the view relies on
-        // to draw a single cursor.
-        assert!(self.streaming_count() <= 1, "at most one entry streams");
+        // Postcondition: at most the last entry streams, which the view relies on to draw a
+        // single cursor. Stated about the entry the push just covered rather than by counting
+        // every entry: the tail is the only one that can stream, so settling it before a push
+        // is the whole invariant, and a count of the transcript on every push made building a
+        // long one — a replay — cost the square of its length.
+        assert!(
+            self.entries
+                .iter()
+                .rev()
+                .nth(1)
+                .is_none_or(|covered| !covered.is_streaming()),
+            "at most one entry streams, and it is the last"
+        );
     }
 
     /// Appends a fragment to the streaming tail, starting one when needed.
@@ -700,6 +710,28 @@ mod tests {
         assert!(Role::Reasoning.is_model());
         assert!(!Role::User.is_model());
         assert!(!Role::Tool.is_model());
+    }
+
+    /// Only the tail streams, however the transcript was built: a push settles what it covers,
+    /// and an entry pushed while still streaming is the one that streams.
+    #[test]
+    fn a_push_settles_the_entry_it_covers_and_only_the_tail_streams() {
+        let mut transcript = Transcript::default();
+        transcript.append_stream(Role::Assistant, "partial", false);
+        assert_eq!(transcript.streaming_count(), 1);
+        transcript.push(Entry::streaming(Role::Reasoning));
+        assert_eq!(transcript.streaming_count(), 1, "the covered entry settled");
+        assert!(!transcript.entries()[0].is_streaming());
+        assert!(
+            transcript.entries()[1].is_streaming(),
+            "and the new tail streams"
+        );
+        transcript.push(Entry::prose(Role::User, "next"));
+        assert_eq!(
+            transcript.streaming_count(),
+            0,
+            "a settled push leaves none"
+        );
     }
 
     #[test]

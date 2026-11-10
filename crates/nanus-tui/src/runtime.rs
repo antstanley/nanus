@@ -1934,7 +1934,11 @@ fn flush_queue(source: &mut dyn SessionSource, view: &mut ViewState) {
     view.transcript
         .push(Entry::prose(Role::User, prompt.clone()));
     view.begin_turn(1);
-    view.scroll_to_bottom();
+    // Followed rather than scrolled to. The prompt is the reader's own, but they typed it a
+    // turn ago: what sends it now is the frame that ended that turn, and a reader who has
+    // scrolled up to read while it ran is in the middle of something. That is the rule every
+    // frame follows, and a queued prompt leaving on a frame is under it.
+    view.follow();
     // `begin_turn` says "thinking", which is true, but the reader should also be told the
     // prompt was one they thought had not been sent yet.
     view.status = if view.has_queued() {
@@ -5401,6 +5405,47 @@ mod tests {
         flush_queue(&mut source, &mut view);
         assert_eq!(view.queue.len(), 0);
         assert_eq!(source.requests.borrow().len(), 2);
+    }
+
+    /// A queued prompt leaves when a turn ends, which is a frame's doing and not a keystroke's:
+    /// a reader at the bottom is taken to it, and one who scrolled up to read is left alone.
+    #[test]
+    fn a_queued_prompt_leaving_follows_the_reader_instead_of_dragging_them() {
+        let queued = |scrolled_up: bool| {
+            let mut source = Scripted::new(Vec::new());
+            let mut view = ViewState::new();
+            for index in 0..200 {
+                view.transcript
+                    .push(Entry::prose(Role::User, format!("entry {index}")));
+            }
+            view.scroll_by(0, 20, 60);
+            view.scroll_to_bottom();
+            view.begin_turn(1);
+            send_or_queue(String::from("later"), &mut source, &mut view);
+            if scrolled_up {
+                view.scroll(-40);
+                assert!(!view.following, "the reader has scrolled away");
+            }
+            let before = view.scroll_offset;
+            view.end_turn();
+            flush_queue(&mut source, &mut view);
+            assert_eq!(source.requests.borrow().len(), 1, "the prompt was sent");
+            (before, view.scroll_offset, view.max_scroll())
+        };
+
+        let (before, after, bottom) = queued(false);
+        assert_eq!(
+            after, bottom,
+            "a reader at the bottom sees their prompt leave"
+        );
+        assert!(after > before, "which is further down than they were");
+
+        let (before, after, bottom) = queued(true);
+        assert_eq!(
+            after, before,
+            "a reader who scrolled up stays where they are"
+        );
+        assert!(after < bottom, "and that is not the bottom");
     }
 
     /// `Ctrl+P` is the queue's key, and it answers on the status line when there is
