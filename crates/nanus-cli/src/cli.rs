@@ -1019,7 +1019,7 @@ fn run_turn(
     let harness = pending.start().map_err(|error| error.to_string())?;
     // The session is resolved here rather than in `prepare`, because resolving it needs
     // the store the composition has just opened and loading it is a blocking call.
-    let mut session = match resume {
+    let session = match resume {
         Some(reference) => load_session(&harness, reference)?,
         None => harness.new_session(workspace),
     };
@@ -1028,8 +1028,13 @@ fn run_turn(
     // that loses a turn. A refusal means somebody else is holding it — most often a service —
     // so the sentence says what to do instead of just what happened.
     let id = session.id().clone();
-    kernel_block_on(harness.store.lock(&id, RUN_CLAIM))
-        .map_err(|error| format!("{error}; attach to it with `nanus tui --connect`"))?;
+    let mut session = match claimed(&harness.store, session, resume.is_some()) {
+        Ok(session) => session,
+        Err(error) => {
+            finish_harness(&harness)?;
+            return Err(error);
+        }
+    };
     let bound = match bind_context(&harness, &mut session, context) {
         Ok(bound) => bound,
         Err(error) => {
@@ -1313,6 +1318,35 @@ fn record_after(
     let named = kernel_block_on(harness.store.name(session.id(), name))
         .map_err(|error| format!("the session could not be named: {error}"));
     (saved, named)
+}
+
+/// Claims `session` for this run, and reads it again under the claim when it was resumed.
+///
+/// Read again once nobody else can write it. The copy the caller holds was read before the
+/// claim — it is how the reference was resolved, and how a session that is not there was
+/// refused without a claim's directory being made for it — so a writer that finished in
+/// between is not in it, and saving this run on top of it would put the older log back. A new
+/// session has no stored copy to be behind.
+///
+/// # Errors
+///
+/// Returns a message when another process holds the session, or it cannot be read under the
+/// claim; the claim is given back in the second case.
+fn claimed(
+    store: &nanus_ports::StoreHandle,
+    session: nanus_domain::Session,
+    resumed: bool,
+) -> Result<nanus_domain::Session, String> {
+    let id = session.id().clone();
+    kernel_block_on(store.lock(&id, RUN_CLAIM))
+        .map_err(|error| format!("{error}; attach to it with `nanus tui --connect`"))?;
+    if !resumed {
+        return Ok(session);
+    }
+    kernel_block_on(store.load(&id)).map_err(|error| {
+        store.release_lock(&id);
+        error.to_string()
+    })
 }
 
 /// Loads the session a reference names.
@@ -2852,6 +2886,51 @@ mod tests {
         kernel_block_on(JsonlStore::new(home.to_path_buf()))
             .unwrap_or_else(|error| panic!("a store in the temporary directory: {error}"))
             .handle()
+    }
+
+    /// A resumed session is the log as it stands under this run's claim. The copy read before
+    /// the claim is behind any writer that finished in between, and a run saved on top of it
+    /// put the older log back and lost that writer's turn.
+    #[test]
+    fn a_resumed_session_is_read_again_under_its_claim() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| panic!("a temp dir: {error}"));
+        let store = store_under(home.path());
+        let mut session = nanus_domain::Session::new(nanus_domain::SessionId::new("run"), 0, "/w");
+        session.append(nanus_domain::SessionEvent::UserMessage {
+            text: "the first turn".into(),
+            content_blocks: None,
+        });
+        kernel_block_on(store.save(&session)).unwrap_or_else(|error| panic!("{error}"));
+        // Read before the claim, as the reference is resolved; then another writer finishes.
+        let read_early = session.clone();
+        session.append(nanus_domain::SessionEvent::UserMessage {
+            text: "another writer's turn".into(),
+            content_blocks: None,
+        });
+        kernel_block_on(store.save(&session)).unwrap_or_else(|error| panic!("{error}"));
+
+        let held = claimed(&store, read_early, true).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(held.event_count(), 2, "the other writer's turn is in it");
+        store.release_lock(held.id());
+    }
+
+    /// The other direction: a new session has no stored copy to be behind, so it is claimed
+    /// and used as it is — and a resumed one that is gone by the time it is claimed is an error
+    /// rather than a run on a copy nothing backs.
+    #[test]
+    fn a_new_session_is_claimed_as_it_is_and_a_vanished_one_is_refused() {
+        let home = tempfile::tempdir().unwrap_or_else(|error| panic!("a temp dir: {error}"));
+        let store = store_under(home.path());
+        let fresh = nanus_domain::Session::new(nanus_domain::SessionId::new("fresh"), 0, "/w");
+        let held = claimed(&store, fresh.clone(), false);
+        assert_eq!(held.as_ref().map(nanus_domain::Session::id), Ok(fresh.id()));
+        store.release_lock(fresh.id());
+
+        let gone = nanus_domain::Session::new(nanus_domain::SessionId::new("gone"), 0, "/w");
+        assert!(
+            claimed(&store, gone, true).is_err(),
+            "nothing is stored under the id"
+        );
     }
 
     /// Records one session, named if asked, and returns its id.
