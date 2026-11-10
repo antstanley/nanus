@@ -41,9 +41,11 @@ child's status on every pass, and reports the log's path when there is something
 read.
 
 Starting a second service where one is already listening is an error rather than a second
-daemon that cannot bind. Without that check the child would fail and the parent's poll
-would find the *old* service and report success, which is the one outcome a user must
-never be given.
+daemon that cannot bind, in the foreground as much as detached. Without that check the child
+would fail and the parent's poll would find the *old* service and report success, which is
+the one outcome a user must never be given. A start that is refused — or that loses a race
+to bind — leaves the running service's socket where it is: an agent removes only a socket it
+bound itself.
 
 ## Stopping it
 
