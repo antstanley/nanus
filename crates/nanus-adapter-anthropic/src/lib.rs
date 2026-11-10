@@ -349,6 +349,7 @@ fn send(transport: Transport, body: String, accumulator: wire::StreamAccumulator
         limits,
     } = transport;
     let stream_host = host.clone();
+    let credential = api_key.clone();
     let response = async move {
         let sent = client
             .post(&endpoint)
@@ -375,12 +376,13 @@ fn send(transport: Transport, body: String, accumulator: wire::StreamAccumulator
                 return error_stream_owned("response decoder was already consumed".into());
             };
             let head = futures::stream::iter([LlmEvent::ResponseHead]);
-            let announced: EventStream = Box::pin(head.chain(response::decode(
-                response,
-                stream_host.clone(),
-                accumulator,
-                limits,
-            )));
+            // A provider's failure is passed on in its own words, and a gateway that echoes the
+            // request puts the key in them. It is taken out here, before the sentence reaches
+            // a terminal or the session log.
+            let secret = credential.clone();
+            let decoded = response::decode(response, stream_host.clone(), accumulator, limits)
+                .map(move |event| nanus_ports::redact_failure(event, &secret));
+            let announced: EventStream = Box::pin(head.chain(decoded));
             announced
         }
         Err(message) => error_stream_owned(message),

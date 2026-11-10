@@ -545,30 +545,32 @@ fn send(transport: Transport, body: String, decoder: Decoder) -> LlmStream {
             .post(&endpoint)
             .header("accept", "text/event-stream")
             .header("content-type", "application/json")
-            .bearer_auth(token)
+            .bearer_auth(&token)
             .body(body);
         if let Some(account) = account {
             sent = sent.header("chatgpt-account-id", account);
         }
+        // The bearer goes on with the response, because it is known only here and the
+        // provider's own words are checked for it before they are passed on.
         sent.send()
             .await
+            .map(|response| (response, token))
             .map_err(|source| OpenAiError::transport(&source, &transport_host).to_string())
     };
     let mut decoder = Some(decoder);
     Box::pin(
         futures::stream::once(response).flat_map(move |outcome| match outcome {
-            Ok(response) => {
+            Ok((response, secret)) => {
                 let Some(decoder) = decoder.take() else {
                     return error_stream_owned("response decoder was already consumed".into());
                 };
                 let head = futures::stream::iter([LlmEvent::ResponseHead]);
-                let announced: EventStream = Box::pin(head.chain(response::decode(
-                    response,
-                    host.clone(),
-                    vendor,
-                    decoder,
-                    limits,
-                )));
+                // A provider's failure is passed on in its own words, and a gateway that
+                // echoes the request puts the bearer in them. It is taken out here, before
+                // the sentence reaches a terminal or the session log.
+                let body = response::decode(response, host.clone(), vendor, decoder, limits)
+                    .map(move |event| nanus_ports::redact_failure(event, &secret));
+                let announced: EventStream = Box::pin(head.chain(body));
                 announced
             }
             Err(message) => error_stream_owned(message),

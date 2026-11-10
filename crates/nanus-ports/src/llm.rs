@@ -701,6 +701,37 @@ pub fn error_chain(error: &dyn std::error::Error) -> String {
     rendered
 }
 
+/// What a credential is replaced with wherever a provider's own words would have shown it.
+pub const REDACTED: &str = "<redacted>";
+
+/// Returns `text` with every occurrence of `secret` replaced by [`REDACTED`].
+///
+/// A provider's error is passed on in its own words, and those words are not ours to vouch
+/// for: a gateway that echoes the request it refused puts the `Authorization` header — the
+/// key — into a sentence that is then printed, shown in the interface and written to the
+/// session log. The key the request carried is the one string known to be secret, so it is
+/// taken out before the sentence goes anywhere. An empty secret matches everywhere and means
+/// nothing, so it redacts nothing.
+#[must_use]
+pub fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.trim().is_empty() || !text.contains(secret) {
+        return text.to_owned();
+    }
+    text.replace(secret, REDACTED)
+}
+
+/// Returns `event` with `secret` taken out of a failure's message; see [`redact_secret`].
+///
+/// Only a failure is touched. What the model said is the model's, and a secret there was read
+/// from the workspace rather than echoed from the request.
+#[must_use]
+pub fn redact_failure(event: LlmEvent, secret: &str) -> LlmEvent {
+    match event {
+        LlmEvent::Error(message) => LlmEvent::Error(redact_secret(&message, secret)),
+        other => other,
+    }
+}
+
 /// The finish reason of a response whose body ended without the provider naming one.
 ///
 /// A response says it is over in its own vocabulary — a finish reason, a stop event, the
@@ -944,6 +975,29 @@ fn merge_name(slot: &mut Slot, index: u32, name: Option<ToolName>) -> LlmResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider's sentence that echoes the key loses the key and keeps the rest; one that
+    /// does not is passed on untouched, and so is everything that is not a failure.
+    #[test]
+    fn a_credential_is_taken_out_of_a_failure_and_nothing_else_is_touched() {
+        let echoed = LlmEvent::Error(String::from(
+            "HTTP 401: bad header `Authorization: Bearer sk-live-123` (sk-live-123)",
+        ));
+        assert_eq!(
+            redact_failure(echoed, "sk-live-123"),
+            LlmEvent::Error(String::from(
+                "HTTP 401: bad header `Authorization: Bearer <redacted>` (<redacted>)"
+            ))
+        );
+        let plain = LlmEvent::Error(String::from("HTTP 429: slow down"));
+        assert_eq!(redact_failure(plain.clone(), "sk-live-123"), plain);
+        // The model's own text is not a failure, even when it holds the same characters.
+        let text = LlmEvent::TextDelta(String::from("the key is sk-live-123"));
+        assert_eq!(redact_failure(text.clone(), "sk-live-123"), text);
+        // An empty secret is in every string, and redacting it would shred the message.
+        assert_eq!(redact_secret("HTTP 500", ""), "HTTP 500");
+        assert_eq!(redact_secret("HTTP 500", "  "), "HTTP 500");
+    }
 
     /// The scale steps upward and wraps, which is what an interface cycling it needs: a step
     /// that ends at the top would be a key that stops working.

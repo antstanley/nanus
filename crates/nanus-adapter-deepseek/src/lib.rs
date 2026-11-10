@@ -360,6 +360,7 @@ fn send(
         limits,
     } = transport;
     let stream_host = host.clone();
+    let credential = api_key.clone();
     let response = async move {
         let sent = client
             .post(&endpoint)
@@ -385,8 +386,13 @@ fn send(
             // fact is true — reading even one byte of it would put the wait for that byte on
             // the wrong side of the split.
             let head = futures::stream::iter([LlmEvent::ResponseHead]);
+            // A provider's failure is passed on in its own words, and a gateway that echoes the
+            // request puts the key in them. It is taken out here, before the sentence reaches
+            // a terminal or the session log.
+            let secret = credential.clone();
             let decoded =
-                response::decode(response, stream_host.clone(), limits, arguments.clone());
+                response::decode(response, stream_host.clone(), limits, arguments.clone())
+                    .map(move |event| nanus_ports::redact_failure(event, &secret));
             let announced: EventStream = Box::pin(head.chain(decoded));
             announced
         }

@@ -231,6 +231,10 @@ printing any value.
   the configuration has no field that could hold one. The wrapper a credential is
   carried in redacts its own `Debug`, and the read is a method named `expose` so
   every site that handles a raw value is greppable.
+- A provider's error is reported in the provider's own words, and a gateway that echoes the
+  request it refused would put the key in them. The key a request carried is replaced with
+  `<redacted>` in that request's failure before the sentence is printed or recorded. This
+  covers the one string known to be secret, not a key the provider shows in some other form.
 - Session transcripts are stored under `<nanus home>/sessions/`. A transcript
   contains everything the model saw and produced, including any secret it read, so
   the session store is its owner's alone: every directory it creates is `0700` and

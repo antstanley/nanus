@@ -422,3 +422,24 @@ fn a_body_that_named_its_stop_reason_is_whole_without_message_stop() {
         "{events:?}"
     );
 }
+
+/// A gateway that echoes the request it refused puts the key into its error, and the error is
+/// printed and written to the session log. The key the request carried is taken out of the
+/// provider's words; the rest of the sentence, and the status, are kept.
+#[test]
+fn a_key_echoed_in_a_providers_error_is_not_passed_on() {
+    let server = spawn_server(
+        401,
+        r#"{"type":"error","error":{"message":"rejected header x-api-key: test-key"}}"#,
+    );
+    let events = collect(&server);
+    let Some(LlmEvent::Error(message)) = events.last() else {
+        panic!("the refusal is reported: {events:?}");
+    };
+    assert!(!message.contains("test-key"), "{message}");
+    assert!(message.contains(nanus_ports::REDACTED), "{message}");
+    assert!(
+        message.contains("401") && message.contains("rejected header x-api-key"),
+        "the provider's sentence is otherwise its own: {message}"
+    );
+}
