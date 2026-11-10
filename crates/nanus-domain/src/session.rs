@@ -44,7 +44,7 @@
 //! promises to guard.
 
 use core::fmt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -675,14 +675,7 @@ impl SessionLog {
     pub fn derive_messages_indexed(&self, keep: impl Fn(u64) -> bool) -> Vec<(u64, Message)> {
         // Which calls some result answers. Collected first because a call can only be judged
         // against results that follow it, and the fold below is a single pass.
-        let answered: Vec<&ToolCallId> = self
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                SessionEvent::ToolResult { call_id, .. } => Some(call_id),
-                _ => None,
-            })
-            .collect();
+        let answered = self.answered_calls();
         let mut messages: Vec<(u64, Message)> = Vec::new();
         for (index, event) in self.events.iter().enumerate() {
             let seq = u64::try_from(index).unwrap_or(u64::MAX);
@@ -703,7 +696,7 @@ impl SessionLog {
                     ));
                 }
                 SessionEvent::AssistantMessage { .. } => {
-                    if let Some(message) = fold_assistant(event, &answered) {
+                    if let Some(message) = fold_assistant(event, index, &answered) {
                         messages.push((seq, message));
                     }
                 }
@@ -743,6 +736,42 @@ impl SessionLog {
         // Postcondition: the fold only removes events, never invents messages.
         assert!(messages.len() <= self.events.len());
         messages
+    }
+
+    /// Pairs every result with the call it answers, as the assistant event that made the call
+    /// and the call's id.
+    ///
+    /// By position, not by id alone: a result answers the newest call before it that carries
+    /// its id and has no result yet. A call id is unique within a response, but nothing makes
+    /// a provider keep it unique across a conversation — some number their calls from zero in
+    /// every response — and a session-wide "is there a result with this id" would then let a
+    /// later turn's result vouch for a call an interrupted turn left unanswered. That call
+    /// would travel with nothing answering it, which is the request no provider accepts and
+    /// the reason unanswered calls are dropped at all. It is the pairing
+    /// [`check_compaction_positions`] makes for the same reason.
+    ///
+    /// A set, because the fold asks it once per call and a long session holds thousands.
+    fn answered_calls(&self) -> BTreeSet<(usize, &ToolCallId)> {
+        let mut waiting: BTreeMap<&ToolCallId, usize> = BTreeMap::new();
+        let mut answered: BTreeSet<(usize, &ToolCallId)> = BTreeSet::new();
+        for (index, event) in self.events.iter().enumerate() {
+            match event {
+                SessionEvent::AssistantMessage { tool_calls, .. } => {
+                    for call in tool_calls {
+                        // A reused id starts a new call; the older one, still waiting, can no
+                        // longer be answered and stays out of the set.
+                        waiting.insert(&call.id, index);
+                    }
+                }
+                SessionEvent::ToolResult { call_id, .. } => {
+                    if let Some(made) = waiting.remove(call_id) {
+                        answered.insert((made, call_id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        answered
     }
 
     /// Sums every usage record the log carries.
@@ -860,15 +889,29 @@ impl SessionLog {
         u32::try_from(steps).unwrap_or(u32::MAX)
     }
 
-    /// Returns the tool calls that have no result yet, in the order they were
-    /// requested.
+    /// Returns the tool calls of the current turn that have no result yet, in the order they
+    /// were requested.
     ///
-    /// This is the harness's "what is still owed" query. A turn may not close
-    /// while it is non-empty.
+    /// This is the harness's "what is still owed" query. A turn may not close while it is
+    /// non-empty.
+    ///
+    /// Only the current turn is asked — the events from the last [`SessionEvent::TurnStart`]
+    /// on, or the whole log when no turn has started. A call an *earlier* turn left unanswered
+    /// is not owed by this one: that turn has ended, nothing will ever run the call, and the
+    /// fold already leaves it out of what a model is shown. Counting it kept every later turn
+    /// open after a final answer, so each one ran to its step budget — hundreds of paid
+    /// requests — and closed as [`TurnEndReason::MaxSteps`]. A log holds such a call when the
+    /// process stopped between recording a call and recording its result, and recovery closes
+    /// that turn without inventing a result.
     #[must_use]
     pub fn open_tool_calls(&self) -> Vec<ToolCallId> {
+        let turn_start = self
+            .events
+            .iter()
+            .rposition(|event| matches!(event, SessionEvent::TurnStart { .. }))
+            .unwrap_or(0);
         let mut open: Vec<ToolCallId> = Vec::new();
-        for event in &self.events {
+        for event in self.events.get(turn_start..).unwrap_or_default() {
             if let SessionEvent::ToolCall { call_id, .. } = event {
                 if open.contains(call_id) {
                     continue;
@@ -2154,7 +2197,15 @@ fn maintenance_usage(payload: &RequestAttemptRecord) -> Option<Usage> {
 
 /// Folds one assistant event into the message a model is shown, or nothing when it has
 /// nothing a model can be sent.
-fn fold_assistant(event: &SessionEvent, answered: &[&ToolCallId]) -> Option<Message> {
+///
+/// `index` is the event's position in the log, and `answered` the pairs
+/// [`SessionLog::answered_calls`] found: a call survives when *this* message's call was answered,
+/// not when some call with its id was.
+fn fold_assistant(
+    event: &SessionEvent,
+    index: usize,
+    answered: &BTreeSet<(usize, &ToolCallId)>,
+) -> Option<Message> {
     let SessionEvent::AssistantMessage {
         text,
         reasoning,
@@ -2183,7 +2234,7 @@ fn fold_assistant(event: &SessionEvent, answered: &[&ToolCallId]) -> Option<Mess
     // rather than into a conversation that resumes.
     let calls: Vec<ToolCall> = tool_calls
         .iter()
-        .filter(|call| answered.contains(&&call.id))
+        .filter(|call| answered.contains(&(index, &call.id)))
         .cloned()
         .collect();
     // Completed opaque Responses reasoning can be empty display text; it still
@@ -2468,6 +2519,66 @@ mod tests {
         assert!(*is_error);
     }
 
+    /// A result answers the call before it, not every call that ever carried its id.
+    ///
+    /// Some providers number a response's calls from zero, so an id comes round again. A call
+    /// an interrupted turn left unanswered must stay dropped when a later turn reuses its id
+    /// and is answered: judged by id alone it looked answered, travelled with no result after
+    /// it, and every later request of the session was refused.
+    #[test]
+    fn a_reused_call_id_does_not_answer_the_call_an_earlier_turn_left_open() {
+        let call = || {
+            ToolCall::new(
+                ToolCallId::new("call_0"),
+                ToolName::new("read").unwrap_or_else(|_| unreachable!("valid")),
+                serde_json::json!({}),
+            )
+        };
+        let asks = |text: &str| SessionEvent::AssistantMessage {
+            replay: None,
+            text: Some(text.to_owned()),
+            reasoning: None,
+            tool_calls: vec![call()],
+            usage: None,
+            interrupted: false,
+            model: None,
+            effort: None,
+        };
+        let result = |content: &str| SessionEvent::ToolResult {
+            content_blocks: None,
+            call_id: ToolCallId::new("call_0"),
+            content: content.to_owned(),
+            is_error: false,
+        };
+        let calls_of = |messages: &[Message]| -> Vec<usize> {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant { tool_calls, .. } => Some(tool_calls.len()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut log = SessionLog::new();
+        log.append(asks("first, never answered"));
+        log.append(asks("second"));
+        log.append(result("second's"));
+        assert_eq!(
+            calls_of(&log.derive_messages()),
+            [0, 1],
+            "the abandoned call is dropped and the answered one kept"
+        );
+
+        // The other direction: an id reused after its first call was answered pairs twice.
+        let mut log = SessionLog::new();
+        log.append(asks("first"));
+        log.append(result("first's"));
+        log.append(asks("second"));
+        log.append(result("second's"));
+        assert_eq!(calls_of(&log.derive_messages()), [1, 1]);
+    }
+
     /// A call nothing answered is dropped from the replay, and what the turn said is kept.
     ///
     /// The provider refuses an assistant message whose calls have no results, so a log holding
@@ -2675,6 +2786,36 @@ mod tests {
         let open = session.log().open_tool_calls();
         assert_eq!(open.len(), 1);
         assert_eq!(open.first().map(ToolCallId::as_str), Some("c-2"));
+    }
+
+    /// A call a finished turn never answered is not owed by the turn after it: nothing will
+    /// run it, and counting it would keep every later turn open until its step budget.
+    #[test]
+    fn a_call_an_earlier_turn_left_unanswered_is_not_owed_by_the_next_turn() {
+        let mut session = session();
+        session.append(SessionEvent::TurnStart { turn: 1 });
+        session.append(SessionEvent::ToolCall {
+            call_id: ToolCallId::new("abandoned"),
+            name: tool_name("read"),
+            arguments: json!({}),
+        });
+        // Still owed while its own turn is the current one, closed or not.
+        assert_eq!(session.log().open_tool_calls().len(), 1);
+        session.append(SessionEvent::TurnEnd {
+            turn: 1,
+            reason: TurnEndReason::Interrupted,
+        });
+        session.append(SessionEvent::TurnStart { turn: 2 });
+        assert!(session.log().open_tool_calls().is_empty());
+        // The other direction: the new turn's own call is owed until it is answered.
+        session.append(SessionEvent::ToolCall {
+            call_id: ToolCallId::new("current"),
+            name: tool_name("read"),
+            arguments: json!({}),
+        });
+        let open = session.log().open_tool_calls();
+        assert_eq!(open.first().map(ToolCallId::as_str), Some("current"));
+        assert_eq!(open.len(), 1);
     }
 
     /// A goal change is state rather than a message, so it never reaches a model.
