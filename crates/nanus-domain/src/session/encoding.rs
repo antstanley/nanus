@@ -247,7 +247,8 @@ impl Session {
     ///
     /// What lets a store that already holds the first `from` events add the rest without
     /// re-encoding what it holds. Every line is validated as [`Session::try_to_jsonl`] validates
-    /// it, and the whole session, header included, is held to the same 64 MiB bound.
+    /// it, the records whose place in the log matters are checked where they sit, and the whole
+    /// session, header included, is held to the same 64 MiB bound.
     ///
     /// # Errors
     ///
@@ -259,6 +260,15 @@ impl Session {
             .ok()
             .filter(|start| *start <= len)
             .ok_or_else(|| past_end(self, len.saturating_add(1)))?;
+        // What a line cannot say about itself, and the whole encoding checks on every write:
+        // where the markers and the handoff records sit in the log. The carried encoding
+        // validates lines one at a time and so cannot see it, and a tail that skipped it would
+        // put a record on disk that every later load refuses. Asked of the whole log rather
+        // than the tail, because a tail can break a rule about what came before it — a result
+        // that answers a call from before a cut. A log with no marker is only walked; one with
+        // a marker is hashed once more, which is the price of a cut session saved this way.
+        super::check_compaction_positions(self)?;
+        super::check_handoff_positions(self)?;
         let mut tail = String::new();
         let resumed = self.advance(start, None, |_, _| ())?.is_some()
             && self.advance(len, Some(&mut tail), |_, _| ())?.is_some();
