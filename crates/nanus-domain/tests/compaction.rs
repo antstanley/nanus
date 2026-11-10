@@ -768,3 +768,32 @@ fn a_cut_needs_a_completed_turn_after_the_previous_one() {
             .is_ok()
     );
 }
+
+/// A store that already holds a session's first lines asks only for the lines after them, and
+/// those are refused by the same rules the whole encoding holds a marker to. A marker the
+/// append path let through would be written, and then refused by every later load.
+#[test]
+fn the_lines_appended_to_a_stored_log_are_held_to_the_marker_rules() {
+    let mut session = two_turn_session();
+    compact(&mut session, "first summary");
+    answered_turn(&mut session, 2, "third question", "third answer");
+    let stored = u64::try_from(session.event_count()).unwrap();
+    // Where a session stands once its lines are on disk: the encoding has been carried to the
+    // stored count, so the lines after it are encoded without revisiting the ones before.
+    session.prefix_digest(stored).unwrap();
+
+    let forged = tampered(&session, |record| record.supersedes = None);
+    assert!(is_marker_refusal(
+        &forged.encoded_lines_from(stored),
+        ErrorCode::InvalidCompact
+    ));
+
+    // The other direction: an honest second marker is appended, as the lines the whole
+    // encoding ends with.
+    let mut honest = session.clone();
+    compact(&mut honest, "second summary");
+    let tail = honest.encoded_lines_from(stored).unwrap();
+    let whole = honest.try_to_jsonl().unwrap();
+    assert!(whole.ends_with(&tail));
+    assert_eq!(tail.lines().count(), 1);
+}
