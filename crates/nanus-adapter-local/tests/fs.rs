@@ -80,6 +80,69 @@ async fn a_symlinked_directory_that_escapes_is_rejected() {
     );
 }
 
+/// A link whose target does not exist cannot be canonicalized, which is also what a file that
+/// has not been written yet looks like. Treating the two alike let an overwrite create the
+/// target, wherever the link pointed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dangling_link_is_not_written_through_to_a_file_outside_the_root() {
+    let (dir, fs) = workspace();
+    let outside = tempfile::tempdir().expect("outside");
+    let target = outside.path().join("planted.txt");
+    std::os::unix::fs::symlink(&target, dir.path().join("notes.txt")).expect("symlink");
+    for mode in [WriteMode::Overwrite, WriteMode::Create] {
+        let error = fs
+            .write(Path::new("notes.txt"), "planted", mode)
+            .await
+            .expect_err("must be rejected");
+        assert!(matches!(error, FsError::OutsideWorkspace { .. }), "{error}");
+        assert!(!target.exists(), "nothing was created outside the root");
+    }
+    // A directory reached through a dangling link is refused the same way.
+    std::os::unix::fs::symlink(outside.path().join("absent"), dir.path().join("dir"))
+        .expect("symlink");
+    let error = fs
+        .write(Path::new("dir/file.txt"), "planted", WriteMode::Overwrite)
+        .await
+        .expect_err("must be rejected");
+    assert!(matches!(error, FsError::OutsideWorkspace { .. }), "{error}");
+    assert!(!fs.exists(Path::new("notes.txt")).await);
+}
+
+/// The other direction: a link that stays inside the root is still an ordinary path, and a
+/// file that simply does not exist yet is still created.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_inside_the_root_is_written_through_and_a_new_file_is_created() {
+    let (dir, fs) = workspace();
+    std::fs::write(dir.path().join("real.txt"), "before").expect("seed");
+    std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("alias.txt"))
+        .expect("symlink");
+    fs.write(Path::new("alias.txt"), "after", WriteMode::Overwrite)
+        .await
+        .expect("a link to a file inside the root is written through");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("real.txt")).expect("read"),
+        "after"
+    );
+    let created = fs
+        .write(Path::new("fresh.txt"), "new", WriteMode::Overwrite)
+        .await
+        .expect("a missing file is created");
+    assert!(created.created);
+
+    // A dangling link whose target would be inside is refused as unresolvable, not as an
+    // escape: the error says which of the two it was.
+    // The target is relative, so it is named inside the root however the root is spelled.
+    std::os::unix::fs::symlink("absent.txt", dir.path().join("dangling.txt")).expect("symlink");
+    let error = fs
+        .write(Path::new("dangling.txt"), "x", WriteMode::Overwrite)
+        .await
+        .expect_err("must be rejected");
+    assert!(matches!(error, FsError::Io { .. }), "{error}");
+    assert!(!dir.path().join("absent.txt").exists());
+}
+
 #[tokio::test]
 async fn an_escape_is_never_reported_as_existing() {
     let (_dir, fs) = workspace();
