@@ -111,7 +111,7 @@ pub use archive::ArchiveQuota;
 pub use gc::GcReport;
 use serde_json::Value;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 
 /// The environment variable that overrides the nanus home.
 pub const HOME_ENV: &str = "NANUS_HOME";
@@ -586,8 +586,12 @@ impl JsonlStore {
     }
 
     /// Returns the name one session answers to.
+    ///
+    /// One read of the one file that holds it. It used to walk the store and read every
+    /// session's name to answer for one, and an agent asks once per session it holds each time
+    /// it is listed — a cost that grew with the store rather than with the question.
     async fn name_of_blocking(&self, id: &SessionId) -> StoreResult<Option<String>> {
-        Ok(self.session_names().await?.remove(id))
+        Ok(read_name(&self.session_dir(id)?).await)
     }
 
     /// Reads every session's name, in one walk of the store.
@@ -759,7 +763,6 @@ impl StorePort for JsonlStore {
 /// Bytes rather than text, because an identity is a digest of what is on disk: a file that is
 /// not UTF-8 still has one, and deciding that it is corrupt is the loader's business.
 async fn read_bounded_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
     let file = fs::File::open(path).await?;
     let cap = u64::try_from(nanus_domain::content::SESSION_BYTES_MAX)
         .unwrap_or(u64::MAX)
@@ -774,7 +777,6 @@ async fn read_bounded_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// Reads at most the session limit plus one byte, including files growing during a read.
 async fn read_bounded_log(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
     let file = fs::File::open(path).await?;
     let cap = u64::try_from(nanus_domain::content::SESSION_BYTES_MAX)
         .unwrap_or(u64::MAX)
@@ -992,10 +994,20 @@ async fn summarize(dir: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         });
+    // The bound a load holds a log to, held here as well: a listing reads every log in the
+    // store, so without it one enormous file — or one with no line break in it, which is read
+    // as a single line — costs every listing its whole size in memory. A log over the bound is
+    // one a load refuses, so leaving it out of the listing offers nothing that could be opened.
+    let bound = u64::try_from(nanus_domain::content::SESSION_BYTES_MAX).unwrap_or(u64::MAX);
+    if metadata.len() > bound {
+        return Err(oversized(id));
+    }
     let file = fs::File::open(&path)
         .await
         .map_err(|source| io_error(&path, &source))?;
-    let mut reader = BufReader::new(file);
+    // One byte past the bound, so a file that grew after it was measured is still caught.
+    let mut reader = BufReader::new(file.take(bound.saturating_add(1)));
+    let mut consumed: u64 = 0;
     let mut line = String::new();
     let mut number: u64 = 0;
     let mut header: Option<Value> = None;
@@ -1009,6 +1021,10 @@ async fn summarize(dir: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
             .map_err(|source| io_error(&path, &source))?;
         if read == 0 {
             break;
+        }
+        consumed = consumed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if consumed > bound {
+            return Err(oversized(id));
         }
         number = number.saturating_add(1);
         let trimmed = line.trim();
@@ -1048,6 +1064,14 @@ async fn summarize(dir: &Path, id: &SessionId) -> StoreResult<SessionSummary> {
         title,
         name: read_name(dir).await,
     })
+}
+
+/// Builds the refusal for a log past the size a session may be.
+fn oversized(id: &SessionId) -> StoreError {
+    StoreError::Corrupt {
+        id: id.as_str().to_owned(),
+        message: String::from("session exceeds 64 MiB"),
+    }
 }
 
 /// Reads one session's name, if it has one.

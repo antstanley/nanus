@@ -1355,3 +1355,62 @@ mod private {
         chmod(&store.sessions_root(), 0o700);
     }
 }
+
+// ---------------------------------------------------------------------------
+// What a listing and a name lookup cost.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_listing_leaves_out_a_log_past_the_size_a_load_refuses() {
+    let (_dir, store) = store().await;
+    let kept = session("kept", 1, &["small"]);
+    let huge = session("huge", 2, &["grown"]);
+    store.save(&kept).await.expect("save");
+    store.save(&huge).await.expect("save");
+    // One line with no break in it, past the bound: read whole, it is the bound in memory.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.session_file(huge.id()).unwrap())
+        .unwrap();
+    file.write_all(&vec![b' '; nanus_domain::content::SESSION_BYTES_MAX])
+        .unwrap();
+
+    let listed: Vec<String> = store
+        .list()
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|summary| summary.id.as_str().to_owned())
+        .collect();
+
+    assert_eq!(listed, ["kept"], "what a load refuses is not offered");
+    assert!(store.load(huge.id()).await.is_err());
+}
+
+#[tokio::test]
+async fn a_name_is_read_from_its_own_session_whatever_else_the_store_holds() {
+    let (_dir, store) = store().await;
+    let named = session("named", 1, &["a"]);
+    let unnamed = session("unnamed", 2, &["b"]);
+    store.save(&named).await.expect("save");
+    store.save(&unnamed).await.expect("save");
+    store.name(named.id(), "nightly").await.expect("name");
+    // A neighbour whose directory cannot be read at all: the lookup used to walk past it on
+    // the way to every answer, and now never goes near it.
+    std::fs::write(store.sessions_root().join("not-a-directory"), b"x").expect("plant");
+
+    assert_eq!(
+        store.name_of(named.id()).await.expect("name"),
+        Some("nightly".to_owned())
+    );
+    assert_eq!(store.name_of(unnamed.id()).await.expect("name"), None);
+    assert_eq!(
+        store
+            .name_of(&SessionId::new("never-stored"))
+            .await
+            .expect("name"),
+        None
+    );
+    // An id that cannot name a directory is still refused, as it is everywhere else.
+    assert!(store.name_of(&SessionId::new("..")).await.is_err());
+}
