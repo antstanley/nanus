@@ -52,7 +52,7 @@ enum Exclusive {
 
 impl JsonlStore {
     /// Returns the directory of retirement markers.
-    fn retired_root(&self) -> PathBuf {
+    pub(super) fn retired_root(&self) -> PathBuf {
         self.home.join(RETIRED_DIR)
     }
 
@@ -164,7 +164,7 @@ impl JsonlStore {
     /// Writes the retirement marker durably: the file synced, then its directory.
     async fn write_marker(&self, id: &SessionId) -> StoreResult<()> {
         let root = self.retired_root();
-        fs::create_dir_all(&root)
+        super::private::create_dir_all(&root)
             .await
             .map_err(|source| io_error(&root, &source))?;
         let marker = self.retired_marker(id)?;
@@ -175,7 +175,8 @@ impl JsonlStore {
     /// Moves a session directory into the trash under a fresh name, atomically.
     fn move_to_trash(&self, id: &SessionId, dir: &Path) -> StoreResult<PathBuf> {
         let trash = self.trash_root();
-        std::fs::create_dir_all(&trash).map_err(|source| io_error(&trash, &source))?;
+        super::private::create_dir_all_blocking(&trash)
+            .map_err(|source| io_error(&trash, &source))?;
         let target = trash.join(format!("{}.{}", encode_id(id)?, uuid::Uuid::now_v7()));
         std::fs::rename(dir, &target).map_err(|source| io_error(dir, &source))?;
         if let Err(source) = sync_dir(&self.sessions_root()) {

@@ -1261,3 +1261,97 @@ async fn two_stores_over_one_home_cannot_both_take_a_name() {
         "{left:?} {right:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Who can read the store.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod private {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    /// The permission bits of `path`.
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    #[tokio::test]
+    async fn everything_a_session_is_kept_in_is_its_owners_alone() {
+        let (_dir, store) = store().await;
+        let written = session("private", 5, &["a secret the model read"]);
+        store.save(&written).await.expect("save");
+        store.name(written.id(), "private").await.expect("name");
+        store.lock(written.id(), "a writer").await.expect("claim");
+
+        let dir = store.session_dir(written.id()).expect("dir");
+        assert_eq!(mode(&store.sessions_root()), 0o700);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("session.jsonl")), 0o600);
+        assert_eq!(mode(&dir.join("name")), 0o600);
+        assert_eq!(mode(&dir.join("lock")), 0o600);
+        store.release_lock(written.id());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_sessions_marker_and_trash_are_private_too() {
+        let (_dir, store) = store().await;
+        let written = session("deleted", 5, &["x"]);
+        store.save(&written).await.expect("save");
+        store.delete(written.id()).await.expect("delete");
+        assert_eq!(mode(&store.home_path().join("retired")), 0o700);
+        assert_eq!(mode(&store.home_path().join("trash")), 0o700);
+    }
+
+    #[tokio::test]
+    async fn opening_a_store_others_could_read_narrows_it_and_loses_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let written = session("older", 5, &["said before the store was private"]);
+        {
+            let store = JsonlStore::new(dir.path()).await.expect("store");
+            store.save(&written).await.expect("save");
+            // What a store written by an earlier build looks like under the usual umask.
+            chmod(&store.sessions_root(), 0o755);
+            chmod(&store.session_dir(written.id()).expect("dir"), 0o755);
+            chmod(&store.session_file(written.id()).expect("file"), 0o644);
+        }
+
+        let store = JsonlStore::new(dir.path()).await.expect("reopen");
+
+        assert_eq!(mode(&store.sessions_root()), 0o700, "narrowed on open");
+        // Not unreadable to its owner: it lists, loads, and can be written again.
+        assert_eq!(store.list().await.expect("list").len(), 1);
+        assert_eq!(store.load(written.id()).await.expect("load"), written);
+        store.lock(written.id(), "a writer").await.expect("claim");
+        store.save(&written).await.expect("save again");
+        assert_eq!(mode(&store.session_dir(written.id()).expect("dir")), 0o700);
+        assert_eq!(
+            mode(&store.session_file(written.id()).expect("file")),
+            0o600
+        );
+        store.release_lock(written.id());
+    }
+
+    #[tokio::test]
+    async fn opening_a_store_does_not_widen_or_touch_a_home_that_already_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        chmod(dir.path(), 0o750);
+        let store = JsonlStore::new(dir.path()).await.expect("store");
+        assert_eq!(mode(store.home_path()), 0o750, "the home is the user's");
+        // And a directory stricter than the store would make it is left as strict.
+        chmod(&store.sessions_root(), 0o500);
+        drop(store);
+        let store = JsonlStore::new(dir.path()).await.expect("reopen");
+        assert_eq!(mode(&store.sessions_root()), 0o500);
+        chmod(&store.sessions_root(), 0o700);
+    }
+}

@@ -310,7 +310,9 @@ impl JsonlStore {
         let not_committed = refused(ErrorCode::CheckpointNotCommitted);
         let path = self.session_file(id).map_err(|_| not_committed)?;
         let dir = self.session_dir(id).map_err(|_| not_committed)?;
-        fs::create_dir_all(&dir).await.map_err(|_| not_committed)?;
+        super::private::create_dir_all(&dir)
+            .await
+            .map_err(|_| not_committed)?;
         let temp = temp_path(&path);
         let staged = match write {
             Write::Whole(body) => write_synced(&temp, body).await,
@@ -483,7 +485,7 @@ const fn artifact_refusal(error: ArtifactError) -> ErrorCode {
 /// the final chunk is never seen, `sync_all` succeeds on the short file, and the rename installs
 /// a truncated session that a receipt then calls committed.
 async fn write_synced(path: &Path, body: &str) -> std::io::Result<()> {
-    let mut file = fs::File::create(path).await?;
+    let mut file = super::private::create(path).await?;
     file.write_all(body.as_bytes()).await?;
     file.flush().await?;
     file.sync_all().await
@@ -493,6 +495,10 @@ async fn write_synced(path: &Path, body: &str) -> std::io::Result<()> {
 /// `tail` and syncs the result.
 async fn extend_synced(stored: &Path, temp: &Path, tail: &str) -> std::io::Result<()> {
     fs::copy(stored, temp).await?;
+    // A copy carries the mode of what it was copied from, and a log written before the store
+    // was private is readable by others: the new file is the owner's alone before it has the
+    // new lines in it.
+    super::private::narrow_file(temp)?;
     let mut file = fs::OpenOptions::new().append(true).open(temp).await?;
     file.write_all(tail.as_bytes()).await?;
     file.flush().await?;
@@ -503,5 +509,39 @@ async fn extend_synced(stored: &Path, temp: &Path, tail: &str) -> std::io::Resul
 async fn discard(path: &Path) {
     if fs::remove_file(path).await.is_ok() {
         tracing::debug!(temp = %path.display(), "discarded a checkpoint's temporary file");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    /// A tail checkpoint clones the stored file, and a clone carries its mode: a log written
+    /// before the store was private must not hand that mode on to the file that replaces it.
+    #[tokio::test]
+    async fn a_file_extended_from_one_others_could_read_is_the_owners_alone() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let stored = dir.path().join("session.jsonl");
+        std::fs::write(&stored, "header\n").unwrap_or_else(|error| panic!("plant: {error}"));
+        std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|error| panic!("chmod: {error}"));
+        let temp = dir.path().join("next");
+
+        let extended = extend_synced(&stored, &temp, "event\n").await;
+
+        assert!(extended.is_ok(), "{extended:?}");
+        let mode = std::fs::metadata(&temp).map_or(0, |found| found.permissions().mode() & 0o777);
+        assert_eq!(mode, 0o600);
+        // The other direction: the clone is whole, and the original is not rewritten.
+        assert_eq!(
+            std::fs::read_to_string(&temp).ok().as_deref(),
+            Some("header\nevent\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stored).ok().as_deref(),
+            Some("header\n")
+        );
     }
 }

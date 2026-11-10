@@ -63,6 +63,12 @@
 //! `[A-Za-z0-9._-]` is percent-hex-escaped, and `.`/`..` are rejected outright, so
 //! an id can never name a path with more than one component.
 //!
+//! ## Who can read it
+//!
+//! Its owner. Every directory the store creates is `0700` and every file `0600` on Unix,
+//! whatever the umask, and a store made before that was so is narrowed when it is opened. The
+//! `private` module says exactly what is narrowed, and what Windows gets instead.
+//!
 //! ## Why writes are atomic
 //!
 //! A save writes a sibling temp file, fsyncs it, and renames it over the real
@@ -80,6 +86,7 @@
 mod archive;
 mod checkpoint;
 mod gc;
+mod private;
 mod retire;
 mod sink;
 
@@ -236,9 +243,15 @@ impl JsonlStore {
             naming: tokio::sync::Mutex::new(()),
         };
         let root = store.sessions_root();
-        fs::create_dir_all(&root)
+        private::create_dir_all(&root)
             .await
             .map_err(|source| io_error(&root, &source))?;
+        // A store made before its directories were private is narrowed here, so opening it is
+        // what protects the transcripts already in it; see `private` for what is and is not
+        // touched, and why this cannot make a store unreadable to its owner.
+        for dir in [root, store.retired_root(), store.trash_root()] {
+            private::narrow_dir(&dir);
+        }
         // A deletion a crash interrupted is finished here, and only ever forwards: whatever is
         // in the trash is removed, and nothing is moved back.
         store.finish_interrupted_deletions().await;
@@ -357,7 +370,8 @@ impl JsonlStore {
         // A deleted conversation cannot be claimed: a claim is the first step of writing it, and
         // a retired id is never written again.
         self.refuse_retired(id)?;
-        std::fs::create_dir_all(&dir).map_err(|source| io_error(&dir, &source))?;
+        private::create_dir_all_blocking(&dir).map_err(|source| io_error(&dir, &source))?;
+        private::narrow_dir(&dir);
         let body = serde_json::to_string(&Claim {
             pid: std::process::id(),
             owner: owner.to_owned(),
@@ -438,7 +452,7 @@ impl JsonlStore {
         let dir = self.session_dir(session.id())?;
         self.refuse_retired(session.id())?;
         refuse_symlinked_dir(&dir).await?;
-        fs::create_dir_all(&dir)
+        private::create_dir_all(&dir)
             .await
             .map_err(|source| io_error(&dir, &source))?;
         let path = dir.join(SESSION_FILE);
@@ -529,7 +543,7 @@ impl JsonlStore {
         let path = self.home.join(NAMES_LOCK_FILE);
         let opened = path.clone();
         let locked = tokio::task::spawn_blocking(move || {
-            let file = std::fs::OpenOptions::new()
+            let file = private::options()
                 .read(true)
                 .write(true)
                 .create(true)
@@ -694,7 +708,7 @@ impl StorePort for JsonlStore {
 
     fn home(&self) -> LocalBoxFuture<'_, StoreResult<PathBuf>> {
         Box::pin(async move {
-            fs::create_dir_all(&self.home)
+            private::create_dir_all(&self.home)
                 .await
                 .map_err(|source| io_error(&self.home, &source))?;
             Ok(self.home.clone())
@@ -788,7 +802,7 @@ async fn read_bounded_log(path: &Path) -> std::io::Result<String> {
 fn take_claim(path: &Path) -> StoreResult<Option<std::fs::File>> {
     use std::os::unix::io::AsRawFd as _;
 
-    let file = std::fs::OpenOptions::new()
+    let file = private::options()
         .read(true)
         .write(true)
         .create(true)
@@ -825,7 +839,7 @@ fn take_claim(path: &Path) -> StoreResult<Option<std::fs::File>> {
 /// and better than two writers sharing a log.
 #[cfg(not(unix))]
 fn take_claim(path: &Path) -> StoreResult<Option<std::fs::File>> {
-    match std::fs::OpenOptions::new()
+    match private::options()
         .read(true)
         .write(true)
         .create_new(true)
@@ -1284,7 +1298,7 @@ async fn write_atomic(path: &Path, body: &str) -> StoreResult<()> {
 
 /// Writes and syncs the temporary file.
 async fn stage(temp: &Path, body: &str) -> std::io::Result<()> {
-    let mut file = fs::File::create(temp).await?;
+    let mut file = private::create(temp).await?;
     file.write_all(body.as_bytes()).await?;
     // Tokio's last write runs in the background until it is flushed, and only the flush
     // reports its error: without it a full disk leaves a short file that syncs cleanly.
