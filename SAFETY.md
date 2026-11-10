@@ -338,8 +338,11 @@ labelled a read.
   arguments reaches a command line: the source is copied to a temporary file with a fixed name, and
   the model chooses only a path, an interval, a frame count and a question.
 - **What it will not read.** The path goes through the rooted filesystem port, so a path outside the
-  workspace is refused. FFmpeg is run with `-protocol_whitelist file`, and a container that refers to
-  other files or streams (concat lists, HLS and DASH playlists, image sequences) is refused.
+  workspace is refused. FFmpeg is run with `-protocol_whitelist file` and a `-format_whitelist` of
+  the self-contained containers the tool reads (WebM/Matroska, MP4/MOV, AVI, MPEG program and
+  transport streams), so a container that refers to other files or streams (concat lists, HLS and
+  DASH playlists, image sequences) is refused when the decoder opens it, before it follows what the
+  file names; the probe's answer is checked against the same list afterwards.
   A protocol whitelist alone does not confine a decoder: **this is not an OS sandbox**, and a
   hostile file is still parsed by FFmpeg as your user. Treat videos from untrusted sources the way
   you treat any file you open in a media player, and keep `per_call` approval if that matters.

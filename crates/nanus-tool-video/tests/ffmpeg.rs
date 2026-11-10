@@ -446,6 +446,37 @@ fn bad_sources_and_windows_are_failures_the_model_can_read() {
     }
 }
 
+/// A file whose demuxer is not one of the self-contained containers is refused by the decoder
+/// when it opens it, with the reason, rather than probed first and refused afterwards: a concat
+/// list is opened by following what it names. A container on the list is still read.
+#[test]
+fn a_file_that_is_not_an_allowed_container_is_refused_as_one_and_an_allowed_one_is_read() {
+    let harness = harness(true, false);
+    let workspace = harness.workspace.path();
+    make_clip(
+        workspace,
+        "clip.mp4",
+        &["-c:v", "libx264", "-pix_fmt", "yuv420p"],
+        "",
+    );
+    make_clip(workspace, "clip.flv", &["-c:v", "flv"], "");
+    std::fs::write(
+        workspace.join("list.ffconcat"),
+        "ffconcat version 1.0\nfile clip.mp4\n",
+    )
+    .expect("write");
+    for refused in ["list.ffconcat", "clip.flv"] {
+        let outcome = run(&harness, json!({"file_path": refused, "mode": "frames"}));
+        let message = outcome.message().unwrap_or_default().to_owned();
+        assert!(
+            !outcome.is_success() && message.contains("not a container this tool reads"),
+            "{refused}: {message}"
+        );
+    }
+    let read = run(&harness, json!({"file_path": "clip.mp4", "mode": "frames"}));
+    assert!(read.is_success(), "{read:?}");
+}
+
 #[test]
 fn an_end_past_the_video_is_clamped_and_said_so_but_a_start_past_it_is_refused() {
     let harness = harness(true, false);
