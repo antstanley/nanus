@@ -1221,8 +1221,8 @@ impl AgentRunner {
                     .await
             }
         };
-        if let Some(managed) = managed {
-            Self::refuse_over_capacity(session, calls, &mut results, managed);
+        if managed.is_some() {
+            self.refuse_over_capacity(session, calls, &mut results, progress);
         }
         self.admit_images(session, calls, &mut results, progress);
         let reservation = match self.reserve_batch(session, position, calls, &results, managed) {
@@ -2997,6 +2997,71 @@ mod tests {
             Some(String::from("deepseek-v4-pro")),
             "and the log says which model produced the message"
         );
+    }
+
+    /// A listener that notes which calls it was told had finished, and whether as failures.
+    #[derive(Default)]
+    struct Finished(Vec<(String, bool)>);
+
+    impl Progress for Finished {
+        fn tool_finished(&mut self, call_id: &ToolCallId, _name: &ToolName, is_error: bool) {
+            self.0.push((call_id.as_str().to_owned(), is_error));
+        }
+    }
+
+    /// A session holding `records` user messages of `bytes` bytes each.
+    fn session_of(records: usize, bytes: usize) -> Session {
+        let mut session = session();
+        for _ in 0..records {
+            session.append(SessionEvent::UserMessage {
+                text: "x".repeat(bytes),
+                content_blocks: None,
+            });
+        }
+        session
+    }
+
+    /// A call a full session cannot record is refused through the same door as every other
+    /// refusal, so whoever was told it started is told it ended; a session with room refuses
+    /// nothing and reports nothing.
+    #[test]
+    fn a_call_refused_for_capacity_is_reported_as_finished_and_one_with_room_is_left_alone() {
+        let Some(runner) = runner(ScriptedLlm::handle(Vec::new()), registry_with_echo()) else {
+            return;
+        };
+        let name = ToolName::new("echo").unwrap_or_else(|_| unreachable!("valid"));
+        let calls = [
+            ToolCall::new(ToolCallId::new("a"), name.clone(), json!({})),
+            ToolCall::new(ToolCallId::new("b"), name, json!({})),
+        ];
+        // Sixteen records of 3.9 MiB leave less than one whole record of the 64 MiB a session
+        // may hold, which is what each pending call is charged.
+        let full = session_of(16, 3_900 * 1024);
+        let mut results = vec![
+            None,
+            Some(ToolResult::failure(calls[1].id.clone(), "denied")),
+        ];
+        let mut told = Finished::default();
+        runner.refuse_over_capacity(&full, &calls, &mut results, &mut told);
+        let refused = results[0].as_ref().map(ToolResult::render_text);
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|text| text.contains("storage_capacity")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            told.0,
+            [(String::from("a"), true)],
+            "only the call it refused"
+        );
+
+        let roomy = session_of(1, 16);
+        let mut results = vec![None, None];
+        let mut told = Finished::default();
+        runner.refuse_over_capacity(&roomy, &calls, &mut results, &mut told);
+        assert!(results.iter().all(Option::is_none));
+        assert!(told.0.is_empty());
     }
 
     /// A listener that switches the runner's model and effort while a response streams.
