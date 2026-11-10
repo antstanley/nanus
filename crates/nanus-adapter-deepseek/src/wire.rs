@@ -378,6 +378,21 @@ impl StreamAccumulator {
                 return;
             }
         }
+        // A failure can be reported inside a 200 response — by the service once the stream is
+        // open, or by a gateway in front of it — and it carries no `choices`, so without this
+        // it was read as an empty frame and the stream then closed as a finished answer. It is
+        // the reason the turn stopped, and it ends the stream as one.
+        if let Some(error) = frame.get("error").filter(|value| !value.is_null()) {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| error.to_string(), str::to_owned);
+            self.fail(format!(
+                "the provider reported an error: {}",
+                truncate_for_message(&message)
+            ));
+            return;
+        }
         // Usage is null on every chunk but the last, so it is read whenever present.
         if let Some(usage) = frame.get("usage").filter(|value| !value.is_null()) {
             self.usage = Some(decode_usage(usage));
@@ -947,6 +962,65 @@ mod tests {
         // Dispatching a nameless call would ask the registry for a tool that cannot
         // exist.
         assert!(!saw_call);
+    }
+
+    /// A failure delivered inside a 200 response ends the stream with its reason. It has no
+    /// `choices`, so it used to be read as an empty frame, and the close that followed
+    /// reported the partial answer as a finished one.
+    #[test]
+    fn an_error_frame_mid_stream_is_the_reason_the_turn_stopped() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.observe_line(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
+        accumulator.observe_line(r#"{"error":{"message":"quota exceeded"}}"#);
+        assert!(accumulator.is_closed(), "the failure is terminal");
+        accumulator.close();
+        let mut events = Vec::new();
+        while let Some(event) = accumulator.take_ready() {
+            events.push(event);
+        }
+        assert!(
+            matches!(events.last(), Some(LlmEvent::Error(message))
+                if message.contains("quota exceeded")),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::Finished { .. })),
+            "a failed stream is not also a finished one: {events:?}"
+        );
+
+        // An error with no message is still an error, rendered whole.
+        let mut bare = StreamAccumulator::default();
+        bare.observe_line(r#"{"error":{"code":"overloaded"}}"#);
+        assert!(matches!(bare.take_ready(), Some(LlmEvent::Error(message))
+                if message.contains("overloaded")));
+    }
+
+    /// The other direction: a frame whose `error` is null, as a server that always writes the
+    /// key sends it, is an ordinary frame and the stream finishes normally.
+    #[test]
+    fn a_null_error_field_is_not_a_failure() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.observe_line(
+            r#"{"error":null,"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+        );
+        assert!(!accumulator.is_closed());
+        accumulator.close();
+        let mut events = Vec::new();
+        while let Some(event) = accumulator.take_ready() {
+            events.push(event);
+        }
+        assert!(
+            matches!(events.first(), Some(LlmEvent::TextDelta(text)) if text == "hi"),
+            "{events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(LlmEvent::Finished {
+                reason: FinishReason::Stop
+            })
+        ));
     }
 
     #[test]
