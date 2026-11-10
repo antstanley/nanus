@@ -354,25 +354,28 @@ impl TurnMachine {
     /// Decides what happens after one step.
     ///
     /// A terminal step outcome closes the turn with the matching reason. A
-    /// non-terminal one closes the turn only when it is final *and* nothing is
-    /// owed; otherwise another step runs, unless the step budget is exhausted,
-    /// in which case the turn closes as [`TurnOutcome::MaxSteps`].
+    /// non-terminal one closes the turn when it is final *and* nothing is
+    /// owed, on whichever step that happens — the last one the budget allows
+    /// included. Otherwise another step runs, unless the step budget is
+    /// exhausted, in which case the turn closes as [`TurnOutcome::MaxSteps`].
     #[must_use]
     pub fn decide(&self, log: &SessionLog, outcome: &StepOutcome) -> TurnOutcome {
         if let Some(closed) = terminal_outcome(outcome) {
             return closed;
         }
         let steps_taken = self.steps_taken(log);
+        // Whether the turn is finished is asked before whether it may go on. The budget bounds
+        // how many steps a turn may *take*, so it has nothing to say about a turn that needs no
+        // further step: asked the other way round, an answer given on the last step the budget
+        // allows closed as `MaxSteps` — a complete answer reported as a failed run, to a model
+        // that had been told the budget and paced itself to it.
+        if matches!(outcome, StepOutcome::FinalAnswer) && self.owed_tool_calls(log).is_empty() {
+            return TurnOutcome::Completed;
+        }
         if steps_taken >= self.config.max_steps_per_turn {
             return TurnOutcome::MaxSteps;
         }
-        let decision = if matches!(outcome, StepOutcome::FinalAnswer)
-            && self.owed_tool_calls(log).is_empty()
-        {
-            TurnOutcome::Completed
-        } else {
-            TurnOutcome::Continue { step: steps_taken }
-        };
+        let decision = TurnOutcome::Continue { step: steps_taken };
         // Postcondition: a turn that continues has budget left, which is the
         // whole reason the budget exists.
         assert!(
@@ -501,6 +504,42 @@ mod tests {
         assert_eq!(closed, TurnOutcome::MaxSteps);
         assert_eq!(closed.turn_end_reason(), Some(TurnEndReason::MaxSteps));
         assert!(!closed.turn_end_reason().is_some_and(|r| r.is_success()));
+    }
+
+    /// The budget bounds the steps a turn takes, not whether its last one counts: an answer on
+    /// the final budgeted step completes the turn, and only a step that wants another is closed.
+    #[test]
+    fn an_answer_on_the_last_budgeted_step_completes_the_turn() {
+        let Ok(config) = AgentConfig::new(2, 4, "deepseek-flash", 1024) else {
+            panic!("a valid configuration");
+        };
+        let Ok(machine) = TurnMachine::new(config) else {
+            panic!("a valid machine");
+        };
+        let mut log = SessionLog::new();
+        log.append(SessionEvent::TurnStart { turn: 0 });
+        log.append(SessionEvent::StepStart { turn: 0, step: 0 });
+        log.append(SessionEvent::StepEnd { turn: 0, step: 0 });
+        log.append(SessionEvent::StepStart { turn: 0, step: 1 });
+        assert_eq!(machine.steps_taken(&log), machine.step_budget());
+        let answered = machine.decide(&log, &StepOutcome::FinalAnswer);
+        assert_eq!(answered, TurnOutcome::Completed);
+        assert!(answered.turn_end_reason().is_some_and(|r| r.is_success()));
+        // The other direction: the same step asking for a tool has no step left to use it in,
+        // and an answer that still owes a result is not finished either.
+        assert_eq!(
+            machine.decide(&log, &StepOutcome::ToolCalls { count: 1 }),
+            TurnOutcome::MaxSteps
+        );
+        log.append(SessionEvent::ToolCall {
+            call_id: ToolCallId::new("c-1"),
+            name: tool_name("read"),
+            arguments: json!({}),
+        });
+        assert_eq!(
+            machine.decide(&log, &StepOutcome::FinalAnswer),
+            TurnOutcome::MaxSteps
+        );
     }
 
     #[test]
