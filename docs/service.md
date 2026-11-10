@@ -98,7 +98,8 @@ goes to every view, and each answer does too. A session is still one turn at a t
 prompt to a busy one is refused rather than queued. See [sessions](sessions.md).
 
 The agent holds a bounded number of conversations and lets idle ones go when it needs room;
-a session that is running or has a client attached is never dropped. Turns that are running
+a session that is running, has a client attached, or is in the middle of being opened is never
+dropped. Turns that are running
 do interleave on the agent's single thread, because the kernel is single-threaded by design
 and there is exactly one model and one toolset.
 
@@ -123,9 +124,14 @@ Two services on one machine is a second socket. `--socket` selects it for `start
 `status`, and — with `--connect` — the interface:
 
 ```sh
-nanus service start --socket /tmp/other.sock --log /tmp/other.log
-nanus tui --connect --socket /tmp/other.sock
+nanus service start --socket ~/.config/nanus/run/other.sock --log ~/.config/nanus/other.log
+nanus tui --connect --socket ~/.config/nanus/run/other.sock
 ```
+
+Keep a second socket in a directory that is yours, as the default one is. A path somewhere
+other accounts can write — `/tmp` — is one another account can be listening at before the
+service is: both ends refuse a peer that is not running as you, so nothing is sent to it, but
+the service cannot start there while it is.
 
 Without `--connect`, `--socket` is a usage error rather than a setting that is quietly
 ignored: `nanus tui` binds its own socket for the agent it starts, so there is nothing for
@@ -157,7 +163,9 @@ joins its runtime workers before process exit. See [the tested revision and run]
   There is no remote mode. The local transports and service lifecycle passed
   [native Linux, macOS, and Windows validation](https://github.com/antstanley/nanus/actions/runs/36852736607).
 - **The link trusts a peer that is the same user.** On Unix the socket is `0600` inside a
-  `0700` directory. Windows uses the default pipe descriptor, whose full-control principals are
+  `0700` directory, and both ends check the connection's peer credentials and refuse another
+  user — root included — so a socket placed in a shared directory is not an agent anybody can
+  drive or pose as. Windows uses the default pipe descriptor, whose full-control principals are
   the creator, LocalSystem, and Administrators, with read access for Everyone and Anonymous, so
   both ends prove themselves with a key only the user can read before any frame is exchanged
   (see [`SAFETY.md`](../SAFETY.md#the-agents-local-link)). A pipe held by another account is

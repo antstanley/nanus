@@ -232,6 +232,19 @@ On Unix, an agent serving an interface — or a service — listens on a domain 
 your user can connect to it, and it is a local socket: nothing listens on an address
 and no packet reaches a network interface.
 
+The directory is the first defence and not the only one, because a socket can be put
+somewhere else: `--socket` and `service_socket` take any path, and a path in a directory
+other accounts can write to — `/tmp` is the usual one — is a path another account can be
+listening at first. So both ends also ask the operating system who is at the other end of the
+connection, and refuse a peer that is not running as the same user: an interface sends
+nothing, a credential included, to an agent that is somebody else's, and an agent serves
+nobody else's client. The socket is created under a mask that already withholds it from other
+accounts, rather than narrowed a moment after it appears, and binding replaces only a dead
+*socket*: a file or a link that happens to be at the path is refused, not removed. A socket
+directory that others can write to is reported in the log. What this does not do is keep
+another account from occupying such a path — the agent then refuses to start there, which is
+an inconvenience and not a breach. Keep a custom socket in a directory that is yours.
+
 On Windows the local endpoint is a SID-named pipe, with remote clients rejected and the
 first instance refusing an existing owner. A pipe has no private directory to live in: its
 name is global and computable by anyone who knows your SID, and the default descriptor grants

@@ -3,7 +3,8 @@
 //!
 //! ## Why a handshake at all
 //!
-//! A Unix socket lives in a `0700` directory, so reaching it is already proof of being the user.
+//! A Unix socket lives in a `0700` directory, so reaching it is already proof of being the user,
+//! and the kernel names a socket's peer for the paths where it does not (see `transport::unix`).
 //! A named pipe has no directory: its name is global, and computed from the user's SID, which is
 //! public. Another account on the machine can therefore create `\\.\pipe\nanus-<your SID>-agent`
 //! before the agent does — the agent's bind is then refused, and an interface that connects is

@@ -55,7 +55,8 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`LinkError::Connect`] when nothing is listening, [`LinkError::Inaccessible`]
-    /// when something is but may not be opened, [`LinkError::Unverified`] when a Windows agent
+    /// when something is but may not be opened, [`LinkError::OtherUser`] when the agent at a
+    /// Unix socket runs as another user, [`LinkError::Unverified`] when a Windows agent
     /// cannot prove it is this user's, [`LinkError::Closed`] when the peer hung up before its
     /// handshake, and [`LinkError::Protocol`] when the handshake is not one.
     pub async fn connect(path: &Path) -> LinkResult<Self> {

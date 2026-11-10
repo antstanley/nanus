@@ -37,7 +37,9 @@ Loopback TCP would be a single code path on every platform, and it is the wrong 
 The link's trust model is *the filesystem*: a socket that is `0600` inside a `0700`
 directory can only be reached by the user it belongs to, and the docs lean on that to say
 the link "trusts its peer" without defending against anything a same-user process could not
-already do. A TCP port can be reached by any local user and any local process, so adopting
+already do — and where a socket is put outside that directory, the kernel's answer to "who
+is this connection's peer" is checked at both ends, which a TCP port cannot give. A TCP port
+can be reached by any local user and any local process, so adopting
 it would need a token or a certificate to put back what the filesystem gave for free — and
 it would do that on every platform to serve one. A named pipe is the Windows analogue of the
 socket: a local, kernel-mediated endpoint with an access-control list, which is the property
