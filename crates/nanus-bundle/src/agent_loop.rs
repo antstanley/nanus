@@ -1018,6 +1018,7 @@ impl AgentRunner {
         if reservation.is_some() && is_cancelled(progress, context.control) {
             return Ok(StepOutcome::Interrupted);
         }
+        let produced = self.produced_by(&request);
         let mut stream = self.llm.borrow().stream_chat(request);
         let assembled = self
             .consume_stream(
@@ -1030,7 +1031,12 @@ impl AgentRunner {
         drop(stream); // Release the model response before host validation or native dispatch.
         let interrupted = assembled.interrupted;
         let answer = stream::answer_outcome(&assembled.finish);
-        let calls = self.append_model_records(session, context.position, assembled, reservation)?;
+        let calls = self.append_model_records(
+            session,
+            context.position,
+            (assembled, produced),
+            reservation,
+        )?;
         if interrupted {
             return Ok(StepOutcome::Interrupted);
         }
@@ -2990,6 +2996,69 @@ mod tests {
             recorded,
             Some(String::from("deepseek-v4-pro")),
             "and the log says which model produced the message"
+        );
+    }
+
+    /// A listener that switches the runner's model and effort while a response streams.
+    struct SwitchesMidStream<'a>(&'a AgentRunner);
+
+    impl Progress for SwitchesMidStream<'_> {
+        fn text(&mut self, _delta: &str) {
+            self.0.set_model("deepseek-v4-pro");
+            self.0.set_effort(Some(nanus_ports::ReasoningEffort::High));
+        }
+    }
+
+    /// The model and effort each assistant record names, in order.
+    fn recorded_stamps(session: &Session) -> Vec<(Option<String>, Option<String>)> {
+        session
+            .log()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::AssistantMessage { model, effort, .. } => {
+                    Some((model.clone(), effort.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A switch made while a response streams is about the next request: the message being
+    /// received is recorded against the model and effort its request was sent under, and the
+    /// next turn's message against the ones switched to.
+    #[tokio::test]
+    async fn a_switch_made_mid_stream_is_not_stamped_on_the_message_already_arriving() {
+        let (llm, seen) = ScriptedLlm::recording(vec![
+            vec![LlmEvent::TextDelta("one".to_owned())],
+            vec![LlmEvent::TextDelta("two".to_owned())],
+        ]);
+        let Some(runner) = runner(llm, registry_with_echo()) else {
+            return;
+        };
+        let mut session = session();
+        let mut switching = SwitchesMidStream(&runner);
+        let first = runner
+            .run_turn(&mut session, "a question", &mut switching, None)
+            .await;
+        assert!(first.is_ok());
+        assert_eq!(runner.model(), "deepseek-v4-pro", "the switch took effect");
+        let second = runner
+            .run_turn(&mut session, "another", &mut Silent, None)
+            .await;
+        assert!(second.is_ok());
+        let models: Vec<String> = seen.borrow().iter().map(|r| r.model.clone()).collect();
+        assert_eq!(models, ["test-model", "deepseek-v4-pro"]);
+        assert_eq!(
+            recorded_stamps(&session),
+            [
+                (Some(String::from("test-model")), None),
+                (
+                    Some(String::from("deepseek-v4-pro")),
+                    Some(String::from("high"))
+                ),
+            ],
+            "each message names what its own request was sent under"
         );
     }
 

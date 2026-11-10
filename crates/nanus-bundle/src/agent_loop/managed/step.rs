@@ -362,6 +362,7 @@ impl AgentRunner {
         if is_cancelled(progress, context.control) {
             return Ok(StepOutcome::Interrupted);
         }
+        let produced = self.produced_now();
         let mut stream = call.stream();
         let assembled = self
             .consume_stream(
@@ -375,7 +376,12 @@ impl AgentRunner {
         let interrupted = assembled.interrupted;
         let answer = crate::agent_loop::stream::answer_outcome(&assembled.finish);
         let seq = session.log().next_seq().value();
-        let calls = self.append_model_records(session, context.position, assembled, reservation)?;
+        let calls = self.append_model_records(
+            session,
+            context.position,
+            (assembled, produced),
+            reservation,
+        )?;
         *assistant = Some(seq);
         if interrupted {
             return Ok(StepOutcome::Interrupted);

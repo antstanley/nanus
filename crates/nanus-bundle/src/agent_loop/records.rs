@@ -41,7 +41,38 @@ fn ending<'a>(session: &'a Session, event: &'a SessionEvent) -> RecordEndProject
     }
 }
 
+/// The model and effort a request was sent under, kept to stamp the message it produces.
+///
+/// Taken when the request leaves rather than read back when the response has arrived: a reader
+/// may switch model or effort while the response streams, and that switch is about the *next*
+/// request. Read afterwards, the runner's cells named the model that was switched to, so the
+/// message — and the cost `usage_by_model` attributes to it — was recorded against a model that
+/// never produced it.
+pub(super) struct Produced {
+    model: String,
+    effort: Option<nanus_ports::ReasoningEffort>,
+}
+
 impl AgentRunner {
+    /// What `request` is being sent under: its own model, and the effort it carries or, when it
+    /// carries none, the one the adapter about to send it applies to that model.
+    pub(super) fn produced_by(&self, request: &ChatRequest) -> Produced {
+        Produced {
+            effort: request
+                .reasoning_effort
+                .or_else(|| self.llm.borrow().reasoning_effort(&request.model)),
+            model: request.model.clone(),
+        }
+    }
+
+    /// What a held step is sent under: the selection in force, which the hold keeps still.
+    pub(super) fn produced_now(&self) -> Produced {
+        Produced {
+            model: self.model(),
+            effort: self.effort(),
+        }
+    }
+
     pub(super) fn reserve_turn_records(
         &self,
         session: &Session,
@@ -121,9 +152,10 @@ impl AgentRunner {
         &self,
         session: &mut Session,
         position: (u32, u32),
-        assembled: Assembled,
+        produced: (Assembled, Produced),
         lease: Option<&dyn StepRecordReservation>,
     ) -> Result<Vec<ToolCall>, BundleError> {
+        let (assembled, produced) = produced;
         // Move every assembled field into the actual event. Calls/replay/text are not copied
         // until the host has counted this complete record and every future audit copy.
         let event = SessionEvent::AssistantMessage {
@@ -141,8 +173,8 @@ impl AgentRunner {
             tool_calls: assembled.calls,
             usage: assembled.usage,
             interrupted: assembled.interrupted,
-            model: Some(self.model()),
-            effort: self.effort().map(|value| value.as_str().to_owned()),
+            model: Some(produced.model),
+            effort: produced.effort.map(|value| value.as_str().to_owned()),
         };
         if let Some(lease) = lease {
             let projection = ModelRecordProjection {
