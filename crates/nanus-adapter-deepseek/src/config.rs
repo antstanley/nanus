@@ -56,6 +56,8 @@ pub struct DeepSeekConfig {
     reasoning_effort: ReasoningEffort,
     temperature: Option<f32>,
     response_limits: Option<nanus_ports::ResponseLimits>,
+    /// How long a connection and a silence may last; see [`nanus_ports::HttpTimeouts`].
+    timeouts: nanus_ports::HttpTimeouts,
 }
 
 impl core::fmt::Debug for DeepSeekConfig {
@@ -68,11 +70,24 @@ impl core::fmt::Debug for DeepSeekConfig {
             .field("reasoning_effort", &self.reasoning_effort)
             .field("temperature", &self.temperature)
             .field("response_limits", &self.response_limits)
+            .field("timeouts", &self.timeouts)
             .finish()
     }
 }
 
 impl DeepSeekConfig {
+    /// Chooses how long a connection and a silence in a response may last.
+    ///
+    /// Read when the adapter is built, because the waits are the HTTP client's.
+    pub const fn set_timeouts(&mut self, timeouts: nanus_ports::HttpTimeouts) {
+        self.timeouts = timeouts;
+    }
+    /// The waits a request is bounded by: [`nanus_ports::HttpTimeouts::default`] unless chosen.
+    #[must_use]
+    pub const fn timeouts(&self) -> nanus_ports::HttpTimeouts {
+        self.timeouts
+    }
+
     /// Selects generic transport/decoder budgets before any request is dispatched.
     pub fn set_response_limits(&mut self, limits: nanus_ports::ResponseLimits) {
         self.response_limits = Some(limits);
@@ -94,6 +109,7 @@ impl DeepSeekConfig {
             reasoning_effort: ReasoningEffort::Medium,
             temperature: None,
             response_limits: None,
+            timeouts: nanus_ports::HttpTimeouts::default(),
         }
     }
 

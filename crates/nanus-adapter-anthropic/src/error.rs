@@ -99,7 +99,9 @@ impl AnthropicError {
     pub(crate) fn transport(source: &reqwest::Error, host: &str) -> Self {
         Self::Transport {
             host: host.to_owned(),
-            message: source.to_string(),
+            // The whole chain, because the outer sentence of a deadline that fired does not
+            // say that it was one.
+            message: nanus_ports::error_chain(source),
         }
     }
 

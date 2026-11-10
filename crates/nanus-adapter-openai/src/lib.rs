@@ -158,6 +158,26 @@ impl Decoder {
     }
 }
 
+/// Builds the HTTP client every request of this adapter goes through.
+///
+/// Two things are decided here because they are the client's and not a request's.
+///
+/// **No redirect is followed.** A request carries a credential and the whole conversation, and
+/// the endpoint it was built for is the only host both were meant for. The client would
+/// otherwise re-post the body to wherever a `307` pointed, with every header but the bearer, so a redirect is reported as the
+/// status it is instead.
+///
+/// **Both waits are bounded**: reaching the host, and each silence after that — before the
+/// response's head and between any two reads of its body. The bound is on the silence rather
+/// than on the response, so a long answer that keeps arriving is never cut.
+fn http_client(timeouts: nanus_ports::HttpTimeouts) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(timeouts.connect())
+        .read_timeout(timeouts.idle())
+        .build()
+}
+
 /// A chat-completions client for one `OpenAI`-compatible vendor.
 ///
 /// The client holds one `reqwest::Client` so connections are pooled across steps,
@@ -214,16 +234,8 @@ impl OpenAiLlm {
         if config.instruction_revisions() && !config.stateless_responses() {
             return Err(OpenAiError::UnsupportedProtocol);
         }
-        let builder = reqwest::Client::builder();
-        // A receipt names one exact endpoint. Redirects cannot silently select a different one.
-        let builder = if config.stateless_responses() {
-            builder.redirect(reqwest::redirect::Policy::none())
-        } else {
-            builder
-        };
-        let client = builder
-            .build()
-            .map_err(|source| OpenAiError::client(&source))?;
+        let client =
+            http_client(config.timeouts()).map_err(|source| OpenAiError::client(&source))?;
         Ok(Self {
             client,
             config,

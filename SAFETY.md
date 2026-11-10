@@ -132,6 +132,16 @@ the body; no partial signed replay or completed tool-call batch is emitted as a 
 composition leaves these limits absent. They do not cap TLS/HTTP-client/allocator overhead or stop a
 silent provider by themselves: the host must still impose deadlines and drive cancellation.
 
+Two bounds hold whether or not those limits are set, because the adapters' HTTP clients carry them.
+**A request waits a bounded time**: thirty seconds to reach the host, and five minutes of silence —
+before the response's head, or between two reads of its body — after which the turn fails with a
+sentence saying a wait ran out. The bound is on the silence, not on the response, so a long answer
+that keeps arriving is never cut; a library host changes either with each API config's
+`set_timeouts`. **No redirect is followed**: a request carries a credential and the whole
+conversation, and a `307` would have the client post both to another host — Anthropic's key in a
+header the client does not strip — so a redirect is reported as the status it is. The
+authorization service is reached under the same two rules, with one minute for a whole request.
+
 ### The honest caveats
 
 - **A non-zero exit code is not an error**, by design: the command ran and told you

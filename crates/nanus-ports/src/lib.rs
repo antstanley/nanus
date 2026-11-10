@@ -79,6 +79,7 @@ pub mod secret;
 pub mod shell;
 pub mod sse;
 pub mod store;
+pub mod timeouts;
 pub mod tool_admission;
 pub mod tool_support;
 
@@ -109,7 +110,7 @@ pub use llm::{
     ChatRequest, FinishReason, LlmError, LlmEvent, LlmHandle, LlmPort, LlmResult, LlmStream,
     ManagedRequest, ManagedSupport, OVERSIZED_ARGUMENTS, PreparedModelCall, PromptCacheRetention,
     ReasoningEffort, ToolArgumentLimits, ToolCallAssembler, UNTERMINATED, error_body_snippet,
-    truncate_chars,
+    error_chain, truncate_chars,
 };
 pub use nanus_domain::{ApprovalOutcome, ApprovalPolicy, SandboxMode, ToolAccess};
 pub use record_admission::{
@@ -127,6 +128,7 @@ pub use store::{
     SESSION_NAME_MAX_CHARS, SessionSummary, StoreError, StoreHandle, StorePort, StoreResult,
     session_name_problem,
 };
+pub use timeouts::HttpTimeouts;
 pub use tool_admission::{
     AdmissionError, ToolAdmission, ToolBatchProjection, ToolBatchReservation,
 };

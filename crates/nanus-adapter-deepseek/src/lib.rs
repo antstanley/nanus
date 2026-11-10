@@ -110,6 +110,26 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 /// A stream of model events.
 type EventStream = Pin<Box<dyn futures::Stream<Item = LlmEvent> + 'static>>;
 
+/// Builds the HTTP client every request of this adapter goes through.
+///
+/// Two things are decided here because they are the client's and not a request's.
+///
+/// **No redirect is followed.** A request carries a credential and the whole conversation, and
+/// the endpoint it was built for is the only host both were meant for. The client would
+/// otherwise re-post the body to wherever a `307` pointed, with every header but the bearer, so a redirect is reported as the
+/// status it is instead.
+///
+/// **Both waits are bounded**: reaching the host, and each silence after that — before the
+/// response's head and between any two reads of its body. The bound is on the silence rather
+/// than on the response, so a long answer that keeps arriving is never cut.
+fn http_client(timeouts: nanus_ports::HttpTimeouts) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(timeouts.connect())
+        .read_timeout(timeouts.idle())
+        .build()
+}
+
 /// A `DeepSeek` chat-completions client.
 ///
 /// The client holds one `reqwest::Client` so connections are pooled across steps,
@@ -136,9 +156,8 @@ impl DeepSeekLlm {
     /// Returns [`DeepSeekError::Client`] when the underlying HTTP client cannot be
     /// constructed, which happens only when the platform TLS stack is unavailable.
     pub fn new(config: DeepSeekConfig) -> Result<Self, DeepSeekError> {
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|source| DeepSeekError::client(&source))?;
+        let client =
+            http_client(config.timeouts()).map_err(|source| DeepSeekError::client(&source))?;
         Ok(Self { client, config })
     }
 
