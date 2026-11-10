@@ -12,6 +12,7 @@
 //! needs no exchange of the kind a Windows pipe does.
 
 use crate::{LinkError, LinkResult};
+use nix::sys::stat::{Mode, umask};
 use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -76,19 +77,47 @@ async fn clear_stale(path: &Path) -> LinkResult<()> {
     Ok(())
 }
 
+/// The mask a socket is bound under: nothing for the group or for anyone else.
+///
+/// It clears the group's and others' bits and *only* those. The owner's execute bit means
+/// nothing on a socket, and [`restrict`] takes it off a moment later, but the mask is the
+/// process's, not the thread's, so a directory some other thread creates while it is in force
+/// gets it too — and a directory its owner cannot search is one nothing can be created in. An
+/// earlier `0o177` did exactly that to every directory a concurrent thread made.
+const BIND_MASK: Mode = Mode::S_IRWXG.union(Mode::S_IRWXO);
+
+/// Serialises every change this module makes to the process's mask.
+///
+/// Reading the mask means setting it, so two binds that overlapped would each save the other's
+/// tightened mask as "previous", and the last to put it back would leave it tightened for the
+/// life of the process. Under this lock, every bind puts back the mask it found.
+static MASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Binds with the socket withheld from other accounts from the instant it exists.
 ///
 /// A socket is created with the process's mask applied, and narrowing it afterwards leaves a
 /// moment in which a permissive mask has made it connectable by others. The mask is tightened
 /// for the bind alone and put back at once. It is the process's, not the thread's: a file some
-/// other thread creates in that instant is created more private than it would have been, which
-/// is the harmless direction, and nothing here awaits while it is in force.
+/// other thread creates in that instant is withheld from the group and from others, which is
+/// the harmless direction because [`BIND_MASK`] leaves the owner every bit, and nothing here
+/// awaits while it is in force.
 fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
-    use nix::sys::stat::{Mode, umask};
-    let previous = umask(Mode::from_bits_truncate(0o177));
+    let _held = lock_mask();
+    bind_masked(path)
+}
+
+/// The bind itself, for a caller that already holds [`MASK`].
+fn bind_masked(path: &Path) -> std::io::Result<UnixListener> {
+    let previous = umask(BIND_MASK);
     let bound = UnixListener::bind(path);
     let _tightened = umask(previous);
     bound
+}
+
+/// Takes [`MASK`]. It guards no data, so a thread that panicked holding it left nothing torn.
+fn lock_mask() -> std::sync::MutexGuard<'static, ()> {
+    MASK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Creates the run directory with owner-only permissions, or looks at the one that is there.
@@ -206,16 +235,75 @@ mod tests {
     /// most permissive mask there is, nothing has to be narrowed afterwards for it to be private.
     #[tokio::test]
     async fn a_socket_is_private_before_it_is_narrowed_even_under_an_open_mask() {
-        use nix::sys::stat::{Mode, umask};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.sock");
+        let held = lock_mask();
         let before = umask(Mode::empty());
-        let bound = bind_private(&path);
+        let bound = bind_masked(&path);
         let restored = umask(before);
+        drop(held);
         assert!(bound.is_ok(), "{bound:?}");
         assert_eq!(restored, Mode::empty(), "the mask is put back as it was");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "socket mode {mode:o}");
+    }
+
+    /// The mask is the process's, so whatever another thread creates during a bind is created
+    /// under it. The owner keeps every bit — a directory made then can still be worked in — and
+    /// the group and others still get none.
+    #[test]
+    fn a_directory_made_while_a_socket_is_bound_is_still_its_owners_to_use() {
+        let held = lock_mask();
+        let previous = umask(BIND_MASK);
+        let created = tempfile::tempdir();
+        let _tightened = umask(previous);
+        drop(held);
+        let created = created.unwrap();
+        let mode = std::fs::metadata(created.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o700, 0o700, "directory mode {mode:o}");
+        assert_eq!(mode & 0o077, 0, "directory mode {mode:o}");
+        let inside = created.path().join("sessions");
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::write(inside.join("session.jsonl"), "{}").unwrap();
+    }
+
+    /// Reading the mask means setting it, so binds that overlap must not save each other's
+    /// tightened mask as the one to put back: however many run at once, the process's mask
+    /// afterwards is the one it had before.
+    #[test]
+    fn overlapping_binds_put_back_the_mask_they_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let found = {
+            let _held = lock_mask();
+            let found = umask(BIND_MASK);
+            umask(found);
+            found
+        };
+        let binds: Vec<_> = (0..16)
+            .map(|index| {
+                let path = dir.path().join(format!("agent-{index}.sock"));
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_io()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async { bind_private(&path).map(drop) })
+                })
+            })
+            .collect();
+        for bind in binds {
+            bind.join().unwrap().unwrap();
+        }
+        let _held = lock_mask();
+        let after = umask(BIND_MASK);
+        umask(after);
+        assert_eq!(
+            after, found,
+            "the mask is {after:?}, not the {found:?} it was"
+        );
     }
 
     #[tokio::test]
