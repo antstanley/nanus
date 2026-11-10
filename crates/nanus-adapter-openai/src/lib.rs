@@ -56,6 +56,8 @@ mod managed_tests;
 pub mod oauth;
 mod response;
 #[cfg(test)]
+mod session_header_tests;
+#[cfg(test)]
 mod stateless_tests;
 mod tool_support;
 
@@ -478,11 +480,22 @@ impl OpenAiLlm {
         };
         tracing::debug!(vendor=%self.config.vendor(),model=%request.model,endpoint=%endpoint,
             messages=request.messages.len(),tools=request.tools.len(),"dispatching a chat completion");
-        send(self.transport(endpoint), body, decoder)
+        let session = self.session_header(request, self.protocol_of(request));
+        send(self.transport(endpoint, session), body, decoder)
+    }
+
+    /// The `session-id` header `request` carries on `protocol`, if its path takes one.
+    ///
+    /// The opt-in stateless replay mode sends no cache key, so it sends no header either.
+    fn session_header(&self, request: &ChatRequest, protocol: Protocol) -> Option<String> {
+        if self.config.stateless_responses() {
+            return None;
+        }
+        responses::session_header(request, self.config.cache_path(protocol))
     }
 
     /// Everything a dispatch needs beyond its body, resolved now and owned from here on.
-    fn transport(&self, endpoint: &str) -> Transport {
+    fn transport(&self, endpoint: &str, session: Option<String>) -> Transport {
         Transport {
             client: self.client.clone(),
             endpoint: endpoint.to_owned(),
@@ -492,6 +505,7 @@ impl OpenAiLlm {
             host: self.config.base_url().to_owned(),
             vendor: self.config.vendor(),
             limits: self.config.response_limits(),
+            session,
         }
     }
 }
@@ -511,6 +525,9 @@ struct Transport {
     host: String,
     vendor: Vendor,
     limits: Option<nanus_ports::ResponseLimits>,
+    /// The `session-id` header, on a path whose cache routing follows it; see
+    /// [`CachePath::session_header`]. Settled with the body, so a prepared call cannot drift.
+    session: Option<String>,
 }
 
 /// Sends exactly `body` over `transport` and decodes the answer with `decoder`.
@@ -527,6 +544,7 @@ fn send(transport: Transport, body: String, decoder: Decoder) -> LlmStream {
         host,
         vendor,
         limits,
+        session,
     } = transport;
     let transport_host = host.clone();
     let response = async move {
@@ -549,6 +567,9 @@ fn send(transport: Transport, body: String, decoder: Decoder) -> LlmStream {
             .body(body);
         if let Some(account) = account {
             sent = sent.header("chatgpt-account-id", account);
+        }
+        if let Some(session) = session {
+            sent = sent.header("session-id", session);
         }
         // The bearer goes on with the response, because it is known only here and the
         // provider's own words are checked for it before they are passed on.

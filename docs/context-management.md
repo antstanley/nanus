@@ -516,6 +516,25 @@ groups. So one session's requests are kept together as its conversation grows, a
 not read another's entries, the system prompt's included. A gateway configured as OpenAI, z.ai and
 Inception are sent no key, and the opt-in stateless replay mode sends none.
 
+The subscription's backend does not route by the body's key. On that path the same key is also
+sent as a `session-id` header, under the same conditions, and only there
+(`CachePath::session_header`). The open-source Codex CLI sends it, beside `thread-id` and a per-turn `x-codex-turn-state` that it
+echoes from the backend's first answer, and its client says that the ChatGPT backend derives cache
+affinity from that header. OpenAI's API documentation names no such header. Measured on 2026-11-10
+with `gpt-6.1-sol`, over turns of four or five sequential steps on a prompt of about eight thousand
+tokens (`openai_subscription_cache_routing_probe`, and for the second row also
+`openai_subscription_reads_each_step_through_the_adapter`):
+
+| Sent | Later steps that read the previous step |
+|---|---|
+| `prompt_cache_key` alone, as before | 0 of 12; one read about one step behind, the other eleven read nothing |
+| `prompt_cache_key` and `session-id` | 19 of 21; the other two read nothing at all |
+| both, with `thread-id` and the turn state echoed | 6 of 6 |
+
+A read is within 256 tokens of the previous step's prompt: the entry ends at the last eligible
+message, at a 128-token granularity. The turn state is not sent: six steps do not show that it
+removes the remaining misses, and it is state the adapter would have to keep per turn.
+
 Each path's carriers are a row of the vendor table (`OpenAiConfig::cache_path`): `system_carrier`,
 `tail_carrier`, `system_breakpoint` and `head_breakpoint`. A path that refused a trailing developer
 message would take the `AppendedExplicit` carrier instead: `prompt_cache_options: {"mode":"explicit"}`,
@@ -948,7 +967,9 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   build still matching;
 - the OpenAI trailing developer tail, the Responses developer system message, both explicit
   breakpoints, and the session's `prompt_cache_key` on both plans at OpenAI's endpoints and on no
-  other path;
+  other path; the same key as the `session-id` header on the subscription's Responses path from both
+  entry points, exactly when the body carries it, and on no other path, stateless replay included,
+  over a local listener;
 - the legacy fitter: its elision notice is costed and carried as the tail, never as a message, on
   every wire, and the fitter's choice of turns is the same as before for the same budget;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
@@ -965,12 +986,24 @@ Not verified, and not claimed:
   - per Anthropic model, whether signed replay is accepted with an earlier step's tail removed.
 
   They need credentials, and a pass is evidence for that day and model only. Only the
-  subscription's acceptance case has been run. Its cache-read case failed on its one run: the
-  second step reported no cached tokens although the first step read the prefix an earlier run
-  wrote. In a three-request probe that day, identical subscription requests were served from cache
-  irregularly with or without a `prompt_cache_key`. With the session's key sent, three more runs
-  of the case the same day read the previous step in one run and nothing at step 2 in two. The
-  subscription's cache routing is not understood, and no claim is made about its hit rate.
+  subscription's cases have been run.
+
+  Before the `session-id` header, its cache-read case failed on its one run, and of three more
+  runs with the session's key in the body, one read the previous step and two read nothing at
+  step 2. Recorded sessions with `gpt-6.1-sol` showed the same: 87 of a 133-step session's steps
+  read nothing, and steps that did read often read an entry several steps old.
+
+  On 2026-11-10, with the header, the routing probe's numbers are in the table under
+  [Request layout and provider caches](#request-layout-and-provider-caches).
+  `openai_subscription_reads_each_step_through_the_adapter` read steps 1 and 2 and then nothing at
+  step 3. The managed case on `gpt-5.6-sol` read the first step at step 2, and read that entry
+  again at step 3 rather than the second step's, so it failed its floor.
+
+  So the header is what routes a session's requests to its cache, and nanus sends it. A step
+  still misses outright about one time in ten, and nothing here shows why. The rate is measured
+  on prompts of about eight thousand tokens, in turns of five steps or fewer. It is not measured on
+  long sessions, across a pause between turns, or in a recorded session since the change. No claim
+  is made about the subscription's hit rate beyond these runs.
 
 - **No live provider has been sent a maintenance request.** A handoff or compaction draft is a model
   call built and read the way a managed turn's is. The tests show the request is built and its

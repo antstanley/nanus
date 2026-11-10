@@ -278,7 +278,7 @@ pub fn prepare(llm: &OpenAiLlm, managed: ManagedRequest) -> LlmResult<PreparedCa
     })?;
     // Postcondition: the estimate measured exactly the bytes that will be sent.
     assert_eq!(body.len(), estimate.request_bytes);
-    let transport = llm.transport(&llm.url(protocol));
+    let transport = llm.transport(&llm.url(protocol), llm.session_header(&request, protocol));
     let effort = match protocol {
         Protocol::ChatCompletions => payload.get("reasoning_effort"),
         Protocol::Responses => payload

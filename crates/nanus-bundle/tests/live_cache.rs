@@ -325,13 +325,25 @@ fn api(model: &str, api_key: String) -> nanus_adapter_openai::OpenAiLlm {
     .unwrap()
 }
 
-async fn subscription(model: &str) -> nanus_adapter_openai::OpenAiLlm {
+/// The stored subscription grant, refused when it is about to run out.
+async fn subscription_tokens() -> nanus_adapter_openai::oauth::Tokens {
     let stored = key("openai:subscription").await;
     let tokens = nanus_adapter_openai::oauth::Tokens::decode(&stored).unwrap();
     assert!(
-        !tokens.is_expired(std::time::Duration::from_mins(1)),
+        !tokens.is_expired(std::time::Duration::from_mins(5)),
         "the authorization has expired; run `nanus run` once to renew it"
     );
+    tokens
+}
+
+async fn subscription(model: &str) -> nanus_adapter_openai::OpenAiLlm {
+    subscription_with(model, subscription_tokens().await)
+}
+
+fn subscription_with(
+    model: &str,
+    tokens: nanus_adapter_openai::oauth::Tokens,
+) -> nanus_adapter_openai::OpenAiLlm {
     let mut config = nanus_adapter_openai::OpenAiConfig::with_base_url(
         nanus_adapter_openai::Vendor::OpenAi,
         model,
@@ -425,6 +437,215 @@ async fn openai_subscription_reads_the_previous_step_from_cache() {
     managed_steps_read_the_previous_step(&llm, RESPONSES_MODEL).await;
 }
 
+// --- The subscription's cache routing ------------------------------------------------------------
+
+/// The model the subscription's routing was observed on.
+const ROUTING_MODEL: &str = "gpt-6.1-sol";
+
+/// Which headers a routing probe sends beside the adapter's own body.
+///
+/// The probe sets every header itself rather than going through the adapter's transport, so an
+/// arm stays what it names whatever the adapter sends today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arm {
+    /// The session's id in `prompt_cache_key` alone: what nanus sent before 2026-11-10.
+    KeyOnly,
+    /// The session's id in a `session-id` header as well: what nanus sends since.
+    SessionHeader,
+    /// `session-id`, `thread-id` and `x-client-request-id`, and the `x-codex-turn-state` the
+    /// backend answered the turn's first request with, echoed on its later ones.
+    TurnState,
+}
+
+impl Arm {
+    fn parse(name: &str) -> Self {
+        match name.trim() {
+            "key-only" => Self::KeyOnly,
+            "session" => Self::SessionHeader,
+            "turn-state" => Self::TurnState,
+            other => panic!("no probe arm named {other:?}"),
+        }
+    }
+}
+
+/// One step's usage, as the backend reported it.
+#[derive(Clone, Copy, Debug)]
+struct Read {
+    prompt: u64,
+    cached: u64,
+}
+
+/// The usage in a `response.completed` event of a streamed Responses body.
+fn completed_usage(text: &str) -> Option<Read> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|event| event["type"] == "response.completed")
+        .map(|event| {
+            let usage = &event["response"]["usage"];
+            Read {
+                prompt: usage["input_tokens"].as_u64().unwrap_or(0),
+                cached: usage["input_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+            }
+        })
+}
+
+/// One tool step of synthetic history: a call and a result of a few hundred tokens.
+fn tool_step(messages: &mut Vec<Message>, id: &str) {
+    let call = ToolCall::new(
+        ToolCallId::new(id),
+        ToolName::new("read").unwrap(),
+        json!({ "path": format!("{id}.txt") }),
+    );
+    messages.push(Message::Assistant {
+        text: None,
+        reasoning: None,
+        tool_calls: vec![call],
+        replay: None,
+    });
+    let content = format!("contents of {id}.txt: {}", "lorem ipsum dolor ".repeat(150));
+    messages.push(Message::tool(ToolCallId::new(id), content, false));
+}
+
+/// Runs one turn of `steps` sequential requests for `arm`, and returns each step's usage.
+///
+/// The body is the adapter's own ordinary encoding; only the headers differ between arms. The
+/// session's id starts with a nonce and so does its system prompt, so no earlier run's entry can
+/// stand in for this one's.
+async fn routing_turn(
+    tokens: &nanus_adapter_openai::oauth::Tokens,
+    arm: Arm,
+    steps: usize,
+) -> Vec<Read> {
+    let llm = subscription_with(ROUTING_MODEL, tokens.clone());
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let session = format!("probe-{nonce}");
+    let mut messages = vec![
+        Message::system(format!("Run {nonce}. {}", long_prompt())),
+        Message::user("Read the files one by one; reply with one word."),
+    ];
+    let client = reqwest::Client::new();
+    let mut turn_state: Option<String> = None;
+    let mut reads = Vec::new();
+    for step in 0..steps {
+        tool_step(&mut messages, &format!("f{step}"));
+        let request = ChatRequest::new(ROUTING_MODEL, messages.clone())
+            .with_tools(vec![schema()])
+            .with_reasoning_effort(nanus_ports::ReasoningEffort::Low)
+            .with_prompt_cache(PromptCacheRetention::Short)
+            .with_prompt_cache_key(session.as_str());
+        let mut sent = client
+            .post(llm.endpoint_for(ROUTING_MODEL))
+            .header("accept", "text/event-stream")
+            .bearer_auth(&tokens.access_token)
+            .json(&llm.encode(&request));
+        if let Some(account) = tokens.account_id.as_deref() {
+            sent = sent.header("chatgpt-account-id", account);
+        }
+        if arm != Arm::KeyOnly {
+            sent = sent.header("session-id", session.as_str());
+        }
+        if arm == Arm::TurnState {
+            sent = sent
+                .header("thread-id", session.as_str())
+                .header("x-client-request-id", session.as_str());
+            if let Some(state) = turn_state.as_deref() {
+                sent = sent.header("x-codex-turn-state", state);
+            }
+        }
+        let response = sent.send().await.unwrap();
+        let status = response.status();
+        if turn_state.is_none() {
+            turn_state = response
+                .headers()
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+        }
+        let text = response.text().await.unwrap();
+        assert!(
+            status.is_success(),
+            "{arm:?} step {step}: {status} {}",
+            text.replace(&tokens.access_token, "<redacted>")
+        );
+        reads.push(completed_usage(&text).unwrap_or_else(|| panic!("{arm:?}: no usage")));
+    }
+    eprintln!(
+        "[{arm:?}] backend answered with a turn state: {}",
+        turn_state.is_some()
+    );
+    reads
+}
+
+/// Prints a turn's reads: each step's cached tokens against the previous step's prompt.
+fn report(arm: Arm, run: usize, reads: &[Read]) -> (usize, usize) {
+    let mut line = format!("[{arm:?} run {run}]");
+    let mut hits = 0_usize;
+    for (step, read) in reads.iter().enumerate() {
+        let previous = step.checked_sub(1).map_or(0, |at| reads[at].prompt);
+        let _ = write!(
+            line,
+            " s{step}: {}/{} (prev {previous})",
+            read.cached, read.prompt
+        );
+        // A step reads the previous one when it is served at least that prompt less 256 tokens.
+        if step > 0 && read.cached.saturating_add(256) >= previous {
+            hits = hits.saturating_add(1);
+        }
+    }
+    eprintln!("{line}");
+    (hits, reads.len().saturating_sub(1))
+}
+
+/// A bounded A/B of the subscription's cache routing.
+///
+/// Each arm runs `NANUS_PROBE_REPS` turns (3 by default) of `NANUS_PROBE_STEPS` sequential
+/// requests (5 by default) over a
+/// prompt of about eight thousand tokens, the arms interleaved so a change in the backend's load
+/// reaches all of them. The arms are `NANUS_PROBE_ARMS`, comma-separated, from `key-only`,
+/// `session` and `turn-state` (`key-only,session` by default). It prints every step and asserts
+/// nothing about rates, because the backend is noisy and a pass would be one day's evidence.
+///
+/// On 2026-11-10 with `gpt-6.1-sol`, three turns of each: `key-only` read the previous step on 0
+/// of 12 steps (one step read an older entry), `session` on 12 of 12.
+#[tokio::test]
+#[ignore = "live: spends subscription quota"]
+async fn openai_subscription_cache_routing_probe() {
+    let tokens = subscription_tokens().await;
+    let arms: Vec<Arm> = std::env::var("NANUS_PROBE_ARMS")
+        .unwrap_or_else(|_| "key-only,session".into())
+        .split(',')
+        .map(Arm::parse)
+        .collect();
+    let reps: usize = std::env::var("NANUS_PROBE_REPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let steps: usize = std::env::var("NANUS_PROBE_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5);
+    let mut totals = vec![(0_usize, 0_usize); arms.len()];
+    for run in 0..reps {
+        for (at, arm) in arms.iter().enumerate() {
+            let reads = routing_turn(&tokens, *arm, steps).await;
+            let (hits, of) = report(*arm, run, &reads);
+            totals[at] = (
+                totals[at].0.saturating_add(hits),
+                totals[at].1.saturating_add(of),
+            );
+        }
+    }
+    for (arm, (hits, of)) in arms.iter().zip(totals) {
+        eprintln!("[{arm:?}] read the previous step on {hits} of {of} steps");
+    }
+}
+
 // --- C17: DeepSeek ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -509,4 +730,41 @@ async fn inception_reads_the_previous_step_from_cache() {
         }
         earlier = Some(usage);
     }
+}
+
+/// Most of a turn's later steps read the previous step's prompt through the adapter's transport.
+///
+/// A read falls short of the previous prompt by what follows its last eligible message and by the
+/// cache's 128-token granularity — 74 to 176 tokens on 2026-11-10 — so a step counts as reading
+/// the previous one within 256. With the `session-id` header a step still misses outright now and
+/// then (2 of 21 measured that day, `gpt-6.1-sol`), so the case asks for two of three. Without
+/// the header, three turns read the previous step on none of their twelve later steps.
+#[tokio::test]
+#[ignore = "live: spends subscription quota"]
+async fn openai_subscription_reads_each_step_through_the_adapter() {
+    let llm = subscription(ROUTING_MODEL).await;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut messages = vec![
+        Message::system(format!("Run {nonce}. {}", long_prompt())),
+        Message::user("Read the files one by one; reply with one word."),
+    ];
+    let mut reads = Vec::new();
+    for step in 0..4 {
+        tool_step(&mut messages, &format!("f{step}"));
+        let request = ChatRequest::new(ROUTING_MODEL, messages.clone())
+            .with_tools(vec![schema()])
+            .with_reasoning_effort(nanus_ports::ReasoningEffort::Low)
+            .with_prompt_cache(PromptCacheRetention::Short)
+            .with_prompt_cache_key(format!("live-{nonce}"));
+        let (usage, _) = usage_of(llm.stream_chat(request)).await;
+        reads.push(Read {
+            prompt: u64::from(usage.prompt_tokens),
+            cached: u64::from(usage.cache_hit_tokens),
+        });
+    }
+    let (hits, of) = report(Arm::SessionHeader, 0, &reads);
+    assert!(hits >= 2, "{hits} of {of} steps read the previous step");
 }

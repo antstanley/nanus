@@ -527,7 +527,8 @@ design docs too.
     would be inside every implicit cache write; a gateway configured as OpenAI takes it appended.
   - The session's id is the request's `prompt_cache_key` at OpenAI's endpoints, on the API and
     subscription plans alike, whenever caching is asked for; a gateway and the other vendors get
-    none.
+    none. On the subscription's Responses path, and nowhere else, the same key is also its
+    `session-id` header, because that backend routes to its cache by the header.
   - Each adapter has a prefix-stability test. A change that puts a per-step value ahead of the
     conversation fails it.
 - **Deletion retires the id.** `delete` takes exclusive ownership and refuses a held session; a
