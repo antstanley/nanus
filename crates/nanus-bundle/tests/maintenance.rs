@@ -832,6 +832,53 @@ fn a_handoff_that_stopped_at_the_output_ceiling_is_refused_and_recorded_as_refus
     );
 }
 
+/// An answer the provider ended with `reason` rather than the model ending it.
+fn ended_by(answer: &str, reason: FinishReason) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::TextDelta(answer.to_owned()),
+        LlmEvent::Finished { reason },
+    ]
+}
+
+/// A summary a filter cut, or one that ended for a reason nobody can name, is no more complete
+/// than one the ceiling cut: each is refused, and the model's own ending is still accepted.
+#[test]
+fn a_summary_cut_by_a_filter_or_an_unknown_reason_is_refused() {
+    for reason in [
+        FinishReason::ContentFilter,
+        FinishReason::Unknown("pause_turn".to_owned()),
+    ] {
+        let (model, runner, session) = legacy_session();
+        model.push(ended_by("the user asked and", reason.clone()));
+        assert!(
+            refused_with(
+                block(runner.draft_compaction(&session)),
+                ErrorCode::InvalidCompact
+            ),
+            "{reason:?}"
+        );
+    }
+    let (model, runner, session) = legacy_session();
+    model.push(ended_by("the user asked two questions", FinishReason::Stop));
+    assert!(block(runner.draft_compaction(&session)).is_ok());
+}
+
+#[test]
+fn a_handoff_cut_by_a_filter_or_an_unknown_reason_is_refused() {
+    for reason in [
+        FinishReason::ContentFilter,
+        FinishReason::Unknown("pause_turn".to_owned()),
+    ] {
+        let (_model, runner, mut session, disk, context) =
+            managed_with_history(vec![ended_by("partial", reason.clone())]);
+        let result = block(runner.draft_handoff(&mut session, host(&disk, &context).runtime));
+        assert!(
+            handoff_refused(result, ErrorCode::HandoffUnavailable),
+            "{reason:?}"
+        );
+    }
+}
+
 #[test]
 fn a_compaction_whose_fit_drops_every_real_turn_is_refused() {
     let wide_answer = "answer ".repeat(1_500);

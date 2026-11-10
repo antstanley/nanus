@@ -879,7 +879,8 @@ Refusals carry one of the stable codes `unsupported_mode`, `policy_denied`, `sta
 `source_corrupt`, `capture_partial`, `capture_unavailable`, `cancelled` and `mixed_mutation_batch`,
 with bounded ids and counts and never source excerpts. The handoff and compaction surface adds
 `invalid_compact` (a marker or summary that breaks an invariant, or a response that asks for a tool
-or stopped at the output ceiling), `compact_unavailable` (compaction asked of a managed, busy or
+or stopped before its own end: at the output ceiling, at a content filter, or for a finish reason
+this build does not know), `compact_unavailable` (compaction asked of a managed, busy or
 recorded session, of one with nothing after its marker, or with no session attached, and a draft
 that was interrupted), `compacted_session` (managed context asked
 of a compacted session), `handoff_unavailable` (a handoff asked of a legacy, busy or recorded

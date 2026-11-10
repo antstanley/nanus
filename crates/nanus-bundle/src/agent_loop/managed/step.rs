@@ -8,7 +8,7 @@ use nanus_domain::context::managed::{
 };
 use nanus_domain::{Session, SessionEvent, StepOutcome, ToolCallId, ToolName, Usage};
 use nanus_ports::{
-    CheckpointReason, FinishReason, PreparedModelCall, StepRecordProjection, StepRecordReservation,
+    CheckpointReason, PreparedModelCall, StepRecordProjection, StepRecordReservation,
     TurnRecordReservation,
 };
 
@@ -373,7 +373,7 @@ impl AgentRunner {
             .await?;
         drop(stream);
         let interrupted = assembled.interrupted;
-        let max_tokens = assembled.finish == FinishReason::Length;
+        let answer = crate::agent_loop::stream::answer_outcome(&assembled.finish);
         let seq = session.log().next_seq().value();
         let calls = self.append_model_records(session, context.position, assembled, reservation)?;
         *assistant = Some(seq);
@@ -381,11 +381,7 @@ impl AgentRunner {
             return Ok(StepOutcome::Interrupted);
         }
         if calls.is_empty() {
-            return Ok(if max_tokens {
-                StepOutcome::MaxTokens
-            } else {
-                StepOutcome::FinalAnswer
-            });
+            return Ok(answer);
         }
         if self.run_tools(session, &calls, progress, context).await? {
             Ok(StepOutcome::Interrupted)
