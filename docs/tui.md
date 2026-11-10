@@ -332,8 +332,12 @@ the dialog shut for as long as it lasts. The quiet is asked for again whenever t
 — a new one arrives, the standing-grant warning opens or is withdrawn — and whenever a key that
 means nothing to the dialog shows the reader is still typing. Once it has been given, choosing and
 deciding are as quick as the reader likes. `Esc` is never held back, because it only refuses. The
-interface has no timer: the clock is read when a key or a frame arrives and handed to the view,
-which stays a pure function of its state. This narrows the hazard and does not close it — a reader
+interface has no timer: the clock is read when a key or a frame arrives, and again when a frame
+has been drawn, and handed to the view, which stays a pure function of its state. "On screen" is
+meant literally: a question is stamped when its frame is applied and stamped again by the first
+draw that shows it, because the two can be far apart — a burst of frames applied ahead of it, a
+slow draw, a masked key field above it — and a quiet measured from the arrival was used up
+before the reader had seen anything, leaving the first key waiting in the terminal to answer. This narrows the hazard and does not close it — a reader
 who pauses and then types `y` without looking has allowed one call — which is the limit of
 answering with a letter, and why the standing grant takes two keys with a pause between them.
 

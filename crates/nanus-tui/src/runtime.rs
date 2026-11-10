@@ -1617,6 +1617,10 @@ async fn event_loop(
 
     loop {
         guard.terminal().draw(|frame| view.render(frame))?;
+        // The clock is read again now that the frame is on screen, and a question the frame
+        // showed for the first time is quiet from here rather than from when it arrived.
+        view.now = clock.elapsed();
+        view.questions_drawn();
         // Redrawn after every wake-up rather than on a timer: every reason to redraw is either a
         // keystroke or a frame from the agent, and both arrive here. A wake-up takes everything
         // that is waiting — every queued frame, every queued key — so a burst is one frame.
@@ -1654,6 +1658,8 @@ async fn event_loop(
                 // Frames arrive in bursts — one per streamed fragment — and each redraw
                 // costs a full frame, so the queue is emptied before the next one.
                 receive_burst(frame, &mut frames, source, &mut view);
+                // Applying a burst takes time, and the view is told how late it now is.
+                view.now = clock.elapsed();
             }
         }
         // A switch that failed left the connection following nothing, so the interface leaves
@@ -8937,6 +8943,93 @@ mod tests {
         );
         pause(&mut view);
         view
+    }
+
+    /// A question is quiet from when it is drawn, not from when its frame arrived. A burst of
+    /// frames or a slow draw between the two used the settle up, and the first key waiting in
+    /// the terminal answered a question nobody had been shown.
+    #[test]
+    fn a_question_that_reached_the_screen_late_is_quiet_from_when_it_was_drawn() {
+        let asked = |stall: core::time::Duration| {
+            let mut view = ViewState::new();
+            apply(
+                Frame::Approval {
+                    call_id: "a1".to_owned(),
+                    tool: "bash".to_owned(),
+                    reason: None,
+                },
+                &mut view,
+            );
+            // The rest of the burst is applied and the frame is drawn, and then the loop reads
+            // the clock and says so.
+            view.now = view.now.saturating_add(stall);
+            view.questions_drawn();
+            view
+        };
+        // Two seconds late: the key typed during the stall is read the moment the frame is up.
+        let mut late = asked(core::time::Duration::from_secs(2));
+        late.now = late
+            .now
+            .saturating_add(core::time::Duration::from_millis(5));
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut late),
+            Outcome::Continue
+        ));
+        assert!(late.pending_approval.is_some(), "it was not an answer");
+        assert!(late.status.contains(crate::view::HELD_KEY_NOTICE));
+        // The other direction: quiet with the question on screen, and the key answers.
+        pause(&mut late);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut late),
+            Outcome::Answer { allow: true, .. }
+        ));
+        // And a question drawn at once loses nothing: half a second later it takes a key.
+        let mut prompt = asked(core::time::Duration::ZERO);
+        pause(&mut prompt);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE), &mut prompt),
+            Outcome::Answer { allow: false, .. }
+        ));
+    }
+
+    /// A question behind the masked key field is not on screen, so a frame drawn while the
+    /// field is up does not start its quiet; the frame that first shows it does.
+    #[test]
+    fn a_question_hidden_behind_the_key_field_is_stamped_when_it_is_shown() {
+        let mut view = ViewState::new();
+        view.open_credential("vendor", None, "VENDOR_API_KEY");
+        view.open_key_entry();
+        apply(
+            Frame::Approval {
+                call_id: "a1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: None,
+            },
+            &mut view,
+        );
+        view.now = core::time::Duration::from_secs(3);
+        view.questions_drawn();
+        assert!(view.approval_undrawn, "the field is what that frame showed");
+        assert_eq!(view.approval_asked, core::time::Duration::ZERO);
+
+        view.close_key_entry();
+        view.now = core::time::Duration::from_secs(9);
+        view.questions_drawn();
+        assert!(!view.approval_undrawn);
+        assert_eq!(view.approval_asked, core::time::Duration::from_secs(9));
+
+        // The same for a preview, which is stamped when it is the dialog drawn.
+        let mut clearing = ViewState::new();
+        clearing.clear_dialog = Some(crate::maintenance::ClearDialog {
+            old_id: "s1".to_owned(),
+            name: None,
+            busy: false,
+        });
+        clearing.unsettle_confirmation();
+        clearing.now = core::time::Duration::from_secs(4);
+        clearing.questions_drawn();
+        assert_eq!(clearing.confirm_asked, core::time::Duration::from_secs(4));
+        assert!(!clearing.confirm_undrawn);
     }
 
     /// A paste is text for the composer, whatever it holds: its line breaks do not send it, and

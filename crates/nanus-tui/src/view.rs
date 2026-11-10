@@ -479,6 +479,15 @@ pub struct ViewState {
     /// Whether the confirmation dialog on screen has sat before a quiet keyboard for
     /// [`APPROVAL_SETTLE`]. A latch, as [`ViewState::approval_settled`] is.
     pub(crate) confirm_settled: bool,
+    /// Whether the approval question has changed since a frame last showed it.
+    ///
+    /// The quiet a question needs is quiet *with it on screen*, and a question is stamped when
+    /// its frame is applied, which is before the frame it arrived with has been drawn — after a
+    /// burst of frames, or a slow draw, some time before. So a question that has not been drawn
+    /// is stamped again when it is: see [`ViewState::questions_drawn`].
+    pub(crate) approval_undrawn: bool,
+    /// The same, for a preview or the `/clear` warning.
+    pub(crate) confirm_undrawn: bool,
     /// Wrapped rows scrolled in the active dialog.
     pub(crate) dialog_scroll: u16,
     /// The last modal and selection drawn, so a new focus is revealed and a resumed one resets.
@@ -796,6 +805,8 @@ impl Default for ViewState {
             approval_settled: false,
             confirm_asked: Duration::ZERO,
             confirm_settled: false,
+            approval_undrawn: false,
+            confirm_undrawn: false,
             dialog_scroll: 0,
             dialog_focus: None,
             approval: ApprovalPolicy::default(),
@@ -1585,6 +1596,7 @@ impl ViewState {
     pub(crate) const fn unsettle_approval(&mut self) {
         self.approval_settled = false;
         self.approval_asked = self.now;
+        self.approval_undrawn = true;
     }
 
     /// Whether the approval may act on a key pressed now.
@@ -1604,10 +1616,35 @@ impl ViewState {
         self.approval_settled
     }
 
+    /// Notes that a frame has just been drawn, at the time now in [`ViewState::now`].
+    ///
+    /// Called by the event loop after each draw, with the clock read after it. A question that
+    /// changed since the last frame, and is the dialog that frame showed, starts its quiet
+    /// from here: the reader can only have seen it from now. Without this the quiet was
+    /// measured from when the question's frame was *applied* — before the rest of its burst
+    /// was, and before the draw — so a stall of half a second between the two used the whole
+    /// of it up, and the first key waiting in the terminal answered a question that had been
+    /// on screen for no time at all.
+    ///
+    /// A question hidden behind a dialog above it — the masked key field — is not on screen,
+    /// and stays to be stamped by the frame that does show it.
+    pub(crate) fn questions_drawn(&mut self) {
+        let shown = self.active_modal();
+        if self.approval_undrawn && shown == Some(Modal::Approval) {
+            self.approval_asked = self.now;
+            self.approval_undrawn = false;
+        }
+        if self.confirm_undrawn && matches!(shown, Some(Modal::Preview | Modal::Clear)) {
+            self.confirm_asked = self.now;
+            self.confirm_undrawn = false;
+        }
+    }
+
     /// Starts a confirmation dialog's settling again: a preview or the `/clear` warning appeared.
     pub(crate) const fn unsettle_confirmation(&mut self) {
         self.confirm_settled = false;
         self.confirm_asked = self.now;
+        self.confirm_undrawn = true;
     }
 
     /// Whether a preview or the `/clear` warning may act on a key pressed now.
