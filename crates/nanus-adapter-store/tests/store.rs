@@ -1045,3 +1045,67 @@ async fn total_log_reads_are_bounded_even_for_a_valid_header() {
         .unwrap();
     assert!(store.load(original.id()).await.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// A log filed under another session's id.
+// ---------------------------------------------------------------------------
+
+/// Copies the stored log of `from` into a fresh directory for `to`, bypassing the store: what
+/// a person does to fork a conversation by hand, or what restoring a backup under a new name
+/// leaves behind.
+fn copy_log(store: &JsonlStore, from: &SessionId, to: &SessionId) {
+    std::fs::create_dir_all(store.session_dir(to).expect("dir")).expect("mkdir");
+    std::fs::copy(
+        store.session_file(from).expect("source"),
+        store.session_file(to).expect("target"),
+    )
+    .expect("copy");
+}
+
+#[tokio::test]
+async fn a_log_filed_under_another_sessions_id_is_refused_rather_than_loaded_as_that_session() {
+    let (_dir, store) = store().await;
+    let original = session("original", 5, &["said in the original"]);
+    store.save(&original).await.expect("save");
+    let copy = SessionId::new("copy");
+    copy_log(&store, original.id(), &copy);
+
+    // Loading the copy used to hand back a session whose id was the original's, so the claim
+    // and the save that followed went to the original and replaced it.
+    let error = store.load(&copy).await.expect_err("a misfiled log is refused");
+    assert_corrupt(error, "original");
+    // The other direction: the session filed under its own id still loads, untouched.
+    assert_eq!(store.load(original.id()).await.expect("load"), original);
+}
+
+#[tokio::test]
+async fn a_listing_offers_no_session_a_load_would_refuse_for_its_id() {
+    let (_dir, store) = store().await;
+    let original = session("original", 5, &["said in the original"]);
+    store.save(&original).await.expect("save");
+    copy_log(&store, original.id(), &SessionId::new("copy"));
+
+    let listed: Vec<String> = store
+        .list()
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|summary| summary.id.as_str().to_owned())
+        .collect();
+    assert_eq!(listed, ["original"], "the misfiled copy is not offered");
+}
+
+#[tokio::test]
+async fn a_misfiled_log_has_no_identity_a_checkpoint_could_extend() {
+    let (_dir, store) = store().await;
+    let original = session("original", 5, &["said in the original"]);
+    store.save(&original).await.expect("save");
+    let copy = SessionId::new("copy");
+    copy_log(&store, original.id(), &copy);
+
+    assert!(matches!(
+        store.stored_identity(&copy).await,
+        Err(StoreError::Corrupt { .. })
+    ));
+    assert!(store.stored_identity(original.id()).await.is_ok());
+}

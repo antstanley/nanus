@@ -45,6 +45,13 @@ separate file beside the log, and that is deliberate:
 - **A name is content, never a path.** It lives inside the session's own directory under a
   fixed file name, so no name can climb out of the store.
 
+The directory's name is the session's id, and the log's header says the same id. A log filed
+under any other id — a directory copied to fork a conversation by hand, a backup restored under
+a new name — is refused as corrupt rather than opened: every write is addressed by the header's
+id, so opening the copy would save over the original. A listing leaves it out for the same
+reason. Renaming the directory to the id its header names, or editing the header to the
+directory's, makes it a session again.
+
 A session is written at the lowest body version that holds it: version 5 when it carries a record
 of a maintenance request (a compaction marker, a handoff seed or back-link, or a request attempt
 with a `kind`), version 4 when a user message carries typed content, version 3 when it has enabled
@@ -152,7 +159,9 @@ one. Archived shell output lives beside the log, under the session's own directo
 
 A name is how a session is found again, so it is taken for good: starting a second session
 with a name that is already held is refused, not moved. Silently reassigning an alias would
-make `--resume nightly` open somebody else's conversation.
+make `--resume nightly` open somebody else's conversation. Checking that a name is free and
+writing it are one step, under a lock (`<nanus home>/names.lock`) every agent over the same home
+shares, so two sessions named in the same instant cannot both keep the name: one is refused.
 
 Two decisions are worth stating, because both are about the same failure — a reader opening a
 conversation they did not mean:
