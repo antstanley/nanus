@@ -1339,6 +1339,17 @@ is still being streamed — falls back to showing the fence's source, because lo
 diagram is worse than showing it unfinished. Diagrams use the interface's own accents and,
 like everything else, obey the column budget, so the scroll arithmetic stays exact.
 
+**An answer costs its length to draw, whatever it says.** The text is a model's, and a model
+may have copied it from a file, so the renderer has to stay cheap on text nobody would write
+on purpose. Two things did not. Every inline construct is opened by looking ahead for its
+closer, and one that never closes was looked for to the end of the paragraph afresh for each
+opener: a run of `[` with no `]`, or of unmatched `**`, cost the square of its length, again
+for every token while it streamed. The scanner now remembers where each kind of closer was
+last looked for and what was found, so a paragraph is looked through once per kind. And a
+diagram is laid out from all of its source, some layouts in more than its length — a
+left-to-right graph with thousands of edges from one node took seconds — so a `mermaid` fence
+of more than 400 lines is drawn as the code it is, the fallback every diagram already has.
+
 Two settings turn the rendering off, both defaulting to on, in the same configuration file:
 
 ```toml

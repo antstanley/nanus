@@ -579,4 +579,33 @@ mod tests {
         );
         assert_eq!(cut("first\r\n\r\nbell\u{7}\r\n\r\nthird"), None);
     }
+
+    /// A `mermaid` fence is drawn whole while it may be a diagram, and cut like any other
+    /// fence once it is too long to be one — where the cut rendering is still the whole's.
+    #[test]
+    fn a_diagram_fence_is_cut_only_once_it_is_too_long_to_be_a_diagram() {
+        let edges = |count: usize| -> String {
+            let lines: Vec<String> = (0..count)
+                .map(|index| format!("  A --> N{index}"))
+                .collect();
+            format!("```mermaid\ngraph LR\n{}\n", lines.join("\n"))
+        };
+        let short = edges(mermaid::MAX_LINES.saturating_sub(2));
+        assert_eq!(all_cuts(&short), Vec::<usize>::new(), "still a diagram");
+
+        let long = edges(mermaid::MAX_LINES.saturating_add(6));
+        let cuts = all_cuts(&long);
+        let first_cut_line = long[..cuts.first().copied().unwrap_or(0)].lines().count();
+        assert_eq!(
+            first_cut_line,
+            mermaid::MAX_LINES.saturating_add(2),
+            "the opening line, then more lines than a diagram is drawn from"
+        );
+        assert!(cuts.len() >= 4, "{cuts:?}");
+        assert_eq!(
+            cut_rendering(&long, 60),
+            Some(render(&long, 60, true, &theme())),
+            "and it is drawn as the code the whole is drawn as"
+        );
+    }
 }
