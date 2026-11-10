@@ -74,6 +74,57 @@ async fn timeout_kills_the_whole_group() {
     assert_eq!(shell.live_groups(), 0, "the group was reaped");
 }
 
+/// A caller that stops waiting — an interrupted turn — drops the run. The shell is the
+/// direct child and dies with it; the sleep is not, and used to be left running with its
+/// group already forgotten by the registry.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_dropped_before_its_command_ends_kills_the_whole_group() {
+    let (dir, shell) = shell();
+    let pid_file = dir.path().join("pid");
+    let request = ShellRequest::shell(background_sleep(&pid_file), None)
+        .with_timeout(Duration::from_secs(60));
+    let dropped = tokio::time::timeout(Duration::from_millis(500), shell.run(request)).await;
+    assert!(dropped.is_err(), "the run was dropped mid-command");
+    let pid = recorded_pid(&pid_file);
+    assert!(
+        wait_for_death(pid, 50).await,
+        "the grandchild of a dropped run is killed"
+    );
+    assert_eq!(shell.live_groups(), 0);
+}
+
+/// The other direction: a command that *finished* is not an abandoned one, so what it left
+/// in the background is still running when the run returns.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_finishes_leaves_its_background_process_running() {
+    let (dir, shell) = shell();
+    let pid_file = dir.path().join("pid");
+    let script = format!(
+        "sleep 300 >/dev/null 2>&1 & echo $! > {}",
+        quote(&pid_file.display().to_string())
+    );
+    let outcome = shell
+        .run(ShellRequest::shell(script, None))
+        .await
+        .expect("the command ran");
+    assert_eq!(outcome.exit_code, Some(0));
+    let pid = recorded_pid(&pid_file);
+    assert!(
+        is_alive(pid),
+        "a finished command's background process stays"
+    );
+    assert_eq!(shell.live_groups(), 0);
+    // Left running on purpose by the adapter, so the test ends it itself.
+    let killed = shell
+        .run(ShellRequest::shell(format!("kill -9 {pid}"), None))
+        .await
+        .expect("kill ran");
+    assert_eq!(killed.exit_code, Some(0));
+    assert!(wait_for_death(pid, 50).await);
+}
+
 /// `kill_all` — what shutdown calls — reaches grandchildren too.
 #[tokio::test]
 async fn kill_all_reaps_a_running_group() {

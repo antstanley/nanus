@@ -274,8 +274,8 @@ stock composition does not expose it.
    as a failure; a call that never returns stalls the turn.
 3. **Be cancel-safe.** The turn can be cancelled and your future dropped mid-call. Do not leave
    half-applied state that a later call trips over; detached work (a spawned task, a child process)
-   is yours to stop. `HostTools::shell()` gives you a shell that kills a call's whole process group
-   (a Job Object on Windows).
+   is yours to stop. `HostTools::shell()` gives you a shell that kills the whole process group
+   (a Job Object on Windows) of a call that is dropped or times out.
 4. **Declare images.** A tool that returns images should declare its worst case with
    `with_result_images(max_images, max_bytes_each)`. The runner reserves that against the model's
    image caps before the call runs, and replaces a result that exceeds it with a failure. A tool

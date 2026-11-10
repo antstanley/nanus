@@ -127,8 +127,9 @@ mod stock {
             Rc::clone(self.fs)
         }
 
-        /// The composition's shell, which kills a call's whole process group (a Job Object on
-        /// Windows) when the call ends.
+        /// The composition's shell, which kills a call's whole process group when the call
+        /// times out or is dropped before its command finishes. On Windows the group is a Job
+        /// Object, which also ends with a command that finished.
         #[must_use]
         pub fn shell(&self) -> ShellHandle {
             Rc::clone(self.shell)
