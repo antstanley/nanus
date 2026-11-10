@@ -46,6 +46,31 @@ const REFUSED_CONTAINERS: [&str; 12] = [
     "ffmetadata",
 ];
 
+/// The demuxers FFprobe and FFmpeg are allowed to open a source with: the self-contained
+/// containers the tool supports, and nothing else.
+///
+/// [`REFUSED_CONTAINERS`] is read from the probe's answer, which is too late to be the only
+/// guard: by the time a probe says "this is a concat list" the demuxer has already opened the
+/// files the list names, as the user, wherever they are. Handing the decoder this list as its
+/// `-format_whitelist` refuses such a file before its header is read, and it is an allowlist, so
+/// a demuxer nobody thought to name in the refusals is refused too. The names are the families
+/// `MANDATORY_DEMUXERS` certifies — Matroska/WebM, MP4/MOV, AVI, MPEG program streams — and
+/// MPEG transport streams beside them.
+const ALLOWED_CONTAINERS: [&str; 7] = ["matroska", "webm", "mov", "mp4", "avi", "mpeg", "mpegts"];
+
+/// What FFmpeg prints when a file's demuxer is not on the whitelist it was given.
+const NOT_ON_WHITELIST: &str = "not on whitelist";
+
+/// The refusal for a file that is not one of the containers the tool reads.
+fn unsupported_container() -> VideoError {
+    VideoError::Media(
+        "read_video: the file is not readable media: it is not a container this tool reads \
+         (WebM/Matroska, MP4/MOV, AVI or MPEG); playlists, lists of other files and image \
+         sequences are not read"
+            .to_owned(),
+    )
+}
+
 /// Decoders every certified build carries; AV1 is satisfied by any of three.
 const MANDATORY_DECODERS: [&str; 7] =
     ["h264", "hevc", "mpeg4", "mpeg2video", "mjpeg", "vp8", "vp9"];
@@ -319,21 +344,11 @@ impl VideoDecoder for FfmpegDecoder {
         snapshot: &'a Snapshot,
     ) -> LocalBoxFuture<'a, Result<MediaInfo, VideoError>> {
         Box::pin(async move {
-            let args: Vec<String> = [
-                "-v",
-                "error",
-                "-protocol_whitelist",
-                "file",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-            ]
-            .iter()
-            .map(|arg| (*arg).to_owned())
-            .chain([snapshot.path.display().to_string()])
-            .collect();
+            let args = probe_arguments(snapshot);
             let probed = run(&self.ffprobe, &args, PROBE_BYTES_MAX).await?;
+            if !probed.success && probed.stderr.contains(NOT_ON_WHITELIST) {
+                return Err(unsupported_container());
+            }
             if !probed.success {
                 return Err(VideoError::Media(format!(
                     "read_video: the file is not readable media ({})",
@@ -423,6 +438,9 @@ impl FfmpegDecoder {
                 Err(RunError::OutputBound) => continue,
                 Err(RunError::Failed(error)) => return Err(error),
             };
+            if !produced.success && produced.stderr.contains(NOT_ON_WHITELIST) {
+                return Err(unsupported_container());
+            }
             if !produced.success {
                 return Err(VideoError::Media(format!(
                     "read_video: the decoder failed ({})",
@@ -456,6 +474,26 @@ impl FfmpegDecoder {
     }
 }
 
+/// The FFprobe arguments for one source: local files only, and only the allowed demuxers.
+fn probe_arguments(snapshot: &Snapshot) -> Vec<String> {
+    [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        &ALLOWED_CONTAINERS.join(","),
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_owned())
+    .chain([snapshot.path.display().to_string()])
+    .collect()
+}
+
 /// The FFmpeg arguments for one still.
 fn frame_arguments(
     snapshot: &Snapshot,
@@ -476,6 +514,8 @@ fn frame_arguments(
         "info",
         "-protocol_whitelist",
         "file",
+        "-format_whitelist",
+        &ALLOWED_CONTAINERS.join(","),
         "-threads",
         "2",
         "-copyts",
@@ -573,6 +613,14 @@ fn info_from_probe(document: &Value, version: &str) -> Result<MediaInfo, VideoEr
         return Err(media(&format!(
             "{container} refers to other files or streams and is not read"
         )));
+    }
+    // The decoder was told the same list, so this only fires for a build that did not honour
+    // it; a container that is neither refused by name nor allowed is still not read.
+    if !container
+        .split(',')
+        .any(|name| ALLOWED_CONTAINERS.contains(&name))
+    {
+        return Err(unsupported_container());
     }
     let streams = document
         .get("streams")
@@ -704,6 +752,19 @@ mod tests {
                 .to_string()
                 .contains("other files")
         );
+        // A self-contained container that is simply not on the list is refused too, and one
+        // that is on it under another of its names is read.
+        let mut other = document("video", &json!({}));
+        other["format"]["format_name"] = json!("flv");
+        assert!(
+            info_from_probe(&other, "v")
+                .unwrap_err()
+                .to_string()
+                .contains("not a container this tool reads")
+        );
+        let mut quicktime = document("video", &json!({}));
+        quicktime["format"]["format_name"] = json!("mov,mp4,m4a,3gp,3g2,mj2");
+        assert!(info_from_probe(&quicktime, "v").is_ok());
         let mut long = document("video", &json!({}));
         long["format"]["duration"] = json!("3601");
         assert!(
@@ -751,6 +812,37 @@ mod tests {
         let relative = candidates("ffprobe", Some(Path::new("tools")), None);
         assert_eq!(relative.len(), 1);
         assert!(relative[0].is_absolute() && relative[0].ends_with(Path::new("tools").join(&file)));
+    }
+
+    /// Both programs are told which demuxers they may use before they are told the input, so
+    /// the refusal happens at open rather than after the probe has followed a list's references.
+    #[test]
+    fn both_programs_are_given_the_demuxer_allowlist_ahead_of_the_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot {
+            path: directory.path().join("source"),
+            blake3: String::new(),
+            byte_len: 0,
+            owner: std::sync::Arc::new(directory),
+        };
+        let info = info_from_probe(&document("video", &json!({})), "v").unwrap();
+        let source = snapshot.path.display().to_string();
+        for args in [
+            probe_arguments(&snapshot),
+            frame_arguments(&snapshot, &info, ["0.000", "0.000"], "4"),
+        ] {
+            let allow = args
+                .iter()
+                .position(|arg| arg == "-format_whitelist")
+                .unwrap();
+            let input = args.iter().position(|arg| *arg == source).unwrap();
+            assert!(allow < input, "{args:?}");
+            let list = &args[allow + 1];
+            assert!(list.split(',').any(|name| name == "matroska"), "{list}");
+            for refused in REFUSED_CONTAINERS {
+                assert!(!list.split(',').any(|name| name == refused), "{refused}");
+            }
+        }
     }
 
     #[test]
