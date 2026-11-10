@@ -234,6 +234,19 @@ want to look at when asking *why* the agent did something. The count is in displ
 which is what the viewport is measured in — a line that wraps occupies several rows, so a
 count in lines would put the end of a long conversation out of reach.
 
+**A row is what the view draws, counts, and scrolls by.** Text drawn as itself — a prompt, a
+tool's output, a notice — is one line per source line, and a source line may be wider than the
+terminal. The view breaks it into rows itself (`crates/nanus-tui/src/rows.rs`) before it is
+measured, with the drawing library's own word wrap, so the rows on screen are the ones the
+library would have made. It used to leave the break to the library and *predict* the height, by
+counting characters and dropping the spaces a break fell among: a line of wide characters, or of
+aligned columns, came up short, and rows that are not counted cannot be scrolled to. A line was
+also drawn from its top or not at all, so a paragraph taller than the viewport never showed its
+end and, at the bottom of a conversation, drew nothing. Now every line the layout holds is one
+row; a long paragraph scrolls through like anything else. The one place the rows differ from the
+library's is a character two cells wide that would start in a row's last column: the library
+lets it overhang, and here it begins the next row.
+
 In a recorded session the composer still works, and submitting tells you to start `nanus`
 without `--session` rather than silently discarding what you typed. Adding a turn to a
 finished transcript would need an agent this mode deliberately does not have.
