@@ -156,6 +156,12 @@ for an interface to watch, rather than one for "the interface we linked" and ano
   authorized in a browser, whose grant is a token set the agent renews rather than a key it sends.
   The wire a request takes is read from the plan and not from how the credential was obtained, so
   pointing a `base_url` somewhere else moves the request without changing what it is.
+- **A failed model request is not retried.** A rate limit, an overloaded provider or a dropped
+  connection fails the turn with the provider's sentence, and `Retry-After` is not read. Each
+  adapter's error type classifies which failures a retry could help (`is_retryable`), but nothing
+  calls it: a retry inside an adapter would be invisible to the session's record of its request
+  attempts and to `read_video`'s one-request budget, so where it belongs is still to be decided.
+  What is bounded is the wait — see [SAFETY.md](../SAFETY.md) — so a request fails rather than hangs.
 - **The sandbox is reported, not OS-enforced.** `nanus-adapter-local` checks the working
   directory and returns the policy, but installs no OS-level confinement. See
   [SAFETY.md](../SAFETY.md).
