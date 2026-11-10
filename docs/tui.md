@@ -162,7 +162,10 @@ interface offers only the session's answer, and draws a notice when the agent-wi
 The scope and the frame moved the protocol to version 13, because an older agent would read an
 agent-wide answer as a session's and grant less than the person chose without saying so.
 Nobody attached, or a last client that detaches while a question is open, is an unavailable
-answerer — the call is denied rather than left waiting for a decision that cannot arrive.
+answerer — the call is denied rather than left waiting for a decision that cannot arrive. That
+holds however the client leaves: hanging up, sending a line that is not a request, or being
+dropped for not reading. A client dropped for falling behind is told so on its next request and
+may attach again on the same connection.
 `all calls` never reaches the link at all: it grants every exception without asking.
 
 **The ending says why the turn ended, not only that it did.** A turn can stop for reasons

@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::transport::{Listener, OwnedWriteHalf, Stream};
+use crate::transport::{Listener, OwnedReadHalf, OwnedWriteHalf, Stream};
 use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{
@@ -701,8 +701,24 @@ impl Held {
     /// answer it, and the waiting turn is denied rather than left waiting for a client that
     /// has closed the window.
     fn unview(&self, viewer: u64) {
-        self.viewers.borrow_mut().retain(|(id, _)| *id != viewer);
-        if self.viewers.borrow().is_empty() {
+        self.retain_viewers(|(id, _)| *id != viewer);
+    }
+
+    /// Keeps the viewers `keep` answers for and detaches the rest.
+    ///
+    /// The one place a viewer leaves the list, whatever the reason — a connection that ended,
+    /// a queue whose reader has gone, a client that did not make room for a frame it had to
+    /// see. Each of those used to remove its own way, and only the first abandoned the open
+    /// questions: a session whose last viewer was dropped for falling behind kept a question
+    /// open that nobody was attached to answer, and the turn waited on it for ever. Emptying
+    /// the list is one fact, so it has one consequence.
+    fn retain_viewers(&self, keep: impl FnMut(&(u64, mpsc::Sender<Frame>)) -> bool) {
+        let emptied = {
+            let mut viewers = self.viewers.borrow_mut();
+            viewers.retain(keep);
+            viewers.is_empty()
+        };
+        if emptied {
             self.abandon_approvals();
         }
     }
@@ -1771,7 +1787,7 @@ impl<'a> Broadcast<'a> {
 
     /// Queues a frame for every attached client without keeping it in the backlog.
     fn send(&self, frame: &Frame) {
-        self.held.viewers.borrow_mut().retain(|(_, sender)| {
+        self.held.retain_viewers(|(_, sender)| {
             !matches!(
                 sender.try_send(frame.clone()),
                 Err(mpsc::error::TrySendError::Closed(_))
@@ -2114,9 +2130,7 @@ async fn broadcast_scoped(held: &Held, frame: Frame, except: Option<u64>, scope:
         }
     }
     if !stale.is_empty() {
-        held.viewers
-            .borrow_mut()
-            .retain(|(viewer, _)| !stale.contains(viewer));
+        held.retain_viewers(|(viewer, _)| !stale.contains(viewer));
     }
 }
 
@@ -2260,7 +2274,8 @@ async fn watch_opened(
 /// A connection detached for falling behind is no longer sent frames, so a request from it
 /// must not act on the session: a prompt whose every answer goes nowhere, or an interrupt
 /// aimed at a turn it cannot see. Saying so is the honest answer, and the connection stays
-/// open so that re-attaching is what recovers.
+/// open so that re-attaching is what recovers — see [`forget_if_detached`], which is what lets
+/// the re-attachment through.
 ///
 /// Returns whether the refusal was sent, which is what the caller acts on.
 async fn refuse_if_detached(
@@ -2280,16 +2295,52 @@ async fn refuse_if_detached(
     true
 }
 
+/// Lets go of a session this connection was detached from, and says whether `request` may
+/// still be acted on.
+///
+/// The refusal tells the client to attach again, so attaching again has to work. It did not:
+/// the check ran ahead of every request and never forgot the session, so the `attach` it asked
+/// for was refused with the same sentence, and so was everything after it, for as long as the
+/// connection lasted. Now a detached connection is told once, on the first request that is not
+/// a way back in, and is then simply unattached — a `new` or an `attach` is acted on, and
+/// anything else that needs a session is answered as a connection without one is.
+///
+/// Returns `false` when the request was answered with the refusal and must not be acted on.
+async fn forget_if_detached(
+    frames: &mpsc::Sender<Frame>,
+    watching: &mut Option<(u64, Rc<Held>)>,
+    drafts: &maintenance::SharedDrafts,
+    request: &Request,
+) -> bool {
+    let detached = watching
+        .as_ref()
+        .is_some_and(|(viewer, held)| !held.is_watching(*viewer));
+    if !detached {
+        return true;
+    }
+    let reattaching = matches!(request, Request::New { .. } | Request::Attach { .. });
+    if !reattaching {
+        let refused = refuse_if_detached(frames, watching.as_ref()).await;
+        assert!(refused, "a detached connection is told that it is");
+    }
+    // Already out of the session's list, which is what detached means; what is left is this
+    // connection's own memory of it, and the drafts made over it.
+    *watching = None;
+    drafts.borrow_mut().clear();
+    reattaching
+}
+
 /// Serves one client for as long as its connection lasts.
+///
+/// The session it watches is let go however the connection ends. A connection that ended on a
+/// line that was not a request — or on a read the operating system failed — used to return
+/// before it unsubscribed, and left a viewer nobody was behind: the session counted it as
+/// attached, so it could never be let go as idle, and a turn that reached an approval asked a
+/// question of nobody and waited for the answer.
 ///
 /// # Errors
 ///
 /// Returns an error when the connection cannot be read or its frames cannot be written.
-// One flat match over the protocol's requests is the whole vocabulary in one place, and splitting
-// it into a helper per arm would hide that; the complexity is the protocol's, not the logic's. The
-// maintenance requests are the one group that is a helper, so the arms that remain are one line
-// each.
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn serve_connection(
     stream: Stream,
     registry: Rc<Registry>,
@@ -2298,58 +2349,104 @@ async fn serve_connection(
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let (frames, queued) = mpsc::channel::<Frame>(FRAME_BUFFER);
-    let writer = tokio::task::spawn_local(write_frames(write_half, queued));
+    let mut writer = tokio::task::spawn_local(write_frames(write_half, queued));
 
     send(&frames, Frame::Ready(registry.agent.info())).await;
 
     // Which session this connection is watching, and the id it watches under.
     let mut watching: Option<(u64, Rc<Held>)> = None;
+    let served = serve_requests(&mut reader, &registry, &frames, &mut watching, shutdown).await;
+
+    // Unsubscribed before the queue is dropped, so the session stops holding a sender
+    // that can no longer be read — on every way out of the loop above, not only the clean one.
+    release(&mut watching);
+    if let Err(error) = served {
+        // The reason, if there is room for it, and then the connection is closed rather than
+        // drained at the peer's pace: a peer that sent something unreadable may not be reading
+        // either, and the writer must not outlive the connection waiting for it to.
+        let _queued = queue_now(
+            &frames,
+            Frame::Failed {
+                message: format!("the connection is closed: {error}"),
+            },
+        );
+        drop(frames);
+        if tokio::time::timeout(ENDING_TIMEOUT, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
+        return Err(error);
+    }
+    drop(frames);
+    match writer.await {
+        Ok(outcome) => outcome,
+        Err(error) => Err(LinkError::agent(format!(
+            "the link writer did not finish: {error}"
+        ))),
+    }
+}
+
+/// Reads and answers one connection's requests until it closes, asks the agent to stop, or
+/// sends something that cannot be read.
+///
+/// # Errors
+///
+/// Returns an error when a request cannot be read. The caller lets go of `watching` either way.
+// One flat match over the protocol's requests is the whole vocabulary in one place, and splitting
+// it into a helper per arm would hide that; the complexity is the protocol's, not the logic's. The
+// maintenance requests are the one group that is a helper, so the arms that remain are one line
+// each.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+async fn serve_requests(
+    reader: &mut BufReader<OwnedReadHalf>,
+    registry: &Rc<Registry>,
+    frames: &mpsc::Sender<Frame>,
+    watching: &mut Option<(u64, Rc<Held>)>,
+    shutdown: &Rc<Notify>,
+) -> LinkResult<()> {
     // The maintenance drafts this connection holds, shared with the drafts it has running.
     // Discarded when it lets go of its session.
     let drafts: maintenance::SharedDrafts = Rc::default();
-    while let Some(request) = read_request(&mut reader).await? {
-        if refuse_if_detached(&frames, watching.as_ref()).await {
-            drafts.borrow_mut().clear();
+    while let Some(request) = read_request(reader).await? {
+        if !forget_if_detached(frames, watching, &drafts, &request).await {
             continue;
         }
         match request {
             Request::New { name } => {
-                release(&mut watching);
+                release(watching);
                 drafts.borrow_mut().clear();
-                let opened = new_session_of(&registry, name).await;
-                watching = watch_opened(&registry, &frames, opened).await;
+                let opened = new_session_of(registry, name).await;
+                *watching = watch_opened(registry, frames, opened).await;
             }
             Request::Attach { session } => {
-                release(&mut watching);
+                release(watching);
                 drafts.borrow_mut().clear();
                 let opened = registry.open_reference(&session).await;
-                watching = watch_opened(&registry, &frames, opened).await;
+                *watching = watch_opened(registry, frames, opened).await;
             }
             Request::Prompt { text } => {
-                if let Some((viewer, held)) = &watching {
-                    start_turn(&registry, held, text, &frames, *viewer).await;
+                if let Some((viewer, held)) = watching.as_ref() {
+                    start_turn(registry, held, text, frames, *viewer).await;
                 } else {
-                    refuse_unattached(&frames).await;
+                    refuse_unattached(frames).await;
                 }
             }
             Request::Interrupt => {
-                if let Some((viewer, held)) = &watching {
+                if let Some((viewer, held)) = watching.as_ref() {
                     interrupt(held, *viewer);
                 } else {
-                    refuse_unattached(&frames).await;
+                    refuse_unattached(frames).await;
                 }
             }
-            Request::Sessions => list_sessions(&registry, &frames).await,
+            Request::Sessions => list_sessions(registry, frames).await,
             request @ (Request::HandoffDraft { .. }
             | Request::HandoffCommit { .. }
             | Request::CompactDraft
             | Request::CompactCommit { .. }) => {
                 Box::pin(answer_maintenance(
-                    &registry,
-                    &frames,
-                    &mut watching,
-                    &drafts,
-                    request,
+                    registry, frames, watching, &drafts, request,
                 ))
                 .await;
             }
@@ -2364,7 +2461,7 @@ async fn serve_connection(
                     (true, ApprovalScope::Session) => Grant::Session,
                     (true, ApprovalScope::Agent) => Grant::Agent(registry.agent.runner()),
                 };
-                answer_approval(&registry, watching.as_ref(), &call_id, allow, grant).await;
+                answer_approval(registry, watching.as_ref(), &call_id, allow, grant).await;
             }
             Request::SetApproval { state } => {
                 // The state belongs to the agent rather than to the session: the runner the
@@ -2375,52 +2472,42 @@ async fn serve_connection(
                 registry.agent.runner().set_approval(domain_policy(state));
                 registry.broadcast_approval(state).await;
             }
-            Request::SetModel { model } => set_model(&registry, &frames, model).await,
+            Request::SetModel { model } => set_model(registry, frames, model).await,
             Request::SetEffort { state } => {
                 registry
                     .agent
                     .runner()
                     .set_effort(Some(domain_effort(state)));
                 registry.broadcast_effort(state).await;
-                remember_selection(&registry);
+                remember_selection(registry);
             }
             Request::SetProvider { provider, plan } => {
-                set_provider(&registry, &frames, &provider, plan.as_deref()).await;
+                set_provider(registry, frames, &provider, plan.as_deref()).await;
             }
             Request::SetCredential {
                 provider,
                 plan,
                 key,
             } => {
-                set_credential(&registry, &frames, &provider, plan.as_deref(), &key).await;
+                set_credential(registry, frames, &provider, plan.as_deref(), &key).await;
             }
-            Request::Goal { action } => match &watching {
-                Some((_, held)) => apply_goal(&registry, &frames, held, action).await,
-                None => refuse_unattached(&frames).await,
+            Request::Goal { action } => match watching.as_ref() {
+                Some((_, held)) => apply_goal(registry, frames, held, action).await,
+                None => refuse_unattached(frames).await,
             },
-            Request::Context { action } => match &watching {
-                Some((_, held)) => context::answer(&registry, &frames, held, action).await,
-                None => refuse_unattached(&frames).await,
+            Request::Context { action } => match watching.as_ref() {
+                Some((_, held)) => context::answer(registry, frames, held, action).await,
+                None => refuse_unattached(frames).await,
             },
-            Request::Status => send(&frames, Frame::Status(registry.agent.info())).await,
+            Request::Status => send(frames, Frame::Status(registry.agent.info())).await,
             Request::Shutdown => {
                 shutdown.notify_one();
-                send(&frames, Frame::Bye).await;
+                send(frames, Frame::Bye).await;
                 break;
             }
         }
     }
-
-    // Unsubscribed before the queue is dropped, so the session stops holding a sender
-    // that can no longer be read.
-    release(&mut watching);
-    drop(frames);
-    match writer.await {
-        Ok(outcome) => outcome,
-        Err(error) => Err(LinkError::agent(format!(
-            "the link writer did not finish: {error}"
-        ))),
-    }
+    Ok(())
 }
 
 /// Delivers an approval answer to the question it names.
@@ -4683,6 +4770,162 @@ mod tests {
             session.approvals.borrow().is_empty(),
             "no question is left open for a client that is not there"
         );
+    }
+
+    /// A viewer dropped for falling behind is as gone as one that hung up: when it was the last
+    /// one, the question it was asked goes with it and the turn is denied rather than left
+    /// waiting on a client nothing is being sent to.
+    // Paused time, so the production timeout is what detaches the viewer without being waited out.
+    #[tokio::test(start_paused = true)]
+    async fn a_last_viewer_dropped_for_falling_behind_takes_the_question_with_it() {
+        let session = held("stalled-asker");
+        let (stalled, _unread) = mpsc::channel(1);
+        session.viewers.borrow_mut().push((1, stalled));
+        let name = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let (sender, mut receiver) = oneshot::channel();
+        let _call_id = session.ask(name, None, sender);
+
+        // The queue of one is full after the first frame, so the second finds no room.
+        broadcast_agent(&session, Frame::Bye).await;
+        assert!(session.is_watching(1), "a viewer with room stays attached");
+        assert!(
+            receiver.try_recv().is_err() && !session.approvals.borrow().is_empty(),
+            "and its question stays open"
+        );
+        broadcast_agent(&session, Frame::Bye).await;
+
+        assert!(!session.is_watching(1), "the stalled viewer is detached");
+        assert!(
+            session.approvals.borrow().is_empty(),
+            "nobody is attached, so no question is left open"
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ),
+            "the waiting turn is told nobody will answer"
+        );
+    }
+
+    /// The other direction: while somebody is still attached the question stays open, because
+    /// that somebody can answer it.
+    #[tokio::test(start_paused = true)]
+    async fn a_question_outlives_a_dropped_viewer_while_another_is_attached() {
+        let session = held("one-left");
+        let (stalled, _unread) = mpsc::channel(1);
+        stalled
+            .try_send(Frame::Bye)
+            .expect("one frame fits in a queue of one");
+        session.viewers.borrow_mut().push((1, stalled));
+        let (reading, _queue) = mpsc::channel(FRAME_BUFFER);
+        session.viewers.borrow_mut().push((2, reading));
+        let name = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let (sender, mut receiver) = oneshot::channel();
+        let call_id = session.ask(name, None, sender);
+
+        broadcast_agent(&session, Frame::Bye).await;
+
+        assert!(!session.is_watching(1) && session.is_watching(2));
+        assert!(
+            session.answer(&call_id, true, Grant::Once).delivered,
+            "the viewer that is left can still answer"
+        );
+        assert_eq!(receiver.try_recv().ok(), Some(ApprovalOutcome::AllowedOnce));
+    }
+
+    /// A viewer whose queue closed under a progress frame is removed the same way, and takes
+    /// the open question with it when it was the last.
+    #[tokio::test]
+    async fn a_last_viewer_whose_queue_closed_takes_the_question_with_it() {
+        let session = held("closed-asker");
+        let (gone, receiver) = mpsc::channel(FRAME_BUFFER);
+        session.viewers.borrow_mut().push((1, gone));
+        drop(receiver);
+        let name = ToolName::new("bash").unwrap_or_else(|_| panic!("a valid tool name"));
+        let (sender, mut answer) = oneshot::channel();
+        let _call_id = session.ask(name, None, sender);
+
+        Broadcast::new(&session, 0).send(&Frame::Step { step: 1 });
+
+        assert!(!session.is_watching(1));
+        assert!(matches!(
+            answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    /// The refusal a detached connection gets says to attach again, so attaching again is
+    /// acted on: the connection forgets the session it was dropped from and is told nothing.
+    #[tokio::test]
+    async fn a_detached_connection_may_attach_again() {
+        let session = held("fell-behind");
+        let (frames, mut queued) = mpsc::channel(FRAME_BUFFER);
+        let drafts = maintenance::SharedDrafts::default();
+        for request in [
+            Request::Attach {
+                session: "fell-behind".to_owned(),
+            },
+            Request::New { name: None },
+        ] {
+            // Watching by its own account, and in nobody's list: detached.
+            let mut watching = Some((7, Rc::clone(&session)));
+            assert!(
+                forget_if_detached(&frames, &mut watching, &drafts, &request).await,
+                "{request:?} is the way back in, and is acted on"
+            );
+            assert!(
+                watching.is_none(),
+                "the session it was dropped from is let go"
+            );
+            assert!(queued.try_recv().is_err(), "and nothing is refused");
+        }
+    }
+
+    /// The other direction: anything else from a detached connection is refused, once, with the
+    /// sentence that says how to recover — and the connection is unattached from then on, so the
+    /// next request is answered as any unattached connection's is rather than refused for ever.
+    #[tokio::test]
+    async fn a_detached_connection_is_told_once_and_is_then_unattached() {
+        let session = held("told-once");
+        let (frames, mut queued) = mpsc::channel(FRAME_BUFFER);
+        let drafts = maintenance::SharedDrafts::default();
+        let mut watching = Some((7, Rc::clone(&session)));
+        let prompt = Request::Prompt {
+            text: "still there?".to_owned(),
+        };
+
+        assert!(
+            !forget_if_detached(&frames, &mut watching, &drafts, &prompt).await,
+            "a prompt into a session it no longer follows is not acted on"
+        );
+        match queued.try_recv() {
+            Ok(Frame::Failed { message }) => assert!(message.contains("attach again"), "{message}"),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert!(watching.is_none());
+
+        assert!(
+            forget_if_detached(&frames, &mut watching, &drafts, &prompt).await,
+            "an unattached connection is left to the request's own handling"
+        );
+        assert!(queued.try_recv().is_err(), "it is not told a second time");
+    }
+
+    /// A connection that is attached is neither refused nor made to forget anything.
+    #[tokio::test]
+    async fn an_attached_connection_keeps_its_session() {
+        let session = held("attached");
+        let (frames, mut queued) = mpsc::channel(FRAME_BUFFER);
+        session.viewers.borrow_mut().push((7, frames.clone()));
+        let drafts = maintenance::SharedDrafts::default();
+        let mut watching = Some((7, Rc::clone(&session)));
+        let prompt = Request::Prompt {
+            text: "go on".to_owned(),
+        };
+        assert!(forget_if_detached(&frames, &mut watching, &drafts, &prompt).await);
+        assert!(watching.is_some());
+        assert!(queued.try_recv().is_err());
     }
 
     /// An abandoned question cannot be answered afterwards, which is what keeps a late

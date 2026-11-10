@@ -6424,3 +6424,170 @@ fn a_compaction_commit_the_store_cannot_save_leaves_the_file_intact() {
     assert!(!disk.is_compacted(), "nothing was cut on disk");
     assert_eq!(disk.to_jsonl().into_bytes(), before);
 }
+
+/// A connection spoken to by hand, for the lines a [`Client`] cannot be made to send.
+struct RawPeer {
+    reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl RawPeer {
+    /// Connects and reads the handshake.
+    async fn connect(socket: &Path) -> Self {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("the agent accepts");
+        let (read_half, writer) = stream.into_split();
+        let mut peer = Self {
+            reader: tokio::io::BufReader::new(read_half),
+            writer,
+        };
+        let ready = peer.next().await;
+        assert!(matches!(ready, Some(Frame::Ready(_))), "{ready:?}");
+        peer
+    }
+
+    /// Writes one line exactly as given.
+    async fn line(&mut self, line: &str) {
+        use tokio::io::AsyncWriteExt as _;
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("the line is written");
+    }
+
+    async fn request(&mut self, request: &Request) {
+        let line = nanus_link::protocol::encode(request).expect("a request encodes");
+        self.line(&line).await;
+    }
+
+    /// The next frame, or `None` once the agent has closed the connection.
+    async fn next(&mut self) -> Option<Frame> {
+        nanus_link::wire::read_message::<Frame, _>(&mut self.reader)
+            .await
+            .expect("frames are readable")
+    }
+
+    /// Starts a session and returns its id.
+    async fn start(&mut self) -> String {
+        self.request(&Request::New { name: None }).await;
+        loop {
+            match self.next().await {
+                Some(Frame::Attached { session, .. }) => return session.session,
+                Some(_) => {}
+                None => panic!("the agent closed before attaching"),
+            }
+        }
+    }
+}
+
+/// Asks the agent, from a connection of its own, how a held session stands.
+async fn listed(socket: &Path, id: &str) -> SessionInfo {
+    let mut observer = Client::connect(socket).await.expect("the agent answers");
+    let listing = observer.sessions().await.expect("the agent lists");
+    listing
+        .into_iter()
+        .find(|session| session.session == id)
+        .unwrap_or_else(|| panic!("{id} is not held"))
+}
+
+/// A connection that ends on a line that is not a request is still a connection that ended:
+/// the session it was watching stops counting it, and the peer is told and then closed on.
+/// Before this the viewer stayed for the agent's lifetime, pinning the session.
+#[test]
+fn a_connection_that_ends_on_an_unreadable_line_leaves_no_viewer_behind() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let path = socket.clone();
+
+    let (before, after, said) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut peer = RawPeer::connect(&path).await;
+        let id = peer.start().await;
+        let before = listed(&path, &id).await;
+
+        peer.line("this is not a request").await;
+        let mut said = Vec::new();
+        while let Some(frame) = peer.next().await {
+            said.push(frame);
+        }
+        let after = listed(&path, &id).await;
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        (before, after, said)
+    });
+
+    assert_eq!(
+        before.viewers, 1,
+        "the control: an attached peer is a viewer"
+    );
+    assert_eq!(after.viewers, 0, "the peer that was closed on is not");
+    assert!(
+        matches!(said.last(), Some(Frame::Failed { message }) if message.contains("closed")),
+        "the peer is told why before the connection closes: {said:?}"
+    );
+}
+
+/// The consequence that mattered most: a turn waiting on an approval when its only viewer's
+/// connection ends that way is denied, as it is when the viewer hangs up, rather than left
+/// waiting for an answer from nobody with the session busy for ever.
+#[test]
+fn a_question_is_denied_when_its_last_viewer_ends_on_an_unreadable_line() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = gated_agent(dir.path(), ApprovalPolicy::PerCall);
+    let socket = dir.path().join("agent.sock");
+    let path = socket.clone();
+
+    let settled = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut peer = RawPeer::connect(&path).await;
+        let id = peer.start().await;
+        peer.request(&Request::Prompt {
+            text: "run it".to_owned(),
+        })
+        .await;
+        loop {
+            match peer.next().await {
+                Some(Frame::Approval { .. }) => break,
+                Some(_) => {}
+                None => panic!("the agent closed before asking"),
+            }
+        }
+        assert!(
+            listed(&path, &id).await.busy,
+            "the turn is waiting on the question"
+        );
+
+        peer.line("{\"request\":\"no such request\"}").await;
+        let mut settled = None;
+        for _ in 0..200 {
+            let now = listed(&path, &id).await;
+            if !now.busy {
+                settled = Some(now);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        settled
+    });
+
+    let Some(settled) = settled else {
+        panic!("the turn was still waiting on a question nobody could answer");
+    };
+    assert_eq!(settled.viewers, 0);
+    assert!(
+        settled.events > 0,
+        "the denied turn finished and was recorded"
+    );
+}
