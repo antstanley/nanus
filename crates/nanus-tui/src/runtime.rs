@@ -1595,9 +1595,6 @@ const fn domain_outcome(outcome: DecisionState) -> nanus_domain::context::manage
 /// on the way out reports alongside the session's own totals. It cannot be read off the
 /// session afterwards: only the process that watched the responses arrive knows how fast they
 /// arrived, and that process is this one.
-// One wake-up is one arm per input the interface can receive, and splitting them would scatter the
-// one place that says what each wake-up does. The length is that list, not tangled logic.
-#[allow(clippy::too_many_lines)]
 async fn event_loop(
     source: &mut dyn SessionSource,
     mut frames: mpsc::Receiver<Frame>,
@@ -1621,7 +1618,8 @@ async fn event_loop(
     loop {
         guard.terminal().draw(|frame| view.render(frame))?;
         // Redrawn after every wake-up rather than on a timer: every reason to redraw is either a
-        // keystroke or a frame from the agent, and both arrive here.
+        // keystroke or a frame from the agent, and both arrive here. A wake-up takes everything
+        // that is waiting — every queued frame, every queued key — so a burst is one frame.
         tokio::select! {
             event = events.next() => {
                 let Some(event) = event else {
@@ -1629,89 +1627,15 @@ async fn event_loop(
                     // read. Leaving is the only sensible answer.
                     break;
                 };
-                let event = event?;
-                // Mouse events are routed before the keyboard, so the key handling below stays
-                // the one flat match it always was. The event is borrowed rather than moved.
-                if let TerminalEvent::Mouse(mouse) = &event {
-                    handle_pointer(*mouse, &mut view, &mut files, source.workspace());
-                    continue;
-                }
-                // A paste is text, and is routed as text: it never passes through the key
-                // handling, so nothing in it can submit a prompt or answer a question.
-                if let TerminalEvent::Paste(text) = &event {
-                    view.now = clock.elapsed();
-                    handle_paste(text, &mut view);
-                    refresh_mentions(&mut view, &mut files, source.workspace());
-                    continue;
-                }
-                let TerminalEvent::Key(key) = event else {
-                    continue;
+                let now = || clock.elapsed();
+                let mut wake = Wake {
+                    view: &mut view,
+                    files: &mut files,
+                    source: &mut *source,
+                    shells: &shells,
                 };
-                // Windows reports both press and release; only a press is a keystroke.
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                view.now = clock.elapsed();
-                let outcome = handle_key(key, &mut view);
-                // After every keystroke, because a mention is a property of the text.
-                refresh_mentions(&mut view, &mut files, source.workspace());
-                match outcome {
-                    Outcome::Quit => break,
-                    Outcome::Interrupt => {
-                        // The turn ends when the agent says it did, with a frame carrying
-                        // the reason — so this only says what has been asked for, and the
-                        // transcript gets the ending it would have got anyway.
-                        view.status = String::from("stopping");
-                        source.interrupt();
-                    }
-                    Outcome::Answer {
-                        call_id,
-                        allow,
-                        always,
-                    } => {
-                        answer_and_report(&call_id, allow, always, source, &mut view);
-                    }
-                    Outcome::Copy => copy_selection(&system_clipboard, &mut view).await,
-                    Outcome::CopyText(text) => copy_ui_text(&text, &system_clipboard, &mut view).await,
-                    Outcome::PasteImage => {
-                        paste_image(&crate::paste::from_clipboard, source.workspace(), &mut view);
-                    }
-                    Outcome::OpenPermissions => {
-                        view.open_permissions();
-                        view.status = String::from("permission: Enter applies, Esc cancels");
-                    }
-                    Outcome::SetContext(action) => request_context(action, source, &mut view),
-                    Outcome::ClearSession { .. }
-                    | Outcome::CommitHandoff { .. }
-                    | Outcome::CommitCompact(_) => session_outcome(outcome, source, &mut view),
-                    Outcome::SetModel(requested) => switch_model(requested, source, &mut view),
-                    Outcome::SetEffort(step) => set_effort_word(&step, source, &mut view),
-                    Outcome::SetProvider { provider, plan } => {
-                        request_switch(&provider, &plan, source, &mut view);
-                    }
-                    Outcome::SetCredential {
-                        provider,
-                        plan,
-                        key,
-                    } => {
-                        store_credential(&provider, plan.as_deref(), &key, source, &mut view);
-                    }
-                    Outcome::CycleEffort => cycle_effort(source, &mut view),
-                    Outcome::SetApproval(policy) => set_approval(policy, source, &mut view),
-                    Outcome::Submit(prompt) => {
-                        if submitted(
-                            prompt,
-                            source,
-                            &mut view,
-                            &shells,
-                            &system_clipboard,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Outcome::Continue => {}
+                if take_events(event, &mut events, &now, &mut wake).await? {
+                    break;
                 }
             }
             outcome = ran.recv() => {
@@ -1745,6 +1669,164 @@ async fn event_loop(
         flush_queue(source, &mut view);
     }
     Ok(view.stats)
+}
+
+/// What a terminal event acts on: the view, and the things a keystroke can reach through it.
+struct Wake<'a> {
+    view: &'a mut ViewState,
+    /// The workspace's files, listed when a mention first needs them.
+    files: &'a mut Option<Vec<String>>,
+    source: &'a mut dyn SessionSource,
+    /// Where a `!` command reports when it finishes.
+    shells: &'a mpsc::UnboundedSender<crate::shell::Outcome>,
+}
+
+/// The most terminal events taken between two frames.
+///
+/// A burst is drawn once, but a keyboard held down or a terminal typing a long paste never
+/// runs out of events, and a screen that is not drawn until it does is a frozen one.
+const EVENT_BURST: usize = 256;
+
+/// Takes a terminal event and every event already waiting behind it, returning whether one of
+/// them asked to leave.
+///
+/// A frame is drawn once for the lot. It used to be drawn after each event, which is what a
+/// reader pressing a key wants and not what a burst needs: a held key, a drag of the mouse, or
+/// text a terminal types rather than pastes arrives as hundreds of events at once, and every
+/// one of them paid for a frame — and for the whole draft to be wrapped again — that was
+/// replaced before anyone could have seen it. Thirty-two thousand typed characters took
+/// thirteen seconds to arrive.
+///
+/// Two things end a burst early. [`EVENT_BURST`] events, so a flood still draws. And an event
+/// that opens or closes a dialog: what the keys after it mean depends on a dialog the reader
+/// has not been shown yet, so it is drawn before they are read.
+///
+/// `now` is the clock, read once per event, which is how time reaches the view.
+async fn take_events<S>(
+    first: io::Result<TerminalEvent>,
+    events: &mut S,
+    now: &dyn Fn() -> core::time::Duration,
+    wake: &mut Wake<'_>,
+) -> io::Result<bool>
+where
+    S: futures::Stream<Item = io::Result<TerminalEvent>> + Unpin,
+{
+    let mut next = Some(first);
+    let mut taken = 0_usize;
+    while let Some(event) = next.take() {
+        let event = event?;
+        let shown = wake.view.active_modal();
+        wake.view.now = now();
+        if on_terminal_event(event, wake).await {
+            return Ok(true);
+        }
+        taken = taken.saturating_add(1);
+        if taken >= EVENT_BURST || wake.view.active_modal() != shown {
+            break;
+        }
+        // Only what is already waiting: the stream is asked first, and when it has nothing
+        // the second arm is ready at once. The stream is polled with this task's own waker
+        // either way, so an event that arrives later still wakes the loop.
+        next = tokio::select! {
+            biased;
+            event = events.next() => event,
+            () = core::future::ready(()) => None,
+        };
+    }
+    Ok(false)
+}
+
+/// Routes one terminal event, returning whether it asked to leave.
+async fn on_terminal_event(event: TerminalEvent, wake: &mut Wake<'_>) -> bool {
+    let Wake {
+        view,
+        files,
+        source,
+        shells,
+    } = wake;
+    match event {
+        // Mouse events are routed apart from the keyboard, so the key handling stays the one
+        // flat match it always was.
+        TerminalEvent::Mouse(mouse) => {
+            handle_pointer(mouse, view, files, source.workspace());
+            false
+        }
+        // A paste is text, and is routed as text: it never passes through the key handling,
+        // so nothing in it can submit a prompt or answer a question.
+        TerminalEvent::Paste(text) => {
+            handle_paste(&text, view);
+            refresh_mentions(view, files, source.workspace());
+            false
+        }
+        // Windows reports both press and release; only a press is a keystroke.
+        TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
+            let outcome = handle_key(key, view);
+            // After every keystroke, because a mention is a property of the text.
+            refresh_mentions(view, files, source.workspace());
+            act_on(outcome, view, &mut **source, shells).await
+        }
+        _ => false,
+    }
+}
+
+/// Does what a keystroke asked for, returning whether it asked to leave.
+async fn act_on(
+    outcome: Outcome,
+    view: &mut ViewState,
+    source: &mut dyn SessionSource,
+    shells: &mpsc::UnboundedSender<crate::shell::Outcome>,
+) -> bool {
+    match outcome {
+        Outcome::Quit => return true,
+        Outcome::Interrupt => {
+            // The turn ends when the agent says it did, with a frame carrying
+            // the reason — so this only says what has been asked for, and the
+            // transcript gets the ending it would have got anyway.
+            view.status = String::from("stopping");
+            source.interrupt();
+        }
+        Outcome::Answer {
+            call_id,
+            allow,
+            always,
+        } => {
+            answer_and_report(&call_id, allow, always, source, view);
+        }
+        Outcome::Copy => copy_selection(&system_clipboard, view).await,
+        Outcome::CopyText(text) => copy_ui_text(&text, &system_clipboard, view).await,
+        Outcome::PasteImage => {
+            paste_image(&crate::paste::from_clipboard, source.workspace(), view);
+        }
+        Outcome::OpenPermissions => {
+            view.open_permissions();
+            view.status = String::from("permission: Enter applies, Esc cancels");
+        }
+        Outcome::SetContext(action) => request_context(action, source, view),
+        Outcome::ClearSession { .. }
+        | Outcome::CommitHandoff { .. }
+        | Outcome::CommitCompact(_) => session_outcome(outcome, source, view),
+        Outcome::SetModel(requested) => switch_model(requested, source, view),
+        Outcome::SetEffort(step) => set_effort_word(&step, source, view),
+        Outcome::SetProvider { provider, plan } => {
+            request_switch(&provider, &plan, source, view);
+        }
+        Outcome::SetCredential {
+            provider,
+            plan,
+            key,
+        } => {
+            store_credential(&provider, plan.as_deref(), &key, source, view);
+        }
+        Outcome::CycleEffort => cycle_effort(source, view),
+        Outcome::SetApproval(policy) => set_approval(policy, source, view),
+        Outcome::Submit(prompt) => {
+            if submitted(prompt, source, view, shells, &system_clipboard).await {
+                return true;
+            }
+        }
+        Outcome::Continue => {}
+    }
+    false
 }
 
 /// What the event loop should do with a submitted line.
@@ -8068,6 +8150,91 @@ mod tests {
                 "the frame was followed to the bottom"
             );
         }
+    }
+
+    /// Runs [`take_events`] over a scripted stream of events, with the clock stood still.
+    fn take(
+        events: Vec<TerminalEvent>,
+        view: &mut ViewState,
+    ) -> (bool, Vec<TerminalEvent>, Scripted) {
+        let mut source = Scripted::new(Vec::new());
+        let (shells, _ran) = mpsc::unbounded_channel::<crate::shell::Outcome>();
+        let mut files = None;
+        let mut waiting = events.into_iter().map(Ok);
+        let first = waiting.next().expect("a burst has a first event");
+        // Everything after the first is already waiting, and then the keyboard is quiet for
+        // ever, which is what a stream with nothing ready looks like.
+        let mut stream = futures::stream::iter(waiting).chain(futures::stream::pending());
+        let now = || core::time::Duration::ZERO;
+        let (left, rest) = nanus_kernel::runtime::block_on_local(async {
+            let mut wake = Wake {
+                view,
+                files: &mut files,
+                source: &mut source,
+                shells: &shells,
+            };
+            let left = take_events(first, &mut stream, &now, &mut wake)
+                .await
+                .expect("a scripted event is never an error");
+            let mut rest = Vec::new();
+            while let Some(Some(Ok(event))) = futures::FutureExt::now_or_never(stream.next()) {
+                rest.push(event);
+            }
+            (left, rest)
+        });
+        (left, rest, source)
+    }
+
+    fn typed(character: char) -> TerminalEvent {
+        TerminalEvent::Key(key(KeyCode::Char(character), KeyModifiers::NONE))
+    }
+
+    /// Every event that is waiting is taken before the frame is drawn, up to a bound, so a
+    /// burst of typing costs one frame and a flood still draws.
+    #[test]
+    fn a_burst_of_keys_is_taken_whole_and_a_flood_is_taken_in_bounded_bursts() {
+        let mut view = ViewState::new();
+        let (left, rest, _source) = take("hello world".chars().map(typed).collect(), &mut view);
+        assert!(!left);
+        assert!(rest.is_empty(), "nothing was left waiting");
+        assert_eq!(view.input.text(), "hello world");
+
+        let mut view = ViewState::new();
+        let flood: Vec<TerminalEvent> = (0..EVENT_BURST.saturating_add(40))
+            .map(|_| typed('x'))
+            .collect();
+        let (left, rest, _source) = take(flood, &mut view);
+        assert!(!left);
+        assert_eq!(view.input.text().chars().count(), EVENT_BURST);
+        assert_eq!(
+            rest.len(),
+            40,
+            "the rest waits for the frame after this one"
+        );
+    }
+
+    /// The keys after one that opened a dialog are for a dialog nobody has been shown, so they
+    /// wait for it to be drawn — and a key that leaves ends the burst there.
+    #[test]
+    fn a_burst_stops_at_an_event_that_opens_a_dialog_or_leaves() {
+        // `?` on an empty prompt opens the key list.
+        let mut view = ViewState::new();
+        let (left, rest, _source) = take(vec![typed('?'), typed('x'), typed('y')], &mut view);
+        assert!(!left);
+        assert!(view.help_open);
+        assert_eq!(
+            rest.len(),
+            2,
+            "the keys behind it were not read as its answers"
+        );
+        assert!(view.input.is_empty());
+
+        let mut view = ViewState::new();
+        let quit = TerminalEvent::Key(key(KeyCode::F(9), KeyModifiers::NONE));
+        let (left, rest, _source) = take(vec![typed('a'), quit, typed('b')], &mut view);
+        assert!(left, "the burst asked to leave");
+        assert_eq!(view.input.text(), "a");
+        assert_eq!(rest.len(), 1, "and what followed was never read");
     }
 
     /// A burst of streamed fragments is applied whole and followed once, to the same place each
