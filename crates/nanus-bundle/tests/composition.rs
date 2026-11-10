@@ -636,6 +636,70 @@ fn a_host_installer_registers_its_tools_before_the_harness_is_returned() {
     assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
 }
 
+/// Reads the pid a script wrote, once it has written it.
+#[cfg(unix)]
+fn recorded_pid(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+}
+
+/// Stopping the agent ends the programs its tools are still running. Nothing called the
+/// shell's `kill_all` outside a test, so a command in flight at shutdown outlived the agent.
+///
+/// Both directions are here: the grandchild is alive while the harness is, and gone once it
+/// has shut down.
+#[cfg(unix)]
+#[test]
+fn shutting_the_harness_down_kills_a_command_still_in_flight() {
+    use nanus_ports::ShellRequest;
+    in_child_process("shutting_the_harness_down_kills_a_command_still_in_flight");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let settings = config(dir.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let harness = runtime
+        .block_on(compose(&settings))
+        .expect("composes")
+        .start()
+        .expect("mounts");
+    let shell = harness
+        .context
+        .get(nanus_ports::shell_key())
+        .expect("the shell service resolves");
+
+    // The command is left running in a task, which is where a turn's call is when the
+    // agent is told to stop.
+    let pid_file = dir.path().join("pid");
+    let script = format!("sleep 300 & echo $! > '{}'; wait", pid_file.display());
+    let local = tokio::task::LocalSet::new();
+    let running =
+        local.spawn_local(async move { shell.run(ShellRequest::shell(script, None)).await });
+    let pid = runtime.block_on(local.run_until(async {
+        loop {
+            if let Some(pid) = recorded_pid(&pid_file) {
+                return pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }));
+    assert!(
+        nanus_adapter_local::is_alive(pid),
+        "the grandchild runs while the harness does"
+    );
+
+    let shutdown = harness.shutdown();
+    assert!(shutdown.is_ok(), "teardown reverts cleanly: {shutdown:?}");
+    let gone = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        !nanus_adapter_local::is_alive(pid)
+    });
+    assert!(gone, "shutdown killed the group the command was running in");
+    drop(running);
+}
+
 /// The other direction: an installer cannot take a name the stock set holds or one the loop
 /// runs itself, and an installer's own failure stops the start rather than leaving a harness
 /// that offers less than its host asked for.

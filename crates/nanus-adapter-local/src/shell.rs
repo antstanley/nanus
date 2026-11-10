@@ -11,7 +11,10 @@
 //!
 //! So every spawn sets `process_group(0)`, which makes the child a group leader
 //! with `pgid == pid`, and every kill signals the group with `nix`'s safe
-//! `killpg`. Two further traps are handled as they were found:
+//! `killpg`. Three things end a group: its timeout, [`ShellPort::kill_all`] at shutdown,
+//! and the run being dropped before its command finished — an interrupted call must not
+//! leave a build running behind it. A command that *finishes* is left alone, so what it
+//! started in the background stays. Two further traps are handled as they were found:
 //!
 //! - **`AsyncReadExt::take(n)` hangs on a pipe.** It stops reading, the writer
 //!   blocks on a full 64 KiB pipe, and the run never ends. This adapter reads each
@@ -174,16 +177,29 @@ fn lock(registry: &Mutex<GroupRegistry>) -> MutexGuard<'_, GroupRegistry> {
     registry.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Removes a group from the registry when the run that owns it ends.
+/// Removes a group from the registry when the run that owns it ends, and ends the group
+/// when the run did not.
 ///
 /// The guard makes "live groups returns to zero" hold on every exit path,
 /// including the error paths, without a hand-written cleanup call.
+///
+/// It also makes an abandoned run mean something. A caller that drops the run — a turn that
+/// was interrupted, a runtime shutting down — used to take the group out of the registry and
+/// leave it running: `kill_on_drop` reaches the shell and not what the shell started, and a
+/// group nobody has the id of can no longer be signalled by `kill_all` either. So a guard
+/// dropped before its leader was reaped kills the group. One dropped after is a command that
+/// finished, and whatever it left in the background was left there on purpose.
 #[derive(Debug)]
 struct LiveGroup {
     /// The registry to update.
     registry: Arc<Mutex<GroupRegistry>>,
     /// The group this guard owns.
     pgid: i32,
+    /// Whether the group's leader has been waited for.
+    ///
+    /// Until it has, the leader is alive or a zombie, so the group id cannot have been
+    /// reused and a signal sent to it reaches this run's processes and no others.
+    reaped: bool,
 }
 
 impl LiveGroup {
@@ -193,14 +209,33 @@ impl LiveGroup {
         Self {
             registry: Arc::clone(registry),
             pgid,
+            reaped: false,
         }
+    }
+
+    /// Records that the leader was waited for, so dropping the guard signals nothing.
+    const fn leader_reaped(&mut self) {
+        self.reaped = true;
     }
 }
 
 impl Drop for LiveGroup {
     fn drop(&mut self) {
         let retired = lock(&self.registry).retire(self.pgid);
-        tracing::debug!(pgid = self.pgid, retired, "process group left the registry");
+        // Not retired means `kill_all` took the group and signalled it already.
+        let abandoned = retired && !self.reaped;
+        tracing::debug!(
+            pgid = self.pgid,
+            retired,
+            abandoned,
+            "process group left the registry"
+        );
+        // A Job Object needs no signal here: it is kill-on-close, and the run's own handle
+        // to it is dropped with the run.
+        #[cfg(unix)]
+        if abandoned && let Err(error) = signal_group(self.pgid, Signal::SIGKILL) {
+            tracing::debug!(pgid = self.pgid, %error, "an abandoned group was already gone");
+        }
     }
 }
 
@@ -874,7 +909,9 @@ async fn run_engine(
     for (key, value) in &request.env {
         command.env(key, value);
     }
-    let (mut child, guard, pgid) = spawn_group(&mut command, &request.program, &registry)?;
+    // Declared in this order so an abandoned run drops the guard before the child: the
+    // guard signals the group while its leader is still unreaped and the id is still its own.
+    let (mut child, mut guard, pgid) = spawn_group(&mut command, &request.program, &registry)?;
     feed_stdin(&mut child, request.stdin.clone());
     let out_pipe = take_stdout(&mut child);
     let err_pipe = take_stderr(&mut child);
@@ -884,6 +921,7 @@ async fn run_engine(
     let err_handle = err_pipe.map(|pipe| tokio::spawn(drain(pipe, cap, true, err_live, stderr)));
 
     let (status, timed_out) = wait_group(&mut child, pgid, request.timeout).await?;
+    guard.leader_reaped();
     let stdout = join_pump(out_handle).await;
     let stderr = join_pump(err_handle).await;
     let elapsed = started.elapsed();

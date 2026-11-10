@@ -105,6 +105,8 @@ pub struct Harness {
     /// a provider with `/provider`. The adapter in force is the placeholder that reports the
     /// missing credential on the first request.
     configured: bool,
+    /// The shell the tools run programs through, kept so shutdown can end what is running.
+    shell: ShellHandle,
     /// What a session created here is being run under.
     ///
     /// Kept on the harness rather than passed to [`Harness::new_session`], so a session is
@@ -172,11 +174,26 @@ impl Harness {
 
     /// Tears the composition down, reverting every plugin's effects.
     ///
+    /// Every process group a tool call started and has not finished is killed first. A turn
+    /// that was interrupted has dropped its call and ended its group already; this is for
+    /// the call still in flight when the agent is told to stop, whose task the runtime has
+    /// not dropped yet and whose programs would otherwise outlive the agent that ran them.
+    ///
     /// # Errors
     ///
     /// Returns the first revert failure. Remaining plugins still revert, because a
     /// partially unwound context is more useful than one abandoned halfway.
     pub fn shutdown(&self) -> Result<(), BundleError> {
+        use futures::FutureExt as _;
+        // This runs outside the runtime, so the port is polled once rather than awaited: the
+        // local shell signals synchronously, and one that would have to wait is not waited
+        // for by a process that is leaving.
+        match self.shell.kill_all().now_or_never() {
+            Some(Ok(0)) => {}
+            Some(Ok(killed)) => tracing::debug!(killed, "process groups ended at shutdown"),
+            Some(Err(error)) => tracing::warn!(%error, "process groups could not be ended"),
+            None => tracing::warn!("the shell did not end its process groups in time"),
+        }
         self.context
             .shutdown()
             .map_err(|error| BundleError::Kernel(error.to_string()))
@@ -398,6 +415,7 @@ impl Pending {
             clock: self.clock,
             switch,
             configured: self.configured,
+            shell: self.shell,
             origin,
         })
     }

@@ -102,8 +102,8 @@ local decision, and it means what it says.
 An embedding host can install an exact-call `ToolPolicy` for registered tools, including
 reads. Errors/cancellation deny; a one-call grant cannot bypass registry validation. The
 policy adds application scope checks, not OS confinement. A controlled turn races its sticky
-signal against waiting work and drops interrupted futures; the host must terminate detached
-process groups or other side effects. Inline image bytes are verified/bounded and unknown
+signal against waiting work and drops interrupted futures. The stock shell kills the process
+group of a call dropped that way; the host must terminate any other detached work or side effect. Inline image bytes are verified/bounded and unknown
 model profiles are refused before image I/O/HTTP. The library performs no URL fetch or resizing.
 
 Declared image results must honor both the count and exact raw image-file byte
@@ -291,8 +291,10 @@ Two consequences worth stating plainly:
 
 ## The shell on Windows
 
-On Unix the `bash` tool runs `sh -c` as the leader of a new process group, and only a timeout
-or shutdown kills the group: a command that starts `server &` and exits leaves it running. On
+On Unix the `bash` tool runs `sh -c` as the leader of a new process group. A timeout, an
+interrupted turn and the agent shutting down each kill the group, so a command that was cut
+off leaves nothing running; a command that *finishes* is left alone, so one that starts
+`server &` and exits leaves it running. On
 Windows the tool runs `cmd /S /C "<script>"` inside a kill-on-close Job Object, and the job is
 the call's. When the command exits, **everything it started ends with it** — a `start /b
 server`, and a `nanus service start` run as a tool, whose service is started inside the job.
