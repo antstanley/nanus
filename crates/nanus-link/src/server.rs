@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::transport::{Listener, OwnedReadHalf, OwnedWriteHalf, Stream};
+use crate::transport::{Listener, OwnedReadHalf, Stream};
 use nanus_bundle::authorize::{AUTHORIZATION_TIMEOUT, POLL_MARGIN};
 use nanus_bundle::compose::new_session;
 use nanus_bundle::{
@@ -56,7 +56,7 @@ use nanus_domain::{
     SessionId, ToolCallId, ToolName, TurnEndReason, Usage,
 };
 use nanus_ports::{ClockHandle, StoreHandle};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWrite, AsyncWriteExt as _, BufReader};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -67,7 +67,7 @@ use crate::protocol::{
     GoalAction, GoalInfo, GoalState, ModelEfforts, ModelInputs, PlanInfo, ProviderInfo, Request,
     SessionInfo, StreamMark, TurnEnd,
 };
-use crate::wire::{read_request, write_frame};
+use crate::wire::read_request;
 
 #[path = "server/backlog.rs"]
 mod backlog;
@@ -3495,14 +3495,43 @@ async fn send(frames: &mpsc::Sender<Frame>, frame: Frame) {
     }
 }
 
+/// How many bytes of queued frames the writer gathers into one write.
+///
+/// Enough that a burst of deltas is one write, and small enough that the gathering is never
+/// what a reader waits on.
+const WRITE_BATCH_BYTES: usize = 64 * 1024;
+
 /// Drains a connection's frames into its socket.
-async fn write_frames(
-    mut writer: OwnedWriteHalf,
-    mut queued: mpsc::Receiver<Frame>,
-) -> LinkResult<()> {
+///
+/// One write for everything that is already queued, rather than one per frame. A model
+/// streams in bursts, each delta is a frame, and each frame used to be a write of its own on
+/// every viewer's socket — a system call per token per client. Only what is *already* waiting
+/// is gathered, so a frame that arrives alone is written at once and nothing is held back to
+/// make a batch: the stream moves exactly as it did, in fewer writes.
+async fn write_frames<W>(mut writer: W, mut queued: mpsc::Receiver<Frame>) -> LinkResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = String::new();
     while let Some(frame) = queued.recv().await {
-        write_frame(&mut writer, &frame).await?;
+        lines.clear();
+        append_line(&mut lines, &frame)?;
+        while lines.len() < WRITE_BATCH_BYTES {
+            let Ok(next) = queued.try_recv() else {
+                break;
+            };
+            append_line(&mut lines, &next)?;
+        }
+        writer.write_all(lines.as_bytes()).await?;
+        writer.flush().await?;
     }
+    Ok(())
+}
+
+/// Appends one frame to `lines` as the line the wire carries it as.
+fn append_line(lines: &mut String, frame: &Frame) -> LinkResult<()> {
+    lines.push_str(&crate::protocol::encode(frame)?);
+    lines.push('\n');
     Ok(())
 }
 
@@ -3705,7 +3734,11 @@ mod tests {
             watched.push((frames, queue));
         }
 
-        assert_eq!(watched.len(), MAX_HELD_SESSIONS, "every one of them is in use");
+        assert_eq!(
+            watched.len(),
+            MAX_HELD_SESSIONS,
+            "every one of them is in use"
+        );
 
         // Opened, and between being held and being watched — where an attachment awaits.
         let opening = new_session_of(&registry, None).await.expect("a session");
@@ -3734,6 +3767,128 @@ mod tests {
         );
         assert!(registry.get(&other.held().id).is_some());
         assert!(registry.get(&third.held().id).is_some());
+    }
+
+    /// A writer that counts the writes it is given, and keeps what they carried.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: Rc<Cell<usize>>,
+        written: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.set(self.writes.get().saturating_add(1));
+            self.written.borrow_mut().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The frames `bytes` carries, one per line, as a client would read them.
+    fn frames_in(bytes: &[u8]) -> Vec<Frame> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(|line| crate::protocol::decode::<Frame>(line).expect("a frame"))
+            .collect()
+    }
+
+    /// A burst that is already queued is one write, not one per frame — and it is the same
+    /// frames, whole and in order, one to a line.
+    #[tokio::test]
+    async fn a_burst_of_queued_frames_is_written_at_once_and_in_order() {
+        let (frames, queued) = mpsc::channel(FRAME_BUFFER);
+        let burst: Vec<Frame> = (0..100)
+            .map(|index| Frame::Text {
+                delta: format!("token {index}\nwith a newline"),
+            })
+            .collect();
+        for frame in &burst {
+            frames.try_send(frame.clone()).expect("room in the queue");
+        }
+        drop(frames);
+        let sink = CountingWriter::default();
+        let (count, bytes) = (Rc::clone(&sink.writes), Rc::clone(&sink.written));
+
+        write_frames(sink, queued).await.expect("written");
+
+        assert_eq!(count.get(), 1, "a hundred waiting frames are one write");
+        assert_eq!(frames_in(&bytes.borrow()), burst);
+    }
+
+    /// The other direction: a frame that arrives alone is written when it arrives. Nothing is
+    /// held back in the hope of a batch, so a slow stream moves frame by frame as it did.
+    #[tokio::test]
+    async fn a_frame_that_arrives_alone_is_written_without_waiting_for_more() {
+        let (frames, queued) = mpsc::channel(FRAME_BUFFER);
+        let sink = CountingWriter::default();
+        let (count, bytes) = (Rc::clone(&sink.writes), Rc::clone(&sink.written));
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let writing = tokio::task::spawn_local(write_frames(sink, queued));
+                for step in 1..=3_u32 {
+                    frames.send(Frame::Step { step }).await.expect("queued");
+                    // The writer runs when this task yields; the queue stays open throughout.
+                    tokio::task::yield_now().await;
+                    assert_eq!(
+                        frames_in(&bytes.borrow()).last(),
+                        Some(&Frame::Step { step }),
+                        "written as it arrived"
+                    );
+                }
+                assert_eq!(
+                    count.get(),
+                    3,
+                    "one write each: there was never a second waiting"
+                );
+                drop(frames);
+                writing.await.expect("joined").expect("written");
+            })
+            .await;
+    }
+
+    /// A burst larger than one batch is still every frame, in order, in more than one write.
+    #[tokio::test]
+    async fn a_burst_past_one_batch_is_split_between_writes_and_loses_nothing() {
+        let (frames, queued) = mpsc::channel(FRAME_BUFFER);
+        let burst: Vec<Frame> = (0..8)
+            .map(|index| Frame::Text {
+                delta: format!("{index}").repeat(WRITE_BATCH_BYTES >> 2),
+            })
+            .collect();
+        for frame in &burst {
+            frames.try_send(frame.clone()).expect("room in the queue");
+        }
+        drop(frames);
+        let sink = CountingWriter::default();
+        let (count, bytes) = (Rc::clone(&sink.writes), Rc::clone(&sink.written));
+
+        write_frames(sink, queued).await.expect("written");
+
+        assert!(
+            (2..8).contains(&count.get()),
+            "{} writes: gathered, and bounded",
+            count.get()
+        );
+        assert_eq!(frames_in(&bytes.borrow()), burst);
     }
 
     /// The backlog is the turn in progress: everything a late client needs, in order, folded
