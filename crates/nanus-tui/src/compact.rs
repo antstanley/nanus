@@ -26,6 +26,8 @@
 //! who wants to study the reasoning rather than skim it.
 
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation as _;
+use unicode_width::UnicodeWidthStr as _;
 
 /// How much of a tool call and a thinking segment the transcript draws.
 ///
@@ -99,6 +101,92 @@ pub fn tool_line(state: ToolState, name: &str, arguments: &str, width: u16) -> S
     let label = tool_label(name);
     let action = action_of(name, arguments);
     one_line(&format!("{} {label}", state.mark()), " · ", &action, width)
+}
+
+/// Draws the call a question is being asked about: one line that keeps the *start* of what it
+/// is acting on.
+///
+/// An ordinary call's line is clipped from the front ([`tool_line`]), because the end of a long
+/// path is the part that names the file. That is the wrong end of a command somebody is being
+/// asked to allow. The approval dialog shows no arguments — the model wrote them, and the
+/// question is the harness's — so this line is the one place the reader sees what the call
+/// is, and clipped from the front it showed whatever the model put last: a command padded out
+/// to the width read as its trailing comment. While the question is open the line is clipped
+/// from the *end* instead, so what is read first is what runs first.
+///
+/// Every line of the argument is on it, joined with a mark where each break was, rather than
+/// the first line alone: the second line of a command runs too. Control characters are
+/// dropped. It is still one row, and still only the head of a long command — the whole of it
+/// is the full detail's to show.
+#[must_use]
+pub fn asked_tool_line(state: ToolState, name: &str, arguments: &str, width: u16) -> String {
+    let label = format!("{} {}", state.mark(), tool_label(name));
+    let action = flattened(&whole_action(name, arguments));
+    if action.is_empty() {
+        return label;
+    }
+    head(&format!("{label} · {action}"), usize::from(width.max(1)))
+}
+
+/// The argument a call's line reports, whole: [`action_of`] without the cut to one line.
+fn whole_action(name: &str, arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_owned();
+    };
+    let Some(object) = value.as_object() else {
+        return String::new();
+    };
+    let Some(key) = action_key(name) else {
+        return value.to_string();
+    };
+    match object.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Text on one line: each line break a visible mark, a tab a space, and no other control
+/// character at all.
+fn flattened(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut characters = text.trim_end().chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                let _ = characters.next_if_eq(&'\n');
+                out.push_str(" \u{23ce} ");
+            }
+            '\n' => out.push_str(" \u{23ce} "),
+            '\t' => out.push(' '),
+            other if other.is_control() => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Returns the first `width` columns of `text`, ending in an ellipsis when some were dropped.
+///
+/// Columns rather than characters, and whole graphemes: this is the line a decision is read
+/// from, so it is measured as it is drawn and never runs onto a second row.
+fn head(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let room = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0_usize;
+    for grapheme in text.graphemes(true) {
+        let cells = grapheme.width();
+        if used.saturating_add(cells) > room {
+            break;
+        }
+        out.push_str(grapheme);
+        used = used.saturating_add(cells);
+    }
+    out.push('…');
+    out
 }
 
 /// Builds the single line a thinking segment occupies at `width` columns.
@@ -222,6 +310,37 @@ fn tail(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The asked-about line is clipped from the end, by the columns it is drawn in, and is
+    /// never wider than the row it has.
+    #[test]
+    fn an_asked_line_keeps_its_start_and_fits_the_width_in_cells() {
+        let arguments = r#"{"command":"rm -rf 漢字漢字漢字漢字漢字 and a long tail of words"}"#;
+        let line = asked_tool_line(ToolState::Running, "bash", arguments, 24);
+        assert!(line.starts_with("⚙ Bash · rm -rf 漢字"), "{line}");
+        assert!(line.ends_with('…'), "{line}");
+        assert!(line.width() <= 24, "{} cells: {line}", line.width());
+        // The ordinary line of the same call keeps the other end.
+        let ordinary = tool_line(ToolState::Running, "bash", arguments, 24);
+        assert!(ordinary.ends_with("tail of words"), "{ordinary}");
+        // A command that fits is not marked, and a call with no argument is its label.
+        let short = asked_tool_line(ToolState::Running, "bash", r#"{"command":"ls"}"#, 24);
+        assert_eq!(short, "⚙ Bash · ls");
+        assert_eq!(
+            asked_tool_line(ToolState::Running, "bash", "null", 24),
+            "⚙ Bash"
+        );
+    }
+
+    /// A tool the interface has no phrasing for is shown whole, from its start, as its
+    /// ordinary line shows it from its end.
+    #[test]
+    fn an_asked_line_for_an_unknown_tool_starts_at_the_start_of_its_arguments() {
+        let arguments = r#"{"target":"production","force":true}"#;
+        let line = asked_tool_line(ToolState::Running, "deploy", arguments, 30);
+        assert!(line.starts_with("⚙ deploy · {"), "{line}");
+        assert!(line.width() <= 30);
+    }
 
     #[test]
     fn compact_is_the_default() {

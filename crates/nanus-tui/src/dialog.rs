@@ -236,6 +236,74 @@ pub(crate) fn bounds(area: Rect, maximum: u16, rows: usize) -> Rect {
     }
 }
 
+/// The fewest rows beside a line that are worth moving a dialog into.
+///
+/// Fewer than this and the dialog would be all border: it is left where it was, over the line,
+/// because a question that cannot be read is worse than one that covers something.
+const CLEAR_ROWS: u16 = 5;
+
+/// A dialog's rectangle, moved off the rows `avoid` names when it would have covered them.
+///
+/// `avoid` is a first row and a count. The approval dialog is the one that passes it: the row
+/// it avoids is the call the question is about, which the dialog itself deliberately does not
+/// repeat. A dialog centred as [`bounds`] centres it sits on the newest rows of a short
+/// terminal, which is where that call is, so the reader was asked about a line the question
+/// was drawn over.
+///
+/// The dialog keeps its place when it covers nothing. Otherwise it goes directly above the
+/// rows if it fits there whole, directly below if it fits there, and into whichever side is
+/// taller if it fits neither — shortened to the side, with its footer kept and its body
+/// scrolling as on any short terminal.
+pub(crate) fn bounds_clear_of(
+    area: Rect,
+    maximum: u16,
+    rows: usize,
+    avoid: Option<(u16, u16)>,
+) -> Rect {
+    let centred = bounds(area, maximum, rows);
+    let Some((top, count)) = avoid else {
+        return centred;
+    };
+    let bottom = top.saturating_add(count);
+    let covers = centred.y < bottom && centred.y.saturating_add(centred.height) > top;
+    if !covers {
+        return centred;
+    }
+    let above = top.saturating_sub(area.y);
+    let below = area.y.saturating_add(area.height).saturating_sub(bottom);
+    let goes_above = if centred.height <= above {
+        true
+    } else if centred.height <= below {
+        false
+    } else {
+        above >= below
+    };
+    let room = if goes_above { above } else { below };
+    if room < CLEAR_ROWS {
+        return centred;
+    }
+    let height = centred.height.min(room);
+    let y = if goes_above {
+        top.saturating_sub(height)
+    } else {
+        bottom
+    };
+    Rect {
+        y,
+        height,
+        ..centred
+    }
+}
+
+/// Where a dialog may be drawn: how wide it may grow, and the rows it should leave uncovered.
+#[derive(Clone, Copy)]
+pub(crate) struct Placement {
+    /// The widest the dialog may be.
+    pub(crate) maximum: u16,
+    /// A first row and a count the dialog moves off, when it can: see [`bounds_clear_of`].
+    pub(crate) avoid: Option<(u16, u16)>,
+}
+
 /// The content width, accounting for borders only when they leave useful text room.
 pub(crate) fn inner_width(area: Rect, maximum: u16) -> usize {
     let rect = bounds(area, maximum, usize::from(area.height));
@@ -256,7 +324,7 @@ pub(crate) fn inner_width(area: Rect, maximum: u16) -> usize {
 pub(crate) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
-    maximum: u16,
+    placement: Placement,
     content: &Content,
     scroll: &mut u16,
     appearance: (bool, &Theme),
@@ -267,7 +335,7 @@ pub(crate) fn render(
         .len()
         .saturating_add(content.footer.len())
         .saturating_add(2);
-    let rect = bounds(area, maximum, count);
+    let rect = bounds_clear_of(area, placement.maximum, count, placement.avoid);
     frame.render_widget(Clear, rect);
     let bordered = rect.width >= 4 && rect.height >= 4;
     let block = Block::default()
@@ -356,4 +424,71 @@ fn render_tiny(
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(visible).style(theme.assistant), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCREEN: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 24,
+    };
+
+    fn overlaps(rect: Rect, top: u16, count: u16) -> bool {
+        rect.y < top.saturating_add(count) && rect.y.saturating_add(rect.height) > top
+    }
+
+    #[test]
+    fn a_dialog_that_covers_nothing_stays_centred() {
+        let centred = bounds(SCREEN, 78, 10);
+        assert_eq!(bounds_clear_of(SCREEN, 78, 10, None), centred);
+        assert_eq!(bounds_clear_of(SCREEN, 78, 10, Some((20, 1))), centred);
+        assert_eq!(bounds_clear_of(SCREEN, 78, 10, Some((1, 2))), centred);
+    }
+
+    #[test]
+    fn a_dialog_moves_off_the_rows_it_would_have_covered() {
+        // Fifteen rows centred in twenty-four cover row seventeen; there is room above it.
+        let centred = bounds(SCREEN, 78, 15);
+        assert!(overlaps(centred, 17, 1));
+        let moved = bounds_clear_of(SCREEN, 78, 15, Some((17, 1)));
+        assert!(!overlaps(moved, 17, 1), "{moved:?}");
+        assert_eq!(moved.height, 15, "it is whole");
+        assert_eq!(
+            moved.y.saturating_add(moved.height),
+            17,
+            "and sits just above the rows"
+        );
+        // Rows near the top send it below them.
+        let below = bounds_clear_of(SCREEN, 78, 15, Some((5, 1)));
+        assert_eq!(below.y, 6);
+        assert!(!overlaps(below, 5, 1));
+        // Neither side holds it whole: the taller side takes a shorter dialog.
+        let squeezed = bounds_clear_of(SCREEN, 78, 20, Some((14, 1)));
+        assert!(!overlaps(squeezed, 14, 1), "{squeezed:?}");
+        assert_eq!(squeezed.height, 14);
+        // Its width and column never change.
+        assert_eq!((moved.x, moved.width), (centred.x, centred.width));
+    }
+
+    #[test]
+    fn a_dialog_with_no_room_beside_the_rows_stays_where_it_was() {
+        let tiny = Rect {
+            height: 8,
+            ..SCREEN
+        };
+        let centred = bounds(tiny, 78, 8);
+        assert_eq!(bounds_clear_of(tiny, 78, 8, Some((4, 1))), centred);
+        // And it is always inside the screen.
+        for top in 0..24 {
+            let rect = bounds_clear_of(SCREEN, 78, 30, Some((top, 1)));
+            assert!(
+                rect.y.saturating_add(rect.height) <= SCREEN.height,
+                "{rect:?}"
+            );
+        }
+    }
 }

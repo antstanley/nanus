@@ -9009,13 +9009,13 @@ mod tests {
         );
         view.now = core::time::Duration::from_secs(3);
         view.questions_drawn();
-        assert!(view.approval_undrawn, "the field is what that frame showed");
+        assert!(view.undrawn.approval, "the field is what that frame showed");
         assert_eq!(view.approval_asked, core::time::Duration::ZERO);
 
         view.close_key_entry();
         view.now = core::time::Duration::from_secs(9);
         view.questions_drawn();
-        assert!(!view.approval_undrawn);
+        assert!(!view.undrawn.approval);
         assert_eq!(view.approval_asked, core::time::Duration::from_secs(9));
 
         // The same for a preview, which is stamped when it is the dialog drawn.
@@ -9029,7 +9029,7 @@ mod tests {
         clearing.now = core::time::Duration::from_secs(4);
         clearing.questions_drawn();
         assert_eq!(clearing.confirm_asked, core::time::Duration::from_secs(4));
-        assert!(!clearing.confirm_undrawn);
+        assert!(!clearing.undrawn.confirm);
     }
 
     /// A paste is text for the composer, whatever it holds: its line breaks do not send it, and

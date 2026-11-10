@@ -341,8 +341,29 @@ before the reader had seen anything, leaving the first key waiting in the termin
 who pauses and then types `y` without looking has allowed one call — which is the limit of
 answering with a letter, and why the standing grant takes two keys with a pause between them.
 
-The harness's reason is drawn as it was written — runs of spaces and indentation included, since it
-may be the command being approved — and wraps and scrolls with PageUp/PageDown and Home/End; the
+**The call a question is about is the line the reader decides from, so it is kept readable.** The
+dialog carries the tool's name and the harness's reason and nothing the model wrote — the
+arguments stay out of it on purpose — which makes the call's own line in the transcript the one
+place a reader sees *what* is being asked about. Two things used to get in its way. A dialog
+centred on a short terminal sits on the newest rows, which is where that call is: at 80x24 the
+question was drawn over the line it was about. And a call's line is clipped from the front, so a
+command longer than the terminal showed its end — whatever the model put last, a trailing comment
+if it chose — and only its first line. While a question is open, then:
+
+- the dialog moves off the call's rows: directly above them when it fits there, below when it
+  fits there, into the taller side when it fits neither, and it stays put only when neither side
+  has room for a dialog at all;
+- the call's line is clipped from the *end*, keeping the start of the command, measured in the
+  cells it is drawn in so it stays one row, with every line of the argument on it — a `⏎` where
+  each line break was — and no control characters;
+- a run of tool calls collapsed to a summary leaves that call out of the summary.
+
+Answered, the call is a line like any other again. This is still only the head of a long command
+on one row; the whole of it is the full detail's (`Ctrl+O`, or `tui_detail = "full"`), and a
+reader who has scrolled away from the newest output is not scrolled back to it by a question.
+
+The harness's reason is drawn as it was written — runs of spaces and indentation included — and
+wraps and scrolls with PageUp/PageDown and Home/End; the
 choices and exit instructions stay in a fixed footer when the screen can hold it. Choosing an answer
 or resizing the terminal keeps the reader's place in a long reason; only a different dialog starts
 from its top. On exceptionally tiny terminals, all text, including the footer, remains scrollable
@@ -1174,7 +1195,8 @@ whole run into a count rather than showing the live end of it.
 **Neither line wraps, and neither carries a blank row of its own.** A line too long for the
 terminal is clipped from the front, keeping its label and the *end* of what it is acting on —
 `✓ Read File · …tools/glob.rs` — because the newest words are the ones that say what is
-happening now. And a tool's call sits directly against its result: no `── tool` heading
+happening now. The one exception is a call a question is open about, which keeps its *start*
+instead: see the approval question, above. And a tool's call sits directly against its result: no `── tool` heading
 repeating what the line already said, and no row for the result's own name, which the call's
 line has already carried along with its outcome. What still separates one piece of tool
 activity from the next is the blank row every *other* entry is followed by — that row belongs
