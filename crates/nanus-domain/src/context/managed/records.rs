@@ -377,7 +377,8 @@ pub struct WorkingNote {
 pub enum RevisionAuthor {
     /// A validated model proposal.
     Model,
-    /// Deterministic hard fitting.
+    /// Deterministic fitting: over the allowance, or toward the working target once the
+    /// provider's cache had lapsed.
     Automatic,
     /// A host or human action.
     Host,
@@ -389,7 +390,9 @@ pub enum RevisionAuthor {
 pub enum RevisionReason {
     /// The model proposed it through `context_manage`.
     ModelProposal,
-    /// The request did not fit and the oldest eligible fragments were hidden.
+    /// The oldest eligible fragments were hidden by deterministic fitting: because the request
+    /// did not fit the allowance, or because the provider's cache had lapsed and it was over the
+    /// working target. Both are written `hard_fit`; which one is not recorded.
     HardFit,
     /// A person reset the session's context.
     Reset,

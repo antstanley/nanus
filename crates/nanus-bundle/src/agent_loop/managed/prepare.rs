@@ -1,10 +1,11 @@
 //! Preparing a managed request: compile, fit, freeze, and describe what was prepared.
 //!
-//! Every candidate the fitter probes is compiled by the domain and prepared by the selected
-//! adapter, so its cost is the cost of the body that adapter would send — schemas, notice,
-//! generated data, typed content and the output reservation included. The candidate that is
-//! chosen is prepared once more with its final notice, and that object is what is recorded and
-//! dispatched; nothing is re-encoded in between.
+//! The fit acts over the hard allowance and, once the provider's cache of the session has lapsed,
+//! over the working target too (see `cold.rs`). Every candidate the fitter probes is compiled by
+//! the domain and prepared by the selected adapter, so its cost is the cost of the body that
+//! adapter would send — schemas, notice, generated data, typed content and the output reservation
+//! included. The candidate that is chosen is prepared once more with its final notice, and that
+//! object is what is recorded and dispatched; nothing is re-encoded in between.
 
 use std::collections::BTreeSet;
 
@@ -269,8 +270,8 @@ impl AgentRunner {
     /// The working target a managed request's soft pressure is measured against: the host's
     /// target or the default, clamped to [`input_allowance`](Self::input_allowance).
     ///
-    /// The one place the runner asks, so the tail, the reminder and anything later that fits
-    /// toward the target — at a moment the provider's cache is already cold, say — agree on it.
+    /// The one place the runner asks, so the tail, the reminder and a fit made once the provider's
+    /// cache has lapsed agree on it.
     pub(in crate::agent_loop) fn working_target(
         &self,
         caps: ModelCapabilities,
@@ -417,11 +418,13 @@ impl AgentRunner {
         // The accepted selection is costed at the revision it is sent under when it fits, so
         // its probe is exactly the draft `freeze` would otherwise prepare a second time.
         let kept = core::cell::Cell::new(None);
-        let fitted = fit::hard_fit(
+        // Hard fitting over the allowance; toward the working target too once the provider's
+        // cache of this session has lapsed, when a rewritten prefix costs nothing extra.
+        let fitted = fit::fit_to(
             &snapshot.fragments,
             &snapshot.protected,
             accepted,
-            allowance,
+            self.fit_bounds(session, allowance, target),
             |hidden| {
                 if hidden == accepted {
                     let tokens = cost(hidden, current)?;
@@ -435,7 +438,7 @@ impl AgentRunner {
         .map_err(refusal)?;
         let (hidden, revision, pre) = fitted.as_ref().map_or_else(
             || {
-                // `hard_fit` costs the accepted selection before anything else, so a fit that
+                // `fit_to` costs the accepted selection before anything else, so a fit that
                 // kept it has always measured it.
                 let pre = kept.get();
                 assert!(pre.is_some(), "a kept selection was costed");
@@ -553,7 +556,8 @@ impl AgentRunner {
         let (selection, automatic) = chosen;
         // `pre` is the chosen selection's probe cost — the request with the probe's notice —
         // which the fit has already measured; the notice is then written with it. The hard
-        // allowance refuses; the working target only decides the hint.
+        // allowance refuses; here the working target decides only the hint, and the fit has
+        // already used it if the cache had lapsed.
         let (base, (allowance, target), pre) = shared;
         if pre > allowance {
             return Err(refusal(ErrorCode::CandidateTooLarge));

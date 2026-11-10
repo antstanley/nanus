@@ -82,7 +82,7 @@ profile.
 |---|---|
 | Working target | 200,000 estimated tokens unless a host names one (`context_working_target`), and never above the input allowance |
 | Soft-pressure hint | 75 % of the working target; re-arms only below 60 % of it; at most once per four completed model steps |
-| Automatic reduction | Acts only above the hard allowance; continues toward 60 % while eligible fragments remain |
+| Automatic reduction | Acts above the hard allowance, or above the working target once the provider's cache has lapsed; continues toward 60 % of that bound while eligible fragments remain |
 | Management | At most one proposal per settled step; every model call charges the step budget |
 | `context_manage` / `context_recall` raw arguments | 16 KiB / 2 KiB, checked before JSON parsing |
 | Notes | 32 per revision, 512 Unicode scalar values each, 1–4 sources each, 8 KiB encoded array |
@@ -107,9 +107,11 @@ allowance is at least three quarters of it.
 
 The **working target** is the size the soft machinery keeps a session near, and the hard allowance
 is the ceiling fitting acts over. They are separate because they cost different things. Hard
-fitting rewrites the cached prefix by force, so it still acts only over the allowance. A model's
-own proposal is the cheap, batched way to shrink, so that is what the target moves: the tail's
-pressure is the estimate as a percentage of the target, and the budget hint is given at 75 % of it.
+fitting rewrites the cached prefix by force, so while the provider's cache is warm it acts only
+over the allowance. A model's own proposal is the cheap, batched way to shrink, so that is what the
+target moves: the tail's pressure is the estimate as a percentage of the target, and the budget
+hint is given at 75 % of it. Once the cache has lapsed, rewriting the prefix costs nothing extra,
+and the runner fits toward the target itself ([fitting a lapsed cache](#fitting-a-lapsed-cache)).
 
 The default is 200,000 estimated tokens. A managed estimate is the serialized body over three, and
 it ran close to the provider's real prompt tokens in the recorded sessions behind the number. On
@@ -127,21 +129,98 @@ or `limits::DEFAULT_WORKING_TARGET_TOKENS`, clamped to the allowance. So a model
 below 200,000 has the allowance as its target. That covers every library host's 64,000 default, a
 128,000-token window, and any configured budget near the target. Its pressure and hint are exactly
 what they were before the target existed. The runner asks `AgentRunner::working_target` for it, the
-one answer for the tail, the reminder, and a later fit that aims for the target.
+one answer for the tail, the reminder, and a fit once the cache has lapsed.
 
 It is host configuration, not policy. `context_working_target` in the configuration file, or
 `AgentRunner::with_context_working_target` for a library host, names it. Zero is refused at start.
 `nanus config` prints it. Nothing records it, for three reasons:
 
-- It decides only the hint and the pressure the tail states. It never decides what a request may
-  carry, what fitting hides, or whether a proposal is accepted, which are measured against the
-  allowance alone.
+- It decides the hint, the pressure the tail states, and how far a fit goes once the cache has
+  lapsed. It never decides what a request may carry or whether a proposal is accepted, which are
+  measured against the allowance alone. A fit it shaped is recorded with its whole hidden set, so
+  reading a session back never asks for it.
 - So a proposal staged under one target is as valid under another, and it is not in the snapshot
   profile.
 - It is the same kind of value as `context_budget`, which moves the allowance and is not recorded
   either.
 
 A legacy session never reads it.
+
+### Fitting a lapsed cache
+
+Hiding history rewrites the provider's cached prefix from the earliest fragment hidden, so a fit is
+expensive while the cache is warm. Once the cache has expired, the next request is read uncached
+whatever it carries, and a smaller one is cheaper on that step and on every step after it. One
+recorded session started four turns after 35 minutes to 3.7 hours of idle. Each re-sent 375,000 to
+556,000 prompt tokens uncached, with nothing hidden.
+
+So a managed step whose cache has **lapsed** is fitted toward the working target before it is sent.
+The cache has lapsed when the time since the session's last request is longer than the provider
+keeps a prefix:
+
+- **The last request** is the newest time any `request/attempt` record carries, a start or a finish,
+  whatever its kind or outcome (`state::last_request_ms`). It is read from the log, so a session
+  reloaded from disk decides exactly as one held in memory. "Now" is the runner's clock port.
+- **How long the provider keeps a prefix** is what the adapter states for the retention the runner
+  asks for (`LlmPort::prompt_cache_lifetime_ms`). Anthropic's own endpoint states the TTL its
+  breakpoints carry: five minutes under `Short` (`nanus run`) and an hour under `Long` (the link).
+  Every other adapter, a proxy configured as Anthropic, and a runner that asked for no entries state
+  nothing. That is taken as an hour, the longest retention a runner can ask for.
+- **Lapsed** means strictly longer: a gap of exactly the lifetime is warm.
+
+A fit while the prefix is still cached costs the rewrite this mechanism exists to avoid, so every
+doubt resolves toward not fitting. A session with no attempt is not fitted. Every attempt counts,
+even a refused or an uncertain one, because more attempts can only make the last request later. An
+unknown lifetime is the longest one. Two cases can still fit a warm prefix:
+
+- A provider that caches by its own rules may keep a prefix longer than an hour. A fit after an
+  hour then rewrites a prefix the provider still held.
+- The retention a request asked for is not recorded. A session last served over the link and
+  resumed by `nanus run` on Anthropic is taken to have lapsed after five minutes, although its last
+  entries were written for an hour.
+
+The fit is hard fitting's own search (`fit::fit_to`), measured against `FitBounds::toward(target,
+allowance)`:
+
+- it acts only when the candidate is over the working target;
+- it hides the oldest eligible complete fragments first, never a user message, and keeps every
+  protected fragment;
+- it aims for 60 % of the target, so the next cold start does not fit again unless the session has
+  grown back past the target.
+
+A protected floor above the target is as far as it goes, and the request is sent over the target:
+only the allowance refuses. A fit that would make the request no smaller is not made. A candidate
+over the allowance when the cache has lapsed is fitted toward the target rather than toward 60 % of
+the allowance. A target at or above the allowance makes this hard fitting exactly.
+
+A fit is an automatic revision, exactly as a hard fit's is. It is persisted with the request intent
+before dispatch, listed in the tail's catalog, and recoverable with `context_recall` and a restore.
+It is recorded with the values a hard fit has always written — `author: automatic`, `reason:
+hard_fit` — so nothing new is recorded and no body version moves. The log does not say which of the
+two produced a revision.
+
+Nothing changes when the cache is warm, when the candidate is at or under the target, when the
+session has never sent a managed request, or when the host turned it off. The request is then
+byte-identical to one built without the mechanism, and hard fitting over the allowance is exactly
+as before. That covers the first request of a new session, and the first managed request of a
+session enabled after legacy turns: legacy requests record no attempt, and their system prompt and
+schemas are not the managed prefix's, so nothing of that prefix was cached.
+
+- **Within a turn.** A step is checked like any other. A tool batch that runs longer than the
+  lifetime leaves the next step's cache lapsed, and that step is fitted.
+- **A staged proposal** is settled at its step's end, before the next request is prepared. So a fit
+  builds on whatever was accepted, notes included, with that revision as its base. A proposal the
+  model makes later against the revision before the fit is stale, as after any automatic revision.
+  A proposal is still admitted against the allowance.
+- **A reset** selects legacy, so nothing is fitted until managed is enabled again. The gap is then
+  measured from the newest attempt on either side of the barrier, because a time is a fact about
+  the provider rather than a selection the reset discards.
+- **A handoff draft's** attempt counts as a request. The draft itself is not fitted: it sends the
+  accepted selection as it stands.
+
+`context_cold_fit` in the configuration file (default `true`), or `AgentRunner::with_context_cold_fit`
+for a library host, turns it off. `nanus config` prints it. Like the target, it is configuration and
+nothing records it, and a legacy session never reads it.
 
 ## Fragments, frontiers and revisions
 
@@ -216,8 +295,10 @@ with `/goal`, or a seeded session's notes), the first request has no working-dat
 because it would be last. The second request inserts it after the first user message. Every
 adapter is tested for the rule and for this exception.
 
-Deterministic hard fitting acts only when the candidate is over the hard allowance, hiding the
-oldest eligible complete fragment first. Every probe is compiled and prepared by the selected
+Deterministic hard fitting acts only when the candidate is over the hard allowance, or over the
+working target once the provider's cache has lapsed
+([fitting a lapsed cache](#fitting-a-lapsed-cache)), hiding the oldest eligible complete fragment
+first. Every probe is compiled and prepared by the selected
 adapter, tail included, so its cost is the cost of the body that adapter would send. A protected
 floor above 60 % but within the allowance succeeds; above the allowance it refuses with
 `protected_floor_too_large`, and no partial hidden set is installed. A successful fit is an
@@ -274,6 +355,10 @@ none: append RequestAttempt(finished) for the next checkpoint to carry
 install what was acknowledged -> honour cancellation -> release the selection
 next step, or append and checkpoint TurnEnd before the answer is reported
 ```
+
+The automatic revision is a hard fit over the allowance, or a fit toward the working target when
+the provider's cache has lapsed. Either is decided while the request is prepared, so the sequence
+is the same for both.
 
 A step that staged no proposal is not checkpointed on its own. Nothing leaves the process between
 its settlement and the next checkpoint — the next step's intent, or the turn's end — so one commit
@@ -503,7 +588,8 @@ opts in:
 Under `Short` every breakpoint is five minutes. Under `Long` every breakpoint is one hour. A cache
 write costs 1.25 times the input price for five minutes and twice the input price for one hour. A
 cache read costs a tenth of the input price or less (a twentieth on Opus 5.5), so a five-minute
-entry pays for itself on its second read and a one-hour entry on its third.
+entry pays for itself on its second read and a one-hour entry on its third. The retention also
+tells a managed runner when its cache has lapsed ([fitting a lapsed cache](#fitting-a-lapsed-cache)).
 
 **Anthropic breakpoints** are computed over the encoded `messages` array:
 
@@ -1111,6 +1197,27 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   - a small window's requests are byte-identical with and without a target above its allowance;
   - a target far under a small allowance leaves every fit and every request's conversation as it
     was;
+- fitting a lapsed cache. The domain tests check `fit_to` toward a bound: oldest first to 60 % of
+  it, nothing at or under it, a floor over it fitted as far as it goes and never refused, nothing
+  eligible or no room for an id leaving the request alone, and the allowance still refusing a floor
+  over it. They also check `last_request_ms` against a clock set back. Anthropic's adapter states
+  its TTLs at its own endpoint and nothing at a proxy. Through the real runner, with a scripted
+  model and a clock the test moves (`nanus-bundle/tests/managed_cold_fit.rs`):
+  - a resume an hour and a millisecond later hides the oldest eligible fragments to under 60 % of
+    the target. It records one automatic revision before the intent of the request built from it,
+    lists it in the tail, keeps every user message, and fits nothing more on the step after;
+  - the same resume after exactly an hour, with no gap, or with the switch off sends identical
+    requests and records no revision;
+  - a cold resume under the target changes nothing;
+  - a resume of the session read back from its JSONL fits exactly as the one held in memory, and
+    sends the same requests;
+  - a stated lifetime's boundary, to the millisecond, under `Short` and `Long`, and an unstated one,
+    or no retention, taken as an hour;
+  - a protected floor over the target hides every eligible fragment and is sent;
+  - a session enabled after legacy turns is not fitted on its first managed request, and is on its
+    next cold start;
+  - over the allowance, a warm resume hard-fits identically with the switch on or off, and a cold
+    one hides more;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
   developer system message and no `instructions` is accepted and answers as the system prompt
   directs, and three managed steps with a trailing developer tail after tool output are accepted;
@@ -1174,8 +1281,11 @@ Not verified, and not claimed:
   DeepSeek, z.ai and Inception accept a generated turn without `reasoning_content`.
 - **The working target's number is arithmetic, not a measured optimum.** It is derived from the
   recorded sessions above. No test shows that a model acts on the hint, or what a session acting on
-  it costs. Nothing yet fits down toward the target. A fit at a moment the cache is already cold,
-  such as the first step after a long idle gap, would call `working_target`. It has not been built.
+  it costs.
+- **That a lapsed cache is in fact cold is the runner's inference, not a measurement.** It rests on
+  Anthropic's documented TTLs and, everywhere else, on an hour being long enough. No live run has
+  checked a provider's cache across an idle gap. No recorded session has been replayed to show what
+  a cold fit saves.
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
   is no claim that managed context improves anything, and the default stays legacy.

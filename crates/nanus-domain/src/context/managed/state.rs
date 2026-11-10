@@ -609,6 +609,33 @@ pub fn unmatched_attempts(log: &SessionLog) -> Vec<RequestAttemptRecord> {
     open
 }
 
+/// The newest time any request attempt in `log` records, a start or a finish: when, as far as the
+/// session's own records say, a provider was last sent this session's prefix.
+///
+/// `None` when the log holds no attempt — a session that has never sent a managed request, whose
+/// provider cache holds nothing of its managed prefix to lose. Every attempt counts, whatever its
+/// kind or outcome, the reset barrier notwithstanding: a time is a fact about the provider, not a
+/// selection, and a refused or uncertain attempt can only make the newest time later, which makes
+/// a caller that asks "has the cache lapsed?" wait longer, never shorter. The maximum is taken
+/// rather than the last record's, so a clock that was set back between two processes cannot make
+/// an earlier time the answer.
+#[must_use]
+pub fn last_request_ms(log: &SessionLog) -> Option<u64> {
+    log.events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::RequestAttempt { payload } => Some(
+                payload
+                    .finished_at_ms
+                    .map_or(payload.started_at_ms, |finished| {
+                        finished.max(payload.started_at_ms)
+                    }),
+            ),
+            _ => None,
+        })
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,5 +1069,67 @@ mod tests {
             _ => None,
         });
         assert!(turn_record.is_some_and(|record| record.unmatched_attempt_ids.is_empty()));
+    }
+
+    /// An attempt record at `started`, finished at `finished` when it has an outcome.
+    fn timed(id: &str, started: u64, finished: Option<u64>) -> SessionEvent {
+        SessionEvent::RequestAttempt {
+            payload: Box::new(RequestAttemptRecord {
+                attempt_id: id.into(),
+                retry_of: None,
+                turn: 1,
+                step: 1,
+                selection: super::super::records::SelectionIdentity {
+                    provider: "p".into(),
+                    endpoint_digest: Digest::empty(),
+                    protocol: "c".into(),
+                    model: "m".into(),
+                    effort: None,
+                    epoch: 0,
+                },
+                projection_revision: 0,
+                request_digest: Digest::empty(),
+                phase: if finished.is_some() {
+                    AttemptPhase::Finished
+                } else {
+                    AttemptPhase::Started
+                },
+                outcome: finished.map(|_| AttemptOutcome::Refused),
+                usage: None,
+                assistant_seq: None,
+                included_management_fragments: Vec::new(),
+                kind: None,
+                started_at_ms: started,
+                finished_at_ms: finished,
+                timings_ms: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_last_request_is_the_newest_time_any_attempt_records() {
+        let mut session = session();
+        assert_eq!(
+            last_request_ms(session.log()),
+            None,
+            "nothing was ever sent"
+        );
+        session.append(SessionEvent::UserMessage {
+            text: "go".into(),
+            content_blocks: None,
+        });
+        assert_eq!(last_request_ms(session.log()), None);
+        session.append(timed("a1", 1_000, None));
+        assert_eq!(
+            last_request_ms(session.log()),
+            Some(1_000),
+            "an intent with no outcome yet counts from its start"
+        );
+        session.append(timed("a1", 1_000, Some(4_000)));
+        assert_eq!(last_request_ms(session.log()), Some(4_000));
+        // A later record stamped by a clock that was set back does not make the answer earlier.
+        session.append(timed("a2", 2_000, None));
+        session.append(timed("a2", 2_000, Some(3_000)));
+        assert_eq!(last_request_ms(session.log()), Some(4_000));
     }
 }

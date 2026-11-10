@@ -1314,7 +1314,8 @@ fn build_runner(
     } else {
         runner
     };
-    let runner = with_working_target(runner, config)?;
+    let runner =
+        with_working_target(runner, config)?.with_context_cold_fit(config.context_cold_fit);
     // A request that carries pixels needs an explicit output reservation, and a model's whole
     // output ceiling would not fit a small budget beside any input. A quarter of a configured
     // budget is reserved, capped at 16K — below every offered model's own ceiling, so it holds
@@ -1900,24 +1901,47 @@ mod tests {
         }
     }
 
+    /// The stock runner `config` composes, over every credential.
+    async fn stock_runner(config: NanusConfig) -> Result<AgentRunner, BundleError> {
+        let selection = Selection::resolve(&config).expect("the default resolves");
+        let secrets: SecretHandle = Rc::new(Box::new(EverySecret));
+        let llm = build_adapter(&config, &selection, &secrets)
+            .await
+            .expect("an adapter");
+        let tools = ToolRegistryHandle::new(nanus_domain::ToolRegistry::new());
+        let clock = SystemClock::new().handle();
+        build_runner(&llm, &tools, &config, &selection, Path::new("/"), &clock)
+    }
+
+    /// The configuration's switch for fitting a lapsed cache toward the target reaches the runner,
+    /// on by default and off when the file says so.
+    #[test]
+    fn a_configured_cold_fit_reaches_the_runner_on_by_default() {
+        nanus_kernel::runtime::block_on(async {
+            let on = stock_runner(NanusConfig::default())
+                .await
+                .expect("a runner");
+            assert!(on.context_cold_fit());
+            let off = stock_runner(NanusConfig {
+                context_cold_fit: false,
+                ..NanusConfig::default()
+            })
+            .await
+            .expect("a runner");
+            assert!(!off.context_cold_fit());
+        });
+    }
+
     /// The configuration's working target reaches the runner, and a zero one stops the start
     /// rather than asking the model to reduce on every request.
     #[test]
     fn a_configured_working_target_reaches_the_runner_and_zero_is_refused() {
         nanus_kernel::runtime::block_on(async {
-            let build = |target: Option<u32>| async move {
-                let config = NanusConfig {
+            let build = |target: Option<u32>| {
+                stock_runner(NanusConfig {
                     context_working_target: target,
                     ..NanusConfig::default()
-                };
-                let selection = Selection::resolve(&config).expect("the default resolves");
-                let secrets: SecretHandle = Rc::new(Box::new(EverySecret));
-                let llm = build_adapter(&config, &selection, &secrets)
-                    .await
-                    .expect("an adapter");
-                let tools = ToolRegistryHandle::new(nanus_domain::ToolRegistry::new());
-                let clock = SystemClock::new().handle();
-                build_runner(&llm, &tools, &config, &selection, Path::new("/"), &clock)
+                })
             };
             let named = build(Some(120_000)).await.expect("a runner");
             assert_eq!(

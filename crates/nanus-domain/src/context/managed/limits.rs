@@ -6,12 +6,13 @@
 //! made under one value cannot be accepted under another.
 //!
 //! [`DEFAULT_WORKING_TARGET_TOKENS`] is the one default here that a host may replace, and it is
-//! not a limit in that sense. It decides only when the tail asks the model to reduce and what
-//! pressure the tail states. It never decides what a request may carry, what fitting hides, or
-//! whether a proposal is accepted: those are measured against the hard allowance alone. So a
-//! proposal staged under one target is exactly as valid under another, and the target is host
-//! configuration beside `context_budget`, which already moves the allowance without being
-//! recorded.
+//! not a limit in that sense. It decides when the tail asks the model to reduce, what pressure the
+//! tail states, and how far the runner's own fit goes once a provider's cache has lapsed. It never
+//! decides what a request may carry or whether a proposal is accepted: those are measured against
+//! the hard allowance alone. A fit it shapes is recorded with its whole hidden set, so reading it
+//! back never asks for the target. So a proposal staged under one target is exactly as valid under
+//! another, and the target is host configuration beside `context_budget`, which already moves the
+//! allowance without being recorded.
 
 /// The only policy version this build reads and writes.
 pub const POLICY_VERSION: u32 = 1;
@@ -38,8 +39,9 @@ pub const DEFAULT_OUTPUT_RESERVE_TOKENS: u32 = 4_096;
 /// The size the soft machinery keeps a session near: the tail's pressure is the estimate as a
 /// percentage of it, and the budget hint is given at [`SOFT_PRESSURE_PERCENT`] of it. The hard
 /// allowance is not moved by it, so fitting, which rewrites the cached prefix, still acts only
-/// over the allowance; what moves is when the model is asked to shrink the request itself, in
-/// one batched proposal.
+/// over the allowance while the cache is warm; what moves is when the model is asked to shrink the
+/// request itself, in one batched proposal. Once the provider's cache has lapsed, rewriting the
+/// prefix costs nothing extra, and the runner fits toward [`TARGET_PERCENT`] of the target itself.
 ///
 /// The number is from the arithmetic of a large window. On a 922,000-token allowance a hint at
 /// three quarters of the allowance is not given until about 690,000 estimated tokens, and a
@@ -62,7 +64,8 @@ pub const REARM_PERCENT: u32 = 60;
 /// Completed model steps between two budget hints.
 pub const REMINDER_MIN_STEPS: u32 = 4;
 
-/// Percent of the allowance automatic reduction aims for once it has to act.
+/// Percent of the bound automatic reduction aims for once it has to act: the allowance, or the
+/// working target when the provider's cache has lapsed.
 pub const TARGET_PERCENT: u32 = 60;
 
 /// Raw argument bytes a `context_manage` call may carry, checked before JSON parsing.

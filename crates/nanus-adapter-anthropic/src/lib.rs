@@ -230,6 +230,26 @@ impl LlmPort for AnthropicLlm {
         self.config.capabilities(model)
     }
 
+    fn prompt_cache_lifetime_ms(
+        &self,
+        model: &str,
+        retention: nanus_ports::PromptCacheRetention,
+    ) -> Option<u64> {
+        let _ = model;
+        // The breakpoints carry the retention's TTL, which Anthropic's own endpoint documents as
+        // the entry's life from its last use. A proxy configured as Anthropic is not known to
+        // honour it, so it is not answered for; nor is a request that marks no entries.
+        if self.config.base_url().trim_end_matches('/') != DEFAULT_BASE_URL {
+            return None;
+        }
+        match retention {
+            nanus_ports::PromptCacheRetention::None => None,
+            // Five minutes and one hour: the `5m` and `1h` the breakpoints carry.
+            nanus_ports::PromptCacheRetention::Short => Some(300_000),
+            nanus_ports::PromptCacheRetention::Long => Some(3_600_000),
+        }
+    }
+
     fn estimate_request(
         &self,
         request: &ChatRequest,
@@ -429,6 +449,37 @@ mod tests {
             return;
         };
         assert_eq!(llm.endpoint(), "https://proxy.test/messages");
+    }
+
+    /// The cache lifetime is the TTL the breakpoints carry, answered only at Anthropic's own
+    /// endpoint and only for a request that marks entries; a proxy's is not known.
+    #[test]
+    fn the_cache_lifetime_is_the_ttl_asked_for_at_anthropic_and_unknown_elsewhere() {
+        use nanus_ports::PromptCacheRetention;
+        let Some(own) = adapter() else {
+            return;
+        };
+        let model = "claude-opus-5-5";
+        assert_eq!(
+            own.prompt_cache_lifetime_ms(model, PromptCacheRetention::Short),
+            Some(300_000)
+        );
+        assert_eq!(
+            own.prompt_cache_lifetime_ms(model, PromptCacheRetention::Long),
+            Some(3_600_000)
+        );
+        assert_eq!(
+            own.prompt_cache_lifetime_ms(model, PromptCacheRetention::None),
+            None
+        );
+        let proxied = AnthropicConfig::with_base_url(model, "test-key", "https://proxy.test/");
+        let Ok(proxied) = AnthropicLlm::new(proxied) else {
+            return;
+        };
+        assert_eq!(
+            proxied.prompt_cache_lifetime_ms(model, PromptCacheRetention::Long),
+            None
+        );
     }
 
     #[test]

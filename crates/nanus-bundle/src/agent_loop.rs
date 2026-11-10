@@ -380,6 +380,11 @@ pub struct AgentRunner {
     /// Read through [`working_target`](nanus_domain::context::managed::working_target) with the
     /// allowance in force, so it is clamped to every model it meets, and never recorded.
     working_target: Option<core::num::NonZeroU32>,
+    /// Whether a managed step whose provider cache has lapsed is fitted toward the working target.
+    ///
+    /// On unless a host turns it off. Configuration, like the target: nothing records it, and a
+    /// fit it makes is recorded as the automatic revision it is.
+    cold_fit: bool,
     /// How long the provider may keep the cache entries a request marks; copied into every
     /// request this runner builds. `None` for a library host, which pays no cache-write premium
     /// it did not ask for.
@@ -448,6 +453,7 @@ impl AgentRunner {
             capture: None,
             model_context: false,
             working_target: None,
+            cold_fit: true,
             prompt_cache: core::cell::Cell::new(nanus_ports::PromptCacheRetention::None),
         })
     }
@@ -528,8 +534,10 @@ impl AgentRunner {
     /// Names the working target a managed session is nudged toward, in estimated tokens.
     ///
     /// The tail's pressure is measured against it and the budget hint is given at three quarters
-    /// of it; the hard allowance, which fitting and a proposal's admission are measured against, is
-    /// not moved. Without it the target is
+    /// of it. Once the provider's cache of a session has lapsed, the runner also hides the oldest
+    /// eligible work itself down toward it (see
+    /// [`with_context_cold_fit`](Self::with_context_cold_fit)). The hard allowance, which refuses a
+    /// request and against which a proposal is admitted, is not moved. Without it the target is
     /// [`DEFAULT_WORKING_TARGET_TOKENS`](nanus_domain::context::managed::limits::DEFAULT_WORKING_TARGET_TOKENS),
     /// and either way it is clamped to the allowance of the model in force, so a target above a
     /// small window is that window. It is configuration, not policy: nothing records it, and a
@@ -547,6 +555,30 @@ impl AgentRunner {
     #[must_use]
     pub const fn context_working_target(&self) -> Option<core::num::NonZeroU32> {
         self.working_target
+    }
+
+    /// Turns fitting toward the working target once a provider's cache has lapsed on or off.
+    ///
+    /// On by default. Hiding history rewrites a provider's cached prefix from the earliest fragment
+    /// hidden, so below the hard allowance the runner leaves shrinking to the model while the
+    /// cache is warm. When the gap since a managed session's last request is longer than the
+    /// provider keeps a prefix — the lifetime its adapter states for the retention asked, or an
+    /// hour when it states none — the next request is read uncached anyway, and the runner hides the
+    /// oldest eligible fragments toward 60 % of the working target before it is sent. The
+    /// fit is an ordinary automatic revision: recorded before dispatch, listed in the tail's
+    /// catalog, recoverable. Off, a managed session is fitted only over the allowance, as before.
+    /// Nothing records the setting, and a legacy session never reads it.
+    #[must_use]
+    pub const fn with_context_cold_fit(mut self, enabled: bool) -> Self {
+        self.cold_fit = enabled;
+        self
+    }
+
+    /// Whether a managed step whose provider cache has lapsed is fitted toward the working target
+    /// ([`with_context_cold_fit`](Self::with_context_cold_fit)).
+    #[must_use]
+    pub const fn context_cold_fit(&self) -> bool {
+        self.cold_fit
     }
 
     /// Returns the budget a request is fitted to, its output reservation included.

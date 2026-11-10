@@ -221,7 +221,10 @@ dispatch, its context validation and its checkpoint.
 A managed session has two sizes, because the two ways to shrink a request cost different things.
 The **allowance** is the hard ceiling: past it the harness hides the oldest work itself, which
 rewrites the cached prefix by force, so it acts as rarely as it can. The **working target** is where
-the model is asked to shrink, in one proposal it batches itself. It defaults to 200,000 estimated
+the model is asked to shrink, in one proposal it batches itself. Once the provider's cache has
+lapsed, a rewrite costs nothing the next request would not pay anyway, so the harness then fits
+toward the target itself
+([fitting a lapsed cache](context-management.md#fitting-a-lapsed-cache)). It defaults to 200,000 estimated
 tokens and is clamped to the allowance. On a million-token window, a hint at three quarters of the
 allowance let a session grow past what legacy sends before anything asked it to stop. A small window
 has the allowance as its target and is nudged as it always was. The target is configuration rather

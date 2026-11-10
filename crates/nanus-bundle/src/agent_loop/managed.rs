@@ -45,6 +45,8 @@ use nanus_ports::{
 use super::{AgentRunner, Approver, Progress, RunOutcome, dispatch, is_cancelled};
 use crate::BundleError;
 
+#[path = "managed/cold.rs"]
+mod cold;
 #[path = "managed/handoff.rs"]
 mod handoff;
 #[path = "managed/prepare.rs"]

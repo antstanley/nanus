@@ -134,6 +134,23 @@ pub trait LlmPort {
         ManagedSupport::Unsupported
     }
 
+    /// How long, in milliseconds after it was last sent, the provider keeps the cache entries a
+    /// request for `model` under `retention` writes — when this adapter's wire states it.
+    ///
+    /// A runner reads it to tell whether a prefix it sent is still cached: past it, rewriting the
+    /// prefix costs nothing the next request would not pay anyway. So an answer must never be
+    /// shorter than the provider's lifetime, and `None`, the default, means the adapter does not
+    /// know it: its provider caches by rules of its own, or `retention` asked for no entries. The
+    /// caller then assumes the longest retention it can ask for. Local, with no I/O.
+    fn prompt_cache_lifetime_ms(
+        &self,
+        model: &str,
+        retention: PromptCacheRetention,
+    ) -> Option<u64> {
+        let _ = (model, retention);
+        None
+    }
+
     /// Prepares one managed request without performing any I/O.
     ///
     /// The returned call owns the admitted body: its estimate and digest are of exactly the bytes

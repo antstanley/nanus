@@ -514,10 +514,10 @@ pub fn pressure_percent(estimate: u32, allowance: u32) -> u32 {
 /// allowance is below the target has the allowance as its target, and the hint and the pressure
 /// it is shown are exactly what they were before the target existed.
 ///
-/// It drives only the soft machinery: the tail's `pressure_percent` and the [`Reminder`]. Hard
-/// fitting and a proposal's admission are measured against the allowance and never against this.
-/// It is also the size a fit chosen for a moment the provider cache is already cold would aim
-/// for, which is why it is a function of its own rather than a line in the runner.
+/// It drives the soft machinery — the tail's `pressure_percent` and the [`Reminder`] — and the one
+/// fit the runner makes below the allowance, once the provider's cache of a session has lapsed
+/// ([`FitBounds::toward`](super::fit::FitBounds::toward)). Whether a request is refused and
+/// whether a proposal is admitted are measured against the allowance and never against this.
 #[must_use]
 pub fn working_target(allowance: u32, configured: Option<core::num::NonZeroU32>) -> u32 {
     let target = configured

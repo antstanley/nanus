@@ -1949,6 +1949,7 @@ async fn show_config(args: &Options) -> Result<(), String> {
         "context working target: {}",
         working_target_display(&config)
     );
+    println!("context cold fit: {}", cold_fit_display(&config));
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
     println!("tui theme: {}", config.tui_theme);
@@ -2089,7 +2090,7 @@ fn context_budget_display(config: &NanusConfig, selection: &Selection) -> String
 ///
 /// Said to be soft and managed-only, because a reader comparing it with the budget above would
 /// otherwise take it for a second ceiling: it is where the model is asked to reduce, and the
-/// harness drops nothing at it.
+/// harness hides nothing at it while the provider's cache is warm (see `context cold fit`).
 fn working_target_display(config: &NanusConfig) -> String {
     let what = "managed sessions; the model is asked to reduce past three quarters of it, and \
                 it is clamped to the model's allowance";
@@ -2102,6 +2103,17 @@ fn working_target_display(config: &NanusConfig) -> String {
         },
         |tokens| format!("{tokens} estimated tokens ({what})"),
     )
+}
+
+/// Renders whether a managed session is fitted toward its working target once its provider's
+/// cache has lapsed, saying what each answer does, since the name alone does not.
+fn cold_fit_display(config: &NanusConfig) -> &'static str {
+    if config.context_cold_fit {
+        "on (managed sessions; once the provider's cache has lapsed, old work is hidden toward the \
+         working target before the next request)"
+    } else {
+        "off (managed sessions are fitted only over the model's allowance)"
+    }
 }
 
 /// Renders a resolved path, or names the home when it cannot be resolved.
@@ -2210,6 +2222,17 @@ mod tests {
             ..NanusConfig::default()
         };
         assert_eq!(credential_service_display(&spelled_as_the_default), "nanus");
+    }
+
+    /// The report says cold fitting is on by default and what turning it off leaves.
+    #[test]
+    fn cold_fitting_is_reported_on_by_default_and_off_when_turned_off() {
+        assert!(cold_fit_display(&NanusConfig::default()).starts_with("on ("));
+        let off = NanusConfig {
+            context_cold_fit: false,
+            ..NanusConfig::default()
+        };
+        assert!(cold_fit_display(&off).starts_with("off ("));
     }
 
     #[test]

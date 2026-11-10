@@ -125,6 +125,27 @@ fn the_built_in_defaults_are_the_documented_ones() {
     );
 }
 
+/// Fitting a lapsed cache toward the working target is on unless a file turns it off, and a file
+/// that says nothing about it keeps it on.
+#[test]
+fn cold_fitting_is_on_unless_a_file_turns_it_off() {
+    assert!(NanusConfig::default().context_cold_fit);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "context_working_target = 120000\n").expect("write");
+    assert!(
+        NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_cold_fit
+    );
+    std::fs::write(&path, "context_cold_fit = false\n").expect("write");
+    assert!(
+        !NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_cold_fit
+    );
+}
+
 #[test]
 fn a_missing_file_yields_defaults() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -528,6 +549,7 @@ fn save_then_load_round_trips() {
         max_tokens: Some(1234),
         context_budget: Some(200_000),
         context_working_target: Some(120_000),
+        context_cold_fit: false,
         reasoning_effort: Some(ReasoningEffort::Low),
         approval_policy: ApprovalPolicy::AllCalls,
         sandbox_mode: SandboxMode::DangerFullAccess,
