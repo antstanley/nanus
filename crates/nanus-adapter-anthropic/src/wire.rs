@@ -1188,7 +1188,10 @@ fn decode_stop_reason(raw: &str) -> FinishReason {
     match raw {
         "end_turn" | "stop_sequence" => FinishReason::Stop,
         "tool_use" => FinishReason::ToolCalls,
-        "max_tokens" => FinishReason::Length,
+        // Both are the model running out of room — the response's own budget, or the window
+        // the whole conversation shares — and both leave an answer cut short, which a caller
+        // has to be able to tell from one that ended.
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
         "refusal" => FinishReason::ContentFilter,
         // `pause_turn` and anything a later version adds: preserved rather than
         // guessed at, so a transcript still says what happened.
@@ -1692,6 +1695,11 @@ mod tests {
         assert_eq!(decode_stop_reason("stop_sequence"), FinishReason::Stop);
         assert_eq!(decode_stop_reason("tool_use"), FinishReason::ToolCalls);
         assert_eq!(decode_stop_reason("max_tokens"), FinishReason::Length);
+        // Running out of the context window is a ceiling cut too, not an unrecognised ending.
+        assert_eq!(
+            decode_stop_reason("model_context_window_exceeded"),
+            FinishReason::Length
+        );
         assert_eq!(decode_stop_reason("refusal"), FinishReason::ContentFilter);
         // Preserved rather than mapped to a clean finish.
         assert_eq!(

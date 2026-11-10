@@ -686,19 +686,29 @@ impl StreamAccumulator {
             }
             "response.output_item.done" => self.observe_item_done(frame.get("item")),
             "response.completed" => {
-                if let Some(usage) = frame
-                    .get("response")
-                    .and_then(|response| response.get("usage"))
-                    .filter(|usage| !usage.is_null())
-                {
-                    self.usage = Some(decode_usage(usage));
-                }
+                self.observe_usage(frame);
                 self.finish = Some(FinishReason::Stop);
             }
-            // The response ran out of room rather than finishing, which is a truncated answer and
-            // not a failure.
-            "response.incomplete" => self.finish = Some(FinishReason::Length),
+            // The response stopped short rather than finishing, which is a truncated answer and
+            // not a failure. It was still generated and is still billed, so its usage is read
+            // exactly as a completed response's is: a turn cut at the ceiling is the one whose
+            // accounting matters most.
+            "response.incomplete" => {
+                self.observe_usage(frame);
+                self.finish = Some(incomplete_reason(frame));
+            }
             _ => {}
+        }
+    }
+
+    /// Reads the accounting a terminal event carries inside its `response`.
+    fn observe_usage(&mut self, frame: &Value) {
+        if let Some(usage) = frame
+            .get("response")
+            .and_then(|response| response.get("usage"))
+            .filter(|usage| !usage.is_null())
+        {
+            self.usage = Some(decode_usage(usage));
         }
     }
 
@@ -931,6 +941,25 @@ impl StreamAccumulator {
             });
         }
         Ok(calls)
+    }
+}
+
+/// Reads why an incomplete response stopped.
+///
+/// Running out of output room is the reason there has always been, and it is what an event
+/// that names none is taken to mean. A response withheld by the content filter is a different
+/// ending and is reported as one, and a reason this build does not know is preserved rather
+/// than guessed at, so a transcript still says what happened.
+fn incomplete_reason(frame: &Value) -> FinishReason {
+    let reason = frame
+        .get("response")
+        .and_then(|response| response.get("incomplete_details"))
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str);
+    match reason {
+        None | Some("max_output_tokens") => FinishReason::Length,
+        Some("content_filter") => FinishReason::ContentFilter,
+        Some(other) => FinishReason::Unknown(other.to_owned()),
     }
 }
 
@@ -1226,6 +1255,64 @@ mod tests {
             LlmEvent::Finished {
                 reason: FinishReason::Length
             }
+        );
+    }
+
+    /// The other direction: only running out of room is a ceiling cut. A response the content
+    /// filter withheld says so, and a reason this build has not met is kept in its own words.
+    #[test]
+    fn an_incomplete_response_names_why_it_stopped() {
+        let ended = |reason: Value| {
+            let events = observe(&[json!({"type":"response.incomplete","response":{
+                "incomplete_details":{"reason":reason}
+            }})]);
+            events.last().cloned()
+        };
+        assert_eq!(
+            ended(json!("content_filter")),
+            Some(LlmEvent::Finished {
+                reason: FinishReason::ContentFilter
+            })
+        );
+        assert_eq!(
+            ended(json!("something_new")),
+            Some(LlmEvent::Finished {
+                reason: FinishReason::Unknown("something_new".to_owned())
+            })
+        );
+        // An event that names no reason keeps the meaning it has always had.
+        let unnamed = observe(&[json!({"type":"response.incomplete","response":{}})]);
+        assert_eq!(
+            unnamed.last(),
+            Some(&LlmEvent::Finished {
+                reason: FinishReason::Length
+            })
+        );
+    }
+
+    /// A truncated response was generated and is billed, so its usage is reported; it used to
+    /// be dropped on exactly the turns that hit the ceiling. A response with no usage still
+    /// reports none rather than a zero.
+    #[test]
+    fn an_incomplete_response_still_reports_its_usage() {
+        let events = observe(&[json!({"type":"response.incomplete","response":{
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"input_tokens":9,"output_tokens":4}
+        }})]);
+        let usage = events.iter().find_map(|event| match event {
+            LlmEvent::Usage(usage) => Some(*usage),
+            _ => None,
+        });
+        let usage = usage.expect("the usage is reported");
+        assert_eq!(usage.prompt_tokens, 9);
+        assert_eq!(usage.completion_tokens, 4);
+
+        let silent = observe(&[json!({"type":"response.incomplete","response":{}})]);
+        assert!(
+            !silent
+                .iter()
+                .any(|event| matches!(event, LlmEvent::Usage(_))),
+            "{silent:?}"
         );
     }
 
