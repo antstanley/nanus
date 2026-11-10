@@ -13,7 +13,7 @@
 //! | Store | Right for | Wrong for |
 //! |---|---|---|
 //! | [`KeychainBackend`] (macOS) | an interactive user; the value leaves the environment and survives a reboot | a detached service with no unlocked keychain, or no graphical session at all |
-//! | [`FileBackend`] | that service or a container: a `0600` file under `<nanus home>/secrets` (another service name's under `<nanus home>/service-secrets/<service>`), mode checked | a machine where more than one user shares a home |
+//! | [`FileBackend`] | that service or a container: a `0600` file under `<nanus home>/secrets` (another service name's under `<nanus home>/service-secrets/<service>`), its mode checked on every read and narrowed when wider | a machine where more than one user shares a home |
 //! | [`EnvBackend`] | CI, where the secret is injected into the process | a person's shell, where it is in every subprocess's environment and in `ps` output |
 //!
 //! The default chain is keychain → file → environment. A **read** takes the first

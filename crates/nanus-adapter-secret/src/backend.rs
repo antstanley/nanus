@@ -194,9 +194,15 @@ impl SecretBackend for EnvBackend {
 /// on a bus. It is deliberately the *last* store that can be written, so it is
 /// used only when the platform's own store has refused.
 ///
-/// The file is written atomically: a sibling temporary file, a sync, and a
-/// rename. A half-written secret would be a credential that authenticates as
+/// The file is written atomically on every platform: a sibling temporary file, a sync,
+/// and a rename. A half-written secret would be a credential that authenticates as
 /// nothing, which is worse than a write that visibly failed.
+///
+/// The mode is checked on every read as well as set on every write: a secret found
+/// readable by anyone but its owner is narrowed before it is used. On Windows, where
+/// there is no mode and a `:` in a file name addresses a stream of another file, an
+/// account is filed under a percent-encoded name instead — `zai%3Acoding` — so a plan's
+/// secret is a file of its own.
 ///
 /// The service name keeps credentials apart here as it does in the platform store.
 /// [`crate::DEFAULT_SERVICE`] files under `<home>/secrets`, where every install before
@@ -253,7 +259,7 @@ impl FileBackend {
         // second line of defence rather than the first.
         let directory = self.directory(service);
         if valid_account(account) {
-            return directory.join(account);
+            return directory.join(file_name(account).as_ref());
         }
         directory.join("invalid")
     }
@@ -298,6 +304,7 @@ impl SecretBackend for FileBackend {
         Box::pin(async move {
             Self::usable(service)?;
             let path = self.path(service, account);
+            narrow_if_open(&path);
             let bytes = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -382,36 +389,144 @@ fn restrict(_path: &Path, _mode: u32) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Writes `body` to `path` with owner-only access, atomically.
-#[cfg(unix)]
-fn write_private(path: &Path, body: &str) -> Result<(), std::io::Error> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let temp = path.with_extension("tmp");
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(body.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+/// Whether an account is spelled differently on disk than in the store's vocabulary.
+///
+/// Only on Windows, where a `:` in a file name is not a character but a separator: it names an
+/// alternate data stream of the file before it. Filed as written, `openai:subscription` would be
+/// a stream of the file `openai` — invisible in a listing, dropped by a copy to another file
+/// system, and deleted along with the API key's file by `nanus auth clear openai`. Elsewhere the
+/// name is kept as it is, so every secret already filed is still found.
+const ENCODES_FILE_NAMES: bool = cfg!(windows);
+
+/// Returns the file name `account` is stored under.
+fn file_name(account: &str) -> std::borrow::Cow<'_, str> {
+    if ENCODES_FILE_NAMES {
+        return std::borrow::Cow::Owned(portable_file_name(account));
     }
-    if let Err(error) = std::fs::rename(&temp, path) {
+    std::borrow::Cow::Borrowed(account)
+}
+
+/// Spells `account` with nothing a Windows file name gives a meaning to.
+///
+/// Every character outside letters, digits, `.`, `-` and `_` becomes `%` and its bytes in
+/// hexadecimal — the `%` itself included, which is what keeps two accounts from ever sharing a
+/// name: `zai:coding` is `zai%3Acoding`, and an account spelled `zai%3Acoding` is
+/// `zai%253Acoding`. A name ending in a dot, which Windows would silently drop, has that dot
+/// encoded too.
+fn portable_file_name(account: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let last = account.len().saturating_sub(1);
+    let mut name = String::with_capacity(account.len());
+    for (index, byte) in account.bytes().enumerate() {
+        let plain = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_')
+            || (byte == b'.' && index != last);
+        if plain {
+            name.push(char::from(byte));
+        } else {
+            name.push('%');
+            name.push(char::from(HEX[usize::from(byte >> 4)]));
+            name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    name
+}
+
+/// Narrows a secret that is readable by more than its owner, before it is read.
+///
+/// This store's own writes are owner-only from the moment the file exists, so a wider mode
+/// means the file was put there by hand — `echo key > secrets/openai` under an ordinary umask
+/// — or restored by something that did not keep modes. The credential is the user's either
+/// way, so it is still read; but it is narrowed first and the fact is logged, rather than
+/// left open for as long as nobody rewrites it.
+#[cfg(unix)]
+fn narrow_if_open(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        // Absent or unreadable: the read that follows reports which.
+        return;
+    };
+    // The group's and everyone else's bits, which this store never sets.
+    let open_to_others = metadata.permissions().mode() & 0o077 != 0;
+    if !open_to_others {
+        return;
+    }
+    match restrict(path, 0o600) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            "a stored secret was readable by other users; narrowed it to its owner"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "a stored secret is readable by other users and could not be narrowed"
+        ),
+    }
+}
+
+/// Leaves a secret's access alone where the platform has no mode bits to check.
+#[cfg(not(unix))]
+const fn narrow_if_open(_path: &Path) {}
+
+/// Opens `path` for a fresh write that only its owner can read.
+#[cfg(unix)]
+fn create_private(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Opens `path` for a fresh write where access follows the directory rather than a mode.
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+}
+
+/// Returns the sibling a secret is written to before it takes `path`'s place.
+///
+/// Named for the process as well as the secret, so two processes storing the same account —
+/// both renewing one authorization — never write through each other's half-finished file, and
+/// begun with a dot so it is not mistaken for an account in a listing.
+fn staging_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
+}
+
+/// Writes `body` and a final newline to the staging file `temp`, and syncs it.
+fn stage(temp: &Path, body: &str) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+    let mut file = create_private(temp)?;
+    file.write_all(body.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+/// Writes `body` to `path` with owner-only access, atomically, on every platform.
+///
+/// A sibling file, a sync, and a rename: a reader sees the old secret or the new one, never
+/// half of either.
+fn write_private(path: &Path, body: &str) -> Result<(), std::io::Error> {
+    let temp = staging_path(path);
+    let written = stage(&temp, body).and_then(|()| std::fs::rename(&temp, path));
+    if let Err(error) = written {
+        // Whatever part of the secret reached the sibling does not stay behind.
         if std::fs::remove_file(&temp).is_ok() {
             tracing::debug!("discarded a temporary secret file");
         }
         return Err(error);
     }
     restrict(path, 0o600)
-}
-
-/// Writes `body` to `path` where the platform has no mode bits.
-#[cfg(not(unix))]
-fn write_private(path: &Path, body: &str) -> Result<(), std::io::Error> {
-    std::fs::write(path, body)
 }
 
 #[cfg(test)]
@@ -619,6 +734,120 @@ mod tests {
             dir.ok().map(|mode| mode & 0o777),
             Some(0o700),
             "so is another service name's"
+        );
+    }
+
+    /// A secret put there by hand under an ordinary umask is readable by everyone on the
+    /// machine. It is still the user's credential, so it is read — and narrowed first, rather
+    /// than left open until something rewrites it.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_left_readable_by_others_is_narrowed_when_it_is_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(home.path());
+        let path = backend.path("nanus", "openai");
+        std::fs::create_dir_all(backend.root()).expect("the directory");
+        std::fs::write(&path, "sk-by-hand\n").expect("the file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let read = futures::executor::block_on(backend.get("nanus", "openai"));
+        assert_eq!(
+            read.ok().flatten().map(|secret| secret.expose().to_owned()),
+            Some(String::from("sk-by-hand"))
+        );
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "narrowed to its owner");
+
+        // The pair: a secret that was already owner-only is read and left exactly as it was.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        assert!(futures::executor::block_on(backend.get("nanus", "openai")).is_ok());
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o400, "an owner-only mode is not rewritten");
+    }
+
+    /// The spelling a Windows file name needs: a `:` there names a stream of another file, so
+    /// a plan's account must not keep one. Every account still has a name of its own.
+    #[test]
+    fn a_portable_file_name_has_no_separator_and_no_two_accounts_share_one() {
+        assert_eq!(portable_file_name("openai"), "openai");
+        assert_eq!(portable_file_name("z.ai"), "z.ai");
+        assert_eq!(portable_file_name("zai:coding"), "zai%3Acoding");
+        assert_eq!(
+            portable_file_name("openai:subscription"),
+            "openai%3Asubscription"
+        );
+        // The escape is escaped, so an account that is spelled like an encoded one is not it.
+        assert_eq!(portable_file_name("zai%3Acoding"), "zai%253Acoding");
+        // A trailing dot is one Windows drops, which would file `a.` over `a`.
+        assert_eq!(portable_file_name("a."), "a%2E");
+        for reserved in ['<', '>', ':', '"', '|', '?', '*', ' '] {
+            let name = portable_file_name(&format!("a{reserved}b"));
+            assert!(!name.contains(reserved), "{reserved:?} survives in {name}");
+        }
+    }
+
+    /// The other direction: where a `:` is only a character the name is kept as written, so a
+    /// secret every existing install has already filed is still found under it.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_account_keeps_its_own_name_where_a_colon_is_only_a_character() {
+        let backend = FileBackend::new(Path::new("/tmp/nanus-test-home"));
+        assert_eq!(
+            backend.path("nanus", "openai:subscription"),
+            backend.root().join("openai:subscription")
+        );
+    }
+
+    /// A plan's account and its provider's are two secrets: storing and clearing one leaves the
+    /// other alone, which on Windows is exactly what a stream of the provider's file would not.
+    #[test]
+    fn clearing_a_providers_secret_leaves_its_plans_secret_alone() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(home.path());
+        let set =
+            |account, value| futures::executor::block_on(backend.set("nanus", account, value));
+        assert!(set("openai", "sk-api").is_ok());
+        assert!(set("openai:subscription", "the-grant").is_ok());
+        assert_ne!(
+            backend.path("nanus", "openai"),
+            backend.path("nanus", "openai:subscription")
+        );
+
+        let cleared = futures::executor::block_on(backend.clear("nanus", "openai"));
+        assert_eq!(cleared.ok(), Some(true));
+        let kept = futures::executor::block_on(backend.get("nanus", "openai:subscription"));
+        assert_eq!(
+            kept.ok().flatten().map(|secret| secret.expose().to_owned()),
+            Some(String::from("the-grant"))
+        );
+    }
+
+    /// A write leaves the secret and nothing else: the sibling it was staged in is gone, so a
+    /// listing of the directory is a listing of accounts.
+    #[test]
+    fn a_write_leaves_no_staging_file_behind() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(home.path());
+        assert!(futures::executor::block_on(backend.set("nanus", "z.ai", "sk-1")).is_ok());
+        assert!(futures::executor::block_on(backend.set("nanus", "z.ai", "sk-2")).is_ok());
+        let names: Vec<String> = std::fs::read_dir(backend.root())
+            .expect("the directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![String::from("z.ai")]);
+        let read = futures::executor::block_on(backend.get("nanus", "z.ai"));
+        assert_eq!(
+            read.ok().flatten().map(|secret| secret.expose().to_owned()),
+            Some(String::from("sk-2")),
+            "the second write replaced the first"
         );
     }
 

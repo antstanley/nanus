@@ -241,10 +241,16 @@ printing any value.
   directory and log take the new modes when the session is next claimed and written.
   The home itself is left as the user made it.
 
-The file store's and the session store's `0600`/`0700` permissions apply on Unix. On
-Windows, files inherit the containing directory's ACL; neither sets an explicit
-descriptor. Choose a home directory that other users cannot read, or use environment
-credentials.
+The file store's and the session store's `0600`/`0700` permissions apply on Unix. For the
+file store that holds on a read as well as a write: a secret found readable by anyone but its
+owner — one written by hand under an ordinary umask — is narrowed to `0600` before it is used,
+and the fact is logged. On Windows, files inherit the containing directory's ACL; neither store
+sets an explicit descriptor. Choose a home directory that other users cannot read, or use
+environment credentials.
+There an account is also filed under a percent-encoded name (`openai%3Asubscription`), because a
+`:` in a Windows file name addresses an alternate data stream: filed as written, a plan's secret
+would be a stream of its provider's file and be deleted with it. A secret a previous build filed
+that way is not migrated — store or authorize it again.
 
 What this does **not** do: the file store is not encrypted, so a secret in it is
 readable by anything running as you — as the environment variable already was. The
