@@ -446,7 +446,15 @@ impl JsonlStore {
             }
             Err(source) => return Err(io_error(&path, &source)),
         };
-        Session::from_jsonl(&raw).map_err(|error| corrupt(id, &error))
+        let session = Session::from_jsonl(&raw).map_err(|error| corrupt(id, &error))?;
+        // The directory is the key and the header is what every later write is addressed by:
+        // the caller claims and saves `session.id()`. A log whose header names another session
+        // — a directory copied to fork a conversation, a backup restored under a new name —
+        // would therefore load as that other session and be saved over it.
+        if session.id() != id {
+            return Err(misfiled(id, session.id().as_str()));
+        }
+        Ok(session)
     }
 
     /// Records `name` for `id`, refusing a name another session already holds.
@@ -851,6 +859,21 @@ fn not_found(id: &SessionId) -> StoreError {
     }
 }
 
+/// Builds the refusal for a log filed under one id whose header names another.
+///
+/// Corrupt rather than not found: something is stored there, and the message has to say what,
+/// because the remedy is the reader's — rename the directory to the id its header names, or
+/// edit the header to the directory's.
+fn misfiled(id: &SessionId, named: &str) -> StoreError {
+    StoreError::Corrupt {
+        id: id.as_str().to_owned(),
+        message: format!(
+            "the log filed under this id says it is session {named:?}; a session directory is \
+             named for the id in its header"
+        ),
+    }
+}
+
 /// Translates a domain session error into the port's corrupt error.
 ///
 /// The port has a single `Corrupt` variant, so the *kind* of damage is carried in
@@ -1017,6 +1040,12 @@ fn parse_header(line: &str, id: &SessionId, number: u64) -> StoreResult<Value> {
             id: id.as_str().to_owned(),
             message: format!("expected format {SESSION_FORMAT_TAG:?}, found {format:?}"),
         });
+    }
+    // The same refusal a load makes, so a listing never offers a session a load would refuse
+    // and a checkpoint never compares itself against another session's file.
+    let named = header.get("id").and_then(Value::as_str).unwrap_or_default();
+    if named != id.as_str() {
+        return Err(misfiled(id, named));
     }
     let version = header_version(&header);
     // Every version the domain reads, not only the newest: a session is written at the lowest
