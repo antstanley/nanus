@@ -459,6 +459,32 @@ mod tests {
     }
 
     #[test]
+    fn a_call_an_earlier_turn_never_answered_does_not_keep_a_later_turn_open() {
+        // What a crash between a call and its result leaves behind, once the turn is closed.
+        // The next turn's final answer has nothing of its own outstanding, so it closes;
+        // it used to continue, step after step, until the budget closed it instead.
+        let mut log = SessionLog::new();
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::StepStart { turn: 1, step: 1 });
+        log.append(SessionEvent::ToolCall {
+            call_id: ToolCallId::new("abandoned"),
+            name: tool_name("read"),
+            arguments: json!({}),
+        });
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            reason: TurnEndReason::Interrupted,
+        });
+        log.append(SessionEvent::TurnStart { turn: 2 });
+        log.append(SessionEvent::StepStart { turn: 2, step: 1 });
+        assert!(machine().owed_tool_calls(&log).is_empty());
+        assert_eq!(
+            machine().decide(&log, &StepOutcome::FinalAnswer),
+            TurnOutcome::Completed
+        );
+    }
+
+    #[test]
     fn a_settled_tool_call_lets_the_final_answer_close_the_turn() {
         let mut log = log_with_one_step();
         log.append(SessionEvent::ToolCall {
