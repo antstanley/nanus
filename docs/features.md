@@ -112,8 +112,9 @@ existing TempDir/copy behavior is preserved. This local unpublished seam and its
 [certificate](../.specs/changes/2026-10-03-video_snapshot.review.md) do not establish
 downstream host integration, image budget acceptance or native Windows execution.
 
-Off unless `read_video = true`. Needs `ffmpeg` and `ffprobe` (on `PATH`, or in `ffmpeg_dir`); the
-agent refuses to start without them, or with a build that lacks the WebM/Matroska, MP4/MOV, AVI
+Off unless `read_video = true`. Needs `ffmpeg` and `ffprobe` (on `PATH`, or in `ffmpeg_dir`; only
+absolute `PATH` entries are searched, so a file of that name in the working directory is never the
+decoder, and a relative `ffmpeg_dir` is resolved once, at start); the agent refuses to start without them, or with a build that lacks the WebM/Matroska, MP4/MOV, AVI
 and MPEG demuxers or the H.264, HEVC, MPEG-4, MPEG-2, MJPEG, VP8, VP9 and AV1 decoders. Nothing is
 installed for you.
 
