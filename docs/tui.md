@@ -996,6 +996,32 @@ key, and pastes *text* into the composer instead, which is what that key does ev
 binding is for the terminals that pass it through, and there is no way to ask which kind you have
 other than to press it.
 
+### Pasting text
+
+**A paste is text, and never a command.** The interface asks the terminal for *bracketed* paste,
+so pasted text arrives as one event rather than as the keys that would have typed it. That
+distinction is the whole of it. A terminal that is not asked types a paste, and a line break is
+typed as `Enter` — which here sends. A pasted paragraph was a prompt per line, a pasted line
+beginning with `/` was a command, and one beginning with `!` was run in the shell the moment its
+line break arrived, by someone who had only meant to paste.
+
+So a paste goes into the composer as it is — its own line breaks (`\r\n`, `\r` and `\n` alike),
+a tab as four spaces, every other control character dropped, and without the line breaks it ends
+on — and is not sent, whatever it holds. Sending is `Enter`, pressed by the reader, on a draft
+they can see. Elsewhere:
+
+- **The masked key field** takes a paste as the key, without its line breaks, and does not store
+  it: that is still `Enter`. A clipboard that begins with a line break used to close the field
+  empty and type the key into the composer in clear.
+- **An approval question, a preview, and the `/clear` warning** refuse it, say so, and start their
+  quiet again: they are answered with a key, and a pasted `y` is not one.
+- **Every other dialog** refuses it and says so; nothing is typed behind a dialog.
+- **A history search** takes the paste's first line into its query.
+
+A terminal that does not know bracketed paste ignores the request and goes on typing its pastes;
+nothing can be done about that from here, and there is no way to ask which kind of terminal it
+is. The mode is given back on every way out, before the screen is restored.
+
 ### How hard the model is asked to think
 
 `Alt+T` steps the reasoning effort, and the title bar names the step in force. The neutral scale is

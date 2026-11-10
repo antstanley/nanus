@@ -65,6 +65,12 @@ pub(crate) const APPROVAL_SETTLE: Duration = Duration::from_millis(500);
 /// keeps it visible when the dialog is drawn over the status line.
 pub(crate) const HELD_KEY_NOTICE: &str = "that key was not taken as an answer";
 
+/// How the status line begins when a paste was refused by a dialog that is answered with keys.
+///
+/// Named for the reason [`HELD_KEY_NOTICE`] is: the routing that says it and the frame that
+/// keeps it visible over a dialog must agree.
+pub(crate) const PASTE_NOTICE: &str = "that paste was not taken";
+
 /// How many files a mention menu lists at once.
 ///
 /// Six is a glance rather than a list: the menu sits directly above the composer, and every row it
@@ -2928,7 +2934,8 @@ impl ViewState {
         let copied = self.status.starts_with("copied ")
             || self.status.starts_with("the UI text was not copied")
             || self.status == "there is no UI text to copy"
-            || self.status.starts_with(HELD_KEY_NOTICE);
+            || self.status.starts_with(HELD_KEY_NOTICE)
+            || self.status.starts_with(PASTE_NOTICE);
         let hidden = status.is_none_or(|row| row.height == 0 || dialog.intersects(row));
         if copied && hidden && dialog.height > 0 {
             let banner = Rect {
