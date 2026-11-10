@@ -28,6 +28,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `umask`, so a socket is private from the instant it is bound rather than narrowed a moment
+# later. A safe wrapper rather than a raw call, because the workspace forbids `unsafe`.
+nix = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 nanus-sys-windows = { workspace = true }
 # The same-user handshake a named pipe needs and a `0700` socket directory does not; see

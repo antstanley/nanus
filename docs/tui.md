@@ -76,7 +76,9 @@ this workspace forbids `unsafe` everywhere. The socket is the local equivalent â
 kernel copies bytes between two file descriptors and no packet reaches a network
 interface. There is no port and nothing listening on an address, the run directory is
 `0700` and the socket `0600`, and the reachable set is therefore "processes already
-running as you", which can read the workspace and the session log anyway.
+running as you", which can read the workspace and the session log anyway. Both ends also ask
+the kernel which user the other end runs as and refuse anyone else, so that stays true of a
+socket somebody chose to put in a directory that is not private.
 
 The protocol is deliberately tiny. A client says what it wants â€” start a session, attach
 to one, list the ones the agent is holding, ask a question, send a prompt, stop, answer an

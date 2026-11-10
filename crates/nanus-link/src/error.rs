@@ -46,6 +46,22 @@ pub enum LinkError {
         source: std::io::Error,
     },
 
+    /// What is listening at a Unix socket runs as another user.
+    ///
+    /// The operating system says who a socket's peer is, and a client asks before it sends
+    /// anything: a socket in a directory other accounts can write to is one another account can
+    /// be listening at, and it must not be handed a prompt or a credential.
+    #[error(
+        "refusing the agent link at {path}: {reason}. Keep an agent's socket in a directory \
+         only you can write to"
+    )]
+    OtherUser {
+        /// The socket that was tried.
+        path: PathBuf,
+        /// Who the peer is, and who this process is.
+        reason: String,
+    },
+
     /// The peer at a Windows pipe could not prove it belongs to this user.
     ///
     /// The pipe's name is predictable and global, so another account can hold it. A client that
@@ -127,6 +143,21 @@ mod tests {
         };
         let rendered = error.to_string();
         assert!(rendered.contains("/tmp/nanus.sock"), "{rendered}");
+        assert!(!rendered.contains("no agent is listening"), "{rendered}");
+    }
+
+    #[test]
+    fn an_agent_that_is_another_users_names_the_socket_and_both_users() {
+        let error = LinkError::OtherUser {
+            path: PathBuf::from("/tmp/other.sock"),
+            reason: String::from("the peer runs as user 502 and this process as user 501"),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("/tmp/other.sock"), "{rendered}");
+        assert!(
+            rendered.contains("502") && rendered.contains("501"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("no agent is listening"), "{rendered}");
     }
 

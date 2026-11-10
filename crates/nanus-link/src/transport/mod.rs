@@ -53,15 +53,22 @@ impl Stream {
     /// # Errors
     ///
     /// Returns [`LinkError::Connect`] when nothing is listening, [`LinkError::Inaccessible`] when
-    /// something is but this process may not open it, and [`LinkError::Unverified`] when the
-    /// agent at a Windows pipe cannot prove it belongs to this user.
+    /// something is but this process may not open it, [`LinkError::OtherUser`] when the agent at
+    /// a Unix socket runs as another user, and [`LinkError::Unverified`] when the agent at a
+    /// Windows pipe cannot prove it belongs to this user.
     pub async fn connect(endpoint: &Path) -> LinkResult<Self> {
         #[cfg(unix)]
         {
-            tokio::net::UnixStream::connect(endpoint)
+            let stream = tokio::net::UnixStream::connect(endpoint)
                 .await
-                .map(Self::Unix)
-                .map_err(|source| refused_connect(endpoint, source))
+                .map_err(|source| refused_connect(endpoint, source))?;
+            // Before anything is sent: what is listening at a path somebody else could have
+            // reached first must be this user's agent, or it is told nothing at all.
+            unix::require_same_user(&stream).map_err(|refusal| LinkError::OtherUser {
+                path: endpoint.to_path_buf(),
+                reason: refusal.to_string(),
+            })?;
+            Ok(Self::Unix(stream))
         }
         #[cfg(windows)]
         {
@@ -114,18 +121,26 @@ pub struct Accepted {
 impl Accepted {
     /// Proves this agent to the peer and requires the peer to prove itself.
     ///
-    /// On Unix there is nothing to prove: the socket's directory is the user's alone, so a peer
-    /// that reached it already is the user.
+    /// On Unix the proof is the kernel's: it says which user the peer runs as, and anyone but
+    /// this user is refused. The default socket's directory is the user's alone, so there the
+    /// answer is always yes; it is asked because a socket can be put in a directory that is not.
     ///
     /// # Errors
     ///
-    /// Returns [`LinkError::Io`] when the peer does not hold this user's link key within
-    /// the handshake's timeout.
+    /// Returns [`LinkError::Io`] when the peer runs as another user, or — on Windows — does not
+    /// hold this user's link key within the handshake's timeout.
     // Unix has nothing to await; the signature is the Windows one, which does.
     #[cfg_attr(unix, allow(clippy::unused_async, clippy::unused_async_trait_impl))]
     pub async fn verify(self) -> LinkResult<Stream> {
         #[cfg(unix)]
         {
+            let Stream::Unix(stream) = &self.stream;
+            unix::require_same_user(stream).map_err(|refusal| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("a client was not accepted as this user: {refusal}"),
+                )
+            })?;
             Ok(self.stream)
         }
         #[cfg(windows)]
