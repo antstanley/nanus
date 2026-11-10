@@ -298,7 +298,7 @@ fn exact_chat_models_can_carry_a_managed_projection() {
             llm.managed_support(model),
             ManagedSupport::Supported {
                 policy_version: 1,
-                layout_version: 2
+                layout_version: 3
             },
             "{model}"
         );

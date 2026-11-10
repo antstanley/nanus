@@ -261,13 +261,16 @@ Compilation (`derive_effective_context`) is fixed in order:
 2. Keep every original user message and every protected fragment; hidden ids remove whole
    eligible fragments and nothing else; what survives keeps its original order.
 3. Render the accepted notes and the goal objective as one labelled **assistant** text message,
-   with no calls, reasoning or replay, immediately after the earliest user message. Its text
-   changes only when the note array or the goal objective changes. Revision numbers, the goal's
-   phase, revision and provenance, note staleness and the hidden-history catalog are stated in the
-   tail, never here. A session with neither notes nor a goal has no such message, even when
-   fragments are hidden.
-4. Never make that message the last one: a fresh request with nothing after its first user
-   message carries no generated data, and the tail says `goal_data_available=false`.
+   with no calls, reasoning or replay, at its **anchor** (see
+   [Where the working data goes](#where-the-working-data-goes)). Its text changes only when the
+   note array or the goal objective changes. Revision numbers, the goal's phase, revision and
+   provenance, note staleness and the hidden-history catalog are stated in the tail, never here.
+   A session with neither notes nor a goal has no such message, even when fragments are hidden.
+   The compiler names the message by its index (`Effective::working_data`, carried to the adapter
+   as `ChatRequest::working_data`), never by its words.
+4. Never make that message the last one, and never put it between a call and its result. While
+   nothing follows its anchor — a fresh request with nothing after its first user message — the
+   request carries no generated data, and the tail says `goal_data_available=false`.
 5. Render the **tail**: the fixed-schema notice line and, when anything is hidden, the bounded
    recovery catalog. The notice line states the counts, revision, estimate and its estimator,
    allowance, working target, pressure against the target, the budget hint, the goal's phase, revision and provenance, note staleness, and recovery
@@ -281,8 +284,8 @@ A managed request has three parts, in this order:
 
 | Part | Holds | Changes when |
 |---|---|---|
-| Head | Tool schemas; the system prompt with `MANUAL_POLICY_V1` and `MANAGED_REQUEST_GUIDE_V2`; a seed; the first user message; the working-data message | The model, effort, schemas, policy, seed, note array or goal objective changes |
-| Body | The selected conversation, in event order | It grows by appending. It changes in place only when a revision hides or restores a fragment, and then only from the earliest fragment the revision changed |
+| Head | Tool schemas; the system prompt with `MANUAL_POLICY_V1` and `MANAGED_REQUEST_GUIDE_V2`; a seed; the first user message | The model, effort, schemas, policy or seed changes |
+| Body | The selected conversation, in event order, with the working-data message at its anchor | It grows by appending. It changes in place only when a revision hides or restores a fragment, from the earliest fragment the revision changed, or when the working data's text changes, from where its earlier copy stood |
 | Tail | The notice line and the catalog | Every request |
 
 **Nothing that changes from one step to the next comes before the newest message.** Take two
@@ -290,10 +293,58 @@ consecutive requests of a session with no revision, goal, policy, schema, model 
 between them. Remove the tail and the cache markers from both. The earlier request's encoding is
 then a prefix of the later one's.
 
-There is one exception. When notes or a goal exist before a session's first prompt (a goal set
-with `/goal`, or a seeded session's notes), the first request has no working-data message,
-because it would be last. The second request inserts it after the first user message. Every
-adapter is tested for the rule and for this exception.
+There is no exception for the working data. When it first appears, or moves, it is placed at the
+end of what the previous request carried, so the previous request is still a prefix. A change to
+its text removes the earlier copy, so the request is re-read from where that copy stood; nothing
+before it moves. Every adapter is tested for the rule, for a goal created and a note array
+changed mid-session, and for a goal set before the first prompt.
+
+### Where the working data goes
+
+The message is anchored at the log position where its text last changed. The compiler folds the
+log on every derivation: the notes and their goal binding from each `context/revision`, and the
+objective from each `goal/change`. The anchor is the last event after which the rendered text
+differed from the text before it. Nothing new is recorded, so two derivations of one log agree,
+and a reload agrees with both.
+
+- An automatic fit re-records the same notes, and a goal phase or revision change keeps the
+  objective, so neither moves the anchor.
+- A candidate the log does not hold yet (a staged proposal being proved) is anchored at the end of
+  the log. That is where its revision will be recorded, so the proof measures the request that
+  will be sent.
+
+The anchor names a place through the latest model reply or human message recorded before it:
+
+| Latest before the anchor | The message goes | Typical change |
+|---|---|---|
+| A model reply | Directly before that reply's assistant message, or before the next kept message when that reply is hidden | A goal tool inside a step, a proposal accepted when its step settles, a host's `/goal` between turns |
+| A human message | Directly after it | A change made after a prompt and before any reply |
+| Nothing (the change came before the first prompt) | Directly after the first user message | `/goal` before the first prompt; a seeded session's goal |
+
+In every case the reply named is the answer to the request sent just before the change, and that
+request ended where the message now goes. So the request after a change extends the one before
+it. The message is placed before the reply rather than after it, because after it would be the end
+of the conversation when the change is a proposal accepted at the end of a step, and the message
+must never be last. Before an assistant message it can never sit between a call and its result.
+
+When nothing follows the place yet, the message is left out and the tail says
+`goal_data_available=false`. It appears on the first request in which something follows, at the
+end of the request that left it out. The position depends only on the log before the anchor and
+the hidden set, so appending never moves it.
+
+The message may therefore follow tool results, a user message or an assistant answer, and precede
+a user message or an assistant message. Two assistant messages side by side are sent as they are
+on every wire: chat completions and Responses have no alternation rule, and the Messages API
+combines consecutive turns of one role into one turn. On `DeepSeek` the message carries an empty
+`reasoning_content`, because thinking mode refuses an earlier assistant message without one when
+the request carries tools (measured live; see [what is verified](#what-is-and-is-not-verified)).
+Anthropic signs thinking against the prefix, so a reply after the message whose signed blocks were
+produced without it there is sent neutrally, as after any change to its prefix.
+
+A change costs the provider cache what follows the earlier copy. The old layout put the message
+after the first user message, so every change re-read the whole conversation after it. A
+session's first change still re-reads from wherever an earlier copy stood, and a session with no
+earlier copy re-reads nothing it had sent.
 
 Deterministic hard fitting acts only when the candidate is over the hard allowance, or over the
 working target once the provider's cache has lapsed
@@ -431,18 +482,23 @@ Support requires the official endpoint and a known model; anything else is unsup
 | Anthropic | `https://api.anthropic.com/v1` | `anthropic.messages` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Supported |
 
 Inception's row rests on the same local preparation and reload fixtures as the other chat
-providers, including the exact body the prepared call sends. Inception and DeepSeek have been sent
-live managed requests only without a working-data message;
-[what is and is not verified](#what-is-and-is-not-verified) records what that does and does not
-cover.
+providers, including the exact body the prepared call sends. It, `DeepSeek` and the subscription
+plan have been sent short live managed exchanges; the rest of the table has not.
+[What is and is not verified](#what-is-and-is-not-verified) records both.
 
 The output reservation must be present and within the model's declared ceiling; it is refused,
-never clamped. Every adapter validates the managed role grammar — leading system messages only
-(the system prompt and a seeded session's handoff seed), the generated message, when present,
-directly after the first user message and never last, every surviving call paired with exactly one
-result, and a conversation that ends with a user message or tool results, which is where the tail
-goes. Generated data is identified by that
-position; a model reply elsewhere that opens with the same label is sent as the reply it is.
+never clamped. Every adapter validates the managed role grammar:
+
+- leading system messages only (the system prompt and a seeded session's handoff seed);
+- the generated message, when present, where `ChatRequest::working_data` names it: after the
+  conversation's first message, an assistant message of labelled text alone, and followed by a
+  user or an assistant message, so it is never last and never parts a call from its result;
+- every surviving call paired with exactly one result;
+- a conversation that ends with a user message or tool results, which is where the tail goes.
+
+The checks are `ChatRequest::check_working_data`, shared by every adapter. Generated data is
+identified by that index, which the compiler states beside the messages as it states the tail. A
+model reply anywhere that opens with the same label is sent as the reply it is.
 Under managed preparation the chat decoders also bound a call's arguments before its name is
 known, at one record.
 
@@ -496,8 +552,9 @@ in what the managed compiler selected, the tail, and the head breakpoint:
 - A result is a `function_call_output`. A result that carries images is answered with its label,
   and the original text and pixels follow as one `user` item once the whole group of results has
   been answered.
-- The generated working-data message is an `assistant` item directly after the first user item,
-  and never last.
+- The generated working-data message is an `assistant` item of `output_text` where the compiler
+  names it, and never last. It may follow a `function_call_output` or an assistant item and
+  precede a `user` or an `assistant` item.
 
 History is always plain. The body carries `store: false` and never `previous_response_id`,
 `include`, a reasoning item, or any other protocol's replay. An assistant turn recorded with replay
@@ -596,8 +653,10 @@ tells a managed runner when its cache has lapsed ([fitting a lapsed cache](#fitt
 1. the first `system` block, which is the harness's system prompt. A seed or a compaction summary
    follows in later blocks, so the entry is shared by every session with the same model, tools and
    prompt;
-2. the last block of the head: the working-data message when present, otherwise the first `user`
-   message;
+2. the last block of the head, which is the first `user` message. The working-data message is not
+   marked: it is placed where the previous request ended, so breakpoint 3 or 4 of this request
+   falls on it or just after it, and the entry the previous request wrote at its end is within
+   the lookback;
 3. the last block of the message immediately before the last `assistant` message. That is where
    the previous request wrote its entry, so the next request reads it even when more than twenty
    blocks were appended in between;
@@ -625,9 +684,10 @@ API plan, when the runner opted into caching, two parts carry
    anything session-specific. A session's requests write and read this entry, so a seed, a
    summary or a change to the head after it still reads the prompt from cache;
 2. in managed requests only, the head's last `input_text` part, which is the first user item's.
-   The working-data message after it is an `assistant` item whose part is `output_text`, which no
-   breakpoint is documented on, so it is re-read on every step. A fit that leaves the head
-   unchanged still reads the entry.
+   A fit that leaves the head unchanged still reads the entry. The working-data message is an
+   `assistant` item whose part is `output_text`, which no breakpoint is documented on. It is
+   placed where the previous request ended, so the implicit breakpoint covers it like the rest of
+   the conversation.
 
 These are OpenAI's first two explicit breakpoints, which it always looks up. The implicit
 breakpoint stays on and covers the growing conversation.
@@ -1023,8 +1083,8 @@ request the session makes, the first included (`compile::seed_message`). It open
 with a fixed label (`HANDOFF_SEED_LABEL`) saying it is a handoff a model wrote from an earlier
 session, generated data rather than a user instruction and not proof, then `Source session: <id>.`,
 a blank line and the document. A leading system message is the one slot every request has: the
-generated message must sit after the first user message and never last, so a session's first
-request, which is only the first prompt, has no place for it, and a seed carried there would be
+generated message never comes before the first user message and is never last, so a session's
+first request, which is only the first prompt, has no place for it, and a seed carried there would be
 missing from exactly the request that needs it. It is not a user message, because the model that
 wrote it is not the human. It is not a fragment, so it cannot be hidden, and it is composed into
 every candidate the fitter probes, so its bytes count toward the request's fit.
@@ -1131,6 +1191,10 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   - every wire: the placement of the elision tail.
 
   The runner compares a legacy run through both entry points;
+- the working data's anchor: where its text last changed, before the reply that changed it, after
+  a user message, deferred while nothing follows, before the next kept message when its reply is
+  hidden, unmoved by a fit or a phase change, identical after a reload, and a staged candidate
+  placed where its revision will be;
 - fragment derivation, protection, compilation, hard fitting, proposal staging and revalidation,
   the reset barrier and the boundary schema (a test checks every payload against
   `context-management.schema.json`);
@@ -1166,7 +1230,13 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   budget bounding the reservation a host's enable records;
 - the three-part layout. On every adapter and wire:
   - three consecutive steps of a managed turn encode with a stable prefix;
-  - the first-turn exception breaks only after the first user message;
+  - a goal set before the first prompt appears at the end of the first request, which stays a
+    prefix of the second;
+  - a goal a model creates mid-session leaves the previous request a prefix, which the head
+    layout failed, and the steps after it stay stable;
+  - a note change rewrites only from the earlier copy: the previous request without it is a prefix;
+  - the working data, named by index, is refused when last, between a call and its result, first,
+    or naming another message, and a reply that opens with its label is sent as a reply;
   - a fit leaves the head unchanged when it changes no notes;
   - the tail is always the last content and is never recorded;
   - a message encodes identically whether or not it is the newest;
@@ -1226,7 +1296,33 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   after tool results, and so are a trailing `system` and a trailing `user` tail. No placement
   reads more from cache than the appended one (the table under
   [Request layout and provider caches](#request-layout-and-provider-caches)). A test without
-  network checks that the probe's appended arm is the bytes each adapter sends.
+  network checks that the probe's appended arm is the bytes each adapter sends;
+- live, on 2026-11-10, anchored working data (`*_anchored_working_data*` in
+  `nanus-bundle/tests/live_cache.rs`). Each case sends three managed requests: one after two tool
+  results; then, after an answer and a host's `/goal`, one whose working data follows the tool
+  results and precedes that answer and a user message; then one after another tool result. All
+  three providers accepted every request, and each model named the goal it was only given there.
+  Prompt and cache-read tokens per request:
+
+  | Provider and model | Request 1 | Request 2 | Request 3 |
+  |---|---|---|---|
+  | `DeepSeek`, `deepseek-flash` | 7,694 / 7,040 | 7,770 / 7,424 | 8,012 / 7,424 |
+  | `DeepSeek`, the same with no goal (the control) | 7,694 / 7,552 | 7,718 / 7,424 | 7,960 / 7,424 |
+  | Inception, `mercury-3` | 7,511 / 1 | 7,621 / 7,207 | 7,815 / 7,167 |
+  | `OpenAI` `subscription`, `gpt-5.6-sol` | 7,270 / 0 | 7,350 / 0 | 7,504 / 7,168 |
+
+  `DeepSeek`'s request 2 read request 1 to its last whole 128-token unit before the tail, as the
+  control did. Its first request read a system prompt an earlier probe had written. Inception read
+  more than 90 % of each previous request. The subscription read nothing at request 2, as it has
+  irregularly before (see below). A second `DeepSeek` run of the same bodies read more, because
+  the first run's entries were warm, and its model answered that the goal was in generated data it
+  would not treat as an instruction.
+- live, on 2026-11-10, with `deepseek-flash` and tools offered: the generated message without
+  `reasoning_content` is refused with a 400 (thinking mode requires one on every earlier assistant
+  message), with an empty `reasoning_content` it is accepted, and the request without it is
+  accepted (`deepseek_requires_reasoning_content_on_the_working_data`). So the adapter sends the
+  message `ChatRequest::working_data` names with an empty `reasoning_content`. The head layout sent
+  none, so every `DeepSeek` managed request that carried working data was refused.
 
 Not verified, and not claimed:
 
@@ -1274,11 +1370,14 @@ Not verified, and not claimed:
 - **The subscription reservation is not enforced by the provider.** The tests show the reservation
   is charged and that the body omits it. The window the subscription is fitted to is the model's
   declared window, by decision, and has not been measured against the backend.
-- **Few paths have been sent a managed request live.** They are the subscription plan, and the
-  DeepSeek and Inception requests above, none of which carried a working-data message. The rest
-  of the provider matrix rests on wire and reload fixtures. In particular, nothing yet proves that
-  a provider accepts the generated assistant message followed by an original one, or that
-  DeepSeek, z.ai and Inception accept a generated turn without `reasoning_content`.
+- **Most of the provider matrix has not been sent a managed request live.** `DeepSeek`, Inception
+  and the subscription plan accepted anchored working data (above). The `OpenAI` API plan on
+  either wire, z.ai and Anthropic have not been sent it; they rest on wire and reload fixtures. In
+  particular nothing proves that the Messages API accepts the generated assistant turn beside an
+  original one, which its documentation says it combines into one turn, or that z.ai accepts a
+  generated turn without `reasoning_content`. A `DeepSeek` request whose history holds another
+  provider's assistant turn with no reasoning would be refused the same way the working data was;
+  that is not handled here.
 - **The working target's number is arithmetic, not a measured optimum.** It is derived from the
   recorded sessions above. No test shows that a model acts on the hint, or what a session acting on
   it costs.

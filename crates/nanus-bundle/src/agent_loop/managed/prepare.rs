@@ -193,8 +193,8 @@ impl AgentRunner {
         }
         let model = self.model();
         let llm = self.llm();
-        // An adapter built for an earlier layout would drop the tail, so it is not a managed path
-        // whatever policy it implements.
+        // An adapter built for an earlier layout would drop the tail or refuse anchored working
+        // data, so it is not a managed path whatever policy it implements.
         let support = llm.managed_support(&model);
         if let nanus_ports::ManagedSupport::Supported { layout_version, .. } = support
             && layout_version != limits::LAYOUT_VERSION
@@ -327,6 +327,10 @@ impl AgentRunner {
         // A seeded session's handoff document leads every request, the first included, after the
         // system prompt. It is composed here, so every probe the fitter measures carries it too.
         request.messages.extend(effective.seed);
+        // Named beside the messages, at its place after the system messages just pushed.
+        request.working_data = effective
+            .working_data
+            .map(|at| at.saturating_add(request.messages.len()));
         request.messages.extend(effective.messages);
         // The notice and catalog are the tail, which the adapter places after the newest message
         // and which every probe carries too, so each is costed as what would be sent.
@@ -604,12 +608,13 @@ impl AgentRunner {
             .managed_reservation(caps, turn.policy())
             .unwrap_or_else(|| turn.policy().output_reserve_tokens);
         let status = Self::status_of(
-            (session, snapshot, frontier),
+            (snapshot, frontier),
             (selection, estimate.input_tokens, &facts),
             (
                 turn.context
                     .is_some_and(|context| context.archive().is_some()),
                 &profile,
+                request.working_data.is_some(),
             ),
             reserve,
         );
@@ -644,15 +649,15 @@ impl AgentRunner {
 
     /// Builds the status a prepared request is described by.
     fn status_of(
-        at: (&Session, &Snapshot, ContextFrontier),
+        at: (&Snapshot, ContextFrontier),
         prepared: (Selection<'_>, u32, &NoticeFacts),
-        extra: (bool, &Digest),
+        extra: (bool, &Digest, bool),
         output_reserve_tokens: u32,
     ) -> ContextStatus {
-        let (session, snapshot, frontier) = at;
+        let (snapshot, frontier) = at;
         let (selection, estimate, facts) = prepared;
-        let (archive, profile) = extra;
-        let anchor_follows = session.derive_messages().len() > 1;
+        // Whether the request carries the working data: its anchor may have nothing after it yet.
+        let (archive, profile, anchor_follows) = extra;
         ContextStatus {
             mode: ContextMode::Managed,
             revision: selection.revision,

@@ -411,18 +411,37 @@ fn notes_bound_to_an_older_goal_are_marked_stale() {
         "{}",
         tool_result(&session, "i2").0
     );
-    let last = model.sent().pop().unwrap();
+    let mut sent = model.sent();
+    let last = sent.pop().unwrap();
+    let before = sent.pop().unwrap();
+    let at = last
+        .working_data
+        .expect("the request names its working data");
     let memory = last
         .messages
-        .get(2)
+        .get(at)
         .and_then(nanus_domain::Message::text)
         .unwrap_or_default()
         .to_owned();
     assert!(memory.contains("n:echo"), "{memory}");
     assert!(memory.contains("a new direction"));
     // Staleness moves with the goal, so it is stated in the tail rather than in the working data
-    // that heads the cached prefix.
+    // the cached prefix carries.
     assert!(!memory.contains("STALE"), "{memory}");
+    // The goal tool moved the working data from before the proposal to before its own call, which
+    // is where the request before it ended: that request without its copy is a prefix of this one.
+    let earlier = before
+        .working_data
+        .expect("the accepted notes were in the step before");
+    let mut kept = before.messages;
+    kept.remove(earlier);
+    assert_eq!(at, kept.len(), "at the end of the request before");
+    assert_eq!(kept[..], last.messages[..kept.len()]);
+    assert!(matches!(
+        last.messages.get(at.saturating_add(1)),
+        Some(nanus_domain::Message::Assistant { tool_calls, .. })
+            if tool_calls.iter().any(|call| call.id.as_str() == "g")
+    ));
     assert_eq!(
         last.prompt_cache_key.as_deref(),
         Some(session.id().as_str()),

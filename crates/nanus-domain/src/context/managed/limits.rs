@@ -104,13 +104,18 @@ pub const CATALOG_BYTES_MAX: usize = 2 * 1024;
 /// and the catalog has its own bound.
 pub const TAIL_BYTES_MAX: usize = CATALOG_BYTES_MAX + 1024;
 
-/// The managed request layout this build compiles: the per-step notice and the catalog travel in
-/// `ChatRequest::context_tail`, which the adapter places after the newest message.
+/// The managed request layout this build compiles.
 ///
-/// An adapter declares it beside the policy version it implements, so one built for the earlier
-/// layout — which knew nothing of the tail and would drop it — cannot claim support. It is not
-/// recorded in a session, so moving it costs no session anything.
-pub const LAYOUT_VERSION: u32 = 2;
+/// Layout 2 put the per-step notice and the catalog in `ChatRequest::context_tail`, which the
+/// adapter places after the newest message. Layout 3 anchors the generated working-data message
+/// where its text last changed rather than after the first user message, and names it by index in
+/// `ChatRequest::working_data` rather than by position: it may follow a tool result or an answer
+/// and precede a user or an assistant message.
+///
+/// An adapter declares it beside the policy version it implements, so one built for an earlier
+/// layout — which would refuse, or misread, a working-data message anywhere but second — cannot
+/// claim support. It is not recorded in a session, so moving it costs no session anything.
+pub const LAYOUT_VERSION: u32 = 3;
 
 /// Encoded bytes of one inspect result.
 pub const INSPECT_BYTES_MAX: usize = 8 * 1024;

@@ -173,7 +173,7 @@ impl LlmPort for Model {
     fn managed_support(&self, _: &str) -> ManagedSupport {
         ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2,
+            layout_version: 3,
         }
     }
     fn prepare_managed(&self, request: ManagedRequest) -> LlmResult<Box<dyn PreparedModelCall>> {

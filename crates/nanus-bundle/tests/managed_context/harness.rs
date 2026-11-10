@@ -72,7 +72,7 @@ impl ModelExt for Model {
             sent: RefCell::new(Vec::new()),
             digests: RefCell::new(Vec::new()),
             supported: Cell::new(true),
-            layout: Cell::new(2),
+            layout: Cell::new(3),
             echoes: Cell::new(0),
             lifetimes: Cell::new(false),
         })

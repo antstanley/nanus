@@ -1,8 +1,9 @@
 //! Managed preparation over a real socket: the bytes that leave are the bytes that were measured.
 //!
 //! The request each fixture prepares is compiled by the domain's own managed compiler from a
-//! session — the system prompt, the generated working-data message after the first user
-//! message, one hidden fragment absent, and the tail — so the grammar under test is the one the
+//! session — the system prompt, the generated working-data message anchored after a tool result and
+//! before the reply it precedes, one hidden fragment absent, and the tail — so the grammar under
+//! test is the one the
 //! runner produces rather than a hand-written imitation of it. The server captures the body it
 //! received, which is what lets the assertions be about what was sent.
 
@@ -103,13 +104,17 @@ fn compiled(session: &Session) -> ChatRequest {
         &facts,
     )
     .unwrap();
-    assert!(effective.memory, "the goal makes a generated message");
+    // The goal is not in the log yet, so it is anchored now: before the newest reply, `d`.
+    let at = effective
+        .working_data
+        .expect("the goal makes a generated message");
     let mut messages = vec![Message::system("you are nanus")];
     messages.extend(effective.messages);
     ChatRequest::new(MODEL_FLASH, messages)
         .with_tools(vec![schema("read"), schema("context_manage")])
         .with_max_tokens(4_096)
         .with_context_tail(effective.tail)
+        .with_working_data(at + 1)
 }
 
 fn schema(name: &str) -> ToolSchema {
@@ -271,13 +276,20 @@ async fn a_managed_request_sends_exactly_the_bytes_it_prepared() {
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    assert_eq!(&roles[..4], ["system", "user", "assistant", "assistant"]);
+    // After a tool result and before an original reply: two assistant messages side by side.
+    assert_eq!(
+        &roles[5..9],
+        ["assistant", "tool", "assistant", "assistant"]
+    );
+    assert_eq!(request.working_data, Some(7));
     assert!(
-        sent["messages"][2]["content"]
+        sent["messages"][7]["content"]
             .as_str()
             .unwrap()
             .starts_with("[nanus working data")
     );
+    // Thinking mode refuses an earlier assistant message without one when tools are sent.
+    assert_eq!(sent["messages"][7]["reasoning_content"], json!(""));
     // The tail is appended to the final tool result, after a blank line.
     let last = sent["messages"].as_array().unwrap().last().unwrap();
     assert_eq!(last["role"], "tool");
@@ -402,7 +414,7 @@ fn only_the_official_endpoint_and_current_models_are_supported() {
         official.managed_support(MODEL_PRO),
         ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2
+            layout_version: 3
         }
     );
     assert_eq!(
@@ -426,7 +438,7 @@ fn only_the_official_endpoint_and_current_models_are_supported() {
 /// Expects a preparation refusal that names `code`.
 fn refused_with(request: ChatRequest, code: &str) {
     match prepare(&llm(), managed(request)) {
-        Err(error) => assert!(error.to_string().contains(code), "{error}"),
+        Err(error) => assert!(error.to_string().contains(code), "{code}: {error}"),
         Ok(_) => panic!("expected a {code} refusal"),
     }
 }
@@ -449,10 +461,26 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     let valid = compiled(&session());
     assert!(prepare(&llm(), managed(valid.clone())).is_ok());
 
+    let at = valid.working_data.unwrap();
     let mut last = valid.clone();
-    last.messages.truncate(3);
-    assert!(matches!(&last.messages[2], Message::Assistant { .. }));
+    last.messages.truncate(at + 1);
+    last.context_tail = None;
     refused_with(last, "generated data is never the last message");
+
+    // Moved between `c`'s call and its result, it would part the two.
+    let mut split = valid.clone();
+    let generated = split.messages.remove(at);
+    split.messages.insert(at - 1, generated);
+    split.working_data = Some(at - 1);
+    refused_with(split, "never parts a call from its result");
+
+    let mut first = valid.clone();
+    first.working_data = Some(1);
+    refused_with(first, "follows the first message");
+
+    let mut misnamed = valid.clone();
+    misnamed.working_data = Some(at + 1);
+    refused_with(misnamed, "not generated working data");
 
     let mut answered = valid.clone();
     answered
@@ -465,6 +493,8 @@ fn a_request_outside_the_managed_grammar_is_refused() {
         !matches!(message, Message::Assistant { tool_calls, .. }
         if tool_calls.first().is_some_and(|call| call.id.as_str() == "c"))
     });
+    // One message before the working data is gone, so it is named one place earlier.
+    orphan.working_data = Some(at - 1);
     refused_with(orphan, "answers no surviving call");
 
     let mut unanswered = valid.clone();
@@ -477,13 +507,14 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     late_system.messages.push(Message::system("late"));
     refused_with(late_system, "follows the conversation");
 
-    // F15: text that opens with the label anywhere but directly after the first user message
-    // is the model's own reply, sent as it is; refusing it would let one reply wedge a session.
-    let mut moved = valid;
-    let generated = moved.messages.remove(2);
-    moved.messages.insert(4, generated);
+    // F15: only the index names generated data. Text that opens with the label anywhere else is
+    // the model's own reply, sent as it is; refusing it would let one reply wedge a session.
+    let mut forged = valid;
+    let reply = forged.messages.remove(at);
+    forged.messages.insert(2, reply);
+    forged.working_data = None;
     assert!(
-        prepare(&llm(), managed(moved)).is_ok(),
+        prepare(&llm(), managed(forged)).is_ok(),
         "a labelled reply elsewhere is sent"
     );
 }

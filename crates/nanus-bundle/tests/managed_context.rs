@@ -103,16 +103,16 @@ fn activation_refuses_an_unsupported_model_without_changing_the_session() {
     );
 }
 
-/// C13: an adapter built for the earlier layout, which would drop the tail, cannot carry a
-/// managed session: enabling is refused and a session already managed is unready, both with
-/// `unsupported_mode`.
+/// C13: an adapter built for an earlier layout — one that would drop the tail, or refuse the
+/// working data anywhere but second — cannot carry a managed session: enabling is refused and a
+/// session already managed is unready, both with `unsupported_mode`.
 #[test]
 fn an_adapter_declaring_the_earlier_layout_is_unsupported() {
     let model = <Model as ModelExt>::new(Vec::new());
     let runner = runner(&model, 64_000);
     let disk = Disk::new();
     let context = context();
-    model.set_layout(1);
+    model.set_layout(2);
     let mut session = session();
     let refused = block(runner.set_context_policy(
         &mut session,
@@ -124,9 +124,9 @@ fn an_adapter_declaring_the_earlier_layout_is_unsupported() {
         refused.err().and_then(|error| error.managed_code()),
         Some(ErrorCode::UnsupportedMode)
     );
-    model.set_layout(2);
+    model.set_layout(3);
     let (managed, _, _) = managed(&runner);
-    model.set_layout(1);
+    model.set_layout(2);
     let status = runner
         .context_status(&managed, host(&disk, &context).runtime)
         .unwrap();

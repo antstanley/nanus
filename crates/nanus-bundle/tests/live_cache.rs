@@ -53,11 +53,16 @@ fn schema() -> ToolSchema {
     }
 }
 
+/// One recorded step: a call to `read` and its result.
+///
+/// The call carries the reasoning a thinking model records, because `DeepSeek`'s thinking mode
+/// refuses an earlier assistant message without its `reasoning_content` when the request carries
+/// tools. The other wires never send an earlier turn's reasoning, so their bodies are unchanged.
 fn work(session: &mut Session, id: &str) {
     session.append(SessionEvent::AssistantMessage {
         replay: None,
         text: None,
-        reasoning: None,
+        reasoning: Some(format!("I should read {id}.txt.")),
         tool_calls: vec![ToolCall::new(
             ToolCallId::new(id),
             ToolName::new("read").unwrap(),
@@ -95,16 +100,27 @@ fn step(model: &str, session: &Session, prompt: &str) -> ChatRequest {
         notes: &[],
         notes_goal_revision: None,
     };
-    let effective =
-        derive_effective_context(session, &derived, &protected, selection, None, &facts).unwrap();
+    let goal = session.goal();
+    let effective = derive_effective_context(
+        session,
+        &derived,
+        &protected,
+        selection,
+        goal.as_ref(),
+        &facts,
+    )
+    .unwrap();
     let mut messages = vec![Message::system(prompt)];
+    let working_data = effective.working_data.map(|at| at.saturating_add(1));
     messages.extend(effective.messages);
-    ChatRequest::new(model, messages)
+    let mut request = ChatRequest::new(model, messages)
         .with_tools(vec![schema()])
         .with_max_tokens(2_048)
         .with_context_tail(effective.tail)
         .with_prompt_cache(PromptCacheRetention::Short)
-        .with_prompt_cache_key(session.id().as_str())
+        .with_prompt_cache_key(session.id().as_str());
+    request.working_data = working_data;
+    request
 }
 
 /// Three consecutive managed steps of one turn over synthetic history.
@@ -1141,4 +1157,231 @@ async fn inception_tail_placement_probe() {
     ))
     .unwrap();
     placement_probe(Chat::Inception(llm), &api_key, model).await;
+}
+
+// --- Anchored working data ----------------------------------------------------------------------
+
+/// The objective a host sets between turns, with a word no prompt mentions, so an answer that
+/// names it read the working data.
+const OBJECTIVE: &str = "ship the PARSNIP parser";
+
+/// Three requests around a goal a host sets between turns, and their usage.
+///
+/// 1. A step after two tool results, with no working data.
+/// 2. The next turn, after a synthetic answer and a host's `/goal`: the working data is anchored
+///    before that answer — after the tool results, followed by an original assistant message and
+///    then a user message — which is where request 1 ended, so request 1 is its prefix.
+/// 3. A step after one more tool result: request 2 is its prefix.
+async fn anchored_working_data(llm: &dyn LlmPort, model: &str, prompt: &str) -> [Usage; 3] {
+    exchange_around_a_goal(llm, model, prompt, true).await
+}
+
+/// The three requests of [`anchored_working_data`], with the host's goal (`set`) or without it, as
+/// the control a cache reading is compared with.
+async fn exchange_around_a_goal(
+    llm: &dyn LlmPort,
+    model: &str,
+    prompt: &str,
+    set: bool,
+) -> [Usage; 3] {
+    let mut session = Session::new(
+        SessionId::new(format!("live-anchor-{set}-{}", prompt.len())),
+        0,
+        "/live",
+    );
+    session.upgrade_to_managed_body();
+    session.append(SessionEvent::UserMessage {
+        text: "Read a.txt, then b.txt, then say done.".into(),
+        content_blocks: None,
+    });
+    work(&mut session, "a");
+    work(&mut session, "b");
+    let one = step(model, &session, prompt);
+    assert_eq!(one.working_data, None);
+    let (first, _) = managed(llm, one).await;
+    session.append(SessionEvent::AssistantMessage {
+        replay: None,
+        text: Some("done".into()),
+        reasoning: Some("Both files are read.".into()),
+        tool_calls: Vec::new(),
+        usage: None,
+        interrupted: false,
+        model: None,
+        effort: None,
+    });
+    if set {
+        session.append(SessionEvent::GoalChange {
+            goal: Some(nanus_domain::goal::Goal::new(OBJECTIVE, 1).unwrap()),
+        });
+    }
+    session.append(SessionEvent::UserMessage {
+        text: "Without calling any tool, state the session goal in one short sentence.".into(),
+        content_blocks: None,
+    });
+    let two = step(model, &session, prompt);
+    if !set {
+        assert_eq!(two.working_data, None);
+        let (second, _) = managed(llm, two).await;
+        work(&mut session, "c");
+        let (third, _) = managed(llm, step(model, &session, prompt)).await;
+        for (label, usage) in [("1", &first), ("2", &second), ("3", &third)] {
+            eprintln!(
+                "[{model}] control request {label}: prompt {} cache hit {}",
+                usage.prompt_tokens, usage.cache_hit_tokens
+            );
+        }
+        return [first, second, third];
+    }
+    let at = two.working_data.unwrap();
+    let around = |offset: usize| two.messages.get(at.saturating_add(offset));
+    assert!(matches!(
+        two.messages.get(at.saturating_sub(1)),
+        Some(Message::Tool { .. })
+    ));
+    assert!(matches!(around(1), Some(Message::Assistant { .. })));
+    assert!(matches!(around(2), Some(Message::User { .. })));
+    let (second, events) = managed(llm, two).await;
+    let text = answer(&events);
+    eprintln!(
+        "[{model}] names the goal: {} ({text:?})",
+        text.to_uppercase().contains("PARSNIP")
+    );
+    work(&mut session, "c");
+    let (third, _) = managed(llm, step(model, &session, prompt)).await;
+    for (label, usage) in [("1", &first), ("2", &second), ("3", &third)] {
+        eprintln!(
+            "[{model}] anchored request {label}: prompt {} cache hit {} reported {}",
+            usage.prompt_tokens, usage.cache_hit_tokens, usage.cache_hit_reported
+        );
+    }
+    [first, second, third]
+}
+
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn deepseek_accepts_anchored_working_data_and_reads_past_it() {
+    let model = nanus_adapter_deepseek::MODEL_FLASH;
+    let llm = nanus_adapter_deepseek::DeepSeekLlm::new(
+        nanus_adapter_deepseek::DeepSeekConfig::new(model, key("deepseek").await),
+    )
+    .unwrap();
+    let [first, second, third] = anchored_working_data(&llm, model, &long_prompt()).await;
+    assert_deepseek_reads(model, &first, &second, &third);
+}
+
+/// `DeepSeek` reads in whole units, and both of a step's end units hold its tail: request 2 reads
+/// request 1 up to its last whole unit before the tail, and request 3 reads at least that much.
+fn assert_deepseek_reads(model: &str, first: &Usage, second: &Usage, third: &Usage) {
+    let tail = 160;
+    assert_reads(model, first, second, tail, 128);
+    assert!(
+        third.cache_hit_tokens >= second.cache_hit_tokens,
+        "{model}: request 3 read less"
+    );
+}
+
+/// The control for the case above: the same three requests with no goal, so no working data.
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn deepseek_reads_the_same_without_working_data() {
+    let model = nanus_adapter_deepseek::MODEL_FLASH;
+    let llm = nanus_adapter_deepseek::DeepSeekLlm::new(
+        nanus_adapter_deepseek::DeepSeekConfig::new(model, key("deepseek").await),
+    )
+    .unwrap();
+    let [first, second, third] = exchange_around_a_goal(&llm, model, &long_prompt(), false).await;
+    assert_deepseek_reads(model, &first, &second, &third);
+}
+
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn inception_accepts_anchored_working_data_and_reads_past_it() {
+    let model = "mercury-3";
+    let llm = nanus_adapter_openai::OpenAiLlm::new(nanus_adapter_openai::OpenAiConfig::new(
+        nanus_adapter_openai::Vendor::Inception,
+        model,
+        key("inception").await,
+    ))
+    .unwrap();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prompt = format!("Run {nonce}. {}", long_prompt());
+    let [first, second, third] = anchored_working_data(&llm, model, &prompt).await;
+    // The share measured for this provider's cache, as in its step-to-step case.
+    for (earlier, later) in [(&first, &second), (&second, &third)] {
+        let floor = earlier
+            .prompt_tokens
+            .saturating_mul(9)
+            .checked_div(10)
+            .unwrap_or(0);
+        assert!(later.cache_hit_tokens >= floor, "{model}: below {floor}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: spends subscription quota"]
+async fn openai_subscription_accepts_anchored_working_data() {
+    let llm = subscription(RESPONSES_MODEL).await;
+    // Acceptance only: the subscription's cache routing is not understood (see the guide).
+    let _ = anchored_working_data(&llm, RESPONSES_MODEL, &long_prompt()).await;
+}
+
+/// `DeepSeek`'s thinking mode refuses an earlier assistant message with no `reasoning_content` when
+/// the request carries tools, the generated working data included, and accepts an empty one, which
+/// is what the adapter sends for the message the request names. Three requests: the adapter's
+/// body, the same body with the field removed, and the body without the working data.
+#[tokio::test]
+#[ignore = "live: spends API credit"]
+async fn deepseek_requires_reasoning_content_on_the_working_data() {
+    let model = nanus_adapter_deepseek::MODEL_FLASH;
+    let api_key = key("deepseek").await;
+    let llm = nanus_adapter_deepseek::DeepSeekLlm::new(
+        nanus_adapter_deepseek::DeepSeekConfig::new(model, api_key.clone()),
+    )
+    .unwrap();
+    let mut session = Session::new(SessionId::new("live-reasoning"), 0, "/live");
+    session.upgrade_to_managed_body();
+    session.append(SessionEvent::UserMessage {
+        text: "Read a.txt, then b.txt, then c.txt, then say done.".into(),
+        content_blocks: None,
+    });
+    work(&mut session, "a");
+    work(&mut session, "b");
+    session.append(SessionEvent::GoalChange {
+        goal: Some(nanus_domain::goal::Goal::new(OBJECTIVE, 1).unwrap()),
+    });
+    work(&mut session, "c");
+    let request = step(model, &session, &long_prompt());
+    let at = request.working_data.unwrap();
+    let sent = llm.encode(&request);
+    assert_eq!(sent["messages"][at]["reasoning_content"], json!(""));
+    let mut absent = sent.clone();
+    absent["messages"][at]
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoning_content");
+    let mut without = sent.clone();
+    without["messages"].as_array_mut().unwrap().remove(at);
+    let mut statuses = Vec::new();
+    for (label, body) in [
+        ("sent", sent),
+        ("absent", absent),
+        ("no working data", without),
+    ] {
+        let response = reqwest::Client::new()
+            .post(llm.endpoint())
+            .bearer_auth(&api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        let excerpt: String = text.chars().take(160).collect();
+        eprintln!("[{model}] working data reasoning_content {label}: {status} {excerpt}");
+        statuses.push(status.as_u16());
+    }
+    assert_eq!(statuses, [200, 400, 200]);
 }

@@ -16,6 +16,15 @@
 //! (`deepseek_tail_placement_probe` in `nanus-bundle`'s `live_cache`). Every other message, an
 //! assistant's `reasoning_content` included, encodes to the same bytes whether or not it is the
 //! newest.
+//!
+//! ## The working data's `reasoning_content`
+//!
+//! In thinking mode a request that carries tools must pass back every earlier assistant message's
+//! `reasoning_content`, and one without it is refused with a 400 — measured live on 2026-11-10 with
+//! `deepseek-flash` for the generated working-data message, which has no reasoning. The message the
+//! request names in `ChatRequest::working_data` is therefore sent with an empty
+//! `reasoning_content`, which the same probe showed is accepted. It is found by that index, never
+//! by its words, so a model reply that opens with the same label is sent as the reply it is.
 
 use nanus_domain::{Message, ToolSchema, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, ReasoningEffort};
@@ -50,7 +59,10 @@ pub fn build_request(config: &DeepSeekConfig, request: &ChatRequest) -> Value {
     // would answer every switch with the model the composition started on. See the OpenAI-compatible
     // adapter for the same fix and the case that exposed it.
     body.insert("model".to_owned(), json!(request.model));
-    body.insert("messages".to_owned(), encode_messages(&request.messages));
+    body.insert(
+        "messages".to_owned(),
+        encode_messages(&request.messages, request.working_data),
+    );
     body.insert("stream".to_owned(), json!(true));
     // Usage rides on the final content chunk; asking for it explicitly is what
     // makes `include_usage` true, and DeepSeek tolerates the field only alongside
@@ -124,17 +136,31 @@ fn insert_effort(body: &mut Map<String, Value>, effort: ReasoningEffort) {
 }
 
 /// Encodes the conversation in `DeepSeek`'s message shape.
+///
+/// The message at `working_data`, when a managed request names one, is the generated working data
+/// and is sent with an empty `reasoning_content`, which thinking mode requires of every earlier
+/// assistant message when the request carries tools.
 #[must_use]
-pub fn encode_messages(messages: &[Message]) -> Value {
+pub fn encode_messages(messages: &[Message], working_data: Option<usize>) -> Value {
     // Chat completions carries pixels in a *user* message, not in a tool message. A tool result
     // with images therefore becomes a labelled tool message plus a user attachment, and the
     // attachments of a run of consecutive results follow the whole run, after every tool message
     // its assistant turn is owed. Anything else is encoded as it always was.
     let mut turns = Vec::new();
     let mut attachments = Vec::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         if !matches!(message, Message::Tool { .. }) {
             turns.append(&mut attachments);
+        }
+        if working_data == Some(index) {
+            let mut encoded = encode_message(message);
+            if let Some(object) = encoded.as_object_mut() {
+                object
+                    .entry("reasoning_content")
+                    .or_insert_with(|| json!(""));
+            }
+            turns.push(encoded);
+            continue;
         }
         // Another protocol's opaque turn: nothing in it can be said here.
         if message.is_replay_only() {
@@ -747,6 +773,39 @@ mod tests {
         let body = build_request(&config, &request(vec![Message::user("hi")]));
         assert_eq!(body["thinking"]["type"], json!("enabled"));
         assert_eq!(body["reasoning_effort"], json!("high"));
+    }
+
+    /// Thinking mode refuses an earlier assistant message with no `reasoning_content` when the
+    /// request carries tools, so the named working data carries an empty one; the same text where
+    /// nothing names it is a model reply and is sent as it was.
+    #[test]
+    fn the_named_working_data_carries_an_empty_reasoning_content_and_nothing_else_does() {
+        let generated = || {
+            Message::assistant(
+                Some(format!(
+                    "{}\n\nGoal: ship it",
+                    nanus_domain::context::managed::compile::MEMORY_LABEL
+                )),
+                None,
+                Vec::new(),
+            )
+        };
+        let messages = vec![
+            Message::user("first"),
+            generated(),
+            Message::assistant(Some("done".into()), Some("because".into()), Vec::new()),
+            generated(),
+            Message::user("second"),
+        ];
+        let mut named = request(messages.clone());
+        named.working_data = Some(1);
+        let body = build_request(&config(), &named);
+        assert_eq!(body["messages"][1]["reasoning_content"], json!(""));
+        assert_eq!(body["messages"][2]["reasoning_content"], json!("because"));
+        assert!(body["messages"][3].get("reasoning_content").is_none());
+        let plain = build_request(&config(), &request(messages));
+        assert!(plain["messages"][1].get("reasoning_content").is_none());
+        assert_eq!(plain["messages"][3], body["messages"][3]);
     }
 
     #[test]

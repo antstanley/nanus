@@ -7,7 +7,13 @@
 //! of the later one's.
 
 use nanus_domain::context::managed::compile::{NoticeFacts, Selection, derive_effective_context};
-use nanus_domain::context::managed::{FragmentId, fragments, state};
+use nanus_domain::context::managed::limits::POLICY_VERSION;
+use nanus_domain::context::managed::notes::notes_digest;
+use nanus_domain::context::managed::records::{
+    ContextFrontier, NoteCategory, ProjectionRevision, RevisionAuthor, RevisionReason, SourceField,
+    SourceKind, SourceRef, WorkingNote,
+};
+use nanus_domain::context::managed::{Digest, FragmentId, NoteId, fragments, state};
 use nanus_domain::goal::Goal;
 use nanus_domain::{
     Message, Session, SessionEvent, SessionId, ToolCall, ToolCallId, ToolName, ToolSchema,
@@ -191,16 +197,18 @@ fn request(messages: Vec<Message>) -> ChatRequest {
         .with_prompt_cache(PromptCacheRetention::Short)
 }
 
-/// The managed request the runner composes for `session` now, hiding `hidden`.
+/// The managed request the runner composes for `session` now, hiding `hidden`, with the notes the
+/// log has accepted.
 fn step(session: &Session, hidden: &[FragmentId]) -> ChatRequest {
     let derived = fragments::derive(session.log()).unwrap();
     let protected = state::protected(session.log(), &derived);
+    let accepted = state::ManagedState::fold(session.log()).unwrap();
     let goal = session.goal();
     let selection = Selection {
-        revision: u64::from(!hidden.is_empty()),
+        revision: accepted.revision().max(u64::from(!hidden.is_empty())),
         hidden,
-        notes: &[],
-        notes_goal_revision: goal.as_ref().map(Goal::revision),
+        notes: accepted.notes(),
+        notes_goal_revision: accepted.notes_goal_revision(),
     };
     let events = u32::try_from(session.log().events().len()).unwrap();
     let facts = NoticeFacts {
@@ -222,8 +230,93 @@ fn step(session: &Session, hidden: &[FragmentId]) -> ChatRequest {
     .unwrap();
     let mut messages = vec![Message::system("you are nanus")];
     messages.extend(effective.seed);
+    let working_data = effective
+        .working_data
+        .map(|at| at.saturating_add(messages.len()));
     messages.extend(effective.messages);
-    request(messages).with_context_tail(effective.tail)
+    let mut request = request(messages).with_context_tail(effective.tail);
+    request.working_data = working_data;
+    request
+}
+
+/// `request` as it would be without its working-data message: the earlier copy a change removes.
+fn without_working_data(request: &ChatRequest) -> ChatRequest {
+    let mut request = request.clone();
+    if let Some(at) = request.working_data.take() {
+        request.messages.remove(at);
+    }
+    request
+}
+
+/// A step whose goal tool sets `objective`, recorded between the call and its result.
+fn goal_step(session: &mut Session, id: &str, objective: &str) {
+    session.append(SessionEvent::AssistantMessage {
+        replay: None,
+        text: None,
+        reasoning: None,
+        tool_calls: vec![ToolCall::new(
+            ToolCallId::new(id),
+            ToolName::new("create_goal").unwrap(),
+            json!({ "objective": objective }),
+        )],
+        usage: None,
+        interrupted: false,
+        model: None,
+        effort: None,
+    });
+    session.append(SessionEvent::GoalChange {
+        goal: Some(Goal::new(objective, 1).unwrap()),
+    });
+    session.append(SessionEvent::ToolResult {
+        call_id: ToolCallId::new(id),
+        content: "goal set".into(),
+        content_blocks: None,
+        is_error: false,
+    });
+}
+
+fn note(id: &str, claim: &str) -> WorkingNote {
+    WorkingNote {
+        id: NoteId::parse(id).unwrap(),
+        claim: claim.into(),
+        category: NoteCategory::Observed,
+        sources: vec![SourceRef {
+            kind: SourceKind::Event,
+            event_seq: Some(2),
+            block_index: None,
+            artifact_id: None,
+            offset: 0,
+            length: 1,
+            source_digest: Digest::of(b"x"),
+            field: SourceField::ToolText,
+        }],
+    }
+}
+
+/// Records an accepted model revision carrying `notes`, as a settled proposal step does.
+fn revise(session: &mut Session, notes: &[WorkingNote]) {
+    let base = state::ManagedState::fold(session.log()).unwrap().revision();
+    session.append(SessionEvent::ContextRevision {
+        payload: Box::new(ProjectionRevision {
+            revision: base.saturating_add(1),
+            base_revision: base,
+            base_frontier: ContextFrontier {
+                session_id: "layout".into(),
+                event_count: session.log().next_seq().value(),
+                prefix_blake3: Digest::of(b"prefix"),
+                projection_revision: base,
+            },
+            hidden: Vec::new(),
+            notes: notes.to_vec(),
+            author: RevisionAuthor::Model,
+            reason: RevisionReason::ModelProposal,
+            policy_version: POLICY_VERSION,
+            decision_id: format!("d-{base}"),
+            goal_revision: None,
+            notes_digest: notes_digest(notes),
+            base_profile_digest: Digest::of(b"profile"),
+        }),
+    });
 }
 
 /// Three consecutive steps of a managed turn, the third crossing into a new human turn.
@@ -267,21 +360,84 @@ fn three_managed_steps_encode_with_a_stable_prefix_on_every_path() {
     }
 }
 
-/// C3: a goal set before the first prompt breaks only after the first user message, once.
+/// C3: a goal set before the first prompt first appears directly after the first prompt, at the
+/// end of the first request, so even that request is a prefix of the second, on every path.
 #[test]
-fn a_goal_before_the_first_prompt_breaks_only_after_the_first_user_message() {
+fn a_goal_before_the_first_prompt_appears_at_the_end_of_the_first_request() {
     for path in PATHS {
         let bodies = three_steps(true).map(|request| path.stripped(&request, Layout::Managed));
         let list = path.list();
-        let first = bodies[0][list].as_array().unwrap();
         let second = bodies[1][list].as_array().unwrap();
-        let user = first
+        let user = second
             .iter()
             .position(|item| item["role"] == "user")
             .unwrap();
-        assert_eq!(first[..=user], second[..=user], "{path:?}");
         assert_eq!(second[user + 1]["role"], "assistant", "{path:?}");
+        assert_prefix(path, &bodies[0], &bodies[1]);
         assert_prefix(path, &bodies[1], &bodies[2]);
+    }
+}
+
+/// C3, the case the head layout failed: a goal a model creates at step N leaves the request
+/// before it a prefix of the request after it, on every path, and the steps after stay stable.
+#[test]
+fn a_goal_created_mid_session_extends_the_previous_request_on_every_path() {
+    let mut session = session(false);
+    user(&mut session, "first");
+    work(&mut session, "a", "output a");
+    work(&mut session, "b", "output b");
+    let before = step(&session, &[]);
+    goal_step(&mut session, "g", "ship the parser");
+    let after = step(&session, &[]);
+    assert_eq!(after.working_data, Some(before.messages.len()));
+    work(&mut session, "c", "output c");
+    let next = step(&session, &[]);
+    work(&mut session, "d", "output d");
+    let third = step(&session, &[]);
+    for path in PATHS {
+        let [before, after, next, third] =
+            [&before, &after, &next, &third].map(|request| path.stripped(request, Layout::Managed));
+        assert_prefix(path, &before, &after);
+        assert_prefix(path, &after, &next);
+        assert_prefix(path, &next, &third);
+    }
+}
+
+/// C3: a note change accepted at step N rewrites the request only from where the earlier copy was:
+/// the earlier request without its copy is a prefix of the later one, on every path.
+#[test]
+fn a_note_change_rewrites_only_from_the_previous_copy_on_every_path() {
+    let mut session = session(false);
+    user(&mut session, "first");
+    work(&mut session, "a", "output a");
+    revise(&mut session, &[note("n:one", "the lexer is done")]);
+    work(&mut session, "b", "output b");
+    work(&mut session, "c", "output c");
+    let before = step(&session, &[]);
+    work(&mut session, "d", "proposal");
+    revise(
+        &mut session,
+        &[
+            note("n:one", "the lexer is done"),
+            note("n:two", "the parser is done"),
+        ],
+    );
+    let after = step(&session, &[]);
+    assert_eq!(
+        after.working_data,
+        Some(before.messages.len().saturating_sub(1))
+    );
+    for path in PATHS {
+        let after = path.stripped(&after, Layout::Managed);
+        assert_prefix(
+            path,
+            &path.stripped(&without_working_data(&before), Layout::Managed),
+            &after,
+        );
+        assert_ne!(
+            path.stripped(&before, Layout::Managed)[path.list()],
+            after[path.list()]
+        );
     }
 }
 

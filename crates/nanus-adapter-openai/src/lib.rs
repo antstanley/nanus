@@ -81,7 +81,7 @@ pub use config::{
 pub enum Layout {
     /// A request the ordinary path sends, legacy context included.
     Ordinary,
-    /// A managed request, whose head ends at the working-data message or the first user item.
+    /// A managed request, whose head ends at the first user item.
     Managed,
 }
 pub use bearer::{Bearer, BearerSource};

@@ -182,9 +182,10 @@ pub enum ManagedSupport {
         /// (`nanus_domain::context::managed::limits::LAYOUT_VERSION`).
         ///
         /// Layout 2 carries the per-step notice in [`ChatRequest::context_tail`], which the
-        /// adapter must place after the newest message. An adapter written before it would drop
-        /// the tail, so the field is required rather than defaulted: it cannot claim support
-        /// without declaring that it places it.
+        /// adapter must place after the newest message. Layout 3 names the working-data message
+        /// by index in [`ChatRequest::working_data`], wherever its anchor put it. An adapter
+        /// written before either would drop the tail or refuse the message, so the field is
+        /// required rather than defaulted: it cannot claim support without declaring the layout.
         layout_version: u32,
     },
 }
@@ -419,6 +420,16 @@ pub struct ChatRequest {
     /// adapter puts it where its wire's prompt cache can work around it, and it is never recorded.
     /// A request that carries one ends with a user message or tool results.
     pub context_tail: Option<String>,
+    /// Where the harness's generated working-data message is in `messages`, when a managed
+    /// request carries one.
+    ///
+    /// Stated beside the messages, as the tail is, so an adapter never identifies generated data
+    /// by its words: a model reply that happens to open with the same label is the reply it is.
+    /// The managed compiler anchors the message where its text last changed, so it can follow a
+    /// tool result or an answer and precede a user or an assistant message; it is never the first
+    /// or the last message and never directly before a tool result. Anything that replaces
+    /// `messages` clears it. See [`ChatRequest::check_working_data`].
+    pub working_data: Option<usize>,
     /// How long the provider may keep the cache entries this request marks.
     pub prompt_cache: PromptCacheRetention,
     /// The name of the group of requests that share this request's reusable prefix: the runner
@@ -444,6 +455,7 @@ impl ChatRequest {
             reasoning_effort: None,
             temperature: None,
             context_tail: None,
+            working_data: None,
             prompt_cache: PromptCacheRetention::None,
             prompt_cache_key: None,
         }
@@ -511,6 +523,64 @@ impl ChatRequest {
     pub fn with_context_tail(mut self, tail: impl Into<String>) -> Self {
         self.context_tail = Some(tail.into());
         self
+    }
+
+    /// Names the message at `index` as the generated working-data message.
+    #[must_use]
+    pub const fn with_working_data(mut self, index: usize) -> Self {
+        self.working_data = Some(index);
+        self
+    }
+
+    /// Refuses a request whose named working-data message is not one a managed request may carry.
+    ///
+    /// The message must be inside the conversation and after its first message, an assistant
+    /// message of text alone — no calls, reasoning or replay — opening with the domain's label,
+    /// and followed by a user or an assistant message: never last, where a model would continue
+    /// from it, and never directly before a tool result, which would part a call from its answer.
+    /// Nothing else in the request is judged by its words, so a reply that opens with the label
+    /// elsewhere is not checked here and is sent as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Unsupported`] with the `protocol_incompatible` code as its first word,
+    /// naming the rule the request breaks.
+    pub fn check_working_data(&self) -> LlmResult<()> {
+        use nanus_domain::context::managed::compile::MEMORY_LABEL;
+        let Some(at) = self.working_data else {
+            return Ok(());
+        };
+        let refuse = |reason: &str| {
+            Err(LlmError::Unsupported {
+                feature: format!("protocol_incompatible: {reason}"),
+            })
+        };
+        let start = self
+            .messages
+            .iter()
+            .position(|message| !matches!(message, Message::System { .. }));
+        if start.is_none_or(|start| at <= start) {
+            return refuse("generated data follows the first message of the conversation");
+        }
+        let generated = matches!(
+            self.messages.get(at),
+            Some(Message::Assistant {
+                text: Some(text),
+                reasoning: None,
+                replay: None,
+                tool_calls,
+            }) if tool_calls.is_empty() && text.starts_with(MEMORY_LABEL)
+        );
+        if !generated {
+            return refuse("the named message is not generated working data");
+        }
+        match self.messages.get(at.saturating_add(1)) {
+            None => refuse("generated data is never the last message"),
+            Some(Message::Tool { .. } | Message::System { .. }) => {
+                refuse("generated data never parts a call from its result")
+            }
+            Some(_) => Ok(()),
+        }
     }
 
     /// Sets how long the provider may keep the cache entries this request marks.

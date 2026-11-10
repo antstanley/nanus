@@ -297,10 +297,9 @@ pub(crate) fn session_header(request: &ChatRequest, path: CachePath) -> Option<S
 
 /// The item that holds the head's last `input_text` part: the first user item.
 ///
-/// The working-data message, when the head has one, is an `assistant` item whose part is
-/// `output_text`, and a breakpoint is documented only on an `input_text` part. So the head's entry
-/// ends at the first user message: the working data after it is re-read on every step, which costs
-/// its few hundred bytes and never risks a refused request.
+/// The head ends at the first user message. The working-data message is anchored later, where the
+/// previous request ended, and is an `assistant` item whose part is `output_text`, on which no
+/// breakpoint is documented; the implicit breakpoint covers it with the rest of the conversation.
 fn head_item(input: &[Value]) -> Option<usize> {
     input.iter().position(|item| item["role"] == "user")
 }

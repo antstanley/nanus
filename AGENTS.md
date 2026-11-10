@@ -517,8 +517,12 @@ design docs too.
   - The system prompt is its own cache entry, ahead of a seed or compaction summary: the first
     Anthropic `system` block, or the first part of the Responses developer system message, never
     `instructions`. The stateless replay mode is the exception.
-  - The working-data message changes only with the notes or the goal objective. The one exception
-    is its first appearance in a session that has notes or a goal before its first prompt.
+  - The working-data message changes only with the notes or the goal objective, and is anchored
+    where its text last changed: before the reply whose step changed it, after a user message, or
+    after the first user message for a change before the first prompt, and left out while nothing
+    follows. It lands where the previous request ended, so that request stays a prefix; a change
+    re-reads only from where the earlier copy stood. It is never last and never between a call and
+    its result, and adapters know it by `ChatRequest::working_data`, never by its label.
   - Adapters encode canonically and then decorate. Cache markers never enter a signed-replay
     fingerprint, and the tail enters it unless the model's live evidence says otherwise — which
     Anthropic's preserved-thinking rules say it will not, for a tail that is removed. Two or more

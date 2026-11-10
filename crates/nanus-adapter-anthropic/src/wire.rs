@@ -58,7 +58,7 @@ use crate::config::AnthropicConfig;
 pub enum Layout {
     /// A request the ordinary path sends, legacy context included.
     Ordinary,
-    /// A managed request, whose head ends at the working-data message or the first user turn.
+    /// A managed request, whose head ends at the first user turn.
     Managed,
 }
 
@@ -255,7 +255,7 @@ fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, tailed: boo
     let Some(turns) = body["messages"].as_array_mut() else {
         return;
     };
-    let candidates = breakpoints(turns, &request.messages, layout, tailed);
+    let candidates = breakpoints(turns, layout, tailed);
     let mut placed: Option<(usize, usize)> = None;
     for (turn, block) in candidates.into_iter().flatten() {
         if placed.is_some_and(|last| (turn, block) <= last) {
@@ -272,23 +272,11 @@ fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, tailed: boo
 }
 
 /// The message breakpoints 2, 3 and 4, as `(turn, block)` positions, in that order.
-fn breakpoints(
-    turns: &[Value],
-    messages: &[Message],
-    layout: Layout,
-    tailed: bool,
-) -> [Option<(usize, usize)>; 3] {
-    let head = (layout == Layout::Managed).then(|| {
-        let conversation = messages
-            .iter()
-            .skip_while(|message| matches!(message, Message::System { .. }));
-        // The working-data message, when the managed grammar admitted one, is the second turn.
-        let memory = conversation
-            .clone()
-            .nth(1)
-            .is_some_and(crate::managed::is_generated);
-        usize::from(memory)
-    });
+fn breakpoints(turns: &[Value], layout: Layout, tailed: bool) -> [Option<(usize, usize)>; 3] {
+    // The head is the first user turn: the system prompt is lifted out of `messages`, and the
+    // working-data message is anchored later in the conversation, where the entry the previous
+    // request wrote at its end (breakpoint 3, or 4 on a first step) already covers what precedes it.
+    let head = (layout == Layout::Managed).then_some(0);
     // Every search stops short of the tail: on a first request the head is also the final turn,
     // and an entry that ended in the tail could never be read by the next request.
     let last = turns.len().checked_sub(1);
