@@ -8859,6 +8859,67 @@ mod tests {
         assert!(view.transcript.entries().is_empty());
     }
 
+    /// A backlog too large for one frame arrives as several, and a reader sees no difference:
+    /// the same turn is drawn whether its catching-up came in one frame or was cut anywhere,
+    /// even through the middle of the answer.
+    #[test]
+    fn a_backlog_sent_as_several_frames_draws_the_same_turn_as_one() {
+        let segments = vec![
+            segment(
+                1,
+                Frame::User {
+                    text: "do the thing".to_owned(),
+                },
+            ),
+            segment(2, Frame::Step { step: 1 }),
+            segment(
+                3,
+                Frame::Text {
+                    delta: "the answer ".to_owned(),
+                },
+            ),
+            segment(
+                3,
+                Frame::Text {
+                    delta: "so far".to_owned(),
+                },
+            ),
+        ];
+        let drawn = |batches: Vec<Vec<BacklogSegment>>| {
+            let mut view = attached_view("e1", 3);
+            for segments in batches {
+                apply(
+                    Frame::Backlog {
+                        stream: mark("e1", 3, 0),
+                        segments,
+                    },
+                    &mut view,
+                );
+            }
+            let said: Vec<String> = view
+                .transcript
+                .entries()
+                .iter()
+                .map(|entry| entry.text().to_owned())
+                .collect();
+            (said, view.step)
+        };
+        let whole = drawn(vec![segments.clone()]);
+        assert_eq!(
+            whole.0,
+            vec!["do the thing", "the answer so far"],
+            "the control: one frame draws the turn"
+        );
+        for cut in 1..segments.len() {
+            let (first, second) = segments.split_at(cut);
+            assert_eq!(
+                drawn(vec![first.to_vec(), second.to_vec()]),
+                whole,
+                "cut after segment {cut}"
+            );
+        }
+    }
+
     /// A backlog from another stream is refused whole, and says so: its frames belong to a
     /// snapshot this interface did not read the store through.
     #[test]

@@ -69,6 +69,8 @@ use crate::protocol::{
 };
 use crate::wire::{read_request, write_frame};
 
+#[path = "server/backlog.rs"]
+mod backlog;
 #[path = "server/context.rs"]
 mod context;
 #[path = "server/maintenance.rs"]
@@ -3203,20 +3205,20 @@ async fn attach(
             "this connection has fallen too far behind to be attached; reconnect and attach again",
         ));
     }
-    if !backlog.is_empty()
-        && !queue_now(
-            frames,
-            Frame::Backlog {
-                stream,
-                segments: backlog,
-            },
-        )
-    {
-        held.unview(viewer);
-        return Err(String::from(
-            "this connection has fallen too far behind to catch up with the running turn; \
-             reconnect and attach again",
-        ));
+    // As many frames as it takes for each to be one a client will read, queued back to back
+    // in this region so they are still one batch as far as any live frame is concerned.
+    for segments in backlog::batches(backlog, backlog::BACKLOG_FRAME_BYTES) {
+        let caught_up = Frame::Backlog {
+            stream: stream.clone(),
+            segments,
+        };
+        if !queue_now(frames, caught_up) {
+            held.unview(viewer);
+            return Err(String::from(
+                "this connection has fallen too far behind to catch up with the running turn; \
+                 reconnect and attach again",
+            ));
+        }
     }
     // A session a handoff started is shown its opening document after the backlog, on every
     // attachment, so a reader always sees what the session was started with.

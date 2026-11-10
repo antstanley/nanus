@@ -207,9 +207,12 @@ store is written when a turn ends, so a client that attaches in the middle of on
 nothing to read. The agent sends that client a `backlog` frame — the frames of the turn so
 far, in order, folded where folding changes nothing — and the interface replays them through
 the same rendering the live frames use, so a reader who joins mid-turn sees the whole turn
-rather than a transcript beginning halfway through it. The batch is one item on the
-connection's queue, so no live frame can slip inside it and reorder the turn, and it empties
-the instant the turn reaches the log. A reader's copy of the log and that batch are read at
+rather than a transcript beginning halfway through it. The batch is queued whole,
+before the client can be sent anything live, so no live frame can slip inside it and reorder
+the turn, and it empties the instant the turn reaches the log. A turn that has grown past what
+one frame may hold — a client refuses a line over four mebibytes — is sent as several `backlog`
+frames back to back, each with the same mark; an interface applies each as it arrives, which is
+what it always did with one, so a long turn can be joined like a short one. A reader's copy of the log and that batch are read at
 two different instants — the agent takes the batch when it answers the attachment, and the
 interface reads the log a moment later — so the attachment carries the log's position at that
 instant, and an interface whose log has moved past it drops the batch rather than drawing the

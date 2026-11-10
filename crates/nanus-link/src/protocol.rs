@@ -1172,8 +1172,12 @@ pub enum Frame {
 
     /// The turn that was already running when this client attached, so far.
     ///
-    /// Sent once, immediately after [`Frame::Attached`] and before any live frame of that
-    /// turn, and only when there is a turn in flight. The frames inside are the ones a
+    /// Sent immediately after [`Frame::Attached`] and before any live frame of that turn, and
+    /// only when there is a turn in flight. A turn whose backlog would not fit one frame a
+    /// client reads is sent as several of these, back to back and in order, each carrying the
+    /// same mark; a client applies each as it arrives, which is what it does with one, so the
+    /// meaning of the frame did not change and [`PROTOCOL_VERSION`] did not move. The frames
+    /// inside are the ones a
     /// client that had been attached all along would already have seen — in the same order,
     /// with adjacent deltas folded together — so the client replays them and its transcript
     /// is whole rather than beginning mid-turn.
@@ -1186,8 +1190,8 @@ pub enum Frame {
     /// sent for an attachment that needs nothing.
     ///
     /// Nesting frames rather than repeating them as ordinary ones is what keeps the batch
-    /// atomic: it is one item on the client's queue, so no live frame can slip between the
-    /// frames it carries and reorder the turn. It identifies the same frontier and watermark
+    /// atomic: its frames are queued together, before the viewer can be sent anything live, so
+    /// no live frame can slip between the frames it carries and reorder the turn. It identifies the same frontier and watermark
     /// as the [`Frame::Attached`] before it, from the same snapshot.
     Backlog {
         /// Where the stream stood at the barrier.
