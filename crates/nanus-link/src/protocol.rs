@@ -445,8 +445,10 @@ pub struct ContextStatusInfo {
     pub last_prompt_tokens: Option<u64>,
     /// The share of those tokens the provider served from its prompt cache.
     ///
-    /// Zero means the provider reported none, or reported no cache counter at all: the neutral
-    /// usage record cannot tell the two apart. Null exactly when [`Self::last_prompt_tokens`] is.
+    /// Zero means the provider reported none, or reported no cache counter at all: the usage
+    /// recorded on an assistant message, which is what this is read from after a reload, cannot
+    /// tell the two apart (a managed session's `request/attempt` record can). Null exactly when
+    /// [`Self::last_prompt_tokens`] is.
     #[serde(default)]
     pub last_cache_hit_tokens: Option<u64>,
 }

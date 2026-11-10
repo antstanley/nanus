@@ -253,7 +253,24 @@ fn core_samples() -> Vec<(&'static str, Value)> {
     ]
     .into_iter()
     .chain(results())
+    .chain(usage_samples())
     .collect()
+}
+
+/// Usage as the runner writes it: a reported total miss is a zero cache read, which the schema's
+/// counters admit, and an unreported one is null.
+fn usage_samples() -> Vec<(&'static str, Value)> {
+    [true, false]
+        .map(|reported| {
+            let usage = nanus_domain::Usage::new(9, 1, 0, 0, 9).with_cache_hit_reported(reported);
+            let value = serde_json::to_value(UsageObservation::from_usage(&usage)).unwrap();
+            assert_eq!(
+                value["cache_read_tokens"],
+                if reported { json!(0) } else { json!(null) }
+            );
+            ("UsageObservation", value)
+        })
+        .into()
 }
 
 /// Samples of the tool and status payloads.

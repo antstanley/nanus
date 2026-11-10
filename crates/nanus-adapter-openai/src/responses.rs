@@ -1035,6 +1035,12 @@ fn decode_usage(value: &Value) -> Usage {
     };
     let prompt_tokens = number("input_tokens");
     let cache_hit_tokens = nested("input_tokens_details", "cached_tokens");
+    // A reported zero is a total miss, and an absent counter is no report at all.
+    let cache_hit_reported = value
+        .get("input_tokens_details")
+        .and_then(|object| object.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .is_some();
     // The two counters partition the prompt, so an unreported miss is derived rather than left at
     // zero — the same rule the chat path follows.
     Usage {
@@ -1043,6 +1049,7 @@ fn decode_usage(value: &Value) -> Usage {
         reasoning_tokens: nested("output_tokens_details", "reasoning_tokens"),
         cache_hit_tokens,
         cache_miss_tokens: prompt_tokens.saturating_sub(cache_hit_tokens),
+        cache_hit_reported,
     }
 }
 
@@ -1222,6 +1229,7 @@ mod tests {
                 reasoning_tokens: 1,
                 cache_hit_tokens: 4,
                 cache_miss_tokens: 6,
+                cache_hit_reported: true,
             })
         );
         assert_eq!(
@@ -1230,6 +1238,27 @@ mod tests {
                 reason: FinishReason::Stop
             }
         );
+    }
+
+    /// A total miss the Responses API reported is a reported zero, and a usage object without the
+    /// counter is no report: the two decode to the same zero and are told apart by the flag.
+    #[test]
+    fn a_reported_zero_cache_read_is_told_from_an_absent_one() {
+        let usage = |details: Value| {
+            observe(&[json!({"type":"response.completed","response":{"usage":{
+                "input_tokens":10,"output_tokens":2,"input_tokens_details":details
+            }}})])
+            .iter()
+            .find_map(|event| match event {
+                LlmEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+        };
+        let miss = usage(json!({"cached_tokens":0})).expect("usage");
+        assert_eq!(miss.reported_cache_read(), Some(0));
+        let silent = usage(json!({})).expect("usage");
+        assert_eq!(silent.cache_hit_tokens, 0);
+        assert_eq!(silent.reported_cache_read(), None);
     }
 
     /// A function call is assembled from its argument deltas and reported when the stream ends.
@@ -1324,6 +1353,11 @@ mod tests {
         let usage = usage.expect("the usage is reported");
         assert_eq!(usage.prompt_tokens, 9);
         assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(
+            usage.reported_cache_read(),
+            None,
+            "no cache counter, no report"
+        );
 
         let silent = observe(&[json!({"type":"response.incomplete","response":{}})]);
         assert!(

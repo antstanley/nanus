@@ -130,10 +130,28 @@ pub struct Usage {
     pub cache_hit_tokens: u32,
     /// The share of `prompt_tokens` that missed the prompt cache.
     pub cache_miss_tokens: u32,
+    /// Whether the provider's report carried a cache-read count at all, so that a zero in
+    /// `cache_hit_tokens` is the provider saying "nothing was read from the cache" rather than
+    /// the provider saying nothing.
+    ///
+    /// The distinction matters most for exactly the case a zero hides: a total cache miss. It is
+    /// set by an adapter as it decodes a live report, and only there. It is deliberately **not
+    /// serialised**: the recorded shape always writes `prompt_cache_hit_tokens`, and a new key
+    /// would change the bytes of every session's assistant messages, a legacy session's included.
+    /// So a usage record read back from a session or a frame says `false` for a zero, and a
+    /// reader asks [`Usage::reported_cache_read`] rather than reading the flag alone. The live report reaches the managed `request/attempt` record, which is where
+    /// the fact is kept (see `UsageObservation::from_usage`).
+    pub cache_hit_reported: bool,
 }
 
 impl Usage {
     /// Builds a usage record.
+    ///
+    /// A positive `cache_hit_tokens` is a report — nobody invents a cache read — so it is marked
+    /// reported, and a record read back from a session or a frame (which is built here) says the
+    /// same as the live one it was written from. Only a zero is left unmarked, because only the
+    /// adapter that decoded the provider's report knows whether the counter was there; it says so
+    /// with [`Usage::with_cache_hit_reported`].
     #[must_use]
     pub const fn new(
         prompt_tokens: u32,
@@ -148,6 +166,28 @@ impl Usage {
             reasoning_tokens,
             cache_hit_tokens,
             cache_miss_tokens,
+            cache_hit_reported: cache_hit_tokens > 0,
+        }
+    }
+
+    /// Records whether the provider's report carried a cache-read count, zero included.
+    #[must_use]
+    pub const fn with_cache_hit_reported(mut self, reported: bool) -> Self {
+        self.cache_hit_reported = reported;
+        self
+    }
+
+    /// The cache-read count when the provider reported one, and `None` when it reported none.
+    ///
+    /// `Some(0)` is a reported total miss. A positive count is a report even when the flag was
+    /// never set, which is what keeps a record built by [`Usage::new`] or read back from a
+    /// session meaning what it always meant: missing is never zero, in either direction.
+    #[must_use]
+    pub const fn reported_cache_read(&self) -> Option<u32> {
+        if self.cache_hit_reported || self.cache_hit_tokens > 0 {
+            Some(self.cache_hit_tokens)
+        } else {
+            None
         }
     }
 
@@ -171,6 +211,9 @@ impl Usage {
         self.cache_miss_tokens = self
             .cache_miss_tokens
             .saturating_add(other.cache_miss_tokens);
+        // A sum carries a reported cache count when either part did: a total of a report and a
+        // non-report still holds the reported part's zero.
+        self.cache_hit_reported = self.cache_hit_reported || other.cache_hit_reported;
         // Postcondition: every counter is at least the value it held, and the
         // total is the sum of the two counters it is derived from.
         assert!(self.total_tokens() >= other.total_tokens());
@@ -1204,6 +1247,45 @@ mod tests {
             wire.get("prompt_cache_miss_tokens"),
             Some(&serde_json::json!(10))
         );
+    }
+
+    /// A reported zero cache read is a fact the live record keeps, and one the recorded shape does
+    /// not: the wire bytes are the same with and without it, so no session's bytes move.
+    #[test]
+    fn a_reported_zero_cache_read_is_kept_live_and_never_serialised() {
+        let unreported = Usage::new(100, 5, 0, 0, 100);
+        let reported = unreported.with_cache_hit_reported(true);
+        assert_eq!(
+            unreported.reported_cache_read(),
+            None,
+            "missing is not zero"
+        );
+        assert_eq!(
+            reported.reported_cache_read(),
+            Some(0),
+            "a total miss is zero"
+        );
+        assert_eq!(
+            Usage::new(100, 5, 0, 60, 40).reported_cache_read(),
+            Some(60),
+            "a positive read is a report even when nobody said so"
+        );
+        assert_eq!(
+            serde_json::to_string(&reported).ok(),
+            serde_json::to_string(&unreported).ok(),
+            "the flag never reaches the recorded shape"
+        );
+        let read_back: Option<Usage> = serde_json::to_string(&reported)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        assert_eq!(
+            read_back,
+            Some(unreported),
+            "a record read back reports nothing"
+        );
+        let mut total = unreported;
+        total.accumulate(&reported);
+        assert_eq!(total.reported_cache_read(), Some(0));
     }
 
     #[test]

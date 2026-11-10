@@ -757,7 +757,8 @@ provider payloads or evidence.
 The link's context status also carries `last_prompt_tokens` and `last_cache_hit_tokens`, in both
 modes. They are read from the usage of the newest assistant message that reported usage, and are
 null when none has. Zero cache-hit tokens means the provider reported none or reported no cache
-counter at all, because the neutral usage record cannot tell those apart. These fields are on the
+counter at all, because the recorded usage of an assistant message cannot tell those apart; a
+managed session's attempt record can (see [Accounting](#accounting)). These fields are on the
 link's `ContextStatusInfo` only. The domain `ContextStatus`, which the model reads in
 `context_manage` results, does not carry them.
 
@@ -919,6 +920,40 @@ attempt is not counted, because its assistant message already is. Monotonic timi
 (response head, first token, decode, total) are measured with the process clock and never
 derived from wall-clock timestamps.
 
+**Cache reads.** An attempt's usage is written under the semantics `nanus.usage.v2`. Its
+`cache_read_tokens` is the provider's own count when the provider's report carried one, a reported
+`0` included, and null only when the report carried no cache-read counter at all. The adapter
+decides which, from the counter's presence in the live report:
+
+| Wire | Counter whose presence is a report |
+|---|---|
+| `DeepSeek` | `prompt_cache_hit_tokens` |
+| Chat completions (OpenAI, z.ai, Inception) | `prompt_tokens_details.cached_tokens`, or `prompt_cache_hit_tokens` |
+| Responses | `input_tokens_details.cached_tokens` |
+| Messages (Anthropic) | `cache_read_input_tokens` in the message head |
+
+A null or non-numeric counter is no report. So a `0` is a total miss the provider stated, and a
+null says nothing about the cache, never a zero. Earlier builds wrote `nanus.usage.v1`, where the
+read was recorded only when positive. Under that label a null is either a reported miss or no
+report, and nothing in the record says which. The label moved so that a reader can tell the two
+rules apart. The raw counters are the same under both labels, and totals read either.
+
+The fact lives only on the live path. `Usage::cache_hit_reported` is set by the adapter and is
+never serialised, because the recorded usage shape of an assistant message always writes
+`prompt_cache_hit_tokens`, and a new key would change every session's bytes, a legacy session's
+included. A usage record read back from a session or a frame therefore cannot say a zero was
+reported. The managed attempt record is where the fact is kept. A legacy session records exactly
+what it did before, and the link's `last_cache_hit_tokens` keeps its documented meaning.
+
+Cache writes are not in the neutral usage record, so `cache_write_tokens` is always null. On the
+Messages wire the tokens written are counted in `cache_miss_tokens`, as before.
+
+What this does not tell a reader is *why* a step missed. A reported `0` says the provider served
+nothing from its cache. It does not say whether the request's prefix had changed since the previous
+request or the provider missed on a prefix it had seen. That needs a per-attempt record of prefix
+stability, and the attempt record cannot take a new field without moving the body version (see
+[What is and is not verified](#what-is-and-is-not-verified)).
+
 ## Errors
 
 Refusals carry one of the stable codes `unsupported_mode`, `policy_denied`, `stale_base`,
@@ -1002,6 +1037,11 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   over a local listener;
 - the legacy fitter: its elision notice is costed and carried as the tail, never as a message, on
   every wire, and the fitter's choice of turns is the same as before for the same budget;
+- the cache read in an attempt's usage. On every adapter's decoder, a reported `0` is a report and
+  an absent or null counter is not. The attempt record writes them as `0` and null under
+  `nanus.usage.v2`, and reads them back as such. A `nanus.usage.v1` record keeps its totals and is
+  never read as a reported zero. The recorded usage shape of an assistant message is byte-identical
+  either way;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
   developer system message and no `instructions` is accepted and answers as the system prompt
   directs, and three managed steps with a trailing developer tail after tool output are accepted;
@@ -1043,6 +1083,14 @@ Not verified, and not claimed:
   long sessions, across a pause between turns, or in a recorded session since the change. No claim
   is made about the subscription's hit rate beyond these runs.
 
+- **A cache miss is not attributed.** An attempt now says the provider reported a total miss, but
+  not whether the request's canonical prefix had changed since the previous request. Each
+  adapter's prefix-stability tests show the runner's requests are built stable. They do not show
+  that a given recorded step was. The comparison would be a new field of the attempt record, which
+  every reader of versions 3 to 6 parses strictly. So it needs a body version of its own, as an
+  attempt's `kind` did, and that has not been decided. Which counters each provider actually sends
+  on a total miss rests on the decoders' fixtures. Only `DeepSeek`'s recorded stream shows a
+  reported `prompt_cache_hit_tokens: 0`.
 - **No live provider has been sent a maintenance request.** A handoff or compaction draft is a model
   call built and read the way a managed turn's is. The tests show the request is built and its
   response is read and refused correctly; they do not show that a provider's summary is good, or

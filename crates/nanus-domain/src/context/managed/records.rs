@@ -703,20 +703,39 @@ pub struct UsageObservation {
 }
 
 impl UsageObservation {
-    /// The semantics of a [`crate::Usage`] reported through the neutral stream.
-    pub const NEUTRAL_SEMANTICS: &'static str = "nanus.usage.v1";
+    /// The semantics of a [`crate::Usage`] reported through the neutral stream, as this build
+    /// writes it: `cache_read_tokens` is `0` for a cache read the provider reported as zero, and
+    /// null only when the provider's report carried no cache-read count at all.
+    pub const NEUTRAL_SEMANTICS: &'static str = "nanus.usage.v2";
+
+    /// The neutral semantics an earlier build wrote. The counters are the same; only the
+    /// normalised cache read differs: it was recorded only when positive, so a null there is
+    /// either a reported total miss or no report, and nothing in the record says which.
+    ///
+    /// The label moved rather than the rule changing under it, because a reader attributing a
+    /// cache miss needs to know which of the two a null means, and the label is the only thing in
+    /// the record that can say.
+    pub const NEUTRAL_SEMANTICS_V1: &'static str = "nanus.usage.v1";
 
     /// Reads the neutral usage record into nullable counters.
     ///
     /// A usage report always carries its prompt and completion counts, so those are recorded as
-    /// reported. The neutral record cannot tell a reasoning or cache count the provider reported
-    /// as zero from one it never reported — both arrive as zero — so those categories are
-    /// recorded only when they are positive and are otherwise absent: missing is never written
-    /// as zero. Every counter, zeros included, is kept in `raw_counters` as the record carried
-    /// it, under the neutral semantics. Cache writes are not in the neutral record at all.
+    /// reported. The cache read is recorded as the adapter decoded it
+    /// ([`crate::Usage::reported_cache_read`]): a zero the provider reported is recorded as zero,
+    /// because a total miss is the case a cache analysis most needs to see, and a count the
+    /// provider never reported is absent. The neutral record cannot tell a reasoning count the
+    /// provider reported as zero from one it never reported, so that category is recorded only
+    /// when it is positive: missing is never written as zero. Every counter, zeros included, is
+    /// kept in `raw_counters` as the record carried it. Cache writes are not in the neutral
+    /// record at all, so they are always absent.
     #[must_use]
     pub fn from_usage(usage: &crate::Usage) -> Self {
         let positive = |value: u32| (value > 0).then_some(u64::from(value));
+        let cache_read_tokens = usage.reported_cache_read().map(u64::from);
+        // Postcondition of the read, in both directions: a positive count is always recorded, and
+        // a recorded zero is one the adapter said it read.
+        assert!(usage.cache_hit_tokens == 0 || cache_read_tokens.is_some());
+        assert!(cache_read_tokens != Some(0) || usage.cache_hit_reported);
         let mut raw_counters = BTreeMap::new();
         for (name, value) in [
             ("prompt_tokens", usage.prompt_tokens),
@@ -731,7 +750,7 @@ impl UsageObservation {
             prompt_tokens: Some(u64::from(usage.prompt_tokens)),
             completion_tokens: Some(u64::from(usage.completion_tokens)),
             reasoning_tokens: positive(usage.reasoning_tokens),
-            cache_read_tokens: positive(usage.cache_hit_tokens),
+            cache_read_tokens,
             cache_write_tokens: None,
             semantics_version: Self::NEUTRAL_SEMANTICS.to_owned(),
             raw_counters,
@@ -742,11 +761,14 @@ impl UsageObservation {
     /// record, or `None` for any other semantics.
     ///
     /// The neutral counters are kept whole in `raw_counters`, zeros included, so they are what is
-    /// read: a reasoning or cache count recorded as absent was a zero. A counter too large for the
-    /// neutral record saturates rather than wraps.
+    /// read, under either neutral label: the two differ only in the normalised cache read, which
+    /// is not what a total is built from. A counter too large for the neutral record saturates
+    /// rather than wraps.
     #[must_use]
     pub fn to_usage(&self) -> Option<crate::Usage> {
-        if self.semantics_version != Self::NEUTRAL_SEMANTICS {
+        if self.semantics_version != Self::NEUTRAL_SEMANTICS
+            && self.semantics_version != Self::NEUTRAL_SEMANTICS_V1
+        {
             return None;
         }
         let counter = |name: &str| {
@@ -754,13 +776,20 @@ impl UsageObservation {
                 .get(name)
                 .map_or(0, |value| u32::try_from(*value).unwrap_or(u32::MAX))
         };
-        Some(crate::Usage::new(
-            counter("prompt_tokens"),
-            counter("completion_tokens"),
-            counter("reasoning_tokens"),
-            counter("cache_hit_tokens"),
-            counter("cache_miss_tokens"),
-        ))
+        // Only the current label can say a zero read was reported; under the earlier one a null
+        // read is read back as the ambiguity it was.
+        let reported =
+            self.semantics_version == Self::NEUTRAL_SEMANTICS && self.cache_read_tokens.is_some();
+        Some(
+            crate::Usage::new(
+                counter("prompt_tokens"),
+                counter("completion_tokens"),
+                counter("reasoning_tokens"),
+                counter("cache_hit_tokens"),
+                counter("cache_miss_tokens"),
+            )
+            .with_cache_hit_reported(reported),
+        )
     }
 }
 
@@ -1220,17 +1249,64 @@ mod tests {
         assert!(partial_eof.validate().is_err());
     }
 
-    /// F10: an optional category the neutral record carries as zero is absent, not zero.
+    /// F10: an optional category the neutral record carries as zero is absent, not zero — unless
+    /// the adapter said the provider reported it.
     #[test]
     fn a_counter_that_may_be_missing_is_never_written_as_zero() {
         let usage = UsageObservation::from_usage(&crate::Usage::new(100, 20, 0, 0, 100));
+        assert_eq!(usage.semantics_version, UsageObservation::NEUTRAL_SEMANTICS);
         assert_eq!(usage.prompt_tokens, Some(100));
         assert_eq!(usage.reasoning_tokens, None);
-        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(
+            usage.cache_read_tokens, None,
+            "no cache counter was reported"
+        );
         assert_eq!(usage.raw_counters.get("cache_hit_tokens"), Some(&0));
         let cached = UsageObservation::from_usage(&crate::Usage::new(100, 20, 5, 60, 40));
         assert_eq!(cached.reasoning_tokens, Some(5));
         assert_eq!(cached.cache_read_tokens, Some(60));
+    }
+
+    /// A total cache miss the provider reported is recorded as the zero it is. Before, it was
+    /// recorded as null, which is also what "the provider reported nothing" is recorded as, so
+    /// the one step a cache analysis most needs to see could not be told from a silent one.
+    #[test]
+    fn a_reported_total_cache_miss_is_recorded_as_zero_and_read_back_as_reported() {
+        let miss = crate::Usage::new(100, 20, 0, 0, 100).with_cache_hit_reported(true);
+        let recorded = UsageObservation::from_usage(&miss);
+        assert_eq!(recorded.cache_read_tokens, Some(0));
+        assert_eq!(
+            recorded.to_usage(),
+            Some(miss),
+            "the fact survives the record"
+        );
+        let silent = crate::Usage::new(100, 20, 0, 0, 100);
+        let unreported = UsageObservation::from_usage(&silent);
+        assert_eq!(unreported.to_usage(), Some(silent));
+        assert_ne!(recorded, unreported, "the two are different records");
+    }
+
+    /// A record an earlier build wrote keeps its totals, and its null cache read stays the
+    /// ambiguity it always was rather than being promoted to either answer.
+    #[test]
+    fn an_earlier_neutral_record_reads_back_without_claiming_a_reported_zero() {
+        let mut earlier = UsageObservation::from_usage(&crate::Usage::new(100, 20, 0, 0, 100));
+        earlier.semantics_version = UsageObservation::NEUTRAL_SEMANTICS_V1.to_owned();
+        let read = earlier.to_usage();
+        assert_eq!(read, Some(crate::Usage::new(100, 20, 0, 0, 100)));
+        assert_eq!(read.and_then(|usage| usage.reported_cache_read()), None);
+        earlier.cache_read_tokens = Some(0);
+        assert_eq!(
+            earlier.to_usage().map(|usage| usage.cache_hit_reported),
+            Some(false),
+            "only the current label can say a zero was reported"
+        );
+        earlier.semantics_version = "vendor.usage.v9".to_owned();
+        assert_eq!(
+            earlier.to_usage(),
+            None,
+            "an unknown label is not guessed at"
+        );
     }
 
     #[test]

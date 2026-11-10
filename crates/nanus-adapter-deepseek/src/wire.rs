@@ -616,8 +616,14 @@ fn decode_usage(value: &Value) -> Usage {
             .unwrap_or_default()
     };
     // DeepSeek reports cache accounting under its own names; absence means zero
-    // rather than an error, because not every response carries the breakdown.
+    // rather than an error, because not every response carries the breakdown. Whether the
+    // hit count was there at all is kept beside it, so a reported total miss is not mistaken
+    // for a response that said nothing about the cache.
     let details = field("prompt_cache_hit_tokens");
+    let reported = value
+        .get("prompt_cache_hit_tokens")
+        .and_then(Value::as_u64)
+        .is_some();
     let missed = field("prompt_cache_miss_tokens");
     let reasoning = value
         .get("completion_tokens_details")
@@ -625,13 +631,14 @@ fn decode_usage(value: &Value) -> Usage {
         .and_then(Value::as_u64)
         .and_then(|number| u32::try_from(number).ok())
         .unwrap_or(0);
-    Usage {
-        prompt_tokens: field("prompt_tokens"),
-        completion_tokens: field("completion_tokens"),
-        reasoning_tokens: reasoning,
-        cache_hit_tokens: details,
-        cache_miss_tokens: missed,
-    }
+    Usage::new(
+        field("prompt_tokens"),
+        field("completion_tokens"),
+        reasoning,
+        details,
+        missed,
+    )
+    .with_cache_hit_reported(reported)
 }
 
 /// Decodes a `finish_reason` string.
@@ -941,8 +948,26 @@ mod tests {
         assert_eq!(usage.completion_tokens, 1);
         // Absent cache accounting means zero, not an error.
         assert_eq!(usage.cache_hit_tokens, 0);
+        assert_eq!(usage.reported_cache_read(), None, "but not a reported zero");
         assert_eq!(usage.reasoning_tokens, 0);
         assert_eq!(usage.total_tokens(), 4);
+    }
+
+    /// A total miss `DeepSeek` reported is a reported zero; the same response without the counter
+    /// is no report at all.
+    #[test]
+    fn a_reported_zero_cache_hit_is_told_from_an_absent_one() {
+        let miss = decode_usage(&json!({
+            "prompt_tokens": 434,
+            "completion_tokens": 59,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 434
+        }));
+        assert!(miss.cache_hit_reported);
+        assert_eq!(miss.reported_cache_read(), Some(0));
+        let silent = decode_usage(&json!({ "prompt_tokens": 434, "completion_tokens": 59 }));
+        assert!(!silent.cache_hit_reported);
+        assert_eq!(silent.reported_cache_read(), None);
     }
 
     #[test]

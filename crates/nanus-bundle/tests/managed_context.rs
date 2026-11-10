@@ -18,7 +18,7 @@ use nanus_domain::context::managed::{
     MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, MEMORY_LABEL, ModeActor, RevisionAuthor, limits,
 };
 use nanus_domain::{Message, SessionEvent};
-use nanus_ports::{CheckpointReason, PersistenceState};
+use nanus_ports::{CheckpointReason, FinishReason, LlmEvent, PersistenceState};
 use std::rc::Rc;
 
 /// T01: a session that never enabled managed context runs, encodes and saves exactly as before.
@@ -751,4 +751,47 @@ fn a_resumed_explicit_session_that_asks_for_model_records_a_following_policy_at_
         "resolved on the model in force"
     );
     assert_eq!(session.body_version(), 6);
+}
+
+/// A total cache miss the provider reported reaches the attempt record as a zero, through the
+/// real runner and checkpoint, and survives a reload; a report with no cache counter reaches it
+/// as null. Before, both were null, so the miss could not be told from silence.
+#[test]
+fn a_reported_cache_miss_is_recorded_as_zero_and_an_unreported_one_as_null() {
+    let answer = |reported: bool| {
+        vec![
+            LlmEvent::TextDelta("hello".to_owned()),
+            LlmEvent::Usage(
+                nanus_domain::Usage::new(120, 4, 0, 0, 120).with_cache_hit_reported(reported),
+            ),
+            LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ]
+    };
+    let model = <Model as ModelExt>::new(vec![answer(true), answer(false)]);
+    let runner = runner(&model, 64_000);
+    let (mut session, disk, context) = managed(&runner);
+    for prompt in ["first", "second"] {
+        let outcome = block(runner.run_turn_with_runtime(
+            &mut session,
+            prompt,
+            &mut Silent,
+            host(&disk, &context),
+        ));
+        assert!(outcome.outcome.is_ok());
+    }
+    let reads = |session: &nanus_domain::Session| {
+        attempts(session, AttemptPhase::Finished)
+            .iter()
+            .map(|attempt| attempt.usage.as_ref().map(|usage| usage.cache_read_tokens))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(reads(&session), vec![Some(Some(0)), Some(None)]);
+    let reloaded = nanus_domain::Session::from_jsonl(&disk.last().try_to_jsonl().unwrap()).unwrap();
+    assert_eq!(
+        reads(&reloaded),
+        reads(&session),
+        "the zero is on disk, not only in memory"
+    );
 }
