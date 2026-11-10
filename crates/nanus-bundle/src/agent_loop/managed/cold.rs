@@ -43,9 +43,16 @@ impl AgentRunner {
     /// Never for a runner built without cold fitting, and never for a session that has sent no
     /// managed request. A clock behind the record reads as no time at all.
     pub(in crate::agent_loop) fn cache_lapsed(&self, session: &Session) -> bool {
-        if !self.cold_fit {
-            return false;
-        }
+        self.cold_fit && self.cache_cold(session)
+    }
+
+    /// Whether the provider's cache of `session`'s prefix has lapsed, whatever this runner does
+    /// about it: the fact [`cache_lapsed`](Self::cache_lapsed) fits on, without its switch.
+    ///
+    /// A hide's break-even rule is waived on it too, and a host that turned cold fitting off has
+    /// not made a rewrite of a lapsed cache any less free. Never for a session that has sent no
+    /// managed request.
+    pub(in crate::agent_loop) fn cache_cold(&self, session: &Session) -> bool {
         let Some(last) = state::last_request_ms(session.log()) else {
             return false;
         };

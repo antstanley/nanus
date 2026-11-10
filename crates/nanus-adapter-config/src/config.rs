@@ -286,6 +286,17 @@ pub struct NanusConfig {
     /// 60 % of the working target first, recoverably. On by default; `false` fits only over the
     /// allowance. Not recorded in a session.
     pub context_cold_fit: bool,
+    /// Whether a managed session's model is refused a hide that cannot pay for the cache rewrite
+    /// it forces.
+    ///
+    /// Managed sessions only. A hide makes the provider re-read the next request uncached from the
+    /// earliest fragment it changes, and each later step saves only the hidden tokens' cache-read
+    /// price, about a tenth of the input price. So a proposal that hides less than a fifth of what
+    /// it forces to be re-read is refused before it is staged, with the numbers, unless the request
+    /// is at three quarters of the working target or the provider's cache has lapsed. A proposal
+    /// that hides nothing is never refused for this. On by default; `false` stages every valid
+    /// proposal. Not recorded in a session.
+    pub context_hide_break_even: bool,
     /// How many tool calls may run at once.
     pub max_parallel_tools: u32,
     /// How much of a tool call and a thinking segment the interface draws.
@@ -400,6 +411,7 @@ impl Default for NanusConfig {
             context_budget: None,
             context_working_target: None,
             context_cold_fit: true,
+            context_hide_break_even: true,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             tui_detail: TuiDetail::default(),
             tui_theme: TuiTheme::default(),

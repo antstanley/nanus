@@ -385,6 +385,12 @@ pub struct AgentRunner {
     /// On unless a host turns it off. Configuration, like the target: nothing records it, and a
     /// fit it makes is recorded as the automatic revision it is.
     cold_fit: bool,
+    /// Whether a model's hide that cannot pay for the cache rewrite it forces is refused before
+    /// it is staged.
+    ///
+    /// On unless a host turns it off. Configuration again: it decides only whether a proposal is
+    /// staged, a refusal is an ordinary tool failure, and nothing records it.
+    hide_break_even: bool,
     /// How long the provider may keep the cache entries a request marks; copied into every
     /// request this runner builds. `None` for a library host, which pays no cache-write premium
     /// it did not ask for.
@@ -454,6 +460,7 @@ impl AgentRunner {
             model_context: false,
             working_target: None,
             cold_fit: true,
+            hide_break_even: true,
             prompt_cache: core::cell::Cell::new(nanus_ports::PromptCacheRetention::None),
         })
     }
@@ -536,8 +543,11 @@ impl AgentRunner {
     /// The tail's pressure is measured against it and the budget hint is given at three quarters
     /// of it. Once the provider's cache of a session has lapsed, the runner also hides the oldest
     /// eligible work itself down toward it (see
-    /// [`with_context_cold_fit`](Self::with_context_cold_fit)). The hard allowance, which refuses a
-    /// request and against which a proposal is admitted, is not moved. Without it the target is
+    /// [`with_context_cold_fit`](Self::with_context_cold_fit)), and a model's hide that cannot pay
+    /// for its cache rewrite is staged anyway once the request is at three quarters of it (see
+    /// [`with_context_hide_break_even`](Self::with_context_hide_break_even)). The hard allowance,
+    /// which refuses a request and against which a staged proposal is admitted, is not moved.
+    /// Without it the target is
     /// [`DEFAULT_WORKING_TARGET_TOKENS`](nanus_domain::context::managed::limits::DEFAULT_WORKING_TARGET_TOKENS),
     /// and either way it is clamped to the allowance of the model in force, so a target above a
     /// small window is that window. It is configuration, not policy: nothing records it, and a
@@ -579,6 +589,31 @@ impl AgentRunner {
     #[must_use]
     pub const fn context_cold_fit(&self) -> bool {
         self.cold_fit
+    }
+
+    /// Turns the refusal of a hide that cannot pay for its cache rewrite on or off.
+    ///
+    /// On by default. When a model's `context_manage` proposal hides fragments, the provider
+    /// re-reads the next request uncached from the earliest fragment it changed, and every later
+    /// step saves only the hidden tokens' cache-read price. A proposal that hides is refused before
+    /// it is staged — an ordinary tool failure stating the numbers — when the tokens it removes are
+    /// less than a fifth of the tokens it forces to be re-read
+    /// ([`REREAD_PER_HIDDEN_TOKEN_MAX`](nanus_domain::context::managed::break_even::REREAD_PER_HIDDEN_TOKEN_MAX)),
+    /// unless the request is at the soft pressure the budget hint is given at or the provider's
+    /// cache has lapsed. A proposal that hides nothing is never judged, and automatic fits are not
+    /// proposals. Off, every valid proposal is staged as before. Nothing records the setting, and a
+    /// legacy session never reads it.
+    #[must_use]
+    pub const fn with_context_hide_break_even(mut self, enabled: bool) -> Self {
+        self.hide_break_even = enabled;
+        self
+    }
+
+    /// Whether a hide that cannot pay for its cache rewrite is refused
+    /// ([`with_context_hide_break_even`](Self::with_context_hide_break_even)).
+    #[must_use]
+    pub const fn context_hide_break_even(&self) -> bool {
+        self.hide_break_even
     }
 
     /// Returns the budget a request is fitted to, its output reservation included.

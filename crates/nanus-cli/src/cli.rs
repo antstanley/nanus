@@ -1950,6 +1950,10 @@ async fn show_config(args: &Options) -> Result<(), String> {
         working_target_display(&config)
     );
     println!("context cold fit: {}", cold_fit_display(&config));
+    println!(
+        "context hide break-even: {}",
+        hide_break_even_display(&config)
+    );
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
     println!("tui theme: {}", config.tui_theme);
@@ -2116,6 +2120,18 @@ fn cold_fit_display(config: &NanusConfig) -> &'static str {
     }
 }
 
+/// Renders whether a managed session's model is refused a hide that cannot pay for the cache
+/// rewrite it forces, saying what each answer does, since the name alone does not.
+fn hide_break_even_display(config: &NanusConfig) -> &'static str {
+    if config.context_hide_break_even {
+        "on (managed sessions; a hide that removes less than a fifth of what it makes the provider \
+         re-read is refused, unless the request is at three quarters of the working target or the \
+         cache has lapsed)"
+    } else {
+        "off (managed sessions stage every valid proposal)"
+    }
+}
+
 /// Renders a resolved path, or names the home when it cannot be resolved.
 fn resolved(path: &Result<PathBuf, String>) -> String {
     path.as_ref().map_or_else(
@@ -2233,6 +2249,17 @@ mod tests {
             ..NanusConfig::default()
         };
         assert!(cold_fit_display(&off).starts_with("off ("));
+    }
+
+    /// The report says the hide break-even rule is on by default and what turning it off leaves.
+    #[test]
+    fn the_hide_break_even_rule_is_reported_on_by_default_and_off_when_turned_off() {
+        assert!(hide_break_even_display(&NanusConfig::default()).starts_with("on ("));
+        let off = NanusConfig {
+            context_hide_break_even: false,
+            ..NanusConfig::default()
+        };
+        assert!(hide_break_even_display(&off).starts_with("off ("));
     }
 
     #[test]

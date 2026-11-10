@@ -228,8 +228,15 @@ toward the target itself
 tokens and is clamped to the allowance. On a million-token window, a hint at three quarters of the
 allowance let a session grow past what legacy sends before anything asked it to stop. A small window
 has the allowance as its target and is nudged as it always was. The target is configuration rather
-than policy, because it decides nothing a proposal's acceptance or a fit depends on
-([the working target](context-management.md#the-working-target)).
+than policy, because it decides nothing a staged proposal's acceptance depends on, and a fit it
+shaped is recorded whole ([the working target](context-management.md#the-working-target)).
+
+The same arithmetic refuses a model's hide that costs more than it saves. A hide rewrites the cache
+from its earliest change and saves only a cache read per later step, so one that removes less than
+a fifth of what it forces to be re-read is refused before it is staged, unless the session is under
+pressure or its cache has lapsed
+([a hide that pays for itself](context-management.md#a-hide-that-pays-for-itself)). It is an
+ordinary tool failure rather than a recorded refusal, so it changes no session format.
 
 ### Requests are laid out for provider caches
 

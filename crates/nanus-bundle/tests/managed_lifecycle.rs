@@ -508,7 +508,11 @@ impl nanus_ports::ToolAdmission for Watching {
 fn admission_sees_the_original_and_the_effective_request_side_by_side() {
     let model = <Model as ModelExt>::new(Vec::new());
     let watching = Rc::new(Watching::default());
-    let runner = runner(&model, 64_000).with_tool_admission(watching.clone());
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = runner(&model, 64_000)
+        .with_context_hide_break_even(false)
+        .with_tool_admission(watching.clone());
     let (mut session, disk, context) = managed(&runner);
     model.push(call("w1", "echo", r#"{"size": 10}"#));
     model.push(call("w2", "echo", r#"{"size": 10}"#));
@@ -629,7 +633,11 @@ impl nanus_ports::ToolAdmission for RefusesProposals {
 #[test]
 fn a_proposal_in_a_failed_step_is_never_accepted() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = runner(&model, 64_000).with_tool_admission(Rc::new(RefusesProposals));
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = runner(&model, 64_000)
+        .with_context_hide_break_even(false)
+        .with_tool_admission(Rc::new(RefusesProposals));
     let (mut session, disk, context) = managed(&runner);
     model.push(call("w1", "echo", r#"{"size": 10}"#));
     model.push(call("w2", "echo", r#"{"size": 10}"#));

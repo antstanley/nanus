@@ -1314,8 +1314,9 @@ fn build_runner(
     } else {
         runner
     };
-    let runner =
-        with_working_target(runner, config)?.with_context_cold_fit(config.context_cold_fit);
+    let runner = with_working_target(runner, config)?
+        .with_context_cold_fit(config.context_cold_fit)
+        .with_context_hide_break_even(config.context_hide_break_even);
     // A request that carries pixels needs an explicit output reservation, and a model's whole
     // output ceiling would not fit a small budget beside any input. A quarter of a configured
     // budget is reserved, capped at 16K — below every offered model's own ceiling, so it holds
@@ -1929,6 +1930,25 @@ mod tests {
             .await
             .expect("a runner");
             assert!(!off.context_cold_fit());
+        });
+    }
+
+    /// The configuration's switch for refusing a hide that cannot pay for its cache rewrite reaches
+    /// the runner, on by default and off when the file says so.
+    #[test]
+    fn a_configured_hide_break_even_reaches_the_runner_on_by_default() {
+        nanus_kernel::runtime::block_on(async {
+            let on = stock_runner(NanusConfig::default())
+                .await
+                .expect("a runner");
+            assert!(on.context_hide_break_even());
+            let off = stock_runner(NanusConfig {
+                context_hide_break_even: false,
+                ..NanusConfig::default()
+            })
+            .await
+            .expect("a runner");
+            assert!(!off.context_hide_break_even());
         });
     }
 

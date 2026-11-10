@@ -14,11 +14,13 @@
 //! - the fold of the accepted state and what it protects ([`state`]);
 //! - compilation of the effective conversation ([`compile`]) and deterministic hard fitting
 //!   ([`fit`]);
-//! - proposal validation, staging and the revisions they become ([`proposal`]).
+//! - proposal validation, staging and the revisions they become ([`proposal`]), and whether a
+//!   proposed hide pays for the cache rewrite it forces ([`break_even`]).
 //!
 //! It performs no I/O and grants no authority. The raw log stays authoritative: an effective
 //! request is a derived view, and nothing here rewrites, reorders or deletes an event.
 
+pub mod break_even;
 pub mod compile;
 pub mod fit;
 pub mod fragments;
@@ -30,6 +32,7 @@ pub mod records;
 pub mod state;
 pub mod tooling;
 
+pub use break_even::{HideCost, HideRule, HideWaiver};
 pub use compile::{
     Effective, GoalProvenance, HANDOFF_SEED_LABEL, MANAGED_REQUEST_GUIDE_V2, MANUAL_POLICY_V1,
     MEMORY_LABEL, NoticeFacts, Reminder, Selection, derive_effective_context, manual_policy_digest,

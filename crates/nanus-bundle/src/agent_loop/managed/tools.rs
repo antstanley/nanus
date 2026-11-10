@@ -6,8 +6,8 @@ use nanus_domain::context::managed::{
 };
 use nanus_domain::context::managed::{
     ContextDecision, ContextManageInput, ContextRecallInput, ContextStatus, DecisionOutcome,
-    ErrorCode, FragmentDescriptor, MANAGE_TOOL, ManageAction, ManageResult, ManageStatus, limits,
-    proposal, state,
+    ErrorCode, FragmentDescriptor, HideRule, MANAGE_TOOL, ManageAction, ManageResult, ManageStatus,
+    limits, proposal, state,
 };
 use nanus_domain::{Session, SessionEvent, ToolCall, ToolOutcome, ToolResult};
 use nanus_ports::control::until_cancelled;
@@ -116,7 +116,7 @@ impl AgentRunner {
             {
                 refused
             } else if call.name.as_str() == MANAGE_TOOL {
-                Self::run_manage(session, call, turn)
+                self.run_manage(session, call, turn)
             } else {
                 self.run_recall(session, call, turn).await
             };
@@ -127,7 +127,11 @@ impl AgentRunner {
     }
 
     /// Runs one `context_manage` call.
-    fn run_manage(session: &Session, call: &ToolCall, turn: &ManagedTurn<'_>) -> ToolResult {
+    ///
+    /// A proposal whose hide cannot pay for the cache rewrite it forces is answered with a plain
+    /// sentence rather than a result object, as a malformed argument is: it was never staged, so
+    /// there is no decision to report and no code to record.
+    fn run_manage(&self, session: &Session, call: &ToolCall, turn: &ManagedTurn<'_>) -> ToolResult {
         if let Some(refused) = oversized(call, limits::MANAGE_ARGUMENT_BYTES_MAX) {
             return refused;
         }
@@ -140,8 +144,11 @@ impl AgentRunner {
             Err(error) => return ToolResult::failure(call.id.clone(), error.to_string()),
         };
         let result = match input.action {
-            ManageAction::Inspect => Self::inspect(session, turn, &input, status),
-            ManageAction::Propose => Self::propose(session, turn, &input, status),
+            ManageAction::Inspect => self.inspect(session, turn, &input, status),
+            ManageAction::Propose => match self.propose(session, turn, &input, status) {
+                Ok(result) => result,
+                Err(unpaid) => return ToolResult::failure(call.id.clone(), unpaid),
+            },
         };
         let failed = result.status == ManageStatus::Refused;
         let value = serde_json::to_value(&result).unwrap_or_default();
@@ -173,8 +180,9 @@ impl AgentRunner {
         Ok(status)
     }
 
-    /// One inspect page, sized to the encoded output bound.
+    /// One inspect page, sized to the encoded output bound, with the hide rule in force.
     fn inspect(
+        &self,
         session: &Session,
         turn: &ManagedTurn<'_>,
         input: &ContextManageInput,
@@ -212,7 +220,8 @@ impl AgentRunner {
                 .position(|descriptor| descriptor.assistant_seq > after)
                 .unwrap_or(all.len())
         });
-        page(&all, start, &status, |last| {
+        let rule = self.hide_rule(session, turn);
+        page(&all, start, (&status, rule), |last| {
             cursor::seal(key, &format!("{binding}:{last}"))
         })
     }
@@ -243,17 +252,22 @@ impl AgentRunner {
     }
 
     /// Validates and stages one proposal. Staged is not accepted: the step must settle first.
+    ///
+    /// Every check that refused a proposal before still refuses it first, with its code. A valid
+    /// proposal whose hide cannot pay for its cache rewrite is then refused with the sentence that
+    /// says so, as the `Err`, and nothing is staged.
     fn propose(
+        &self,
         session: &Session,
         turn: &ManagedTurn<'_>,
         input: &ContextManageInput,
         status: ContextStatus,
-    ) -> ManageResult {
+    ) -> Result<ManageResult, String> {
         let Ok(snapshot) = Self::snapshot(session) else {
-            return refused_manage(status, ErrorCode::SourceCorrupt);
+            return Ok(refused_manage(status, ErrorCode::SourceCorrupt));
         };
         let Some(profile) = turn.step.borrow().profile.clone() else {
-            return refused_manage(status, ErrorCode::StaleBase);
+            return Ok(refused_manage(status, ErrorCode::StaleBase));
         };
         let lookup = super::settle::artifact_facts(session);
         let check = proposal::Snapshot {
@@ -267,6 +281,9 @@ impl AgentRunner {
         };
         match proposal::stage(&check, input) {
             Ok(staged) => {
+                if let Some(unpaid) = self.unpaid_hide(session, turn, &snapshot, (input, &staged)) {
+                    return Err(unpaid);
+                }
                 let decision_id = format!("p-{}", session.event_count());
                 let decision = ContextDecision {
                     decision_id: decision_id.clone(),
@@ -278,16 +295,17 @@ impl AgentRunner {
                     staged,
                     decision_id,
                 });
-                ManageResult {
+                Ok(ManageResult {
                     status: ManageStatus::Staged,
                     context: status,
                     decision: Some(decision),
                     fragments: Vec::new(),
                     next_cursor: None,
                     error_code: None,
-                }
+                    hide_rule: None,
+                })
             }
-            Err(code) => refused_manage(status, code),
+            Err(code) => Ok(refused_manage(status, code)),
         }
     }
 
@@ -467,6 +485,7 @@ fn refused_manage(context: ContextStatus, code: ErrorCode) -> ManageResult {
         fragments: Vec::new(),
         next_cursor: None,
         error_code: Some(code),
+        hide_rule: None,
     }
 }
 
@@ -474,7 +493,7 @@ fn refused_manage(context: ContextStatus, code: ErrorCode) -> ManageResult {
 fn page(
     all: &[FragmentDescriptor],
     start: usize,
-    context: &ContextStatus,
+    (context, hide_rule): (&ContextStatus, Option<HideRule>),
     seal: impl Fn(u64) -> String,
 ) -> ManageResult {
     let mut count = all
@@ -493,6 +512,7 @@ fn page(
                 .flatten()
                 .map(|last| seal(last.assistant_seq)),
             error_code: None,
+            hide_rule,
         };
         let fits =
             nanus_domain::content::serialized_size(&result, limits::INSPECT_BYTES_MAX).is_ok();

@@ -146,6 +146,27 @@ fn cold_fitting_is_on_unless_a_file_turns_it_off() {
     );
 }
 
+/// Refusing a hide that cannot pay for its cache rewrite is on unless a file turns it off, and a
+/// file that says nothing about it keeps it on.
+#[test]
+fn the_hide_break_even_rule_is_on_unless_a_file_turns_it_off() {
+    assert!(NanusConfig::default().context_hide_break_even);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "context_cold_fit = false\n").expect("write");
+    assert!(
+        NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_hide_break_even
+    );
+    std::fs::write(&path, "context_hide_break_even = false\n").expect("write");
+    assert!(
+        !NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_hide_break_even
+    );
+}
+
 #[test]
 fn a_missing_file_yields_defaults() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -550,6 +571,7 @@ fn save_then_load_round_trips() {
         context_budget: Some(200_000),
         context_working_target: Some(120_000),
         context_cold_fit: false,
+        context_hide_break_even: false,
         reasoning_effort: Some(ReasoningEffort::Low),
         approval_policy: ApprovalPolicy::AllCalls,
         sandbox_mode: SandboxMode::DangerFullAccess,

@@ -7,9 +7,10 @@
 //!
 //! [`DEFAULT_WORKING_TARGET_TOKENS`] is the one default here that a host may replace, and it is
 //! not a limit in that sense. It decides when the tail asks the model to reduce, what pressure the
-//! tail states, and how far the runner's own fit goes once a provider's cache has lapsed. It never
-//! decides what a request may carry or whether a proposal is accepted: those are measured against
-//! the hard allowance alone. A fit it shapes is recorded with its whole hidden set, so reading it
+//! tail states, how far the runner's own fit goes once a provider's cache has lapsed, and, through
+//! that pressure, whether a small hide is staged anyway (see `break_even`). It never decides what a
+//! request may carry or whether a staged proposal is accepted: those are measured against the hard
+//! allowance alone. A fit it shapes is recorded with its whole hidden set, so reading it
 //! back never asks for the target. So a proposal staged under one target is exactly as valid under
 //! another, and the target is host configuration beside `context_budget`, which already moves the
 //! allowance without being recorded.

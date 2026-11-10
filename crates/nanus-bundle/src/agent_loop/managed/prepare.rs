@@ -38,6 +38,8 @@ pub(in crate::agent_loop) struct Prepared {
     pub(in crate::agent_loop) profile: Digest,
     /// The revision the request was built from.
     pub(in crate::agent_loop) revision: u64,
+    /// The pressure its tail states: the estimate as a percentage of the working target.
+    pub(in crate::agent_loop) pressure: u32,
 }
 
 /// Everything a compile needs, folded once per preparation.
@@ -284,7 +286,11 @@ impl AgentRunner {
     }
 
     /// The request every candidate shares: model, schemas, effort and reservations.
-    fn base_request(&self, session: &Session, policy: ContextPolicy) -> ChatRequest {
+    pub(in crate::agent_loop) fn base_request(
+        &self,
+        session: &Session,
+        policy: ContextPolicy,
+    ) -> ChatRequest {
         let mut request = ChatRequest::new(self.model(), Vec::new());
         request.tools = self.managed_schemas();
         request.reasoning_effort = self.effort.get();
@@ -303,7 +309,7 @@ impl AgentRunner {
     }
 
     /// Compiles one candidate into a request.
-    fn compose(
+    pub(in crate::agent_loop) fn compose(
         &self,
         session: &Session,
         snapshot: &Snapshot,
@@ -626,6 +632,7 @@ impl AgentRunner {
             status,
             profile,
             revision: selection.revision,
+            pressure: percent,
         })
     }
 

@@ -299,8 +299,13 @@ fn results() -> Vec<(&'static str, Value)> {
                 fragments: Vec::new(),
                 next_cursor: None,
                 error_code: None,
+                hide_rule: Some(HideRule::with(None)),
             })
             .unwrap(),
+        ),
+        (
+            "HideRule",
+            serde_json::to_value(HideRule::with(Some(HideWaiver::Pressure))).unwrap(),
         ),
         (
             "RecallHit",

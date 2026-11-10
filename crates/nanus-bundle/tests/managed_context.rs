@@ -388,7 +388,9 @@ fn a_refused_commit_carrying_a_settled_step_sends_nothing_and_keeps_its_outcome(
 #[test]
 fn a_valid_proposal_is_staged_then_accepted_after_its_step_settles() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = runner(&model, 64_000);
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = runner(&model, 64_000).with_context_hide_break_even(false);
     let (mut session, disk, context) = managed(&runner);
     // Three earlier fragments to choose from.
     model.push(call("w1", "echo", r#"{"size": 10}"#));
@@ -499,7 +501,9 @@ fn a_mixed_proposal_batch_refuses_every_call_before_any_effect() {
 #[test]
 fn reset_selects_legacy_and_a_re_enable_starts_from_an_empty_selection() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = runner(&model, 64_000);
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = runner(&model, 64_000).with_context_hide_break_even(false);
     let (mut session, disk, context) = managed(&runner);
     model.push(call("w1", "echo", r#"{"size": 10}"#));
     model.push(call("w2", "echo", r#"{"size": 10}"#));
@@ -651,7 +655,9 @@ fn a_configured_budget_bounds_a_following_reservation_and_an_explicit_one_is_kep
 #[test]
 fn a_selection_change_while_a_proposal_is_staged_lands_after_the_step_settles() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = Rc::new(runner(&model, 64_000));
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = Rc::new(runner(&model, 64_000).with_context_hide_break_even(false));
     let (mut session, disk, context) = managed(&runner);
     model.push(call("w1", "echo", r#"{"size": 10}"#));
     model.push(call("w2", "echo", r#"{"size": 10}"#));

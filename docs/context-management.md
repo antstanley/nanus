@@ -84,6 +84,7 @@ profile.
 | Soft-pressure hint | 75 % of the working target; re-arms only below 60 % of it; at most once per four completed model steps |
 | Automatic reduction | Acts above the hard allowance, or above the working target once the provider's cache has lapsed; continues toward 60 % of that bound while eligible fragments remain |
 | Management | At most one proposal per settled step; every model call charges the step budget |
+| Hide break-even | A proposal that hides must remove at least a fifth of the tokens it forces to be re-read, unless the request is at 75 % of the working target or the provider's cache has lapsed ([a hide that pays for itself](#a-hide-that-pays-for-itself)) |
 | `context_manage` / `context_recall` raw arguments | 16 KiB / 2 KiB, checked before JSON parsing |
 | Notes | 32 per revision, 512 Unicode scalar values each, 1–4 sources each, 8 KiB encoded array |
 | Hidden fragment ids | 4,096 per revision, strictly increasing; reaching the cap refuses further reduction |
@@ -135,10 +136,12 @@ It is host configuration, not policy. `context_working_target` in the configurat
 `AgentRunner::with_context_working_target` for a library host, names it. Zero is refused at start.
 `nanus config` prints it. Nothing records it, for three reasons:
 
-- It decides the hint, the pressure the tail states, and how far a fit goes once the cache has
-  lapsed. It never decides what a request may carry or whether a proposal is accepted, which are
-  measured against the allowance alone. A fit it shaped is recorded with its whole hidden set, so
-  reading a session back never asks for it.
+- It decides the hint, the pressure the tail states, how far a fit goes once the cache has
+  lapsed, and whether a small hide is staged anyway because the session needs the room
+  ([a hide that pays for itself](#a-hide-that-pays-for-itself)). It never decides what a request
+  may carry or whether a staged proposal is accepted, which are measured against the allowance
+  alone. A fit it shaped is recorded with its whole hidden set, so reading a session back never
+  asks for it.
 - So a proposal staged under one target is as valid under another, and it is not in the snapshot
   profile.
 - It is the same kind of value as `context_budget`, which moves the allowance and is not recorded
@@ -369,11 +372,13 @@ seven, a legacy session's schemas are unchanged, and the encoded definitions car
 allowed fields.
 
 - **`context_manage inspect`** returns the context status (revision, frontier, profile digest,
-  pressure, last decision) and a page of fragment descriptors, sized to 8 KiB. Its cursor is
-  sealed with a process-held key and bound to the revision, frontier and profile.
+  pressure, last decision), a page of fragment descriptors, and the rule a hide must meet to be
+  staged ([a hide that pays for itself](#a-hide-that-pays-for-itself)), sized to 8 KiB. Its
+  cursor is sealed with a process-held key and bound to the revision, frontier and profile.
 - **`context_manage propose`** names its base revision, frontier and profile digest, hide and
   restore deltas, and a complete replacement note array. It is validated against the complete
-  snapshot, staged, and returns `staged` — never "committed".
+  snapshot, a hide is checked against the cache rewrite it forces, and it is staged and returns
+  `staged` — never "committed".
 - **`context_recall search`** finds a literal, case-sensitive string in the session's neutral
   text and published archive objects; **`read`** returns one bounded range of one exact source
   with the digest of the whole source, for citing in a note.
@@ -389,6 +394,84 @@ deny either. They go through complete-batch admission and `before_dispatch` like
 A proposal must be the only call in its message. A batch that mixes one with any other call is
 refused whole — every call answered with `mixed_mutation_batch`, in model order — before any
 approval, goal change or executor runs.
+
+### A hide that pays for itself
+
+Provider caches are prefix caches. When an accepted proposal hides fragments, the next request is
+read uncached from the earliest fragment the proposal changed to its end, once. Every request after
+it is smaller by what was hidden. While the cache is warm, a hidden token saves only its cache-read
+price on each later step, about a tenth of the input price, and the re-read suffix costs the full
+input price. So a small hide early in a long conversation costs more than it saves: hiding 20,000
+tokens ahead of a 200,000-token suffix takes about a hundred steps to pay back.
+
+So a proposal that hides is refused before it is staged when it cannot pay its rewrite back within
+50 steps. Let `R` be the tokens the next request would be smaller by, and `S` the tokens it would
+carry from the earliest fragment the proposal hides or restores to its end:
+
+- each later step saves `R / 10`, so 50 steps save `5R`;
+- the rewrite costs `S` once;
+- so the hide is staged when `5R ≥ S`: **a hide must remove at least a fifth of what it forces to
+  be re-read.**
+
+The constants are `nanus_domain::context::managed::break_even`'s: `CACHE_READ_DISCOUNT` (10),
+`BREAK_EVEN_HORIZON_STEPS` (50) and their quotient `REREAD_PER_HIDDEN_TOKEN_MAX` (5). The rewrite
+strictly costs `0.9 S` more than a warm read would, and a cache write on Anthropic carries a
+premium of 1.25 or 2 on top. The two pull in opposite directions and are within the rounding of the
+horizon, so `S` is taken at the full input price. A hide near the end of the conversation has a
+small `S` and passes by the arithmetic alone.
+
+Both numbers are the selected adapter's estimates of the next request, from three dry preparations
+that share schemas, system prompt, notes and the probe's widest notice:
+
+1. under the accepted selection;
+2. under the candidate's hidden set;
+3. of the candidate's messages up to the first one that differs from the accepted selection's.
+
+`R` is the first less the second, and `S` the second less the third. The candidate is measured with
+the accepted notes, so a note change in the same proposal neither helps nor hurts its hide. The
+preparations are made only for a proposal that hides while no waiver applies. An inspect, a step, a
+restore and a note change cost nothing. A preparation that is refused stages the proposal, and its
+re-validation after the step checks what it always has.
+
+The rule never stops a session getting room it needs:
+
+- **Pressure.** Any hide is staged when the step's tail stated `pressure_percent` at or above 75,
+  the pressure the budget hint is given at. The working target is what the pressure is measured
+  against, so a session asked to reduce can always reduce.
+- **A lapsed cache.** Any hide is staged when the provider's cache of the session has lapsed
+  ([fitting a lapsed cache](#fitting-a-lapsed-cache)), because the next request is read uncached
+  whatever it carries. This holds whether or not `context_cold_fit` is on.
+- **Nothing hidden.** A proposal that only restores, or only changes notes, is never judged. A
+  restore is about correctness, and a note change is a different cost. A proposal that hides and
+  restores is judged on its net numbers, from the earliest fragment it changes.
+- **Not a proposal.** Hard fitting and a cold fit are automatic revisions, and the rule does not
+  reach them.
+
+Every check that refused a proposal before refuses it first, with its code: a mixed batch, a stale
+base, an invalid or protected fragment. A refusal under this rule is then an ordinary bounded tool
+failure, the form a malformed argument takes. It is a sentence giving `R`, `S`, the earliest changed
+fragment, the tokens that would pass, and what would be accepted: hide more of the resolved stretch
+in one proposal, hide later work, or wait for the pressure or a lapsed cache. It has no error code.
+Nothing is staged, no `context/decision` is recorded, the revision does not move, and later requests
+carry the same selection as if the call had been an inspect. The session records only the call and
+its failed result, which every body version already holds, so the rule changes no recorded format.
+
+An inspect page states the rule as `hide_rule`: `max_reread_per_hidden_token` (5) and `waived`
+(`pressure`, `cache_lapsed` or null), so a model can plan one proposal that passes rather than learn
+the rule by refusal. It is null on a proposal's result and when the host turned the rule off. It
+says nothing about the cache's hit rate: the ratio is a constant, and `waived` changes only when
+the pressure crosses 75 % or the cache lapses. The status carries no cache share, as before. The
+system prompt's guide is unchanged. Its sentence that one change hiding a resolved stretch is
+cheaper than several small ones is still true, and changing it would cost every managed session one
+read of its system prompt uncached.
+
+The rule decides only whether a proposal is staged, at the moment it is proposed. A proposal is the
+only call in its message, so nothing between then and its step's end can change the numbers, and
+re-validation after `StepEnd` is unchanged. So, like the working target, it is configuration rather
+than policy: a proposal staged with the rule on is as valid with it off. `context_hide_break_even`
+in the configuration file (default `true`), or `AgentRunner::with_context_hide_break_even` for a
+library host, turns it off. `nanus config` prints it. Nothing records it, and a legacy session never
+reads it.
 
 ## The step transaction
 
@@ -422,6 +505,8 @@ The selection is held whenever managed mode or either admission port is active; 
 and apply after the step. The adapter-owned prepared call is frozen once: its body digest is
 recorded in the intent and the same object is dispatched, never re-encoded or re-resolved.
 
+A proposal is checked when it is proposed: its snapshot, references and deltas, then whether a
+hide pays for its cache rewrite. One that fails is answered as a failed call and never staged.
 A staged proposal is re-validated after `StepEnd`: the snapshot compare-and-set again, its
 references, the record bound, and a dry preparation proving the *next* request would fit. An
 oversized proposal is rejected as it stands — nothing is hidden on its behalf. Acceptance records
@@ -1175,8 +1260,9 @@ of a compacted session), `handoff_unavailable` (a handoff asked of a legacy, bus
 session or with none attached, an interrupted draft, a narrative or seed that breaks the text rule,
 or a malformed seed or back-link) and `stale_draft` (a commit whose draft base moved, or whose draft
 id is not the one held). Over the link a refusal's code travels in `Frame::Refused.code` beside a
-sentence that never repeats it. A malformed tool argument is an ordinary bounded tool failure; a
-failed context edit never invalidates an earlier result or retries a command.
+sentence that never repeats it. A malformed tool argument is an ordinary bounded tool failure, and
+so is a hide refused because it cannot pay for its cache rewrite: it has no code, and records no
+decision. A failed context edit never invalidates an earlier result or retries a command.
 
 ## What is and is not verified
 
@@ -1288,6 +1374,21 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
     next cold start;
   - over the allowance, a warm resume hard-fits identically with the switch on or off, and a cold
     one hides more;
+- a hide that pays for itself. The domain tests check the rule at its boundary (20,000 hidden ahead
+  of 200,000 re-read is refused, 40,000 passes), a candidate that removes nothing, the waivers, the
+  earliest changed fragment, and the inspect payload against the schema. Through the real runner,
+  with a scripted model whose estimate is its body's size (`nanus-bundle/tests/managed_hide_break_even.rs`):
+  - a small early hide ahead of thousands of tokens is refused with its numbers. Nothing is staged
+    or decided, the revision stays 0, and the next request begins with every message of the one
+    before it and hides nothing;
+  - the same hide is staged and accepted under pressure, once the cache has lapsed (with cold
+    fitting on or off, and refused at exactly the lifetime), and with the rule off;
+  - a hide of the whole resolved stretch, and a hide of the latest eligible fragment, are staged;
+  - a restore of the earliest fragment and a note change alone are staged, and a note does not
+    carry a small hide with it;
+  - a mixed batch is still refused whole with `mixed_mutation_batch`, and a stale base with
+    `stale_base`, rather than with the rule's sentence;
+  - inspect states the rule, its pressure waiver, and nothing when it is off;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
   developer system message and no `instructions` is accepted and answers as the system prompt
   directs, and three managed steps with a trailing developer tail after tool output are accepted;
@@ -1385,6 +1486,13 @@ Not verified, and not claimed:
   Anthropic's documented TTLs and, everywhere else, on an hour being long enough. No live run has
   checked a provider's cache across an idle gap. No recorded session has been replayed to show what
   a cold fit saves.
+- **The hide rule's price ratio is a documented figure, not a measured one.** A cache read at a
+  tenth of the input price is the providers' published pricing, and the 50-step horizon is a
+  judgement of how long a long turn runs. No recorded session has been replayed to show what the
+  rule saves or costs, and nothing shows that a live model plans its proposals around the rule
+  stated in inspect rather than learning it by refusal. The estimates the rule compares are the
+  adapter's, not the provider's tokens, and the suffix is measured once, at the proposal, so a
+  session that ends a few steps later never repays a hide the rule accepted under pressure.
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
   is no claim that managed context improves anything, and the default stays legacy.
