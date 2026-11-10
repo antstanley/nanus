@@ -427,6 +427,28 @@ fn rename_max_output_tokens(document: &mut Value) -> Result<(), nanus_kernel::Er
     Ok(())
 }
 
+/// Reads the version a document declares: zero when it declares none.
+///
+/// An absent version is the pre-1.0 shape and is migrated from the start. A version that is
+/// *present* and not a whole number — `"2"`, `1.5`, `-1` — used to be read as absent too, so a
+/// file a newer build wrote with its version quoted was migrated as though it were the oldest
+/// shape and then stamped with this build's version, instead of being refused. It is a document
+/// that does not fit the schema, and it is reported as one.
+fn declared_version(document: &Value, path: &Path) -> Result<u32, ConfigError> {
+    let Some(declared) = document.get("config_version") else {
+        return Ok(0);
+    };
+    if let Some(whole) = declared.as_u64() {
+        // A number too large for the field is newer than anything this build could know.
+        return Ok(u32::try_from(whole).unwrap_or(u32::MAX));
+    }
+    // Decoded only for its error, which says what was found and what was expected.
+    serde_json::from_value::<u32>(declared.clone()).map_err(|source| ConfigError::Invalid {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 impl NanusConfig {
     /// Loads the configuration using the documented precedence.
     ///
@@ -490,7 +512,7 @@ impl NanusConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        let config = Self::migrate(document)?;
+        let config = Self::migrate_from(document, path)?;
         tracing::debug!(path = %path.display(), version = config.config_version, "loaded configuration");
         Ok(config)
     }
@@ -500,12 +522,13 @@ impl NanusConfig {
     /// # Errors
     ///
     /// As [`NanusConfig::from_toml`] for the version and migration failures.
-    pub fn migrate(mut document: Value) -> Result<Self, ConfigError> {
-        let declared = document
-            .get("config_version")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let found = u32::try_from(declared).unwrap_or(u32::MAX);
+    pub fn migrate(document: Value) -> Result<Self, ConfigError> {
+        Self::migrate_from(document, Path::new("<migrated document>"))
+    }
+
+    /// [`NanusConfig::migrate`], for a document read from `path`, which a failure then names.
+    fn migrate_from(mut document: Value, path: &Path) -> Result<Self, ConfigError> {
+        let found = declared_version(&document, path)?;
         if found > CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion {
                 found,
@@ -521,7 +544,7 @@ impl NanusConfig {
             table.insert(String::from("config_version"), Value::from(applied));
         }
         serde_json::from_value(document).map_err(|source| ConfigError::Invalid {
-            path: PathBuf::from("<migrated document>"),
+            path: path.to_path_buf(),
             source,
         })
     }
