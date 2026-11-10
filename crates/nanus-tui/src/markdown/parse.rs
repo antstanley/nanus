@@ -129,7 +129,8 @@ pub(crate) enum Resume<'a> {
 ///   is drawn a line at a time, and the lexer's state at the line is carried with the cut. The
 ///   lines must not be empty because a fence's body is read without the blank lines it ends
 ///   with: a part that ended on one would draw a row the whole would not. A `mermaid` fence
-///   drawn as a diagram is not cut — a diagram is drawn from all of its source.
+///   that may be drawn as a diagram is not cut — a diagram is drawn from all of its source —
+///   until it is longer than any diagram is drawn from, after which it is code for good.
 pub(crate) fn cut_points(source: &str, resume: &Resume<'_>, mermaid: bool) -> Vec<Point> {
     let cleaned = inline::sanitize(source);
     let lines: Vec<&str> = cleaned.lines().collect();
@@ -242,7 +243,14 @@ fn fence_points(
                 .and_then(|before| lines.get(before))
                 .is_some_and(|before| !before.is_empty())
         };
-        if !diagram && after_code && !line.is_empty() {
+        // A fence that may be a diagram is drawn from all of its source, so it is cut only
+        // once it holds more lines than a diagram is drawn from: it is code from then on,
+        // whatever it goes on to say. A fence that was already open when the search began was
+        // cut before, so it is already past that.
+        let whole = diagram
+            && fence.opener.is_some()
+            && index.saturating_sub(first) <= super::mermaid::MAX_LINES;
+        if !whole && after_code && !line.is_empty() {
             points.push(Point {
                 line: index,
                 joint: Joint::Code {

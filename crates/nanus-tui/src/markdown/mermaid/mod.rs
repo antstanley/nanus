@@ -22,12 +22,25 @@ use ratatui::text::{Line, Span};
 use super::text::{char_width, str_width};
 use super::theme::MarkdownTheme;
 
-/// Renders a mermaid source, or `None` when it is not a diagram this module knows.
+/// The most lines of source a diagram is drawn from.
+///
+/// A diagram is laid out from all of its source, and some layouts cost more than the source is
+/// long: a left-to-right graph stacks every node of a layer in one column and routes each edge
+/// down it, so a star of a few thousand edges took seconds to draw — per token, while it was
+/// still arriving. Nothing that long is a picture a terminal can show either. Past this the
+/// fence is drawn as the code it is, which is the fallback every diagram already has.
+pub(crate) const MAX_LINES: usize = 400;
+
+/// Renders a mermaid source, or `None` when it is not a diagram this module draws: one it does
+/// not know, or one longer than [`MAX_LINES`].
 pub(crate) fn render(
     source: &str,
     width: usize,
     theme: &MarkdownTheme,
 ) -> Option<Vec<Line<'static>>> {
+    if source.lines().nth(MAX_LINES).is_some() {
+        return None;
+    }
     let first = source.lines().next()?.trim();
     if first.starts_with("graph") || first.starts_with("flowchart") {
         graph::flowchart(source, width, theme)
@@ -295,6 +308,21 @@ mod tests {
         let text = expect("block-beta\ncolumns 2\nA B\nC D");
         assert!(text.contains('A'), "{text}");
         assert!(text.contains('D'), "{text}");
+    }
+
+    /// A diagram is drawn from at most [`MAX_LINES`] of source; a longer one is left to be
+    /// drawn as code, so its cost stays in step with its length.
+    #[test]
+    fn a_diagram_too_long_to_be_a_picture_is_left_as_code() {
+        let star = |edges: usize| {
+            let lines: Vec<String> = (0..edges)
+                .map(|index| format!("  A --> N{index}"))
+                .collect();
+            format!("graph LR\n{}\n", lines.join("\n"))
+        };
+        assert!(draw(&star(MAX_LINES.saturating_sub(1)), 80).is_some());
+        assert!(draw(&star(MAX_LINES), 80).is_none());
+        assert!(draw(&star(8_000), 80).is_none());
     }
 
     #[test]
