@@ -15,7 +15,7 @@ use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -94,7 +94,15 @@ impl Next {
 
 /// Advances a waterfall one listener, invoking it with a fresh continuation.
 fn plateau(payload: ErasedPayload, state: &Rc<WaterfallState>) -> Option<ErasedPayload> {
-    let Some(handler) = state.chain.get(state.index) else {
+    // The next listener that is still registered: one an earlier listener in this same chain
+    // caused to be unloaded is stepped over, as if it had never been in the snapshot.
+    let live = state
+        .chain
+        .iter()
+        .enumerate()
+        .skip(state.index)
+        .find(|(_, handler)| handler.is_live());
+    let Some((index, handler)) = live else {
         // Postcondition: past the end of the chain, the payload survives as-is.
         return Some(payload);
     };
@@ -106,7 +114,7 @@ fn plateau(payload: ErasedPayload, state: &Rc<WaterfallState>) -> Option<ErasedP
     };
     let next_state = Rc::new(WaterfallState {
         chain: Rc::clone(&state.chain),
-        index: state.index.saturating_add(1),
+        index: index.saturating_add(1),
         key: state.key,
     });
     let event = EventErased {
@@ -341,6 +349,20 @@ struct ErasedHandler {
     order: u64,
     owner: PluginId,
     kind: HandlerKind,
+    /// Set when the listener is unregistered.
+    ///
+    /// A dispatch walks a snapshot, and a listener may now unload a plugin part way through
+    /// one — its own or another's. The handlers that plugin registered are still in the
+    /// snapshot, so the walk asks each one whether it is still registered before calling it:
+    /// a listener must not outlive the plugin that owned it by the rest of a dispatch.
+    withdrawn: Cell<bool>,
+}
+
+impl ErasedHandler {
+    /// Whether the listener is still registered.
+    fn is_live(&self) -> bool {
+        !self.withdrawn.get()
+    }
 }
 
 /// A snapshot of one registered listener, for diagnostics.
@@ -387,7 +409,13 @@ impl Store {
             return;
         };
         let before = chain.len();
-        chain.retain(|handler| handler.order != order);
+        chain.retain(|handler| {
+            let kept = handler.order != order;
+            if !kept {
+                handler.withdrawn.set(true);
+            }
+            kept
+        });
         let after = chain.len();
         if after == 0 {
             listeners.remove(&key);
@@ -429,6 +457,17 @@ impl Registry {
         }
     }
 
+    /// Another handle on the same registry.
+    ///
+    /// The context hands one out and lets go of its own borrow before a dispatch starts, so a
+    /// listener is free to call back into the context — to unload a plugin, say — which a
+    /// borrow held across the callbacks turned into a panic.
+    pub(crate) fn handle(&self) -> Self {
+        Self {
+            store: Rc::clone(&self.store),
+        }
+    }
+
     /// Inserts a listener, honouring its [`Priority`], and returns the guard that
     /// unregisters it.
     fn insert<K: 'static>(
@@ -439,7 +478,12 @@ impl Registry {
         priority: Priority,
     ) -> Rc<EventGuard> {
         let order = self.store.allocate_order();
-        let handler = Rc::new(ErasedHandler { order, owner, kind });
+        let handler = Rc::new(ErasedHandler {
+            order,
+            owner,
+            kind,
+            withdrawn: Cell::new(false),
+        });
         {
             let mut listeners = self.store.listeners.borrow_mut();
             let chain = listeners.entry(key.name()).or_default();
@@ -483,7 +527,13 @@ impl Registry {
             return;
         };
         let before = chain.len();
-        chain.retain(|handler| handler.owner != owner);
+        chain.retain(|handler| {
+            let kept = handler.owner != owner;
+            if !kept {
+                handler.withdrawn.set(true);
+            }
+            kept
+        });
         let after = chain.len();
         if after == 0 {
             listeners.remove(&key);
@@ -615,7 +665,7 @@ impl Registry {
             name: key.as_str(),
             dispatcher: None,
         };
-        for handler in &chain {
+        for handler in chain.iter().filter(|handler| handler.is_live()) {
             if let HandlerKind::Observe(callback) = &handler.kind {
                 callback(&event, payload);
             } else {
@@ -713,7 +763,7 @@ impl Registry {
             dispatcher: None,
         };
         let mut first: Option<Box<dyn Any>> = None;
-        for handler in &chain {
+        for handler in chain.iter().filter(|handler| handler.is_live()) {
             if let HandlerKind::Decide(callback) = &handler.kind {
                 let decision = callback(&event, payload);
                 if first.is_none() {
@@ -743,7 +793,7 @@ impl Registry {
             name: key.as_str(),
             dispatcher: None,
         };
-        for handler in &chain {
+        for handler in chain.iter().filter(|handler| handler.is_live()) {
             if let HandlerKind::Decide(callback) = &handler.kind {
                 if let Some(boxed) = callback(&event, payload) {
                     return boxed.downcast::<R>().ok().map(|value| *value);

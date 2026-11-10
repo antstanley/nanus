@@ -701,6 +701,128 @@ fn a_three_plugin_cascade_hands_every_binding_back_to_its_dependent() {
         "every binding is gone once the cascade has run"
     );
 }
+/// A cascade unwinds newest first, so an effect that hands back what its plugin borrowed still
+/// finds it.
+///
+/// `unmount` was already safe at any depth. An *effect* was not: the sweep parks plugins
+/// provider-first and used to finish them in that order, so by the time the far end's effects
+/// reverted the middle plugin's binding had been withdrawn. A direct unload of the far end never
+/// had the problem, which is the other half of this test — the two must agree.
+#[test]
+fn a_cascade_reverts_a_dependents_effects_while_its_provider_still_resolves() {
+    let build = |trace: &Rc<Trace>| {
+        let trace_leaf = Rc::clone(trace);
+        Kernel::new()
+            .with_plugin(
+                plugin_id("leaf"),
+                nanus_kernel::Hook::new(plugin_id("leaf"), "hands a counter back", move |cx| {
+                    let trace = Rc::clone(&trace_leaf);
+                    cx.effect("leaf.hand-back", move |context| {
+                        let saw = context.get(counter_key()).is_ok();
+                        trace.record(format!("leaf.effect-saw-counter:{saw}"));
+                        Ok(())
+                    });
+                    Ok(())
+                })
+                .requiring(vec![AnyServiceKey::from_typed(counter_key())]),
+            )
+            .with_plugin(
+                plugin_id("relay"),
+                Relay::new(plugin_id("relay"), Rc::clone(trace)),
+            )
+            .with_plugin(
+                plugin_id("base"),
+                Publisher::new(plugin_id("base"), Rc::clone(trace), 2),
+            )
+            .start()
+    };
+
+    // The cascade: removing the root deactivates the relay and then the leaf.
+    let trace = Rc::new(Trace::default());
+    let started = build(&trace);
+    assert!(started.is_ok(), "{started:?}");
+    let Ok(context) = started else {
+        return;
+    };
+    assert_eq!(context.stats().active, 3, "{:?}", trace.entries());
+    assert!(context.unload(plugin_id("base")).is_ok());
+    let entries = trace.entries();
+    assert!(
+        entries.contains(&"leaf.effect-saw-counter:true".to_owned()),
+        "the far end's effect reverts before the relay's binding is withdrawn: {entries:?}"
+    );
+    assert!(
+        context.get(counter_key()).is_err(),
+        "and the binding is gone once the cascade has finished"
+    );
+
+    // The direct unload it must agree with.
+    let trace = Rc::new(Trace::default());
+    let started = build(&trace);
+    assert!(started.is_ok(), "{started:?}");
+    let Ok(context) = started else {
+        return;
+    };
+    assert!(context.unload(plugin_id("leaf")).is_ok());
+    assert!(
+        trace
+            .entries()
+            .contains(&"leaf.effect-saw-counter:true".to_owned()),
+        "{:?}",
+        trace.entries()
+    );
+    assert!(
+        context.get(counter_key()).is_ok(),
+        "a direct unload of the far end withdraws nothing it did not publish"
+    );
+}
+
+/// `unmount` follows a `mount`, and only one.
+///
+/// Unloading a plugin that was still waiting for a requirement used to run its `unmount` all the
+/// same — a teardown for state the plugin never built.
+#[test]
+fn unloading_a_plugin_that_never_mounted_does_not_unmount_it() {
+    let trace = Rc::new(Trace::default());
+    let kernel = Kernel::new()
+        .with_plugin(
+            plugin_id("waiting"),
+            Consumer::new(plugin_id("waiting"), Rc::clone(&trace)),
+        )
+        .with_plugin(
+            plugin_id("mounted"),
+            CounterConsumer::new(plugin_id("mounted"), Rc::clone(&trace)),
+        )
+        .with_plugin(
+            plugin_id("counter"),
+            nanus_kernel::Hook::new(plugin_id("counter"), "publishes a counter", |cx| {
+                cx.provide(counter_key(), Rc::new(Rc::new(StubCounter)))
+            }),
+        );
+    let started = kernel.start();
+    assert!(started.is_ok(), "{started:?}");
+    let Ok(context) = started else {
+        return;
+    };
+    let state = |id| context.plugin(plugin_id(id)).map(|info| info.state);
+    assert_eq!(state("waiting"), Some(PluginState::Pending));
+    assert_eq!(state("mounted"), Some(PluginState::Active));
+
+    assert!(context.unload(plugin_id("waiting")).is_ok());
+    assert!(context.unload(plugin_id("mounted")).is_ok());
+
+    let entries = trace.entries();
+    assert!(
+        !entries.contains(&"waiting.unmount".to_owned()),
+        "a plugin that never mounted has nothing to unmount: {entries:?}"
+    );
+    assert!(
+        entries.contains(&"mounted.unmount".to_owned()),
+        "and one that mounted still is: {entries:?}"
+    );
+    assert_eq!(state("waiting"), Some(PluginState::Unloaded));
+}
+
 #[test]
 fn a_provider_that_replaces_itself_is_observed() {
     let trace = Rc::new(Trace::default());
@@ -1055,6 +1177,73 @@ fn unloading_a_plugin_unregisters_its_listeners() {
     assert_eq!(context.listener_listing().len(), 0);
     context.emit(STEP, &StepPayload { step: 2 });
     assert_eq!(trace.entries(), vec!["heard"]);
+}
+
+/// A listener may call back into the context, and a listener whose plugin went away during a
+/// dispatch is not called for the rest of it.
+///
+/// The dispatch used to hold the context borrowed across every callback, so a listener that
+/// unloaded a plugin panicked on a `RefCell`. With the borrow gone the snapshot being walked
+/// still holds the unloaded plugin's listener, which is why the walk checks each one.
+#[test]
+fn a_listener_can_unload_a_plugin_and_that_plugins_listener_is_then_skipped() {
+    let trace = Rc::new(Trace::default());
+    let shared: Rc<RefCell<Option<Context>>> = Rc::new(RefCell::new(None));
+    let (trace_first, trace_victim, trace_last) =
+        (Rc::clone(&trace), Rc::clone(&trace), Rc::clone(&trace));
+    let handle = Rc::clone(&shared);
+    let kernel = Kernel::new()
+        .with_plugin(
+            plugin_id("first"),
+            nanus_kernel::Hook::new(plugin_id("first"), "unloads the victim", move |cx| {
+                let (trace, handle) = (Rc::clone(&trace_first), Rc::clone(&handle));
+                cx.on(STEP, move |_event, _payload| {
+                    trace.record("first.heard");
+                    let context = handle.borrow().clone();
+                    if let Some(context) = context {
+                        let unloaded = context.unload(plugin_id("victim"));
+                        trace.record(format!("victim.unloaded:{}", unloaded.is_ok()));
+                    }
+                });
+                Ok(())
+            }),
+        )
+        .with_plugin(
+            plugin_id("victim"),
+            nanus_kernel::Hook::new(plugin_id("victim"), "is unloaded", move |cx| {
+                let trace = Rc::clone(&trace_victim);
+                cx.on(STEP, move |_event, _payload| trace.record("victim.heard"));
+                Ok(())
+            }),
+        )
+        .with_plugin(
+            plugin_id("last"),
+            nanus_kernel::Hook::new(plugin_id("last"), "still listens", move |cx| {
+                let trace = Rc::clone(&trace_last);
+                cx.on(STEP, move |_event, _payload| trace.record("last.heard"));
+                Ok(())
+            }),
+        );
+    let started = kernel.start();
+    assert!(started.is_ok());
+    let Ok(context) = started else {
+        return;
+    };
+    *shared.borrow_mut() = Some(context.clone());
+
+    context.emit(STEP, &StepPayload { step: 1 });
+
+    assert_eq!(
+        trace.entries(),
+        vec!["first.heard", "victim.unloaded:true", "last.heard"],
+        "the unload happens inside the dispatch, the victim is skipped, and the rest still hear"
+    );
+    assert_eq!(
+        context.plugin(plugin_id("victim")).map(|info| info.state),
+        Some(PluginState::Unloaded)
+    );
+    // Dropped so the context is not kept alive by its own listener.
+    *shared.borrow_mut() = None;
 }
 
 // ---------------------------------------------------------------------------

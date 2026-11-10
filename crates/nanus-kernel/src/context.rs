@@ -163,6 +163,16 @@ impl Context {
         self.inner.borrow_mut()
     }
 
+    /// A handle on the event registry, taken without keeping the context borrowed.
+    ///
+    /// Every dispatch goes through this. The registry shares its storage, so the handle is a
+    /// pointer copy, and the borrow that produced it has ended by the time a listener runs:
+    /// a listener that unloads a plugin, or asks for a sweep, needs the context mutably, and
+    /// a dispatch that held it borrowed for the whole chain made that a `RefCell` panic.
+    fn events(&self) -> event::Registry {
+        self.inner.borrow().events.handle()
+    }
+
     /// Returns a view of the published services that attributes errors to `owner`.
     #[must_use]
     pub const fn services_for(&self, owner: PluginId) -> Services<'_> {
@@ -207,7 +217,7 @@ impl Context {
     ///
     /// `emit` is fire-and-forget: listeners observe and cannot affect the caller.
     pub fn emit<K: 'static>(&self, key: EventKey<K>, payload: &K) {
-        self.inner.borrow().events.dispatch_emit(key, payload);
+        self.events().dispatch_emit(key, payload);
     }
 
     /// Dispatches an event through `waterfall`, returning the final payload.
@@ -217,7 +227,7 @@ impl Context {
     /// observes `None`.
     #[must_use]
     pub fn waterfall<K: 'static>(&self, key: EventKey<K>, payload: K) -> Option<K> {
-        self.inner.borrow().events.dispatch_waterfall(key, payload)
+        self.events().dispatch_waterfall(key, payload)
     }
 
     /// Dispatches an event through `waterfall`, recording `dispatcher` as its
@@ -229,15 +239,13 @@ impl Context {
         dispatcher: PluginId,
         payload: K,
     ) -> Option<K> {
-        self.inner
-            .borrow()
-            .events
+        self.events()
             .dispatch_waterfall_from(key, dispatcher, payload)
     }
 
     /// Dispatches an event through `parallel`: every listener runs concurrently.
     pub fn parallel<K: 'static>(&self, key: EventKey<K>, payload: &K) {
-        self.inner.borrow().events.dispatch_parallel(key, payload);
+        self.events().dispatch_parallel(key, payload);
     }
 
     /// Dispatches an event through `serial`, returning the first decision.
@@ -247,7 +255,7 @@ impl Context {
     /// has decided is what [`bail`](Context::bail) is for.
     #[must_use]
     pub fn serial<K: 'static, R: 'static>(&self, key: EventKey<K>, payload: &K) -> Option<R> {
-        self.inner.borrow().events.dispatch_serial(key, payload)
+        self.events().dispatch_serial(key, payload)
     }
 
     /// Dispatches an event through `bail`, stopping at the first decision.
@@ -256,7 +264,7 @@ impl Context {
     /// listener can own a decision outright.
     #[must_use]
     pub fn bail<K: 'static, R: 'static>(&self, key: EventKey<K>, payload: &K) -> Option<R> {
-        self.inner.borrow().events.dispatch_bail(key, payload)
+        self.events().dispatch_bail(key, payload)
     }
 
     /// Mounts every staged plugin and activates those whose requirements are met.
@@ -414,7 +422,13 @@ impl Context {
         if parked.is_empty() {
             return false;
         }
-        for withdrawal in parked {
+        // Newest first. Plugins are parked in the order the sweep reached them, which is
+        // provider before dependent, so finishing them in that order took a provider's
+        // bindings away before its dependent's effects had reverted — and an effect that
+        // resolves what its plugin required found nothing, in a cascade and only in a
+        // cascade. Reversed, a cascade unwinds the way a direct unload of each plugin would:
+        // the far end first, with everything it borrowed still resolvable.
+        for withdrawal in parked.into_iter().rev() {
             let id = withdrawal.id;
             let mut disposer = withdrawal.disposer;
             let guards = withdrawal.guards;
@@ -649,12 +663,18 @@ impl Context {
                 None => return Ok(()),
             }
         };
-        let outcome = {
-            let mut borrowed = record.plugin.borrow_mut();
-            crate::runtime::block_on(borrowed.unmount(self))
-        };
-        if let Err(error) = outcome {
-            tracing::warn!(plugin = %id, error = %error, "unmount hook failed");
+        // Only a plugin that is mounted has anything to unmount. One that is still waiting for
+        // a requirement, or whose mount failed and was reverted, never had its `mount` run to
+        // completion, and the hooks are documented as running in order: an `unmount` with no
+        // `mount` before it hands a plugin a teardown for state it never built.
+        if record.state.is_active() {
+            let outcome = {
+                let mut borrowed = record.plugin.borrow_mut();
+                crate::runtime::block_on(borrowed.unmount(self))
+            };
+            if let Err(error) = outcome {
+                tracing::warn!(plugin = %id, error = %error, "unmount hook failed");
+            }
         }
         // Withdrawn *after* the effects revert and after the sweep below, which is the order the
         // comment that used to sit here described and the code did not implement: withdrawing
