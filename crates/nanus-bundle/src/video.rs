@@ -69,7 +69,9 @@ impl VideoRouting for StockRouting {
     fn analyzer(&self) -> LocalBoxFuture<'_, Result<Rc<dyn VideoAnalyzer>, VideoError>> {
         Box::pin(async move {
             let switch = self.switch()?;
-            let current = switch.current_selection();
+            // The provider the step asking is being sent to, not one a switch has queued behind
+            // it: the frames go where the conversation that asked for them is.
+            let current = switch.selection_in_force();
             let provider = current.provider();
             let Some(model) = analysis_model(provider) else {
                 return Err(VideoError::Unavailable(format!(

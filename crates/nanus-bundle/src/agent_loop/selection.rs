@@ -27,7 +27,8 @@ enum PendingEffort {
     Set(Option<ReasoningEffort>),
 }
 
-pub(super) struct Hold<'a> {
+/// A step's hold on the selection; setters queue until the last one is dropped.
+pub struct Hold<'a> {
     runner: &'a AgentRunner,
 }
 
@@ -81,7 +82,9 @@ impl AgentRunner {
     /// Holds the exact selection for a step when managed context or either admission port is
     /// active, so the adapter, model and effort a request was prepared under are the ones it is
     /// dispatched, validated and checkpointed under. Setters queue until the hold is released.
-    pub(super) fn hold_selection(&self, managed: bool) -> Result<Option<Hold<'_>>, BundleError> {
+    ///
+    /// Crate-visible so the provider switch's tests can stand in for a step in progress.
+    pub(crate) fn hold_selection(&self, managed: bool) -> Result<Option<Hold<'_>>, BundleError> {
         if !managed && self.admission.is_none() && self.records.is_none() {
             return Ok(None);
         }
