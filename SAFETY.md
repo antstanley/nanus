@@ -214,11 +214,19 @@ printing any value.
   carried in redacts its own `Debug`, and the read is a method named `expose` so
   every site that handles a raw value is greppable.
 - Session transcripts are stored under `<nanus home>/sessions/`. A transcript
-  contains everything the model saw and produced, including any secret it read.
+  contains everything the model saw and produced, including any secret it read, so
+  the session store is its owner's alone: every directory it creates is `0700` and
+  every file `0600`, whatever the umask — logs, names, claims, archived shell output,
+  and the markers and trash of deleted sessions. A store written before this was so
+  has its `sessions/`, `retired/` and `trash/` directories narrowed the next time it
+  is opened, which closes every transcript beneath them at once; a session's own
+  directory and log take the new modes when the session is next claimed and written.
+  The home itself is left as the user made it.
 
-The file store's `0600`/`0700` permissions apply on Unix. On Windows, files inherit
-the containing directory's ACL; the backend does not set an explicit descriptor.
-Choose a home directory that other users cannot read, or use environment credentials.
+The file store's and the session store's `0600`/`0700` permissions apply on Unix. On
+Windows, files inherit the containing directory's ACL; neither sets an explicit
+descriptor. Choose a home directory that other users cannot read, or use environment
+credentials.
 
 What this does **not** do: the file store is not encrypted, so a secret in it is
 readable by anything running as you — as the environment variable already was. The

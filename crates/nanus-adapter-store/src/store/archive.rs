@@ -400,7 +400,7 @@ impl Reservation {
         let path = self
             .artifacts
             .join(format!("{}.{LEASE_EXT}", record.stem()));
-        let file = std::fs::OpenOptions::new()
+        let file = super::private::options()
             .read(true)
             .write(true)
             .create_new(true)
@@ -420,7 +420,7 @@ fn new_artifact_id() -> Result<ArtifactId, CaptureFailure> {
 
 /// Creates a staging file, refusing to reuse a name.
 fn create_partial(artifacts: &Path, id: &ArtifactId) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
+    super::private::options()
         .write(true)
         .create_new(true)
         .open(artifacts.join(format!("{}.{PARTIAL_EXT}", id.uuid())))
@@ -429,7 +429,7 @@ fn create_partial(artifacts: &Path, id: &ArtifactId) -> std::io::Result<std::fs:
 /// Takes the quota lock, retrying briefly; the returned file is the lock.
 pub fn quota_lock(home: &Path) -> Result<std::fs::File, CaptureFailure> {
     let path = home.join(QUOTA_LOCK_FILE);
-    let file = std::fs::OpenOptions::new()
+    let file = super::private::options()
         .read(true)
         .write(true)
         .create(true)
@@ -453,7 +453,7 @@ fn prepare_dir(dir: &Path) -> std::io::Result<()> {
     if let Some(parent) = dir.parent() {
         refuse_link(parent)?;
     }
-    std::fs::create_dir_all(dir)?;
+    super::private::create_dir_all_blocking(dir)?;
     refuse_link(dir)
 }
 
