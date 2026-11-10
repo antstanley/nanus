@@ -39,8 +39,10 @@ pub(crate) enum Piece {
     /// A tool call in the compact form: one line, carrying how the call ended.
     ///
     /// The state is part of the piece because it comes from *another* entry — the result —
-    /// so the call's own stamp cannot say when its line has to change.
-    CompactCall(compact::ToolState),
+    /// so the call's own stamp cannot say when its line has to change. So is whether a
+    /// question is open about this call, which decides which end of a long command the line
+    /// keeps and comes from the view rather than from any entry.
+    CompactCall(compact::ToolState, bool),
     /// A result that answers a call, in the compact form: only what the tool said.
     CompactResult,
     /// A thinking segment in the compact form: its newest line.
@@ -73,7 +75,7 @@ impl Piece {
             Self::StreamHead(_) | Self::StreamChunk(..) => entry.id(),
             Self::ToolRun
             | Self::ReasoningRun
-            | Self::CompactCall(_)
+            | Self::CompactCall(..)
             | Self::CompactResult
             | Self::CompactThinking
             | Self::Whole
