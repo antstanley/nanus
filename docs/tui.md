@@ -1500,7 +1500,11 @@ Two rules keep the kept layout honest, and a change to the view has to respect b
 - **Every input to rendering is in the layout key.** The width, the detail, the markdown and
   diagram settings, the collapse toggles, and the theme decide how an entry is drawn, and
   changing any of them discards the layout (`LayoutKey`). A new setting that changes what a
-  line looks like belongs there, or the view will keep drawing the old look.
+  line looks like belongs there, or the view will keep drawing the old look. An input that
+  belongs to one block rather than to the whole view is part of what the block is drawn *as*
+  (`Piece`): how a call ended, which comes from another entry, and whether a question is open
+  about it, which comes from the view. A block is compared by its piece, so either changing
+  redraws that block and no other.
 
 `a_kept_layout_draws_what_a_fresh_one_does_through_a_whole_turn` is the test that catches a
 break of either: it drives a turn — reasoning, calls answered out of order, an answer streamed

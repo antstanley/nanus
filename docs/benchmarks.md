@@ -103,7 +103,7 @@ dominant in a long one.
 | `session` | `build`, `derive_messages`, `encode/{to_jsonl,try_to_jsonl}`, `decode`, `append`, over 10, 100, and 500 turns | `derive_messages` runs before every model step and `try_to_jsonl` before every save, each over the *whole* log. |
 | `wire` | `sse/*`: SSE framing of a ~460 KB response (500 reasoning deltas, 2,000 content deltas, a fragmented tool call), in 1,460-byte segments and one frame per chunk; `encode/{value,body}/*`: each adapter's request for 10 and 100 turns of history with a 4 KB system prompt and the twelve offered tool schemas; `stream/*`: a whole `stream_chat` decode through the real DeepSeek, OpenAI and Anthropic adapters against a loopback server | Framing and decoding run per token; encoding runs per step over the whole history. |
 | `link` | `frame/*` and `request/*` round trips, `turn/*` (a turn's 2,506 frames, line by line), `backlog/*` (the same turn as one frame) | Every streamed token crosses the link once in each direction. |
-| `tui` | `replay`, `stream` (2,000 six-byte deltas into a transcript), `draw/*` (one frame at 120x40 or 200x60, markdown on and off, compact and full detail, scrolled to the middle; `first`, the frame that renders everything; `empty`, the floor with no conversation), `delta` (append, follow, redraw: the runtime's per-token cycle), `answer` (a whole 500- or 4,000-delta answer, redrawn every 32 deltas as the runtime does), `input`, and held: `resident/*` (a 100-turn transcript, what the view holds beside it, and every rendered line at once) | What opening a session, receiving a token, and pressing a key cost the interface, and what it keeps. |
+| `tui` | `replay`, `stream` (2,000 six-byte deltas into a transcript), `draw/*` (one frame at 120x40 or 200x60, markdown on and off, compact and full detail, scrolled to the middle; `first`, the frame that renders everything; `empty`, the floor with no conversation), `delta` (append, follow, redraw: the runtime's per-token cycle), `answer` (a whole 500- or 4,000-delta answer, redrawn every 32 deltas as the runtime does), `unsettled/*` (the same, for an answer with no blank line to settle at: a 300-line fence, a 300-item list, and prose with `\r\n` line ends), `input`, and held: `resident/*` (a 100-turn transcript, what the view holds beside it, and every rendered line at once) | What opening a session, receiving a token, and pressing a key cost the interface, and what it keeps. |
 | `kernel` | `start_chain` and `unload_root` over chains of 1, 8, and 64 dependent plugins, `get` (service lookup), `emit` to 1, 16, and 128 listeners | Composition and teardown, and the per-call cost of the kernel's indirection. |
 | `store` | `save` and `load` of 10-, 100-, and 500-turn sessions, `list` of a store of 50 sessions, on a tempdir | Every turn ends in a save; every resume and every listing starts with a read. |
 | `tools` | `read` of a 5,000-line file, `grep` and `glob` over a 500-file tree, `edit` and `write` of a 2,000-line file, `bash` running `true` and `echo`, through `ToolDefinition::execute` on a real tempdir | The calls a model makes most often. |
@@ -137,7 +137,7 @@ command line, so `--sample-size` and `--measurement-time` do not shorten these:
 | Groups | Override | Applies to |
 |---|---|---|
 | `tui/draw/*`, `tui/delta/*` | flat sampling, 20 samples | all three measurements |
-| `tui/answer/*` | flat sampling, 10 samples | all three measurements |
+| `tui/answer/*`, `tui/unsettled/*` | flat sampling, 10 samples | all three measurements |
 | `wire/sse/*`, `wire/encode/*` | 50 samples, 1 s warm-up, 2 s window | time |
 | `wire/stream/*` | 10 samples, 1 s warm-up, 3 s window | time |
 | `store/*/10` | 50 samples, 2 s window | time |
@@ -624,6 +624,30 @@ no longer builds and holds every rendered line of the conversation on every fram
 100 turns before the change, and once for each of the two passes a frame made. Peak use while
 drawing a 100-turn session fell from about 2 MiB to about 0.5 MiB.
 
+### What cutting inside a fence and a list changed
+
+Not part of the recording above: the `unsettled` benchmarks were added with the change they
+measure, and were run against the code before it for the first column. The counts are exact.
+The machine was busy for the first column's times and quiet for the second's, so the times
+overstate the change — by how much can be read off `draw/compact/100`, which this change does
+not touch and which read 2.2 ms in the busy run against 158 µs in the quiet one. They are here
+for their size, not their digits.
+
+| Benchmark | Before | After |
+|---|---:|---:|
+| `unsettled/fence/300`: allocations / bytes | 34.84 M / 1.86 GiB | 185,193 / 10.6 MiB |
+| `unsettled/list/300`: allocations / bytes | 11.30 M / 457 MiB | 155,389 / 9.13 MiB |
+| `unsettled/crlf/300`: allocations / bytes | 7.80 M / 591 MiB | 142,289 / 10.0 MiB |
+| `unsettled/fence/300`: time | 9.9 s | 26 ms |
+| `unsettled/list/300`: time | 5.6 s | 19 ms |
+| `unsettled/crlf/300`: time | 5.5 s | 18 ms |
+| `answer/4000`: allocations / bytes | 407,022 / 27.8 MiB | 341,528 / 25.5 MiB |
+| `answer/500`: allocations / bytes | 50,651 / 3.46 MiB | 42,763 / 3.18 MiB |
+| `delta/100`: allocations | 207 | 194 |
+
+Every other count in the `tui` group is unchanged or lower, and what the view holds between
+frames (`resident/*`) is unchanged to the byte.
+
 ## What the baseline shows
 
 These are observations from the numbers above, recorded so that a fix can be measured
@@ -639,6 +663,12 @@ against them. Those marked fixed have been changed and measured again; the rest 
   settled, so a token re-renders only the tail; a 4,000-token answer costs eight times a
   500-token one, as it should, where it cost sixteen. The renderer also stopped making a span
   for every word and every space, which roughly halved what rendering an answer allocates.
+- **Fixed: an answer with no blank line was rendered whole for every token.** The cuts were
+  only ever after a blank line at the top level, so a fence, a list, or any answer holding a
+  carriage return was all tail: a 300-line fence streamed in 35 million allocations and
+  1.9 GiB. An answer is now also cut at a line of code and between list items
+  ([the interface](tui.md#what-a-frame-costs)), and the same fence streams in 185 thousand and
+  11 MiB. A long table and a single long paragraph are still all tail.
 - **The first frame of a long session still renders everything.** Opening a 100-turn session,
   resizing, or toggling a display setting renders every block once at the new conditions:
   `draw/first/100` is about 3 ms and 44 K allocations. That is once per act rather than once
