@@ -520,7 +520,9 @@ struct PartialCall {
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
     limits: Option<nanus_ports::ResponseLimits>,
-    ready: Vec<LlmEvent>,
+    /// Events decoded and not yet taken. A queue, because one network chunk can decode into
+    /// hundreds of events and each is taken from the front.
+    ready: std::collections::VecDeque<LlmEvent>,
     calls: Vec<PartialCall>,
     usage: Option<Usage>,
     finish: Option<FinishReason>,
@@ -590,10 +592,7 @@ impl StreamAccumulator {
 
     /// Takes the next ready event, if any.
     pub fn take_ready(&mut self) -> Option<LlmEvent> {
-        if self.ready.is_empty() {
-            return None;
-        }
-        Some(self.ready.remove(0))
+        self.ready.pop_front()
     }
 
     /// Records a failure as a terminal event.
@@ -605,7 +604,7 @@ impl StreamAccumulator {
             self.finish = None;
             self.replay = None;
         }
-        self.ready.push(LlmEvent::Error(message));
+        self.ready.push_back(LlmEvent::Error(message));
         self.closed = true;
     }
 
@@ -620,7 +619,7 @@ impl StreamAccumulator {
                 self.fail("malformed stream: provider payload is not JSON".into());
                 return;
             }
-            self.ready.push(LlmEvent::Error(format!(
+            self.ready.push_back(LlmEvent::Error(format!(
                 "the server sent a frame that is not JSON: {}",
                 crate::wire::truncate_for_message(payload)
             )));
@@ -660,13 +659,14 @@ impl StreamAccumulator {
                 if kind == "response.output_text.delta" || self.replay.is_some() =>
             {
                 if let Some(text) = non_empty_str(frame, "delta") {
-                    self.ready.push(LlmEvent::TextDelta(text.to_owned()));
+                    self.ready.push_back(LlmEvent::TextDelta(text.to_owned()));
                 }
             }
             // A model that summarizes its reasoning streams it under one of these names.
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 if let Some(text) = non_empty_str(frame, "delta") {
-                    self.ready.push(LlmEvent::ReasoningDelta(text.to_owned()));
+                    self.ready
+                        .push_back(LlmEvent::ReasoningDelta(text.to_owned()));
                 }
             }
             "response.output_item.added" => self.observe_item_added(frame.get("item")),
@@ -882,7 +882,7 @@ impl StreamAccumulator {
                 .completed_calls()
                 .and_then(|calls| replay.finish(&calls));
             match checked {
-                Ok(replay) => self.ready.push(LlmEvent::AssistantReplay(replay)),
+                Ok(replay) => self.ready.push_back(LlmEvent::AssistantReplay(replay)),
                 Err(error) => {
                     self.fail(error.to_string());
                     return;
@@ -903,13 +903,13 @@ impl StreamAccumulator {
                 continue;
             }
             let Ok(name) = nanus_domain::ToolName::new(call.name.clone()) else {
-                self.ready.push(LlmEvent::Error(format!(
+                self.ready.push_back(LlmEvent::Error(format!(
                     "the model requested a tool whose name is not usable: {:?}",
                     crate::wire::truncate_for_message(&call.name)
                 )));
                 continue;
             };
-            self.ready.push(LlmEvent::ToolCallDelta {
+            self.ready.push_back(LlmEvent::ToolCallDelta {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 id: Some(nanus_domain::ToolCallId::new(call.call_id)),
                 name: Some(name),
@@ -921,10 +921,10 @@ impl StreamAccumulator {
             });
         }
         if let Some(usage) = self.usage.take() {
-            self.ready.push(LlmEvent::Usage(usage));
+            self.ready.push_back(LlmEvent::Usage(usage));
         }
         let reason = self.finish.take().unwrap_or(FinishReason::Stop);
-        self.ready.push(LlmEvent::Finished { reason });
+        self.ready.push_back(LlmEvent::Finished { reason });
     }
 
     fn completed_calls(&self) -> nanus_ports::LlmResult<Vec<nanus_domain::ToolCall>> {

@@ -403,23 +403,50 @@ impl OpenAiLlm {
             self.tool_call_support(&request.model, request.reasoning_effort),
             request,
         )?;
-        if zai::requires_preflight(&self.config, request)
+        let payload = if zai::requires_preflight(&self.config, request)
             || inception::requires_preflight(&self.config, request)
         {
-            let checked = self.estimate_request(request).and_then(|estimate| {
-                nanus_ports::capabilities::validate_estimate(
-                    self.capabilities(&request.model),
-                    request,
-                    estimate,
-                )
-            });
-            checked?;
-        }
+            // The body the estimate measured is the body that is sent: encoding it a second
+            // time rebuilt the whole history, images included, to produce the same bytes.
+            request.check_tail()?;
+            let (estimate, payload) = self.estimate_encoded(request)?;
+            nanus_ports::capabilities::validate_estimate(
+                self.capabilities(&request.model),
+                request,
+                estimate,
+            )?;
+            payload
+        } else {
+            self.encode(request)
+        };
         let decoder = match protocol {
             Protocol::ChatCompletions => Decoder::Chat(Box::default()),
             Protocol::Responses => Decoder::Responses(Box::default()),
         };
-        Ok((protocol, self.encode(request), decoder))
+        Ok((protocol, payload, decoder))
+    }
+
+    /// Estimates an ordinary request and hands back the body the estimate was made from.
+    ///
+    /// The checks run before the body is built, in the order [`LlmPort::estimate_request`]
+    /// has always run them, so a request that is refused is refused for the same reason.
+    fn estimate_encoded(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<(nanus_ports::RequestEstimate, serde_json::Value)> {
+        self.checked_protocol(request)?;
+        zai::validate(&self.config, request)?;
+        inception::validate(&self.config, request)?;
+        let capabilities = self.capabilities(&request.model);
+        nanus_ports::capabilities::validate_image_input(capabilities, request)?;
+        nanus_ports::tool_support::validate_input(
+            self.tool_call_support(&request.model, request.reasoning_effort),
+            request,
+        )?;
+        let payload = self.encode(request);
+        let estimate =
+            nanus_ports::capabilities::estimate_payload(capabilities, request, &payload)?;
+        Ok((estimate, payload))
     }
 
     fn transmit(
@@ -552,16 +579,7 @@ impl LlmPort for OpenAiLlm {
         if self.config.stateless_responses() {
             return self.estimate_responses(request);
         }
-        self.checked_protocol(request)?;
-        zai::validate(&self.config, request)?;
-        inception::validate(&self.config, request)?;
-        let capabilities = self.capabilities(&request.model);
-        nanus_ports::capabilities::validate_image_input(capabilities, request)?;
-        nanus_ports::tool_support::validate_input(
-            self.tool_call_support(&request.model, request.reasoning_effort),
-            request,
-        )?;
-        nanus_ports::capabilities::estimate_payload(capabilities, request, &self.encode(request))
+        self.estimate_encoded(request).map(|(estimate, _)| estimate)
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {

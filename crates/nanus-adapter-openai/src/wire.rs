@@ -327,7 +327,9 @@ pub struct StreamAccumulator {
     limits: Option<nanus_ports::ResponseLimits>,
     /// Raw per-tool argument limits; empty on the ordinary path, so nothing changes there.
     argument_limits: nanus_ports::ToolArgumentLimits,
-    ready: Vec<LlmEvent>,
+    /// Events decoded and not yet taken. A queue, because one network chunk can decode into
+    /// hundreds of events and each is taken from the front.
+    ready: std::collections::VecDeque<LlmEvent>,
     calls: Vec<PartialToolCall>,
     usage: Option<Usage>,
     finish: Option<FinishReason>,
@@ -351,10 +353,7 @@ impl StreamAccumulator {
 
     /// Takes the next ready event, if any.
     pub fn take_ready(&mut self) -> Option<LlmEvent> {
-        if self.ready.is_empty() {
-            return None;
-        }
-        Some(self.ready.remove(0))
+        self.ready.pop_front()
     }
 
     /// Records a failure as a terminal event.
@@ -365,7 +364,7 @@ impl StreamAccumulator {
             self.usage = None;
             self.finish = None;
         }
-        self.ready.push(LlmEvent::Error(message));
+        self.ready.push_back(LlmEvent::Error(message));
         self.closed = true;
     }
 
@@ -383,7 +382,7 @@ impl StreamAccumulator {
                 self.fail("malformed stream: provider payload is not JSON".into());
                 return;
             }
-            self.ready.push(LlmEvent::Error(format!(
+            self.ready.push_back(LlmEvent::Error(format!(
                 "the server sent a frame that is not JSON: {}",
                 truncate_for_message(payload)
             )));
@@ -441,10 +440,10 @@ impl StreamAccumulator {
             non_empty_str(delta, "reasoning_content").or_else(|| non_empty_str(delta, "reasoning"))
         {
             self.ready
-                .push(LlmEvent::ReasoningDelta(reasoning.to_owned()));
+                .push_back(LlmEvent::ReasoningDelta(reasoning.to_owned()));
         }
         if let Some(text) = non_empty_str(delta, "content") {
-            self.ready.push(LlmEvent::TextDelta(text.to_owned()));
+            self.ready.push_back(LlmEvent::TextDelta(text.to_owned()));
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
@@ -594,14 +593,14 @@ impl StreamAccumulator {
             // worth surfacing, and inventing a valid one would dispatch the wrong
             // tool.
             let Ok(name) = nanus_domain::ToolName::new(call.name.clone()) else {
-                self.ready.push(LlmEvent::Error(format!(
+                self.ready.push_back(LlmEvent::Error(format!(
                     "the model requested a tool whose name is not usable: {:?}",
                     truncate_for_message(&call.name)
                 )));
                 continue;
             };
             let index = u32::try_from(index).unwrap_or(u32::MAX);
-            self.ready.push(LlmEvent::ToolCallDelta {
+            self.ready.push_back(LlmEvent::ToolCallDelta {
                 index,
                 id: Some(nanus_domain::ToolCallId::new(call.id)),
                 name: Some(name),
@@ -613,10 +612,10 @@ impl StreamAccumulator {
             });
         }
         if let Some(usage) = self.usage.take() {
-            self.ready.push(LlmEvent::Usage(usage));
+            self.ready.push_back(LlmEvent::Usage(usage));
         }
         let reason = self.finish.take().unwrap_or(FinishReason::Stop);
-        self.ready.push(LlmEvent::Finished { reason });
+        self.ready.push_back(LlmEvent::Finished { reason });
     }
 
     /// Returns `true` once the terminal event has been emitted.
