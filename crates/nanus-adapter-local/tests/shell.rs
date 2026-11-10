@@ -125,6 +125,51 @@ async fn a_command_that_finishes_leaves_its_background_process_running() {
     assert!(wait_for_death(pid, 50).await);
 }
 
+/// A command that prints and then leaves a process holding its pipes never reaches end of
+/// output, so its pumps are abandoned. They used to come back empty, and the model was told a
+/// command that had printed its status had said nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn output_printed_before_a_background_process_took_the_pipe_is_kept() {
+    let (dir, shell) = shell();
+    let pid_file = dir.path().join("pid");
+    let script = format!(
+        "echo started; echo warned >&2; sleep 300 & echo $! > {}",
+        quote(&pid_file.display().to_string())
+    );
+    let outcome = shell
+        .run(ShellRequest::shell(script, None))
+        .await
+        .expect("the command ran");
+    let pid = recorded_pid(&pid_file);
+    assert_eq!(outcome.exit_code, Some(0));
+    assert_eq!(outcome.stdout.text, "started\n");
+    assert_eq!(outcome.stdout.total_bytes, 8);
+    assert!(!outcome.stdout.truncated);
+    assert_eq!(outcome.stderr.text, "warned\n");
+    // Both pipes were held, and the run waited for them once rather than once each.
+    assert!(
+        (2_000..3_500).contains(&outcome.duration_ms),
+        "one drain grace, not two: {} ms",
+        outcome.duration_ms
+    );
+
+    // The other direction: a command whose pipes close is not kept waiting at all.
+    let prompt = shell
+        .run(ShellRequest::shell("echo done", None))
+        .await
+        .expect("the command ran");
+    assert_eq!(prompt.stdout.text, "done\n");
+    assert!(prompt.duration_ms < 1_500, "{} ms", prompt.duration_ms);
+
+    let killed = shell
+        .run(ShellRequest::shell(format!("kill -9 {pid}"), None))
+        .await
+        .expect("kill ran");
+    assert_eq!(killed.exit_code, Some(0));
+    assert!(wait_for_death(pid, 50).await);
+}
+
 /// `kill_all` — what shutdown calls — reaches grandchildren too.
 #[tokio::test]
 async fn kill_all_reaps_a_running_group() {

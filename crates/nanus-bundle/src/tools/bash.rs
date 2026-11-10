@@ -318,8 +318,8 @@ pub fn render_archived(outcome: &ShellOutcome, receipts: &[ArtifactReceipt]) -> 
 /// Appends one captured stream, labelled, when it has content, and its archive line when it was
 /// archived.
 ///
-/// A stream the archive saw bytes of is drawn even when the preview kept none — a pipe whose
-/// drain was abandoned has an empty preview and may still have an archive.
+/// A stream the archive saw bytes of is drawn even when the preview kept none — a pump that
+/// was lost has an empty preview and may still have an archive.
 fn append_stream(
     rendered: &mut String,
     label: &str,

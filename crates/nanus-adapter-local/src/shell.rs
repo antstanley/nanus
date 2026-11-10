@@ -40,7 +40,7 @@
 //!   one sink deadline per stream, and never longer than half the drain grace; after that the
 //!   stream's capture is disabled and the pump goes back to draining for the preview alone. A
 //!   slow archive can delay a command by at most that much, can never stop it, and can never be
-//!   the reason a drain is abandoned and its preview lost.
+//!   the reason a drain is abandoned and the rest of its preview lost.
 //! - **An in-flight write is never abandoned.** A write that passes its deadline disables the
 //!   stream and the task keeps polling it to completion before it finalizes, so no physical
 //!   write is dropped and then published. The engine waits for the finalization for a bounded
@@ -90,17 +90,18 @@ use tokio::time::Instant;
 /// Bytes read from a pipe in one syscall.
 const READ_CHUNK: usize = 8 * 1024;
 
-/// How long to wait for the pipe pumps to reach EOF after the group is killed.
+/// How long to wait for the pipe pumps to reach EOF after the command has ended.
 ///
-/// Without this bound a grandchild that escaped the group by calling `setsid`
-/// would hold the pipe open forever and the run would never return.
+/// Without this bound a grandchild that escaped the group by calling `setsid`, or a
+/// process a finished command left in the background, would hold the pipe open forever and
+/// the run would never return. What the pumps had read by then is still returned.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// The longest, in total, a pump may wait for the archive's staging room.
 ///
 /// Kept under [`DRAIN_GRACE`] so that a pump held back by a slow archive after the process has
-/// exited still reaches EOF before the engine gives up on it: an abandoned drain loses its
-/// preview, and capture must never change what a run returns.
+/// exited still reaches EOF before the engine gives up on it: an abandoned drain keeps only
+/// what it had read, and capture must never change what a run returns.
 const STALL_MAX: Duration = Duration::from_secs(1);
 
 const _: () = assert!(
@@ -283,25 +284,48 @@ fn offer(sender: &mpsc::Sender<ShellEvent>, is_stderr: bool, bytes: &[u8]) {
     }
 }
 
+/// What a pump has read so far, kept where the engine can reach it.
+///
+/// A pump that never reaches EOF is aborted, and an aborted task returns nothing. A command
+/// that prints and then leaves a process in the background holding the pipe is exactly that
+/// case, and it used to come back with no output at all. The preview therefore lives here
+/// rather than in the pump's own frame, so abandoning the pump keeps what it had read.
+#[derive(Debug, Default)]
+struct Preview {
+    /// The bytes kept, at most the request's cap.
+    stored: Vec<u8>,
+    /// Every byte read, cap or no cap.
+    total: u64,
+}
+
+/// A preview shared between a pump and the engine that may have to abandon it.
+type SharedPreview = Arc<Mutex<Preview>>;
+
+/// Builds the capture a preview amounts to at this moment.
+fn snapshot(preview: &Mutex<Preview>) -> Captured {
+    let preview = preview.lock().unwrap_or_else(PoisonError::into_inner);
+    captured(&preview.stored, preview.total)
+}
+
 /// Reads `reader` to EOF, keeping at most `cap` bytes and reporting the total.
 ///
 /// Reading always continues to EOF: stopping at the cap would block the writer on
 /// a full pipe and hang the run, which is the `take(n)` trap. An archive, when there is
 /// one, is handed each chunk exactly as it was read and *before* the cap, so what scrolls
-/// past the preview is still kept; it is told how the pipe ended once it has.
+/// past the preview is still kept; it is told how the pipe ended once it has. The preview
+/// is written into `kept` as it grows, so it survives the pump being abandoned.
 async fn drain<R>(
     mut reader: R,
     cap: usize,
     is_stderr: bool,
     live: Option<mpsc::Sender<ShellEvent>>,
     mut archive: Option<ArchiveFeed>,
+    kept: SharedPreview,
 ) -> Captured
 where
     R: AsyncRead + Unpin,
 {
     assert!(cap > 0, "an output cap is at least one byte");
-    let mut stored: Vec<u8> = Vec::new();
-    let mut total: u64 = 0;
     let mut chunk = [0u8; READ_CHUNK];
     let ended = loop {
         let read = match reader.read(&mut chunk).await {
@@ -312,12 +336,19 @@ where
                 break CaptureReason::ReadError;
             }
         };
-        total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         let bytes = chunk.get(..read).unwrap_or_default();
         if let Some(feed) = archive.as_mut() {
             feed.stage(bytes).await;
         }
-        append_capped(&mut stored, bytes, cap);
+        {
+            // Held for one append and never across an await, so the engine's snapshot can
+            // only ever wait for a copy of at most one chunk.
+            let mut preview = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            preview.total = preview
+                .total
+                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            append_capped(&mut preview.stored, bytes, cap);
+        }
         if let Some(sender) = live.as_ref() {
             offer(sender, is_stderr, bytes);
         }
@@ -325,7 +356,7 @@ where
     if let Some(feed) = archive {
         feed.end(ended);
     }
-    captured(&stored, total)
+    snapshot(&kept)
 }
 
 /// What a pump hands the task that owns one stream's archive sink.
@@ -732,14 +763,50 @@ struct Ran {
     cut_off: bool,
 }
 
-/// Awaits a pump, giving up after [`DRAIN_GRACE`] and aborting it.
-async fn join_drain(mut handle: JoinHandle<Captured>) -> Captured {
+/// A pump and the preview it writes into.
+struct Pump {
+    /// The task reading the pipe.
+    handle: JoinHandle<Captured>,
+    /// What it has read so far.
+    kept: SharedPreview,
+}
+
+/// Starts a pump for one pipe.
+fn start_pump<R>(
+    pipe: R,
+    cap: usize,
+    is_stderr: bool,
+    live: Option<mpsc::Sender<ShellEvent>>,
+    archive: Option<ArchiveFeed>,
+) -> Pump
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let kept = SharedPreview::default();
+    let handle = tokio::spawn(drain(
+        pipe,
+        cap,
+        is_stderr,
+        live,
+        archive,
+        Arc::clone(&kept),
+    ));
+    Pump { handle, kept }
+}
+
+/// Awaits a pump until `deadline`, then aborts it and keeps what it had read.
+///
+/// The deadline is one instant for the whole run rather than a grace per pump: a process
+/// left in the background holds both pipes, and waiting for each in turn would stall the
+/// command twice for the same reason.
+async fn join_drain(pump: Pump, deadline: Instant) -> Captured {
+    let Pump { mut handle, kept } = pump;
     tokio::select! {
-        joined = &mut handle => joined.unwrap_or_else(|_join| empty_captured()),
-        () = tokio::time::sleep(DRAIN_GRACE) => {
+        joined = &mut handle => joined.unwrap_or_else(|_join| snapshot(&kept)),
+        () = tokio::time::sleep_until(deadline) => {
             handle.abort();
             tracing::warn!("a pipe pump did not reach EOF; the task was aborted");
-            empty_captured()
+            snapshot(&kept)
         }
     }
 }
@@ -875,9 +942,9 @@ fn feed_stdin(child: &mut Child, stdin: Option<String>) {
 }
 
 /// Awaits a pump that may never have been started.
-async fn join_pump(handle: Option<JoinHandle<Captured>>) -> Captured {
-    match handle {
-        Some(handle) => join_drain(handle).await,
+async fn join_pump(pump: Option<Pump>, deadline: Instant) -> Captured {
+    match pump {
+        Some(pump) => join_drain(pump, deadline).await,
         None => empty_captured(),
     }
 }
@@ -917,13 +984,15 @@ async fn run_engine(
     let err_pipe = take_stderr(&mut child);
     let (out_live, err_live) = (live.clone(), live.clone());
     let Feeds { stdout, stderr } = archive;
-    let out_handle = out_pipe.map(|pipe| tokio::spawn(drain(pipe, cap, false, out_live, stdout)));
-    let err_handle = err_pipe.map(|pipe| tokio::spawn(drain(pipe, cap, true, err_live, stderr)));
+    let out_pump = out_pipe.map(|pipe| start_pump(pipe, cap, false, out_live, stdout));
+    let err_pump = err_pipe.map(|pipe| start_pump(pipe, cap, true, err_live, stderr));
 
     let (status, timed_out) = wait_group(&mut child, pgid, request.timeout).await?;
     guard.leader_reaped();
-    let stdout = join_pump(out_handle).await;
-    let stderr = join_pump(err_handle).await;
+    let drained = Instant::now();
+    let drain_by = drained.checked_add(DRAIN_GRACE).unwrap_or(drained);
+    let stdout = join_pump(out_pump, drain_by).await;
+    let stderr = join_pump(err_pump, drain_by).await;
     let elapsed = started.elapsed();
     // `kill_all` retires the groups it signals, so a group already gone from the registry
     // was ended by a shutdown rather than by the command.
