@@ -305,9 +305,10 @@ Support requires the official endpoint and a known model; anything else is unsup
 | Anthropic | `https://api.anthropic.com/v1` | `anthropic.messages` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Supported |
 
 Inception's row rests on the same local preparation and reload fixtures as the other chat
-providers, including the exact body the prepared call sends. Like every provider in this table it
-has **not** been sent a live managed request; [what is and is not verified](#what-is-and-is-not-verified)
-records that limitation for all of them.
+providers, including the exact body the prepared call sends. Inception and DeepSeek have been sent
+live managed requests only without a working-data message;
+[what is and is not verified](#what-is-and-is-not-verified) records what that does and does not
+cover.
 
 The output reservation must be present and within the model's declared ceiling; it is refused,
 never clamped. Every adapter validates the managed role grammar — leading system messages only
@@ -542,9 +543,10 @@ every tool output as an `input_text` list, explicit breakpoints at the head, bef
 and before the tail, and the tail appended as the final part. No shipped path uses it.
 
 **DeepSeek** writes a cache unit at the end of the request's input and another at the end of its
-output, and it matches only whole units. Both of a step's end units contain that step's tail. Its
-hits therefore come from common-prefix and fixed-interval units, about one step behind a
-tail-free conversation. That is still most of the prompt, where before it was almost none.
+output, and it matches only whole units. Both of a step's end units contain that step's tail, so
+its hits come from common-prefix and fixed-interval units. Measured on 2026-11-10, those are
+128-token units, and a step reads the previous step's prompt less a few hundred tokens: the
+units the tail touches, not a whole step.
 
 **Inception** caches automatically and documents nothing of how. Measured live with `mercury-3`
 on 2026-10-29 (`inception_reads_the_previous_step_from_cache`), a managed step reads the previous
@@ -554,6 +556,34 @@ total misses, which read not even the system prompt. Sessions recorded on mercur
 mode show such misses on about 2% of steps.
 
 **z.ai** caching is not established here. The tail costs it nothing it had.
+
+**Why the tail is appended on these three.** A trailing message would leave the final message's
+bytes unchanged from one step to the next, as OpenAI's trailing developer message does. That is
+worth something only to a cache that ends its entries at message boundaries, and neither DeepSeek
+nor Inception showed one. `deepseek_tail_placement_probe` and `inception_tail_placement_probe`
+measured it on 2026-11-10 with `deepseek-flash` and `mercury-3`. Each ran three turns per arm:
+a prompt of about seven thousand tokens, then three tool results of about 4,500 tokens each, read
+one call per step, and a final answer. Each arm put the tail somewhere different on the
+adapter's own encoding. Every request was accepted, after a plain user message and after tool
+results, and every turn read the files in order and answered. The one wrong answer was a sum,
+in one `user` turn on DeepSeek. The table gives the mean tokens a later step read short of the
+previous step's prompt, over nine steps per arm:
+
+| Tail | `deepseek-flash` | `mercury-3` |
+|---|---|---|
+| Appended to the final message, as sent | 265 | 341 |
+| A trailing `system` message | 288 | 274 |
+| A trailing `user` message | 277 | 331 |
+| None | 12 | 275 |
+
+On DeepSeek every tailed arm loses the last two or three 128-token units, wherever the tail is.
+The untailed control shows the loss is the tail's own presence in the step's last units, which
+no placement removes. On Inception each step's shortfall ranged from nothing to about 750 tokens
+in every arm, the untailed one included. That spread is wider than any difference between arms,
+and no step missed outright. So no placement read better on either vendor. The wire was not
+changed, and a `user` tail would have put harness metadata in the person's voice for nothing.
+z.ai was not measured, because its key had no funds, and it keeps the appended tail with the
+other two.
 
 ## Checkpoints and recovery
 
@@ -974,7 +1004,13 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   every wire, and the fitter's choice of turns is the same as before for the same budget;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
   developer system message and no `instructions` is accepted and answers as the system prompt
-  directs, and three managed steps with a trailing developer tail after tool output are accepted.
+  directs, and three managed steps with a trailing developer tail after tool output are accepted;
+- live, on 2026-11-10, with `deepseek-flash` and `mercury-3`: the adapters' managed encoding,
+  with no working-data message, is accepted with the tail appended after a plain user message and
+  after tool results, and so are a trailing `system` and a trailing `user` tail. No placement
+  reads more from cache than the appended one (the table under
+  [Request layout and provider caches](#request-layout-and-provider-caches)). A test without
+  network checks that the probe's appended arm is the bytes each adapter sends.
 
 Not verified, and not claimed:
 
@@ -985,8 +1021,10 @@ Not verified, and not claimed:
     developer system message and no `instructions`, on both plans and wires;
   - per Anthropic model, whether signed replay is accepted with an earlier step's tail removed.
 
-  They need credentials, and a pass is evidence for that day and model only. Only the
-  subscription's cases have been run.
+  They need credentials, and a pass is evidence for that day and model only. Of these cases, only
+  the subscription's, Inception's read and the DeepSeek and Inception tail-placement probes have
+  been run. z.ai has been sent nothing, so where its tail goes rests on the other two chat vendors
+  and on no measurement of its own.
 
   Before the `session-id` header, its cache-read case failed on its one run, and of three more
   runs with the session's key in the body, one read the previous step and two read nothing at
@@ -1012,10 +1050,11 @@ Not verified, and not claimed:
 - **The subscription reservation is not enforced by the provider.** The tests show the reservation
   is charged and that the body omits it. The window the subscription is fitted to is the model's
   declared window, by decision, and has not been measured against the backend.
-- **Only the subscription plan has been sent a managed request live.** The rest of the provider
-  matrix rests on wire and reload fixtures; in particular, nothing yet proves a provider accepts the
-  generated assistant message followed by an original one, or DeepSeek, z.ai and Inception a
-  generated turn without `reasoning_content`.
+- **Few paths have been sent a managed request live.** They are the subscription plan, and the
+  DeepSeek and Inception requests above, none of which carried a working-data message. The rest
+  of the provider matrix rests on wire and reload fixtures. In particular, nothing yet proves that
+  a provider accepts the generated assistant message followed by an original one, or that
+  DeepSeek, z.ai and Inception accept a generated turn without `reasoning_content`.
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
   is no claim that managed context improves anything, and the default stays legacy.

@@ -291,6 +291,8 @@ pub enum TailCarrier {
     /// Appended to the final message: a trailing text part when its content is a list, otherwise
     /// after a blank line. For vendors with no established mid-conversation system or developer
     /// message, where a new user message would read as the person interrupting the tool loop.
+    /// Inception accepted a trailing `system` and a trailing `user` message on 2026-11-10 with
+    /// `mercury-3`, and neither read measurably more from cache than this, so it stays here.
     Appended,
     /// The fallback if a Responses path refuses a trailing developer message: explicit-only caching
     /// (`prompt_cache_options`), every tool output as an `input_text` list, breakpoints at the head,

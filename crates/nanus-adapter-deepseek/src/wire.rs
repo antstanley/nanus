@@ -7,13 +7,15 @@
 //! ## The tail
 //!
 //! A request's tail is appended to the final message's content: a trailing text part when the
-//! content is a list, otherwise after a blank line. A new trailing user message after tool
-//! results would read as the person interrupting the tool loop, and would open a new turn in
-//! thinking mode; a mid-conversation system message is not established here. `DeepSeek` caches
-//! in whole units ending at the end of the input and of the output, so both of a step's end units
-//! hold that step's tail and its hits come about one step behind a tail-free conversation. Every
-//! other message, an assistant's `reasoning_content` included, encodes to the same bytes whether
-//! or not it is the newest.
+//! content is a list, otherwise after a blank line. A trailing user message after tool results
+//! would put the harness's notice in the person's voice. `DeepSeek` accepted both a trailing
+//! `user` and a trailing `system` message on 2026-11-10, but neither read more from cache:
+//! `DeepSeek` reads in fixed 128-token units, so the units the tail touches are lost wherever
+//! it is, and a step read the previous step's prompt less about 265 tokens appended, 288 as a
+//! trailing system message and 277 as a trailing user message, against 12 with no tail at all
+//! (`deepseek_tail_placement_probe` in `nanus-bundle`'s `live_cache`). Every other message, an
+//! assistant's `reasoning_content` included, encodes to the same bytes whether or not it is the
+//! newest.
 
 use nanus_domain::{Message, ToolSchema, Usage};
 use nanus_ports::{ChatRequest, FinishReason, LlmEvent, ReasoningEffort};
