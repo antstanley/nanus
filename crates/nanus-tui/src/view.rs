@@ -24,7 +24,7 @@ use crate::layout::{LayoutBlock, LayoutKey, Piece, TranscriptLayout};
 use crate::markdown::{self, MarkdownTheme};
 use crate::queue::Queue;
 use crate::stats::{Throughput, share, show, show_duration};
-use crate::transcript::{Entry, EntryKind, Role, Transcript, wrap_count};
+use crate::transcript::{Entry, EntryKind, Role, Transcript};
 
 pub use crate::theme::Theme;
 
@@ -939,9 +939,9 @@ fn edge_towards(column: usize, head_line: usize, anchor_line: usize) -> usize {
 /// A line the terminal wraps is selected *whole*, and that is the one place this is approximate. The
 /// wrapping is the drawing library's, and which character a wrapped row begins with is not something
 /// it reports, so the first row of such a line resolves to its start and any later row to its end.
-/// The loss is small and it is not the usual case: every line the markdown renderer produces is
-/// wrapped by the renderer itself, one row per line, so this is reached only by a line the *drawer*
-/// had to break.
+/// It is kept for a caller that hands in a line of its own: the transcript's lines are broken
+/// into rows before they are laid out ([`crate::rows`]), one row per line, so nothing the view
+/// draws reaches it.
 fn column_in_line(line: &Line<'static>, x: usize, rows: usize, within: usize) -> usize {
     if rows > 1 {
         return if within == 0 {
@@ -3710,8 +3710,20 @@ impl ViewState {
         (Piece::Whole, 1)
     }
 
-    /// Renders one block: the entries `run`, drawn as `piece`.
+    /// Renders one block: the entries `run`, drawn as `piece`, one line per display row.
+    ///
+    /// The block is drawn and then broken into rows ([`crate::rows`]). Text drawn as itself — a
+    /// prompt, a tool's output, a notice — is one line per *source* line, and a source line may
+    /// be wider than the terminal; left that way its height had to be predicted and it could
+    /// only be drawn from its top. Broken here, every line the layout holds is exactly one row,
+    /// so the scroll bounds are counted rather than estimated and a line taller than the
+    /// viewport scrolls through it like anything else.
     fn render_piece(&self, piece: Piece, run: &[Entry], width: u16) -> Vec<Line<'static>> {
+        crate::rows::rows(self.draw_piece(piece, run, width), width)
+    }
+
+    /// Draws one block as the lines its text is written in, before they are broken into rows.
+    fn draw_piece(&self, piece: Piece, run: &[Entry], width: u16) -> Vec<Line<'static>> {
         let Some(entry) = run.first() else {
             return Vec::new();
         };
@@ -3960,33 +3972,19 @@ impl ViewState {
 
     /// The display rows each rendered line occupies at `width`.
     ///
-    /// Counted by the same rule the renderer breaks by, rather than by dividing the line's
-    /// width: ceiling division is a *lower bound* for word wrapping, because a row whose next
-    /// word does not fit ends early and wastes the rest of itself. A window computed from a
-    /// bound that is too low leaves the rows it under-counted below the fold *permanently* —
-    /// scrolling can only reach content whose height it knows about — which is how the last
-    /// rows of a long line of paths became visible at no offset at all.
-    ///
-    /// A line that fits is one row and needs no counting, which is most of them.
+    /// One each, because [`ViewState::render_piece`] hands back lines already broken into the
+    /// rows they are drawn on. This used to *predict* the drawing library's wrap — by counting
+    /// characters, and by dropping the spaces a break fell among — and a prediction that came up
+    /// short left the rows it missed below the fold permanently: scrolling can only reach
+    /// content whose height it knows about. A line of wide characters or of aligned columns was
+    /// short every time. Nothing is predicted now; the precondition is asserted instead.
     fn line_heights(lines: &[Line<'static>], width: u16) -> Vec<u32> {
-        let usable = width.max(1);
-        lines
-            .iter()
-            .map(|line| {
-                if line.width() <= usize::from(usable) {
-                    return 1;
-                }
-                // Measured from the text rather than from the line's width: the width is a
-                // number of columns and the question is how many *rows* those columns take,
-                // which depends on where the words break.
-                let text: String = line
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect();
-                wrap_count(&text, usable)
-            })
-            .collect()
+        let usable = usize::from(width.max(1));
+        assert!(
+            lines.iter().all(|line| line.width() <= usable),
+            "a rendered line is one row"
+        );
+        vec![1; lines.len()]
     }
 
     /// Picks the lines to draw for a scroll offset measured in display rows.
@@ -4990,6 +4988,81 @@ mod tests {
             state.transcript.push(entry);
         }
         state
+    }
+
+    /// Every scroll offset's frame, top to bottom, for a view already told its size.
+    fn every_frame(state: &mut ViewState, width: u16, height: u16) -> Vec<String> {
+        let _ = rendered(state, width, height);
+        (0..=state.max_scroll())
+            .map(|offset| {
+                state.scroll_offset = offset;
+                rendered(state, width, height)
+            })
+            .collect()
+    }
+
+    /// A prompt that is one long paragraph is taller than a small terminal. It used to be drawn
+    /// from its top or not at all — at the bottom of the conversation, where a reader is, not at
+    /// all — and its last rows were on screen at no offset.
+    #[test]
+    fn a_line_taller_than_the_viewport_is_read_to_its_end_by_scrolling() {
+        let words: Vec<String> = (0..200).map(|index| format!("word{index}")).collect();
+        let long = format!("{} ", words.join(" "));
+        let mut state = state_with(vec![Entry::prose(Role::User, long)]);
+        let _ = rendered(&mut state, 40, 16);
+        state.scroll_to_bottom();
+        let bottom = rendered(&mut state, 40, 16);
+        assert!(
+            bottom.contains("word199"),
+            "the end is at the bottom:\n{bottom}"
+        );
+        assert!(!bottom.contains("word0 "), "and the start has scrolled off");
+        state.scroll_to_top();
+        let top = rendered(&mut state, 40, 16);
+        assert!(top.contains("word0 "), "the start is at the top:\n{top}");
+        assert!(!top.contains("word199"));
+        // Every word is on screen at some offset, which is what scrolling is for.
+        let frames = every_frame(&mut state, 40, 16).concat();
+        assert!((0..200).all(|index| frames.contains(&format!("word{index}"))));
+
+        // The other direction: a prompt that fits is one row, and nothing scrolls.
+        let mut short = state_with(vec![Entry::prose(Role::User, "a short prompt")]);
+        let _ = rendered(&mut short, 40, 16);
+        assert_eq!(short.max_scroll(), 0);
+        assert_eq!(
+            short.transcript_rows(),
+            3,
+            "a heading, the line, and a blank"
+        );
+    }
+
+    /// Rows are counted in cells. A line of wide characters was counted in characters, so half
+    /// its rows were not known about, and what is not counted cannot be scrolled to.
+    #[test]
+    fn wide_characters_and_runs_of_spaces_are_counted_by_the_rows_they_draw() {
+        let wide = format!("{}END", "漢".repeat(150));
+        let columns = format!(
+            "{}END",
+            "name        size        modified        ".repeat(12)
+        );
+        for text in [wide, columns] {
+            let mut state = state_with(vec![
+                Entry::prose(Role::Assistant, "older"),
+                Entry::prose(Role::User, text.clone()),
+            ]);
+            let _ = rendered(&mut state, 60, 16);
+            state.scroll_to_bottom();
+            let bottom = rendered(&mut state, 60, 16);
+            assert!(bottom.contains("END"), "{text:?} ends on screen:\n{bottom}");
+            assert!(state.max_scroll() > 0, "and there is something above it");
+        }
+
+        // A combining mark covers no cell: sixty accented letters are one row, not two, so a
+        // conversation that fits does not scroll into blank space.
+        let mut accented = state_with(vec![Entry::prose(Role::User, "e\u{301}".repeat(60))]);
+        let _ = rendered(&mut accented, 60, 16);
+        assert_eq!(accented.max_scroll(), 0);
+        assert_eq!(accented.transcript_rows(), 3);
     }
 
     #[test]

@@ -201,11 +201,10 @@ fn one_line(label: &str, separator: &str, body: &str, width: u16) -> String {
 /// Returns the last `width` characters of `text`, prefixed with an ellipsis when some were
 /// dropped.
 ///
-/// Characters, not display columns, matching the estimate the transcript makes elsewhere. A
-/// line holding wide characters can therefore occupy a second row once it is drawn, which
-/// the transcript's height estimate accounts for: it measures the drawn line by display
-/// width, so the scroll arithmetic and the renderer still agree about how many rows the
-/// line takes.
+/// Characters, not display columns. A line holding wide characters can therefore be wider
+/// than the terminal, and the view breaks it onto a second row as it does any line that is
+/// (`crate::rows`): the row is counted because it is made, so the scroll arithmetic and the
+/// drawing still agree about how many rows the line takes.
 fn tail(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();

@@ -77,9 +77,13 @@ mod markdown;
 // The transcript's layout, kept between frames so a frame renders what changed and draws what is on
 // screen. Private because it is how the view draws, not something the view shows.
 mod layout;
+// Breaking a rendered line into the rows it is drawn on, so the layout measures rows it made
+// rather than predicting the ones the drawing library would. Private for the reason the layout
+// is: it is how the view draws.
 pub mod notice;
 pub mod queue;
 pub mod replay;
+mod rows;
 pub mod stats;
 pub mod stream;
 pub mod summary;
