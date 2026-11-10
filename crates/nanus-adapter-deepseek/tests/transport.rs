@@ -359,3 +359,57 @@ async fn a_redirect_is_reported_rather_than_followed() {
         "nothing was sent to the redirect's target"
     );
 }
+
+/// Serves one connection with `status` and `body`.
+fn a_server_that_refuses(status: u16, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let address = listener.local_addr().expect("the bound address");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let head = format!(
+            "HTTP/1.1 {status} Refused\r\n\
+             content-type: application/json\r\n\
+             content-length: {}\r\n\
+             connection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+    });
+    format!("http://{address}")
+}
+
+/// A gateway that echoes the request it refused puts the key into its error, and the error is
+/// printed and written to the session log. The key the request carried is taken out of the
+/// provider's words; the rest of the sentence, and the status, are kept.
+#[tokio::test]
+async fn a_key_echoed_in_a_providers_error_is_not_passed_on() {
+    let base_url = a_server_that_refuses(
+        401,
+        r#"{"error":{"message":"rejected header Authorization: Bearer test-key"}}"#,
+    );
+    let message = the_only_failure(&base_url).await;
+    assert!(!message.contains("test-key"), "{message}");
+    assert!(message.contains(nanus_ports::REDACTED), "{message}");
+    assert!(
+        message.contains("401") && message.contains("rejected header Authorization"),
+        "the provider's sentence is otherwise its own: {message}"
+    );
+}
+
+/// The other direction: an error that does not hold the key is passed on word for word.
+#[tokio::test]
+async fn a_providers_error_without_the_key_is_passed_on_as_it_is() {
+    let base_url = a_server_that_refuses(429, r#"{"error":{"message":"slow down"}}"#);
+    let message = the_only_failure(&base_url).await;
+    assert!(
+        message.contains("429") && message.contains("slow down"),
+        "{message}"
+    );
+    assert!(!message.contains(nanus_ports::REDACTED), "{message}");
+}

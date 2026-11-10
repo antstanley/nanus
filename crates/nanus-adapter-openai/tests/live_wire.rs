@@ -610,3 +610,24 @@ fn a_source_that_cannot_renew_fails_the_turn_without_sending_anything() {
         "no request left"
     );
 }
+
+/// A gateway that echoes the request it refused puts the bearer into its error, and the error
+/// is printed and written to the session log. The bearer the request carried is taken out of
+/// the provider's words; the rest of the sentence, and the status, are kept.
+#[test]
+fn a_key_echoed_in_a_providers_error_is_not_passed_on() {
+    let server = spawn_server(
+        401,
+        r#"{"error":{"message":"rejected header Authorization: Bearer test-key"}}"#,
+    );
+    let events = collect(nanus_adapter_openai::Vendor::OpenAi, &server, "gpt-4.1");
+    let Some(LlmEvent::Error(message)) = events.last() else {
+        panic!("the refusal is reported: {events:?}");
+    };
+    assert!(!message.contains("test-key"), "{message}");
+    assert!(message.contains(nanus_ports::REDACTED), "{message}");
+    assert!(
+        message.contains("401") && message.contains("rejected header Authorization"),
+        "the provider's sentence is otherwise its own: {message}"
+    );
+}
