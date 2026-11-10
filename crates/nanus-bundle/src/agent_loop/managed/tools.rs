@@ -41,11 +41,16 @@ impl AgentRunner {
     ///
     /// Each permitted call is charged a whole record, because its result is not known yet; the
     /// closing reserve is kept back, so the turn can always end honestly.
+    ///
+    /// A refusal here is finished like every other one — through `finish_result` — so the
+    /// listener that was told the call started is told it ended. Written straight into the
+    /// slot, as it once was, the call was recorded as refused and still drawn as running.
     pub(in crate::agent_loop) fn refuse_over_capacity(
+        &self,
         session: &Session,
         calls: &[ToolCall],
         results: &mut [Option<ToolResult>],
-        _turn: &ManagedTurn<'_>,
+        progress: &mut dyn Progress,
     ) {
         let pending = results.iter().filter(|result| result.is_none()).count();
         let need = pending
@@ -61,7 +66,8 @@ impl AgentRunner {
         }
         for (call, result) in calls.iter().zip(results.iter_mut()) {
             if result.is_none() {
-                *result = Some(ToolResult::failure(call.id.clone(), FULL));
+                let refusal = ToolResult::failure(call.id.clone(), FULL);
+                *result = Some(self.finish_result(call, refusal, progress));
             }
         }
     }
