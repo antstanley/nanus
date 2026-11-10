@@ -122,6 +122,13 @@ impl Decoder {
             Self::Responses(accumulator) => accumulator.terminal_received(),
         }
     }
+    /// Closes a stream whose body ended with no protocol terminator; see the accumulators.
+    fn close_unterminated(&mut self) {
+        match self {
+            Self::Chat(accumulator) => accumulator.close_unterminated(),
+            Self::Responses(accumulator) => accumulator.close_unterminated(),
+        }
+    }
     fn take_ready(&mut self) -> Option<LlmEvent> {
         match self {
             Self::Chat(accumulator) => accumulator.take_ready(),

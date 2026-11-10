@@ -850,6 +850,18 @@ impl StreamAccumulator {
         }
     }
 
+    /// Closes a stream whose body ended with no protocol terminator.
+    ///
+    /// A response that had named its finish reason is closed as it stands: no sentinel
+    /// follows `response.completed`. One that had not is still closed and still finishes, but as
+    /// [`nanus_ports::UNTERMINATED`] rather than as a stop nobody reported.
+    pub fn close_unterminated(&mut self) {
+        if !self.closed && self.finish.is_none() {
+            self.finish = Some(FinishReason::Unknown(nanus_ports::UNTERMINATED.to_owned()));
+        }
+        self.close();
+    }
+
     /// Emits the accumulated tool calls and the terminal event.
     pub fn close(&mut self) {
         if self.closed {
