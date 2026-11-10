@@ -9,7 +9,9 @@
 //! ## Two kinds of window
 //!
 //! The line window (`offset`, `limit`) reads the whole file and numbers its lines, which is
-//! the right shape for source code and is refused above [`MAX_READ_BYTES`]. The byte window
+//! the right shape for source code and is refused above [`MAX_READ_BYTES`]. What it renders
+//! stops at [`MAX_LINE_WINDOW_BYTES`] as well as at `limit` lines, so a file of very long
+//! lines is shown a piece at a time rather than whole. The byte window
 //! (`byte_offset`, `max_bytes`, `version`) reads one bounded range through
 //! [`nanus_ports::FsPort::read_range`] and never the whole file, so a 50 MB log, a 5 MB
 //! single-line JSON file, or a file that is not UTF-8 can still be looked at. The two are
@@ -46,6 +48,16 @@ pub const MAX_READ_LIMIT: u32 = 20_000;
 
 /// The number of bytes above which a file is reported as too large to read by lines.
 pub const MAX_READ_BYTES: u64 = 4_194_304;
+
+/// The most text a line window renders, before its footer.
+///
+/// Large enough that a default window of ordinary source is never cut — two thousand lines
+/// of a hundred columns fit — and small enough that a file of long lines cannot put
+/// megabytes into one result.
+pub const MAX_LINE_WINDOW_BYTES: usize = 256 * 1024;
+
+/// Room kept for a line window's footer: one fixed sentence and at most five numbers.
+const LINE_FOOTER_RESERVE: usize = 384;
 
 /// The default byte window, in bytes.
 pub const DEFAULT_WINDOW_BYTES: u32 = 4_096;
@@ -285,11 +297,26 @@ struct Window {
     returned: u32,
 }
 
+/// Where a line window stopped because of its byte budget rather than its line count.
+struct BudgetStop {
+    /// The 1-based number of the first line not shown.
+    line: usize,
+    /// The byte offset that line starts at, which is where a byte window would begin.
+    byte_offset: usize,
+    /// How long that line is, its line ending included.
+    bytes: usize,
+}
+
 /// Renders `offset`/`limit` lines of `text` with line numbers.
 ///
 /// The footer is the important part: it states both how many lines were shown and
 /// how many exist, because a model that cannot tell a complete file from a window
 /// will reason about the wrong thing.
+///
+/// A window is bounded twice. `limit` bounds it in lines, and [`MAX_LINE_WINDOW_BYTES`] in
+/// bytes, because lines have no length of their own: two thousand lines of a minified
+/// bundle, or one line of four megabytes, is the whole file under a line limit. The window
+/// stops at the last whole line that fits and the footer says where to go on.
 fn render_window(text: &str, _path: &str, offset: u32, limit: u32) -> Window {
     // Precondition: callers pass a 1-based offset and a non-zero limit.
     assert!(offset >= 1, "the first line is line 1");
@@ -297,38 +324,92 @@ fn render_window(text: &str, _path: &str, offset: u32, limit: u32) -> Window {
 
     let start = usize::try_from(offset.saturating_sub(1)).unwrap_or(usize::MAX);
     let take = usize::try_from(limit).unwrap_or(usize::MAX);
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-    let end = start.saturating_add(take).min(total);
+    let total = text.lines().count();
 
     let mut rendered = String::new();
-    for (index, line) in lines.iter().enumerate().take(end).skip(start) {
+    let mut shown = 0_usize;
+    let mut line_at = 0_usize;
+    let mut stop: Option<BudgetStop> = None;
+    // Split with the line endings kept, so the byte offset of each line is known exactly;
+    // what is shown is each piece without its ending, which is what `lines` would yield.
+    for (index, raw) in text.split_inclusive('\n').enumerate() {
+        let byte_offset = line_at;
+        line_at = line_at.saturating_add(raw.len());
+        if index < start {
+            continue;
+        }
+        if shown >= take {
+            break;
+        }
         // Line numbers are 1-based, which is what every editor and every `grep`
         // output the model has seen uses.
         let number = index.saturating_add(1);
-        let _ = writeln!(rendered, "{number}: {line}");
+        let line = raw
+            .strip_suffix('\n')
+            .map_or(raw, |line| line.strip_suffix('\r').unwrap_or(line));
+        let entry = format!("{number}: {line}\n");
+        if rendered.len().saturating_add(entry.len()) > MAX_LINE_WINDOW_BYTES {
+            stop = Some(BudgetStop {
+                line: number,
+                byte_offset,
+                bytes: raw.len(),
+            });
+            break;
+        }
+        rendered.push_str(&entry);
+        shown = shown.saturating_add(1);
     }
-    let returned = end.saturating_sub(start);
-    let returned = u32::try_from(returned).unwrap_or(u32::MAX);
-
-    if returned == 0 {
-        let _ = writeln!(
-            rendered,
-            "(no lines: the file has {total} lines and offset {offset} is past the end)"
-        );
-    } else if end >= total {
-        let _ = writeln!(rendered, "(end of file: {total} lines total)");
-    } else {
-        let _ = writeln!(
-            rendered,
-            "(showing lines {offset}-{end} of {total}; use offset={} to continue)",
-            end.saturating_add(1)
-        );
-    }
+    let end = start.saturating_add(shown);
+    rendered.push_str(&line_footer(offset, end, total, shown, stop.as_ref()));
+    assert!(
+        rendered.len() <= MAX_LINE_WINDOW_BYTES.saturating_add(LINE_FOOTER_RESERVE),
+        "a line window renders within its budget"
+    );
     Window {
         text: rendered,
-        returned,
+        returned: u32::try_from(shown).unwrap_or(u32::MAX),
     }
+}
+
+/// Renders the sentence that ends a line window: what was shown, and how to see the rest.
+fn line_footer(
+    offset: u32,
+    end: usize,
+    total: usize,
+    shown: usize,
+    stop: Option<&BudgetStop>,
+) -> String {
+    let footer = match stop {
+        // Not even one line fits: the line itself is the problem, and only a byte window
+        // can show it.
+        Some(stop) if shown == 0 => format!(
+            "(line {} is {} bytes, more than the {MAX_LINE_WINDOW_BYTES}-byte line window; \
+             read it with byte_offset={} and max_bytes, or skip it with offset={}; the file \
+             has {total} lines)\n",
+            stop.line,
+            stop.bytes,
+            stop.byte_offset,
+            stop.line.saturating_add(1)
+        ),
+        Some(stop) => format!(
+            "(showing lines {offset}-{end} of {total}: stopped at the \
+             {MAX_LINE_WINDOW_BYTES}-byte window budget; use offset={} to continue)\n",
+            stop.line
+        ),
+        None if shown == 0 => {
+            format!("(no lines: the file has {total} lines and offset {offset} is past the end)\n")
+        }
+        None if end >= total => format!("(end of file: {total} lines total)\n"),
+        None => format!(
+            "(showing lines {offset}-{end} of {total}; use offset={} to continue)\n",
+            end.saturating_add(1)
+        ),
+    };
+    assert!(
+        footer.len() <= LINE_FOOTER_RESERVE,
+        "the footer fits its reserve"
+    );
+    footer
 }
 
 /// What a byte-window call asked for, after its arguments were checked.
@@ -1205,6 +1286,58 @@ mod tests {
         assert!(!encoded.is_empty());
         assert!(encoded.is_ascii());
         assert_eq!(encoded.len() % 4, 0);
+    }
+
+    /// The defect this pins: a line limit does not bound a window whose lines are long, so a
+    /// default read of a few megabytes of minified text put all of it in one result.
+    #[test]
+    fn a_window_of_long_lines_stops_at_its_byte_budget_and_says_where_to_continue() {
+        let line = "x".repeat(100_000);
+        let text = format!("{line}\n{line}\n{line}\n{line}\n");
+        let window = render_window(&text, "f.txt", 1, 2_000);
+        assert_eq!(window.returned, 2, "two lines of 100 kB fit in 256 KiB");
+        assert!(window.text.len() <= MAX_LINE_WINDOW_BYTES.saturating_add(LINE_FOOTER_RESERVE));
+        assert!(
+            window
+                .text
+                .contains("(showing lines 1-2 of 4: stopped at the")
+        );
+        assert!(window.text.contains("use offset=3 to continue"));
+        // Continuing from there reaches the end, so nothing is skipped.
+        let rest = render_window(&text, "f.txt", 3, 2_000);
+        assert_eq!(rest.returned, 2);
+        assert!(rest.text.ends_with("(end of file: 4 lines total)\n"));
+
+        // The other direction: an ordinary window is not cut and its footer is unchanged.
+        let ordinary = "short line\n".repeat(2_000);
+        let window = render_window(&ordinary, "f.txt", 1, 2_000);
+        assert_eq!(window.returned, 2_000);
+        assert!(window.text.ends_with("(end of file: 2000 lines total)\n"));
+    }
+
+    #[test]
+    fn a_line_longer_than_the_window_names_the_byte_window_that_can_show_it() {
+        let long = "y".repeat(MAX_LINE_WINDOW_BYTES);
+        let text = format!("first\r\n{long}\nlast\n");
+        // The line before it is shown, and the window stops there.
+        let window = render_window(&text, "f.txt", 1, 10);
+        assert_eq!(window.returned, 1);
+        assert!(window.text.starts_with("1: first\n"), "{}", window.text);
+        assert!(window.text.contains("use offset=2 to continue"));
+        // Asked for directly, it cannot be shown at all, and the footer says how to read it:
+        // the byte offset is the line's own, counted past the CRLF before it.
+        let window = render_window(&text, "f.txt", 2, 10);
+        assert_eq!(window.returned, 0);
+        assert!(
+            window
+                .text
+                .contains("read it with byte_offset=7 and max_bytes")
+        );
+        assert!(window.text.contains("skip it with offset=3"));
+        assert!(window.text.contains("the file has 3 lines"));
+        // And the line after it is still reachable.
+        let window = render_window(&text, "f.txt", 3, 10);
+        assert_eq!(window.text, "3: last\n(end of file: 3 lines total)\n");
     }
 
     #[test]
