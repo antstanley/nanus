@@ -789,7 +789,16 @@ impl AgentRunner {
     /// goal tool's name is not counted, because it is not offered — see [`Self::offered_schemas`].
     #[must_use]
     pub fn tool_count(&self) -> usize {
-        self.offered_schemas().len()
+        // Counted where the schemas are, not by building the list a request carries: a handshake
+        // and a status line ask this, and neither needs a copy of every schema to learn a number.
+        let registered = self
+            .tools
+            .borrow()
+            .schemas()
+            .iter()
+            .filter(|schema| !crate::goal_tools::is_goal_tool(&schema.name))
+            .count();
+        registered.saturating_add(crate::goal_tools::COUNT)
     }
 
     /// Returns every schema a request offers the model: the registered tools, then the goal tools.
@@ -1133,13 +1142,15 @@ impl AgentRunner {
             let source: std::sync::Arc<[nanus_domain::Message]> = messages.into();
             request.source_history = Some(std::sync::Arc::clone(&source));
             let mut failure = None;
+            // One probe for the whole search: the schemas and settings every candidate shares
+            // are copied once, and each candidate replaces only its messages and tail.
+            let mut probe = request.clone();
             let fitted = nanus_domain::context::fit_with_source(
                 &source,
                 self.context_budget().min(u32::MAX.saturating_sub(1)),
                 |candidate, tail| {
                     // The probe carries the tail the candidate would, so it costs exactly what is
                     // sent. A candidate whose tail has no place is not one that fits.
-                    let mut probe = request.clone();
                     probe.messages = candidate.to_vec();
                     probe.context_tail = tail.map(str::to_owned);
                     if !probe.tail_is_placeable() {
@@ -1556,18 +1567,22 @@ fn base64_len(bytes: u32) -> usize {
 /// The newest turn starts at the last user message and cannot be dropped to make room, which is
 /// why it is the part of the transcript admission has to count.
 fn turn_images(session: &Session) -> (usize, usize) {
-    let messages = session.derive_messages();
-    let start = messages
+    // Read from the log rather than from a fold of it: every tool result is a message and every
+    // user record starts a turn, so the events after the newest user record are the turn, and
+    // counting them there costs no copy of the conversation. The fold was a clone of the whole
+    // history, pixels included, once per tool batch, to count a handful of blocks.
+    let events = session.log().events();
+    let start = events
         .iter()
-        .rposition(|message| matches!(message, nanus_domain::Message::User { .. }))
+        .rposition(|event| matches!(event, SessionEvent::UserMessage { .. }))
         .unwrap_or(0);
     let mut images = 0_usize;
     let mut bytes = 0_usize;
-    for message in messages.iter().skip(start) {
-        if let nanus_domain::Message::Tool {
+    for event in events.iter().skip(start) {
+        if let SessionEvent::ToolResult {
             content_blocks: Some(blocks),
             ..
-        } = message
+        } = event
         {
             for block in blocks {
                 if let ContentBlock::Image { data_base64, .. } = block {
@@ -1609,13 +1624,17 @@ fn bounded_result(result: &ToolResult) -> ToolResult {
     } else {
         blocks.to_vec()
     };
+    let validation = nanus_domain::content::validate_blocks(&blocks);
+    // The record is measured as the record it will be, so the blocks are moved into it and
+    // taken back afterwards rather than copied in: a file read is as large as a record may be,
+    // and this is on the path of every tool result.
     let event = SessionEvent::ToolResult {
         call_id: result.call_id.clone(),
         content: render_content(&blocks),
-        content_blocks: Some(blocks.clone()),
+        content_blocks: Some(blocks),
         is_error: !result.is_success(),
     };
-    let validation = nanus_domain::content::validate_blocks(&blocks).and_then(|()| {
+    let validation = validation.and_then(|()| {
         // Sequence/envelope overhead is bounded here; the store checks the exact line too.
         nanus_domain::content::serialized_size(
             &event,
@@ -1626,6 +1645,13 @@ fn bounded_result(result: &ToolResult) -> ToolResult {
     if let Err(error) = validation {
         return ToolResult::failure(result.call_id.clone(), error.to_string());
     }
+    let SessionEvent::ToolResult {
+        content_blocks: Some(blocks),
+        ..
+    } = event
+    else {
+        return ToolResult::failure(result.call_id.clone(), "tool result could not be measured");
+    };
     let outcome = if result.is_success() {
         nanus_domain::ToolOutcome::success_with(serde_json::Value::Null, blocks)
     } else {
@@ -2997,6 +3023,76 @@ mod tests {
             Some(String::from("deepseek-v4-pro")),
             "and the log says which model produced the message"
         );
+    }
+
+    /// The count is taken without building the offered list, so it has to stay the length of
+    /// that list: with nothing registered, with a tool registered, and with a registered tool
+    /// that takes a goal tool's name and is therefore not offered.
+    #[test]
+    fn the_tool_count_is_the_number_of_schemas_a_request_offers() {
+        let named = |raw: &str| {
+            let name = ToolName::new(raw).unwrap_or_else(|_| unreachable!("valid"));
+            let schema = ToolSchema {
+                name,
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            };
+            nanus_domain::ToolDefinition::new(schema, Echo)
+        };
+        for (registered, expected) in [
+            (vec![], crate::goal_tools::COUNT),
+            (vec!["echo"], crate::goal_tools::COUNT + 1),
+            (vec!["echo", "get_goal"], crate::goal_tools::COUNT + 1),
+        ] {
+            let mut registry = ToolRegistry::new();
+            for raw in &registered {
+                assert!(registry.register(named(raw)).is_ok());
+            }
+            let Some(runner) = runner(
+                ScriptedLlm::handle(Vec::new()),
+                ToolRegistryHandle::new(registry),
+            ) else {
+                return;
+            };
+            assert_eq!(runner.tool_count(), expected, "{registered:?}");
+            assert_eq!(runner.tool_count(), runner.offered_schemas().len());
+        }
+    }
+
+    /// The images admission counts are the ones the newest turn retains: results after the
+    /// newest user message, and nothing from a turn before it.
+    #[test]
+    fn the_images_counted_are_the_newest_turns_and_an_older_turns_are_not() {
+        let pixels = |call: &str, data: &str| SessionEvent::ToolResult {
+            call_id: ToolCallId::new(call),
+            content: String::from("[image: image/png]\n"),
+            content_blocks: Some(vec![
+                ContentBlock::Text("a still".to_owned()),
+                ContentBlock::Image {
+                    media_type: "image/png".to_owned(),
+                    data_base64: data.to_owned(),
+                },
+            ]),
+            is_error: false,
+        };
+        let user = |text: &str| SessionEvent::UserMessage {
+            text: text.to_owned(),
+            content_blocks: None,
+        };
+        let mut session = session();
+        assert_eq!(turn_images(&session), (0, 0));
+        session.append(user("first"));
+        session.append(pixels("old", "AAAAAAAA"));
+        assert_eq!(turn_images(&session), (1, 8));
+        session.append(user("second"));
+        assert_eq!(
+            turn_images(&session),
+            (0, 0),
+            "the older turn's image is not counted"
+        );
+        session.append(pixels("a", "AAAA"));
+        session.append(pixels("b", "AAAAAA"));
+        assert_eq!(turn_images(&session), (2, 10));
     }
 
     /// A listener that notes which calls it was told had finished, and whether as failures.
