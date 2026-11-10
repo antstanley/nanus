@@ -243,6 +243,7 @@ fn local_adapter(config: OpenAiConfig) -> (OpenAiLlm, TcpListener) {
     (
         OpenAiLlm {
             client,
+            bearer: None,
             config,
             #[cfg(feature = "test-endpoint")]
             test_origin: None,

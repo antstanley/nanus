@@ -493,3 +493,120 @@ fn a_body_that_said_it_was_over_needs_no_sentinel() {
         "{events:?}"
     );
 }
+
+/// A bearer source that hands out a numbered token per request, or refuses.
+struct Numbered {
+    asked: std::cell::Cell<u32>,
+    refuse: bool,
+}
+
+impl nanus_adapter_openai::BearerSource for Numbered {
+    fn bearer(
+        &self,
+    ) -> nanus_ports::LocalBoxFuture<'_, Result<nanus_adapter_openai::Bearer, String>> {
+        Box::pin(async move {
+            if self.refuse {
+                return Err(String::from("the grant could not be renewed"));
+            }
+            let number = self.asked.get().saturating_add(1);
+            self.asked.set(number);
+            Ok(nanus_adapter_openai::Bearer::new(
+                format!("token-{number}"),
+                Some(format!("acct-{number}")),
+            ))
+        })
+    }
+}
+
+/// Runs `requests` Responses requests through one adapter that asks `source` for its bearer.
+fn collect_with_source(server: &Server, source: Numbered, requests: usize) -> Vec<Vec<LlmEvent>> {
+    let mut config = nanus_adapter_openai::OpenAiConfig::with_base_url(
+        nanus_adapter_openai::Vendor::OpenAi,
+        "gpt-5.3-codex",
+        "the-token-it-was-built-with",
+        &server.base_url,
+    );
+    config.set_protocol(nanus_adapter_openai::Protocol::Responses);
+    config.set_account_id("the-account-it-was-built-with");
+    let llm = nanus_adapter_openai::OpenAiLlm::new(config)
+        .expect("the adapter builds")
+        .with_bearer_source(std::rc::Rc::new(source));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let mut all = Vec::new();
+        for _ in 0..requests {
+            let request = ChatRequest::new("gpt-5.3-codex", vec![Message::user("hi")]);
+            let mut events = Vec::new();
+            let mut stream = llm.stream_chat(request);
+            while let Some(event) = stream.next().await {
+                events.push(event);
+            }
+            all.push(events);
+        }
+        all
+    })
+}
+
+/// A finished Responses body.
+const COMPLETED: &str = "data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+
+/// An adapter that lives longer than an access token asks for its bearer as each request
+/// leaves, so the second request carries what the source holds *then* — not the token the
+/// adapter was built with, which is what an agent used to go on sending after it ran out.
+#[test]
+fn each_request_carries_the_bearer_its_source_holds_when_it_leaves() {
+    let server = spawn_server(200, COMPLETED);
+    let source = Numbered {
+        asked: std::cell::Cell::new(0),
+        refuse: false,
+    };
+    let runs = collect_with_source(&server, source, 2);
+    assert!(
+        runs.iter()
+            .all(|events| matches!(events.last(), Some(LlmEvent::Finished { .. }))),
+        "{runs:?}"
+    );
+    let seen = server.requests.lock().expect("the request log").clone();
+    assert_eq!(seen.len(), 2);
+    for (index, request) in seen.iter().enumerate() {
+        let head = request.to_lowercase();
+        let number = index.saturating_add(1);
+        assert!(
+            head.contains(&format!("authorization: bearer token-{number}")),
+            "request {number}: {head}"
+        );
+        assert!(
+            head.contains(&format!("chatgpt-account-id: acct-{number}")),
+            "request {number}: {head}"
+        );
+        assert!(
+            !head.contains("it-was-built-with"),
+            "nothing the adapter was built with is sent: {head}"
+        );
+    }
+}
+
+/// The other direction: a source that cannot produce a bearer is the turn's failure, in its
+/// own words, and nothing is sent — a request known to be refused costs a round trip to say so.
+#[test]
+fn a_source_that_cannot_renew_fails_the_turn_without_sending_anything() {
+    let server = spawn_server(200, COMPLETED);
+    let source = Numbered {
+        asked: std::cell::Cell::new(0),
+        refuse: true,
+    };
+    let runs = collect_with_source(&server, source, 1);
+    let events = runs.first().expect("one run");
+    assert!(
+        matches!(events.as_slice(), [LlmEvent::Error(message)]
+            if message == "the grant could not be renewed"),
+        "{events:?}"
+    );
+    assert!(
+        server.requests.lock().expect("the request log").is_empty(),
+        "no request left"
+    );
+}

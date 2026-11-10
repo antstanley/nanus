@@ -14,7 +14,6 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
 
 use nanus_adapter_anthropic::{AnthropicConfig, AnthropicLlm};
 use nanus_adapter_config::NanusConfig;
@@ -34,6 +33,7 @@ use crate::ToolRegistryHandle;
 use crate::agent_loop::AgentRunner;
 use crate::error::BundleError;
 use crate::provider::{Provider, Selection};
+use crate::renewal::{REFRESH_MARGIN, RenewingGrant, renew_and_store};
 use crate::selection::LastSelection;
 
 /// The default system prompt.
@@ -579,7 +579,7 @@ impl ProviderSwitch {
         config.model = Some(model.to_owned());
         let selection = Selection::resolve(&config)?;
         let credential = resolve_credential(&self.secrets, &selection).await?;
-        let llm = build_llm(&config, &selection, &credential)?;
+        let llm = build_llm(&config, &selection, &credential, &self.secrets)?;
         Ok((llm, selection))
     }
 
@@ -668,7 +668,7 @@ impl ProviderSwitch {
         let config = switched_config(&self.config, provider, plan);
         let selection = Selection::resolve(&config)?;
         let credential = resolve_credential(&self.secrets, &selection).await?;
-        let llm = build_llm(&config, &selection, &credential)?;
+        let llm = build_llm(&config, &selection, &credential, &self.secrets)?;
         // Read before the switch: what is being left, and the adapter it was sending through.
         let leaving = self.selection_in_force();
         let in_use = self.runner.llm();
@@ -845,7 +845,7 @@ async fn build_adapter(
     secrets: &SecretHandle,
 ) -> Result<LlmHandle, BundleError> {
     let credential = resolve_credential(secrets, selection).await?;
-    build_llm(config, selection, &credential)
+    build_llm(config, selection, &credential, secrets)
 }
 
 /// Resolves the credential the selected provider needs.
@@ -897,17 +897,12 @@ pub(crate) async fn resolve_credential(
     }
 }
 
-/// How long before an access token's expiry it is renewed.
-///
-/// A request that leaves just before the expiry would arrive just after it, so the renewal happens
-/// early rather than exactly on time.
-const REFRESH_MARGIN: Duration = Duration::from_mins(5);
-
 /// Renews an authorization whose access token is at or past expiry, storing the new set.
 ///
 /// A grant is a long-lived refresh token and a short-lived access token, so an authorization older
-/// than its access token is renewed here rather than sent and refused. The renewed set is written
-/// back, so the next request does not renew again.
+/// than its access token is renewed here rather than sent and refused. This is the check made when
+/// an adapter is built; the adapter then asks a [`RenewingGrant`] as each request leaves, which
+/// is what keeps the grant good for an agent that outlives it.
 async fn renew(
     secrets: &SecretHandle,
     selection: &Selection,
@@ -919,18 +914,9 @@ async fn renew(
     if !tokens.is_expired(REFRESH_MARGIN) {
         return Ok(stored);
     }
-    let renewed = oauth::refresh(oauth::ISSUER, &tokens).await.map_err(|error| {
-        BundleError::config(format!(
-            "{account} could not be renewed: {error}; run `nanus auth login {account}` to authorize \
-             it again"
-        ))
-    })?;
+    let renewed = renew_and_store(secrets, account, oauth::ISSUER, &tokens).await?;
     let encoded = renewed
         .encode()
-        .map_err(|error| BundleError::config(format!("{account}: {error}")))?;
-    secrets
-        .set(account, &encoded)
-        .await
         .map_err(|error| BundleError::config(format!("{account}: {error}")))?;
     Ok(Secret::new(encoded))
 }
@@ -1080,6 +1066,7 @@ pub(crate) fn build_llm(
     config: &NanusConfig,
     selection: &Selection,
     key: &Secret,
+    secrets: &SecretHandle,
 ) -> Result<LlmHandle, BundleError> {
     let port: Box<dyn LlmPort> = match selection.provider() {
         Provider::DeepSeek => Box::new(build_deepseek(config, selection, key)?),
@@ -1088,7 +1075,12 @@ pub(crate) fn build_llm(
         // `ChatGPT` backend serves the Responses API because that is the endpoint it is, and the
         // subscription plan names it. The credential decides only how the request authenticates.
         Provider::OpenAi if matches!(selection.protocol(), Protocol::Responses) => {
-            Box::new(build_responses(config, selection, key)?)
+            Box::new(renewing(
+                build_responses(config, selection, key)?,
+                selection,
+                key,
+                secrets,
+            )?)
         }
         Provider::OpenAi => Box::new(build_compatible(Vendor::OpenAi, config, selection, key)?),
         Provider::Inception => {
@@ -1126,6 +1118,28 @@ fn build_responses(
         adapter.set_account_id(account_id);
     }
     OpenAiLlm::new(adapter).map_err(|error| BundleError::config(error.to_string()))
+}
+
+/// Has a subscription's adapter ask for its bearer as each request leaves.
+///
+/// The token set the adapter was built from is good now and will not stay so: an agent that
+/// serves for longer than an access token lasts would otherwise send the one it started with
+/// until it was restarted. The grant renews it, files the new set where `key` came from, and
+/// never sends one it knows has run out.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] when the stored credential is not a token set.
+fn renewing(
+    adapter: OpenAiLlm,
+    selection: &Selection,
+    key: &Secret,
+    secrets: &SecretHandle,
+) -> Result<OpenAiLlm, BundleError> {
+    let tokens = oauth::Tokens::decode(key.expose())
+        .map_err(|error| BundleError::config(error.to_string()))?;
+    let grant = RenewingGrant::new(Rc::clone(secrets), selection.credential_account(), tokens);
+    Ok(adapter.with_bearer_source(Rc::new(grant)))
 }
 
 /// Builds the `DeepSeek` adapter.

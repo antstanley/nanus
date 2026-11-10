@@ -336,6 +336,7 @@ fn local_adapter() -> (OpenAiLlm, TcpListener) {
     (
         OpenAiLlm {
             client,
+            bearer: None,
             config: config("mercury-3"),
             #[cfg(feature = "test-endpoint")]
             test_origin: None,

@@ -120,6 +120,8 @@ pub mod host_tools;
 pub mod provider;
 mod recall;
 #[cfg(feature = "stock-compose")]
+mod renewal;
+#[cfg(feature = "stock-compose")]
 pub mod selection;
 pub mod tools;
 #[cfg(feature = "stock-compose")]

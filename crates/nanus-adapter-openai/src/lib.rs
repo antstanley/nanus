@@ -41,6 +41,7 @@
 // here is deliberate.
 #![allow(unreachable_pub)]
 
+mod bearer;
 mod config;
 mod error;
 mod function_policy;
@@ -81,6 +82,7 @@ pub enum Layout {
     /// A managed request, whose head ends at the working-data message or the first user item.
     Managed,
 }
+pub use bearer::{Bearer, BearerSource};
 pub use error::OpenAiError;
 pub use nanus_ports::ReasoningEffort;
 
@@ -185,6 +187,8 @@ fn http_client(timeouts: nanus_ports::HttpTimeouts) -> reqwest::Result<reqwest::
 pub struct OpenAiLlm {
     client: reqwest::Client,
     config: OpenAiConfig,
+    /// Where each request's bearer comes from, when it is not the configuration's key.
+    bearer: Option<std::rc::Rc<dyn BearerSource>>,
     /// A test-only origin the transport sends to, instead of the configured base URL.
     #[cfg(feature = "test-endpoint")]
     test_origin: Option<String>,
@@ -239,6 +243,7 @@ impl OpenAiLlm {
         Ok(Self {
             client,
             config,
+            bearer: None,
             // The binary's end-to-end tests name their listener in the environment; see the feature's
             // manifest comment. Read here, once, so a request never consults the environment.
             #[cfg(feature = "test-endpoint")]
@@ -256,6 +261,18 @@ impl OpenAiLlm {
     /// makes it diagnosable.
     pub fn from_env(vendor: Vendor, model: impl Into<String>) -> Result<Self, OpenAiError> {
         Self::new(OpenAiConfig::from_env(vendor, model)?)
+    }
+
+    /// Asks `source` for the bearer of every request, instead of sending the configuration's.
+    ///
+    /// For a credential that runs out while the adapter lives — a subscription's access token.
+    /// The source is asked at the moment a request is sent, so a token renewed between two
+    /// requests is the one the second carries; the configuration's key and account are then
+    /// only what the adapter was described with.
+    #[must_use]
+    pub fn with_bearer_source(mut self, source: std::rc::Rc<dyn BearerSource>) -> Self {
+        self.bearer = Some(source);
+        self
     }
 
     /// Returns the configuration in use.
@@ -471,6 +488,7 @@ impl OpenAiLlm {
             endpoint: endpoint.to_owned(),
             api_key: self.config.api_key().to_owned(),
             account_id: self.config.account_id().map(str::to_owned),
+            source: self.bearer.clone(),
             host: self.config.base_url().to_owned(),
             vendor: self.config.vendor(),
             limits: self.config.response_limits(),
@@ -488,6 +506,8 @@ struct Transport {
     endpoint: String,
     api_key: String,
     account_id: Option<String>,
+    /// Asked for the bearer when the request is sent; the two fields above are used without one.
+    source: Option<std::rc::Rc<dyn BearerSource>>,
     host: String,
     vendor: Vendor,
     limits: Option<nanus_ports::ResponseLimits>,
@@ -503,21 +523,33 @@ fn send(transport: Transport, body: String, decoder: Decoder) -> LlmStream {
         endpoint,
         api_key,
         account_id,
+        source,
         host,
         vendor,
         limits,
     } = transport;
-    let mut sent = client
-        .post(&endpoint)
-        .header("accept", "text/event-stream")
-        .header("content-type", "application/json")
-        .bearer_auth(api_key)
-        .body(body);
-    if let Some(account) = account_id {
-        sent = sent.header("chatgpt-account-id", account);
-    }
     let transport_host = host.clone();
     let response = async move {
+        // The credential is settled here, as the request leaves, and not when the adapter was
+        // built: a grant that has run out since is renewed first, and one that cannot be is the
+        // turn's failure — without a request, which could only have been refused.
+        let (token, account) = match source {
+            Some(source) => {
+                let bearer = source.bearer().await?;
+                let account = bearer.account_id().map(str::to_owned);
+                (bearer.expose().to_owned(), account)
+            }
+            None => (api_key, account_id),
+        };
+        let mut sent = client
+            .post(&endpoint)
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .bearer_auth(token)
+            .body(body);
+        if let Some(account) = account {
+            sent = sent.header("chatgpt-account-id", account);
+        }
         sent.send()
             .await
             .map_err(|source| OpenAiError::transport(&source, &transport_host).to_string())
