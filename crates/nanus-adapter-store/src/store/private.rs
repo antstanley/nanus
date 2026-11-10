@@ -69,6 +69,10 @@ pub(super) fn create_dir_all_blocking(dir: &Path) -> std::io::Result<()> {
 ///
 /// The mode applies only at creation, so opening a file that exists changes nothing about it.
 pub(super) fn options() -> std::fs::OpenOptions {
+    // Setting the mode is the only change made here, and only Unix has one to set: elsewhere the
+    // binding is never changed, and the lint that notices would have the two platforms differ in
+    // how it is declared.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = std::fs::OpenOptions::new();
     #[cfg(unix)]
     {
@@ -100,6 +104,9 @@ pub(super) fn narrow_dir(dir: &Path) {
 ///
 /// For a file that was copied rather than created, which carries the mode of what it was
 /// copied from.
+// The `Result` is the Unix signature; on other platforms the body cannot fail, and the lint
+// that notices would have the two platforms disagree on how this is called.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(super) fn narrow_file(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
