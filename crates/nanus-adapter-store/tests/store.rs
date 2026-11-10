@@ -1182,3 +1182,82 @@ async fn a_sweep_leaves_a_write_in_flight_and_every_file_that_is_not_a_temporary
     );
     store.release_lock(written.id());
 }
+
+// ---------------------------------------------------------------------------
+// Two namings at once.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn two_sessions_named_at_once_cannot_both_take_the_name() {
+    let (_dir, store) = store().await;
+    let first = session("first", 1, &["a"]);
+    let second = session("second", 2, &["b"]);
+    store.save(&first).await.expect("save");
+    store.save(&second).await.expect("save");
+
+    // Each naming walks the store before it writes, and the walk yields: without a lock held
+    // across both, each finds the name free and both keep it.
+    let (one, two) = tokio::join!(
+        store.name(first.id(), "nightly"),
+        store.name(second.id(), "Nightly"),
+    );
+
+    let taken = [&one, &two]
+        .into_iter()
+        .filter(|outcome| matches!(outcome, Err(StoreError::NameTaken { .. })))
+        .count();
+    assert_eq!(taken, 1, "exactly one is refused: {one:?} {two:?}");
+    assert_eq!([&one, &two].into_iter().filter(|o| o.is_ok()).count(), 1);
+    let names = [
+        store.name_of(first.id()).await.expect("name"),
+        store.name_of(second.id()).await.expect("name"),
+    ];
+    assert_eq!(names.iter().flatten().count(), 1, "one session holds it");
+}
+
+#[tokio::test]
+async fn two_sessions_named_differently_at_once_both_keep_their_names() {
+    let (_dir, store) = store().await;
+    let first = session("first", 1, &["a"]);
+    let second = session("second", 2, &["b"]);
+    store.save(&first).await.expect("save");
+    store.save(&second).await.expect("save");
+
+    let (one, two) = tokio::join!(
+        store.name(first.id(), "nightly"),
+        store.name(second.id(), "weekly"),
+    );
+
+    assert!(one.is_ok() && two.is_ok(), "{one:?} {two:?}");
+    assert_eq!(
+        store.resolve("weekly").await.expect("resolve"),
+        Some(second.id().clone())
+    );
+    assert_eq!(
+        store.resolve("NIGHTLY").await.expect("resolve"),
+        Some(first.id().clone())
+    );
+}
+
+#[tokio::test]
+async fn two_stores_over_one_home_cannot_both_take_a_name() {
+    // Two agents are two stores over one home; the lock they share is the file's, not a mutex.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let one = JsonlStore::new(dir.path()).await.expect("store");
+    let two = JsonlStore::new(dir.path()).await.expect("store");
+    let first = session("first", 1, &["a"]);
+    let second = session("second", 2, &["b"]);
+    one.save(&first).await.expect("save");
+    two.save(&second).await.expect("save");
+
+    let (left, right) = tokio::join!(
+        one.name(first.id(), "nightly"),
+        two.name(second.id(), "nightly"),
+    );
+
+    assert_eq!(
+        [&left, &right].into_iter().filter(|o| o.is_ok()).count(),
+        1,
+        "{left:?} {right:?}"
+    );
+}

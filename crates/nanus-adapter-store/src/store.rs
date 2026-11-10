@@ -10,6 +10,7 @@
 //! <home>/retired/<encoded-session-id>                 (a deleted id, never written again)
 //! <home>/trash/<encoded-session-id>.<uuid>/           (a deleted session, being removed)
 //! <home>/archive.lock                                 (the archive's cross-process quota lock)
+//! <home>/names.lock                                   (held while a name is checked and written)
 //! ```
 //!
 //! `<home>` is the explicit home when one is given (a configuration's `home`), then `$NANUS_HOME`
@@ -24,6 +25,11 @@
 //! to be held already and takes only the quota lock; garbage collection takes the claim and then
 //! the quota lock; deletion takes the claim and never needs the quota lock, because removing
 //! bytes can only lower what a reservation counts.
+//!
+//! A third, the **names lock**, stands apart from that order: naming a session takes it alone,
+//! holds it for one walk of the store and one small write, and acquires nothing else while it
+//! has it. It is what makes "is this name free" and "write this name" one step — without it two
+//! sessions named in the same instant both find the name free, and both keep it.
 //!
 //! ## Why a name is a file beside the session rather than a field in it
 //!
@@ -115,6 +121,21 @@ const SESSION_FILE: &str = "session.jsonl";
 /// and never a path component: no name can escape the directory it lives in.
 const NAME_FILE: &str = "name";
 
+/// The file, under the home, that is locked while a name is checked and written.
+const NAMES_LOCK_FILE: &str = "names.lock";
+
+/// The names lock, held: dropping it lets the next naming in.
+///
+/// Fields drop in the order they are declared, so the file's lock is released before this
+/// process's turn is given up. Either order would be safe — the turn only orders this process's
+/// own namings — but this one never leaves the file locked with nobody about to use it.
+struct NamesLock<'a> {
+    /// The shared file, locked.
+    _file: std::fs::File,
+    /// This process's turn.
+    _turn: tokio::sync::MutexGuard<'a, ()>,
+}
+
 /// The file name of one session's write claim.
 const LOCK_FILE: &str = "lock";
 
@@ -194,6 +215,8 @@ pub struct JsonlStore {
     written: Mutex<BTreeMap<SessionId, checkpoint::Written>>,
     /// The archive's byte limits, never above the policy's.
     quota: ArchiveQuota,
+    /// Serialises this process's namings, so only one of them waits on the names lock's file.
+    naming: tokio::sync::Mutex<()>,
 }
 
 impl JsonlStore {
@@ -210,6 +233,7 @@ impl JsonlStore {
             locks: Mutex::new(BTreeMap::new()),
             written: Mutex::new(BTreeMap::new()),
             quota: ArchiveQuota::default(),
+            naming: tokio::sync::Mutex::new(()),
         };
         let root = store.sessions_root();
         fs::create_dir_all(&root)
@@ -474,6 +498,11 @@ impl JsonlStore {
         if !fs::try_exists(&log).await.unwrap_or(false) {
             return Err(not_found(id));
         }
+        // Held from the check to the write. The check is a walk of the store with awaits in it,
+        // so two namings — two connections of one agent, or two processes — would otherwise
+        // both find the name free and both write it, and resolving it would then quietly pick
+        // one of them.
+        let _names = self.names_lock().await?;
         for (other, held) in self.session_names().await? {
             // Folded, so `Nightly` and `nightly` cannot both exist: two names a person reads as
             // the same word would let them name a second conversation with the word they think
@@ -488,6 +517,34 @@ impl JsonlStore {
         // Written atomically and last, so a failure leaves the previous name — or
         // no name — rather than half of one.
         write_atomic(&self.name_file(id)?, &format!("{name}\n")).await
+    }
+
+    /// Takes the names lock: this process's turn first, then the file every process shares.
+    ///
+    /// The file's lock is the operating system's, so a holder that dies releases it. Waiting for
+    /// it blocks, and a naming is short, so the wait is handed to the blocking pool rather than
+    /// polled: nothing on the runtime thread stalls behind another process's walk of the store.
+    async fn names_lock(&self) -> StoreResult<NamesLock<'_>> {
+        let turn = self.naming.lock().await;
+        let path = self.home.join(NAMES_LOCK_FILE);
+        let opened = path.clone();
+        let locked = tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&opened)?;
+            file.lock()?;
+            Ok::<_, std::io::Error>(file)
+        })
+        .await
+        .map_err(|source| io_error(&path, &std::io::Error::other(source)))?
+        .map_err(|source| io_error(&path, &source))?;
+        Ok(NamesLock {
+            _turn: turn,
+            _file: locked,
+        })
     }
 
     /// Resolves a name to the session that answers to it.
@@ -534,10 +591,9 @@ impl JsonlStore {
             let entry = match entries.next_entry().await {
                 Ok(Some(entry)) => entry,
                 Ok(None) => break,
-                Err(source) => {
-                    tracing::warn!(%source, "stopped reading session names after a read error");
-                    break;
-                }
+                // An error rather than the names read so far: the walk is what decides that a
+                // name is free, and half a walk would call a taken name free.
+                Err(source) => return Err(io_error(&root, &source)),
             };
             let dir = entry.path();
             if !dir.is_dir() {
