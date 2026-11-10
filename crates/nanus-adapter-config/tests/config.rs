@@ -184,6 +184,61 @@ fn a_file_from_a_newer_build_is_refused() {
     }
 }
 
+/// A version that is present but not a whole number used to be read as absent, so the file
+/// was migrated as the oldest shape and stamped with this build's version — a file a newer
+/// build wrote with its version quoted was *accepted*. It is refused, and the failure names
+/// the file rather than a placeholder.
+#[test]
+fn a_version_that_is_not_a_whole_number_is_refused_rather_than_read_as_absent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, version) in [("quoted", "\"2\""), ("fraction", "1.5"), ("negative", "-1")] {
+        let path = dir.path().join(format!("{name}.toml"));
+        std::fs::write(&path, format!("config_version = {version}\n")).expect("seed");
+        let error = NanusConfig::load(Some(&path)).expect_err("a refusal");
+        assert!(
+            matches!(error, nanus_adapter_config::ConfigError::Invalid { .. }),
+            "{name}: {error}"
+        );
+        assert!(
+            error.to_string().contains(&format!("{name}.toml")),
+            "the failure names the file: {error}"
+        );
+    }
+}
+
+/// The other direction: a file that declares no version is still the pre-1.0 shape and is
+/// migrated, and one that declares this build's version is read as it is.
+#[test]
+fn an_absent_version_is_migrated_and_a_whole_one_is_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let absent = dir.path().join("absent.toml");
+    std::fs::write(&absent, "max_output_tokens = 512\n").expect("seed");
+    let config = NanusConfig::load(Some(&absent)).expect("load");
+    assert_eq!(config.max_tokens, Some(512));
+    assert_eq!(config.config_version, CONFIG_VERSION);
+
+    let current = dir.path().join("current.toml");
+    std::fs::write(&current, format!("config_version = {CONFIG_VERSION}\n")).expect("seed");
+    let config = NanusConfig::load(Some(&current)).expect("load");
+    assert_eq!(config.config_version, CONFIG_VERSION);
+}
+
+/// A field that does not fit the schema is reported against the file it came from. The
+/// migration step used to report it against a placeholder, which named nothing a reader
+/// could open.
+#[test]
+fn a_field_that_does_not_fit_names_the_file_it_came_from() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mistyped.toml");
+    std::fs::write(&path, "max_steps_per_turn = \"many\"\n").expect("seed");
+    let error = NanusConfig::load(Some(&path)).expect_err("a refusal");
+    assert!(error.to_string().contains("mistyped.toml"), "{error}");
+    assert!(
+        !error.to_string().contains("<migrated document>"),
+        "{error}"
+    );
+}
+
 #[test]
 fn the_permission_and_effort_spellings_parse() {
     let dir = tempfile::tempdir().expect("tempdir");
