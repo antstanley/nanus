@@ -551,7 +551,9 @@ pub fn encode_tools(tools: &[ToolSchema]) -> Value {
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
     limits: Option<nanus_ports::ResponseLimits>,
-    ready: Vec<LlmEvent>,
+    /// Events decoded and not yet taken. A queue, because one network chunk can decode into
+    /// hundreds of events and each is taken from the front.
+    ready: std::collections::VecDeque<LlmEvent>,
     input_tokens: u32,
     cache_read_tokens: u32,
     cache_creation_tokens: u32,
@@ -607,10 +609,7 @@ impl StreamAccumulator {
 
     /// Takes the next ready event, if any.
     pub fn take_ready(&mut self) -> Option<LlmEvent> {
-        if self.ready.is_empty() {
-            return None;
-        }
-        Some(self.ready.remove(0))
+        self.ready.pop_front()
     }
 
     /// Returns `true` once the terminal event has been emitted.
@@ -627,7 +626,7 @@ impl StreamAccumulator {
             self.replay_arguments.clear();
             self.finish = None;
         }
-        self.ready.push(LlmEvent::Error(message));
+        self.ready.push_back(LlmEvent::Error(message));
         self.closed = true;
     }
 
@@ -642,7 +641,7 @@ impl StreamAccumulator {
                 self.fail("malformed stream: provider payload is not JSON".into());
                 return;
             }
-            self.ready.push(LlmEvent::Error(format!(
+            self.ready.push_back(LlmEvent::Error(format!(
                 "the server sent a frame that is not JSON: {}",
                 truncate_for_message(payload)
             )));
@@ -922,7 +921,7 @@ impl StreamAccumulator {
         let Some(call) = self.limited.remove(&index) else {
             return;
         };
-        self.ready.push(LlmEvent::ToolCallDelta {
+        self.ready.push_back(LlmEvent::ToolCallDelta {
             index,
             id: None,
             name: None,
@@ -960,12 +959,13 @@ impl StreamAccumulator {
             Some("tool_use") => self.open_tool_use(index, block),
             Some("text") => {
                 if let Some(text) = non_empty_str(block, "text") {
-                    self.ready.push(LlmEvent::TextDelta(text.to_owned()));
+                    self.ready.push_back(LlmEvent::TextDelta(text.to_owned()));
                 }
             }
             Some("thinking") => {
                 if let Some(text) = non_empty_str(block, "thinking") {
-                    self.ready.push(LlmEvent::ReasoningDelta(text.to_owned()));
+                    self.ready
+                        .push_back(LlmEvent::ReasoningDelta(text.to_owned()));
                 }
             }
             _ => {}
@@ -988,7 +988,7 @@ impl StreamAccumulator {
                 self.fail("malformed stream: tool call has no id".into());
                 return;
             }
-            self.ready.push(LlmEvent::Error(format!(
+            self.ready.push_back(LlmEvent::Error(format!(
                 "the model opened tool call {index} with no id"
             )));
             return;
@@ -998,13 +998,13 @@ impl StreamAccumulator {
                 self.fail("malformed stream: tool call has invalid name".into());
                 return;
             }
-            self.ready.push(LlmEvent::Error(format!(
+            self.ready.push_back(LlmEvent::Error(format!(
                 "the model requested a tool whose name is not usable: {:?}",
                 truncate_for_message(name)
             )));
             return;
         };
-        self.ready.push(LlmEvent::ToolCallDelta {
+        self.ready.push_back(LlmEvent::ToolCallDelta {
             index,
             id: Some(ToolCallId::new(id)),
             name: Some(name),
@@ -1022,12 +1022,13 @@ impl StreamAccumulator {
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => {
                 if let Some(text) = non_empty_str(delta, "text") {
-                    self.ready.push(LlmEvent::TextDelta(text.to_owned()));
+                    self.ready.push_back(LlmEvent::TextDelta(text.to_owned()));
                 }
             }
             Some("thinking_delta") => {
                 if let Some(text) = non_empty_str(delta, "thinking") {
-                    self.ready.push(LlmEvent::ReasoningDelta(text.to_owned()));
+                    self.ready
+                        .push_back(LlmEvent::ReasoningDelta(text.to_owned()));
                 }
             }
             Some("input_json_delta") => {
@@ -1037,7 +1038,7 @@ impl StreamAccumulator {
                     return;
                 }
                 if let Some(fragment) = delta.get("partial_json").and_then(Value::as_str) {
-                    self.ready.push(LlmEvent::ToolCallDelta {
+                    self.ready.push_back(LlmEvent::ToolCallDelta {
                         index,
                         id: None,
                         name: None,
@@ -1124,7 +1125,7 @@ impl StreamAccumulator {
                 );
                 return;
             }
-            self.ready.push(LlmEvent::AssistantReplay(replay));
+            self.ready.push_back(LlmEvent::AssistantReplay(replay));
         }
         let usage = Usage::new(
             self.prompt_tokens(),
@@ -1140,10 +1141,10 @@ impl StreamAccumulator {
             self.input_tokens.saturating_add(self.cache_creation_tokens),
         );
         if usage.total_tokens() > 0 {
-            self.ready.push(LlmEvent::Usage(usage));
+            self.ready.push_back(LlmEvent::Usage(usage));
         }
         let reason = self.finish.take().unwrap_or(FinishReason::Stop);
-        self.ready.push(LlmEvent::Finished { reason });
+        self.ready.push_back(LlmEvent::Finished { reason });
     }
 
     /// Returns the whole prompt: uncached input plus both cache counts.

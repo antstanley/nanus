@@ -53,23 +53,37 @@ impl SseFrames {
     /// A payload is the text after `data:` on a line, with the trailing newline
     /// removed. The `[DONE]` sentinel is consumed rather than returned.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.pending.extend_from_slice(chunk);
         let mut payloads = Vec::new();
-        // Only whole lines are consumed, so a partial frame stays buffered.
-        while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=index).collect();
-            let Some(payload) = decode_line(&line) else {
-                continue;
+        // Only the new bytes are searched, and nothing already buffered is moved: the buffer
+        // holds one partial line and never a newline, so a line ends where the chunk says it
+        // does. Searching the whole buffer on every chunk — and shifting it down once per
+        // line — made a long frame cost the square of its length.
+        let mut rest = chunk;
+        while let Some(index) = rest.iter().position(|byte| *byte == b'\n') {
+            let Some((line, tail)) = rest.split_at_checked(index.saturating_add(1)) else {
+                break;
             };
-            if payload == DONE_SENTINEL {
-                self.done = true;
-                continue;
+            rest = tail;
+            let decoded = if self.pending.is_empty() {
+                decode_line(line)
+            } else {
+                // The line began in an earlier chunk; what was held is its head.
+                self.pending.extend_from_slice(line);
+                let decoded = decode_line(&self.pending);
+                self.pending.clear();
+                decoded
+            };
+            match decoded {
+                Some(payload) if payload == DONE_SENTINEL => self.done = true,
+                Some(payload) => payloads.push(payload),
+                None => {}
             }
-            payloads.push(payload);
         }
-        // Postcondition: whatever remains is a partial line, never a whole one, so a
-        // frame cannot be emitted twice.
-        assert!(!self.pending.contains(&b'\n'), "whole lines are drained");
+        // Postcondition: what is kept is a partial line, never a whole one, so a frame
+        // cannot be emitted twice. Checked on the remainder alone — the buffer it joins
+        // passed the same check when it was kept.
+        assert!(!rest.contains(&b'\n'), "whole lines are consumed");
+        self.pending.extend_from_slice(rest);
         payloads
     }
 
@@ -112,6 +126,52 @@ fn decode_line(line: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where the chunks fall is the network's business: a stream fed a byte at a time, in
+    /// one piece, or cut at every other width decodes to the same payloads, sentinel and
+    /// partial tail included.
+    #[test]
+    fn the_payloads_do_not_depend_on_where_the_chunks_fall() {
+        let stream =
+            "data: {\"a\":\"é\"}\r\n\n: ping\ndata: {\"b\":2}\n\ndata: [DONE]\ndata: {\"tail\":3}"
+                .as_bytes();
+        let decode = |width: usize| {
+            let mut frames = SseFrames::new();
+            let mut payloads = Vec::new();
+            for chunk in stream.chunks(width) {
+                payloads.extend(frames.push(chunk));
+            }
+            payloads.extend(frames.finish());
+            (payloads, frames.is_done())
+        };
+        let whole = decode(stream.len());
+        assert_eq!(
+            whole.0,
+            vec![
+                "{\"a\":\"é\"}".to_owned(),
+                "{\"b\":2}".to_owned(),
+                "{\"tail\":3}".to_owned()
+            ]
+        );
+        assert!(whole.1, "the sentinel was seen");
+        for width in 1..stream.len() {
+            assert_eq!(decode(width), whole, "chunks of {width}");
+        }
+    }
+
+    /// The other direction: a line that never ends is held, not emitted, however many chunks
+    /// it arrives in — and it is still one payload when its newline finally comes.
+    #[test]
+    fn an_unfinished_line_is_held_across_any_number_of_chunks() {
+        let mut frames = SseFrames::new();
+        assert!(frames.push(b"data: ").is_empty());
+        for _ in 0..1_000 {
+            assert!(frames.push(b"xxxxxxxx").is_empty());
+        }
+        let payloads = frames.push(b"\n");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads.first().map(String::len), Some(8_000));
+    }
 
     /// The case a line reader gets wrong: a frame split mid-payload.
     #[test]

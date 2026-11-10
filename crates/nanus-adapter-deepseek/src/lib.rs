@@ -232,13 +232,7 @@ impl LlmPort for DeepSeekLlm {
         &self,
         request: &ChatRequest,
     ) -> nanus_ports::LlmResult<nanus_ports::RequestEstimate> {
-        request.check_tail()?;
-        metadata::validate_output(&self.config, request)?;
-        nanus_ports::capabilities::estimate_payload(
-            self.capabilities(&request.model),
-            request,
-            &self.encode(request),
-        )
+        self.estimate_encoded(request).map(|(estimate, _)| estimate)
     }
 
     fn stream_chat(&self, request: ChatRequest) -> LlmStream {
@@ -251,19 +245,26 @@ impl LlmPort for DeepSeekLlm {
         ) {
             return error_stream(&error.to_string());
         }
-        if metadata::requires_preflight(&self.config, &request) {
-            let checked = self.estimate_request(&request).and_then(|estimate| {
-                nanus_ports::capabilities::validate_estimate(
-                    self.capabilities(&request.model),
-                    &request,
-                    estimate,
-                )
-            });
-            if let Err(error) = checked {
-                return error_stream(&error.to_string());
+        let payload = if metadata::requires_preflight(&self.config, &request) {
+            // The body the estimate measured is the body that is sent: encoding it a second
+            // time rebuilt the whole history, images included, to produce the same bytes.
+            let checked = self
+                .estimate_encoded(&request)
+                .and_then(|(estimate, payload)| {
+                    nanus_ports::capabilities::validate_estimate(
+                        self.capabilities(&request.model),
+                        &request,
+                        estimate,
+                    )
+                    .map(|()| payload)
+                });
+            match checked {
+                Ok(payload) => payload,
+                Err(error) => return error_stream(&error.to_string()),
             }
-        }
-        let payload = self.encode(&request);
+        } else {
+            self.encode(&request)
+        };
 
         let Ok(body) = serde_json::to_string(&payload) else {
             return error_stream("could not encode the request as JSON");
@@ -296,6 +297,25 @@ impl LlmPort for DeepSeekLlm {
 }
 
 impl DeepSeekLlm {
+    /// Estimates a request and hands back the body the estimate was made from.
+    ///
+    /// The checks run before the body is built, in the order [`LlmPort::estimate_request`]
+    /// has always run them, so a request that is refused is refused for the same reason.
+    fn estimate_encoded(
+        &self,
+        request: &ChatRequest,
+    ) -> nanus_ports::LlmResult<(nanus_ports::RequestEstimate, serde_json::Value)> {
+        request.check_tail()?;
+        metadata::validate_output(&self.config, request)?;
+        let payload = self.encode(request);
+        let estimate = nanus_ports::capabilities::estimate_payload(
+            self.capabilities(&request.model),
+            request,
+            &payload,
+        )?;
+        Ok((estimate, payload))
+    }
+
     /// Everything a dispatch needs beyond its body, resolved now and owned from here on.
     fn transport(&self) -> Transport {
         Transport {
