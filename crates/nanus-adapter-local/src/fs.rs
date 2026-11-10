@@ -16,6 +16,17 @@
 //! resolved through the filesystem and re-checked against the root. Both checks
 //! must pass.
 //!
+//! ## A link that leads nowhere is still a link
+//!
+//! "The longest existing ancestor" has a trap in it. A link whose target does not exist
+//! cannot be canonicalized, so it looks exactly like a file that has not been written yet —
+//! and a write to it would then *create* the target, wherever the link points. A component
+//! that cannot be resolved is therefore looked at before it is treated as missing: a link
+//! there is refused, as outside the workspace when its target is, and as unresolvable when
+//! the target would be inside but is absent or loops. The open that follows refuses a link
+//! too (`O_NOFOLLOW` on Unix), so a link put there after the check is not written through
+//! either.
+//!
 //! ## A window is read through the handle that was checked
 //!
 //! Both checks above are about a *path*, and a path can be changed between the check and the
@@ -128,6 +139,9 @@ impl LocalFs {
             if let Ok(canonical) = existing.canonicalize() {
                 break canonical;
             }
+            // Not resolvable is not the same as not there: a link whose target is missing
+            // fails to canonicalize too, and writing to it would create that target.
+            self.refuse_unresolved_link(existing)?;
             let Some(name) = existing.file_name() else {
                 return Err(FsError::OutsideWorkspace {
                     root: self.root.clone(),
@@ -158,6 +172,41 @@ impl LocalFs {
             "a resolved path stays inside the root"
         );
         Ok(resolved)
+    }
+
+    /// Refuses `path` when it is a link that could not be resolved.
+    ///
+    /// Called only for a component [`Path::canonicalize`] failed on. A link there is dangling
+    /// or part of a loop, and either way following it is not something the root can vouch
+    /// for: the target is named outside the workspace, or it is named inside and does not
+    /// exist to be checked. The two are told apart so the error says which.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::OutsideWorkspace`] for a link whose target is lexically outside
+    /// the root, and [`FsError::Io`] for one whose target is inside but unresolvable.
+    fn refuse_unresolved_link(&self, path: &Path) -> FsResult<()> {
+        let is_link =
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if !is_link {
+            return Ok(());
+        }
+        let outside = || FsError::OutsideWorkspace {
+            root: self.root.clone(),
+            path: path.to_path_buf(),
+        };
+        let target = std::fs::read_link(path).map_err(|_| outside())?;
+        // A relative target is relative to the directory holding the link, which is inside
+        // the root already: every ancestor of `path` is, by the lexical check.
+        let base = path.parent().unwrap_or(&self.root);
+        ensure_within(&self.root, &base.join(target)).map_err(|_| outside())?;
+        Err(FsError::Io {
+            path: path.to_path_buf(),
+            message: String::from(
+                "the path is a symbolic link whose target does not resolve, so it cannot be \
+                 shown to stay inside the workspace",
+            ),
+        })
     }
 
     /// Reads a file and counts its lines.
@@ -213,8 +262,7 @@ impl LocalFs {
                 true
             }
             WriteMode::Overwrite => {
-                std::fs::write(&resolved, contents)
-                    .map_err(|source| io_error(&resolved, &source))?;
+                write_no_follow(&self.root, &resolved, contents.as_bytes())?;
                 !existed
             }
         };
@@ -246,7 +294,7 @@ impl LocalFs {
         if old != new {
             assert_ne!(before, after, "a successful edit changes the text");
         }
-        std::fs::write(&resolved, &after).map_err(|source| io_error(&resolved, &source))?;
+        write_no_follow(&self.root, &resolved, after.as_bytes())?;
         Ok(EditOutcome {
             path: resolved,
             replacements,
@@ -748,6 +796,57 @@ fn open_confined(root: &Path, resolved: &Path) -> FsResult<File> {
     }
     assert!(handle.is_file(), "a confined handle is a regular file");
     Ok(file)
+}
+
+/// Replaces a confined file's contents without writing through a link.
+///
+/// `resolved` has passed [`LocalFs::resolve`], so its last component is not a link unless one
+/// was put there since. The open refuses that case rather than following it out of the root,
+/// which is the write-side half of what [`open_confined`] does for a ranged read.
+fn write_no_follow(root: &Path, resolved: &Path, contents: &[u8]) -> FsResult<()> {
+    use std::io::Write as _;
+    assert!(root.is_absolute(), "a confinement root is absolute");
+    let mut file = create_no_follow(resolved).map_err(|source| {
+        let swapped = std::fs::symlink_metadata(resolved)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if swapped {
+            FsError::OutsideWorkspace {
+                root: root.to_path_buf(),
+                path: resolved.to_path_buf(),
+            }
+        } else {
+            io_error(resolved, &source)
+        }
+    })?;
+    file.write_all(contents)
+        .map_err(|source| io_error(resolved, &source))
+}
+
+/// Opens a path for a whole-file write, creating or truncating it, without following a link
+/// in its last component.
+#[cfg(unix)]
+fn create_no_follow(path: &Path) -> std::io::Result<File> {
+    use nix::fcntl::OFlag;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        .open(path)
+}
+
+/// Opens a path for a whole-file write, creating or truncating it.
+///
+/// There is no open flag here that refuses a link and still truncates, so this platform has
+/// the path check alone.
+#[cfg(not(unix))]
+fn create_no_follow(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
 }
 
 /// Refuses a directory and anything else that is not a regular file.
