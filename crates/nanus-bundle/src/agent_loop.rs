@@ -1029,17 +1029,13 @@ impl AgentRunner {
             .await?;
         drop(stream); // Release the model response before host validation or native dispatch.
         let interrupted = assembled.interrupted;
-        let max_tokens = assembled.finish == FinishReason::Length;
+        let answer = stream::answer_outcome(&assembled.finish);
         let calls = self.append_model_records(session, context.position, assembled, reservation)?;
         if interrupted {
             return Ok(StepOutcome::Interrupted);
         }
         if calls.is_empty() {
-            return Ok(if max_tokens {
-                StepOutcome::MaxTokens
-            } else {
-                StepOutcome::FinalAnswer
-            });
+            return Ok(answer);
         }
         if self.run_tools(session, &calls, progress, context).await? {
             Ok(StepOutcome::Interrupted)
@@ -2690,6 +2686,73 @@ mod tests {
         let outcome = runner.run_turn(&mut session, "hi", &mut Silent, None).await;
         assert!(outcome.is_ok());
         assert!(outcome.is_ok_and(|outcome| outcome.reason == TurnEndReason::Completed));
+    }
+
+    /// Runs one turn against a model that says `text` and ends its response with `reason`.
+    async fn turn_ending_with(text: &str, reason: FinishReason) -> Option<(RunOutcome, Session)> {
+        let llm = ScriptedLlm::handle(vec![vec![
+            LlmEvent::TextDelta(text.to_owned()),
+            LlmEvent::Finished { reason },
+        ]]);
+        let runner = runner(llm, ToolRegistryHandle::new(ToolRegistry::new()))?;
+        let mut session = session();
+        let outcome = runner.run_turn(&mut session, "hi", &mut Silent, None).await;
+        outcome.ok().map(|outcome| (outcome, session))
+    }
+
+    /// A response a content filter stopped is not a completed turn: the words stay, and the
+    /// turn's ending says why it is not one. It used to close as `Completed` and exit zero.
+    #[tokio::test]
+    async fn a_response_a_content_filter_stopped_is_not_a_completed_turn() {
+        let Some((outcome, session)) =
+            turn_ending_with("the first half", FinishReason::ContentFilter).await
+        else {
+            panic!("the turn runs");
+        };
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.answer, "the first half", "what arrived is kept");
+        let TurnEndReason::Error { message } = &outcome.reason else {
+            panic!(
+                "a filtered response ends its turn as a failure: {:?}",
+                outcome.reason
+            );
+        };
+        assert!(message.contains("content filter"), "{message}");
+        assert_eq!(session.log().last_turn_end(), Some(&outcome.reason));
+    }
+
+    /// A finish reason this build has no name for cannot be vouched for as an ending. The reason
+    /// is quoted so the transcript says what the provider said, bounded and on one line.
+    #[tokio::test]
+    async fn a_response_that_ended_for_an_unknown_reason_is_not_a_completed_turn() {
+        let raw = format!("pause_turn\n{}", "x".repeat(500));
+        let Some((outcome, _)) = turn_ending_with("so far", FinishReason::Unknown(raw)).await
+        else {
+            panic!("the turn runs");
+        };
+        assert!(!outcome.is_success());
+        let TurnEndReason::Error { message } = &outcome.reason else {
+            panic!("an unknown ending is a failure: {:?}", outcome.reason);
+        };
+        assert!(message.contains("`pause_turn "), "{message}");
+        assert!(!message.contains('\n') && message.len() < 250, "{message}");
+    }
+
+    /// The other direction: the model's own endings still complete the turn, including a
+    /// provider that says `tool_calls` and then names none.
+    #[tokio::test]
+    async fn a_response_the_model_ended_itself_completes_the_turn() {
+        for reason in [FinishReason::Stop, FinishReason::ToolCalls] {
+            let Some((outcome, _)) = turn_ending_with("done", reason.clone()).await else {
+                panic!("the turn runs");
+            };
+            assert_eq!(outcome.reason, TurnEndReason::Completed, "{reason:?}");
+            assert!(outcome.is_success());
+        }
+        let Some((ceiling, _)) = turn_ending_with("cut", FinishReason::Length).await else {
+            panic!("the turn runs");
+        };
+        assert_eq!(ceiling.reason, TurnEndReason::MaxTokens);
     }
 
     #[tokio::test]

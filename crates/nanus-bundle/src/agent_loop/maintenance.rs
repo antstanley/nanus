@@ -11,7 +11,7 @@
 use nanus_domain::context::managed::{ContextFrontier, Digest, ErrorCode};
 use nanus_domain::context::{COMPACTION_SUMMARY_BYTES_MAX, model_text_is_admissible};
 use nanus_domain::{Message, Session, Usage};
-use nanus_ports::{FinishReason, TurnControl};
+use nanus_ports::TurnControl;
 
 use super::{AgentRunner, Silent};
 use crate::BundleError;
@@ -147,7 +147,8 @@ pub(super) struct Reply {
     pub(super) text: String,
     /// The provider's usage for the request, when it reported any.
     pub(super) usage: Option<Usage>,
-    /// Whether the reply stopped at the output ceiling rather than at its own end.
+    /// Whether the reply stopped somewhere other than its own end: at the output ceiling, at a
+    /// content filter, or for a reason this build does not know.
     pub(super) truncated: bool,
     /// Whether a stop cut the reply short.
     pub(super) interrupted: bool,
@@ -231,8 +232,8 @@ impl AgentRunner {
         if reply.truncated {
             return Err(BundleError::compaction(
                 ErrorCode::InvalidCompact,
-                "the summary stopped at the output ceiling and is not complete; nothing was \
-                 compacted",
+                "the summary stopped before its own end (the output ceiling, a content filter, \
+                 or a reason this build does not know) and is not complete; nothing was compacted",
             ));
         }
         let summary = reply.text.trim().to_owned();
@@ -338,7 +339,7 @@ impl AgentRunner {
             ));
         }
         Ok(Reply {
-            truncated: assembled.finish == FinishReason::Length,
+            truncated: !super::stream::ended_itself(&assembled.finish),
             interrupted: false,
             text: assembled.text,
             usage: assembled.usage,

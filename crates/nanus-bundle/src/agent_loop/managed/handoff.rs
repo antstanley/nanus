@@ -44,9 +44,10 @@ fn unavailable(message: &'static str) -> BundleError {
 /// A response that asks for a tool is refused, and so is one whose text breaks the text rule or
 /// imitates a header field: the narrative is refused, never repaired.
 fn narrative_of(reply: &Assembled) -> Result<String, BundleError> {
-    if reply.finish == nanus_ports::FinishReason::Length {
+    if !crate::agent_loop::stream::ended_itself(&reply.finish) {
         return Err(unavailable(
-            "the handoff stopped at the output ceiling and is not complete",
+            "the handoff stopped before its own end (the output ceiling, a content filter, or a \
+             reason this build does not know) and is not complete",
         ));
     }
     if !reply.calls.is_empty() {

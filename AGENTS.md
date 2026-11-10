@@ -199,7 +199,8 @@ Contract to preserve:
   stderr.
 - **Exit code is meaningful:** `0` only for a completed turn, a clean interface
   exit, or a service that started; a failed run, an exhausted step budget, a turn cut
-  off at the model's token ceiling, or a `service status` with nothing listening is non-zero.
+  off at the model's token ceiling, a response a content filter stopped or that ended for a
+  reason this build does not know, or a `service status` with nothing listening is non-zero.
 - A bare `nanus` starts the interface when there is a terminal and prints usage when
   there is not. It never panics on a missing terminal.
 - **A `Done` frame means the session is already on disk.** The link server records
