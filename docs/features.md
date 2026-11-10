@@ -277,7 +277,9 @@ which one is in use.
 key: choosing it runs the device flow, files the token set under `openai:subscription`, and reaches
 the account through the **Responses API** — the items-shaped wire that backend speaks, with the
 grant's access token as the bearer, the account named in its own header, and an expired access token
-renewed from the refresh token rather than sent and refused.
+renewed from the refresh token rather than sent and refused. The check is made as each request
+leaves, not only at a start, so an agent that serves for longer than an access token lasts keeps
+working; the store is read again first, so a grant another nanus process renewed is used as it is.
 On the `api` plan, models from `gpt-5.6` on (read from the id's version, so a later model is
 covered) go to the Responses API too, chosen per request; older ids stay on chat completions. The
 plan starts on `gpt-6.1-sol` at `high` effort; a `reasoning_effort` in the configuration, or a
