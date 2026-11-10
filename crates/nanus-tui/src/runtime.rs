@@ -1684,10 +1684,9 @@ async fn event_loop(
                     continue;
                 };
                 view.now = clock.elapsed();
-                receive(frame, source, &mut view);
                 // Frames arrive in bursts — one per streamed fragment — and each redraw
                 // costs a full frame, so the queue is emptied before the next one.
-                drain_received(&mut frames, source, &mut view);
+                receive_burst(frame, &mut frames, source, &mut view);
             }
         }
         // A switch that failed left the connection following nothing, so the interface leaves
@@ -4393,6 +4392,24 @@ fn receive(frame: Frame, source: &mut dyn SessionSource, view: &mut ViewState) {
     if matches!(switch, Some(crate::maintenance::Switch::Clear { .. })) {
         request_context(ContextAction::Status, source, view);
     }
+}
+
+/// Applies a frame and every frame already waiting behind it, following the newest output once.
+///
+/// The burst is drawn once, so it is followed once: each streamed fragment asks the view to
+/// follow, and finding the bottom means laying out the text that just grew. Asked per frame,
+/// a burst of a few hundred fragments laid the same answer out a few hundred times for a
+/// screen nobody saw in between.
+fn receive_burst(
+    first: Frame,
+    frames: &mut mpsc::Receiver<Frame>,
+    source: &mut dyn SessionSource,
+    view: &mut ViewState,
+) {
+    view.begin_burst();
+    receive(first, source, view);
+    drain_received(frames, source, view);
+    view.end_burst();
 }
 
 /// Applies every frame already waiting, as [`receive`] applies one.
@@ -7921,6 +7938,48 @@ mod tests {
                 "the frame was followed to the bottom"
             );
         }
+    }
+
+    /// A burst of streamed fragments is applied whole and followed once, to the same place each
+    /// fragment's own follow would have reached — and a reader who scrolled away is left alone.
+    #[test]
+    fn a_burst_of_fragments_is_followed_once_to_the_bottom() {
+        let burst = |scrolled_up: bool| {
+            let (sender, mut receiver) = mpsc::channel::<Frame>(64);
+            let mut source = Scripted::new(Vec::new());
+            let mut view = ViewState::new();
+            for index in 0..200 {
+                view.transcript
+                    .push(Entry::prose(Role::User, format!("entry {index}")));
+            }
+            view.scroll_by(0, 20, 60);
+            view.scroll_to_bottom();
+            if scrolled_up {
+                view.scroll(-40);
+            }
+            let before = view.scroll_offset;
+            for index in 0..20 {
+                let delta = format!("paragraph {index}\n\n");
+                assert!(sender.try_send(Frame::Text { delta }).is_ok());
+            }
+            let first = receiver.try_recv().expect("a frame is waiting");
+            receive_burst(first, &mut receiver, &mut source, &mut view);
+            assert!(receiver.try_recv().is_err(), "the burst was drained");
+            let text = view.transcript.entries().last().map(Entry::text);
+            assert!(text.is_some_and(|text| text.contains("paragraph 19")));
+            (before, view.scroll_offset, view.max_scroll())
+        };
+
+        let (before, after, bottom) = burst(false);
+        assert_eq!(
+            after, bottom,
+            "a reader at the bottom is taken to the newest output"
+        );
+        assert!(after > before);
+
+        let (before, after, bottom) = burst(true);
+        assert_eq!(after, before, "a reader who scrolled away is not");
+        assert!(after < bottom);
     }
 
     #[test]

@@ -1385,6 +1385,25 @@ latest is parsed again, and a property test holds the cut rendering to the whole
 prefix of a set of awkward answers. Streaming a 4,000-token answer went from 68 million
 allocations and 3.9 GiB to about 400,000 and 28 MiB.
 
+A blank line is not the only place. An answer that is one long fence — a model writing a file —
+or one long list has none at the top level, and was all tail: every token rendered, and
+highlighted, the whole of it. So an answer is also cut **between two list items** and **at a
+line of code inside a fence**, each cut carrying how its part joins the one before: after a
+blank row, flush against an item, or as more of a fence, with the lexer's state at that line so
+a comment that spans the cut is still a comment. A fence is not cut beside an empty line of
+code, because a fence's body is read without the blank lines it ends on; a list is not cut
+after an item holding a `|`, which a separator row would turn into a table's header; and a
+`mermaid` fence drawn as a diagram is not cut, because a diagram is drawn from all of its
+source. A carriage return no longer stops the search — it used to, with every other control
+character, so an answer written with `\r\n` line ends was never cut. What is still all tail is
+a long table and a single long paragraph, whose rows depend on all of their text.
+
+**A burst of frames is followed once.** Each streamed fragment asks the view to follow the
+newest output, and finding the bottom lays out the text that just grew. The event loop applies
+every frame that is waiting before it draws, so it brackets them (`ViewState::begin_burst`,
+`end_burst`) and the view follows once, at the end, to the place each follow would have
+reached.
+
 The trade is residency for traffic. The view holds about 1.4 KiB per turn of measurements —
 146 KiB for a 100-turn session, where it used to hold nothing between frames — and in exchange
 no longer builds and holds every rendered line of the conversation, 1.6 MiB at 100 turns, on

@@ -6,6 +6,7 @@
 //! simply swallows the rest of the message as code, which is what a half-streamed code
 //! block looks like and is preferable to dropping it.
 
+use super::highlight::{Carry, Highlighter};
 use super::inline;
 use super::types::{Block, Marker};
 
@@ -14,7 +15,7 @@ pub(crate) fn parse(source: &str) -> Vec<Block> {
     let cleaned = inline::sanitize(source);
     let mut lines: Vec<&str> = cleaned.lines().collect();
     strip_frontmatter(&mut lines);
-    blocks_of(&lines)
+    blocks_from(&lines, 0)
         .into_iter()
         .map(|(_, block)| block)
         .collect()
@@ -27,10 +28,77 @@ pub(crate) fn parse(source: &str) -> Vec<Block> {
 pub(crate) fn parse_continued(source: &str) -> Vec<Block> {
     let cleaned = inline::sanitize(source);
     let lines: Vec<&str> = cleaned.lines().collect();
-    blocks_of(&lines)
+    blocks_from(&lines, 0)
         .into_iter()
         .map(|(_, block)| block)
         .collect()
+}
+
+/// Parses text that begins inside a fence opened with `marker`: the code up to the fence's
+/// close, and the blocks after it.
+///
+/// The code is read exactly as [`parse`] reads a fence's body, so the part of a fence drawn
+/// from here and the fence drawn whole hold the same lines.
+pub(crate) fn parse_in_fence(source: &str, marker: char) -> (String, Vec<Block>) {
+    let cleaned = inline::sanitize(source);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let (code, after) = read_code(&lines, 0, marker);
+    let blocks = blocks_from(&lines, after)
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect();
+    (code, blocks)
+}
+
+/// Reads a fence's opening line: its marker and its language.
+pub(crate) fn fence_at(line: &str) -> Option<(char, String)> {
+    fence_open(inline::sanitize(line).trim())
+}
+
+/// How the text after a cut joins the text before it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Joint {
+    /// After a blank line at the top level: the part is drawn as if a blank row preceded it.
+    Blank,
+    /// Straight after a list item: the part opens with the next item, with no row between.
+    Flush,
+    /// At the start of a line of code inside a fence.
+    Code {
+        /// The line the fence opens on, or `None` when it was already open where the text
+        /// being searched begins.
+        opener: Option<usize>,
+        /// What the lines of the fence before this one leave open for the lexer.
+        carry: Carry,
+    },
+}
+
+/// A line a streaming message could be cut at.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Point {
+    /// The line, as an index into the text that was searched.
+    pub(crate) line: usize,
+    /// How the text from this line on joins what came before.
+    pub(crate) joint: Joint,
+    /// The block the line starts, for the renderer to say whether it draws anything. `None`
+    /// inside a fence, where a line that is not empty always draws a row.
+    pub(crate) block: Option<Block>,
+}
+
+/// Where the text handed to [`cut_points`] begins.
+pub(crate) enum Resume<'a> {
+    /// At the start of a message.
+    Message,
+    /// At an earlier cut, at the top level.
+    Continued,
+    /// At an earlier cut inside a fence.
+    InFence {
+        /// The fence's marker.
+        marker: char,
+        /// Its language.
+        lang: &'a str,
+        /// The lexer's state at the cut.
+        carry: Carry,
+    },
 }
 
 /// The lines a streaming message could be cut at, in order, with the block each one starts.
@@ -49,28 +117,151 @@ pub(crate) fn parse_continued(source: &str) -> Vec<Block> {
 ///
 /// Found by the parser itself rather than by a second scan for fences, so the two cannot
 /// disagree about where a fence is.
-pub(crate) fn cut_points(source: &str, continued: bool) -> Vec<(usize, Block)> {
+///
+/// Two more places hold no state the text before them does not fix, and without them an answer
+/// that never has a blank line at the top level — a file written into a fence, a long list —
+/// was never cut at all, and every token rendered the whole of it again:
+///
+/// - **Between two list items.** An item is one line and is drawn without looking at what
+///   precedes it. The item before must hold no `|`, because a line with one becomes a table's
+///   header when a separator row arrives under it.
+/// - **At a line of code inside a fence**, when it and the line before it are not empty. Code
+///   is drawn a line at a time, and the lexer's state at the line is carried with the cut. The
+///   lines must not be empty because a fence's body is read without the blank lines it ends
+///   with: a part that ended on one would draw a row the whole would not. A `mermaid` fence
+///   drawn as a diagram is not cut — a diagram is drawn from all of its source.
+pub(crate) fn cut_points(source: &str, resume: &Resume<'_>, mermaid: bool) -> Vec<Point> {
     let cleaned = inline::sanitize(source);
     let lines: Vec<&str> = cleaned.lines().collect();
-    if !continued && lines.first().map(|line| line.trim()) == Some("+++") {
-        return Vec::new();
+    let mut points = Vec::new();
+    let (start, continued) = match *resume {
+        Resume::Message => {
+            if lines.first().map(|line| line.trim()) == Some("+++") {
+                return points;
+            }
+            (0, false)
+        }
+        Resume::Continued => (0, true),
+        Resume::InFence {
+            marker,
+            lang,
+            carry,
+        } => {
+            let fence = Fence {
+                marker,
+                lang,
+                opener: None,
+                carry,
+            };
+            (fence_points(&lines, 0, &fence, mermaid, &mut points), false)
+        }
+    };
+    let blocks = blocks_from(&lines, start);
+    let mut previous: Option<&(usize, Block)> = None;
+    for entry in &blocks {
+        let (line, block) = entry;
+        if let Some(joint) = joint_before(&lines, previous, block, continued) {
+            points.push(Point {
+                line: *line,
+                joint,
+                block: Some(block.clone()),
+            });
+        }
+        if let Block::Code { lang, .. } = block
+            && let Some((marker, _)) = lines.get(*line).and_then(|text| fence_open(text.trim()))
+        {
+            let fence = Fence {
+                marker,
+                lang,
+                opener: Some(*line),
+                carry: Carry::default(),
+            };
+            fence_points(&lines, line.saturating_add(1), &fence, mermaid, &mut points);
+        }
+        previous = Some(entry);
     }
-    let blocks = blocks_of(&lines);
-    let opening = blocks
-        .first()
-        .filter(|(_, block)| continued && !matches!(block, Block::Blank))
-        .cloned();
-    let after_blanks = blocks
-        .windows(2)
-        .filter(|pair| matches!(pair[0].1, Block::Blank) && !matches!(pair[1].1, Block::Blank))
-        .map(|pair| pair[1].clone());
-    opening.into_iter().chain(after_blanks).collect()
+    points
 }
 
-/// Parses lines into blocks, each with the index of the line it starts on.
-fn blocks_of(lines: &[&str]) -> Vec<(usize, Block)> {
+/// How a block joins the one before it, when it is somewhere a message can be cut.
+fn joint_before(
+    lines: &[&str],
+    previous: Option<&(usize, Block)>,
+    block: &Block,
+    continued: bool,
+) -> Option<Joint> {
+    if matches!(block, Block::Blank) {
+        return None;
+    }
+    match previous {
+        // The first block of text that resumes at a cut is itself a candidate: the cut it
+        // resumes at is the joint, and the caller already holds it.
+        None => continued.then_some(Joint::Blank),
+        Some((_, Block::Blank)) => Some(Joint::Blank),
+        Some((before, Block::Item { .. })) => {
+            let piped = lines.get(*before).is_some_and(|line| line.contains('|'));
+            (matches!(block, Block::Item { .. }) && !piped).then_some(Joint::Flush)
+        }
+        Some(_) => None,
+    }
+}
+
+/// A fence being searched for cuts.
+struct Fence<'a> {
+    marker: char,
+    lang: &'a str,
+    /// The line it opens on, or `None` when it was open before the text began.
+    opener: Option<usize>,
+    /// The lexer's state at its first line searched.
+    carry: Carry,
+}
+
+/// Adds the cuts inside a fence whose body starts at line `first`, returning the line after
+/// its close — or the number of lines, when it never closes.
+fn fence_points(
+    lines: &[&str],
+    first: usize,
+    fence: &Fence<'_>,
+    mermaid: bool,
+    points: &mut Vec<Point>,
+) -> usize {
+    let diagram = mermaid && fence.lang.eq_ignore_ascii_case("mermaid");
+    let mut highlighter = Highlighter::resumed(fence.lang, fence.carry);
+    let mut index = first;
+    while let Some(line) = lines.get(index) {
+        if is_fence_close(line.trim(), fence.marker) {
+            return index.saturating_add(1);
+        }
+        // The line before must be code that is not empty. A fence that was already open is
+        // searched from a cut, and a cut was only ever made after such a line.
+        let after_code = if index == first {
+            fence.opener.is_none()
+        } else {
+            index
+                .checked_sub(1)
+                .and_then(|before| lines.get(before))
+                .is_some_and(|before| !before.is_empty())
+        };
+        if !diagram && after_code && !line.is_empty() {
+            points.push(Point {
+                line: index,
+                joint: Joint::Code {
+                    opener: fence.opener,
+                    carry: highlighter.carry(),
+                },
+                block: None,
+            });
+        }
+        let _runs = highlighter.line(line);
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+/// Parses the lines from `start` into blocks, each with the index of the line it starts on.
+fn blocks_from(lines: &[&str], start: usize) -> Vec<(usize, Block)> {
     let mut blocks = Vec::new();
-    let mut index = 0_usize;
+    let mut index = start;
     while index < lines.len() {
         let (block, next) = block_at(lines, index);
         // Every block consumes at least the line it starts on, so the walk always ends.
