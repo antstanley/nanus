@@ -564,6 +564,44 @@ struct Held {
     approval_seq: Cell<u64>,
     /// When it was last used, for letting an idle session go.
     touched: Cell<u64>,
+    /// How many connections have opened this session and not yet attached to it.
+    ///
+    /// Counted by [`Opening`]. A session between being found and being watched is idle and
+    /// unwatched by every other measure, which is exactly what another connection's `hold`
+    /// lets go to make room — so it has to be told apart from one nobody wants.
+    opening: Cell<usize>,
+}
+
+/// A session a connection has opened and is about to attach to.
+///
+/// Opening awaits between finding the session and registering the viewer: the name is read
+/// back from the store, and a managed body is bound to its checkpoint. During those awaits the
+/// session had no viewer and no turn, so a second connection that needed room could let it go.
+/// The first was then attached to a session the agent no longer held — absent from every
+/// listing, loaded a second time by anyone who asked for it, the two copies writing one log —
+/// and its claim went with whichever copy was dropped first. While one of these exists the
+/// session is not a candidate, and it stops counting the moment it is dropped, attached or not.
+struct Opening(Rc<Held>);
+
+impl Opening {
+    /// Marks `held` as being opened. Call with no await since the session was found or held.
+    fn of(held: &Rc<Held>) -> Self {
+        held.opening.set(held.opening.get().saturating_add(1));
+        Self(Rc::clone(held))
+    }
+
+    /// The session being opened.
+    const fn held(&self) -> &Rc<Held> {
+        &self.0
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        let before = self.0.opening.get();
+        assert!(before > 0, "an opening that is ending was counted");
+        self.0.opening.set(before.saturating_sub(1));
+    }
 }
 
 impl Held {
@@ -617,6 +655,7 @@ impl Held {
             last_usage: Cell::new(None),
             seed: RefCell::new(seed),
             touched: Cell::new(touched),
+            opening: Cell::new(0),
         };
         held.refresh(&held.session.borrow());
         held
@@ -1168,9 +1207,9 @@ impl Registry {
     ///
     /// Returns a message when the store cannot be read, or nothing answers to the
     /// reference.
-    async fn open_reference(&self, reference: &str) -> Result<Rc<Held>, String> {
+    async fn open_reference(&self, reference: &str) -> Result<Opening, String> {
         if let Some(found) = self.get(&SessionId::new(reference)) {
-            return Ok(found);
+            return Ok(Opening::of(&found));
         }
         let named = match self.agent.store.resolve(reference).await {
             Ok(named) => named,
@@ -1178,14 +1217,9 @@ impl Registry {
         };
         let id = named.unwrap_or_else(|| SessionId::new(reference));
         if let Some(found) = self.get(&id) {
-            return Ok(found);
+            return Ok(Opening::of(&found));
         }
-        let session = self
-            .agent
-            .store
-            .load(&id)
-            .await
-            .map_err(|error| format!("{error}"))?;
+        let session = self.load_claimed(&id).await?;
         // What a person calls it, so a session resumed by id still shows the name it was
         // given. A name is a convenience, so an unreadable one is worth a line rather than
         // refusing to open the conversation at all.
@@ -1196,19 +1230,63 @@ impl Registry {
                 None
             }
         };
-        // A session this agent is not already holding has to be claimed, and a refusal here is
-        // another *agent* writing the same conversation: the reader's answer is to attach to
-        // that one rather than to start a second, so the message says so.
-        let held = self.hold(session, name).await.map_err(|error| {
-            format!(
-                "{error}; attach to it with `nanus tui --connect`, or stop the agent that holds it"
-            )
-        })?;
+        let held = match self.hold(session, name).await {
+            Ok(held) => held,
+            Err(error) => {
+                self.release_unheld(&id);
+                return Err(elsewhere(&error));
+            }
+        };
+        // Counted as being opened before anything else can run: `hold` returns without
+        // yielding once the session is in the map, and the binding below awaits.
+        let opening = Opening::of(&held);
         // A managed session is bound to its checkpoint under the claim just taken, and whatever
         // a crash left open is closed before anything can be asked of it. A session already held
         // was prepared when it was first held, and this does nothing for it.
         context::prepare(self, &held).await;
-        Ok(held)
+        Ok(opening)
+    }
+
+    /// Reads a session this agent is not holding, under the agent's claim on it.
+    ///
+    /// Claimed and *then* read. The copy an agent holds is the one every later turn is built on
+    /// and saved from, so it has to be the log as it stands once nobody else can write it: read
+    /// first, a writer that finished between the read and the claim had its turn overwritten by
+    /// the first save from the stale copy. The read before the claim is only the question of
+    /// whether the session exists — claiming creates the directory a claim lives in, and a
+    /// mistyped reference should not leave one behind.
+    ///
+    /// A refused claim is another *agent* writing the same conversation: the reader's answer is
+    /// to attach to that one rather than to start a second, so the message says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the session is not there, cannot be read, or is claimed elsewhere.
+    async fn load_claimed(&self, id: &SessionId) -> Result<Session, String> {
+        let store = &self.agent.store;
+        let _exists = store.load(id).await.map_err(|error| error.to_string())?;
+        store
+            .lock(id, &self.owner)
+            .await
+            .map_err(|error| elsewhere(&error.to_string()))?;
+        match store.load(id).await {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                self.release_unheld(id);
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// Gives back a claim taken for a session that was then not held.
+    ///
+    /// Only when nothing holds the session: a claim records a process rather than a holder, so
+    /// another connection that opened the same session in the meantime is relying on the very
+    /// claim this would release.
+    fn release_unheld(&self, id: &SessionId) {
+        if self.get(id).is_none() {
+            self.agent.store.release_lock(id);
+        }
     }
 
     /// Attaches a client to a session and returns the id it unsubscribes by.
@@ -1347,7 +1425,11 @@ impl Registry {
             let candidate = {
                 let held = self.held.borrow();
                 held.values()
-                    .filter(|entry| !entry.busy.get() && entry.viewers.borrow().is_empty())
+                    .filter(|entry| {
+                        !entry.busy.get()
+                            && entry.viewers.borrow().is_empty()
+                            && entry.opening.get() == 0
+                    })
                     .min_by_key(|entry| entry.touched.get())
                     .map(|entry| entry.id.clone())
             };
@@ -2246,6 +2328,11 @@ pub async fn serve(
     Ok(())
 }
 
+/// A refused claim's sentence, with what to do about it.
+fn elsewhere(refusal: &str) -> String {
+    format!("{refusal}; attach to it with `nanus tui --connect`, or stop the agent that holds it")
+}
+
 /// Subscribes this connection to a session it asked to open, or says why it could not.
 ///
 /// The two ways a connection acquires a session — `new` and `attach` — differ only in how
@@ -2254,10 +2341,12 @@ pub async fn serve(
 async fn watch_opened(
     registry: &Rc<Registry>,
     frames: &mpsc::Sender<Frame>,
-    opened: Result<Rc<Held>, String>,
+    opened: Result<Opening, String>,
 ) -> Option<(u64, Rc<Held>)> {
     let attached = match opened {
-        Ok(held) => attach(registry, &held, frames).await,
+        // Counted as being opened until the attachment has registered its viewer or given up,
+        // so the session cannot be let go as idle in between.
+        Ok(opening) => attach(registry, opening.held(), frames).await,
         Err(message) => Err(message),
     };
     match attached {
@@ -3135,7 +3224,7 @@ async fn answer_maintenance(
                     // cannot be let go as idle and unwatched in between.
                     release(watching);
                     drafts.borrow_mut().clear();
-                    let opened = Ok(Rc::clone(seeded.held()));
+                    let opened = Ok(Opening::of(seeded.held()));
                     *watching = watch_opened(registry, frames, opened).await;
                     drop(seeded);
                 }
@@ -3268,7 +3357,7 @@ async fn attach(
 ///
 /// The caller attaches; this only creates, and it creates *nothing* when the name is
 /// unusable or taken, so a refused name cannot leave an orphan conversation behind.
-async fn new_session_of(registry: &Rc<Registry>, name: Option<String>) -> Result<Rc<Held>, String> {
+async fn new_session_of(registry: &Rc<Registry>, name: Option<String>) -> Result<Opening, String> {
     // A name that is unusable or taken is refused *before* a session exists, so a refused
     // name cannot leave an orphan conversation behind. Usable first: the store answers "nobody
     // holds it" for a name it could never record, which reads as free, and the session was then
@@ -3297,6 +3386,9 @@ async fn new_session_of(registry: &Rc<Registry>, name: Option<String>) -> Result
         }
     }
     let held = registry.hold(session, name.clone()).await?;
+    // Counted as being opened from here, with no await since it was held: the naming below
+    // awaits the store, and so does the attachment the caller goes on to make.
+    let opening = Opening::of(&held);
     if let Some(asked) = name
         && let Err(error) = registry.agent.store.name(&id, &asked).await
     {
@@ -3304,13 +3396,14 @@ async fn new_session_of(registry: &Rc<Registry>, name: Option<String>) -> Result
         // it while this session was being written. The session exists only to carry the name,
         // so it goes with the refusal — let go first, because a deletion takes the claim.
         registry.held.borrow_mut().remove(&id);
+        drop(opening);
         drop(held);
         if let Err(removed) = registry.agent.store.delete(&id).await {
             tracing::warn!(%removed, "a session whose name was refused could not be removed");
         }
         return Err(error.to_string());
     }
-    Ok(held)
+    Ok(opening)
 }
 
 /// Starts a turn in a session, refusing a second one at the same time.
@@ -3595,6 +3688,52 @@ mod tests {
             })),
             String::from("a test agent"),
         ))
+    }
+
+    /// A session a connection has opened and not yet attached to is idle and unwatched, and is
+    /// still not let go when another connection needs room: the first connection is about to be
+    /// attached to it. Every other session is in use, which is what makes it the only candidate.
+    #[tokio::test]
+    async fn a_session_being_opened_is_not_let_go_to_make_room() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let registry = registry_over(dir.path()).await;
+        let mut watched = Vec::new();
+        for _ in 0..MAX_HELD_SESSIONS {
+            let opening = new_session_of(&registry, None).await.expect("a session");
+            let (frames, queue) = mpsc::channel(FRAME_BUFFER);
+            registry.view(opening.held(), &frames);
+            watched.push((frames, queue));
+        }
+
+        assert_eq!(watched.len(), MAX_HELD_SESSIONS, "every one of them is in use");
+
+        // Opened, and between being held and being watched — where an attachment awaits.
+        let opening = new_session_of(&registry, None).await.expect("a session");
+        let id = opening.held().id.clone();
+        let other = new_session_of(&registry, None)
+            .await
+            .expect("another session");
+        assert!(
+            registry.get(&id).is_some(),
+            "the session being opened is still the agent's"
+        );
+        assert!(
+            Rc::ptr_eq(&registry.get(&id).expect("held"), opening.held()),
+            "and it is the same one the connection was given"
+        );
+
+        // The other direction: an opening that was given up is an idle session like any other,
+        // and is what makes room next.
+        drop(opening);
+        let third = new_session_of(&registry, None)
+            .await
+            .expect("a third session");
+        assert!(
+            registry.get(&id).is_none(),
+            "a session nobody is opening or watching is let go"
+        );
+        assert!(registry.get(&other.held().id).is_some());
+        assert!(registry.get(&third.held().id).is_some());
     }
 
     /// The backlog is the turn in progress: everything a late client needs, in order, folded

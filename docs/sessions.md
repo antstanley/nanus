@@ -184,7 +184,9 @@ nanus: the name "nightly" already belongs to session 01a09a98-d8c4-73d7-b11d-638
 ```
 
 The name is claimed *before* the turn runs, so a refused name costs a sentence rather than
-a turn, and leaves no unnamed session behind as the evidence of it.
+a turn, and leaves no unnamed session behind as the evidence of it. A name that could never
+be recorded — blank, longer than 128 characters, or holding a control character — is refused
+at the same point, for the same reason.
 
 Renaming releases the old name:
 
@@ -369,8 +371,8 @@ it.
 
 The agent holds at most [`MAX_HELD_SESSIONS`](../crates/nanus-link/src/server.rs) open, and
 lets the least recently used *idle* one go when it needs room. The bound yields to the work:
-a session that is running a turn or has a client attached is never dropped, even if that
-means holding more. A session that is let go is still on disk, and attaching to it again
+a session that is running a turn, has a client attached, or is being opened by a connection
+that has not finished attaching is never dropped, even if that means holding more. A session that is let go is still on disk, and attaching to it again
 loads it.
 
 ## What travels over the link
@@ -457,6 +459,10 @@ each read back from the disk.
   holding a session and a connection racing to open the same one would be — are one claim
   rather than two, and the store answers a re-claim from the process that already has it.
   That is correct for the shipped agents, which are one per process.
+- **A session is read under its claim.** An agent and `nanus run --resume` both claim a session
+  and then read the copy they keep, so a writer that finished a moment earlier is in it. The
+  read before the claim only answers whether the session exists, so a mistyped reference does
+  not leave a claim's directory behind.
 - **No deletion in the interface.** `nanus sessions delete <ref>` removes a session and
   releases its name; the interface has no key for it yet, so a conversation is removed from
   the CLI rather than from the screen it is being read on.

@@ -2248,6 +2248,214 @@ fn a_session_that_was_never_held_is_loaded_from_the_store() {
     assert_eq!(attached.events, 1, "the stored log came with it");
 }
 
+/// A store in which another writer finishes a turn at the last possible moment: just before
+/// this agent's claim on the session is taken.
+///
+/// The interleaving that loses a turn, made a fact rather than a race. An agent that read the
+/// session before claiming it is holding the copy from before that write, and its first save
+/// puts the older log back.
+struct LateWriterStore {
+    /// The store that does the reading and writing.
+    inner: StoreHandle,
+    /// What the other writer saves, once, as the claim is asked for.
+    late: std::cell::RefCell<Option<Session>>,
+}
+
+impl StorePort for LateWriterStore {
+    fn save<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.save(session)
+    }
+
+    fn load<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Session>> {
+        self.inner.load(id)
+    }
+
+    fn list(
+        &self,
+    ) -> futures::future::LocalBoxFuture<
+        '_,
+        nanus_ports::StoreResult<Vec<nanus_ports::SessionSummary>>,
+    > {
+        self.inner.list()
+    }
+
+    fn delete<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.delete(id)
+    }
+
+    fn name<'a>(
+        &'a self,
+        id: &'a SessionId,
+        name: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        self.inner.name(id, name)
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Option<SessionId>>> {
+        self.inner.resolve(name)
+    }
+
+    fn name_of<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<Option<String>>> {
+        self.inner.name_of(id)
+    }
+
+    fn home(
+        &self,
+    ) -> futures::future::LocalBoxFuture<'_, nanus_ports::StoreResult<std::path::PathBuf>> {
+        self.inner.home()
+    }
+
+    fn lock<'a>(
+        &'a self,
+        id: &'a SessionId,
+        owner: &'a str,
+    ) -> futures::future::LocalBoxFuture<'a, nanus_ports::StoreResult<()>> {
+        Box::pin(async move {
+            let late = self.late.borrow_mut().take();
+            if let Some(session) = late {
+                self.inner.save(&session).await?;
+            }
+            self.inner.lock(id, owner).await
+        })
+    }
+
+    fn release_lock(&self, id: &SessionId) {
+        self.inner.release_lock(id);
+    }
+}
+
+/// The session an agent holds is the log as it stands once the agent has claimed it, not as it
+/// stood a moment before: a writer that finished between the two keeps its turn.
+#[test]
+fn a_turn_written_just_before_the_claim_is_in_the_session_the_agent_holds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let inner = nanus_kernel::runtime::block_on(async {
+        JsonlStore::new(dir.path().to_path_buf())
+            .await
+            .expect("the store opens")
+            .handle()
+    });
+    let mut session = Session::new(SessionId::new("contended"), 1, "/work");
+    session.append(SessionEvent::UserMessage {
+        content_blocks: None,
+        text: "the first turn".to_owned(),
+    });
+    nanus_kernel::runtime::block_on(inner.save(&session)).expect("save");
+    // What the other writer adds while this agent is between reading and claiming.
+    let mut later = session.clone();
+    later.append(SessionEvent::UserMessage {
+        content_blocks: None,
+        text: "the turn that used to be lost".to_owned(),
+    });
+    let store: StoreHandle = Rc::new(Box::new(LateWriterStore {
+        inner: inner.clone(),
+        late: std::cell::RefCell::new(Some(later)),
+    }));
+    let (agent, _store) = agent_with_store(
+        dir.path(),
+        Rc::new(Box::new(ScriptedLlm)),
+        "scripted",
+        store,
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (attached, frames) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let attached = client.attach("contended").await.expect("loads by id");
+        // And a turn on top of it, saved from the copy the agent holds.
+        client
+            .send(&Request::Prompt {
+                text: "carry on".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        let frames = turn_frames(&mut client).await;
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        (attached, frames)
+    });
+
+    assert_eq!(
+        attached.events, 2,
+        "the agent holds the log as it stood under its claim"
+    );
+    assert_eq!(answer_of(&frames), Some("hello back"));
+    let stored = nanus_kernel::runtime::block_on(inner.load(&SessionId::new("contended")))
+        .expect("the session loads");
+    let said: Vec<&str> = stored
+        .log()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::UserMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        said,
+        vec![
+            "the first turn",
+            "the turn that used to be lost",
+            "carry on"
+        ],
+        "the other writer's turn survives this agent's save"
+    );
+}
+
+/// Claiming comes before the read that is kept, but not before knowing there is something to
+/// claim: a reference to nothing is refused without a session directory appearing for it.
+#[test]
+fn a_reference_to_nothing_is_refused_without_leaving_a_directory_behind() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, _store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let refused = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let refused = client.attach("mistyped").await;
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        refused
+    });
+
+    assert!(matches!(refused, Err(LinkError::Agent(_))), "{refused:?}");
+    assert!(
+        !dir.path().join("sessions").join("mistyped").exists(),
+        "nothing was created for a session that does not exist"
+    );
+}
+
 /// A session another live agent is writing is refused, naming the holder.
 ///
 /// The agent claims every session it holds, so this is what a second `nanus tui --resume`
