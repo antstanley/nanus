@@ -143,11 +143,21 @@ impl AgentRunner {
                 call.id, result.call_id,
                 "a result answers the call it names"
             );
+            let is_error = !result.outcome.is_success();
+            let content = super::render_content(result.outcome.content());
+            // The result is finished with here, so its blocks go into the record rather than a
+            // copy of them.
+            let (nanus_domain::ToolOutcome::Success {
+                content: blocks, ..
+            }
+            | nanus_domain::ToolOutcome::Failure {
+                content: blocks, ..
+            }) = result.outcome;
             session.append(SessionEvent::ToolResult {
-                content: super::render_content(result.outcome.content()),
-                content_blocks: Some(result.outcome.content().to_vec()),
+                content,
+                content_blocks: Some(blocks),
                 call_id: result.call_id,
-                is_error: !result.outcome.is_success(),
+                is_error,
             });
         }
     }

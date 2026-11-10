@@ -296,10 +296,22 @@ pub fn estimate_tail(tail: &str) -> u32 {
 pub fn fit_with(
     messages: Vec<Message>,
     budget: u32,
-    cost: impl FnMut(&[Message], Option<&str>) -> u32,
+    mut cost: impl FnMut(&[Message], Option<&str>) -> u32,
 ) -> Result<Fitted, FitError> {
-    let source: std::sync::Arc<[Message]> = messages.into();
-    fit_with_source(&source, budget, cost)
+    // The conversation that fits whole is the ordinary case, asked once per step, and it is
+    // answered without copying anything: the messages the caller handed over are the result.
+    // It is exactly the first candidate the search below would try — every turn kept, no notice
+    // — so the answer is the same and only the copy of the whole history is saved.
+    let whole = cost(&messages, None);
+    if whole <= budget {
+        return Ok(Fitted {
+            messages,
+            elision: None,
+        });
+    }
+    // The search is told what the whole conversation cost, so each candidate is still costed
+    // exactly once.
+    search(&messages, budget, cost, Some(whole))
 }
 
 /// Fits a borrowed immutable source without deleting the original history.
@@ -311,7 +323,19 @@ pub fn fit_with(
 pub fn fit_with_source(
     messages: &[Message],
     budget: u32,
+    cost: impl FnMut(&[Message], Option<&str>) -> u32,
+) -> Result<Fitted, FitError> {
+    search(messages, budget, cost, None)
+}
+
+/// The search both entry points share. `whole` is the cost of the untrimmed conversation when the
+/// caller has already measured it, so the first candidate — which is that conversation — is not
+/// measured a second time.
+fn search(
+    messages: &[Message],
+    budget: u32,
     mut cost: impl FnMut(&[Message], Option<&str>) -> u32,
+    whole: Option<u32>,
 ) -> Result<Fitted, FitError> {
     let head = leading_prompt(messages);
     let tail = &messages[head..];
@@ -319,7 +343,7 @@ pub fn fit_with_source(
     if turns.is_empty() {
         // No human turn at all: there is nothing to drop and nothing to answer, so the only
         // question is whether the prompt itself fits.
-        let estimated = cost(messages, None);
+        let estimated = whole.unwrap_or_else(|| cost(messages, None));
         if estimated > budget {
             return Err(FitError::TooLarge { estimated, budget });
         }
@@ -339,7 +363,11 @@ pub fn fit_with_source(
             (dropped_messages > 0).then(|| notice_for(dropped_messages, turns_dropped, budget));
         let mut candidate: Vec<Message> = messages[..head].to_vec();
         candidate.extend_from_slice(kept);
-        let kept_tokens = cost(&candidate, notice.as_deref());
+        // With nothing dropped the candidate is the whole conversation and carries no notice.
+        let kept_tokens = match whole {
+            Some(whole) if dropped_turns == 0 => whole,
+            _ => cost(&candidate, notice.as_deref()),
+        };
         if kept_tokens <= budget {
             let elision = notice.map(|_| Elision {
                 dropped_messages,
@@ -774,6 +802,39 @@ mod tests {
         let under_one = exact(1, 1);
         assert_eq!(dropped(under_one, 0), Some(2));
         assert_eq!(dropped(under_one, -1), Some(1));
+    }
+
+    /// The owning entry point answers a conversation that fits without searching, and that
+    /// answer is the one the search gives: the two agree at every budget from "everything
+    /// fits" down to "only the newest turn does", and refuse together below that.
+    #[test]
+    fn the_owning_fit_and_the_borrowing_search_agree_at_every_budget() {
+        let messages = conversation(6, 400);
+        let cost = |messages: &[Message], tail: Option<&str>| {
+            estimate(messages).saturating_add(tail.map_or(0, estimate_tail))
+        };
+        let whole = fits_everything(&messages);
+        let part = |divisor: u32| whole.checked_div(divisor).unwrap_or(0);
+        let mut budgets = vec![whole, whole.saturating_sub(1), part(2), part(4), 1];
+        budgets.push(u32::MAX);
+        let (mut fitted_whole, mut trimmed, mut refused) = (0, 0, 0);
+        for budget in budgets {
+            let owned = fit_with(messages.clone(), budget, cost);
+            let searched = fit_with_source(&messages, budget, cost);
+            assert_eq!(owned, searched, "budget {budget}");
+            match owned {
+                Ok(fitted) if fitted.elision.is_none() => {
+                    assert_eq!(fitted.messages, messages);
+                    fitted_whole += 1;
+                }
+                Ok(_) => trimmed += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        assert!(
+            fitted_whole > 0 && trimmed > 0 && refused > 0,
+            "every outcome is exercised"
+        );
     }
 
     /// The same input gives the same answer, which is what makes two runs comparable.
