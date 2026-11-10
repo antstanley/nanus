@@ -217,18 +217,20 @@ pub fn derive_effective_context(
         .into_iter()
         .map(|(_, message)| message)
         .collect();
-    let users = |messages: &[Message]| {
-        messages
-            .iter()
-            .filter(|message| matches!(message, Message::User { .. }))
-            .count()
-    };
-    let before = users(&session.derive_messages());
-    assert_eq!(
-        users(&messages),
-        before,
-        "managed selection keeps every user message"
-    );
+    // Counted off the log rather than off a second fold: every user event becomes exactly one
+    // user message, so the events are the count a fold with nothing hidden would give, without
+    // cloning the whole conversation again to learn it.
+    let asked = session
+        .log()
+        .events()
+        .iter()
+        .filter(|event| matches!(event, SessionEvent::UserMessage { .. }))
+        .count();
+    let kept = messages
+        .iter()
+        .filter(|message| matches!(message, Message::User { .. }))
+        .count();
+    assert_eq!(kept, asked, "managed selection keeps every user message");
 
     let memory_text = render_memory(selection, goal);
     let anchor = messages
