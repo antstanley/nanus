@@ -293,3 +293,37 @@ fn context_projection_cannot_change_pixels_or_split_a_human_turn() {
     assert!(nanus_domain::context::identify_projection(&source, &changed, None, 100).is_err());
     assert!(nanus_domain::context::identify_projection(&source, &source, None, 100).is_ok());
 }
+
+/// The check that keeps typed user content out of an old body reads the raw line, and skips a
+/// line that cannot be carrying the field. A key spelled with escapes is still the field to the
+/// typed parser, so it must not be what the skip lets through.
+#[test]
+fn typed_user_content_spelled_with_escapes_is_still_refused_in_an_old_body() {
+    let plain = session(None).try_to_jsonl().unwrap();
+    for old in [1, 2, 3] {
+        let raw = version(&plain, old);
+        let smuggled = raw.replacen(
+            r#""text":"display only""#,
+            r#""text":"display only","content_blocks":null"#,
+            1,
+        );
+        assert_ne!(smuggled, raw, "the fixture carries the escaped key");
+        assert!(Session::from_jsonl(&smuggled).is_err(), "version {old}");
+    }
+}
+
+/// The other direction: a line that only *mentions* the field, or carries an escape for some
+/// other reason, is an ordinary line and loads as what it says.
+#[test]
+fn an_old_body_that_only_mentions_typed_content_still_loads() {
+    let mut mentions = Session::new(SessionId::new("direct-input"), 123, "/fictional");
+    mentions.append(SessionEvent::UserMessage {
+        text: "why is content_blocks null in the replay? \u{1} \\u005f".into(),
+        content_blocks: None,
+    });
+    let raw = mentions.try_to_jsonl().unwrap();
+    for old in [1, 2, 3] {
+        let restored = Session::from_jsonl(&version(&raw, old)).unwrap();
+        assert_eq!(restored.derive_messages(), mentions.derive_messages());
+    }
+}

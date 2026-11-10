@@ -2288,6 +2288,18 @@ fn validate_body_version(version: u32, line: &str, number: u64) -> Result<(), Se
     if version >= SESSION_FORMAT_VERSION_USER_CONTENT {
         return Ok(());
     }
+    // Nearly every stored body is below version 4, and parsing each of its lines a second time
+    // into a generic value doubled what a load cost. A line can only break the rule below by
+    // carrying one of two keys, so a line that cannot be spelling either is not parsed again.
+    // A key can be spelled with escapes (`content\u005fblocks`) and the typed parser would
+    // still read it as the field, so any line with a `\u` escape is parsed too: the test errs
+    // toward parsing, never away from it.
+    let may_carry = ["content_blocks", "replay", "\\u"]
+        .iter()
+        .any(|needle| line.contains(needle));
+    if !may_carry {
+        return Ok(());
+    }
     let value: Value =
         serde_json::from_str(line).map_err(|error| SessionError::MalformedEvent {
             line: number,
