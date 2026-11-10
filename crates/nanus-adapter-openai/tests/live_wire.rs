@@ -387,3 +387,109 @@ fn the_subscription_speaks_the_responses_api() {
         "the stream ends with a reason: {collected:?}"
     );
 }
+
+/// Runs one Responses request against `server`, returning every event.
+fn collect_responses(server: &Server) -> Vec<LlmEvent> {
+    let mut config = nanus_adapter_openai::OpenAiConfig::with_base_url(
+        nanus_adapter_openai::Vendor::OpenAi,
+        "gpt-5.3-codex",
+        "access-token",
+        &server.base_url,
+    );
+    config.set_protocol(nanus_adapter_openai::Protocol::Responses);
+    let llm = nanus_adapter_openai::OpenAiLlm::new(config).expect("the adapter builds");
+    let request = ChatRequest::new("gpt-5.3-codex", vec![Message::user("hi")]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let mut events = Vec::new();
+        let mut stream = llm.stream_chat(request);
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        events
+    })
+}
+
+/// Asserts that `events` finish without claiming a stop, and without an error.
+fn assert_unterminated(events: &[LlmEvent]) {
+    assert!(
+        matches!(events.last(), Some(LlmEvent::Finished {
+            reason: nanus_ports::FinishReason::Unknown(reason)
+        }) if reason == nanus_ports::UNTERMINATED),
+        "the stream still finishes, and says nobody ended it: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Error(_))),
+        "a closed socket is not an error on the ordinary path: {events:?}"
+    );
+}
+
+/// A body that ends cleanly with no finish reason and no sentinel simply stopped arriving, on
+/// either wire. The ordinary path still finishes such a stream, as it always has, but it used
+/// to report a `Stop` the provider never sent, which made half a reply indistinguishable from
+/// a whole one. The reason now says so.
+#[test]
+fn a_body_that_ends_with_no_finish_reason_does_not_claim_a_stop() {
+    let chat = spawn_server(
+        200,
+        &frame(r#"{"choices":[{"delta":{"content":"half an"}}]}"#),
+    );
+    let events = collect(nanus_adapter_openai::Vendor::OpenAi, &chat, "gpt-4.1");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::TextDelta(text) if text == "half an")),
+        "what arrived is still shown: {events:?}"
+    );
+    assert_unterminated(&events);
+
+    let responses = spawn_server(
+        200,
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"half an\"}\n\n",
+    );
+    assert_unterminated(&collect_responses(&responses));
+}
+
+/// The other direction, and the behaviour that must not move: neither wire needs the sentinel,
+/// so a body that said it was over and then simply closed is a whole answer.
+#[test]
+fn a_body_that_said_it_was_over_needs_no_sentinel() {
+    let mut body = frame(r#"{"choices":[{"delta":{"content":"whole"}}]}"#);
+    body.push_str(&frame(
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ));
+    let chat = spawn_server(200, &body);
+    let events = collect(nanus_adapter_openai::Vendor::OpenAi, &chat, "gpt-4.1");
+    assert!(
+        matches!(
+            events.last(),
+            Some(LlmEvent::Finished {
+                reason: nanus_ports::FinishReason::Stop
+            })
+        ),
+        "{events:?}"
+    );
+
+    let responses = spawn_server(
+        200,
+        concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"whole\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        ),
+    );
+    let events = collect_responses(&responses);
+    assert!(
+        matches!(
+            events.last(),
+            Some(LlmEvent::Finished {
+                reason: nanus_ports::FinishReason::Stop
+            })
+        ),
+        "{events:?}"
+    );
+}

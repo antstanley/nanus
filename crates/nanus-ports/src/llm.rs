@@ -680,6 +680,17 @@ pub enum LlmError {
 /// The result type for adapter internals that fail before a stream starts.
 pub type LlmResult<T> = Result<T, LlmError>;
 
+/// The finish reason of a response whose body ended without the provider naming one.
+///
+/// A response says it is over in its own vocabulary — a finish reason, a stop event, the
+/// transport's sentinel. On the ordinary path a closed socket also ends a response, and has
+/// always closed it as a finished one; what it must not do is *invent* the reason. A body that
+/// ended having named none is reported as [`FinishReason::Unknown`] carrying this word, rather
+/// than as a clean `Stop`, so a caller can tell an answer the provider finished from one that
+/// simply stopped arriving — a gateway that gave up on its upstream, a connection closed
+/// between two frames.
+pub const UNTERMINATED: &str = "unterminated";
+
 /// Renders a short, human-readable excerpt of an error response body.
 ///
 /// Providers wrap the useful sentence in JSON, so the excerpt is the

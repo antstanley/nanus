@@ -91,6 +91,11 @@ fn finish(accumulator: &mut Decoder, terminal: bool, limits: Option<ResponseLimi
     }
     if limits.is_some() && !terminal {
         accumulator.fail("malformed stream: response ended without protocol termination".into());
+    } else if limits.is_none() && !terminal {
+        // The ordinary path takes a closed socket as the end of a response — a server need not
+        // send the sentinel — and still finishes it. What it does not do is call the ending a
+        // clean stop when the provider never named one.
+        accumulator.close_unterminated();
     } else {
         accumulator.close();
     }

@@ -108,7 +108,8 @@ pub use fs::{
 pub use llm::{
     ChatRequest, FinishReason, LlmError, LlmEvent, LlmHandle, LlmPort, LlmResult, LlmStream,
     ManagedRequest, ManagedSupport, OVERSIZED_ARGUMENTS, PreparedModelCall, PromptCacheRetention,
-    ReasoningEffort, ToolArgumentLimits, ToolCallAssembler, error_body_snippet, truncate_chars,
+    ReasoningEffort, ToolArgumentLimits, ToolCallAssembler, UNTERMINATED, error_body_snippet,
+    truncate_chars,
 };
 pub use nanus_domain::{ApprovalOutcome, ApprovalPolicy, SandboxMode, ToolAccess};
 pub use record_admission::{

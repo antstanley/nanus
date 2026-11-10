@@ -349,3 +349,76 @@ fn a_provider_error_is_reported_with_its_message() {
         "{events:?}"
     );
 }
+
+/// A body that ends cleanly before any stop reason simply stopped arriving. The ordinary path
+/// still finishes such a stream, as it always has, but it used to report an `end_turn` the
+/// provider never sent, which made half a reply indistinguishable from a whole one. The reason
+/// now says so, and what arrived before it is still delivered.
+#[test]
+fn a_body_that_ends_before_any_stop_reason_does_not_claim_a_stop() {
+    let mut body = String::new();
+    body.push_str(&event(
+        "message_start",
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#,
+    ));
+    body.push_str(&event(
+        "content_block_start",
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+    ));
+    body.push_str(&event(
+        "content_block_delta",
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an"}}"#,
+    ));
+    let server = spawn_server(200, &body);
+    let events = collect(&server);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::TextDelta(text) if text == "half an")),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(LlmEvent::Finished {
+            reason: nanus_ports::FinishReason::Unknown(reason)
+        }) if reason == nanus_ports::UNTERMINATED),
+        "the stream still finishes, and says nobody ended it: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Error(_))),
+        "a closed socket is not an error on the ordinary path: {events:?}"
+    );
+}
+
+/// The other direction: a response that named its stop reason is over, whether or not the
+/// `message_stop` that follows it arrived before the socket closed.
+#[test]
+fn a_body_that_named_its_stop_reason_is_whole_without_message_stop() {
+    let mut body = String::new();
+    body.push_str(&event(
+        "content_block_delta",
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"whole"}}"#,
+    ));
+    body.push_str(&event(
+        "message_delta",
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+    ));
+    let server = spawn_server(200, &body);
+    let events = collect(&server);
+    assert!(
+        matches!(
+            events.last(),
+            Some(LlmEvent::Finished {
+                reason: nanus_ports::FinishReason::Stop
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Error(_))),
+        "{events:?}"
+    );
+}
