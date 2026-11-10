@@ -549,7 +549,7 @@ this build offers.
 | ----------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | `provider`              | `deepseek`                        | `deepseek`, `zai`, `anthropic`, `openai`, `inception`                                                                     |
 | `plan`                  | the provider's default            | `api`, `coding` (z.ai), `subscription` (OpenAI, authorized with OAuth)                                                    |
-| `base_url`              | the plan's endpoint               | an override, for a proxy or a gateway                                                                                     |
+| `base_url`              | the plan's endpoint               | an override, for a proxy or a gateway It belongs to the `provider` and `plan` written beside it: a switch to another one — live, or remembered at the next start — uses that one's own endpoint, so its key is never posted here. |
 | `model`                 | the plan's or provider's default  | any id the provider serves                                                                                                |
 | `max_tokens`            | the model's output ceiling        | per-response budget, capped at the model's ceiling                                                                        |
 | `reasoning_effort`      | the plan's default, then `medium` | `minimal`, `low`, `medium`, `high`                                                                                        |

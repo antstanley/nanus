@@ -43,6 +43,7 @@ use nanus_ports::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 use crate::error::BundleError;
+use crate::provider::{DEFAULT_PLAN, DEFAULT_PROVIDER};
 
 /// The file, inside the nanus home, that remembers the last selection by default.
 pub const SELECTION_FILE: &str = "selection.toml";
@@ -185,14 +186,38 @@ impl LastSelection {
     /// model to the new host, which is a refused request rather than a substitution. A record
     /// with a model and no provider — one a future build wrote, or a person edited — moves only
     /// the model.
+    ///
+    /// The configuration's `base_url` goes the same way as the plan and the model, and for a
+    /// stronger reason: it is where the *file's* provider and plan are reached, so keeping it
+    /// under a remembered provider would post that provider's key to the other one's gateway.
+    /// It survives only when the record names the provider and plan the file already resolves
+    /// to — a `/model` or `/effort` change, which never moved the endpoint — and is otherwise
+    /// dropped, which is what the switch that wrote the record did while it was live.
     pub fn apply(&self, config: &mut NanusConfig) {
         if let Some(provider) = &self.provider {
+            if !Self::same_route(config, provider, self.plan.as_deref()) {
+                config.base_url = None;
+            }
             config.provider = Some(provider.clone());
             config.plan.clone_from(&self.plan);
             config.model.clone_from(&self.model);
         } else if self.model.is_some() {
             config.model.clone_from(&self.model);
         }
+    }
+
+    /// Returns whether `provider` and `plan` are the ones `config` already resolves to.
+    ///
+    /// Absent means the default on both sides, exactly as [`crate::Selection::resolve`] reads
+    /// it, so a file that names no plan and a record that names `api` are the same route.
+    #[must_use]
+    pub fn same_route(config: &NanusConfig, provider: &str, plan: Option<&str>) -> bool {
+        let configured_provider = config
+            .provider
+            .as_deref()
+            .unwrap_or_else(|| DEFAULT_PROVIDER.name());
+        let configured_plan = config.plan.as_deref().unwrap_or(DEFAULT_PLAN);
+        configured_provider == provider && configured_plan == plan.unwrap_or(DEFAULT_PLAN)
     }
 
     /// Returns the remembered effort, when it names a step on the scale.
@@ -264,6 +289,75 @@ mod tests {
         assert_eq!(config.provider.as_deref(), Some("openai"));
         assert_eq!(config.plan.as_deref(), Some("subscription"));
         assert_eq!(config.model.as_deref(), Some("gpt-5.3-codex"));
+    }
+
+    /// The endpoint is the file's provider's. A record that names another provider must not
+    /// leave it in force, or that provider's key is posted to the first one's gateway.
+    #[test]
+    fn a_remembered_provider_does_not_keep_the_files_endpoint() {
+        let gateway = || NanusConfig {
+            provider: Some(String::from("openai")),
+            base_url: Some(String::from("https://gateway.invalid/v1")),
+            ..NanusConfig::default()
+        };
+        let record = |provider: &str, plan: Option<&str>| LastSelection {
+            provider: Some(provider.to_owned()),
+            plan: plan.map(str::to_owned),
+            model: None,
+            effort: None,
+        };
+
+        let mut other_provider = gateway();
+        record("anthropic", Some("api")).apply(&mut other_provider);
+        assert_eq!(other_provider.base_url, None, "another provider");
+
+        // A plan is a different host and, for these two, a different credential account.
+        let mut other_plan = gateway();
+        record("openai", Some("subscription")).apply(&mut other_plan);
+        assert_eq!(other_plan.base_url, None, "another plan");
+
+        // The default provider is a provider too: a file that names none is `deepseek`.
+        let mut unnamed = NanusConfig {
+            base_url: Some(String::from("https://gateway.invalid/v1")),
+            ..NanusConfig::default()
+        };
+        record("zai", None).apply(&mut unnamed);
+        assert_eq!(unnamed.base_url, None, "away from the default provider");
+    }
+
+    /// The other direction: a record of a `/model` or `/effort` change names the provider and
+    /// plan the file already has, and the gateway the file chose is still where it goes.
+    #[test]
+    fn a_record_of_the_files_own_provider_and_plan_keeps_its_endpoint() {
+        let mut config = NanusConfig {
+            provider: Some(String::from("openai")),
+            base_url: Some(String::from("https://gateway.invalid/v1")),
+            ..NanusConfig::default()
+        };
+        let selection = LastSelection {
+            provider: Some(String::from("openai")),
+            // The file names no plan and the record names the default one: the same route.
+            plan: Some(String::from("api")),
+            model: Some(String::from("gpt-6-luna")),
+            effort: None,
+        };
+        selection.apply(&mut config);
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://gateway.invalid/v1")
+        );
+        assert_eq!(config.model.as_deref(), Some("gpt-6-luna"));
+
+        // A record with no provider moves only the model, so it cannot move the endpoint.
+        let model_only = LastSelection {
+            model: Some(String::from("gpt-6-astra")),
+            ..LastSelection::default()
+        };
+        model_only.apply(&mut config);
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://gateway.invalid/v1")
+        );
     }
 
     #[test]

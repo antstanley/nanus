@@ -651,8 +651,9 @@ impl ProviderSwitch {
     /// Rebuilds the model adapter for `provider` and `plan`, and points the runner at it.
     ///
     /// Returns the model ids the new provider offers. The startup configuration's other fields are
-    /// carried over, and its provider, plan, model, and endpoint are overwritten: a switch names a
-    /// provider, not a whole configuration, so everything else has to stay what the file said.
+    /// carried over, and its provider, plan, and model are overwritten: a switch names a provider,
+    /// not a whole configuration, so everything else has to stay what the file said. Its endpoint
+    /// stays with the provider and plan it was written for, and goes with neither of them.
     ///
     /// # Errors
     ///
@@ -664,13 +665,7 @@ impl ProviderSwitch {
         provider: Provider,
         plan: Option<&str>,
     ) -> Result<Vec<String>, BundleError> {
-        let mut config = self.config.clone();
-        config.provider = Some(provider.name().to_owned());
-        config.plan = plan.map(str::to_owned);
-        // The model and the endpoint belong to the provider being left, so they are dropped and
-        // resolved afresh: a DeepSeek id sent to OpenAI is a refused request, not a substitution.
-        config.model = None;
-        config.base_url = None;
+        let config = switched_config(&self.config, provider, plan);
         let selection = Selection::resolve(&config)?;
         let credential = resolve_credential(&self.secrets, &selection).await?;
         let llm = build_llm(&config, &selection, &credential)?;
@@ -690,6 +685,28 @@ impl ProviderSwitch {
         *self.selection.borrow_mut() = selection;
         Ok(self.models())
     }
+}
+
+/// Returns the configuration a switch to `provider` and `plan` is resolved from.
+///
+/// The model belongs to the provider being left, so it is dropped and resolved afresh: a
+/// `DeepSeek` id sent to `OpenAI` is a refused request, not a substitution.
+///
+/// The endpoint the configuration names is where *its* provider and plan are reached, so it is
+/// kept only for a switch that lands on that same pair — choosing the provider already in force,
+/// or coming back to it — and dropped for any other, where it would carry the new provider's key
+/// to the old one's gateway. Dropping it for the same pair was the mirror of that mistake: a key
+/// issued by a gateway went to the provider's own host.
+fn switched_config(startup: &NanusConfig, provider: Provider, plan: Option<&str>) -> NanusConfig {
+    let mut config = startup.clone();
+    // Asked before the fields it compares are overwritten.
+    if !LastSelection::same_route(startup, provider.name(), plan) {
+        config.base_url = None;
+    }
+    config.provider = Some(provider.name().to_owned());
+    config.plan = plan.map(str::to_owned);
+    config.model = None;
+    config
 }
 
 /// Builds the record of what a session created here is being run under.
@@ -1468,6 +1485,82 @@ mod tests {
             "the root everything is confined to is absolute: {}",
             root.display()
         );
+    }
+
+    /// A configuration that sends `openai` through a gateway, as a proxy or an aggregator is used.
+    fn through_a_gateway() -> NanusConfig {
+        NanusConfig {
+            provider: Some(String::from("openai")),
+            base_url: Some(String::from("https://gateway.invalid/v1")),
+            ..NanusConfig::default()
+        }
+    }
+
+    /// The whole path a start takes: the record a provider change left is read, and the endpoint
+    /// that comes out is the remembered provider's own — not the gateway the file wrote for a
+    /// different one, which is where that provider's key would otherwise be posted.
+    #[test]
+    fn a_start_from_a_remembered_provider_does_not_post_to_the_files_gateway() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("selection.toml");
+        LastSelection {
+            provider: Some(String::from("anthropic")),
+            plan: Some(String::from("api")),
+            model: Some(String::from("claude-sonnet-5-5")),
+            effort: None,
+        }
+        .save_to(&file)
+        .expect("the record is written");
+
+        let mut config = through_a_gateway();
+        let _effort = apply_remembered(&mut config, Some(&file));
+        let selection = Selection::resolve(&config).expect("resolves");
+        assert_eq!(selection.provider(), Provider::Anthropic);
+        assert_eq!(selection.credential_account(), "anthropic");
+        assert_eq!(
+            selection.endpoint(),
+            nanus_adapter_anthropic::DEFAULT_BASE_URL,
+            "the key filed under `anthropic` goes to Anthropic"
+        );
+
+        // The pair: with no record the file is the whole answer, gateway included.
+        let mut untouched = through_a_gateway();
+        let _effort = apply_remembered(&mut untouched, None);
+        let selection = Selection::resolve(&untouched).expect("resolves");
+        assert_eq!(selection.endpoint(), "https://gateway.invalid/v1");
+    }
+
+    /// A live switch follows the same rule in both directions: away from the file's provider the
+    /// gateway is left behind, and onto it — choosing it again, or coming back — the gateway is
+    /// still where its key goes, rather than the provider's own host.
+    #[test]
+    fn a_switch_keeps_the_gateway_only_for_the_provider_and_plan_it_was_written_for() {
+        let startup = through_a_gateway();
+
+        let away = switched_config(&startup, Provider::Anthropic, None);
+        let selection = Selection::resolve(&away).expect("resolves");
+        assert_eq!(
+            selection.endpoint(),
+            nanus_adapter_anthropic::DEFAULT_BASE_URL
+        );
+
+        let other_plan = switched_config(&startup, Provider::OpenAi, Some("subscription"));
+        let selection = Selection::resolve(&other_plan).expect("resolves");
+        assert_eq!(
+            selection.endpoint(),
+            nanus_adapter_openai::OPENAI_SUBSCRIPTION_BASE_URL
+        );
+
+        for plan in [None, Some("api")] {
+            let same = switched_config(&startup, Provider::OpenAi, plan);
+            let selection = Selection::resolve(&same).expect("resolves");
+            assert_eq!(
+                selection.endpoint(),
+                "https://gateway.invalid/v1",
+                "{plan:?}"
+            );
+            assert_eq!(same.model, None, "the model is still resolved afresh");
+        }
     }
 
     #[test]
