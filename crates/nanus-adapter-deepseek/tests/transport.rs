@@ -18,6 +18,9 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use nanus_adapter_deepseek::{DeepSeekConfig, DeepSeekLlm, MODEL_FLASH};
@@ -142,7 +145,13 @@ fn a_server_that_answers(body: &'static str) -> String {
 
 /// Drives one request to the end of its stream and returns every event.
 async fn every_event(base_url: &str) -> Vec<LlmEvent> {
-    let config = DeepSeekConfig::with_base_url(MODEL_FLASH, "test-key", base_url);
+    every_event_within(base_url, nanus_ports::HttpTimeouts::default()).await
+}
+
+/// Drives one request, bounded by `timeouts`, to the end of its stream.
+async fn every_event_within(base_url: &str, timeouts: nanus_ports::HttpTimeouts) -> Vec<LlmEvent> {
+    let mut config = DeepSeekConfig::with_base_url(MODEL_FLASH, "test-key", base_url);
+    config.set_timeouts(timeouts);
     let llm = DeepSeekLlm::new(config).expect("the adapter builds");
     let request = ChatRequest::new(MODEL_FLASH, vec![Message::user("hi")]);
     let mut stream = llm.stream_chat(request);
@@ -205,5 +214,148 @@ async fn a_body_that_named_its_finish_reason_needs_no_sentinel() {
             .iter()
             .any(|event| matches!(event, LlmEvent::Error(_))),
         "{events:?}"
+    );
+}
+
+/// Serves one connection: the head, `first`, a pause of `silence`, then `rest`, and closes.
+///
+/// The body is declared at its whole length, so a client that stops waiting during the pause
+/// has stopped on its own deadline rather than at an end of body.
+fn a_server_that_pauses(first: &'static str, silence: Duration, rest: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let address = listener.local_addr().expect("the bound address");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             content-length: {}\r\n\
+             connection: close\r\n\r\n",
+            first.len().saturating_add(rest.len())
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(first.as_bytes());
+        let _ = stream.flush();
+        std::thread::sleep(silence);
+        let _ = stream.write_all(rest.as_bytes());
+        let _ = stream.flush();
+    });
+    format!("http://{address}")
+}
+
+/// The first half of an answer, and the half that finishes it.
+const FIRST_HALF: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n";
+const SECOND_HALF: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"content\":\" two\"},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// A provider that goes silent part-way through a response used to hold the turn for ever: no
+/// byte, no error, and nothing but an interrupt to end it. The silence is bounded now, and the
+/// failure says that a wait ran out and where.
+#[tokio::test]
+async fn a_response_that_goes_silent_is_given_up_on() {
+    let base_url = a_server_that_pauses(FIRST_HALF, Duration::from_secs(5), SECOND_HALF);
+    let timeouts =
+        nanus_ports::HttpTimeouts::new(Duration::from_secs(5), Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let events = every_event_within(&base_url, timeouts).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the adapter stopped waiting before the server spoke again"
+    );
+    let Some(LlmEvent::Error(message)) = events.last() else {
+        panic!("the silence is reported: {events:?}");
+    };
+    assert!(message.contains("timed out"), "{message}");
+    assert_names(message, &base_url);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Finished { .. })),
+        "{events:?}"
+    );
+}
+
+/// The other direction: the bound is on a silence, not on the response. A pause shorter than
+/// it — a model thinking between two frames — changes nothing.
+#[tokio::test]
+async fn a_pause_shorter_than_the_bound_is_only_a_pause() {
+    let base_url = a_server_that_pauses(FIRST_HALF, Duration::from_millis(300), SECOND_HALF);
+    let timeouts = nanus_ports::HttpTimeouts::new(Duration::from_secs(5), Duration::from_secs(5));
+    let events = every_event_within(&base_url, timeouts).await;
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "one two");
+    assert!(
+        matches!(events.last(), Some(LlmEvent::Finished { .. })),
+        "{events:?}"
+    );
+}
+
+/// Accepts connections for ever and counts them, answering nothing.
+///
+/// What a redirect would be followed to: a connection here is the request having left the
+/// endpoint it was built for.
+fn a_host_that_counts_its_visitors() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let address = listener.local_addr().expect("the bound address");
+    let visits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&visits);
+    std::thread::spawn(move || {
+        while listener.accept().is_ok() {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (format!("http://{address}"), visits)
+}
+
+/// Serves one connection with `status` and a `location` header naming `target`.
+fn a_server_that_answers_with(status: u16, target: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let address = listener.local_addr().expect("the bound address");
+    let head = format!(
+        "HTTP/1.1 {status} Elsewhere\r\n\
+         location: {target}/chat/completions\r\n\
+         content-length: 0\r\n\
+         connection: close\r\n\r\n"
+    );
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.flush();
+    });
+    format!("http://{address}")
+}
+
+/// A `307` asks the client to post the same body — the whole conversation — somewhere else. It
+/// is not followed: the request stays with the endpoint it was built for, and the redirect is
+/// reported as the status it is.
+#[tokio::test]
+async fn a_redirect_is_reported_rather_than_followed() {
+    let (elsewhere, visits) = a_host_that_counts_its_visitors();
+    let base_url = a_server_that_answers_with(307, &elsewhere);
+    let events = every_event(&base_url).await;
+    let Some(LlmEvent::Error(message)) = events.last() else {
+        panic!("the redirect is reported: {events:?}");
+    };
+    assert!(message.contains("307"), "{message}");
+    assert_eq!(
+        visits.load(Ordering::SeqCst),
+        0,
+        "nothing was sent to the redirect's target"
     );
 }

@@ -32,6 +32,26 @@ const DEFAULT_INTERVAL_SECS: u64 = 5;
 /// The least the service's own interval is respected as.
 const MIN_INTERVAL_SECS: u64 = 1;
 
+/// How long one request to the authorization service may take, connection included.
+///
+/// These are small exchanges with no stream to wait on, so the bound is on the whole request. A
+/// renewal runs inside a model request and before a start, and a service that accepted the
+/// connection and never answered would otherwise hold either for ever.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Builds the client the authorization service is reached through.
+///
+/// No redirect is followed: every request here carries a grant in its body — a device code, a
+/// verifier, a refresh token — and a `307` would have the client post it again to another host.
+fn http_client(deadline: Duration) -> Result<reqwest::Client, OAuthError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(nanus_ports::timeouts::DEFAULT_CONNECT_TIMEOUT.min(deadline))
+        .timeout(deadline)
+        .build()
+        .map_err(|error| OAuthError::Transport(error.to_string()))
+}
+
 /// Why the authorization could not be started or completed.
 #[derive(Debug, thiserror::Error)]
 pub enum OAuthError {
@@ -212,15 +232,13 @@ struct TokenResponse {
 /// Returns [`OAuthError`] when the HTTP client cannot be built, the service cannot be reached, or it
 /// refuses the device request.
 pub async fn begin(issuer: &str) -> Result<Pending, OAuthError> {
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+    let client = http_client(REQUEST_DEADLINE)?;
     let response = client
         .post(format!("{issuer}/api/accounts/deviceauth/usercode"))
         .json(&serde_json::json!({ "client_id": CLIENT_ID }))
         .send()
         .await
-        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+        .map_err(|error| OAuthError::Transport(nanus_ports::error_chain(&error)))?;
     if !response.status().is_success() {
         return Err(OAuthError::Status(response.status().as_u16()));
     }
@@ -263,7 +281,7 @@ pub async fn poll(pending: &Pending) -> Result<Option<Tokens>, OAuthError> {
         }))
         .send()
         .await
-        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+        .map_err(|error| OAuthError::Transport(nanus_ports::error_chain(&error)))?;
     let status = response.status();
     if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -308,7 +326,7 @@ async fn exchange(
         ]))
         .send()
         .await
-        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+        .map_err(|error| OAuthError::Transport(nanus_ports::error_chain(&error)))?;
     if !response.status().is_success() {
         return Err(OAuthError::Status(response.status().as_u16()));
     }
@@ -363,9 +381,15 @@ fn percent_encode(value: &str, out: &mut String) {
 /// Returns [`OAuthError`] when the service cannot be reached or refuses the grant, which means the
 /// authorization is gone and the user must complete the flow again.
 pub async fn refresh(issuer: &str, tokens: &Tokens) -> Result<Tokens, OAuthError> {
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+    refresh_through(&http_client(REQUEST_DEADLINE)?, issuer, tokens).await
+}
+
+/// [`refresh`], through a client the caller built — which is how its deadline is tested.
+async fn refresh_through(
+    client: &reqwest::Client,
+    issuer: &str,
+    tokens: &Tokens,
+) -> Result<Tokens, OAuthError> {
     let response = client
         .post(format!("{issuer}/oauth/token"))
         .header(
@@ -379,7 +403,7 @@ pub async fn refresh(issuer: &str, tokens: &Tokens) -> Result<Tokens, OAuthError
         ]))
         .send()
         .await
-        .map_err(|error| OAuthError::Transport(error.to_string()))?;
+        .map_err(|error| OAuthError::Transport(nanus_ports::error_chain(&error)))?;
     if !response.status().is_success() {
         return Err(OAuthError::Status(response.status().as_u16()));
     }
@@ -616,6 +640,107 @@ mod tests {
         assert!(rendered.contains("expires_at"), "{rendered}");
         assert!(rendered.contains("acct-1"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// Serves one connection with `response` after reading the request, returning the issuer
+    /// to point a client at. `None` holds the connection open and never answers.
+    fn an_issuer_that_answers(response: Option<String>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("the bound address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            match response {
+                Some(response) => {
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                // Long enough to outlast any deadline a test sets, short enough to end.
+                None => std::thread::sleep(Duration::from_secs(5)),
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// A grant with a refresh token and an access token that has run out.
+    fn expired() -> Tokens {
+        Tokens {
+            access_token: String::from("old-access"),
+            refresh_token: String::from("refresh-1"),
+            id_token: String::new(),
+            expires_at: Some(1),
+            account_id: Some(String::from("acct-1")),
+        }
+    }
+
+    /// Runs one renewal through a client with `deadline`.
+    fn renew_within(issuer: &str, deadline: Duration) -> Result<Tokens, OAuthError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let client = http_client(deadline)?;
+            refresh_through(&client, issuer, &expired()).await
+        })
+    }
+
+    /// A renewal that the service answers yields the new access token, and keeps the refresh
+    /// token and the account when the answer rotates neither.
+    #[test]
+    fn a_renewal_the_service_answers_yields_the_new_access_token() {
+        let body = r#"{"access_token":"new-access","expires_in":3600}"#;
+        let issuer = an_issuer_that_answers(Some(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )));
+        let renewed = renew_within(&issuer, Duration::from_secs(5)).expect("renews");
+        assert_eq!(renewed.access_token, "new-access");
+        assert_eq!(renewed.refresh_token, "refresh-1");
+        assert_eq!(renewed.account_id.as_deref(), Some("acct-1"));
+        assert!(!renewed.is_expired(Duration::from_secs(60)));
+    }
+
+    /// The other direction: a service that takes the connection and never answers is given up
+    /// on. A renewal runs before a start and inside a model request, and with no deadline
+    /// either would wait on it for ever.
+    #[test]
+    fn a_renewal_the_service_never_answers_is_given_up_on() {
+        let issuer = an_issuer_that_answers(None);
+        let started = std::time::Instant::now();
+        let outcome = renew_within(&issuer, Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let Err(OAuthError::Transport(message)) = outcome else {
+            panic!("the wait is reported as a transport failure: {outcome:?}");
+        };
+        assert!(message.contains("timed out"), "{message}");
+    }
+
+    /// A redirect from the authorization service is the status it is: following it would post
+    /// the refresh token to another host.
+    #[test]
+    fn a_renewal_is_not_followed_to_another_host() {
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        elsewhere.set_nonblocking(true).expect("non-blocking");
+        let target = elsewhere.local_addr().expect("the bound address");
+        let issuer = an_issuer_that_answers(Some(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{target}/oauth/token\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        )));
+        let outcome = renew_within(&issuer, Duration::from_secs(2));
+        assert!(
+            matches!(outcome, Err(OAuthError::Status(307))),
+            "{outcome:?}"
+        );
+        assert!(
+            elsewhere.accept().is_err(),
+            "nothing connected to the redirect's target"
+        );
     }
 
     /// Test-side base64url, independent of the decoder under test.

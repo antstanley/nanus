@@ -680,6 +680,27 @@ pub enum LlmError {
 /// The result type for adapter internals that fail before a stream starts.
 pub type LlmResult<T> = Result<T, LlmError>;
 
+/// Renders an error with every cause beneath it, outermost first.
+///
+/// An HTTP client's own sentence is often only the outer layer — "error decoding response
+/// body" — with the fact a reader needs, that the wait timed out, one cause down. Rendering
+/// the chain is what makes a deadline that fired say so. A cause that only repeats the layer
+/// above it is skipped.
+#[must_use]
+pub fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut cause = error.source();
+    while let Some(inner) = cause {
+        let text = inner.to_string();
+        if !text.is_empty() && !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        cause = inner.source();
+    }
+    rendered
+}
+
 /// The finish reason of a response whose body ended without the provider naming one.
 ///
 /// A response says it is over in its own vocabulary — a finish reason, a stop event, the
