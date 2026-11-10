@@ -211,7 +211,14 @@ impl LocalFs {
 
     /// Reads a file and counts its lines.
     fn read_blocking(&self, path: &Path) -> FsResult<FileRead> {
-        let resolved = self.resolve(path)?;
+        Self::read_resolved(self.resolve(path)?)
+    }
+
+    /// Reads a file whose path has already been confined.
+    ///
+    /// Separate from [`Self::read_blocking`] so an edit, which has to resolve the path to
+    /// write it back, does not resolve it a second time to read it.
+    fn read_resolved(resolved: PathBuf) -> FsResult<FileRead> {
         let bytes = read_checked(&resolved)?;
         let text = String::from_utf8(bytes).map_err(|_| FsError::Io {
             path: resolved.clone(),
@@ -283,7 +290,7 @@ impl LocalFs {
         replace_all: bool,
     ) -> FsResult<EditOutcome> {
         let resolved = self.resolve(path)?;
-        let before = self.read_blocking(path)?.text;
+        let before = Self::read_resolved(resolved.clone())?.text;
         let count = occurrence_count(&before, old);
         let replacements = check_edit_count(&resolved, count, replace_all)?;
         let after = if replace_all {
@@ -325,8 +332,14 @@ impl LocalFs {
         Ok(entries)
     }
 
-    /// Walks the tree, excluding version-control metadata.
-    fn walk(root: &Path, include_hidden: bool) -> Vec<PathBuf> {
+    /// Walks the tree in path order, excluding version-control metadata.
+    ///
+    /// Lazily: a file is yielded as the walk reaches it, so a search that fills its cap stops
+    /// reading directories there. Collecting and sorting the whole tree first made every
+    /// search pay for the largest directory in the workspace, whatever it was looking for.
+    /// Sorting each directory by name as it is opened gives the same order a sort of the full
+    /// paths would, because a path compares component by component.
+    fn walk(root: &Path, include_hidden: bool) -> impl Iterator<Item = PathBuf> {
         let walker = WalkBuilder::new(root)
             .hidden(!include_hidden)
             .ignore(false)
@@ -336,17 +349,14 @@ impl LocalFs {
             .parents(false)
             .require_git(false)
             .filter_entry(|entry| !is_vcs_dir(entry.path()))
+            .sort_by_file_name(Ord::cmp)
             .build();
-        let mut files: Vec<PathBuf> = Vec::new();
-        for entry in walker.flatten() {
-            // `flatten` drops per-entry errors: an unreadable corner of the tree
-            // is skipped, not fatal to the search.
-            if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                files.push(entry.into_path());
-            }
-        }
-        files.sort_unstable();
-        files
+        // `flatten` drops per-entry errors: an unreadable corner of the tree
+        // is skipped, not fatal to the search.
+        walker
+            .flatten()
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(ignore::DirEntry::into_path)
     }
 
     /// Searches by glob or by literal substring.
@@ -602,13 +612,28 @@ enum SearchText {
 }
 
 /// Reads a file for content search, classifying the ones that cannot be searched.
+///
+/// The leading bytes are read and sniffed before the rest: most of what a search passes over
+/// is binary, and reading a megabyte of object file to look at its first eight kilobytes is
+/// the larger part of what a search of a build directory costs.
 fn text_for_search(path: &Path) -> SearchText {
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(mut file) = File::open(path) else {
         return SearchText::Unreadable;
     };
-    let sniff = bytes.get(..BINARY_SNIFF).unwrap_or(&bytes);
-    if sniff.contains(&0) {
+    let mut bytes: Vec<u8> = Vec::with_capacity(BINARY_SNIFF);
+    let sniff = u64::try_from(BINARY_SNIFF).unwrap_or(u64::MAX);
+    if file.by_ref().take(sniff).read_to_end(&mut bytes).is_err() {
+        return SearchText::Unreadable;
+    }
+    assert!(
+        bytes.len() <= BINARY_SNIFF,
+        "the sniff reads a bounded prefix"
+    );
+    if bytes.contains(&0) {
         return SearchText::Binary;
+    }
+    if file.read_to_end(&mut bytes).is_err() {
+        return SearchText::Unreadable;
     }
     String::from_utf8(bytes).map_or(SearchText::Binary, SearchText::Text)
 }
@@ -627,12 +652,14 @@ fn collect_literal(
     outcome: &mut SearchOutcome,
 ) -> bool {
     for (index, line) in text.lines().enumerate() {
-        let haystack = if query.case_sensitive {
-            line.to_owned()
+        // The case-sensitive search compares the line where it lies; only folding needs a
+        // copy, and this loop runs once for every line of every file searched.
+        let found = if query.case_sensitive {
+            line.contains(needle)
         } else {
-            line.to_lowercase()
+            line.to_lowercase().contains(needle)
         };
-        if !haystack.contains(needle) {
+        if !found {
             continue;
         }
         if outcome.matches.len() >= query.max_results {

@@ -439,6 +439,73 @@ async fn binary_files_are_skipped_without_error() {
     );
 }
 
+/// The walk yields files as it reaches them rather than sorting the whole tree first, so the
+/// order has to be the one a sort of the full paths gives — including where a directory and
+/// a file share a prefix, which is where a per-directory order and a string order differ.
+#[tokio::test]
+async fn a_search_reports_files_in_path_order_and_a_cap_keeps_the_first_of_them() {
+    let (dir, fs) = workspace();
+    for path in [
+        "a/z.txt",
+        "a.b/c.txt",
+        "a-b/c.txt",
+        "a.txt",
+        "b.txt",
+        "a/b/c.txt",
+    ] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(full, "needle\n").expect("seed");
+    }
+    let all = fs
+        .search(&SearchQuery::glob(".", "**/*.txt"))
+        .await
+        .expect("search");
+    let found: Vec<_> = all.matches.iter().map(|found| found.path.clone()).collect();
+    let mut sorted = found.clone();
+    sorted.sort();
+    assert_eq!(found.len(), 6);
+    assert_eq!(found, sorted, "matches come back in path order");
+
+    let mut capped = SearchQuery::literal(".", "needle");
+    capped.max_results = 2;
+    let outcome = fs.search(&capped).await.expect("search");
+    let first: Vec<_> = outcome
+        .matches
+        .iter()
+        .map(|found| found.path.clone())
+        .collect();
+    assert_eq!(first, sorted.get(..2).expect("two paths"));
+    assert!(outcome.truncated, "the third file's match was dropped");
+    assert_eq!(
+        outcome.files_scanned, 3,
+        "the walk stopped at the file that hit the cap"
+    );
+}
+
+/// A file is sniffed before it is read in full. Both sides of that: a file whose first bytes
+/// say binary is passed over, and a text file longer than the sniff is still searched to its
+/// end.
+#[tokio::test]
+async fn a_match_past_the_sniffed_prefix_is_found_and_a_binary_prefix_is_skipped() {
+    let (dir, fs) = workspace();
+    let mut text = "filler line\n".repeat(2_000);
+    text.push_str("the needle is here\n");
+    std::fs::write(dir.path().join("long.txt"), &text).expect("seed");
+    let mut binary = vec![0_u8; 16];
+    binary.extend_from_slice(text.as_bytes());
+    std::fs::write(dir.path().join("object.bin"), &binary).expect("seed");
+    let outcome = fs
+        .search(&SearchQuery::literal(".", "needle"))
+        .await
+        .expect("search");
+    assert_eq!(outcome.matches.len(), 1);
+    assert_eq!(outcome.matches[0].line_number, 2_001);
+    assert!(outcome.matches[0].path.ends_with("long.txt"));
+    assert_eq!(outcome.skipped_binary, 1);
+    assert_eq!(outcome.files_scanned, 1);
+}
+
 #[tokio::test]
 async fn vcs_metadata_is_never_searched() {
     let (dir, fs) = workspace();
