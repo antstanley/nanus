@@ -370,6 +370,7 @@ impl JsonlStore {
         write_claim(&file, &body, &path)?;
         locks.insert(id.clone(), file);
         drop(locks);
+        sweep_stale_temps(&dir);
         Ok(())
     }
 
@@ -1214,34 +1215,102 @@ fn invalid_id(raw: &str, reason: &str) -> StoreError {
 }
 
 /// Writes `body` to `path` atomically: temp file, fsync, rename.
+///
+/// A failure at any step removes the temporary file. It was never under the real name, so the
+/// previous file is intact either way; what removal saves is the disk. The failure this is most
+/// likely to be is a full disk, and a save that left its partial copy behind each time it
+/// failed would take what room was left.
 async fn write_atomic(path: &Path, body: &str) -> StoreResult<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temp = temp_path(path);
-    {
-        let mut file = fs::File::create(&temp)
-            .await
-            .map_err(|source| io_error(&temp, &source))?;
-        file.write_all(body.as_bytes())
-            .await
-            .map_err(|source| io_error(&temp, &source))?;
-        // Tokio's last write runs in the background until it is flushed, and only the flush
-        // reports its error: without it a full disk leaves a short file that syncs cleanly.
-        file.flush()
-            .await
-            .map_err(|source| io_error(&temp, &source))?;
-        // fsync before the rename is what makes the rename a commit rather than a
-        // hope: without it a crash can leave a zero-length file under the real name.
-        file.sync_all()
-            .await
-            .map_err(|source| io_error(&temp, &source))?;
-    }
-    if let Err(source) = fs::rename(&temp, path).await {
-        if fs::remove_file(&temp).await.is_ok() {
-            tracing::debug!(temp = %temp.display(), "discarded the temporary file");
+    let staged = stage(&temp, body).await;
+    settle(&temp, path, staged).await
+}
+
+/// Writes and syncs the temporary file.
+async fn stage(temp: &Path, body: &str) -> std::io::Result<()> {
+    let mut file = fs::File::create(temp).await?;
+    file.write_all(body.as_bytes()).await?;
+    // Tokio's last write runs in the background until it is flushed, and only the flush
+    // reports its error: without it a full disk leaves a short file that syncs cleanly.
+    file.flush().await?;
+    // fsync before the rename is what makes the rename a commit rather than a
+    // hope: without it a crash can leave a zero-length file under the real name.
+    file.sync_all().await
+}
+
+/// Renames a staged temporary file over `path`, or removes it when staging or the rename
+/// failed.
+///
+/// Separate from the staging so the failure path can be exercised without a disk that fails
+/// on demand.
+async fn settle(temp: &Path, path: &Path, staged: std::io::Result<()>) -> StoreResult<()> {
+    let failure = match staged {
+        Ok(()) => match fs::rename(temp, path).await {
+            Ok(()) => return Ok(()),
+            Err(source) => io_error(path.parent().unwrap_or_else(|| Path::new(".")), &source),
+        },
+        Err(source) => io_error(temp, &source),
+    };
+    match fs::remove_file(temp).await {
+        Ok(()) => tracing::debug!(temp = %temp.display(), "discarded the temporary file"),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            tracing::warn!(%source, temp = %temp.display(), "a temporary file remains");
         }
-        return Err(io_error(parent, &source));
     }
-    Ok(())
+    Err(failure)
+}
+
+/// How old a temporary file must be before a claim sweeps it.
+///
+/// A temporary file lives for one write, which is milliseconds. An hour is long past any write
+/// still in flight, including one by a process that does not hold the claim — naming a session
+/// needs none — so nothing a live writer is about to rename is ever taken from under it.
+const TEMP_STALE_AFTER: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Whether `name` is a temporary file [`temp_path`] made: `.<file>.<pid>.<seq>.tmp`.
+fn is_temp_name(name: &str) -> bool {
+    let Some(inner) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = inner.rsplitn(3, '.');
+    let numeric = |part: Option<&str>| {
+        part.is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    numeric(parts.next())
+        && numeric(parts.next())
+        && parts.next().is_some_and(|file| !file.is_empty())
+}
+
+/// Removes the temporary files a crashed writer left in a session directory.
+///
+/// A crash between creating a temporary file and renaming it leaves the file for good: no
+/// later write reuses its name, since the name carries the dead writer's pid and counter. Called
+/// when a session is claimed, which is the moment before it is written again. Best effort,
+/// because a file that cannot be removed costs disk and nothing else.
+fn sweep_stale_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_temp_name) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= TEMP_STALE_AFTER);
+        if stale {
+            sink::remove_quietly(&entry.path());
+        }
+    }
 }
 
 /// Builds a unique sibling temp path for `path`.
@@ -1278,6 +1347,55 @@ mod tests {
         // same answer: not an id.
         assert!(decode_id("%zz").is_none());
         assert!(decode_id("%ff").is_none());
+    }
+
+    /// A save that fails before its rename takes its temporary file with it, and the file it
+    /// was replacing is untouched.
+    #[tokio::test]
+    async fn a_write_that_fails_before_its_rename_removes_its_temporary_file() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "previous").unwrap_or_else(|error| panic!("plant: {error}"));
+        let temp = temp_path(&path);
+        std::fs::write(&temp, "half of the n").unwrap_or_else(|error| panic!("plant: {error}"));
+
+        let full = Err(std::io::Error::other("no space left on device"));
+        let outcome = settle(&temp, &path, full).await;
+
+        assert!(matches!(outcome, Err(StoreError::Io { .. })));
+        assert!(!temp.exists(), "the partial copy is removed");
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("previous")
+        );
+    }
+
+    /// The other direction: a staged file becomes the real one, and no temporary remains.
+    #[tokio::test]
+    async fn a_staged_write_replaces_the_file_and_leaves_no_temporary() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "previous").unwrap_or_else(|error| panic!("plant: {error}"));
+
+        let written = write_atomic(&path, "next").await;
+
+        assert!(written.is_ok());
+        assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), Some("next"));
+        let left = std::fs::read_dir(dir.path()).map_or(0, Iterator::count);
+        assert_eq!(left, 1, "only the file itself");
+    }
+
+    /// Only this store's own temporary names are swept: a dot-file somebody else left, and the
+    /// session's own files, are not.
+    #[test]
+    fn only_a_name_this_store_gives_a_temporary_file_is_one() {
+        assert!(is_temp_name(".session.jsonl.4242.7.tmp"));
+        assert!(is_temp_name(".name.1.0.tmp"));
+        assert!(!is_temp_name("session.jsonl"));
+        assert!(!is_temp_name(".session.jsonl.tmp"));
+        assert!(!is_temp_name(".session.jsonl.pid.7.tmp"));
+        assert!(!is_temp_name("..1.2.tmp"));
+        assert!(!is_temp_name(".notes.tmp"));
     }
 
     /// The other direction: an ordinary id survives the round trip, so the refusal above is

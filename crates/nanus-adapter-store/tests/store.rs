@@ -1072,7 +1072,10 @@ async fn a_log_filed_under_another_sessions_id_is_refused_rather_than_loaded_as_
 
     // Loading the copy used to hand back a session whose id was the original's, so the claim
     // and the save that followed went to the original and replaced it.
-    let error = store.load(&copy).await.expect_err("a misfiled log is refused");
+    let error = store
+        .load(&copy)
+        .await
+        .expect_err("a misfiled log is refused");
     assert_corrupt(error, "original");
     // The other direction: the session filed under its own id still loads, untouched.
     assert_eq!(store.load(original.id()).await.expect("load"), original);
@@ -1108,4 +1111,74 @@ async fn a_misfiled_log_has_no_identity_a_checkpoint_could_extend() {
         Err(StoreError::Corrupt { .. })
     ));
     assert!(store.stored_identity(original.id()).await.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Temporary files a crashed writer left behind.
+// ---------------------------------------------------------------------------
+
+/// Plants a file in a session's directory and dates it `age` in the past.
+fn plant_aged(store: &JsonlStore, id: &SessionId, name: &str, age: std::time::Duration) {
+    let path = store.session_dir(id).expect("dir").join(name);
+    std::fs::write(&path, b"{ truncated").expect("plant");
+    let then = std::time::SystemTime::now()
+        .checked_sub(age)
+        .expect("a time in the past");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("open")
+        .set_modified(then)
+        .expect("date");
+}
+
+#[tokio::test]
+async fn claiming_a_session_sweeps_the_temporary_files_a_crashed_writer_left() {
+    let (_dir, store) = store().await;
+    let written = session("swept", 5, &["x"]);
+    store.save(&written).await.expect("save");
+    let day = std::time::Duration::from_hours(24);
+    plant_aged(&store, written.id(), ".session.jsonl.999.0.tmp", day);
+    plant_aged(&store, written.id(), ".name.999.1.tmp", day);
+
+    store.lock(written.id(), "a writer").await.expect("claim");
+
+    let dir = store.session_dir(written.id()).expect("dir");
+    assert!(!dir.join(".session.jsonl.999.0.tmp").exists());
+    assert!(!dir.join(".name.999.1.tmp").exists());
+    assert_eq!(store.load(written.id()).await.expect("load"), written);
+    store.release_lock(written.id());
+}
+
+#[tokio::test]
+async fn a_sweep_leaves_a_write_in_flight_and_every_file_that_is_not_a_temporary() {
+    let (_dir, store) = store().await;
+    let written = session("kept", 5, &["x"]);
+    store.save(&written).await.expect("save");
+    store.name(written.id(), "kept-name").await.expect("name");
+    let day = std::time::Duration::from_hours(24);
+    // A temporary file young enough to belong to a writer that is about to rename it, and an
+    // old file that merely looks hidden: neither is this store's to remove.
+    plant_aged(
+        &store,
+        written.id(),
+        ".name.999.2.tmp",
+        std::time::Duration::from_secs(1),
+    );
+    plant_aged(&store, written.id(), ".notes.tmp", day);
+
+    store.lock(written.id(), "a writer").await.expect("claim");
+
+    let dir = store.session_dir(written.id()).expect("dir");
+    assert!(dir.join(".name.999.2.tmp").exists(), "a live write is left");
+    assert!(
+        dir.join(".notes.tmp").exists(),
+        "not a name this store makes"
+    );
+    assert!(dir.join("session.jsonl").exists());
+    assert_eq!(
+        store.name_of(written.id()).await.expect("name"),
+        Some("kept-name".to_owned())
+    );
+    store.release_lock(written.id());
 }
