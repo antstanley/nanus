@@ -384,6 +384,7 @@ impl Pending {
             secrets: self.secrets.clone(),
             runner: Rc::clone(&runner),
             selection: core::cell::RefCell::new(self.selection),
+            outgoing: core::cell::RefCell::new(None),
             selection_file: self.selection_file,
         });
         // Optional tools go on after the switch exists, because the one there is routes
@@ -465,6 +466,15 @@ pub struct ProviderSwitch {
     secrets: SecretHandle,
     runner: Rc<AgentRunner>,
     selection: core::cell::RefCell<Selection>,
+    /// The adapter a step is still sending through, and the selection it was built from, while
+    /// a switch waits behind that step.
+    ///
+    /// A runner that holds its selection across a step queues a new adapter until the step
+    /// ends, but `selection` above is what the reader *chose* and changes at once. Between the
+    /// two, anything that asks "which provider is this conversation on" has to be answered from
+    /// the adapter actually in use, so the selection being left is kept beside that adapter
+    /// until the runner lets go of it.
+    outgoing: core::cell::RefCell<Option<(LlmHandle, Selection)>>,
     /// Where a change of selection is remembered, or `None` when it is not.
     selection_file: Option<PathBuf>,
 }
@@ -531,21 +541,37 @@ impl ProviderSwitch {
         self.runner.tools()
     }
 
-    /// The selection in force, copied out.
-    pub(crate) fn current_selection(&self) -> Selection {
-        self.selection.borrow().clone()
+    /// The selection the runner's adapter in force was built from, copied out.
+    ///
+    /// The chosen selection, except while a switch is queued behind a step that holds the
+    /// previous adapter: then it is the selection being left, because that is the provider the
+    /// step's requests are still going to. Asked by identity of the adapter rather than by a
+    /// flag, so nothing has to tell this type when the runner's hold ends.
+    pub(crate) fn selection_in_force(&self) -> Selection {
+        let in_use = self.runner.llm();
+        let mut outgoing = self.outgoing.borrow_mut();
+        match outgoing.as_ref() {
+            Some((adapter, selection)) if Rc::ptr_eq(adapter, &in_use) => selection.clone(),
+            _ => {
+                // The step that held the previous adapter is over, so it is let go of too.
+                *outgoing = None;
+                self.selection.borrow().clone()
+            }
+        }
     }
 
     /// Builds an adapter for `model` on the provider, plan, endpoint and credential in force.
     ///
     /// The one way a helper model is reached: the provider, plan, endpoint and credential account
     /// all come from the selection in force, so a helper can never be a different provider or be
-    /// sent a key stored for another plan. Only the model id differs.
+    /// sent a key stored for another plan. Only the model id differs. "In force" is the adapter
+    /// the runner is sending through now ([`Self::selection_in_force`]), not a switch still
+    /// waiting for the step that asks to end.
     pub(crate) async fn adapter_for(
         &self,
         model: &str,
     ) -> Result<(LlmHandle, Selection), BundleError> {
-        let current = self.current_selection();
+        let current = self.selection_in_force();
         let mut config = self.config.clone();
         config.provider = Some(current.provider().name().to_owned());
         config.plan = Some(current.plan().name.to_owned());
@@ -648,7 +674,14 @@ impl ProviderSwitch {
         let selection = Selection::resolve(&config)?;
         let credential = resolve_credential(&self.secrets, &selection).await?;
         let llm = build_llm(&config, &selection, &credential)?;
+        // Read before the switch: what is being left, and the adapter it was sending through.
+        let leaving = self.selection_in_force();
+        let in_use = self.runner.llm();
         self.runner.set_llm(llm);
+        // A runner that still answers with the same adapter has queued the new one behind a
+        // held step, and that step's helper requests belong to the provider being left.
+        let queued = Rc::ptr_eq(&self.runner.llm(), &in_use);
+        *self.outgoing.borrow_mut() = queued.then_some((in_use, leaving));
         self.runner.set_model(selection.model());
         // The effort in force was chosen for the model being left, and the steps a model takes
         // differ, so it goes back to the adapter's own default rather than naming a step the new
@@ -1683,6 +1716,94 @@ mod tests {
         fn backend(&self) -> &'static str {
             "none"
         }
+    }
+
+    /// A `SecretPort` that holds a key for every account.
+    struct EverySecret;
+
+    impl SecretPort for EverySecret {
+        fn get<'a>(
+            &'a self,
+            _account: &'a str,
+        ) -> nanus_ports::LocalBoxFuture<'a, nanus_ports::SecretResult<Option<Secret>>> {
+            Box::pin(async { Ok(Some(Secret::new("a-key"))) })
+        }
+
+        fn set<'a>(
+            &'a self,
+            _account: &'a str,
+            _secret: &'a str,
+        ) -> nanus_ports::LocalBoxFuture<'a, nanus_ports::SecretResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn clear<'a>(
+            &'a self,
+            _account: &'a str,
+        ) -> nanus_ports::LocalBoxFuture<'a, nanus_ports::SecretResult<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn backend(&self) -> &'static str {
+            "every"
+        }
+    }
+
+    /// A switch over the default configuration, with a credential for whatever is asked.
+    async fn switch_with_every_credential() -> ProviderSwitch {
+        let config = NanusConfig::default();
+        let selection = Selection::resolve(&config).expect("the default resolves");
+        let secrets: SecretHandle = Rc::new(Box::new(EverySecret));
+        let llm = build_adapter(&config, &selection, &secrets)
+            .await
+            .expect("an adapter");
+        let tools = ToolRegistryHandle::new(nanus_domain::ToolRegistry::new());
+        let clock = SystemClock::new().handle();
+        let runner = build_runner(&llm, &tools, &config, &selection, Path::new("/"), &clock)
+            .expect("a runner");
+        ProviderSwitch {
+            config,
+            secrets,
+            runner: Rc::new(runner),
+            selection: core::cell::RefCell::new(selection),
+            outgoing: core::cell::RefCell::new(None),
+            selection_file: None,
+        }
+    }
+
+    /// A helper model is reached on the provider the step in progress is sending to. A switch
+    /// made while the runner holds its selection is what the reader chose, and is reported as
+    /// chosen at once, but it is not in force until that step ends — and with nothing held it
+    /// is in force immediately.
+    #[test]
+    fn a_switch_queued_behind_a_held_step_does_not_move_the_helper_route_until_the_step_ends() {
+        nanus_kernel::runtime::block_on(async {
+            let switch = switch_with_every_credential().await;
+            let started = switch.selection_in_force().provider();
+            assert_ne!(started, Provider::Anthropic);
+            let held = switch.runner.hold_selection(true).expect("a hold");
+            switch
+                .switch(Provider::Anthropic, None)
+                .await
+                .expect("a switch");
+            assert_eq!(switch.provider(), "anthropic", "the choice is reported");
+            assert_eq!(switch.selection_in_force().provider(), started);
+            let (_, helper) = switch.adapter_for("a-helper-model").await.expect("a route");
+            assert_eq!(helper.provider(), started, "the helper stays with the step");
+            drop(held);
+            assert_eq!(switch.selection_in_force().provider(), Provider::Anthropic);
+            let (_, helper) = switch.adapter_for("a-helper-model").await.expect("a route");
+            assert_eq!(helper.provider(), Provider::Anthropic);
+
+            // The other direction: with no step holding the selection, a switch is in force at
+            // once.
+            let unheld = switch_with_every_credential().await;
+            unheld
+                .switch(Provider::Anthropic, None)
+                .await
+                .expect("a switch");
+            assert_eq!(unheld.selection_in_force().provider(), Provider::Anthropic);
+        });
     }
 
     /// A missing credential is the one configuration failure the composition distinguishes: it is
