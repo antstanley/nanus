@@ -134,21 +134,10 @@ fn missing_components(decoders: &str, demuxers: &str) -> Vec<String> {
     missing
 }
 
-/// Resolves an executable in `dir` or on `PATH`.
+/// Resolves an executable in `dir`, or on `PATH` when none is given.
 fn locate(name: &str, dir: Option<&Path>) -> Result<PathBuf, VideoError> {
-    let candidates: Vec<PathBuf> = dir.map_or_else(
-        || {
-            std::env::var_os("PATH")
-                .map(|path| {
-                    std::env::split_paths(&path)
-                        .map(|dir| dir.join(name))
-                        .collect()
-                })
-                .unwrap_or_default()
-        },
-        |dir| vec![dir.join(name)],
-    );
-    candidates
+    let path = std::env::var_os("PATH");
+    candidates(name, dir, path.as_deref())
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| {
@@ -157,6 +146,37 @@ fn locate(name: &str, dir: Option<&Path>) -> Result<PathBuf, VideoError> {
                  configuration"
             ))
         })
+}
+
+/// Where `name` may be, in the order it is looked for: every candidate is an absolute path to
+/// the platform's executable file name.
+///
+/// The file name carries the platform's suffix, because `ffmpeg` is not a file on Windows and
+/// `ffmpeg.exe` is; without it the tool could never start there. Every candidate is absolute,
+/// because the decoder is spawned from wherever the agent happens to be running, which is
+/// usually the workspace: a relative `ffmpeg_dir` is made absolute once, here, rather than
+/// re-read against a directory the model can write to, and an empty or relative `PATH` entry is
+/// skipped rather than searched — it names the working directory, and a file called `ffmpeg` in
+/// a workspace is not the decoder a configuration asked for.
+fn candidates(name: &str, dir: Option<&Path>, path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let on_path = || -> Vec<PathBuf> {
+        path.map(|path| {
+            std::env::split_paths(path)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join(&file))
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let found: Vec<PathBuf> = dir.map_or_else(on_path, |dir| {
+        std::path::absolute(dir)
+            .map(|dir| vec![dir.join(&file)])
+            .unwrap_or_default()
+    });
+    // Postcondition: nothing here can be resolved against the working directory later.
+    assert!(found.iter().all(|path| path.is_absolute()));
+    found
 }
 
 /// Runs a listing command to completion.
@@ -692,6 +712,45 @@ mod tests {
                 .to_string()
                 .contains("one hour")
         );
+    }
+
+    /// The name looked for is the platform's executable name, in the directory that was named.
+    #[test]
+    fn an_executable_is_looked_for_under_the_platforms_own_file_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
+        let found = candidates("ffmpeg", Some(directory.path()), None);
+        assert_eq!(found, vec![directory.path().join(&file)]);
+        // Nothing is there yet, so it is not found; once the file exists, it is.
+        assert!(locate("ffmpeg", Some(directory.path())).is_err());
+        std::fs::write(directory.path().join(&file), b"").unwrap();
+        assert_eq!(
+            locate("ffmpeg", Some(directory.path())).unwrap(),
+            directory.path().join(&file)
+        );
+    }
+
+    /// An empty or relative `PATH` entry names the working directory, which is the workspace:
+    /// it is skipped, and an absolute entry beside it is still searched.
+    #[test]
+    fn a_relative_search_entry_is_skipped_and_a_relative_directory_is_made_absolute() {
+        let directory = tempfile::tempdir().unwrap();
+        let joined = std::env::join_paths([
+            Path::new(""),
+            Path::new("."),
+            Path::new("bin"),
+            directory.path(),
+        ])
+        .unwrap();
+        let file = format!("ffprobe{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            candidates("ffprobe", None, Some(&joined)),
+            vec![directory.path().join(&file)]
+        );
+        assert!(candidates("ffprobe", None, None).is_empty());
+        let relative = candidates("ffprobe", Some(Path::new("tools")), None);
+        assert_eq!(relative.len(), 1);
+        assert!(relative[0].is_absolute() && relative[0].ends_with(Path::new("tools").join(&file)));
     }
 
     #[test]
