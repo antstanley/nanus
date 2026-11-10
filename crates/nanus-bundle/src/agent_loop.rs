@@ -375,6 +375,11 @@ pub struct AgentRunner {
     /// host gets. `true` is a configuration that named no budget: the model's documented window
     /// is the budget, and a model with none keeps the configured value as its fallback.
     model_context: bool,
+    /// The working target a host named for managed requests, or `None` for the default.
+    ///
+    /// Read through [`working_target`](nanus_domain::context::managed::working_target) with the
+    /// allowance in force, so it is clamped to every model it meets, and never recorded.
+    working_target: Option<core::num::NonZeroU32>,
     /// How long the provider may keep the cache entries a request marks; copied into every
     /// request this runner builds. `None` for a library host, which pays no cache-write premium
     /// it did not ask for.
@@ -442,6 +447,7 @@ impl AgentRunner {
             selection: selection::Selection::default(),
             capture: None,
             model_context: false,
+            working_target: None,
             prompt_cache: core::cell::Cell::new(nanus_ports::PromptCacheRetention::None),
         })
     }
@@ -517,6 +523,30 @@ impl AgentRunner {
     pub const fn with_model_context_budget(mut self) -> Self {
         self.model_context = true;
         self
+    }
+
+    /// Names the working target a managed session is nudged toward, in estimated tokens.
+    ///
+    /// The tail's pressure is measured against it and the budget hint is given at three quarters
+    /// of it; the hard allowance, which fitting and a proposal's admission are measured against, is
+    /// not moved. Without it the target is
+    /// [`DEFAULT_WORKING_TARGET_TOKENS`](nanus_domain::context::managed::limits::DEFAULT_WORKING_TARGET_TOKENS),
+    /// and either way it is clamped to the allowance of the model in force, so a target above a
+    /// small window is that window. It is configuration, not policy: nothing records it, and a
+    /// legacy session never reads it.
+    #[must_use]
+    pub const fn with_context_working_target(mut self, tokens: core::num::NonZeroU32) -> Self {
+        self.working_target = Some(tokens);
+        self
+    }
+
+    /// The working target a host named with
+    /// [`with_context_working_target`](Self::with_context_working_target), or `None` for the
+    /// default. Unclamped: the target a request uses is this, or the default, clamped to that
+    /// request's allowance.
+    #[must_use]
+    pub const fn context_working_target(&self) -> Option<core::num::NonZeroU32> {
+        self.working_target
     }
 
     /// Returns the budget a request is fitted to, its output reservation included.
@@ -2143,7 +2173,7 @@ mod tests {
     #[test]
     fn a_profile_taken_before_the_guide_is_not_the_current_one() {
         use nanus_domain::context::managed::{
-            ContextPolicy, Digest, MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, SelectionIdentity,
+            ContextPolicy, Digest, MANAGED_REQUEST_GUIDE_V2, MANUAL_POLICY_V1, SelectionIdentity,
             SnapshotProfile,
         };
         let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(WindowedLlm));
@@ -2177,7 +2207,7 @@ mod tests {
         assert_eq!(
             current,
             under(&format!(
-                "{prompt}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}"
+                "{prompt}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V2}"
             ))
         );
         let old = under(&format!("{prompt}\n\n{MANUAL_POLICY_V1}"));

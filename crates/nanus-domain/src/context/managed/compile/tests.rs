@@ -48,6 +48,7 @@ fn facts() -> NoticeFacts {
         estimate_input_tokens: Some(750),
         estimator: "test".into(),
         input_allowance: 1_000,
+        working_target: 1_000,
         budget_hint: true,
         recovery_available: true,
     }
@@ -239,7 +240,7 @@ fn a_fresh_request_has_no_prefill_and_points_at_get_goal() {
     let tail = &effective.tail;
     assert!(tail.contains("goal_data_available=false"), "{tail}");
     // What the field means is said once, in the guide, rather than on every request.
-    assert!(MANAGED_REQUEST_GUIDE_V1.contains("get_goal"));
+    assert!(MANAGED_REQUEST_GUIDE_V2.contains("get_goal"));
     assert!(
         !effective
             .messages
@@ -362,6 +363,115 @@ fn the_reminder_fires_at_seventy_five_and_rearms_below_sixty() {
         !reminder.observe(80),
         "re-armed but only one step has passed"
     );
+}
+
+/// The target is the host's or the default, and never above the allowance it is clamped to.
+#[test]
+fn the_working_target_is_clamped_to_the_allowance() {
+    let named = core::num::NonZeroU32::new(50_000);
+    assert_eq!(
+        working_target(922_000, None),
+        limits::DEFAULT_WORKING_TARGET_TOKENS
+    );
+    assert_eq!(working_target(922_000, named), 50_000);
+    // The other direction: an allowance under the target is the target, named or not, so a small
+    // window's pressure is measured exactly as it was before the target existed.
+    assert_eq!(working_target(78_000, None), 78_000);
+    assert_eq!(working_target(40_000, named), 40_000);
+    assert_eq!(working_target(0, None), 0);
+}
+
+/// On a large window the hint follows the target, with its hysteresis intact; against the hard
+/// allowance the same estimates would never have asked for anything.
+#[test]
+fn the_reminder_follows_the_working_target_rather_than_the_allowance() {
+    let allowance = 922_000;
+    let target = working_target(allowance, None);
+    let mut reminder = Reminder::default();
+    let mut against_allowance = Reminder::default();
+    let mut observe = |estimate: u32| {
+        let hint = reminder.observe(pressure_percent(estimate, target));
+        assert!(
+            !against_allowance.observe(pressure_percent(estimate, allowance)),
+            "{estimate} is far under the allowance"
+        );
+        reminder.step_completed();
+        against_allowance.step_completed();
+        hint
+    };
+    assert!(!observe(149_000), "under three quarters of the target");
+    assert!(observe(150_000), "three quarters of the target");
+    for _ in 0..6 {
+        assert!(!observe(180_000), "not re-armed above 60 % of the target");
+    }
+    assert!(!observe(119_000), "re-armed below 60 % of the target");
+    assert!(observe(160_000), "re-armed, and four steps have passed");
+    assert!(!observe(100_000));
+    assert!(!observe(170_000), "re-armed but only one step has passed");
+}
+
+/// The tail states the target, and its pressure is measured against it rather than the allowance.
+#[test]
+fn the_tail_states_the_working_target_and_its_pressure_against_it() {
+    let mut session = session();
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
+    let fragments = derive(session.log()).unwrap_or_default();
+    let protected = protected(session.log(), &fragments);
+    let selection = Selection {
+        revision: 0,
+        hidden: &[],
+        notes: &[],
+        notes_goal_revision: None,
+    };
+    let tail = |allowance: u32, target: u32| {
+        let facts = NoticeFacts {
+            estimate_input_tokens: Some(300_000),
+            input_allowance: allowance,
+            working_target: target,
+            ..facts()
+        };
+        derive_effective_context(&session, &fragments, &protected, selection, None, &facts)
+            .unwrap_or_else(|code| panic!("{code}"))
+            .tail
+    };
+    let large = tail(922_000, 200_000);
+    assert!(
+        large.contains("input_allowance=922000 working_target=200000 pressure_percent=150 "),
+        "{large}"
+    );
+    // A target equal to the allowance states the pressure the allowance always gave.
+    let small = tail(400_000, 400_000);
+    assert!(
+        small.contains("input_allowance=400000 working_target=400000 pressure_percent=75 "),
+        "{small}"
+    );
+}
+
+/// A target above the allowance would make the soft size a second, larger ceiling.
+#[test]
+#[should_panic(expected = "the working target is within the allowance")]
+fn a_working_target_above_the_allowance_is_refused() {
+    let mut session = session();
+    session.append(SessionEvent::UserMessage {
+        text: "go".into(),
+        content_blocks: None,
+    });
+    let fragments = derive(session.log()).unwrap_or_default();
+    let protected = protected(session.log(), &fragments);
+    let facts = NoticeFacts {
+        working_target: 1_001,
+        ..facts()
+    };
+    let selection = Selection {
+        revision: 0,
+        hidden: &[],
+        notes: &[],
+        notes_goal_revision: None,
+    };
+    let _ = derive_effective_context(&session, &fragments, &protected, selection, None, &facts);
 }
 
 #[test]
@@ -711,6 +821,7 @@ fn the_tail_states_every_key_and_the_catalog_only_when_something_is_hidden() {
                 estimate_input_tokens: Some(u32::MAX),
                 estimator: "a-long-estimator-name".into(),
                 input_allowance: u32::MAX,
+                working_target: u32::MAX,
                 budget_hint: true,
                 recovery_available: true,
             },
@@ -730,6 +841,7 @@ fn the_tail_states_every_key_and_the_catalog_only_when_something_is_hidden() {
         "estimate_age=previous_candidate",
         "estimator=",
         "input_allowance=",
+        "working_target=",
         "pressure_percent=",
         "budget_hint=reduce",
         "goal_phase=active",
@@ -817,6 +929,7 @@ fn the_tail_fits_its_bound_at_the_hidden_id_cap() {
             estimate_input_tokens: Some(u32::MAX),
             estimator: "adapter-serialized-body/3".into(),
             input_allowance: u32::MAX,
+            working_target: u32::MAX,
             budget_hint: true,
             recovery_available: true,
         },

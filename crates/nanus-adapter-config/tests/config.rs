@@ -74,6 +74,10 @@ fn the_built_in_defaults_are_the_documented_ones() {
         config.context_budget, None,
         "an unset context budget is the model's own window"
     );
+    assert_eq!(
+        config.context_working_target, None,
+        "an unset working target is the harness's default"
+    );
     assert_eq!(config.max_steps_per_turn, DEFAULT_MAX_STEPS_PER_TURN);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
     assert_eq!(
@@ -523,6 +527,7 @@ fn save_then_load_round_trips() {
         model: Some(String::from("glm-4.5")),
         max_tokens: Some(1234),
         context_budget: Some(200_000),
+        context_working_target: Some(120_000),
         reasoning_effort: Some(ReasoningEffort::Low),
         approval_policy: ApprovalPolicy::AllCalls,
         sandbox_mode: SandboxMode::DangerFullAccess,

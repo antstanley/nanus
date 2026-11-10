@@ -265,6 +265,15 @@ pub struct NanusConfig {
     /// sent to a provider that would refuse it, and a turn whose *newest* part does not fit is
     /// refused with a sentence naming this field.
     pub context_budget: Option<u32>,
+    /// The working target of a managed session, in estimated tokens, when the file names one.
+    ///
+    /// Managed sessions only; a legacy session never reads it. It is the size the model is asked
+    /// to keep the request near: the context notice states the estimate as a percentage of it,
+    /// and asks the model to hide resolved work once that passes three quarters. It moves no hard
+    /// limit — the harness hides work itself only past the model's allowance, as before — and it
+    /// is clamped to that allowance, so a target above a small window is the window. Absent
+    /// means 200000. Zero is refused when the agent starts. Not recorded in a session.
+    pub context_working_target: Option<u32>,
     /// How many tool calls may run at once.
     pub max_parallel_tools: u32,
     /// How much of a tool call and a thinking segment the interface draws.
@@ -377,6 +386,7 @@ impl Default for NanusConfig {
             sandbox_mode: SandboxMode::default(),
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,
             context_budget: None,
+            context_working_target: None,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             tui_detail: TuiDetail::default(),
             tui_theme: TuiTheme::default(),

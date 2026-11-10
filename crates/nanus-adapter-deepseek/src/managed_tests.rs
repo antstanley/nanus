@@ -90,6 +90,7 @@ fn compiled(session: &Session) -> ChatRequest {
     };
     let facts = NoticeFacts {
         input_allowance: 100_000,
+        working_target: 100_000,
         ..NoticeFacts::default()
     };
     let goal = Goal::new("ship the parser", 1).unwrap();
@@ -607,6 +608,7 @@ mod seeded {
         };
         let facts = NoticeFacts {
             input_allowance: 100_000,
+            working_target: 100_000,
             ..NoticeFacts::default()
         };
         let effective =

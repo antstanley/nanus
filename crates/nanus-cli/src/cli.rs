@@ -1945,6 +1945,10 @@ async fn show_config(args: &Options) -> Result<(), String> {
         "context budget: {}",
         context_budget_display(&config, &selection)
     );
+    println!(
+        "context working target: {}",
+        working_target_display(&config)
+    );
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
     println!("tui theme: {}", config.tui_theme);
@@ -2078,6 +2082,25 @@ fn context_budget_display(config: &NanusConfig, selection: &Selection) -> String
             )
         },
         |window| format!("{window} tokens (the model's window; unset; {dropped})"),
+    )
+}
+
+/// Renders a managed session's working target, naming the default when the file names none.
+///
+/// Said to be soft and managed-only, because a reader comparing it with the budget above would
+/// otherwise take it for a second ceiling: it is where the model is asked to reduce, and the
+/// harness drops nothing at it.
+fn working_target_display(config: &NanusConfig) -> String {
+    let what = "managed sessions; the model is asked to reduce past three quarters of it, and \
+                it is clamped to the model's allowance";
+    config.context_working_target.map_or_else(
+        || {
+            format!(
+                "{} estimated tokens (unset; {what})",
+                nanus_domain::context::managed::limits::DEFAULT_WORKING_TARGET_TOKENS
+            )
+        },
+        |tokens| format!("{tokens} estimated tokens ({what})"),
     )
 }
 

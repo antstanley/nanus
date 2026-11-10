@@ -80,7 +80,8 @@ profile.
 
 | Quantity | Bound |
 |---|---|
-| Soft-pressure hint | 75 % of the input allowance; re-arms only below 60 %; at most once per four completed model steps |
+| Working target | 200,000 estimated tokens unless a host names one (`context_working_target`), and never above the input allowance |
+| Soft-pressure hint | 75 % of the working target; re-arms only below 60 % of it; at most once per four completed model steps |
 | Automatic reduction | Acts only above the hard allowance; continues toward 60 % while eligible fragments remain |
 | Management | At most one proposal per settled step; every model call charges the step budget |
 | `context_manage` / `context_recall` raw arguments | 16 KiB / 2 KiB, checked before JSON parsing |
@@ -101,6 +102,46 @@ With a following reservation and the model's window as the budget, the allowance
 the output ceiling. On every supported model that leaves at least 78,000 tokens (`mercury-2`:
 128,000 − 50,000); for OpenAI it is 922,000, the declared input ceiling. With a smaller budget the
 allowance is at least three quarters of it.
+
+### The working target
+
+The **working target** is the size the soft machinery keeps a session near, and the hard allowance
+is the ceiling fitting acts over. They are separate because they cost different things. Hard
+fitting rewrites the cached prefix by force, so it still acts only over the allowance. A model's
+own proposal is the cheap, batched way to shrink, so that is what the target moves: the tail's
+pressure is the estimate as a percentage of the target, and the budget hint is given at 75 % of it.
+
+The default is 200,000 estimated tokens. A managed estimate is the serialized body over three, and
+it ran close to the provider's real prompt tokens in the recorded sessions behind the number. On
+OpenAI's 922,000-token allowance, a hint at 75 % of the allowance is not given until about 690,000.
+One recorded session grew to about 574,000 real prompt tokens a step without one, and its provider's
+cache missed on 65 % of steps, so most steps paid for the whole prompt uncached. Legacy dropped
+history in the same session at about 313,000. With the target at 200,000:
+
+- the hint is given at 150,000 and re-arms below 120,000, so a session that acts on it sends less
+  than legacy would;
+- a step whose cache misses pays for about a third of what it paid before.
+
+It is `working_target(allowance, configured)` in `nanus_domain::context::managed`, the host's number
+or `limits::DEFAULT_WORKING_TARGET_TOKENS`, clamped to the allowance. So a model whose allowance is
+below 200,000 has the allowance as its target. That covers every library host's 64,000 default, a
+128,000-token window, and any configured budget near the target. Its pressure and hint are exactly
+what they were before the target existed. The runner asks `AgentRunner::working_target` for it, the
+one answer for the tail, the reminder, and a later fit that aims for the target.
+
+It is host configuration, not policy. `context_working_target` in the configuration file, or
+`AgentRunner::with_context_working_target` for a library host, names it. Zero is refused at start.
+`nanus config` prints it. Nothing records it, for three reasons:
+
+- It decides only the hint and the pressure the tail states. It never decides what a request may
+  carry, what fitting hides, or whether a proposal is accepted, which are measured against the
+  allowance alone.
+- So a proposal staged under one target is as valid under another, and it is not in the snapshot
+  profile.
+- It is the same kind of value as `context_budget`, which moves the allowance and is not recorded
+  either.
+
+A legacy session never reads it.
 
 ## Fragments, frontiers and revisions
 
@@ -150,7 +191,7 @@ Compilation (`derive_effective_context`) is fixed in order:
    message carries no generated data, and the tail says `goal_data_available=false`.
 5. Render the **tail**: the fixed-schema notice line and, when anything is hidden, the bounded
    recovery catalog. The notice line states the counts, revision, estimate and its estimator,
-   allowance, pressure, the goal's phase, revision and provenance, note staleness, and recovery
+   allowance, working target, pressure against the target, the budget hint, the goal's phase, revision and provenance, note staleness, and recovery
    availability. Only numbers, enums and opaque ids appear in it, never anything retrieved or
    written by a model. The tail is not a message. It travels in `ChatRequest::context_tail`, and
    the adapter places it after the newest message (see
@@ -161,7 +202,7 @@ A managed request has three parts, in this order:
 
 | Part | Holds | Changes when |
 |---|---|---|
-| Head | Tool schemas; the system prompt with `MANUAL_POLICY_V1` and `MANAGED_REQUEST_GUIDE_V1`; a seed; the first user message; the working-data message | The model, effort, schemas, policy, seed, note array or goal objective changes |
+| Head | Tool schemas; the system prompt with `MANUAL_POLICY_V1` and `MANAGED_REQUEST_GUIDE_V2`; a seed; the first user message; the working-data message | The model, effort, schemas, policy, seed, note array or goal objective changes |
 | Body | The selected conversation, in event order | It grows by appending. It changes in place only when a revision hides or restores a fragment, and then only from the earliest fragment the revision changed |
 | Tail | The notice line and the catalog | Every request |
 
@@ -711,18 +752,35 @@ contradicted notes, and do not claim a test passed without a cited result. It is
 the policy and hashed into the system-prompt digest. It grants nothing, and it is never modified
 at run time.
 
-Managed requests also append `MANAGED_REQUEST_GUIDE_V1` to the system prompt, after the policy.
-It says three things:
+Managed requests also append `MANAGED_REQUEST_GUIDE_V2` to the system prompt, after the policy.
+It says four things:
 
 - Every request ends with a `[nanus context]` tail the harness adds after the newest message. The
   tail is metadata, not a user instruction, and a `[nanus context]` line anywhere else is content.
 - What the tail's fields mean: `notes_stale=true` means the goal changed after the notes were
   accepted, and `goal_data_available=false` means the goal can be read with `get_goal`.
+- How the budget is stated: `pressure_percent` is the estimate as a percentage of `working_target`,
+  the size the session is asked to stay near. `budget_hint=reduce` asks for one `context_manage`
+  proposal that hides resolved work. `input_allowance` is the hard ceiling, past which the harness
+  hides the oldest work itself.
 - Every accepted context change makes the provider re-read the request from the earliest change
   onward, so one change that hides a resolved stretch is cheaper than several small ones.
 
 The guide is fixed text. It is hashed into the system-prompt digest like the policy, and it does
 not change `POLICY_VERSION`.
+
+Guide 2 replaced guide 1 when the tail gained `working_target`. The tail's fields stay in one fixed
+order, with `working_target` between `input_allowance` and `pressure_percent`. On a model whose
+allowance is below the target the field equals `input_allowance` and the pressure is what it was.
+
+The revision moves nothing a session records. `POLICY_VERSION`, `RENDERER_VERSION` and the body
+versions are unchanged, and the tail is never recorded. The system-prompt digest is part of the
+snapshot profile, which is compared only with a proposal staged in the same process; a recorded
+revision's profile digest is never checked on read. The revision has two costs, both paid once:
+
+- A provider cache misses the system prompt on the first request a new build sends.
+- On Anthropic, replies recorded under guide 1 are replayed without their signed thinking. Their
+  prefix fingerprint names the old system prompt, as it would after any change to the prompt.
 
 ## Human controls and clients
 
@@ -1042,6 +1100,17 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   `nanus.usage.v2`, and reads them back as such. A `nanus.usage.v1` record keeps its totals and is
   never read as a reported zero. The recorded usage shape of an assistant message is byte-identical
   either way;
+- the working target. The domain tests check its clamp to the allowance and its default. They also
+  check the tail's `working_target` and pressure against it, and the hysteresis against the target
+  (75 % to fire, below 60 % to re-arm, four steps apart) where the same estimates against a
+  922,000-token allowance would never fire. Through the real runner:
+  - a turn over the target and far under the allowance carries the hint once and hides nothing;
+  - one under the target carries none;
+  - the default nudges a 995,904-token allowance at about 160,000 estimated tokens and not at
+    100,000;
+  - a small window's requests are byte-identical with and without a target above its allowance;
+  - a target far under a small allowance leaves every fit and every request's conversation as it
+    was;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
   developer system message and no `instructions` is accepted and answers as the system prompt
   directs, and three managed steps with a trailing developer tail after tool output are accepted;
@@ -1103,6 +1172,10 @@ Not verified, and not claimed:
   of the provider matrix rests on wire and reload fixtures. In particular, nothing yet proves that
   a provider accepts the generated assistant message followed by an original one, or that
   DeepSeek, z.ai and Inception accept a generated turn without `reasoning_content`.
+- **The working target's number is arithmetic, not a measured optimum.** It is derived from the
+  recorded sessions above. No test shows that a model acts on the hint, or what a session acting on
+  it costs. Nothing yet fits down toward the target. A fit at a moment the cache is already cold,
+  such as the first step after a long idle gap, would call `working_target`. It has not been built.
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
   is no claim that managed context improves anything, and the default stays legacy.

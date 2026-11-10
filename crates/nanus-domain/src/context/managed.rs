@@ -31,9 +31,9 @@ pub mod state;
 pub mod tooling;
 
 pub use compile::{
-    Effective, GoalProvenance, HANDOFF_SEED_LABEL, MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1,
+    Effective, GoalProvenance, HANDOFF_SEED_LABEL, MANAGED_REQUEST_GUIDE_V2, MANUAL_POLICY_V1,
     MEMORY_LABEL, NoticeFacts, Reminder, Selection, derive_effective_context, manual_policy_digest,
-    seed_message,
+    seed_message, working_target,
 };
 pub use fragments::{Fragment, Fragments, MANAGE_TOOL, RECALL_TOOL};
 pub use ids::{ArtifactId, Digest, ErrorCode, FragmentId, Hasher, NoteId};

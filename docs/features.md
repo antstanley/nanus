@@ -560,6 +560,7 @@ this build offers.
 | `sandbox_mode`          | `read_only`                       | `read_only`, `workspace_write`, `danger_full_access`                                                                      |
 | `max_steps_per_turn`    | `512`                             | steps in one turn                                                                                                         |
 | `context_budget`        | the model's window, else `64000`  | estimated prompt tokens for one request                                                                                   |
+| `context_working_target` | `200000`, clamped to the allowance | estimated prompt tokens a managed session is asked to stay near; soft, never a ceiling ([managed context](context-management.md#the-working-target)) |
 | `max_parallel_tools`    | `4`                               | how many of a step's calls may be in flight at once                                                                       |
 | `tui_detail`            | `compact`                         | `compact`, `full`                                                                                                         |
 | `tui_theme`             | `terminal`                        | `terminal`, `light`, `dark`, `high_contrast`; applies to the whole screen |

@@ -207,6 +207,7 @@ fn step(session: &Session, hidden: &[FragmentId]) -> ChatRequest {
         estimate_input_tokens: Some(events.saturating_mul(97)),
         estimator: "test".into(),
         input_allowance: 100_000,
+        working_target: 100_000,
         budget_hint: false,
         recovery_available: true,
     };

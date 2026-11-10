@@ -218,6 +218,16 @@ recallable. Every model call — context management included — consumes the sa
 is accounted for. The adapter, model and effort a request was prepared under are held through its
 dispatch, its context validation and its checkpoint.
 
+A managed session has two sizes, because the two ways to shrink a request cost different things.
+The **allowance** is the hard ceiling: past it the harness hides the oldest work itself, which
+rewrites the cached prefix by force, so it acts as rarely as it can. The **working target** is where
+the model is asked to shrink, in one proposal it batches itself. It defaults to 200,000 estimated
+tokens and is clamped to the allowance. On a million-token window, a hint at three quarters of the
+allowance let a session grow past what legacy sends before anything asked it to stop. A small window
+has the allowance as its target and is nudged as it always was. The target is configuration rather
+than policy, because it decides nothing a proposal's acceptance or a fit depends on
+([the working target](context-management.md#the-working-target)).
+
 ### Requests are laid out for provider caches
 
 A provider's prompt cache is most of what a long agent session costs, and it matches by prefix.

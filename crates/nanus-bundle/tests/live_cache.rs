@@ -85,6 +85,7 @@ fn step(model: &str, session: &Session, prompt: &str) -> ChatRequest {
         estimate_input_tokens: Some(events.saturating_mul(997)),
         estimator: "live".into(),
         input_allowance: 200_000,
+        working_target: 200_000,
         budget_hint: false,
         recovery_available: true,
     };
