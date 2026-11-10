@@ -93,8 +93,17 @@ impl DeepSeekError {
 
     /// Returns `true` when retrying the same request could plausibly succeed.
     ///
-    /// This is the classification the agent loop needs: a malformed frame or a bad
-    /// key will fail identically on a retry, a rate limit or a server fault may not.
+    /// A malformed frame or a bad key will fail identically on a retry; a rate limit or a
+    /// server fault may not.
+    ///
+    /// **Nothing in the harness acts on this.** A failed request fails its turn: no adapter and
+    /// no loop sends it again, and a `Retry-After` is not read. That is deliberate for now
+    /// rather than an oversight — a retry inside the adapter would be invisible to the session's
+    /// record of its request attempts and to a budget that reserves for exactly one request
+    /// (`read_video`'s analysis is documented as "one request with no retry"), so where a
+    /// retry belongs is a decision about the loop, not about this crate. The classification
+    /// is kept for the caller that makes it: an embedding host deciding whether to offer the
+    /// turn again, and the retry policy when there is one.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
