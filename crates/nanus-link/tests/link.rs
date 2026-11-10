@@ -1658,6 +1658,135 @@ fn a_client_that_attaches_mid_turn_catches_up() {
     });
 }
 
+/// A model that says a great deal and then holds its turn open, so a client can attach to a
+/// turn whose backlog is larger than one frame.
+struct VerboseLlm {
+    /// Given by the stream once everything has been said.
+    said: Arc<tokio::sync::Semaphore>,
+    /// Awaited by the stream, so the turn stays in flight until the test says otherwise.
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl VerboseLlm {
+    /// One delta: sixty-four kilobytes, numbered so the order of the whole is checkable.
+    fn delta(index: usize) -> String {
+        format!("[{index:04}]{}", "x".repeat(64 * 1024))
+    }
+
+    /// How many deltas the turn says: six megabytes, past the four a client reads in a frame.
+    const DELTAS: usize = 96;
+}
+
+impl LlmPort for VerboseLlm {
+    fn model(&self) -> &'static str {
+        "verbose"
+    }
+
+    fn stream_chat(&self, _request: ChatRequest) -> LlmStream {
+        let said = Arc::clone(&self.said);
+        let release = Arc::clone(&self.release);
+        let deltas = futures::stream::iter(
+            (0..Self::DELTAS).map(|index| LlmEvent::TextDelta(Self::delta(index))),
+        );
+        let held = futures::stream::once(async move {
+            said.add_permits(1);
+            let _permit = release.acquire().await;
+            LlmEvent::TextDelta("the end".to_owned())
+        });
+        Box::pin(
+            deltas
+                .chain(held)
+                .chain(futures::stream::iter(vec![LlmEvent::Finished {
+                    reason: FinishReason::Stop,
+                }])),
+        )
+    }
+}
+
+/// A turn that has already said more than a client reads in one frame can still be attached
+/// to: its backlog arrives as several frames, each one readable, which together are the turn
+/// so far, in order, from one snapshot. As one frame it was a line the client refused, so the
+/// longest turns were the ones nobody could join.
+#[test]
+fn a_backlog_larger_than_one_frame_arrives_in_frames_a_client_reads() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let said = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (agent, _store) = agent_over(
+        dir.path(),
+        Rc::new(Box::new(VerboseLlm {
+            said: Arc::clone(&said),
+            release: Arc::clone(&release),
+        })),
+        "verbose",
+    );
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut owner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let mine = owner.start(None).await.expect("a session starts");
+        owner
+            .send(&Request::Prompt {
+                text: "say a lot".to_owned(),
+            })
+            .await
+            .expect("the prompt is sent");
+        // Drained as it streams, so the owner's own connection never backs up.
+        let draining = tokio::task::spawn_local(async move { turn_frames(&mut owner).await });
+        let _permit = said.acquire().await.expect("the model said its piece");
+
+        let mut joiner = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let attachment = joiner.attach_at(&mine.session).await.expect("joins");
+        // Every frame is read through the client's own cap, so reading them at all is the
+        // claim; the model frame is what an attachment always ends its catching-up with.
+        let mut backlogs = 0_usize;
+        let mut caught_up = String::new();
+        loop {
+            match joiner
+                .next()
+                .await
+                .expect("each frame is one a client reads")
+            {
+                Some(Frame::Backlog { stream, segments }) => {
+                    assert_eq!(
+                        stream, attachment.stream,
+                        "one snapshot, however many frames"
+                    );
+                    backlogs = backlogs.saturating_add(1);
+                    for segment in segments {
+                        if let Frame::Text { delta } = segment.frame {
+                            caught_up.push_str(&delta);
+                        }
+                    }
+                }
+                Some(Frame::ModelChanged { .. }) => break,
+                Some(_) => {}
+                None => panic!("the agent closed the connection"),
+            }
+        }
+        let expected: String = (0..VerboseLlm::DELTAS).map(VerboseLlm::delta).collect();
+        assert!(backlogs > 1, "six megabytes do not fit one frame");
+        assert!(caught_up == expected, "the turn so far, whole and in order");
+
+        release.add_permits(1);
+        let rest = turn_frames(&mut joiner).await;
+        assert_eq!(text_of(&rest), "the end");
+        let _ = draining.await.expect("the owner saw the turn end");
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+    });
+}
+
 /// A turn that has ended is not sent twice: a client attaching to an idle session is given
 /// no backlog, because the store is where a finished turn lives.
 #[test]
