@@ -36,7 +36,15 @@ and the **approval policy** decides what happens to a call _outside_ it.
 - `permitted` — a call that cannot destroy anything runs without asking. A call
   that looks destructive — a command that deletes or overwrites — still prompts,
   _unless_ every path it names is inside a temporary directory, where a destructive
-  command is the ordinary way to clean up. A tool says whether it can destroy anything: the
+  command is the ordinary way to clean up. That exception is read narrowly: every argument
+  of the deleting command has to be an absolute path that resolves — through any link —
+  under `/tmp`, `/var/tmp` or a believable `TMPDIR`, and a command with a variable, a
+  substitution, quoting, `~`, a relative or bare name, or a glob anywhere but the last
+  component is asked about instead. The check reads the command; it cannot see a link the
+  same command creates before it deletes. Which commands delete is a word list, found
+  however the command is punctuated, and it is not the whole shell: `git clean`, a
+  redirection that truncates and an interpreter one-liner are not on it.
+  A tool says whether it can destroy anything: the
   stock filesystem tools say they cannot, `bash` is judged by its command, and a tool an
   embedding application registered that does not say is treated as destructive, so it is
   always asked about here ([host tools](docs/host-tools.md#when-a-person-is-asked)). Prefer this over `per_call` when you
