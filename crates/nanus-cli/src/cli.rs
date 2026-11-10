@@ -756,6 +756,11 @@ async fn prepare_run(
     // the turn means a name somebody else holds costs a sentence instead of a turn, and
     // leaves no unnamed session behind as the evidence of it.
     if let Some(asked) = &name {
+        // Usable before it is free. The store answers "nobody holds it" for a name it could
+        // never record, which is true and used to be read as "free": the turn ran, the session
+        // was saved without the name, and the answer the turn had cost was withheld behind the
+        // naming error.
+        refuse_unusable_name(asked)?;
         let store = open_store(&config)
             .await
             .map_err(|error| error.to_string())?;
@@ -782,6 +787,16 @@ async fn prepare_run(
         resume,
         name,
         context,
+    })
+}
+
+/// Refuses a session name the store could never record, in the store's own words.
+///
+/// Trimmed first, as the store trims before it validates, so the two agree about which names
+/// are usable.
+fn refuse_unusable_name(asked: &str) -> Result<(), String> {
+    nanus_ports::session_name_problem(asked.trim()).map_or(Ok(()), |problem| {
+        Err(format!("{asked:?} is not a usable session name: {problem}"))
     })
 }
 
@@ -1057,14 +1072,33 @@ fn run_turn(
     // redirects stdout and loses the process should still find the transcript, and a turn
     // that *failed* is exactly the one worth being able to resume — what the model said
     // before it failed is what the next attempt has to work from.
-    let recorded = record_after(&harness, &session, name);
+    let (saved, named) = record_after(&harness, &session, name);
     // Released before the harness is torn down, and after the log has been written: the claim
     // covers exactly the time this process could have written it.
     harness.store.release_lock(&id);
     finish_harness(&harness)?;
-    recorded?;
+    saved?;
 
-    report_answer(&outcome.map_err(|error| error.to_string())?, verbose)
+    report_named(outcome.map_err(|error| error.to_string()), named, verbose)
+}
+
+/// Reports a run whose session is on disk, and then says if the session could not be named.
+///
+/// The answer first. A name that could not be recorded is a failure — the exit code says so —
+/// but the session is saved and the turn has been paid for, so its answer is still printed: the
+/// naming error used to return ahead of it, and a caller was left with neither. When the run
+/// failed too, both are said, the run first.
+fn report_named(
+    outcome: Result<nanus_bundle::RunOutcome, String>,
+    named: Result<(), String>,
+    verbose: bool,
+) -> Result<(), String> {
+    let reported = outcome.and_then(|outcome| report_answer(&outcome, verbose));
+    match (reported, named) {
+        (Ok(()), named) => named,
+        (Err(run), Ok(())) => Err(run),
+        (Err(run), Err(name)) => Err(format!("{run}; {name}")),
+    }
 }
 
 /// Prints a finished run's answer on stdout and its totals on stderr, and says whether it
@@ -1238,8 +1272,11 @@ fn run_managed(
     };
     harness.store.release_lock(&id);
     finish_harness(harness)?;
-    named?;
-    report_answer(&ran.outcome.map_err(|error| error.to_string())?, verbose)
+    report_named(
+        ran.outcome.map_err(|error| error.to_string()),
+        named,
+        verbose,
+    )
 }
 
 /// The sentence a managed run's persistence state warrants, when it warrants one.
@@ -1259,20 +1296,23 @@ fn persistence_line(state: Option<&nanus_ports::PersistenceState>) -> Option<Str
 /// Saves the session, and records its name when one was asked for.
 ///
 /// One step rather than two because both are about the session being durable before the
-/// caller is told anything, and because a named session that failed still has a name.
+/// caller is told anything, and because a named session that failed still has a name. Two
+/// results, because they are not the same failure: a session that was not saved has no answer
+/// a caller may be shown, and one that was saved and not named does.
 fn record_after(
     harness: &Harness,
     session: &nanus_domain::Session,
     name: Option<&str>,
-) -> Result<(), String> {
-    kernel_block_on(record(harness, session))?;
-    let Some(name) = name else {
-        return Ok(());
+) -> (Result<(), String>, Result<(), String>) {
+    let saved = kernel_block_on(record(harness, session));
+    let (Ok(()), Some(name)) = (&saved, name) else {
+        return (saved, Ok(()));
     };
     // After the save, because a name is an alias for a session that has to exist for the
     // alias to mean anything.
-    kernel_block_on(harness.store.name(session.id(), name))
-        .map_err(|error| format!("the session could not be named: {error}"))
+    let named = kernel_block_on(harness.store.name(session.id(), name))
+        .map_err(|error| format!("the session could not be named: {error}"));
+    (saved, named)
 }
 
 /// Loads the session a reference names.
@@ -2113,6 +2153,71 @@ mod tests {
             ..NanusConfig::default()
         };
         assert_eq!(credential_service_display(&spelled_as_the_default), "nanus");
+    }
+
+    #[test]
+    fn a_name_the_store_could_never_record_is_refused_before_anything_runs() {
+        let long = "x".repeat(nanus_ports::SESSION_NAME_MAX_CHARS.saturating_add(1));
+        for unusable in ["", "   ", "two\nlines", long.as_str()] {
+            let refused = refuse_unusable_name(unusable);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|message| message.contains("not a usable session name")),
+                "{unusable:?}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_usable_name_is_not_refused_whatever_surrounds_it() {
+        // Trimmed as the store trims, so padding a person did not mean is not a reason to refuse.
+        for usable in ["nightly", "  nightly  ", "release/1.2"] {
+            assert_eq!(refuse_unusable_name(usable), Ok(()), "{usable:?}");
+        }
+    }
+
+    fn finished(reason: nanus_domain::TurnEndReason) -> nanus_bundle::RunOutcome {
+        nanus_bundle::RunOutcome {
+            session_id: nanus_domain::SessionId::new("reported"),
+            answer: String::from("the answer"),
+            reason,
+            steps: 1,
+            usage: nanus_domain::Usage::default(),
+        }
+    }
+
+    #[test]
+    fn a_session_that_could_not_be_named_fails_the_run_it_still_reports() {
+        // The answer is printed by the same call that returns the naming failure, rather than
+        // the failure returning ahead of it.
+        let completed = finished(nanus_domain::TurnEndReason::Completed);
+        let named = Err(String::from("the session could not be named: taken"));
+        let reported = report_named(Ok(completed), named, false);
+        assert_eq!(
+            reported,
+            Err(String::from("the session could not be named: taken"))
+        );
+    }
+
+    #[test]
+    fn a_named_run_reports_as_the_run_itself_does() {
+        let completed = finished(nanus_domain::TurnEndReason::Completed);
+        assert_eq!(report_named(Ok(completed), Ok(()), false), Ok(()));
+        let failed = report_named(Err(String::from("the model failed")), Ok(()), false);
+        assert_eq!(failed, Err(String::from("the model failed")));
+        // Both failures are said, the run's first.
+        let both = report_named(
+            Err(String::from("the model failed")),
+            Err(String::from("the session could not be named: taken")),
+            false,
+        );
+        assert_eq!(
+            both,
+            Err(String::from(
+                "the model failed; the session could not be named: taken"
+            ))
+        );
     }
 
     #[test]

@@ -1457,6 +1457,55 @@ fn a_name_another_session_holds_is_refused_and_creates_nothing() {
     );
 }
 
+/// A name the store could never record is refused like a taken one: before a session exists.
+/// The store says nobody holds such a name, which used to be read as "free" — the session was
+/// written down, the naming failed, and the empty conversation stayed in the store.
+#[test]
+fn a_name_the_store_could_never_record_is_refused_and_creates_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (agent, store) = scripted_agent(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let socket_for_client = socket.clone();
+
+    let (refusals, after_refusals, accepted) = nanus_kernel::runtime::block_on_local(async move {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = nanus_link::bind(&socket).await.expect("the socket binds");
+        let serving = serve(listener, agent, async move {
+            let _ = stop_rx.await;
+        });
+        let mut client = Client::connect(&socket_for_client)
+            .await
+            .expect("the agent answers");
+        let mut refusals = Vec::new();
+        for unusable in ["x".repeat(200), "   ".to_owned(), "two\nlines".to_owned()] {
+            refusals.push(client.start(Some(unusable)).await);
+        }
+        let after_refusals = store.list().await.expect("the store lists");
+        // The other direction: a usable name is still accepted, and recorded.
+        let accepted = client.start(Some("usable".to_owned())).await;
+        let _ = stop_tx.send(());
+        serving.await.expect("joined").expect("clean");
+        (refusals, after_refusals, accepted)
+    });
+
+    for refusal in refusals {
+        match refusal {
+            Err(LinkError::Agent(message)) => {
+                assert!(message.contains("not a usable session name"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+    assert!(
+        after_refusals.is_empty(),
+        "a refused name leaves no session behind: {after_refusals:?}"
+    );
+    assert_eq!(
+        accepted.map(|info| info.name).ok().flatten().as_deref(),
+        Some("usable")
+    );
+}
+
 #[test]
 fn a_running_session_can_be_listed_and_joined() {
     let dir = tempfile::tempdir().expect("temp dir");

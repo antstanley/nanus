@@ -3265,22 +3265,23 @@ async fn attach(
 /// Starts a session for a client, named if it was asked for by name.
 ///
 /// The caller attaches; this only creates, and it creates *nothing* when the name is
-/// taken, so a refused name cannot leave an orphan conversation behind.
+/// unusable or taken, so a refused name cannot leave an orphan conversation behind.
 async fn new_session_of(registry: &Rc<Registry>, name: Option<String>) -> Result<Rc<Held>, String> {
-    // A name that is taken is refused *before* a session exists, so a refused name
-    // cannot leave an orphan conversation behind.
-    if let Some(asked) = &name
-        && let Some(existing) = registry
-            .agent
-            .store
-            .resolve(asked)
-            .await
-            .map_err(|error| error.to_string())?
-    {
-        return Err(format!(
-            "the name {asked:?} already belongs to session {}",
-            existing.as_str()
-        ));
+    // A name that is unusable or taken is refused *before* a session exists, so a refused
+    // name cannot leave an orphan conversation behind. Usable first: the store answers "nobody
+    // holds it" for a name it could never record, which reads as free, and the session was then
+    // written down before the naming failed.
+    if let Some(asked) = &name {
+        if let Some(problem) = nanus_ports::session_name_problem(asked.trim()) {
+            return Err(format!("{asked:?} is not a usable session name: {problem}"));
+        }
+        let holder = registry.agent.store.resolve(asked).await;
+        if let Some(existing) = holder.map_err(|error| error.to_string())? {
+            return Err(format!(
+                "the name {asked:?} already belongs to session {}",
+                existing.as_str()
+            ));
+        }
     }
     let session = registry.agent.start_session();
     let id = session.id().clone();
@@ -3297,7 +3298,14 @@ async fn new_session_of(registry: &Rc<Registry>, name: Option<String>) -> Result
     if let Some(asked) = name
         && let Err(error) = registry.agent.store.name(&id, &asked).await
     {
+        // The name was free when it was asked about and is not now: another connection took
+        // it while this session was being written. The session exists only to carry the name,
+        // so it goes with the refusal — let go first, because a deletion takes the claim.
         registry.held.borrow_mut().remove(&id);
+        drop(held);
+        if let Err(removed) = registry.agent.store.delete(&id).await {
+            tracing::warn!(%removed, "a session whose name was refused could not be removed");
+        }
         return Err(error.to_string());
     }
     Ok(held)
