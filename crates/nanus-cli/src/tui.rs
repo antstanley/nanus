@@ -24,7 +24,7 @@ use std::rc::Rc;
 use nanus_adapter_config::CONFIG_ENV;
 use nanus_bundle::compose::Pending;
 use nanus_link::paths::attached_endpoint;
-use nanus_link::server::{Agent, bind, serve};
+use nanus_link::server::{Agent, serve};
 
 use crate::block_on_local;
 
@@ -95,14 +95,15 @@ pub fn attached(
     let harness = pending.start().map_err(|error| error.to_string())?;
     let agent = Rc::new(Agent::new(&harness, workspace));
 
-    // The agent is torn down and the socket removed whatever the loop does, so a failure
-    // part way through cannot leave either behind.
+    // The agent is torn down whatever the loop does, and the socket is removed if this
+    // process bound it, so a failure part way through cannot leave either behind.
     let outcome = block_on_local(async {
         // The failures are carried out rather than propagated, because the block also has
-        // to produce the child's exit status: a `?` here would leave the socket behind.
-        let listener = match bind(&socket).await {
-            Ok(listener) => listener,
-            Err(error) => return (Err(error.to_string()), None),
+        // to produce the child's exit status. The socket is owned from the bind on, and goes
+        // when the block ends however it ends.
+        let (listener, _owned) = match crate::service::listen(&socket).await {
+            Ok(bound) => bound,
+            Err(error) => return (Err(error), None),
         };
         let mut child = match spawn(&binary, &socket, config_file, arguments) {
             Ok(child) => child,
@@ -119,8 +120,6 @@ pub fn attached(
         (served, status.await.ok().flatten())
     });
 
-    #[cfg(unix)]
-    let _removed = std::fs::remove_file(&socket);
     if let Err(error) = harness.shutdown() {
         tracing::warn!(%error, "the composition did not shut down cleanly");
     }

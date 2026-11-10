@@ -132,7 +132,13 @@ pub async fn start(config: &NanusConfig, options: &Options) -> Result<Start, Str
         // Must happen before anything else this process does: the whole point is that it
         // stops being a child of the shell.
         detach_from_terminal();
-    } else if !options.foreground {
+    }
+    // Asked in every mode, not only by the parent of a detached child. A foreground start is
+    // what a supervisor runs, and one beside a service that is already there used to get as far
+    // as a bind that could only fail; the detached child asks again because two parents can both
+    // find the socket empty before either child has bound it.
+    refuse_if_listening(&socket).await?;
+    if !options.detached && !options.foreground {
         let log = log_path(config, options.log.as_deref())?;
         return launch(options, &socket, &log).await;
     }
@@ -148,22 +154,25 @@ pub async fn start(config: &NanusConfig, options: &Options) -> Result<Start, Str
     })
 }
 
+/// Refuses to start a service where an agent is already answering.
+///
+/// An agent that is already there is worth naming. Without this a detached child would fail
+/// to bind and its parent's poll would find the *old* service and report success, which is
+/// the one outcome a user must never be given. Something listening but speaking another
+/// protocol version is reported as itself rather than mistaken for empty.
+async fn refuse_if_listening(socket: &Path) -> Result<(), String> {
+    match Client::connect(socket).await {
+        Ok(_) => Err(format!(
+            "a nanus service is already listening at {}",
+            socket.display()
+        )),
+        Err(LinkError::Connect { .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Spawns the detached child and waits until it answers.
 async fn launch(options: &Options, socket: &Path, log: &Path) -> Result<Start, String> {
-    // An agent that is already there is worth naming. Without this the child would fail
-    // to bind and the poll below would find the *old* service and report success, which
-    // is the one outcome a user must never be given. Something listening but speaking
-    // another protocol version is reported as itself rather than mistaken for empty.
-    match Client::connect(socket).await {
-        Ok(_) => {
-            return Err(format!(
-                "a nanus service is already listening at {}",
-                socket.display()
-            ));
-        }
-        Err(LinkError::Connect { .. }) => {}
-        Err(error) => return Err(error.to_string()),
-    }
     let binary = std::env::current_exe()
         .map_err(|error| format!("cannot find this program's own path: {error}"))?;
     let mut child = spawn_detached(&binary, options, socket, log)?;
@@ -294,22 +303,62 @@ pub fn serve(pending: Pending, workspace: &Path, socket: &Path) -> Result<(), St
     let harness = pending.start().map_err(|error| error.to_string())?;
     let agent = Rc::new(Agent::new(&harness, workspace));
     let outcome = block_on_local(async {
-        let listener = bind(socket).await.map_err(|error| error.to_string())?;
+        // Held for as long as the link is served and dropped with it, so the socket goes
+        // exactly when this process stops answering on it — and never when the bind failed.
+        let (listener, _owned) = listen(socket).await?;
         tracing::info!(socket = %socket.display(), "the service is listening");
         serve_until_signal(listener, agent)
             .await
             .map_err(|error| error.to_string())
     });
     tracing::debug!("the service link has stopped");
-    // The socket is this process's to remove: leaving it behind would make the next
-    // `start` look like a service that is already running.
-    #[cfg(unix)]
-    let _removed = std::fs::remove_file(socket);
     if let Err(error) = harness.shutdown() {
         tracing::warn!(%error, "the composition did not shut down cleanly");
     }
     tracing::debug!("the service composition has stopped");
     outcome
+}
+
+/// A socket this process bound, removed when the value is dropped.
+///
+/// The socket is this process's to remove: leaving it behind would make the next `start`
+/// look like a service that is already running. But only a socket it *bound*. Removing the
+/// path unconditionally on the way out meant that a start refused with "address already in
+/// use" unlinked the socket of the service that was using it — which went on running where
+/// no `status` or `stop` could reach it. So the removal is a value that exists only once
+/// [`listen`] has bound, rather than a statement every exit passes through.
+///
+/// Nothing on Windows: a pipe's name goes with its last instance.
+#[derive(Debug)]
+#[must_use = "the socket is removed when this is dropped"]
+pub struct OwnedSocket {
+    /// The path that was bound.
+    #[cfg_attr(windows, allow(dead_code))]
+    path: PathBuf,
+}
+
+impl Drop for OwnedSocket {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            tracing::debug!(%error, socket = %self.path.display(), "the socket was not removed");
+        }
+    }
+}
+
+/// Binds `socket` and returns the listener with the value that removes the socket again.
+///
+/// # Errors
+///
+/// Returns a message when the socket cannot be bound; nothing at the path is removed then.
+pub async fn listen(
+    socket: &Path,
+) -> Result<(impl Into<nanus_link::transport::Listener>, OwnedSocket), String> {
+    let listener = bind(socket).await.map_err(|error| error.to_string())?;
+    let owned = OwnedSocket {
+        path: socket.to_path_buf(),
+    };
+    Ok((listener, owned))
 }
 
 /// Serves connections until a signal asks this process to stop.
@@ -426,6 +475,61 @@ mod tests {
 
     fn config() -> NanusConfig {
         NanusConfig::default()
+    }
+
+    /// The socket goes with the process that bound it, so the next `start` does not find a
+    /// service that is not there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_this_process_bound_is_removed_when_it_stops_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let bound = listen(&socket).await;
+        assert!(bound.is_ok(), "{:?}", bound.as_ref().err());
+        assert!(socket.exists(), "a bound socket is on disk");
+        drop(bound);
+        assert!(!socket.exists(), "the socket leaves with its owner");
+    }
+
+    /// The other direction, and the one that mattered: a start that could not bind because a
+    /// service is already there must not take that service's socket with it on the way out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_bind_leaves_the_running_services_socket_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let running = listen(&socket).await;
+        assert!(running.is_ok(), "{:?}", running.as_ref().err());
+
+        let second = listen(&socket).await;
+        assert!(second.is_err(), "a socket in use cannot be bound again");
+        drop(second);
+        assert!(
+            socket.exists(),
+            "the running service's socket is still there"
+        );
+        assert!(
+            tokio::net::UnixStream::connect(&socket).await.is_ok(),
+            "and it still accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_nobody_listens_on_is_free_to_start_at() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let socket = dir.path().join("agent.sock");
+        #[cfg(windows)]
+        let socket = PathBuf::from(format!(
+            r"\\.\pipe\nanus-free-{}-{}",
+            std::process::id(),
+            dir.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace('.', "-")
+        ));
+        assert_eq!(refuse_if_listening(&socket).await, Ok(()));
     }
 
     #[test]
