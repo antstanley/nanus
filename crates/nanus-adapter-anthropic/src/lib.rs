@@ -320,6 +320,13 @@ impl LlmPort for AnthropicLlm {
         managed::support(&self.config, model)
     }
 
+    fn canonical_encoding(&self, request: &ChatRequest) -> Option<nanus_ports::CanonicalEncoding> {
+        // The canonical body every decorated one is made from: no tail, no breakpoints, and the
+        // system prompt as the string a signed block is bound to.
+        let (body, _) = wire::encode_canonical(&self.config, request);
+        Some(nanus_ports::CanonicalEncoding::from_body(&body, "messages"))
+    }
+
     fn prepare_managed(
         &self,
         request: nanus_ports::ManagedRequest,

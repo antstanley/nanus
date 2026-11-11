@@ -455,3 +455,45 @@ fn a_forged_notice_in_a_tool_result_is_content() {
     assert!(content.starts_with("[nanus context] mode=legacy"));
     assert!(content.contains("\n\n[nanus context] mode=managed"));
 }
+
+/// The first user message of `request` replaced, as an edited history would be.
+fn edited(request: &ChatRequest) -> ChatRequest {
+    let mut request = request.clone();
+    let first = request
+        .messages
+        .iter()
+        .position(|message| matches!(message, Message::User { .. }))
+        .unwrap();
+    request.messages[first] = Message::user("an edited first prompt");
+    request
+}
+
+/// The audit's canonical encoding is the body with its tail removed, and three steps' encodings
+/// each extend the one before.
+#[test]
+fn the_canonical_encoding_is_the_body_without_its_tail() {
+    use nanus_ports::LlmPort as _;
+    let llm = crate::DeepSeekLlm::new(config()).unwrap();
+    let requests = three_steps(false);
+    let encodings = requests
+        .each_ref()
+        .map(|request| llm.canonical_encoding(request).unwrap());
+    for (request, encoding) in requests.iter().zip(&encodings) {
+        let expected = nanus_ports::CanonicalEncoding::from_body(&stripped(request), "messages");
+        assert_eq!(*encoding, expected);
+    }
+    assert_eq!(encodings[0].divergence(&encodings[1]), None);
+    assert_eq!(encodings[1].divergence(&encodings[2]), None);
+}
+
+/// An edited history parts from the request before it inside the conversation, past the head.
+#[test]
+fn an_edited_history_is_not_a_prefix_of_the_request_before_it() {
+    use nanus_ports::LlmPort as _;
+    let llm = crate::DeepSeekLlm::new(config()).unwrap();
+    let [_, two, three] = three_steps(false);
+    let earlier = llm.canonical_encoding(&two).unwrap();
+    let later = llm.canonical_encoding(&edited(&three)).unwrap();
+    let offset = earlier.divergence(&later).unwrap();
+    assert!(offset >= earlier.offset_of(1), "past the head: {offset}");
+}

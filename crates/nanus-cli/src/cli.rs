@@ -12,7 +12,7 @@
 //!
 //! A session is the conversation, and it is written down whether it was started by a run,
 //! an interface, or a service. `--name` records one under a name, `--resume` continues
-//! one, and `nanus sessions` lists, names, and deletes them. The name is an alias for the
+//! one, and `nanus sessions` lists, names, reports on, audits, and deletes them. The name is an alias for the
 //! store key, so a session keeps its identity through a rename, a name is refused rather
 //! than moved when another session already answers to it, and deleting a session takes its
 //! name with it.
@@ -304,6 +304,24 @@ pub enum SessionsAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Audit a session's prompt-cache reads, and say whose each miss was.
+    ///
+    /// Each model request is prepared again from the log as it stood, and claimed only when its
+    /// body has exactly the digest the session recorded; consecutive claimed requests are then
+    /// compared without their tails and cache hints, so a lost read is either a prefix nanus
+    /// changed (and the byte where it changed) or one the provider had and did not read. Read
+    /// from the log: no model, no key, no network, and nothing is written. A legacy session
+    /// records no digests, so its requests are rebuilt and labelled as such. An audit that
+    /// finds misses is a successful audit; only a session that cannot be read fails it.
+    Cache {
+        /// The session to audit: an id, or a name it already answers to.
+        session: String,
+
+        /// Emit the audit as a JSON object instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// What to do with a stored credential.
@@ -578,6 +596,17 @@ pub enum Ready {
         /// Whether to emit JSON rather than the readable report.
         json: bool,
     },
+    /// A session is ready to be audited for its cache reads.
+    Cache {
+        /// The store that holds it.
+        store: nanus_ports::StoreHandle,
+        /// The configuration the requests are prepared again under.
+        config: Box<NanusConfig>,
+        /// The session to audit: an id, or a name it answers to.
+        session: String,
+        /// Whether to emit JSON rather than the table.
+        json: bool,
+    },
     /// A composition is built for a shell-scoped agent the interface will talk to.
     Tui {
         /// The adapters, ready to mount.
@@ -660,6 +689,12 @@ pub fn finish(ready: Ready) -> Result<(), String> {
             session,
             json,
         } => print_session_report(&store, &session, json),
+        Ready::Cache {
+            store,
+            config,
+            session,
+            json,
+        } => print_cache_audit(&store, &config, &session, json),
         Ready::Tui {
             pending,
             workspace,
@@ -1470,6 +1505,32 @@ fn print_session_report(
     Ok(())
 }
 
+/// Audits a recorded session's prompt-cache reads and prints the audit.
+///
+/// The session is loaded as `nanus sessions show` loads one — read, with no claim taken — so an
+/// audit of a session an agent is holding does not disturb it; it reads what was on disk when it
+/// started. Each request is prepared again by the adapters' own encoders under `config`, with no
+/// credential and no network, and nothing is written anywhere. A session that cannot be read is
+/// the one failure: an audit that finds misses has done its job.
+fn print_cache_audit(
+    store: &nanus_ports::StoreHandle,
+    config: &NanusConfig,
+    reference: &str,
+    json: bool,
+) -> Result<(), String> {
+    let id = resolve_id(store, reference)?;
+    let session = kernel_block_on(store.load(&id)).map_err(|error| error.to_string())?;
+    let routes = compose::audit_routes(config, &session)
+        .map_err(|error| format!("the session cannot be audited: {error}"))?;
+    let audit = nanus_bundle::cache_audit::audit(&session, &routes);
+    if json {
+        println!("{}", crate::cache::render_json(&audit));
+    } else {
+        print!("{}", crate::cache::render_text(&audit));
+    }
+    Ok(())
+}
+
 /// Renders the report as a JSON object.
 ///
 /// Field names are the ones the log uses, so a reader who has a session file open and a
@@ -2184,6 +2245,12 @@ async fn prepare_sessions(args: &Options, action: Option<SessionsAction>) -> Res
             session,
             json,
         }),
+        Some(SessionsAction::Cache { session, json }) => Ok(Ready::Cache {
+            store,
+            config: Box::new(config),
+            session,
+            json,
+        }),
     }
 }
 
@@ -2589,6 +2656,35 @@ mod tests {
         };
         assert!(json, "--json asks for the machine-readable shape");
         assert!(Args::try_parse_from(["nanus", "sessions", "show"]).is_err());
+    }
+
+    #[test]
+    fn the_cache_audit_takes_one_session_and_prints_a_table_unless_asked_for_json() {
+        let audit = |argv: &[&str]| match Args::try_parse_from(argv).map(|args| args.command) {
+            Ok(Some(Command::Sessions {
+                action: Some(SessionsAction::Cache { session, json }),
+            })) => Some((session, json)),
+            _ => None,
+        };
+        assert_eq!(
+            audit(&["nanus", "sessions", "cache", "nightly"]),
+            Some((String::from("nightly"), false))
+        );
+        assert_eq!(
+            audit(&["nanus", "sessions", "cache", "--json", "nightly"]),
+            Some((String::from("nightly"), true))
+        );
+        // One session at a time, and a session there must be.
+        assert!(Args::try_parse_from(["nanus", "sessions", "cache"]).is_err());
+        assert!(Args::try_parse_from(["nanus", "sessions", "cache", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn auditing_a_session_that_is_not_there_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store_under(home.path());
+        let refused = print_cache_audit(&store, &NanusConfig::default(), "no-such-session", true);
+        assert!(refused.is_err(), "{refused:?}");
     }
 
     /// A session with one answered turn, for the report renderers.

@@ -29,6 +29,11 @@ use nanus_ports::{
     Secret, SecretHandle, SecretPort, ShellHandle, StoreHandle,
 };
 
+#[path = "compose/audit.rs"]
+mod audit;
+
+pub use audit::{StockAuditRoutes, audit_routes};
+
 use crate::ToolRegistryHandle;
 use crate::agent_loop::AgentRunner;
 use crate::error::BundleError;

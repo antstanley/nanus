@@ -107,6 +107,7 @@ pub mod agent_loop;
 pub mod args;
 #[cfg(feature = "stock-compose")]
 pub mod authorize;
+pub mod cache_audit;
 pub mod capture;
 pub mod checkpoint;
 #[cfg(feature = "stock-compose")]
@@ -128,8 +129,8 @@ pub mod tools;
 mod video;
 
 pub use agent_loop::{
-    AgentRunner, Approver, CompactionDraft, HandoffDraft, ManagedRun, Progress, RunOutcome, Silent,
-    TurnHost,
+    AgentRunner, Approver, CompactionDraft, HandoffDraft, ManagedRun, Progress, RebuiltLegacy,
+    RecordedRequest, Rederivation, Rederived, RunOutcome, Silent, TurnHost,
 };
 #[cfg(feature = "stock-compose")]
 pub use authorize::PendingAuth;

@@ -53,6 +53,8 @@ mod cold;
 mod handoff;
 #[path = "managed/prepare.rs"]
 mod prepare;
+#[path = "managed/rederive.rs"]
+mod rederive;
 #[path = "managed/settle.rs"]
 mod settle;
 #[path = "managed/step.rs"]
@@ -60,7 +62,9 @@ mod step;
 #[path = "managed/tools.rs"]
 mod tools;
 
+pub use cold::UNKNOWN_CACHE_LIFETIME_MS;
 pub(super) use prepare::{Prepared, refusal};
+pub use rederive::{RebuiltLegacy, RecordedRequest, Rederivation, Rederived};
 pub(super) use settle::Staged;
 
 /// What a managed run produced, and whether its session is durable.

@@ -26,7 +26,7 @@ use crate::agent_loop::AgentRunner;
 /// entries is not told how long its provider keeps what it caches anyway. A fit while a prefix is
 /// still cached rewrites it, which is the one cost this mechanism exists to avoid, so not knowing
 /// is answered with the longest lifetime rather than the one the runner asked for.
-pub(in crate::agent_loop) const UNKNOWN_CACHE_LIFETIME_MS: u64 = 3_600_000;
+pub const UNKNOWN_CACHE_LIFETIME_MS: u64 = 3_600_000;
 
 impl AgentRunner {
     /// How long the provider is taken to keep this session's prefix after it was last sent: the

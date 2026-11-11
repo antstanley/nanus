@@ -77,6 +77,11 @@ required-features = ["stock-compose"]
 name = "resume_across_providers"
 required-features = ["stock-compose"]
 
+# Audits sessions saved through the stock session store.
+[[test]]
+name = "cache_audit"
+required-features = ["stock-compose"]
+
 # The live cache checks name the stock adapters and credential stores, like the vision checks.
 [[test]]
 name = "live_cache"

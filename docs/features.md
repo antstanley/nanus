@@ -514,6 +514,14 @@ A session is the conversation, written down as it happens. See
   per-model breakdown, and why the last turn ended. Read from the log, so it needs
   no model and no key, and `nanus run --verbose` prints the same totals in one line
   on stderr when the turn finishes.
+- **Auditing a run's cache reads**, with `nanus sessions cache [--json] <name|id>`: one
+  row per model request with its prompt and cache-read tokens as recorded, the idle gap, the
+  projection revision, and whether a lost read was a prefix nanus changed (at which byte, and
+  what the log records there) or one the provider had and read less (and whether the cache had
+  expired). Each managed request is prepared again from the log and claimed only when its body
+  has the recorded digest; legacy requests, which record none, are rebuilt and labelled. No
+  model, no key, no network, nothing written. See
+  [the audit](context-management.md#auditing-a-sessions-cache-reads).
 - **What produced a run is recorded.** The session header carries the model that
   was configured, the reasoning effort, the sandbox mode, the approval policy and
   the release that wrote it; each model turn carries the model and effort that
@@ -669,6 +677,7 @@ which asks for progress on stderr.
 | `nanus sessions name <NAME> <SESSION>`                            | Record or change a session's name.                                                                           |
 | `nanus sessions delete <NAME\|ID>`                                | Remove a session and release its name.                                                                       |
 | `nanus sessions show [--json] <NAME\|ID>`                         | Report what a session ran under and what it spent; no key needed.                                            |
+| `nanus sessions cache [--json] <NAME\|ID>`                        | Audit a session's prompt-cache reads and attribute each miss; no key needed.                                 |
 
 A bare `nanus` starts the interface when there is a terminal and prints usage
 when there is not. The usage text is built from the same parser the commands

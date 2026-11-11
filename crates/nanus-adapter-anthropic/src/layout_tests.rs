@@ -776,3 +776,49 @@ fn a_legacy_reply_under_an_elision_tail_replays_only_where_the_model_allows() {
     assert!(replayed(&next(produced(elided, true), true)));
     assert!(replayed(&next(produced(None, false), false)));
 }
+
+/// The first user message of `request` replaced, as an edited history would be.
+fn edited(request: &ChatRequest) -> ChatRequest {
+    let mut request = request.clone();
+    let first = request
+        .messages
+        .iter()
+        .position(|message| matches!(message, Message::User { .. }))
+        .unwrap();
+    request.messages[first] = Message::user("an edited first prompt");
+    request
+}
+
+/// The audit's canonical encoding carries the turns that are sent, with the tail and every marker
+/// removed, and three steps' encodings each extend the one before, whatever the retention.
+#[test]
+fn the_canonical_encoding_is_the_sent_turns_without_tail_or_markers() {
+    use nanus_ports::LlmPort as _;
+    let llm = crate::AnthropicLlm::new(config()).unwrap();
+    let requests = three_steps(false).map(|mut request| {
+        request.prompt_cache = PromptCacheRetention::Long;
+        request
+    });
+    let encodings = requests
+        .each_ref()
+        .map(|request| llm.canonical_encoding(request).unwrap());
+    for (request, encoding) in requests.iter().zip(&encodings) {
+        let sent = strip(managed(request), true);
+        let turns: Vec<String> = sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::to_string)
+            .collect();
+        assert_eq!(encoding.units()[1..], turns[..]);
+        assert!(!encoding.units()[0].contains("cache_control"));
+    }
+    assert_eq!(encodings[0].divergence(&encodings[1]), None);
+    assert_eq!(encodings[1].divergence(&encodings[2]), None);
+    let edited = llm.canonical_encoding(&edited(&requests[2])).unwrap();
+    let offset = encodings[1].divergence(&edited).unwrap();
+    assert!(
+        offset >= encodings[1].offset_of(1),
+        "past the head: {offset}"
+    );
+}

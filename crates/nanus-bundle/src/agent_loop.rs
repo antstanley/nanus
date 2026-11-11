@@ -1997,7 +1997,8 @@ fn bound(call: &mut PartialCall, limits: &nanus_ports::ToolArgumentLimits) {
 pub use nanus_ports::FinishReason as ModelFinishReason;
 
 pub use maintenance::{COMPACTION_INSTRUCTION, CompactionDraft, HANDOFF_INSTRUCTION, HandoffDraft};
-pub use managed::{ManagedRun, TurnHost};
+pub(crate) use managed::UNKNOWN_CACHE_LIFETIME_MS;
+pub use managed::{ManagedRun, RebuiltLegacy, RecordedRequest, Rederivation, Rederived, TurnHost};
 
 #[cfg(test)]
 mod tests {

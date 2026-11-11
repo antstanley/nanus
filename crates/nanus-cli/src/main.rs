@@ -43,6 +43,7 @@
 #![allow(unreachable_pub)]
 
 mod approve;
+mod cache;
 mod cli;
 mod progress;
 mod service;
