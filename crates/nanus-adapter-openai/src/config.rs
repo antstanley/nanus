@@ -291,6 +291,8 @@ pub enum TailCarrier {
     /// Appended to the final message: a trailing text part when its content is a list, otherwise
     /// after a blank line. For vendors with no established mid-conversation system or developer
     /// message, where a new user message would read as the person interrupting the tool loop.
+    /// Inception accepted a trailing `system` and a trailing `user` message on 2026-11-10 with
+    /// `mercury-3`, and neither read measurably more from cache than this, so it stays here.
     Appended,
     /// The fallback if a Responses path refuses a trailing developer message: explicit-only caching
     /// (`prompt_cache_options`), every tool output as an `input_text` list, breakpoints at the head,
@@ -311,6 +313,13 @@ pub struct CachePath {
     pub head_breakpoint: bool,
     /// Whether the request's `prompt_cache_key` is sent when caching is asked for.
     pub cache_key: bool,
+    /// Whether that key is also sent as the `session-id` header, under the same conditions.
+    ///
+    /// The `ChatGPT` backend routes a request to its cache by this header and not by the body's
+    /// key: measured on 2026-11-10 with `gpt-6.1-sol`, a turn's later steps read nothing without it
+    /// and read the previous step with it. The public API documents no such header, so it goes to
+    /// the subscription endpoint alone.
+    pub session_header: bool,
 }
 
 /// The adapter's settings.
@@ -565,7 +574,9 @@ impl OpenAiConfig {
     ///
     /// The cache key goes to `OpenAI`'s own endpoints, the API and the subscription alike: a plan
     /// changes who pays, not how a session's requests are routed to its cache. A gateway configured
-    /// as `OpenAI` and the other vendors are sent none, since they document no such field.
+    /// as `OpenAI` and the other vendors are sent none, since they document no such field. The
+    /// subscription's Responses path also sends the key as its `session-id` header, which is what
+    /// that backend's cache routing follows; see [`CachePath::session_header`].
     #[must_use]
     pub fn cache_path(&self, protocol: Protocol) -> CachePath {
         let base = self.base_url.trim_end_matches('/');
@@ -578,6 +589,7 @@ impl OpenAiConfig {
                 system_breakpoint: api,
                 head_breakpoint: api,
                 cache_key: api || subscription,
+                session_header: subscription,
             },
             (Vendor::OpenAi, Protocol::ChatCompletions) => CachePath {
                 system_carrier: SystemCarrier::System,
@@ -589,6 +601,7 @@ impl OpenAiConfig {
                 system_breakpoint: false,
                 head_breakpoint: false,
                 cache_key: api,
+                session_header: false,
             },
             (Vendor::Zai | Vendor::Inception, Protocol::Responses) => CachePath {
                 system_carrier: SystemCarrier::Instructions,
@@ -596,6 +609,7 @@ impl OpenAiConfig {
                 system_breakpoint: false,
                 head_breakpoint: false,
                 cache_key: false,
+                session_header: false,
             },
             (Vendor::Zai | Vendor::Inception, Protocol::ChatCompletions) => CachePath {
                 system_carrier: SystemCarrier::System,
@@ -603,6 +617,7 @@ impl OpenAiConfig {
                 system_breakpoint: false,
                 head_breakpoint: false,
                 cache_key: false,
+                session_header: false,
             },
         }
     }

@@ -277,6 +277,24 @@ pub(crate) fn insert_cache_key(body: &mut Value, request: &ChatRequest, path: Ca
     }
 }
 
+/// The `session-id` header a request carries on `path`: its cache key, sent exactly when the body's
+/// is, on a path whose cache routing follows the header.
+///
+/// `None` for a key that cannot be a header value, which the runner's session ids always can: the
+/// header is a routing hint, and a hint that would fail the request is better left unsent.
+pub(crate) fn session_header(request: &ChatRequest, path: CachePath) -> Option<String> {
+    if !path.cache_key
+        || !path.session_header
+        || request.prompt_cache == nanus_ports::PromptCacheRetention::None
+    {
+        return None;
+    }
+    let key = request.prompt_cache_key.as_deref()?;
+    reqwest::header::HeaderValue::from_str(key)
+        .is_ok()
+        .then(|| key.to_owned())
+}
+
 /// The item that holds the head's last `input_text` part: the first user item.
 ///
 /// The working-data message, when the head has one, is an `assistant` item whose part is

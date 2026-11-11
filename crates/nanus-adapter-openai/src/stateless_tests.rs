@@ -95,6 +95,10 @@ fn read_request(socket: &mut TcpStream) -> Value {
     assert!(header.starts_with("post /responses "));
     assert!(header.contains("authorization: bearer fictional-key\r\n"));
     assert!(!header.contains("chatgpt-account-id"));
+    assert!(
+        !header.contains("session-id"),
+        "stateless replay sends no cache key"
+    );
     let length = header
         .lines()
         .find_map(|line| line.strip_prefix("content-length: "))
