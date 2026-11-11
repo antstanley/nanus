@@ -1314,6 +1314,9 @@ fn build_runner(
     } else {
         runner
     };
+    let runner = with_working_target(runner, config)?
+        .with_context_cold_fit(config.context_cold_fit)
+        .with_context_hide_break_even(config.context_hide_break_even);
     // A request that carries pixels needs an explicit output reservation, and a model's whole
     // output ceiling would not fit a small budget beside any input. A quarter of a configured
     // budget is reserved, capped at 16K — below every offered model's own ceiling, so it holds
@@ -1331,6 +1334,27 @@ fn build_runner(
         )
         .min(IMAGE_OUTPUT_RESERVATION_MAX);
     Ok(runner.with_image_request_budget(image_output, 0))
+}
+
+/// Gives the runner the configuration's working target for managed sessions, when it names one.
+///
+/// Where a managed session's model is nudged, never where fitting acts, so it is the runner's
+/// rather than the agent configuration's: nothing records it, and a legacy request never reads it.
+///
+/// # Errors
+///
+/// Returns [`BundleError::Config`] for a target of zero, which would ask the model to reduce on
+/// every request rather than name a size.
+fn with_working_target(
+    runner: AgentRunner,
+    config: &NanusConfig,
+) -> Result<AgentRunner, BundleError> {
+    let Some(tokens) = config.context_working_target else {
+        return Ok(runner);
+    };
+    let tokens = core::num::NonZeroU32::new(tokens)
+        .ok_or_else(|| BundleError::config("context_working_target must be greater than zero"))?;
+    Ok(runner.with_context_working_target(tokens))
 }
 
 /// The most output tokens an image-carrying request reserves in the stock composition.
@@ -1876,6 +1900,88 @@ mod tests {
             outgoing: core::cell::RefCell::new(None),
             selection_file: None,
         }
+    }
+
+    /// The stock runner `config` composes, over every credential.
+    async fn stock_runner(config: NanusConfig) -> Result<AgentRunner, BundleError> {
+        let selection = Selection::resolve(&config).expect("the default resolves");
+        let secrets: SecretHandle = Rc::new(Box::new(EverySecret));
+        let llm = build_adapter(&config, &selection, &secrets)
+            .await
+            .expect("an adapter");
+        let tools = ToolRegistryHandle::new(nanus_domain::ToolRegistry::new());
+        let clock = SystemClock::new().handle();
+        build_runner(&llm, &tools, &config, &selection, Path::new("/"), &clock)
+    }
+
+    /// The configuration's switch for fitting a lapsed cache toward the target reaches the runner,
+    /// on by default and off when the file says so.
+    #[test]
+    fn a_configured_cold_fit_reaches_the_runner_on_by_default() {
+        nanus_kernel::runtime::block_on(async {
+            let on = stock_runner(NanusConfig::default())
+                .await
+                .expect("a runner");
+            assert!(on.context_cold_fit());
+            let off = stock_runner(NanusConfig {
+                context_cold_fit: false,
+                ..NanusConfig::default()
+            })
+            .await
+            .expect("a runner");
+            assert!(!off.context_cold_fit());
+        });
+    }
+
+    /// The configuration's switch for refusing a hide that cannot pay for its cache rewrite reaches
+    /// the runner, on by default and off when the file says so.
+    #[test]
+    fn a_configured_hide_break_even_reaches_the_runner_on_by_default() {
+        nanus_kernel::runtime::block_on(async {
+            let on = stock_runner(NanusConfig::default())
+                .await
+                .expect("a runner");
+            assert!(on.context_hide_break_even());
+            let off = stock_runner(NanusConfig {
+                context_hide_break_even: false,
+                ..NanusConfig::default()
+            })
+            .await
+            .expect("a runner");
+            assert!(!off.context_hide_break_even());
+        });
+    }
+
+    /// The configuration's working target reaches the runner, and a zero one stops the start
+    /// rather than asking the model to reduce on every request.
+    #[test]
+    fn a_configured_working_target_reaches_the_runner_and_zero_is_refused() {
+        nanus_kernel::runtime::block_on(async {
+            let build = |target: Option<u32>| {
+                stock_runner(NanusConfig {
+                    context_working_target: target,
+                    ..NanusConfig::default()
+                })
+            };
+            let named = build(Some(120_000)).await.expect("a runner");
+            assert_eq!(
+                named
+                    .context_working_target()
+                    .map(core::num::NonZeroU32::get),
+                Some(120_000)
+            );
+            let unset = build(None).await.expect("a runner");
+            assert_eq!(
+                unset.context_working_target(),
+                None,
+                "the default is the domain's"
+            );
+            let zero = build(Some(0)).await.expect_err("a zero target is refused");
+            assert!(
+                zero.to_string().contains("context_working_target"),
+                "{zero}"
+            );
+        });
     }
 
     /// A helper model is reached on the provider the step in progress is sending to. A switch

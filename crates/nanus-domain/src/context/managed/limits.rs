@@ -4,6 +4,16 @@
 //! configuration because every one of them is part of what `policy_version` promises: a future
 //! tunable limit keeps an absolute bound and becomes part of the snapshot profile, so a proposal
 //! made under one value cannot be accepted under another.
+//!
+//! [`DEFAULT_WORKING_TARGET_TOKENS`] is the one default here that a host may replace, and it is
+//! not a limit in that sense. It decides when the tail asks the model to reduce, what pressure the
+//! tail states, how far the runner's own fit goes once a provider's cache has lapsed, and, through
+//! that pressure, whether a small hide is staged anyway (see `break_even`). It never decides what a
+//! request may carry or whether a staged proposal is accepted: those are measured against the hard
+//! allowance alone. A fit it shapes is recorded with its whole hidden set, so reading it
+//! back never asks for the target. So a proposal staged under one target is exactly as valid under
+//! another, and the target is host configuration beside `context_budget`, which already moves the
+//! allowance without being recorded.
 
 /// The only policy version this build reads and writes.
 pub const POLICY_VERSION: u32 = 1;
@@ -25,16 +35,38 @@ pub const RENDERER_VERSION: u32 = 1;
 /// [`ContextPolicy::validate`]: crate::context::managed::records::ContextPolicy::validate
 pub const DEFAULT_OUTPUT_RESERVE_TOKENS: u32 = 4_096;
 
-/// Percent of the admissible input allowance at which a budget hint is given.
+/// The working target of a managed request, in estimated tokens, when the host names none.
+///
+/// The size the soft machinery keeps a session near: the tail's pressure is the estimate as a
+/// percentage of it, and the budget hint is given at [`SOFT_PRESSURE_PERCENT`] of it. The hard
+/// allowance is not moved by it, so fitting, which rewrites the cached prefix, still acts only
+/// over the allowance while the cache is warm; what moves is when the model is asked to shrink the
+/// request itself, in one batched proposal. Once the provider's cache has lapsed, rewriting the
+/// prefix costs nothing extra, and the runner fits toward [`TARGET_PERCENT`] of the target itself.
+///
+/// The number is from the arithmetic of a large window. On a 922,000-token allowance a hint at
+/// three quarters of the allowance is not given until about 690,000 estimated tokens, and a
+/// recorded session grew to about 574,000 real prompt tokens a step without one. The legacy path
+/// dropped history in the same session at about 313,000. At 200,000 the hint is given at 150,000
+/// and re-arms below 120,000, so a nudged managed session sends less than a legacy one would,
+/// and a step whose cache misses pays for about a third of the prompt it paid for before. It is
+/// clamped to the allowance (see `compile::working_target`), so a model whose allowance is
+/// smaller — every library host's 64,000 default, a 128,000-token window — is unaffected.
+pub const DEFAULT_WORKING_TARGET_TOKENS: u32 = 200_000;
+
+/// Percent of the working target at which a budget hint is given.
+///
+/// The working target is the admissible input allowance whenever the allowance is the smaller.
 pub const SOFT_PRESSURE_PERCENT: u32 = 75;
 
-/// Percent below which the budget hint re-arms.
+/// Percent of the working target below which the budget hint re-arms.
 pub const REARM_PERCENT: u32 = 60;
 
 /// Completed model steps between two budget hints.
 pub const REMINDER_MIN_STEPS: u32 = 4;
 
-/// Percent of the allowance automatic reduction aims for once it has to act.
+/// Percent of the bound automatic reduction aims for once it has to act: the allowance, or the
+/// working target when the provider's cache has lapsed.
 pub const TARGET_PERCENT: u32 = 60;
 
 /// Raw argument bytes a `context_manage` call may carry, checked before JSON parsing.
@@ -73,13 +105,18 @@ pub const CATALOG_BYTES_MAX: usize = 2 * 1024;
 /// and the catalog has its own bound.
 pub const TAIL_BYTES_MAX: usize = CATALOG_BYTES_MAX + 1024;
 
-/// The managed request layout this build compiles: the per-step notice and the catalog travel in
-/// `ChatRequest::context_tail`, which the adapter places after the newest message.
+/// The managed request layout this build compiles.
 ///
-/// An adapter declares it beside the policy version it implements, so one built for the earlier
-/// layout — which knew nothing of the tail and would drop it — cannot claim support. It is not
-/// recorded in a session, so moving it costs no session anything.
-pub const LAYOUT_VERSION: u32 = 2;
+/// Layout 2 put the per-step notice and the catalog in `ChatRequest::context_tail`, which the
+/// adapter places after the newest message. Layout 3 anchors the generated working-data message
+/// where its text last changed rather than after the first user message, and names it by index in
+/// `ChatRequest::working_data` rather than by position: it may follow a tool result or an answer
+/// and precede a user or an assistant message.
+///
+/// An adapter declares it beside the policy version it implements, so one built for an earlier
+/// layout — which would refuse, or misread, a working-data message anywhere but second — cannot
+/// claim support. It is not recorded in a session, so moving it costs no session anything.
+pub const LAYOUT_VERSION: u32 = 3;
 
 /// Encoded bytes of one inspect result.
 pub const INSPECT_BYTES_MAX: usize = 8 * 1024;
@@ -179,6 +216,7 @@ mod tests {
         const {
             assert!(REARM_PERCENT < SOFT_PRESSURE_PERCENT);
             assert!(TARGET_PERCENT <= REARM_PERCENT);
+            assert!(DEFAULT_WORKING_TARGET_TOKENS > 0);
             assert!(NOTES_BYTES_MAX < REVISION_RECORD_BYTES_MAX);
             assert!(REVISION_RECORD_BYTES_MAX < CLOSING_RESERVE_BYTES);
             assert!(RECALL_CHUNK_BYTES <= RECALL_WORK_BYTES);

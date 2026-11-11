@@ -375,6 +375,22 @@ pub struct AgentRunner {
     /// host gets. `true` is a configuration that named no budget: the model's documented window
     /// is the budget, and a model with none keeps the configured value as its fallback.
     model_context: bool,
+    /// The working target a host named for managed requests, or `None` for the default.
+    ///
+    /// Read through [`working_target`](nanus_domain::context::managed::working_target) with the
+    /// allowance in force, so it is clamped to every model it meets, and never recorded.
+    working_target: Option<core::num::NonZeroU32>,
+    /// Whether a managed step whose provider cache has lapsed is fitted toward the working target.
+    ///
+    /// On unless a host turns it off. Configuration, like the target: nothing records it, and a
+    /// fit it makes is recorded as the automatic revision it is.
+    cold_fit: bool,
+    /// Whether a model's hide that cannot pay for the cache rewrite it forces is refused before
+    /// it is staged.
+    ///
+    /// On unless a host turns it off. Configuration again: it decides only whether a proposal is
+    /// staged, a refusal is an ordinary tool failure, and nothing records it.
+    hide_break_even: bool,
     /// How long the provider may keep the cache entries a request marks; copied into every
     /// request this runner builds. `None` for a library host, which pays no cache-write premium
     /// it did not ask for.
@@ -442,6 +458,9 @@ impl AgentRunner {
             selection: selection::Selection::default(),
             capture: None,
             model_context: false,
+            working_target: None,
+            cold_fit: true,
+            hide_break_even: true,
             prompt_cache: core::cell::Cell::new(nanus_ports::PromptCacheRetention::None),
         })
     }
@@ -517,6 +536,84 @@ impl AgentRunner {
     pub const fn with_model_context_budget(mut self) -> Self {
         self.model_context = true;
         self
+    }
+
+    /// Names the working target a managed session is nudged toward, in estimated tokens.
+    ///
+    /// The tail's pressure is measured against it and the budget hint is given at three quarters
+    /// of it. Once the provider's cache of a session has lapsed, the runner also hides the oldest
+    /// eligible work itself down toward it (see
+    /// [`with_context_cold_fit`](Self::with_context_cold_fit)), and a model's hide that cannot pay
+    /// for its cache rewrite is staged anyway once the request is at three quarters of it (see
+    /// [`with_context_hide_break_even`](Self::with_context_hide_break_even)). The hard allowance,
+    /// which refuses a request and against which a staged proposal is admitted, is not moved.
+    /// Without it the target is
+    /// [`DEFAULT_WORKING_TARGET_TOKENS`](nanus_domain::context::managed::limits::DEFAULT_WORKING_TARGET_TOKENS),
+    /// and either way it is clamped to the allowance of the model in force, so a target above a
+    /// small window is that window. It is configuration, not policy: nothing records it, and a
+    /// legacy session never reads it.
+    #[must_use]
+    pub const fn with_context_working_target(mut self, tokens: core::num::NonZeroU32) -> Self {
+        self.working_target = Some(tokens);
+        self
+    }
+
+    /// The working target a host named with
+    /// [`with_context_working_target`](Self::with_context_working_target), or `None` for the
+    /// default. Unclamped: the target a request uses is this, or the default, clamped to that
+    /// request's allowance.
+    #[must_use]
+    pub const fn context_working_target(&self) -> Option<core::num::NonZeroU32> {
+        self.working_target
+    }
+
+    /// Turns fitting toward the working target once a provider's cache has lapsed on or off.
+    ///
+    /// On by default. Hiding history rewrites a provider's cached prefix from the earliest fragment
+    /// hidden, so below the hard allowance the runner leaves shrinking to the model while the
+    /// cache is warm. When the gap since a managed session's last request is longer than the
+    /// provider keeps a prefix — the lifetime its adapter states for the retention asked, or an
+    /// hour when it states none — the next request is read uncached anyway, and the runner hides the
+    /// oldest eligible fragments toward 60 % of the working target before it is sent. The
+    /// fit is an ordinary automatic revision: recorded before dispatch, listed in the tail's
+    /// catalog, recoverable. Off, a managed session is fitted only over the allowance, as before.
+    /// Nothing records the setting, and a legacy session never reads it.
+    #[must_use]
+    pub const fn with_context_cold_fit(mut self, enabled: bool) -> Self {
+        self.cold_fit = enabled;
+        self
+    }
+
+    /// Whether a managed step whose provider cache has lapsed is fitted toward the working target
+    /// ([`with_context_cold_fit`](Self::with_context_cold_fit)).
+    #[must_use]
+    pub const fn context_cold_fit(&self) -> bool {
+        self.cold_fit
+    }
+
+    /// Turns the refusal of a hide that cannot pay for its cache rewrite on or off.
+    ///
+    /// On by default. When a model's `context_manage` proposal hides fragments, the provider
+    /// re-reads the next request uncached from the earliest fragment it changed, and every later
+    /// step saves only the hidden tokens' cache-read price. A proposal that hides is refused before
+    /// it is staged — an ordinary tool failure stating the numbers — when the tokens it removes are
+    /// less than a fifth of the tokens it forces to be re-read
+    /// ([`REREAD_PER_HIDDEN_TOKEN_MAX`](nanus_domain::context::managed::break_even::REREAD_PER_HIDDEN_TOKEN_MAX)),
+    /// unless the request is at the soft pressure the budget hint is given at or the provider's
+    /// cache has lapsed. A proposal that hides nothing is never judged, and automatic fits are not
+    /// proposals. Off, every valid proposal is staged as before. Nothing records the setting, and a
+    /// legacy session never reads it.
+    #[must_use]
+    pub const fn with_context_hide_break_even(mut self, enabled: bool) -> Self {
+        self.hide_break_even = enabled;
+        self
+    }
+
+    /// Whether a hide that cannot pay for its cache rewrite is refused
+    /// ([`with_context_hide_break_even`](Self::with_context_hide_break_even)).
+    #[must_use]
+    pub const fn context_hide_break_even(&self) -> bool {
+        self.hide_break_even
     }
 
     /// Returns the budget a request is fitted to, its output reservation included.
@@ -2143,7 +2240,7 @@ mod tests {
     #[test]
     fn a_profile_taken_before_the_guide_is_not_the_current_one() {
         use nanus_domain::context::managed::{
-            ContextPolicy, Digest, MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, SelectionIdentity,
+            ContextPolicy, Digest, MANAGED_REQUEST_GUIDE_V2, MANUAL_POLICY_V1, SelectionIdentity,
             SnapshotProfile,
         };
         let llm: Rc<Box<dyn LlmPort>> = Rc::new(Box::new(WindowedLlm));
@@ -2177,7 +2274,7 @@ mod tests {
         assert_eq!(
             current,
             under(&format!(
-                "{prompt}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}"
+                "{prompt}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V2}"
             ))
         );
         let old = under(&format!("{prompt}\n\n{MANUAL_POLICY_V1}"));

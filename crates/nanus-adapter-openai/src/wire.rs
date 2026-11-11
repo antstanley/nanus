@@ -667,6 +667,14 @@ fn decode_usage(value: &Value) -> Usage {
     // the larger wins, so a response carrying either spelling is accounted for.
     let cache_hit_tokens =
         nested("prompt_tokens_details", "cached_tokens").max(number("prompt_cache_hit_tokens"));
+    // Whether either spelling was there at all: a reported zero is a total miss, and an absent
+    // counter is no report, which the zero above cannot say on its own.
+    let cache_hit_reported = value
+        .get("prompt_tokens_details")
+        .and_then(|object| object.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .is_some();
     // A miss count is derived when it is not reported, rather than being left at
     // zero: the two counters partition the prompt, and a reader subtracting one
     // from the other would otherwise see the whole prompt as cached.
@@ -682,6 +690,7 @@ fn decode_usage(value: &Value) -> Usage {
         reasoning_tokens: nested("completion_tokens_details", "reasoning_tokens"),
         cache_hit_tokens,
         cache_miss_tokens,
+        cache_hit_reported,
     }
 }
 
@@ -1044,8 +1053,35 @@ mod tests {
         // A response with no breakdown at all: zero, not an error.
         let bare = decode_usage(&json!({ "prompt_tokens": 3, "completion_tokens": 1 }));
         assert_eq!(bare.cache_hit_tokens, 0);
+        assert_eq!(bare.reported_cache_read(), None, "no counter is no report");
         assert_eq!(bare.reasoning_tokens, 0);
         assert_eq!(bare.total_tokens(), 4);
+    }
+
+    /// A zero under either spelling is a reported total miss; a null or absent counter is not.
+    #[test]
+    fn a_reported_zero_cache_hit_is_told_from_an_absent_one_under_both_spellings() {
+        for reported in [
+            json!({ "prompt_tokens": 9, "prompt_tokens_details": { "cached_tokens": 0 } }),
+            json!({ "prompt_tokens": 9, "prompt_cache_hit_tokens": 0 }),
+            json!({ "prompt_tokens": 9, "prompt_tokens_details": { "cached_tokens": null },
+                "prompt_cache_hit_tokens": 0 }),
+        ] {
+            assert_eq!(
+                decode_usage(&reported).reported_cache_read(),
+                Some(0),
+                "{reported}"
+            );
+        }
+        for silent in [
+            json!({ "prompt_tokens": 9 }),
+            json!({ "prompt_tokens": 9, "prompt_tokens_details": {} }),
+            json!({ "prompt_tokens": 9, "prompt_tokens_details": { "cached_tokens": null } }),
+        ] {
+            let usage = decode_usage(&silent);
+            assert!(!usage.cache_hit_reported, "{silent}");
+            assert_eq!(usage.reported_cache_read(), None, "{silent}");
+        }
     }
 
     #[test]

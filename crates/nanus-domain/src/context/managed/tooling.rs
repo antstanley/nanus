@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::break_even::HideRule;
 use super::ids::{ArtifactId, Digest, ErrorCode, FragmentId};
 use super::limits;
 use super::records::{
@@ -368,6 +369,9 @@ pub struct ManageResult {
     pub next_cursor: Option<String>,
     /// Why it was refused.
     pub error_code: Option<ErrorCode>,
+    /// On an inspect page, what a hide must save to be staged, so one proposal can be planned to
+    /// pass; `None` on any other result, and when the host turned the rule off.
+    pub hide_rule: Option<HideRule>,
 }
 
 /// How completely a recall covered what it was asked.

@@ -4523,7 +4523,7 @@ impl LlmPort for ManagedLlm {
     fn managed_support(&self, _: &str) -> nanus_ports::ManagedSupport {
         nanus_ports::ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2,
+            layout_version: 3,
         }
     }
     fn prepare_managed(

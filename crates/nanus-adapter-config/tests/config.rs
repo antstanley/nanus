@@ -74,6 +74,10 @@ fn the_built_in_defaults_are_the_documented_ones() {
         config.context_budget, None,
         "an unset context budget is the model's own window"
     );
+    assert_eq!(
+        config.context_working_target, None,
+        "an unset working target is the harness's default"
+    );
     assert_eq!(config.max_steps_per_turn, DEFAULT_MAX_STEPS_PER_TURN);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
     assert_eq!(
@@ -118,6 +122,48 @@ fn the_built_in_defaults_are_the_documented_ones() {
     assert!(
         config.credential_service.is_none(),
         "credentials are filed under the shared name unless the file names another"
+    );
+}
+
+/// Fitting a lapsed cache toward the working target is on unless a file turns it off, and a file
+/// that says nothing about it keeps it on.
+#[test]
+fn cold_fitting_is_on_unless_a_file_turns_it_off() {
+    assert!(NanusConfig::default().context_cold_fit);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "context_working_target = 120000\n").expect("write");
+    assert!(
+        NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_cold_fit
+    );
+    std::fs::write(&path, "context_cold_fit = false\n").expect("write");
+    assert!(
+        !NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_cold_fit
+    );
+}
+
+/// Refusing a hide that cannot pay for its cache rewrite is on unless a file turns it off, and a
+/// file that says nothing about it keeps it on.
+#[test]
+fn the_hide_break_even_rule_is_on_unless_a_file_turns_it_off() {
+    assert!(NanusConfig::default().context_hide_break_even);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "context_cold_fit = false\n").expect("write");
+    assert!(
+        NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_hide_break_even
+    );
+    std::fs::write(&path, "context_hide_break_even = false\n").expect("write");
+    assert!(
+        !NanusConfig::load(Some(&path))
+            .expect("load")
+            .context_hide_break_even
     );
 }
 
@@ -523,6 +569,9 @@ fn save_then_load_round_trips() {
         model: Some(String::from("glm-4.5")),
         max_tokens: Some(1234),
         context_budget: Some(200_000),
+        context_working_target: Some(120_000),
+        context_cold_fit: false,
+        context_hide_break_even: false,
         reasoning_effort: Some(ReasoningEffort::Low),
         approval_policy: ApprovalPolicy::AllCalls,
         sandbox_mode: SandboxMode::DangerFullAccess,

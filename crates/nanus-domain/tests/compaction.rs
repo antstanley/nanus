@@ -11,13 +11,7 @@ use nanus_domain::{
 use serde_json::{Value, json};
 
 fn usage(prompt: u32) -> Usage {
-    Usage {
-        prompt_tokens: prompt,
-        completion_tokens: 5,
-        reasoning_tokens: 0,
-        cache_hit_tokens: 0,
-        cache_miss_tokens: prompt,
-    }
+    Usage::new(prompt, 5, 0, 0, prompt)
 }
 
 /// One turn that ends cleanly: a human prompt, a model answer, and the turn's ending.

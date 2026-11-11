@@ -560,6 +560,9 @@ this build offers.
 | `sandbox_mode`          | `read_only`                       | `read_only`, `workspace_write`, `danger_full_access`                                                                      |
 | `max_steps_per_turn`    | `512`                             | steps in one turn                                                                                                         |
 | `context_budget`        | the model's window, else `64000`  | estimated prompt tokens for one request                                                                                   |
+| `context_working_target` | `200000`, clamped to the allowance | estimated prompt tokens a managed session is asked to stay near; soft, never a ceiling ([managed context](context-management.md#the-working-target)) |
+| `context_cold_fit`      | `true`                            | whether a managed session whose provider cache has lapsed is fitted toward the working target before its next request ([managed context](context-management.md#fitting-a-lapsed-cache)) |
+| `context_hide_break_even` | `true`                          | whether a managed session's model is refused a hide that removes less than a fifth of what it makes the provider re-read, unless the session is under pressure or its cache has lapsed ([managed context](context-management.md#a-hide-that-pays-for-itself)) |
 | `max_parallel_tools`    | `4`                               | how many of a step's calls may be in flight at once                                                                       |
 | `tui_detail`            | `compact`                         | `compact`, `full`                                                                                                         |
 | `tui_theme`             | `terminal`                        | `terminal`, `light`, `dark`, `high_contrast`; applies to the whole screen |

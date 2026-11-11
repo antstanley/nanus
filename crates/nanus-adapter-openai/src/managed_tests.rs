@@ -1,9 +1,9 @@
 //! Managed preparation over a real socket, and its refusal on every Responses route.
 //!
 //! The request each fixture prepares is compiled by the domain's own managed compiler from a
-//! session — the system prompt, the generated working-data message after the first user
-//! message, one hidden fragment absent, and the tail — so the grammar under test is the one the
-//! runner produces. The server captures the body it received, which is what lets the
+//! session — the system prompt, the generated working-data message anchored after a tool result and
+//! before the reply it precedes, one hidden fragment absent, and the tail — so the grammar under
+//! test is the one the runner produces. The server captures the body it received, which is what lets the
 //! assertions be about what was sent rather than what was encoded.
 
 // Fixtures compute exact byte boundaries (a limit and one byte over it) on small, known sizes.
@@ -100,6 +100,7 @@ fn compiled(session: &Session) -> ChatRequest {
     };
     let facts = NoticeFacts {
         input_allowance: 100_000,
+        working_target: 100_000,
         ..NoticeFacts::default()
     };
     let goal = Goal::new("ship the parser", 1).unwrap();
@@ -112,13 +113,17 @@ fn compiled(session: &Session) -> ChatRequest {
         &facts,
     )
     .unwrap();
-    assert!(effective.memory, "the goal makes a generated message");
+    // The goal is not in the log yet, so it is anchored now: before the newest reply, `d`.
+    let at = effective
+        .working_data
+        .expect("the goal makes a generated message");
     let mut messages = vec![Message::system("you are nanus")];
     messages.extend(effective.messages);
     ChatRequest::new(MODEL, messages)
         .with_tools(vec![schema("read"), schema("context_manage")])
         .with_max_tokens(4_096)
         .with_context_tail(effective.tail)
+        .with_working_data(at + 1)
 }
 
 fn schema(name: &str) -> ToolSchema {
@@ -295,8 +300,13 @@ async fn sends_exactly_what_it_prepared(llm: &OpenAiLlm, request: ChatRequest) -
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    assert_eq!(&roles[..4], ["system", "user", "assistant", "assistant"]);
-    let generated = sent["messages"][2]["content"].as_str().unwrap();
+    // After a tool result and before an original reply: two assistant messages side by side.
+    assert_eq!(
+        &roles[5..9],
+        ["assistant", "tool", "assistant", "assistant"]
+    );
+    assert_eq!(request.working_data, Some(7));
+    let generated = sent["messages"][7]["content"].as_str().unwrap();
     assert!(generated.starts_with("[nanus working data"));
     assert!(
         !body.contains("OBSOLETE EARLY OUTPUT"),
@@ -537,7 +547,7 @@ fn the_responses_wire_is_supported_on_the_api_plan_and_the_stock_subscription() 
         automatic.managed_support(MODEL),
         ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2
+            layout_version: 3
         }
     );
     assert!(automatic.endpoint_for(MODEL).ends_with("/responses"));
@@ -552,7 +562,7 @@ fn the_responses_wire_is_supported_on_the_api_plan_and_the_stock_subscription() 
         exact.managed_support(MODEL),
         ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2
+            layout_version: 3
         }
     );
     assert!(prepare(&exact, managed(with_model(MODEL))).is_ok());
@@ -570,7 +580,7 @@ fn the_responses_wire_is_supported_on_the_api_plan_and_the_stock_subscription() 
         subscription.managed_support(MODEL),
         ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2
+            layout_version: 3
         }
     );
     assert!(prepare(&subscription, managed(with_model(MODEL))).is_ok());
@@ -587,7 +597,7 @@ fn an_exact_chat_preference_is_supported_only_where_tools_are_not_refused() {
         chat.managed_support("gpt-5.6-sol"),
         ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2
+            layout_version: 3
         }
     );
     assert!(prepare(&chat, managed(with_model("gpt-5.6-sol"))).is_ok());
@@ -606,7 +616,7 @@ fn zai_is_supported_on_its_api_models_only() {
         api.managed_support("glm-5.3"),
         ManagedSupport::Supported {
             policy_version: 1,
-            layout_version: 2
+            layout_version: 3
         }
     );
     assert_eq!(api.managed_support("glm-4.5"), ManagedSupport::Unsupported);
@@ -645,7 +655,7 @@ fn inception_is_supported_on_its_api_models_only() {
             api.managed_support(model),
             ManagedSupport::Supported {
                 policy_version: 1,
-                layout_version: 2
+                layout_version: 3
             },
             "{model}"
         );
@@ -699,9 +709,26 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     let valid = compiled(&session());
     assert!(prepare(&llm(), managed(valid.clone())).is_ok());
 
+    let at = valid.working_data.unwrap();
     let mut last = valid.clone();
-    last.messages.truncate(3);
+    last.messages.truncate(at + 1);
+    last.context_tail = None;
     refused_with(last, "generated data is never the last message");
+
+    // Moved between `c`'s call and its result, it would part the two.
+    let mut split = valid.clone();
+    let generated = split.messages.remove(at);
+    split.messages.insert(at - 1, generated);
+    split.working_data = Some(at - 1);
+    refused_with(split, "never parts a call from its result");
+
+    let mut first = valid.clone();
+    first.working_data = Some(1);
+    refused_with(first, "follows the first message");
+
+    let mut misnamed = valid.clone();
+    misnamed.working_data = Some(at + 1);
+    refused_with(misnamed, "not generated working data");
 
     let mut answered = valid.clone();
     answered
@@ -714,6 +741,8 @@ fn a_request_outside_the_managed_grammar_is_refused() {
         !matches!(message, Message::Assistant { tool_calls, .. }
         if tool_calls.first().is_some_and(|call| call.id.as_str() == "c"))
     });
+    // One message before the working data is gone, so it is named one place earlier.
+    orphan.working_data = Some(at - 1);
     refused_with(orphan, "answers no surviving call");
 
     let mut unanswered = valid.clone();
@@ -726,13 +755,14 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     late_system.messages.push(Message::system("late"));
     refused_with(late_system, "follows the conversation");
 
-    // F15: text that opens with the label anywhere but directly after the first user message
-    // is the model's own reply, sent as it is; refusing it would let one reply wedge a session.
-    let mut moved = valid;
-    let generated = moved.messages.remove(2);
-    moved.messages.insert(4, generated);
+    // F15: only the index names generated data. Text that opens with the label anywhere else is
+    // the model's own reply, sent as it is; refusing it would let one reply wedge a session.
+    let mut forged = valid;
+    let reply = forged.messages.remove(at);
+    forged.messages.insert(2, reply);
+    forged.working_data = None;
     assert!(
-        prepare(&llm(), managed(moved)).is_ok(),
+        prepare(&llm(), managed(forged)).is_ok(),
         "a labelled reply elsewhere is sent"
     );
 }
@@ -857,6 +887,7 @@ mod seeded {
         };
         let facts = NoticeFacts {
             input_allowance: 100_000,
+            working_target: 100_000,
             ..NoticeFacts::default()
         };
         let effective =
@@ -1215,8 +1246,9 @@ fn history_is_sent_plain_and_a_replay_only_turn_is_refused() {
     refused_by(&automatic(), request, "protocol_incompatible");
 }
 
-/// Case 4: the generated working-data message sits directly after the first user item, as an
-/// assistant item, and is refused when it is the last message.
+/// Case 4: the generated working-data message is an assistant item where the compiler names it —
+/// after tool output and before an original reply, or before a user item — and is refused when it
+/// is the last message.
 #[test]
 fn the_generated_message_is_in_place_and_never_last() {
     let generated = || Message::Assistant {
@@ -1228,24 +1260,41 @@ fn the_generated_message_is_in_place_and_never_last() {
         replay: None,
         tool_calls: Vec::new(),
     };
+    let call = || {
+        vec![ToolCall::new(
+            ToolCallId::new("c"),
+            ToolName::new("read").unwrap(),
+            json!({}),
+        )]
+    };
     let placed = ChatRequest::new(
         MODEL,
         vec![
             Message::system("you are nanus"),
             Message::user("first"),
+            Message::assistant(None, None, call()),
+            Message::tool(ToolCallId::new("c"), "output", false),
+            generated(),
+            Message::assistant(Some("done".into()), None, Vec::new()),
             generated(),
             Message::user("second"),
         ],
     )
-    .with_max_tokens(4_096);
+    .with_max_tokens(4_096)
+    .with_working_data(4);
     let prepared = prepare(&automatic(), managed(placed)).unwrap();
     let body = sent(&prepared);
-    assert_eq!(body["input"][1]["role"], json!("user"));
+    assert_eq!(body["input"][2]["type"], json!("function_call"));
+    assert_eq!(body["input"][3]["type"], json!("function_call_output"));
     assert_eq!(
-        body["input"][2]["role"],
+        body["input"][4]["role"],
         json!("assistant"),
-        "after the first user item"
+        "after the tool output"
     );
+    assert_eq!(body["input"][4]["content"][0]["type"], json!("output_text"));
+    assert_eq!(body["input"][5]["role"], json!("assistant"));
+    // The same text where the compiler named nothing is a model reply, sent as one.
+    assert_eq!(body["input"][6]["content"], body["input"][4]["content"]);
 
     let last = ChatRequest::new(
         MODEL,
@@ -1255,7 +1304,8 @@ fn the_generated_message_is_in_place_and_never_last() {
             generated(),
         ],
     )
-    .with_max_tokens(4_096);
+    .with_max_tokens(4_096)
+    .with_working_data(2);
     refused_by(&automatic(), last, "protocol_incompatible");
 }
 

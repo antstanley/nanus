@@ -1050,7 +1050,9 @@ fn a_handoff_whose_document_would_pass_its_bound_is_recorded_refused_not_complet
 #[test]
 fn a_session_that_hid_history_still_runs_turns_and_drafts_after_a_handoff_draft() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = runner(&model, 64_000);
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = runner(&model, 64_000).with_context_hide_break_even(false);
     let (mut session, disk, context) = managed(&runner);
     model.push(call("w1", "echo", r#"{"size": 10}"#));
     model.push(call("w2", "echo", r#"{"size": 10}"#));

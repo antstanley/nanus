@@ -58,7 +58,7 @@ use crate::config::AnthropicConfig;
 pub enum Layout {
     /// A request the ordinary path sends, legacy context included.
     Ordinary,
-    /// A managed request, whose head ends at the working-data message or the first user turn.
+    /// A managed request, whose head ends at the first user turn.
     Managed,
 }
 
@@ -255,7 +255,7 @@ fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, tailed: boo
     let Some(turns) = body["messages"].as_array_mut() else {
         return;
     };
-    let candidates = breakpoints(turns, &request.messages, layout, tailed);
+    let candidates = breakpoints(turns, layout, tailed);
     let mut placed: Option<(usize, usize)> = None;
     for (turn, block) in candidates.into_iter().flatten() {
         if placed.is_some_and(|last| (turn, block) <= last) {
@@ -272,23 +272,11 @@ fn decorate(body: &mut Value, request: &ChatRequest, layout: Layout, tailed: boo
 }
 
 /// The message breakpoints 2, 3 and 4, as `(turn, block)` positions, in that order.
-fn breakpoints(
-    turns: &[Value],
-    messages: &[Message],
-    layout: Layout,
-    tailed: bool,
-) -> [Option<(usize, usize)>; 3] {
-    let head = (layout == Layout::Managed).then(|| {
-        let conversation = messages
-            .iter()
-            .skip_while(|message| matches!(message, Message::System { .. }));
-        // The working-data message, when the managed grammar admitted one, is the second turn.
-        let memory = conversation
-            .clone()
-            .nth(1)
-            .is_some_and(crate::managed::is_generated);
-        usize::from(memory)
-    });
+fn breakpoints(turns: &[Value], layout: Layout, tailed: bool) -> [Option<(usize, usize)>; 3] {
+    // The head is the first user turn: the system prompt is lifted out of `messages`, and the
+    // working-data message is anchored later in the conversation, where the entry the previous
+    // request wrote at its end (breakpoint 3, or 4 on a first step) already covers what precedes it.
+    let head = (layout == Layout::Managed).then_some(0);
     // Every search stops short of the tail: on a first request the head is also the final turn,
     // and an entry that ended in the tail could never be read by the next request.
     let last = turns.len().checked_sub(1);
@@ -556,6 +544,9 @@ pub struct StreamAccumulator {
     ready: std::collections::VecDeque<LlmEvent>,
     input_tokens: u32,
     cache_read_tokens: u32,
+    /// Whether the message head carried `cache_read_input_tokens` at all, so a reported zero —
+    /// a total miss — is not mistaken for a head that said nothing about the cache.
+    cache_read_reported: bool,
     cache_creation_tokens: u32,
     output_tokens: u32,
     finish: Option<FinishReason>,
@@ -944,6 +935,10 @@ impl StreamAccumulator {
         self.input_tokens = number(usage, "input_tokens").max(self.input_tokens);
         self.cache_read_tokens =
             number(usage, "cache_read_input_tokens").max(self.cache_read_tokens);
+        self.cache_read_reported |= usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .is_some();
         self.cache_creation_tokens =
             number(usage, "cache_creation_input_tokens").max(self.cache_creation_tokens);
         self.output_tokens = number(usage, "output_tokens").max(self.output_tokens);
@@ -1139,7 +1134,8 @@ impl StreamAccumulator {
             // were not served from a cache — and the two counters have to partition
             // the prompt, which is the invariant the harness's accounting relies on.
             self.input_tokens.saturating_add(self.cache_creation_tokens),
-        );
+        )
+        .with_cache_hit_reported(self.cache_read_reported);
         if usage.total_tokens() > 0 {
             self.ready.push_back(LlmEvent::Usage(usage));
         }
@@ -1590,6 +1586,7 @@ mod tests {
         let usage = usage.unwrap_or_default();
         assert_eq!(usage.prompt_tokens, 20);
         assert_eq!(usage.cache_hit_tokens, 4);
+        assert_eq!(usage.reported_cache_read(), Some(4));
         // Ten uncached tokens plus six written into the cache: a miss is everything
         // the cache did not serve.
         assert_eq!(usage.cache_miss_tokens, 16);
@@ -1607,6 +1604,33 @@ mod tests {
             })
         ));
         assert!(accumulator.is_closed());
+    }
+
+    /// A head that reports no cache read is a reported total miss; a head without the counter
+    /// is no report at all, though both decode to a zero.
+    #[test]
+    fn a_reported_zero_cache_read_is_told_from_an_absent_one() {
+        let usage = |head: &str| {
+            let mut accumulator = StreamAccumulator::default();
+            accumulator.observe_line(head);
+            accumulator.observe_line(r#"{"type":"message_stop"}"#);
+            let mut usage = None;
+            while let Some(event) = accumulator.take_ready() {
+                if let LlmEvent::Usage(reported) = event {
+                    usage = Some(reported);
+                }
+            }
+            usage
+        };
+        let miss = usage(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":6}}}"#,
+        );
+        assert_eq!(miss.and_then(|usage| usage.reported_cache_read()), Some(0));
+        let silent = usage(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+        );
+        assert!(silent.is_some_and(|usage| usage.cache_hit_tokens == 0));
+        assert_eq!(silent.and_then(|usage| usage.reported_cache_read()), None);
     }
 
     /// The terminal event is emitted exactly once, whether the stream ends at

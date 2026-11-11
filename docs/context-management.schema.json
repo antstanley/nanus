@@ -1145,7 +1145,8 @@
         "decision",
         "fragments",
         "next_cursor",
-        "error_code"
+        "error_code",
+        "hide_rule"
       ],
       "properties": {
         "status": {
@@ -1193,6 +1194,44 @@
               "type": "string",
               "maxLength": 64,
               "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hide_rule": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HideRule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "HideRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_reread_per_hidden_token",
+        "waived"
+      ],
+      "properties": {
+        "max_reread_per_hidden_token": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "waived": {
+          "anyOf": [
+            {
+              "enum": [
+                "pressure",
+                "cache_lapsed"
+              ]
             },
             {
               "type": "null"

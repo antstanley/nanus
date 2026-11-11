@@ -7,7 +7,7 @@
 //!
 //! ## Signed replay
 //!
-//! Hiding a fragment or inserting the generated working-data message changes the encoded prefix
+//! Hiding a fragment or placing the generated working-data message changes the encoded prefix
 //! of every assistant turn after the change, and a thinking block's signature is bound to the
 //! prefix that produced it. The decision here is to apply the
 //! adapter's **existing** checked replay unchanged, per message:
@@ -42,11 +42,14 @@
 //! Leading system messages only — the system prompt and a seeded session's handoff seed, each its
 //! own block of the top-level system field, in order; a conversation that opens with a user
 //! message and ends with a user message or tool results, which is where the tail goes; at most one
-//! generated working-data message, directly after the first user message and never last, so it is
-//! never an assistant prefill, which these models refuse; and every surviving call answered once,
-//! in place. A generated message beside an original assistant turn
-//! is two consecutive assistant messages, which the Messages API accepts and reads as one turn:
-//! nothing is merged here, no call is invented, and no generated text changes role.
+//! generated working-data message, where `ChatRequest::working_data` names it — never last, so it
+//! is never an assistant prefill, which these models refuse, and never between a `tool_use` and
+//! its result; and every surviving call answered once, in place. The message is anchored where its
+//! text last changed, so it may follow a tool result turn or an answer and precede a user turn or
+//! an original assistant turn. Beside an assistant turn it is two consecutive assistant messages,
+//! which the Messages API documents it combines into one turn: nothing is merged here, no call is
+//! invented, and no generated text changes role. A reply after it whose signed blocks were
+//! produced under a prefix without it is sent neutrally, as after any change to its prefix.
 //!
 //! ## Output
 //!
@@ -57,11 +60,10 @@
 use std::collections::BTreeSet;
 
 use nanus_domain::Message;
-use nanus_domain::context::managed::compile::MEMORY_LABEL;
 use nanus_domain::context::managed::limits::{LAYOUT_VERSION, POLICY_VERSION};
 use nanus_domain::context::managed::{Digest, ErrorCode, SelectionIdentity};
 use nanus_ports::{
-    LlmError, LlmPort as _, LlmResult, LlmStream, ManagedRequest, ManagedSupport,
+    ChatRequest, LlmError, LlmPort as _, LlmResult, LlmStream, ManagedRequest, ManagedSupport,
     PreparedModelCall, RequestEstimate, ToolArgumentLimits,
 };
 
@@ -183,7 +185,7 @@ pub fn prepare(llm: &AnthropicLlm, managed: ManagedRequest) -> LlmResult<Prepare
         .unwrap_or(u32::MAX)
         .min(crate::model_max_output_tokens(&request.model));
     check_output(request.max_tokens, ceiling)?;
-    validate_sequence(&request.messages)?;
+    validate_sequence(&request)?;
     nanus_ports::capabilities::validate_image_input(caps, &request)?;
     nanus_ports::tool_support::validate_input(
         llm.tool_call_support(&request.model, request.reasoning_effort),
@@ -251,19 +253,6 @@ fn check_output(requested: Option<u32>, ceiling: u32) -> LlmResult<()> {
     Ok(())
 }
 
-/// Whether `message` is the generated working-data message the runner inserts.
-pub fn is_generated(message: &Message) -> bool {
-    matches!(
-        message,
-        Message::Assistant {
-            text: Some(text),
-            reasoning: None,
-            replay: None,
-            tool_calls,
-        } if tool_calls.is_empty() && text.starts_with(MEMORY_LABEL)
-    )
-}
-
 /// Checks the managed role grammar described in the module documentation.
 ///
 /// Replay is not judged here: whether a turn's signed blocks are admitted depends on the body
@@ -272,7 +261,8 @@ pub fn is_generated(message: &Message) -> bool {
 /// # Errors
 ///
 /// Returns `protocol_incompatible` naming the first rule the request breaks.
-pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
+pub fn validate_sequence(request: &ChatRequest) -> LlmResult<()> {
+    let messages = request.messages.as_slice();
     let start = messages
         .iter()
         .position(|message| !matches!(message, Message::System { .. }))
@@ -287,14 +277,10 @@ pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
     if !matches!(conversation.first(), Some(Message::User { .. })) {
         return Err(incompatible("the conversation opens with a user message"));
     }
-    // Only the message directly after the first user message can be the generated one. A
-    // reply elsewhere that happens to open with the label is the model's own text and is sent
-    // as it is: identifying generated data anywhere by its words would let one reply wedge
-    // every later request of its session.
-    let anchor_generated = conversation.get(1).is_some_and(is_generated);
-    if anchor_generated && conversation.len() <= 2 {
-        return Err(incompatible("generated data is never the last message"));
-    }
+    // The generated message is the one the compiler names beside the messages, never one found by
+    // its words: a reply that happens to open with the label is the model's own text and is sent
+    // as it is, so it can never wedge every later request of its session.
+    request.check_working_data()?;
     validate_pairs(conversation)?;
     // The tail is placed after the newest message, in the final user turn, so there must be one.
     if !matches!(

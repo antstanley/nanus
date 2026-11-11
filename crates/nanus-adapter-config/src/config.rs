@@ -265,6 +265,38 @@ pub struct NanusConfig {
     /// sent to a provider that would refuse it, and a turn whose *newest* part does not fit is
     /// refused with a sentence naming this field.
     pub context_budget: Option<u32>,
+    /// The working target of a managed session, in estimated tokens, when the file names one.
+    ///
+    /// Managed sessions only; a legacy session never reads it. It is the size the model is asked
+    /// to keep the request near: the context notice states the estimate as a percentage of it,
+    /// and asks the model to hide resolved work once that passes three quarters. It moves no hard
+    /// limit — while the provider's cache is warm the harness hides work itself only past the
+    /// model's allowance, as before; see `context_cold_fit` for when it is not — and it is clamped
+    /// to that allowance, so a target above a small window is the window. Absent means 200000.
+    /// Zero is refused when the agent starts. Not recorded in a session.
+    pub context_working_target: Option<u32>,
+    /// Whether a managed session is fitted toward its working target once its provider's cache
+    /// has lapsed.
+    ///
+    /// Managed sessions only. Hiding history rewrites the provider's cached prefix, so while the
+    /// cache is warm the harness hides nothing of its own below the model's allowance. Once the
+    /// time since the session's last request passes how long the provider keeps a prefix — five
+    /// minutes or an hour on Anthropic, as asked, and an hour wherever the provider does not say —
+    /// the next request is read uncached anyway, and the oldest resolved work is hidden toward
+    /// 60 % of the working target first, recoverably. On by default; `false` fits only over the
+    /// allowance. Not recorded in a session.
+    pub context_cold_fit: bool,
+    /// Whether a managed session's model is refused a hide that cannot pay for the cache rewrite
+    /// it forces.
+    ///
+    /// Managed sessions only. A hide makes the provider re-read the next request uncached from the
+    /// earliest fragment it changes, and each later step saves only the hidden tokens' cache-read
+    /// price, about a tenth of the input price. So a proposal that hides less than a fifth of what
+    /// it forces to be re-read is refused before it is staged, with the numbers, unless the request
+    /// is at three quarters of the working target or the provider's cache has lapsed. A proposal
+    /// that hides nothing is never refused for this. On by default; `false` stages every valid
+    /// proposal. Not recorded in a session.
+    pub context_hide_break_even: bool,
     /// How many tool calls may run at once.
     pub max_parallel_tools: u32,
     /// How much of a tool call and a thinking segment the interface draws.
@@ -377,6 +409,9 @@ impl Default for NanusConfig {
             sandbox_mode: SandboxMode::default(),
             max_steps_per_turn: DEFAULT_MAX_STEPS_PER_TURN,
             context_budget: None,
+            context_working_target: None,
+            context_cold_fit: true,
+            context_hide_break_even: true,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             tui_detail: TuiDetail::default(),
             tui_theme: TuiTheme::default(),

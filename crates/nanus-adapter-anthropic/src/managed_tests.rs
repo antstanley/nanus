@@ -98,6 +98,7 @@ fn compiled(session: &Session) -> ChatRequest {
     };
     let facts = NoticeFacts {
         input_allowance: 100_000,
+        working_target: 100_000,
         ..NoticeFacts::default()
     };
     let goal = Goal::new("ship the parser", 1).unwrap();
@@ -110,12 +111,16 @@ fn compiled(session: &Session) -> ChatRequest {
         &facts,
     )
     .unwrap();
-    assert!(effective.memory, "the goal makes a generated message");
+    // The goal is not in the log yet, so it is anchored now: before the newest reply, `d`.
+    let at = effective
+        .working_data
+        .expect("the goal makes a generated message");
     let mut messages = vec![Message::system("you are nanus")];
     messages.extend(effective.messages);
     request(messages)
         .with_context_tail(effective.tail)
         .with_prompt_cache(nanus_ports::PromptCacheRetention::Short)
+        .with_working_data(at + 1)
 }
 
 fn request(messages: Vec<Message>) -> ChatRequest {
@@ -338,9 +343,15 @@ async fn a_managed_request_sends_exactly_the_bytes_it_prepared() {
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    assert_eq!(&roles[..3], ["user", "assistant", "assistant"]);
-    let generated = sent["messages"][1]["content"][0]["text"].as_str().unwrap();
+    // After a tool result turn and before an original reply: two assistant turns, which the
+    // Messages API reads as one.
+    assert_eq!(
+        &roles[4..8],
+        ["assistant", "user", "assistant", "assistant"]
+    );
+    let generated = sent["messages"][6]["content"][0]["text"].as_str().unwrap();
     assert!(generated.starts_with("[nanus working data"));
+    assert_eq!(sent["messages"][7]["content"][0]["type"], "tool_use");
     assert!(
         !body.contains("OBSOLETE EARLY OUTPUT"),
         "the hidden fragment is absent"
@@ -636,7 +647,7 @@ fn only_the_official_endpoint_and_adaptive_models_are_supported() {
             official.managed_support(model),
             ManagedSupport::Supported {
                 policy_version: 1,
-                layout_version: 2
+                layout_version: 3
             }
         );
     }
@@ -682,9 +693,26 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     let valid = compiled(&session());
     assert!(prepare(&llm(), managed(valid.clone())).is_ok());
 
+    let at = valid.working_data.unwrap();
     let mut last = valid.clone();
-    last.messages.truncate(3);
+    last.messages.truncate(at + 1);
+    last.context_tail = None;
     refused_with(last, "generated data is never the last message");
+
+    // Moved between `c`'s call and its result, it would part the two.
+    let mut split = valid.clone();
+    let generated = split.messages.remove(at);
+    split.messages.insert(at - 1, generated);
+    split.working_data = Some(at - 1);
+    refused_with(split, "never parts a call from its result");
+
+    let mut first = valid.clone();
+    first.working_data = Some(1);
+    refused_with(first, "follows the first message");
+
+    let mut misnamed = valid.clone();
+    misnamed.working_data = Some(at + 1);
+    refused_with(misnamed, "not generated working data");
 
     let mut answered = valid.clone();
     answered
@@ -697,6 +725,8 @@ fn a_request_outside_the_managed_grammar_is_refused() {
         !matches!(message, Message::Assistant { tool_calls, .. }
         if tool_calls.first().is_some_and(|call| call.id.as_str() == "c"))
     });
+    // One message before the working data is gone, so it is named one place earlier.
+    orphan.working_data = Some(at - 1);
     refused_with(orphan, "answers no surviving call");
 
     let mut unanswered = valid.clone();
@@ -709,13 +739,14 @@ fn a_request_outside_the_managed_grammar_is_refused() {
     late_system.messages.push(Message::system("late"));
     refused_with(late_system, "follows the conversation");
 
-    // F15: text that opens with the label anywhere but directly after the first user message
-    // is the model's own reply, sent as it is; refusing it would let one reply wedge a session.
-    let mut moved = valid;
-    let generated = moved.messages.remove(2);
-    moved.messages.insert(4, generated);
+    // F15: only the index names generated data. Text that opens with the label anywhere else is
+    // the model's own reply, sent as it is; refusing it would let one reply wedge a session.
+    let mut forged = valid;
+    let reply = forged.messages.remove(at);
+    forged.messages.insert(2, reply);
+    forged.working_data = None;
     assert!(
-        prepare(&llm(), managed(moved)).is_ok(),
+        prepare(&llm(), managed(forged)).is_ok(),
         "a labelled reply elsewhere is sent"
     );
 }
@@ -858,6 +889,7 @@ mod seeded {
         };
         let facts = NoticeFacts {
             input_allowance: 100_000,
+            working_target: 100_000,
             ..NoticeFacts::default()
         };
         let effective =

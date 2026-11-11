@@ -80,9 +80,11 @@ profile.
 
 | Quantity | Bound |
 |---|---|
-| Soft-pressure hint | 75 % of the input allowance; re-arms only below 60 %; at most once per four completed model steps |
-| Automatic reduction | Acts only above the hard allowance; continues toward 60 % while eligible fragments remain |
+| Working target | 200,000 estimated tokens unless a host names one (`context_working_target`), and never above the input allowance |
+| Soft-pressure hint | 75 % of the working target; re-arms only below 60 % of it; at most once per four completed model steps |
+| Automatic reduction | Acts above the hard allowance, or above the working target once the provider's cache has lapsed; continues toward 60 % of that bound while eligible fragments remain |
 | Management | At most one proposal per settled step; every model call charges the step budget |
+| Hide break-even | A proposal that hides must remove at least a fifth of the tokens it forces to be re-read, unless the request is at 75 % of the working target or the provider's cache has lapsed ([a hide that pays for itself](#a-hide-that-pays-for-itself)) |
 | `context_manage` / `context_recall` raw arguments | 16 KiB / 2 KiB, checked before JSON parsing |
 | Notes | 32 per revision, 512 Unicode scalar values each, 1–4 sources each, 8 KiB encoded array |
 | Hidden fragment ids | 4,096 per revision, strictly increasing; reaching the cap refuses further reduction |
@@ -101,6 +103,127 @@ With a following reservation and the model's window as the budget, the allowance
 the output ceiling. On every supported model that leaves at least 78,000 tokens (`mercury-2`:
 128,000 − 50,000); for OpenAI it is 922,000, the declared input ceiling. With a smaller budget the
 allowance is at least three quarters of it.
+
+### The working target
+
+The **working target** is the size the soft machinery keeps a session near, and the hard allowance
+is the ceiling fitting acts over. They are separate because they cost different things. Hard
+fitting rewrites the cached prefix by force, so while the provider's cache is warm it acts only
+over the allowance. A model's own proposal is the cheap, batched way to shrink, so that is what the
+target moves: the tail's pressure is the estimate as a percentage of the target, and the budget
+hint is given at 75 % of it. Once the cache has lapsed, rewriting the prefix costs nothing extra,
+and the runner fits toward the target itself ([fitting a lapsed cache](#fitting-a-lapsed-cache)).
+
+The default is 200,000 estimated tokens. A managed estimate is the serialized body over three, and
+it ran close to the provider's real prompt tokens in the recorded sessions behind the number. On
+OpenAI's 922,000-token allowance, a hint at 75 % of the allowance is not given until about 690,000.
+One recorded session grew to about 574,000 real prompt tokens a step without one, and its provider's
+cache missed on 65 % of steps, so most steps paid for the whole prompt uncached. Legacy dropped
+history in the same session at about 313,000. With the target at 200,000:
+
+- the hint is given at 150,000 and re-arms below 120,000, so a session that acts on it sends less
+  than legacy would;
+- a step whose cache misses pays for about a third of what it paid before.
+
+It is `working_target(allowance, configured)` in `nanus_domain::context::managed`, the host's number
+or `limits::DEFAULT_WORKING_TARGET_TOKENS`, clamped to the allowance. So a model whose allowance is
+below 200,000 has the allowance as its target. That covers every library host's 64,000 default, a
+128,000-token window, and any configured budget near the target. Its pressure and hint are exactly
+what they were before the target existed. The runner asks `AgentRunner::working_target` for it, the
+one answer for the tail, the reminder, and a fit once the cache has lapsed.
+
+It is host configuration, not policy. `context_working_target` in the configuration file, or
+`AgentRunner::with_context_working_target` for a library host, names it. Zero is refused at start.
+`nanus config` prints it. Nothing records it, for three reasons:
+
+- It decides the hint, the pressure the tail states, how far a fit goes once the cache has
+  lapsed, and whether a small hide is staged anyway because the session needs the room
+  ([a hide that pays for itself](#a-hide-that-pays-for-itself)). It never decides what a request
+  may carry or whether a staged proposal is accepted, which are measured against the allowance
+  alone. A fit it shaped is recorded with its whole hidden set, so reading a session back never
+  asks for it.
+- So a proposal staged under one target is as valid under another, and it is not in the snapshot
+  profile.
+- It is the same kind of value as `context_budget`, which moves the allowance and is not recorded
+  either.
+
+A legacy session never reads it.
+
+### Fitting a lapsed cache
+
+Hiding history rewrites the provider's cached prefix from the earliest fragment hidden, so a fit is
+expensive while the cache is warm. Once the cache has expired, the next request is read uncached
+whatever it carries, and a smaller one is cheaper on that step and on every step after it. One
+recorded session started four turns after 35 minutes to 3.7 hours of idle. Each re-sent 375,000 to
+556,000 prompt tokens uncached, with nothing hidden.
+
+So a managed step whose cache has **lapsed** is fitted toward the working target before it is sent.
+The cache has lapsed when the time since the session's last request is longer than the provider
+keeps a prefix:
+
+- **The last request** is the newest time any `request/attempt` record carries, a start or a finish,
+  whatever its kind or outcome (`state::last_request_ms`). It is read from the log, so a session
+  reloaded from disk decides exactly as one held in memory. "Now" is the runner's clock port.
+- **How long the provider keeps a prefix** is what the adapter states for the retention the runner
+  asks for (`LlmPort::prompt_cache_lifetime_ms`). Anthropic's own endpoint states the TTL its
+  breakpoints carry: five minutes under `Short` (`nanus run`) and an hour under `Long` (the link).
+  Every other adapter, a proxy configured as Anthropic, and a runner that asked for no entries state
+  nothing. That is taken as an hour, the longest retention a runner can ask for.
+- **Lapsed** means strictly longer: a gap of exactly the lifetime is warm.
+
+A fit while the prefix is still cached costs the rewrite this mechanism exists to avoid, so every
+doubt resolves toward not fitting. A session with no attempt is not fitted. Every attempt counts,
+even a refused or an uncertain one, because more attempts can only make the last request later. An
+unknown lifetime is the longest one. Two cases can still fit a warm prefix:
+
+- A provider that caches by its own rules may keep a prefix longer than an hour. A fit after an
+  hour then rewrites a prefix the provider still held.
+- The retention a request asked for is not recorded. A session last served over the link and
+  resumed by `nanus run` on Anthropic is taken to have lapsed after five minutes, although its last
+  entries were written for an hour.
+
+The fit is hard fitting's own search (`fit::fit_to`), measured against `FitBounds::toward(target,
+allowance)`:
+
+- it acts only when the candidate is over the working target;
+- it hides the oldest eligible complete fragments first, never a user message, and keeps every
+  protected fragment;
+- it aims for 60 % of the target, so the next cold start does not fit again unless the session has
+  grown back past the target.
+
+A protected floor above the target is as far as it goes, and the request is sent over the target:
+only the allowance refuses. A fit that would make the request no smaller is not made. A candidate
+over the allowance when the cache has lapsed is fitted toward the target rather than toward 60 % of
+the allowance. A target at or above the allowance makes this hard fitting exactly.
+
+A fit is an automatic revision, exactly as a hard fit's is. It is persisted with the request intent
+before dispatch, listed in the tail's catalog, and recoverable with `context_recall` and a restore.
+It is recorded with the values a hard fit has always written — `author: automatic`, `reason:
+hard_fit` — so nothing new is recorded and no body version moves. The log does not say which of the
+two produced a revision.
+
+Nothing changes when the cache is warm, when the candidate is at or under the target, when the
+session has never sent a managed request, or when the host turned it off. The request is then
+byte-identical to one built without the mechanism, and hard fitting over the allowance is exactly
+as before. That covers the first request of a new session, and the first managed request of a
+session enabled after legacy turns: legacy requests record no attempt, and their system prompt and
+schemas are not the managed prefix's, so nothing of that prefix was cached.
+
+- **Within a turn.** A step is checked like any other. A tool batch that runs longer than the
+  lifetime leaves the next step's cache lapsed, and that step is fitted.
+- **A staged proposal** is settled at its step's end, before the next request is prepared. So a fit
+  builds on whatever was accepted, notes included, with that revision as its base. A proposal the
+  model makes later against the revision before the fit is stale, as after any automatic revision.
+  A proposal is still admitted against the allowance.
+- **A reset** selects legacy, so nothing is fitted until managed is enabled again. The gap is then
+  measured from the newest attempt on either side of the barrier, because a time is a fact about
+  the provider rather than a selection the reset discards.
+- **A handoff draft's** attempt counts as a request. The draft itself is not fitted: it sends the
+  accepted selection as it stands.
+
+`context_cold_fit` in the configuration file (default `true`), or `AgentRunner::with_context_cold_fit`
+for a library host, turns it off. `nanus config` prints it. Like the target, it is configuration and
+nothing records it, and a legacy session never reads it.
 
 ## Fragments, frontiers and revisions
 
@@ -141,16 +264,19 @@ Compilation (`derive_effective_context`) is fixed in order:
 2. Keep every original user message and every protected fragment; hidden ids remove whole
    eligible fragments and nothing else; what survives keeps its original order.
 3. Render the accepted notes and the goal objective as one labelled **assistant** text message,
-   with no calls, reasoning or replay, immediately after the earliest user message. Its text
-   changes only when the note array or the goal objective changes. Revision numbers, the goal's
-   phase, revision and provenance, note staleness and the hidden-history catalog are stated in the
-   tail, never here. A session with neither notes nor a goal has no such message, even when
-   fragments are hidden.
-4. Never make that message the last one: a fresh request with nothing after its first user
-   message carries no generated data, and the tail says `goal_data_available=false`.
+   with no calls, reasoning or replay, at its **anchor** (see
+   [Where the working data goes](#where-the-working-data-goes)). Its text changes only when the
+   note array or the goal objective changes. Revision numbers, the goal's phase, revision and
+   provenance, note staleness and the hidden-history catalog are stated in the tail, never here.
+   A session with neither notes nor a goal has no such message, even when fragments are hidden.
+   The compiler names the message by its index (`Effective::working_data`, carried to the adapter
+   as `ChatRequest::working_data`), never by its words.
+4. Never make that message the last one, and never put it between a call and its result. While
+   nothing follows its anchor — a fresh request with nothing after its first user message — the
+   request carries no generated data, and the tail says `goal_data_available=false`.
 5. Render the **tail**: the fixed-schema notice line and, when anything is hidden, the bounded
    recovery catalog. The notice line states the counts, revision, estimate and its estimator,
-   allowance, pressure, the goal's phase, revision and provenance, note staleness, and recovery
+   allowance, working target, pressure against the target, the budget hint, the goal's phase, revision and provenance, note staleness, and recovery
    availability. Only numbers, enums and opaque ids appear in it, never anything retrieved or
    written by a model. The tail is not a message. It travels in `ChatRequest::context_tail`, and
    the adapter places it after the newest message (see
@@ -161,8 +287,8 @@ A managed request has three parts, in this order:
 
 | Part | Holds | Changes when |
 |---|---|---|
-| Head | Tool schemas; the system prompt with `MANUAL_POLICY_V1` and `MANAGED_REQUEST_GUIDE_V1`; a seed; the first user message; the working-data message | The model, effort, schemas, policy, seed, note array or goal objective changes |
-| Body | The selected conversation, in event order | It grows by appending. It changes in place only when a revision hides or restores a fragment, and then only from the earliest fragment the revision changed |
+| Head | Tool schemas; the system prompt with `MANUAL_POLICY_V1` and `MANAGED_REQUEST_GUIDE_V2`; a seed; the first user message | The model, effort, schemas, policy or seed changes |
+| Body | The selected conversation, in event order, with the working-data message at its anchor | It grows by appending. It changes in place only when a revision hides or restores a fragment, from the earliest fragment the revision changed, or when the working data's text changes, from where its earlier copy stood |
 | Tail | The notice line and the catalog | Every request |
 
 **Nothing that changes from one step to the next comes before the newest message.** Take two
@@ -170,13 +296,63 @@ consecutive requests of a session with no revision, goal, policy, schema, model 
 between them. Remove the tail and the cache markers from both. The earlier request's encoding is
 then a prefix of the later one's.
 
-There is one exception. When notes or a goal exist before a session's first prompt (a goal set
-with `/goal`, or a seeded session's notes), the first request has no working-data message,
-because it would be last. The second request inserts it after the first user message. Every
-adapter is tested for the rule and for this exception.
+There is no exception for the working data. When it first appears, or moves, it is placed at the
+end of what the previous request carried, so the previous request is still a prefix. A change to
+its text removes the earlier copy, so the request is re-read from where that copy stood; nothing
+before it moves. Every adapter is tested for the rule, for a goal created and a note array
+changed mid-session, and for a goal set before the first prompt.
 
-Deterministic hard fitting acts only when the candidate is over the hard allowance, hiding the
-oldest eligible complete fragment first. Every probe is compiled and prepared by the selected
+### Where the working data goes
+
+The message is anchored at the log position where its text last changed. The compiler folds the
+log on every derivation: the notes and their goal binding from each `context/revision`, and the
+objective from each `goal/change`. The anchor is the last event after which the rendered text
+differed from the text before it. Nothing new is recorded, so two derivations of one log agree,
+and a reload agrees with both.
+
+- An automatic fit re-records the same notes, and a goal phase or revision change keeps the
+  objective, so neither moves the anchor.
+- A candidate the log does not hold yet (a staged proposal being proved) is anchored at the end of
+  the log. That is where its revision will be recorded, so the proof measures the request that
+  will be sent.
+
+The anchor names a place through the latest model reply or human message recorded before it:
+
+| Latest before the anchor | The message goes | Typical change |
+|---|---|---|
+| A model reply | Directly before that reply's assistant message, or before the next kept message when that reply is hidden | A goal tool inside a step, a proposal accepted when its step settles, a host's `/goal` between turns |
+| A human message | Directly after it | A change made after a prompt and before any reply |
+| Nothing (the change came before the first prompt) | Directly after the first user message | `/goal` before the first prompt; a seeded session's goal |
+
+In every case the reply named is the answer to the request sent just before the change, and that
+request ended where the message now goes. So the request after a change extends the one before
+it. The message is placed before the reply rather than after it, because after it would be the end
+of the conversation when the change is a proposal accepted at the end of a step, and the message
+must never be last. Before an assistant message it can never sit between a call and its result.
+
+When nothing follows the place yet, the message is left out and the tail says
+`goal_data_available=false`. It appears on the first request in which something follows, at the
+end of the request that left it out. The position depends only on the log before the anchor and
+the hidden set, so appending never moves it.
+
+The message may therefore follow tool results, a user message or an assistant answer, and precede
+a user message or an assistant message. Two assistant messages side by side are sent as they are
+on every wire: chat completions and Responses have no alternation rule, and the Messages API
+combines consecutive turns of one role into one turn. On `DeepSeek` the message carries an empty
+`reasoning_content`, because thinking mode refuses an earlier assistant message without one when
+the request carries tools (measured live; see [what is verified](#what-is-and-is-not-verified)).
+Anthropic signs thinking against the prefix, so a reply after the message whose signed blocks were
+produced without it there is sent neutrally, as after any change to its prefix.
+
+A change costs the provider cache what follows the earlier copy. The old layout put the message
+after the first user message, so every change re-read the whole conversation after it. A
+session's first change still re-reads from wherever an earlier copy stood, and a session with no
+earlier copy re-reads nothing it had sent.
+
+Deterministic hard fitting acts only when the candidate is over the hard allowance, or over the
+working target once the provider's cache has lapsed
+([fitting a lapsed cache](#fitting-a-lapsed-cache)), hiding the oldest eligible complete fragment
+first. Every probe is compiled and prepared by the selected
 adapter, tail included, so its cost is the cost of the body that adapter would send. A protected
 floor above 60 % but within the allowance succeeds; above the allowance it refuses with
 `protected_floor_too_large`, and no partial hidden set is installed. A successful fit is an
@@ -196,11 +372,13 @@ seven, a legacy session's schemas are unchanged, and the encoded definitions car
 allowed fields.
 
 - **`context_manage inspect`** returns the context status (revision, frontier, profile digest,
-  pressure, last decision) and a page of fragment descriptors, sized to 8 KiB. Its cursor is
-  sealed with a process-held key and bound to the revision, frontier and profile.
+  pressure, last decision), a page of fragment descriptors, and the rule a hide must meet to be
+  staged ([a hide that pays for itself](#a-hide-that-pays-for-itself)), sized to 8 KiB. Its
+  cursor is sealed with a process-held key and bound to the revision, frontier and profile.
 - **`context_manage propose`** names its base revision, frontier and profile digest, hide and
   restore deltas, and a complete replacement note array. It is validated against the complete
-  snapshot, staged, and returns `staged` — never "committed".
+  snapshot, a hide is checked against the cache rewrite it forces, and it is staged and returns
+  `staged` — never "committed".
 - **`context_recall search`** finds a literal, case-sensitive string in the session's neutral
   text and published archive objects; **`read`** returns one bounded range of one exact source
   with the digest of the whole source, for citing in a note.
@@ -216,6 +394,84 @@ deny either. They go through complete-batch admission and `before_dispatch` like
 A proposal must be the only call in its message. A batch that mixes one with any other call is
 refused whole — every call answered with `mixed_mutation_batch`, in model order — before any
 approval, goal change or executor runs.
+
+### A hide that pays for itself
+
+Provider caches are prefix caches. When an accepted proposal hides fragments, the next request is
+read uncached from the earliest fragment the proposal changed to its end, once. Every request after
+it is smaller by what was hidden. While the cache is warm, a hidden token saves only its cache-read
+price on each later step, about a tenth of the input price, and the re-read suffix costs the full
+input price. So a small hide early in a long conversation costs more than it saves: hiding 20,000
+tokens ahead of a 200,000-token suffix takes about a hundred steps to pay back.
+
+So a proposal that hides is refused before it is staged when it cannot pay its rewrite back within
+50 steps. Let `R` be the tokens the next request would be smaller by, and `S` the tokens it would
+carry from the earliest fragment the proposal hides or restores to its end:
+
+- each later step saves `R / 10`, so 50 steps save `5R`;
+- the rewrite costs `S` once;
+- so the hide is staged when `5R ≥ S`: **a hide must remove at least a fifth of what it forces to
+  be re-read.**
+
+The constants are `nanus_domain::context::managed::break_even`'s: `CACHE_READ_DISCOUNT` (10),
+`BREAK_EVEN_HORIZON_STEPS` (50) and their quotient `REREAD_PER_HIDDEN_TOKEN_MAX` (5). The rewrite
+strictly costs `0.9 S` more than a warm read would, and a cache write on Anthropic carries a
+premium of 1.25 or 2 on top. The two pull in opposite directions and are within the rounding of the
+horizon, so `S` is taken at the full input price. A hide near the end of the conversation has a
+small `S` and passes by the arithmetic alone.
+
+Both numbers are the selected adapter's estimates of the next request, from three dry preparations
+that share schemas, system prompt, notes and the probe's widest notice:
+
+1. under the accepted selection;
+2. under the candidate's hidden set;
+3. of the candidate's messages up to the first one that differs from the accepted selection's.
+
+`R` is the first less the second, and `S` the second less the third. The candidate is measured with
+the accepted notes, so a note change in the same proposal neither helps nor hurts its hide. The
+preparations are made only for a proposal that hides while no waiver applies. An inspect, a step, a
+restore and a note change cost nothing. A preparation that is refused stages the proposal, and its
+re-validation after the step checks what it always has.
+
+The rule never stops a session getting room it needs:
+
+- **Pressure.** Any hide is staged when the step's tail stated `pressure_percent` at or above 75,
+  the pressure the budget hint is given at. The working target is what the pressure is measured
+  against, so a session asked to reduce can always reduce.
+- **A lapsed cache.** Any hide is staged when the provider's cache of the session has lapsed
+  ([fitting a lapsed cache](#fitting-a-lapsed-cache)), because the next request is read uncached
+  whatever it carries. This holds whether or not `context_cold_fit` is on.
+- **Nothing hidden.** A proposal that only restores, or only changes notes, is never judged. A
+  restore is about correctness, and a note change is a different cost. A proposal that hides and
+  restores is judged on its net numbers, from the earliest fragment it changes.
+- **Not a proposal.** Hard fitting and a cold fit are automatic revisions, and the rule does not
+  reach them.
+
+Every check that refused a proposal before refuses it first, with its code: a mixed batch, a stale
+base, an invalid or protected fragment. A refusal under this rule is then an ordinary bounded tool
+failure, the form a malformed argument takes. It is a sentence giving `R`, `S`, the earliest changed
+fragment, the tokens that would pass, and what would be accepted: hide more of the resolved stretch
+in one proposal, hide later work, or wait for the pressure or a lapsed cache. It has no error code.
+Nothing is staged, no `context/decision` is recorded, the revision does not move, and later requests
+carry the same selection as if the call had been an inspect. The session records only the call and
+its failed result, which every body version already holds, so the rule changes no recorded format.
+
+An inspect page states the rule as `hide_rule`: `max_reread_per_hidden_token` (5) and `waived`
+(`pressure`, `cache_lapsed` or null), so a model can plan one proposal that passes rather than learn
+the rule by refusal. It is null on a proposal's result and when the host turned the rule off. It
+says nothing about the cache's hit rate: the ratio is a constant, and `waived` changes only when
+the pressure crosses 75 % or the cache lapses. The status carries no cache share, as before. The
+system prompt's guide is unchanged. Its sentence that one change hiding a resolved stretch is
+cheaper than several small ones is still true, and changing it would cost every managed session one
+read of its system prompt uncached.
+
+The rule decides only whether a proposal is staged, at the moment it is proposed. A proposal is the
+only call in its message, so nothing between then and its step's end can change the numbers, and
+re-validation after `StepEnd` is unchanged. So, like the working target, it is configuration rather
+than policy: a proposal staged with the rule on is as valid with it off. `context_hide_break_even`
+in the configuration file (default `true`), or `AgentRunner::with_context_hide_break_even` for a
+library host, turns it off. `nanus config` prints it. Nothing records it, and a legacy session never
+reads it.
 
 ## The step transaction
 
@@ -234,6 +490,10 @@ install what was acknowledged -> honour cancellation -> release the selection
 next step, or append and checkpoint TurnEnd before the answer is reported
 ```
 
+The automatic revision is a hard fit over the allowance, or a fit toward the working target when
+the provider's cache has lapsed. Either is decided while the request is prepared, so the sequence
+is the same for both.
+
 A step that staged no proposal is not checkpointed on its own. Nothing leaves the process between
 its settlement and the next checkpoint — the next step's intent, or the turn's end — so one commit
 carries both, and a turn of `n` steps takes `n + 1` checkpoints rather than `2n + 1`. A refused
@@ -245,6 +505,8 @@ The selection is held whenever managed mode or either admission port is active; 
 and apply after the step. The adapter-owned prepared call is frozen once: its body digest is
 recorded in the intent and the same object is dispatched, never re-encoded or re-resolved.
 
+A proposal is checked when it is proposed: its snapshot, references and deltas, then whether a
+hide pays for its cache rewrite. One that fails is answered as a failed call and never staged.
 A staged proposal is re-validated after `StepEnd`: the snapshot compare-and-set again, its
 references, the record bound, and a dry preparation proving the *next* request would fit. An
 oversized proposal is rejected as it stands — nothing is hidden on its behalf. Acceptance records
@@ -305,18 +567,23 @@ Support requires the official endpoint and a known model; anything else is unsup
 | Anthropic | `https://api.anthropic.com/v1` | `anthropic.messages` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Supported |
 
 Inception's row rests on the same local preparation and reload fixtures as the other chat
-providers, including the exact body the prepared call sends. Inception and DeepSeek have been sent
-live managed requests only without a working-data message;
-[what is and is not verified](#what-is-and-is-not-verified) records what that does and does not
-cover.
+providers, including the exact body the prepared call sends. It, `DeepSeek` and the subscription
+plan have been sent short live managed exchanges; the rest of the table has not.
+[What is and is not verified](#what-is-and-is-not-verified) records both.
 
 The output reservation must be present and within the model's declared ceiling; it is refused,
-never clamped. Every adapter validates the managed role grammar — leading system messages only
-(the system prompt and a seeded session's handoff seed), the generated message, when present,
-directly after the first user message and never last, every surviving call paired with exactly one
-result, and a conversation that ends with a user message or tool results, which is where the tail
-goes. Generated data is identified by that
-position; a model reply elsewhere that opens with the same label is sent as the reply it is.
+never clamped. Every adapter validates the managed role grammar:
+
+- leading system messages only (the system prompt and a seeded session's handoff seed);
+- the generated message, when present, where `ChatRequest::working_data` names it: after the
+  conversation's first message, an assistant message of labelled text alone, and followed by a
+  user or an assistant message, so it is never last and never parts a call from its result;
+- every surviving call paired with exactly one result;
+- a conversation that ends with a user message or tool results, which is where the tail goes.
+
+The checks are `ChatRequest::check_working_data`, shared by every adapter. Generated data is
+identified by that index, which the compiler states beside the messages as it states the tail. A
+model reply anywhere that opens with the same label is sent as the reply it is.
 Under managed preparation the chat decoders also bound a call's arguments before its name is
 known, at one record.
 
@@ -370,8 +637,9 @@ in what the managed compiler selected, the tail, and the head breakpoint:
 - A result is a `function_call_output`. A result that carries images is answered with its label,
   and the original text and pixels follow as one `user` item once the whole group of results has
   been answered.
-- The generated working-data message is an `assistant` item directly after the first user item,
-  and never last.
+- The generated working-data message is an `assistant` item of `output_text` where the compiler
+  names it, and never last. It may follow a `function_call_output` or an assistant item and
+  precede a `user` or an `assistant` item.
 
 History is always plain. The body carries `store: false` and never `previous_response_id`,
 `include`, a reasoning item, or any other protocol's replay. An assistant turn recorded with replay
@@ -462,15 +730,18 @@ opts in:
 Under `Short` every breakpoint is five minutes. Under `Long` every breakpoint is one hour. A cache
 write costs 1.25 times the input price for five minutes and twice the input price for one hour. A
 cache read costs a tenth of the input price or less (a twentieth on Opus 5.5), so a five-minute
-entry pays for itself on its second read and a one-hour entry on its third.
+entry pays for itself on its second read and a one-hour entry on its third. The retention also
+tells a managed runner when its cache has lapsed ([fitting a lapsed cache](#fitting-a-lapsed-cache)).
 
 **Anthropic breakpoints** are computed over the encoded `messages` array:
 
 1. the first `system` block, which is the harness's system prompt. A seed or a compaction summary
    follows in later blocks, so the entry is shared by every session with the same model, tools and
    prompt;
-2. the last block of the head: the working-data message when present, otherwise the first `user`
-   message;
+2. the last block of the head, which is the first `user` message. The working-data message is not
+   marked: it is placed where the previous request ended, so breakpoint 3 or 4 of this request
+   falls on it or just after it, and the entry the previous request wrote at its end is within
+   the lookback;
 3. the last block of the message immediately before the last `assistant` message. That is where
    the previous request wrote its entry, so the next request reads it even when more than twenty
    blocks were appended in between;
@@ -498,9 +769,10 @@ API plan, when the runner opted into caching, two parts carry
    anything session-specific. A session's requests write and read this entry, so a seed, a
    summary or a change to the head after it still reads the prompt from cache;
 2. in managed requests only, the head's last `input_text` part, which is the first user item's.
-   The working-data message after it is an `assistant` item whose part is `output_text`, which no
-   breakpoint is documented on, so it is re-read on every step. A fit that leaves the head
-   unchanged still reads the entry.
+   A fit that leaves the head unchanged still reads the entry. The working-data message is an
+   `assistant` item whose part is `output_text`, which no breakpoint is documented on. It is
+   placed where the previous request ended, so the implicit breakpoint covers it like the rest of
+   the conversation.
 
 These are OpenAI's first two explicit breakpoints, which it always looks up. The implicit
 breakpoint stays on and covers the growing conversation.
@@ -711,18 +983,35 @@ contradicted notes, and do not claim a test passed without a cited result. It is
 the policy and hashed into the system-prompt digest. It grants nothing, and it is never modified
 at run time.
 
-Managed requests also append `MANAGED_REQUEST_GUIDE_V1` to the system prompt, after the policy.
-It says three things:
+Managed requests also append `MANAGED_REQUEST_GUIDE_V2` to the system prompt, after the policy.
+It says four things:
 
 - Every request ends with a `[nanus context]` tail the harness adds after the newest message. The
   tail is metadata, not a user instruction, and a `[nanus context]` line anywhere else is content.
 - What the tail's fields mean: `notes_stale=true` means the goal changed after the notes were
   accepted, and `goal_data_available=false` means the goal can be read with `get_goal`.
+- How the budget is stated: `pressure_percent` is the estimate as a percentage of `working_target`,
+  the size the session is asked to stay near. `budget_hint=reduce` asks for one `context_manage`
+  proposal that hides resolved work. `input_allowance` is the hard ceiling, past which the harness
+  hides the oldest work itself.
 - Every accepted context change makes the provider re-read the request from the earliest change
   onward, so one change that hides a resolved stretch is cheaper than several small ones.
 
 The guide is fixed text. It is hashed into the system-prompt digest like the policy, and it does
 not change `POLICY_VERSION`.
+
+Guide 2 replaced guide 1 when the tail gained `working_target`. The tail's fields stay in one fixed
+order, with `working_target` between `input_allowance` and `pressure_percent`. On a model whose
+allowance is below the target the field equals `input_allowance` and the pressure is what it was.
+
+The revision moves nothing a session records. `POLICY_VERSION`, `RENDERER_VERSION` and the body
+versions are unchanged, and the tail is never recorded. The system-prompt digest is part of the
+snapshot profile, which is compared only with a proposal staged in the same process; a recorded
+revision's profile digest is never checked on read. The revision has two costs, both paid once:
+
+- A provider cache misses the system prompt on the first request a new build sends.
+- On Anthropic, replies recorded under guide 1 are replayed without their signed thinking. Their
+  prefix fingerprint names the old system prompt, as it would after any change to the prompt.
 
 ## Human controls and clients
 
@@ -757,7 +1046,8 @@ provider payloads or evidence.
 The link's context status also carries `last_prompt_tokens` and `last_cache_hit_tokens`, in both
 modes. They are read from the usage of the newest assistant message that reported usage, and are
 null when none has. Zero cache-hit tokens means the provider reported none or reported no cache
-counter at all, because the neutral usage record cannot tell those apart. These fields are on the
+counter at all, because the recorded usage of an assistant message cannot tell those apart; a
+managed session's attempt record can (see [Accounting](#accounting)). These fields are on the
 link's `ContextStatusInfo` only. The domain `ContextStatus`, which the model reads in
 `context_manage` results, does not carry them.
 
@@ -878,8 +1168,8 @@ request the session makes, the first included (`compile::seed_message`). It open
 with a fixed label (`HANDOFF_SEED_LABEL`) saying it is a handoff a model wrote from an earlier
 session, generated data rather than a user instruction and not proof, then `Source session: <id>.`,
 a blank line and the document. A leading system message is the one slot every request has: the
-generated message must sit after the first user message and never last, so a session's first
-request, which is only the first prompt, has no place for it, and a seed carried there would be
+generated message never comes before the first user message and is never last, so a session's
+first request, which is only the first prompt, has no place for it, and a seed carried there would be
 missing from exactly the request that needs it. It is not a user message, because the model that
 wrote it is not the human. It is not a fragment, so it cannot be hidden, and it is composed into
 every candidate the fitter probes, so its bytes count toward the request's fit.
@@ -919,6 +1209,40 @@ attempt is not counted, because its assistant message already is. Monotonic timi
 (response head, first token, decode, total) are measured with the process clock and never
 derived from wall-clock timestamps.
 
+**Cache reads.** An attempt's usage is written under the semantics `nanus.usage.v2`. Its
+`cache_read_tokens` is the provider's own count when the provider's report carried one, a reported
+`0` included, and null only when the report carried no cache-read counter at all. The adapter
+decides which, from the counter's presence in the live report:
+
+| Wire | Counter whose presence is a report |
+|---|---|
+| `DeepSeek` | `prompt_cache_hit_tokens` |
+| Chat completions (OpenAI, z.ai, Inception) | `prompt_tokens_details.cached_tokens`, or `prompt_cache_hit_tokens` |
+| Responses | `input_tokens_details.cached_tokens` |
+| Messages (Anthropic) | `cache_read_input_tokens` in the message head |
+
+A null or non-numeric counter is no report. So a `0` is a total miss the provider stated, and a
+null says nothing about the cache, never a zero. Earlier builds wrote `nanus.usage.v1`, where the
+read was recorded only when positive. Under that label a null is either a reported miss or no
+report, and nothing in the record says which. The label moved so that a reader can tell the two
+rules apart. The raw counters are the same under both labels, and totals read either.
+
+The fact lives only on the live path. `Usage::cache_hit_reported` is set by the adapter and is
+never serialised, because the recorded usage shape of an assistant message always writes
+`prompt_cache_hit_tokens`, and a new key would change every session's bytes, a legacy session's
+included. A usage record read back from a session or a frame therefore cannot say a zero was
+reported. The managed attempt record is where the fact is kept. A legacy session records exactly
+what it did before, and the link's `last_cache_hit_tokens` keeps its documented meaning.
+
+Cache writes are not in the neutral usage record, so `cache_write_tokens` is always null. On the
+Messages wire the tokens written are counted in `cache_miss_tokens`, as before.
+
+What this does not tell a reader is *why* a step missed. A reported `0` says the provider served
+nothing from its cache. It does not say whether the request's prefix had changed since the previous
+request or the provider missed on a prefix it had seen. That needs a per-attempt record of prefix
+stability, and the attempt record cannot take a new field without moving the body version (see
+[What is and is not verified](#what-is-and-is-not-verified)).
+
 ## Errors
 
 Refusals carry one of the stable codes `unsupported_mode`, `policy_denied`, `stale_base`,
@@ -936,8 +1260,9 @@ of a compacted session), `handoff_unavailable` (a handoff asked of a legacy, bus
 session or with none attached, an interrupted draft, a narrative or seed that breaks the text rule,
 or a malformed seed or back-link) and `stale_draft` (a commit whose draft base moved, or whose draft
 id is not the one held). Over the link a refusal's code travels in `Frame::Refused.code` beside a
-sentence that never repeats it. A malformed tool argument is an ordinary bounded tool failure; a
-failed context edit never invalidates an earlier result or retries a command.
+sentence that never repeats it. A malformed tool argument is an ordinary bounded tool failure, and
+so is a hide refused because it cannot pay for its cache rewrite: it has no code, and records no
+decision. A failed context edit never invalidates an earlier result or retries a command.
 
 ## What is and is not verified
 
@@ -952,6 +1277,10 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   - every wire: the placement of the elision tail.
 
   The runner compares a legacy run through both entry points;
+- the working data's anchor: where its text last changed, before the reply that changed it, after
+  a user message, deferred while nothing follows, before the next kept message when its reply is
+  hidden, unmoved by a fit or a phase change, identical after a reload, and a staged candidate
+  placed where its revision will be;
 - fragment derivation, protection, compilation, hard fitting, proposal staging and revalidation,
   the reset barrier and the boundary schema (a test checks every payload against
   `context-management.schema.json`);
@@ -987,7 +1316,13 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   budget bounding the reservation a host's enable records;
 - the three-part layout. On every adapter and wire:
   - three consecutive steps of a managed turn encode with a stable prefix;
-  - the first-turn exception breaks only after the first user message;
+  - a goal set before the first prompt appears at the end of the first request, which stays a
+    prefix of the second;
+  - a goal a model creates mid-session leaves the previous request a prefix, which the head
+    layout failed, and the steps after it stay stable;
+  - a note change rewrites only from the earlier copy: the previous request without it is a prefix;
+  - the working data, named by index, is refused when last, between a call and its result, first,
+    or naming another message, and a reply that opens with its label is sent as a reply;
   - a fit leaves the head unchanged when it changes no notes;
   - the tail is always the last content and is never recorded;
   - a message encodes identically whether or not it is the newest;
@@ -1002,6 +1337,58 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   over a local listener;
 - the legacy fitter: its elision notice is costed and carried as the tail, never as a message, on
   every wire, and the fitter's choice of turns is the same as before for the same budget;
+- the cache read in an attempt's usage. On every adapter's decoder, a reported `0` is a report and
+  an absent or null counter is not. The attempt record writes them as `0` and null under
+  `nanus.usage.v2`, and reads them back as such. A `nanus.usage.v1` record keeps its totals and is
+  never read as a reported zero. The recorded usage shape of an assistant message is byte-identical
+  either way;
+- the working target. The domain tests check its clamp to the allowance and its default. They also
+  check the tail's `working_target` and pressure against it, and the hysteresis against the target
+  (75 % to fire, below 60 % to re-arm, four steps apart) where the same estimates against a
+  922,000-token allowance would never fire. Through the real runner:
+  - a turn over the target and far under the allowance carries the hint once and hides nothing;
+  - one under the target carries none;
+  - the default nudges a 995,904-token allowance at about 160,000 estimated tokens and not at
+    100,000;
+  - a small window's requests are byte-identical with and without a target above its allowance;
+  - a target far under a small allowance leaves every fit and every request's conversation as it
+    was;
+- fitting a lapsed cache. The domain tests check `fit_to` toward a bound: oldest first to 60 % of
+  it, nothing at or under it, a floor over it fitted as far as it goes and never refused, nothing
+  eligible or no room for an id leaving the request alone, and the allowance still refusing a floor
+  over it. They also check `last_request_ms` against a clock set back. Anthropic's adapter states
+  its TTLs at its own endpoint and nothing at a proxy. Through the real runner, with a scripted
+  model and a clock the test moves (`nanus-bundle/tests/managed_cold_fit.rs`):
+  - a resume an hour and a millisecond later hides the oldest eligible fragments to under 60 % of
+    the target. It records one automatic revision before the intent of the request built from it,
+    lists it in the tail, keeps every user message, and fits nothing more on the step after;
+  - the same resume after exactly an hour, with no gap, or with the switch off sends identical
+    requests and records no revision;
+  - a cold resume under the target changes nothing;
+  - a resume of the session read back from its JSONL fits exactly as the one held in memory, and
+    sends the same requests;
+  - a stated lifetime's boundary, to the millisecond, under `Short` and `Long`, and an unstated one,
+    or no retention, taken as an hour;
+  - a protected floor over the target hides every eligible fragment and is sent;
+  - a session enabled after legacy turns is not fitted on its first managed request, and is on its
+    next cold start;
+  - over the allowance, a warm resume hard-fits identically with the switch on or off, and a cold
+    one hides more;
+- a hide that pays for itself. The domain tests check the rule at its boundary (20,000 hidden ahead
+  of 200,000 re-read is refused, 40,000 passes), a candidate that removes nothing, the waivers, the
+  earliest changed fragment, and the inspect payload against the schema. Through the real runner,
+  with a scripted model whose estimate is its body's size (`nanus-bundle/tests/managed_hide_break_even.rs`):
+  - a small early hide ahead of thousands of tokens is refused with its numbers. Nothing is staged
+    or decided, the revision stays 0, and the next request begins with every message of the one
+    before it and hides nothing;
+  - the same hide is staged and accepted under pressure, once the cache has lapsed (with cold
+    fitting on or off, and refused at exactly the lifetime), and with the rule off;
+  - a hide of the whole resolved stretch, and a hide of the latest eligible fragment, are staged;
+  - a restore of the earliest fragment and a note change alone are staged, and a note does not
+    carry a small hide with it;
+  - a mixed batch is still refused whole with `mixed_mutation_batch`, and a stale base with
+    `stale_base`, rather than with the rule's sentence;
+  - inspect states the rule, its pressure waiver, and nothing when it is off;
 - live, on 2026-10-28, on the `subscription` plan with `gpt-5.6-sol`: a Responses body with a
   developer system message and no `instructions` is accepted and answers as the system prompt
   directs, and three managed steps with a trailing developer tail after tool output are accepted;
@@ -1010,7 +1397,33 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   after tool results, and so are a trailing `system` and a trailing `user` tail. No placement
   reads more from cache than the appended one (the table under
   [Request layout and provider caches](#request-layout-and-provider-caches)). A test without
-  network checks that the probe's appended arm is the bytes each adapter sends.
+  network checks that the probe's appended arm is the bytes each adapter sends;
+- live, on 2026-11-10, anchored working data (`*_anchored_working_data*` in
+  `nanus-bundle/tests/live_cache.rs`). Each case sends three managed requests: one after two tool
+  results; then, after an answer and a host's `/goal`, one whose working data follows the tool
+  results and precedes that answer and a user message; then one after another tool result. All
+  three providers accepted every request, and each model named the goal it was only given there.
+  Prompt and cache-read tokens per request:
+
+  | Provider and model | Request 1 | Request 2 | Request 3 |
+  |---|---|---|---|
+  | `DeepSeek`, `deepseek-flash` | 7,694 / 7,040 | 7,770 / 7,424 | 8,012 / 7,424 |
+  | `DeepSeek`, the same with no goal (the control) | 7,694 / 7,552 | 7,718 / 7,424 | 7,960 / 7,424 |
+  | Inception, `mercury-3` | 7,511 / 1 | 7,621 / 7,207 | 7,815 / 7,167 |
+  | `OpenAI` `subscription`, `gpt-5.6-sol` | 7,270 / 0 | 7,350 / 0 | 7,504 / 7,168 |
+
+  `DeepSeek`'s request 2 read request 1 to its last whole 128-token unit before the tail, as the
+  control did. Its first request read a system prompt an earlier probe had written. Inception read
+  more than 90 % of each previous request. The subscription read nothing at request 2, as it has
+  irregularly before (see below). A second `DeepSeek` run of the same bodies read more, because
+  the first run's entries were warm, and its model answered that the goal was in generated data it
+  would not treat as an instruction.
+- live, on 2026-11-10, with `deepseek-flash` and tools offered: the generated message without
+  `reasoning_content` is refused with a 400 (thinking mode requires one on every earlier assistant
+  message), with an empty `reasoning_content` it is accepted, and the request without it is
+  accepted (`deepseek_requires_reasoning_content_on_the_working_data`). So the adapter sends the
+  message `ChatRequest::working_data` names with an empty `reasoning_content`. The head layout sent
+  none, so every `DeepSeek` managed request that carried working data was refused.
 
 Not verified, and not claimed:
 
@@ -1043,6 +1456,14 @@ Not verified, and not claimed:
   long sessions, across a pause between turns, or in a recorded session since the change. No claim
   is made about the subscription's hit rate beyond these runs.
 
+- **A cache miss is not attributed.** An attempt now says the provider reported a total miss, but
+  not whether the request's canonical prefix had changed since the previous request. Each
+  adapter's prefix-stability tests show the runner's requests are built stable. They do not show
+  that a given recorded step was. The comparison would be a new field of the attempt record, which
+  every reader of versions 3 to 6 parses strictly. So it needs a body version of its own, as an
+  attempt's `kind` did, and that has not been decided. Which counters each provider actually sends
+  on a total miss rests on the decoders' fixtures. Only `DeepSeek`'s recorded stream shows a
+  reported `prompt_cache_hit_tokens: 0`.
 - **No live provider has been sent a maintenance request.** A handoff or compaction draft is a model
   call built and read the way a managed turn's is. The tests show the request is built and its
   response is read and refused correctly; they do not show that a provider's summary is good, or
@@ -1050,11 +1471,28 @@ Not verified, and not claimed:
 - **The subscription reservation is not enforced by the provider.** The tests show the reservation
   is charged and that the body omits it. The window the subscription is fitted to is the model's
   declared window, by decision, and has not been measured against the backend.
-- **Few paths have been sent a managed request live.** They are the subscription plan, and the
-  DeepSeek and Inception requests above, none of which carried a working-data message. The rest
-  of the provider matrix rests on wire and reload fixtures. In particular, nothing yet proves that
-  a provider accepts the generated assistant message followed by an original one, or that
-  DeepSeek, z.ai and Inception accept a generated turn without `reasoning_content`.
+- **Most of the provider matrix has not been sent a managed request live.** `DeepSeek`, Inception
+  and the subscription plan accepted anchored working data (above). The `OpenAI` API plan on
+  either wire, z.ai and Anthropic have not been sent it; they rest on wire and reload fixtures. In
+  particular nothing proves that the Messages API accepts the generated assistant turn beside an
+  original one, which its documentation says it combines into one turn, or that z.ai accepts a
+  generated turn without `reasoning_content`. A `DeepSeek` request whose history holds another
+  provider's assistant turn with no reasoning would be refused the same way the working data was;
+  that is not handled here.
+- **The working target's number is arithmetic, not a measured optimum.** It is derived from the
+  recorded sessions above. No test shows that a model acts on the hint, or what a session acting on
+  it costs.
+- **That a lapsed cache is in fact cold is the runner's inference, not a measurement.** It rests on
+  Anthropic's documented TTLs and, everywhere else, on an hour being long enough. No live run has
+  checked a provider's cache across an idle gap. No recorded session has been replayed to show what
+  a cold fit saves.
+- **The hide rule's price ratio is a documented figure, not a measured one.** A cache read at a
+  tenth of the input price is the providers' published pricing, and the 50-step horizon is a
+  judgement of how long a long turn runs. No recorded session has been replayed to show what the
+  rule saves or costs, and nothing shows that a live model plans its proposals around the rule
+  stated in inspect rather than learning it by refusal. The estimates the rule compares are the
+  adapter's, not the provider's tokens, and the suffix is measured once, at the proposal, so a
+  session that ends a few steps later never repays a hide the rule accepted under pressure.
 - **No quality or cost evaluation has been run.** The held-out exact-retention and coding-task
   suite (acceptance case T34) needs paid, repeated live runs and has not been authorised, so there
   is no claim that managed context improves anything, and the default stays legacy.

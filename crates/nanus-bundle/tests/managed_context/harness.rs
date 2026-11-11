@@ -19,8 +19,8 @@ use nanus_domain::{
 use nanus_ports::{
     ChatRequest, CheckpointError, CheckpointReason, CheckpointView, ExpectedCheckpoint,
     FinishReason, LlmEvent, LlmPort, LlmResult, LlmStream, LocalBoxFuture, ManagedRequest,
-    ManagedSupport, ModelCapabilities, PreparedModelCall, Reconciled, RequestEstimate,
-    SessionCheckpoint, TurnRuntime,
+    ManagedSupport, ModelCapabilities, PreparedModelCall, PromptCacheRetention, Reconciled,
+    RequestEstimate, SessionCheckpoint, TurnRuntime,
 };
 use serde_json::{Value, json};
 
@@ -46,6 +46,8 @@ pub struct Shared {
     supported: Cell<bool>,
     layout: Cell<u32>,
     echoes: Cell<usize>,
+    /// Whether the port states a cache lifetime for the retention asked, as Anthropic's does.
+    lifetimes: Cell<bool>,
 }
 
 /// The test's handle on the model.
@@ -60,6 +62,7 @@ pub trait ModelExt {
     fn set_supported(&self, supported: bool);
     fn set_layout(&self, layout: u32);
     fn echoes(&self) -> usize;
+    fn set_cache_lifetimes(&self, stated: bool);
 }
 
 impl ModelExt for Model {
@@ -69,8 +72,9 @@ impl ModelExt for Model {
             sent: RefCell::new(Vec::new()),
             digests: RefCell::new(Vec::new()),
             supported: Cell::new(true),
-            layout: Cell::new(2),
+            layout: Cell::new(3),
             echoes: Cell::new(0),
+            lifetimes: Cell::new(false),
         })
     }
     fn push(&self, events: Vec<LlmEvent>) {
@@ -95,6 +99,9 @@ impl ModelExt for Model {
     }
     fn echoes(&self) -> usize {
         self.echoes.get()
+    }
+    fn set_cache_lifetimes(&self, stated: bool) {
+        self.lifetimes.set(stated);
     }
 }
 
@@ -134,6 +141,16 @@ impl LlmPort for Port {
             }
         } else {
             ManagedSupport::Unsupported
+        }
+    }
+    fn prompt_cache_lifetime_ms(&self, _: &str, retention: PromptCacheRetention) -> Option<u64> {
+        if !self.0.lifetimes.get() {
+            return None;
+        }
+        match retention {
+            PromptCacheRetention::None => None,
+            PromptCacheRetention::Short => Some(300_000),
+            PromptCacheRetention::Long => Some(3_600_000),
         }
     }
     fn prepare_managed(&self, request: ManagedRequest) -> LlmResult<Box<dyn PreparedModelCall>> {
@@ -207,7 +224,22 @@ struct Clock;
 
 impl nanus_ports::ClockPort for Clock {
     fn now_ms(&self) -> u64 {
-        1_700_000_000_000
+        EPOCH_MS
+    }
+}
+
+/// A clock the test moves, in milliseconds.
+pub type Time = Rc<Cell<u64>>;
+
+/// The instant every clock in these tests starts at: the fixed clock's.
+pub const EPOCH_MS: u64 = 1_700_000_000_000;
+
+/// A clock that reads the test's [`Time`].
+struct Moving(Time);
+
+impl nanus_ports::ClockPort for Moving {
+    fn now_ms(&self) -> u64 {
+        self.0.get()
     }
 }
 
@@ -235,6 +267,21 @@ pub fn runner(model: &Model, budget: u32) -> AgentRunner {
 
 /// As [`runner`], with a step budget of `steps`.
 pub fn runner_steps(model: &Model, budget: u32, steps: u32) -> AgentRunner {
+    runner_configured(model, echo_registry(model), budget, steps)
+}
+
+/// As [`runner`], on a clock the test moves.
+pub fn runner_timed(model: &Model, budget: u32, time: &Time) -> AgentRunner {
+    runner_clocked(
+        model,
+        echo_registry(model),
+        (budget, 32),
+        Rc::new(Box::new(Moving(Rc::clone(time)))),
+    )
+}
+
+/// A registry holding the one `echo` tool.
+fn echo_registry(model: &Model) -> ToolRegistryHandle {
     let mut registry = ToolRegistry::new();
     let schema = ToolSchema {
         name: ToolName::new("echo").unwrap(),
@@ -244,7 +291,7 @@ pub fn runner_steps(model: &Model, budget: u32, steps: u32) -> AgentRunner {
     registry
         .register(ToolDefinition::new(schema, Echo(Rc::clone(model))))
         .unwrap();
-    runner_configured(model, ToolRegistryHandle::new(registry), budget, steps)
+    ToolRegistryHandle::new(registry)
 }
 
 /// A runner over the scripted model and the given tools.
@@ -258,6 +305,15 @@ fn runner_configured(
     budget: u32,
     steps: u32,
 ) -> AgentRunner {
+    runner_clocked(model, tools, (budget, steps), Rc::new(Box::new(Clock)))
+}
+
+fn runner_clocked(
+    model: &Model,
+    tools: ToolRegistryHandle,
+    (budget, steps): (u32, u32),
+    clock: nanus_ports::ClockHandle,
+) -> AgentRunner {
     let config = AgentConfig::new(steps, 1, "m", 32_768)
         .unwrap()
         .with_context_budget(budget)
@@ -268,7 +324,7 @@ fn runner_configured(
         tools,
         "you are a test",
         config,
-        Rc::new(Box::new(Clock)),
+        clock,
     )
     .unwrap()
 }

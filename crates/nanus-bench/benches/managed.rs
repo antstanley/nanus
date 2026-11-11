@@ -100,6 +100,7 @@ fn compile<M: Metric>(c: &mut Criterion<M>) {
             estimate_input_tokens: Some(10_000),
             estimator: "bench".into(),
             input_allowance: 60_000,
+            working_target: 60_000,
             budget_hint: false,
             recovery_available: true,
         };

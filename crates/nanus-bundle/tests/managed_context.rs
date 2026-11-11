@@ -15,10 +15,10 @@ use harness::*;
 use nanus_bundle::{Silent, TurnHost};
 use nanus_domain::context::managed::{
     AttemptOutcome, AttemptPhase, ContextMode, ContextPolicy, DecisionOutcome, ErrorCode,
-    MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, MEMORY_LABEL, ModeActor, RevisionAuthor, limits,
+    MANAGED_REQUEST_GUIDE_V2, MANUAL_POLICY_V1, MEMORY_LABEL, ModeActor, RevisionAuthor, limits,
 };
 use nanus_domain::{Message, SessionEvent};
-use nanus_ports::{CheckpointReason, PersistenceState};
+use nanus_ports::{CheckpointReason, FinishReason, LlmEvent, PersistenceState};
 use std::rc::Rc;
 
 /// T01: a session that never enabled managed context runs, encodes and saves exactly as before.
@@ -103,16 +103,16 @@ fn activation_refuses_an_unsupported_model_without_changing_the_session() {
     );
 }
 
-/// C13: an adapter built for the earlier layout, which would drop the tail, cannot carry a
-/// managed session: enabling is refused and a session already managed is unready, both with
-/// `unsupported_mode`.
+/// C13: an adapter built for an earlier layout — one that would drop the tail, or refuse the
+/// working data anywhere but second — cannot carry a managed session: enabling is refused and a
+/// session already managed is unready, both with `unsupported_mode`.
 #[test]
 fn an_adapter_declaring_the_earlier_layout_is_unsupported() {
     let model = <Model as ModelExt>::new(Vec::new());
     let runner = runner(&model, 64_000);
     let disk = Disk::new();
     let context = context();
-    model.set_layout(1);
+    model.set_layout(2);
     let mut session = session();
     let refused = block(runner.set_context_policy(
         &mut session,
@@ -124,9 +124,9 @@ fn an_adapter_declaring_the_earlier_layout_is_unsupported() {
         refused.err().and_then(|error| error.managed_code()),
         Some(ErrorCode::UnsupportedMode)
     );
-    model.set_layout(2);
+    model.set_layout(3);
     let (managed, _, _) = managed(&runner);
-    model.set_layout(1);
+    model.set_layout(2);
     let status = runner
         .context_status(&managed, host(&disk, &context).runtime)
         .unwrap();
@@ -163,7 +163,7 @@ fn the_guide_closes_the_prompt_and_the_tail_is_never_recorded() {
             panic!("the system prompt leads")
         };
         assert!(
-            text.ends_with(&format!("{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}")),
+            text.ends_with(&format!("{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V2}")),
             "{text}"
         );
         assert_eq!(
@@ -388,7 +388,9 @@ fn a_refused_commit_carrying_a_settled_step_sends_nothing_and_keeps_its_outcome(
 #[test]
 fn a_valid_proposal_is_staged_then_accepted_after_its_step_settles() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = runner(&model, 64_000);
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = runner(&model, 64_000).with_context_hide_break_even(false);
     let (mut session, disk, context) = managed(&runner);
     // Three earlier fragments to choose from.
     model.push(call("w1", "echo", r#"{"size": 10}"#));
@@ -499,7 +501,9 @@ fn a_mixed_proposal_batch_refuses_every_call_before_any_effect() {
 #[test]
 fn reset_selects_legacy_and_a_re_enable_starts_from_an_empty_selection() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = runner(&model, 64_000);
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = runner(&model, 64_000).with_context_hide_break_even(false);
     let (mut session, disk, context) = managed(&runner);
     model.push(call("w1", "echo", r#"{"size": 10}"#));
     model.push(call("w2", "echo", r#"{"size": 10}"#));
@@ -651,7 +655,9 @@ fn a_configured_budget_bounds_a_following_reservation_and_an_explicit_one_is_kep
 #[test]
 fn a_selection_change_while_a_proposal_is_staged_lands_after_the_step_settles() {
     let model = <Model as ModelExt>::new(Vec::new());
-    let runner = Rc::new(runner(&model, 64_000));
+    // A small hide ahead of the inspect result does not pay for its cache rewrite; what is tested
+    // here is staging, so the break-even rule (`managed_hide_break_even.rs`) is off.
+    let runner = Rc::new(runner(&model, 64_000).with_context_hide_break_even(false));
     let (mut session, disk, context) = managed(&runner);
     model.push(call("w1", "echo", r#"{"size": 10}"#));
     model.push(call("w2", "echo", r#"{"size": 10}"#));
@@ -751,4 +757,262 @@ fn a_resumed_explicit_session_that_asks_for_model_records_a_following_policy_at_
         "resolved on the model in force"
     );
     assert_eq!(session.body_version(), 6);
+}
+
+/// A total cache miss the provider reported reaches the attempt record as a zero, through the
+/// real runner and checkpoint, and survives a reload; a report with no cache counter reaches it
+/// as null. Before, both were null, so the miss could not be told from silence.
+#[test]
+fn a_reported_cache_miss_is_recorded_as_zero_and_an_unreported_one_as_null() {
+    let answer = |reported: bool| {
+        vec![
+            LlmEvent::TextDelta("hello".to_owned()),
+            LlmEvent::Usage(
+                nanus_domain::Usage::new(120, 4, 0, 0, 120).with_cache_hit_reported(reported),
+            ),
+            LlmEvent::Finished {
+                reason: FinishReason::Stop,
+            },
+        ]
+    };
+    let model = <Model as ModelExt>::new(vec![answer(true), answer(false)]);
+    let runner = runner(&model, 64_000);
+    let (mut session, disk, context) = managed(&runner);
+    for prompt in ["first", "second"] {
+        let outcome = block(runner.run_turn_with_runtime(
+            &mut session,
+            prompt,
+            &mut Silent,
+            host(&disk, &context),
+        ));
+        assert!(outcome.outcome.is_ok());
+    }
+    let reads = |session: &nanus_domain::Session| {
+        attempts(session, AttemptPhase::Finished)
+            .iter()
+            .map(|attempt| attempt.usage.as_ref().map(|usage| usage.cache_read_tokens))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(reads(&session), vec![Some(Some(0)), Some(None)]);
+    let reloaded = nanus_domain::Session::from_jsonl(&disk.last().try_to_jsonl().unwrap()).unwrap();
+    assert_eq!(
+        reads(&reloaded),
+        reads(&session),
+        "the zero is on disk, not only in memory"
+    );
+}
+
+/// The value of `key` in a request's tail notice line.
+fn tail_value(request: &nanus_ports::ChatRequest, key: &str) -> String {
+    let tail = request.context_tail.as_deref().unwrap_or_default();
+    let notice = tail.lines().next().unwrap_or_default();
+    let prefix = format!("{key}=");
+    notice
+        .split(' ')
+        .find_map(|field| field.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("{key} is in the tail: {tail}"))
+        .to_owned()
+}
+
+/// A runner over the scripted model with a context budget and a named working target.
+fn targeted(model: &Model, budget: u32, target: u32) -> nanus_bundle::AgentRunner {
+    let target = core::num::NonZeroU32::new(target).unwrap();
+    let runner = runner(model, budget).with_context_working_target(target);
+    assert_eq!(runner.context_working_target(), Some(target));
+    runner
+}
+
+/// Six echoes of 1,500 bytes after a prompt of 14,000: about 3,500 estimated tokens from the
+/// first request on, growing to about 6,000, against an allowance of 95,904.
+fn growing_turn(runner: &nanus_bundle::AgentRunner, model: &Model) -> nanus_domain::Session {
+    for index in 0..6 {
+        model.push(call(&format!("g{index}"), "echo", r#"{"size": 1500}"#));
+    }
+    model.push(text("done"));
+    let (mut session, disk, context) = managed(runner);
+    let prompt = "x".repeat(14_000);
+    let outcome = block(runner.run_turn_with_runtime(
+        &mut session,
+        &prompt,
+        &mut Silent,
+        host(&disk, &context),
+    ));
+    assert!(outcome.outcome.is_ok(), "{:?}", outcome.outcome);
+    session
+}
+
+fn automatic_revisions(session: &nanus_domain::Session) -> Vec<Vec<String>> {
+    session
+        .log()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ContextRevision { payload }
+                if payload.author == RevisionAuthor::Automatic =>
+            {
+                Some(payload.hidden.iter().map(ToString::to_string).collect())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A prompt over three quarters of the working target, and far under the hard allowance, carries
+/// the hint once: pressure that stays high is not re-armed, and nothing is hidden for it.
+#[test]
+fn a_prompt_over_the_working_target_far_under_the_allowance_carries_the_hint_once() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = targeted(&model, 100_000, 4_000);
+    let session = growing_turn(&runner, &model);
+    let sent = model.sent();
+    assert_eq!(sent.len(), 7);
+    let hints: Vec<String> = sent.iter().map(|r| tail_value(r, "budget_hint")).collect();
+    assert_eq!(
+        hints.first().map(String::as_str),
+        Some("reduce"),
+        "{hints:?}"
+    );
+    assert!(hints.iter().skip(1).all(|hint| hint == "none"), "{hints:?}");
+    for request in &sent {
+        assert_eq!(tail_value(request, "input_allowance"), "95904");
+        assert_eq!(tail_value(request, "working_target"), "4000");
+        let pressure: u32 = tail_value(request, "pressure_percent").parse().unwrap();
+        assert!(pressure >= 75, "measured against the target: {pressure}");
+    }
+    assert!(
+        automatic_revisions(&session).is_empty(),
+        "hard fitting acts only over the allowance"
+    );
+    let calls: usize = sent
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| m.tool_calls().len())
+        .sum();
+    assert_eq!(calls, 6, "nothing was hidden");
+}
+
+/// The same turn under a target it never reaches three quarters of carries no hint.
+#[test]
+fn a_prompt_under_the_working_target_carries_no_hint() {
+    let model = <Model as ModelExt>::new(Vec::new());
+    let runner = targeted(&model, 100_000, 40_000);
+    let _ = growing_turn(&runner, &model);
+    let sent = model.sent();
+    assert_eq!(sent.len(), 7);
+    for request in &sent {
+        assert_eq!(tail_value(request, "budget_hint"), "none");
+        assert_eq!(tail_value(request, "working_target"), "40000");
+        let pressure: u32 = tail_value(request, "pressure_percent").parse().unwrap();
+        assert!(pressure < 75, "{pressure}");
+    }
+}
+
+/// The default target nudges a large window long before its allowance, and not before three
+/// quarters of the target.
+#[test]
+fn the_default_target_nudges_a_large_window_long_before_its_allowance() {
+    let hint_for = |prompt_bytes: usize| {
+        let model = <Model as ModelExt>::new(vec![text("ok")]);
+        let runner = runner(&model, 1_000_000);
+        assert_eq!(runner.context_working_target(), None);
+        let (mut session, disk, context) = managed(&runner);
+        let prompt = "x".repeat(prompt_bytes);
+        let outcome = block(runner.run_turn_with_runtime(
+            &mut session,
+            &prompt,
+            &mut Silent,
+            host(&disk, &context),
+        ));
+        assert!(outcome.outcome.is_ok(), "{:?}", outcome.outcome);
+        let request = model.sent().pop().unwrap();
+        assert_eq!(tail_value(&request, "input_allowance"), "995904");
+        assert_eq!(
+            tail_value(&request, "working_target"),
+            limits::DEFAULT_WORKING_TARGET_TOKENS.to_string()
+        );
+        tail_value(&request, "budget_hint")
+    };
+    // About 160,000 estimated tokens: 80 % of the target, 16 % of the allowance.
+    assert_eq!(hint_for(640_000), "reduce");
+    // About 100,000: half the target.
+    assert_eq!(hint_for(400_000), "none");
+}
+
+/// The fitting turn under a 12,000-token budget (allowance 7,904), with or without a target:
+/// what was sent, and the hidden set of every automatic revision.
+fn long_fitted_turn(target: Option<u32>) -> (Vec<nanus_ports::ChatRequest>, Vec<Vec<String>>) {
+    let mut script = Vec::new();
+    for index in 0..8 {
+        script.push(call(&format!("c{index}"), "echo", r#"{"size": 3000}"#));
+    }
+    script.push(text("done"));
+    let model = <Model as ModelExt>::new(script);
+    let runner = target.map_or_else(
+        || runner(&model, 12_000),
+        |target| targeted(&model, 12_000, target),
+    );
+    let (mut session, disk, context) = managed(&runner);
+    let outcome = block(runner.run_turn_with_runtime(
+        &mut session,
+        "the long task",
+        &mut Silent,
+        host(&disk, &context),
+    ));
+    assert!(outcome.outcome.is_ok(), "{:?}", outcome.outcome);
+    (model.sent(), automatic_revisions(&session))
+}
+
+/// A model whose allowance is under the target is nudged exactly as before: the target is the
+/// allowance, so a named target above it changes no byte of any request, and the pressure is the
+/// estimate against the allowance.
+#[test]
+fn a_small_window_under_the_target_is_nudged_exactly_as_before() {
+    let (default, default_fits) = long_fitted_turn(None);
+    let (named, named_fits) = long_fitted_turn(Some(500_000));
+    assert_eq!(
+        default, named,
+        "a target above the allowance is the allowance"
+    );
+    assert_eq!(default_fits, named_fits);
+    let mut hinted = false;
+    for request in &default {
+        assert_eq!(tail_value(request, "working_target"), "7904");
+        assert_eq!(tail_value(request, "input_allowance"), "7904");
+        let estimate: u32 = tail_value(request, "estimate_input_tokens")
+            .parse()
+            .unwrap();
+        let pressure: u32 = tail_value(request, "pressure_percent").parse().unwrap();
+        assert_eq!(
+            pressure,
+            nanus_domain::context::managed::compile::pressure_percent(estimate, 7_904)
+        );
+        hinted |= tail_value(request, "budget_hint") == "reduce";
+    }
+    assert!(hinted, "the allowance's own pressure still gives the hint");
+}
+
+/// A target far under a small allowance moves the hint and nothing else: fitting hides exactly
+/// what it hides without one, at the same steps, because it acts only over the hard allowance.
+#[test]
+fn hard_fitting_acts_over_the_allowance_and_never_at_the_target() {
+    let conversations = |sent: Vec<nanus_ports::ChatRequest>| -> Vec<Vec<Message>> {
+        sent.into_iter().map(|request| request.messages).collect()
+    };
+    let (plain, plain_fits) = long_fitted_turn(None);
+    let (with_target, target_fits) = long_fitted_turn(Some(1_000));
+    assert!(
+        !plain_fits.is_empty(),
+        "the allowance is passed, so fitting acts"
+    );
+    assert_eq!(
+        plain_fits, target_fits,
+        "the target hides nothing of its own"
+    );
+    assert_eq!(
+        conversations(plain),
+        conversations(with_target),
+        "every request carries the same conversation"
+    );
 }

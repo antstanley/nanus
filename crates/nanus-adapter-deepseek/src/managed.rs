@@ -18,16 +18,19 @@
 //! - a conversation that opens with a user message and ends with a user message or tool results,
 //!   whose content the tail is appended to;
 //! - at most one generated working-data message — an assistant text turn with no calls, no
-//!   reasoning and no replay, opening with the domain's provenance label — directly after the
-//!   first user message and never last, so it can never be an assistant prefill;
+//!   reasoning and no replay, opening with the domain's provenance label — where
+//!   `ChatRequest::working_data` names it: after the conversation's first message, never last, so
+//!   it can never be an assistant prefill, and never directly before a tool result;
 //! - every surviving tool call answered by exactly one result, in place, and no result without
 //!   its call — hiding takes whole fragments, so anything else is a projection error;
 //! - no assistant turn that only another protocol's opaque replay could express, because the
 //!   chat encoder skips such a turn and a managed request must not drop a message silently.
 //!
-//! A generated message followed by an original assistant turn puts two assistant messages side
-//! by side. Chat completions has no alternation rule, so they are sent as they are; nothing is
-//! merged, no call is invented and generated text is never promoted to a user or system role.
+//! The message is anchored where its text last changed, so it may follow a tool result or an
+//! answer and precede a user message or an original assistant turn. Beside an assistant turn it
+//! puts two assistant messages side by side. Chat completions has no alternation rule, so they are
+//! sent as they are; nothing is merged, no call is invented and generated text is never promoted
+//! to a user or system role.
 //!
 //! ## Output
 //!
@@ -38,11 +41,10 @@
 use std::collections::BTreeSet;
 
 use nanus_domain::Message;
-use nanus_domain::context::managed::compile::MEMORY_LABEL;
 use nanus_domain::context::managed::limits::{LAYOUT_VERSION, POLICY_VERSION};
 use nanus_domain::context::managed::{Digest, ErrorCode, SelectionIdentity};
 use nanus_ports::{
-    LlmError, LlmResult, LlmStream, ManagedRequest, ManagedSupport, PreparedModelCall,
+    ChatRequest, LlmError, LlmResult, LlmStream, ManagedRequest, ManagedSupport, PreparedModelCall,
     RequestEstimate, ToolArgumentLimits,
 };
 use serde_json::Value;
@@ -146,7 +148,7 @@ pub fn prepare(llm: &DeepSeekLlm, managed: ManagedRequest) -> LlmResult<Prepared
     }
     let caps = crate::metadata::capabilities(config, &request.model);
     check_output(request.max_tokens, caps.max_output_tokens)?;
-    validate_sequence(&request.messages)?;
+    validate_sequence(&request)?;
     nanus_ports::capabilities::validate_image_input(caps, &request)?;
 
     // Encoded once: the estimate, the digest and the dispatch all read this one value.
@@ -207,25 +209,13 @@ fn check_output(requested: Option<u32>, ceiling: Option<u32>) -> LlmResult<()> {
     Ok(())
 }
 
-/// Whether `message` is the generated working-data message the runner inserts.
-fn is_generated(message: &Message) -> bool {
-    matches!(
-        message,
-        Message::Assistant {
-            text: Some(text),
-            reasoning: None,
-            replay: None,
-            tool_calls,
-        } if tool_calls.is_empty() && text.starts_with(MEMORY_LABEL)
-    )
-}
-
 /// Checks the managed role grammar described in the module documentation.
 ///
 /// # Errors
 ///
 /// Returns `protocol_incompatible` naming the first rule the request breaks.
-pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
+pub fn validate_sequence(request: &ChatRequest) -> LlmResult<()> {
+    let messages = request.messages.as_slice();
     let start = messages
         .iter()
         .position(|message| !matches!(message, Message::System { .. }))
@@ -245,14 +235,10 @@ pub fn validate_sequence(messages: &[Message]) -> LlmResult<()> {
             "an assistant turn only another protocol's replay can express",
         ));
     }
-    // Only the message directly after the first user message can be the generated one. A
-    // reply elsewhere that happens to open with the label is the model's own text and is sent
-    // as it is: identifying generated data anywhere by its words would let one reply wedge
-    // every later request of its session.
-    let anchor_generated = conversation.get(1).is_some_and(is_generated);
-    if anchor_generated && conversation.len() <= 2 {
-        return Err(incompatible("generated data is never the last message"));
-    }
+    // The generated message is the one the compiler names beside the messages, never one found by
+    // its words: a reply that happens to open with the label is the model's own text and is sent
+    // as it is, so it can never wedge every later request of its session.
+    request.check_working_data()?;
     validate_pairs(conversation)?;
     // The tail is appended to the newest message, so it must be one the tail can follow.
     if !matches!(

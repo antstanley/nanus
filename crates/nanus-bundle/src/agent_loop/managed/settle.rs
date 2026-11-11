@@ -234,7 +234,8 @@ impl AgentRunner {
     ) -> Result<(), ErrorCode> {
         let caps = self.llm().capabilities(&self.model());
         let allowance = self.input_allowance(caps, turn.policy());
-        let facts = super::prepare::probe_facts(allowance);
+        let facts =
+            super::prepare::probe_facts(allowance, self.working_target(caps, turn.policy()));
         let selection = Selection {
             revision: revision.revision,
             hidden: &revision.hidden,

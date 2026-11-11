@@ -266,6 +266,21 @@ Contract to preserve:
   `--capture-shell-evidence` — a session's context policy, recorded in the session before the turn
   that uses it. Absent flags keep a resumed session's policy; a new session is legacy, and capture
   never turns managed mode on by itself. See `docs/context-management.md`.
+- `context_working_target` / `context_cold_fit` / `context_hide_break_even` — what a managed
+  session's prompt costs on the provider's prefix cache. None is recorded in a session, none reaches
+  a legacy one, and `nanus config` prints all three.
+  - `context_working_target` (default 200,000 estimated tokens, clamped to the hard allowance; zero
+    is refused) is the size a managed session is nudged toward: the tail's pressure and budget hint
+    are measured against it. It is soft. Hard fitting and refusal still answer only to the
+    allowance.
+  - `context_cold_fit` (default `true`) fits a session over that target down toward it before a
+    request sent after the provider's cache has lapsed, when the rewrite costs nothing. The fit is
+    an ordinary automatic revision.
+  - `context_hide_break_even` (default `true`) refuses, at propose time, a model's hide that removes
+    less than a fifth of what it forces the provider to re-read, unless the session is under
+    pressure or its cache has lapsed.
+
+  See `docs/context-management.md` and `docs/features.md`.
 - `NO_COLOR` — when set to anything non-empty, the interface renders with no colour at all
   (keeping bold and italic) rather than letting the backend drop the colours: the command
   that would have carried a colour to a cell collapses into a reset when colour is
@@ -517,8 +532,12 @@ design docs too.
   - The system prompt is its own cache entry, ahead of a seed or compaction summary: the first
     Anthropic `system` block, or the first part of the Responses developer system message, never
     `instructions`. The stateless replay mode is the exception.
-  - The working-data message changes only with the notes or the goal objective. The one exception
-    is its first appearance in a session that has notes or a goal before its first prompt.
+  - The working-data message changes only with the notes or the goal objective, and is anchored
+    where its text last changed: before the reply whose step changed it, after a user message, or
+    after the first user message for a change before the first prompt, and left out while nothing
+    follows. It lands where the previous request ended, so that request stays a prefix; a change
+    re-reads only from where the earlier copy stood. It is never last and never between a call and
+    its result, and adapters know it by `ChatRequest::working_data`, never by its label.
   - Adapters encode canonically and then decorate. Cache markers never enter a signed-replay
     fingerprint, and the tail enters it unless the model's live evidence says otherwise — which
     Anthropic's preserved-thinking rules say it will not, for a tail that is removed. Two or more

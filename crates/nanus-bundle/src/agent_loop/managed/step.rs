@@ -25,6 +25,9 @@ pub(in crate::agent_loop) struct StepState {
     pub(in crate::agent_loop) status: Option<ContextStatus>,
     /// A proposal staged during the step, waiting for it to settle.
     pub(in crate::agent_loop) staged: Option<Staged>,
+    /// The pressure the step's tail stated, which waives a hide's break-even rule at three
+    /// quarters of the working target.
+    pub(in crate::agent_loop) pressure: Option<u32>,
 }
 
 /// What the stream told the step, beyond the assembled message.
@@ -160,6 +163,7 @@ impl AgentRunner {
             management,
             profile,
             revision,
+            pressure,
         } = prepared;
         let attempt = self.started_attempt(session, phase.position, (&*call, revision, management));
         self.record_intent(session, turn, auto, &attempt, progress)
@@ -169,6 +173,7 @@ impl AgentRunner {
             profile: Some(profile),
             status: Some(status),
             staged: None,
+            pressure: Some(pressure),
         };
         let lease = match self.begin_managed_records(session, phase.position, turn_lease, &request)
         {
@@ -326,6 +331,7 @@ impl AgentRunner {
         let mut request = effective.clone();
         // The raw view carries every message, so nothing is hidden and it has no tail.
         request.context_tail = None;
+        request.working_data = None;
         request.messages = vec![nanus_domain::Message::system(self.managed_system_prompt())];
         request.messages.extend(session.derive_messages());
         let llm = self.llm();

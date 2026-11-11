@@ -1,16 +1,17 @@
 //! Preparing a managed request: compile, fit, freeze, and describe what was prepared.
 //!
-//! Every candidate the fitter probes is compiled by the domain and prepared by the selected
-//! adapter, so its cost is the cost of the body that adapter would send — schemas, notice,
-//! generated data, typed content and the output reservation included. The candidate that is
-//! chosen is prepared once more with its final notice, and that object is what is recorded and
-//! dispatched; nothing is re-encoded in between.
+//! The fit acts over the hard allowance and, once the provider's cache of the session has lapsed,
+//! over the working target too (see `cold.rs`). Every candidate the fitter probes is compiled by
+//! the domain and prepared by the selected adapter, so its cost is the cost of the body that
+//! adapter would send — schemas, notice, generated data, typed content and the output reservation
+//! included. The candidate that is chosen is prepared once more with its final notice, and that
+//! object is what is recorded and dispatched; nothing is re-encoded in between.
 
 use std::collections::BTreeSet;
 
 use nanus_domain::context::managed::{
     ContextFrontier, ContextMode, ContextPolicy, ContextStatus, Digest, ErrorCode, FragmentId,
-    Fragments, MANAGED_REQUEST_GUIDE_V1, MANUAL_POLICY_V1, ManagedState, NoticeFacts,
+    Fragments, MANAGED_REQUEST_GUIDE_V2, MANUAL_POLICY_V1, ManagedState, NoticeFacts,
     ProjectionRevision, ReserveBudget, Selection, SnapshotProfile, derive_effective_context, fit,
     fragments, limits, proposal, state,
 };
@@ -37,6 +38,8 @@ pub(in crate::agent_loop) struct Prepared {
     pub(in crate::agent_loop) profile: Digest,
     /// The revision the request was built from.
     pub(in crate::agent_loop) revision: u64,
+    /// The pressure its tail states: the estimate as a percentage of the working target.
+    pub(in crate::agent_loop) pressure: u32,
 }
 
 /// Everything a compile needs, folded once per preparation.
@@ -80,11 +83,15 @@ fn code_of(error: &nanus_ports::LlmError) -> ErrorCode {
 
 /// Notice facts for the fitter's probes: every field at least as long as the final notice's, so
 /// a probe never measures a candidate as cheaper than the request that is finally sent.
-pub(in crate::agent_loop) fn probe_facts(allowance: u32) -> NoticeFacts {
+///
+/// The target is the final notice's own, so the probe's pressure — the largest estimate against
+/// it — is never shorter than the pressure the final notice states.
+pub(in crate::agent_loop) fn probe_facts(allowance: u32, target: u32) -> NoticeFacts {
     NoticeFacts {
         estimate_input_tokens: Some(u32::MAX),
         estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
         input_allowance: allowance,
+        working_target: target,
         budget_hint: true,
         recovery_available: true,
     }
@@ -129,7 +136,7 @@ impl AgentRunner {
     /// guide to the tail the adapter places after the newest message.
     pub(in crate::agent_loop) fn managed_system_prompt(&self) -> String {
         format!(
-            "{}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V1}",
+            "{}\n\n{MANUAL_POLICY_V1}\n\n{MANAGED_REQUEST_GUIDE_V2}",
             self.system_prompt
         )
     }
@@ -188,8 +195,8 @@ impl AgentRunner {
         }
         let model = self.model();
         let llm = self.llm();
-        // An adapter built for an earlier layout would drop the tail, so it is not a managed path
-        // whatever policy it implements.
+        // An adapter built for an earlier layout would drop the tail or refuse anchored working
+        // data, so it is not a managed path whatever policy it implements.
         let support = llm.managed_support(&model);
         if let nanus_ports::ManagedSupport::Supported { layout_version, .. } = support
             && layout_version != limits::LAYOUT_VERSION
@@ -262,8 +269,28 @@ impl AgentRunner {
             .min(caps.max_input_tokens.unwrap_or(u32::MAX))
     }
 
+    /// The working target a managed request's soft pressure is measured against: the host's
+    /// target or the default, clamped to [`input_allowance`](Self::input_allowance).
+    ///
+    /// The one place the runner asks, so the tail, the reminder and a fit made once the provider's
+    /// cache has lapsed agree on it.
+    pub(in crate::agent_loop) fn working_target(
+        &self,
+        caps: ModelCapabilities,
+        policy: ContextPolicy,
+    ) -> u32 {
+        nanus_domain::context::managed::working_target(
+            self.input_allowance(caps, policy),
+            self.working_target,
+        )
+    }
+
     /// The request every candidate shares: model, schemas, effort and reservations.
-    fn base_request(&self, session: &Session, policy: ContextPolicy) -> ChatRequest {
+    pub(in crate::agent_loop) fn base_request(
+        &self,
+        session: &Session,
+        policy: ContextPolicy,
+    ) -> ChatRequest {
         let mut request = ChatRequest::new(self.model(), Vec::new());
         request.tools = self.managed_schemas();
         request.reasoning_effort = self.effort.get();
@@ -282,7 +309,7 @@ impl AgentRunner {
     }
 
     /// Compiles one candidate into a request.
-    fn compose(
+    pub(in crate::agent_loop) fn compose(
         &self,
         session: &Session,
         snapshot: &Snapshot,
@@ -306,6 +333,10 @@ impl AgentRunner {
         // A seeded session's handoff document leads every request, the first included, after the
         // system prompt. It is composed here, so every probe the fitter measures carries it too.
         request.messages.extend(effective.seed);
+        // Named beside the messages, at its place after the system messages just pushed.
+        request.working_data = effective
+            .working_data
+            .map(|at| at.saturating_add(request.messages.len()));
         request.messages.extend(effective.messages);
         // The notice and catalog are the tail, which the adapter places after the newest message
         // and which every probe carries too, so each is costed as what would be sent.
@@ -373,11 +404,14 @@ impl AgentRunner {
         }
         let snapshot = Self::snapshot(session)?;
         let caps = self.llm().capabilities(&self.model());
-        let allowance = self.input_allowance(caps, policy);
+        let (allowance, target) = (
+            self.input_allowance(caps, policy),
+            self.working_target(caps, policy),
+        );
         let base = self.base_request(session, policy);
         let notes = snapshot.state.notes().to_vec();
         let bound = snapshot.state.notes_goal_revision();
-        let probe = probe_facts(allowance);
+        let probe = probe_facts(allowance, target);
         let cost = |hidden: &[FragmentId], revision: u64| -> Result<u32, ErrorCode> {
             let selection = Selection {
                 revision,
@@ -394,11 +428,13 @@ impl AgentRunner {
         // The accepted selection is costed at the revision it is sent under when it fits, so
         // its probe is exactly the draft `freeze` would otherwise prepare a second time.
         let kept = core::cell::Cell::new(None);
-        let fitted = fit::hard_fit(
+        // Hard fitting over the allowance; toward the working target too once the provider's
+        // cache of this session has lapsed, when a rewritten prefix costs nothing extra.
+        let fitted = fit::fit_to(
             &snapshot.fragments,
             &snapshot.protected,
             accepted,
-            allowance,
+            self.fit_bounds(session, allowance, target),
             |hidden| {
                 if hidden == accepted {
                     let tokens = cost(hidden, current)?;
@@ -412,7 +448,7 @@ impl AgentRunner {
         .map_err(refusal)?;
         let (hidden, revision, pre) = fitted.as_ref().map_or_else(
             || {
-                // `hard_fit` costs the accepted selection before anything else, so a fit that
+                // `fit_to` costs the accepted selection before anything else, so a fit that
                 // kept it has always measured it.
                 let pre = kept.get();
                 assert!(pre.is_some(), "a kept selection was costed");
@@ -431,7 +467,7 @@ impl AgentRunner {
             turn,
             &snapshot,
             (selection, fitted.is_some()),
-            (&base, allowance, pre),
+            (&base, (allowance, target), pre),
         )
     }
 
@@ -455,7 +491,10 @@ impl AgentRunner {
         }
         let snapshot = Self::snapshot(session)?;
         let caps = self.llm().capabilities(&self.model());
-        let allowance = self.input_allowance(caps, policy);
+        let (allowance, target) = (
+            self.input_allowance(caps, policy),
+            self.working_target(caps, policy),
+        );
         let base = self.base_request(session, policy);
         let notes = snapshot.state.notes().to_vec();
         let hidden = snapshot.state.hidden().to_vec();
@@ -475,7 +514,7 @@ impl AgentRunner {
                 session,
                 &snapshot,
                 selection,
-                &probe_facts(allowance),
+                &probe_facts(allowance, target),
                 &base,
             )
             .map_err(refusal)?,
@@ -492,6 +531,7 @@ impl AgentRunner {
             estimate_input_tokens: Some(pre),
             estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
             input_allowance: allowance,
+            working_target: target,
             budget_hint: false,
             recovery_available: true,
         };
@@ -521,21 +561,24 @@ impl AgentRunner {
         turn: &ManagedTurn<'_>,
         snapshot: &Snapshot,
         chosen: (Selection<'_>, bool),
-        shared: (&ChatRequest, u32, u32),
+        shared: (&ChatRequest, (u32, u32), u32),
     ) -> Result<Prepared, BundleError> {
         let (selection, automatic) = chosen;
         // `pre` is the chosen selection's probe cost — the request with the probe's notice —
-        // which the fit has already measured; the notice is then written with it.
-        let (base, allowance, pre) = shared;
+        // which the fit has already measured; the notice is then written with it. The hard
+        // allowance refuses; here the working target decides only the hint, and the fit has
+        // already used it if the cache had lapsed.
+        let (base, (allowance, target), pre) = shared;
         if pre > allowance {
             return Err(refusal(ErrorCode::CandidateTooLarge));
         }
         let mut reminder = turn.reminder();
-        let percent = nanus_domain::context::managed::compile::pressure_percent(pre, allowance);
+        let percent = nanus_domain::context::managed::compile::pressure_percent(pre, target);
         let facts = NoticeFacts {
             estimate_input_tokens: Some(pre),
             estimator: String::from(nanus_ports::capabilities::MANAGED_ESTIMATOR),
             input_allowance: allowance,
+            working_target: target,
             budget_hint: reminder.observe(percent),
             recovery_available: true,
         };
@@ -571,12 +614,13 @@ impl AgentRunner {
             .managed_reservation(caps, turn.policy())
             .unwrap_or_else(|| turn.policy().output_reserve_tokens);
         let status = Self::status_of(
-            (session, snapshot, frontier),
+            (snapshot, frontier),
             (selection, estimate.input_tokens, &facts),
             (
                 turn.context
                     .is_some_and(|context| context.archive().is_some()),
                 &profile,
+                request.working_data.is_some(),
             ),
             reserve,
         );
@@ -588,6 +632,7 @@ impl AgentRunner {
             status,
             profile,
             revision: selection.revision,
+            pressure: percent,
         })
     }
 
@@ -611,15 +656,15 @@ impl AgentRunner {
 
     /// Builds the status a prepared request is described by.
     fn status_of(
-        at: (&Session, &Snapshot, ContextFrontier),
+        at: (&Snapshot, ContextFrontier),
         prepared: (Selection<'_>, u32, &NoticeFacts),
-        extra: (bool, &Digest),
+        extra: (bool, &Digest, bool),
         output_reserve_tokens: u32,
     ) -> ContextStatus {
-        let (session, snapshot, frontier) = at;
+        let (snapshot, frontier) = at;
         let (selection, estimate, facts) = prepared;
-        let (archive, profile) = extra;
-        let anchor_follows = session.derive_messages().len() > 1;
+        // Whether the request carries the working data: its anchor may have nothing after it yet.
+        let (archive, profile, anchor_follows) = extra;
         ContextStatus {
             mode: ContextMode::Managed,
             revision: selection.revision,
@@ -652,6 +697,7 @@ impl AgentRunner {
         let caps = self.llm().capabilities(&self.model());
         let facts = NoticeFacts {
             input_allowance: self.input_allowance(caps, turn.policy()),
+            working_target: self.working_target(caps, turn.policy()),
             recovery_available: true,
             ..NoticeFacts::default()
         };
@@ -732,6 +778,7 @@ impl AgentRunner {
         let caps = self.llm().capabilities(&self.model());
         let facts = NoticeFacts {
             input_allowance: self.input_allowance(caps, policy),
+            working_target: self.working_target(caps, policy),
             recovery_available: true,
             ..NoticeFacts::default()
         };

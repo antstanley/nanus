@@ -1945,6 +1945,15 @@ async fn show_config(args: &Options) -> Result<(), String> {
         "context budget: {}",
         context_budget_display(&config, &selection)
     );
+    println!(
+        "context working target: {}",
+        working_target_display(&config)
+    );
+    println!("context cold fit: {}", cold_fit_display(&config));
+    println!(
+        "context hide break-even: {}",
+        hide_break_even_display(&config)
+    );
     println!("max parallel tools: {}", config.max_parallel_tools);
     println!("tui detail: {}", config.tui_detail);
     println!("tui theme: {}", config.tui_theme);
@@ -2081,6 +2090,48 @@ fn context_budget_display(config: &NanusConfig, selection: &Selection) -> String
     )
 }
 
+/// Renders a managed session's working target, naming the default when the file names none.
+///
+/// Said to be soft and managed-only, because a reader comparing it with the budget above would
+/// otherwise take it for a second ceiling: it is where the model is asked to reduce, and the
+/// harness hides nothing at it while the provider's cache is warm (see `context cold fit`).
+fn working_target_display(config: &NanusConfig) -> String {
+    let what = "managed sessions; the model is asked to reduce past three quarters of it, and \
+                it is clamped to the model's allowance";
+    config.context_working_target.map_or_else(
+        || {
+            format!(
+                "{} estimated tokens (unset; {what})",
+                nanus_domain::context::managed::limits::DEFAULT_WORKING_TARGET_TOKENS
+            )
+        },
+        |tokens| format!("{tokens} estimated tokens ({what})"),
+    )
+}
+
+/// Renders whether a managed session is fitted toward its working target once its provider's
+/// cache has lapsed, saying what each answer does, since the name alone does not.
+fn cold_fit_display(config: &NanusConfig) -> &'static str {
+    if config.context_cold_fit {
+        "on (managed sessions; once the provider's cache has lapsed, old work is hidden toward the \
+         working target before the next request)"
+    } else {
+        "off (managed sessions are fitted only over the model's allowance)"
+    }
+}
+
+/// Renders whether a managed session's model is refused a hide that cannot pay for the cache
+/// rewrite it forces, saying what each answer does, since the name alone does not.
+fn hide_break_even_display(config: &NanusConfig) -> &'static str {
+    if config.context_hide_break_even {
+        "on (managed sessions; a hide that removes less than a fifth of what it makes the provider \
+         re-read is refused, unless the request is at three quarters of the working target or the \
+         cache has lapsed)"
+    } else {
+        "off (managed sessions stage every valid proposal)"
+    }
+}
+
 /// Renders a resolved path, or names the home when it cannot be resolved.
 fn resolved(path: &Result<PathBuf, String>) -> String {
     path.as_ref().map_or_else(
@@ -2187,6 +2238,28 @@ mod tests {
             ..NanusConfig::default()
         };
         assert_eq!(credential_service_display(&spelled_as_the_default), "nanus");
+    }
+
+    /// The report says cold fitting is on by default and what turning it off leaves.
+    #[test]
+    fn cold_fitting_is_reported_on_by_default_and_off_when_turned_off() {
+        assert!(cold_fit_display(&NanusConfig::default()).starts_with("on ("));
+        let off = NanusConfig {
+            context_cold_fit: false,
+            ..NanusConfig::default()
+        };
+        assert!(cold_fit_display(&off).starts_with("off ("));
+    }
+
+    /// The report says the hide break-even rule is on by default and what turning it off leaves.
+    #[test]
+    fn the_hide_break_even_rule_is_reported_on_by_default_and_off_when_turned_off() {
+        assert!(hide_break_even_display(&NanusConfig::default()).starts_with("on ("));
+        let off = NanusConfig {
+            context_hide_break_even: false,
+            ..NanusConfig::default()
+        };
+        assert!(hide_break_even_display(&off).starts_with("off ("));
     }
 
     #[test]
