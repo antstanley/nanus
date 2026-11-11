@@ -775,3 +775,46 @@ fn a_chat_gateway_takes_the_tail_appended() {
         "developer"
     );
 }
+
+/// `request` as `path` sends it, asking for the short retention and naming its cache group.
+fn cached(path: Path, request: &ChatRequest) -> ChatRequest {
+    let mut request = request.clone();
+    path.model().clone_into(&mut request.model);
+    request.prompt_cache = PromptCacheRetention::Short;
+    request.prompt_cache_key = Some(String::from("session"));
+    request
+}
+
+/// The audit's canonical encoding is the body with its tail, breakpoints and cache key removed, on
+/// every path, and three steps' encodings each extend the one before.
+#[test]
+fn the_canonical_encoding_is_the_undecorated_body_on_every_path() {
+    use nanus_ports::LlmPort as _;
+    for path in PATHS {
+        let llm = crate::OpenAiLlm::new(path.config()).unwrap();
+        let requests = three_steps(false).map(|request| cached(path, &request));
+        let encodings = requests
+            .each_ref()
+            .map(|request| llm.canonical_encoding(request).unwrap());
+        for (request, encoding) in requests.iter().zip(&encodings) {
+            let mut stripped = path.stripped(request, Layout::Managed);
+            stripped.as_object_mut().unwrap().remove("prompt_cache_key");
+            let expected = nanus_ports::CanonicalEncoding::from_body(&stripped, path.list());
+            assert_eq!(*encoding, expected, "{path:?}");
+        }
+        assert_eq!(encodings[0].divergence(&encodings[1]), None, "{path:?}");
+        assert_eq!(encodings[1].divergence(&encodings[2]), None, "{path:?}");
+        // A history edited at its first prompt parts inside the conversation, past the head.
+        let mut edited = requests[2].clone();
+        let first = edited
+            .messages
+            .iter()
+            .position(|message| matches!(message, Message::User { .. }))
+            .unwrap();
+        edited.messages[first] = Message::user("an edited first prompt");
+        let offset = encodings[1]
+            .divergence(&llm.canonical_encoding(&edited).unwrap())
+            .unwrap();
+        assert!(offset >= encodings[1].offset_of(1), "{path:?}: {offset}");
+    }
+}

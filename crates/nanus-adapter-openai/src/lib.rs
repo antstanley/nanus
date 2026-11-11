@@ -650,6 +650,25 @@ impl LlmPort for OpenAiLlm {
         managed::support(&self.config, model)
     }
 
+    fn canonical_encoding(&self, request: &ChatRequest) -> Option<nanus_ports::CanonicalEncoding> {
+        // The stateless replay mode binds its receipts to a body of its own, which is not a path
+        // either managed or ordinary requests share, so nothing is stated for it.
+        if self.config.stateless_responses() {
+            return None;
+        }
+        let undecorated = request.undecorated();
+        Some(match self.protocol_of(request) {
+            Protocol::ChatCompletions => nanus_ports::CanonicalEncoding::from_body(
+                &wire::build_request(&self.config, &undecorated),
+                "messages",
+            ),
+            Protocol::Responses => nanus_ports::CanonicalEncoding::from_body(
+                &responses::encode(&self.config, &undecorated, Layout::Managed),
+                "input",
+            ),
+        })
+    }
+
     fn prepare_managed(
         &self,
         request: nanus_ports::ManagedRequest,

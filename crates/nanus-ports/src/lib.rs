@@ -65,6 +65,7 @@
 )]
 
 pub mod artifact;
+pub mod canonical;
 pub mod capabilities;
 pub mod clock;
 pub mod context;
@@ -92,6 +93,7 @@ pub use artifact::{
     ArtifactError, ArtifactHandle, ArtifactStore, CaptureFailure, CaptureFinalization,
     CaptureLease, CaptureLimits, RawCaptureSink, SendBoxFuture,
 };
+pub use canonical::CanonicalEncoding;
 pub use capabilities::{ImageInputSupport, ImageProfile, ModelCapabilities, RequestEstimate};
 pub use clock::{ClockHandle, ClockPort};
 pub use context::{

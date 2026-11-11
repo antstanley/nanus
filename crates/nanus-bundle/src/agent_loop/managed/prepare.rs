@@ -379,7 +379,10 @@ impl AgentRunner {
     }
 
     /// Prepares a candidate with the selected adapter, refusing what it cannot carry.
-    fn prepare_call(&self, request: ChatRequest) -> Result<Box<dyn PreparedModelCall>, ErrorCode> {
+    pub(super) fn prepare_call(
+        &self,
+        request: ChatRequest,
+    ) -> Result<Box<dyn PreparedModelCall>, ErrorCode> {
         let epoch = self
             .selection
             .epoch()

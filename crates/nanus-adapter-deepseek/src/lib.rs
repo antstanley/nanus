@@ -288,6 +288,12 @@ impl LlmPort for DeepSeekLlm {
         managed::support(&self.config, model)
     }
 
+    fn canonical_encoding(&self, request: &ChatRequest) -> Option<nanus_ports::CanonicalEncoding> {
+        // The tail is the only decoration this wire has: it carries no cache hints.
+        let body = wire::build_request(&self.config, &request.undecorated());
+        Some(nanus_ports::CanonicalEncoding::from_body(&body, "messages"))
+    }
+
     fn prepare_managed(
         &self,
         request: nanus_ports::ManagedRequest,

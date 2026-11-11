@@ -1237,11 +1237,131 @@ what it did before, and the link's `last_cache_hit_tokens` keeps its documented 
 Cache writes are not in the neutral usage record, so `cache_write_tokens` is always null. On the
 Messages wire the tokens written are counted in `cache_miss_tokens`, as before.
 
-What this does not tell a reader is *why* a step missed. A reported `0` says the provider served
-nothing from its cache. It does not say whether the request's prefix had changed since the previous
-request or the provider missed on a prefix it had seen. That needs a per-attempt record of prefix
-stability, and the attempt record cannot take a new field without moving the body version (see
-[What is and is not verified](#what-is-and-is-not-verified)).
+What the record does not tell a reader is *why* a step missed. A reported `0` says the provider
+served nothing from its cache. It does not say whether the request's prefix had changed since the
+previous request or the provider missed on a prefix it had seen. The attempt record is not made to
+say it: a new field would move the body version, and every reader of versions 3 to 6 would refuse
+the sessions written with it. The question is answered offline instead, from sessions already
+recorded, by `nanus sessions cache` (below).
+
+### Auditing a session's cache reads
+
+```sh
+nanus sessions cache <name|id>          # a table, and a one-line verdict
+nanus sessions cache --json <name|id>   # the same audit, for a script
+```
+
+Preparation is deterministic, so a recorded request can be prepared again. The audit walks the
+log. For each managed request it takes the log as that request's preparation saw it: every event
+before the automatic revision and the intent its checkpoint recorded. It prepares the request
+through the runner's own path (`AgentRunner::rederive_managed_request`). That path compiles the
+selection the log accepted, or the automatic revision recorded with the intent, and prepares the
+probe whose estimate the tail states, then the final request. The audit claims the request only
+when BLAKE3 of the prepared body equals the intent's `request_digest`. Two consecutive claimed
+requests are then compared by the adapter's canonical encoding (`LlmPort::canonical_encoding`):
+the body its own encoder makes with no tail, no cache hints and no cache key, as one unit for
+everything but the conversation and then one unit per conversation item. The earlier is a prefix
+of the later unit by unit, or the audit names the byte, over the earlier encoding, where they part.
+
+The digest covers the decorated body, tail included, so everything the tail states has to be
+reproduced, and is:
+
+- the estimate is the probe's, which the audit prepares exactly as the step did;
+- the allowance and the working target are the configuration's;
+- the goal, the notes, the catalog and the revision are the log's;
+- the budget hint is process-held reminder state that no record carries. It can only have been
+  given at 75 % pressure or more, and only there is it tried both ways.
+
+What a request records only in part is searched, and the digest decides. The provider, endpoint
+(by digest), wire and model are the intent's; every plan of that provider is a candidate. The
+effort is tried as the recorded spelling and then every step. The retention is tried short, long
+and none, and a match says which one the request asked for. The system prompt is the configured
+one with its runtime section: the session's workspace, and the model, approval and sandbox states
+the session's origin recorded and then the configuration's. Adapters are built with a placeholder
+key, because a body never carries a credential and nothing built is sent. The combination that
+matched is tried first for the route's next request. A route whose first two exhaustive searches
+fail is then tried only under the combination that came closest, so a long session recorded by
+another build costs a few preparations per request. Sessions of several hundred requests audit in
+seconds.
+
+**What a verified row proves.** This build, under this configuration, prepares from the recorded
+log a body identical to the one that was dispatched. The canonical encoding is taken of that same
+request by that same encoder, before decoration, which is a pure function of the canonical body,
+the tail and the retention (see [Request layout and provider caches](#request-layout-and-provider-caches)).
+So a comparison between two verified rows is a comparison of what the provider was offered.
+
+**What it does not prove.** It says nothing of what a provider's cache held or how it counts:
+
+- An offset is bytes, not tokens.
+- A stable prefix read short of the previous prompt is the provider's, whatever rule of its own
+  explains it: entries ending on whole units, a minimum cacheable length, or a lookback window.
+- An expiry is the runner's own inference. The lifetime is the one the adapter states for the
+  retention that matched, or an hour when it states none, as for
+  [a lapsed cache](#fitting-a-lapsed-cache).
+
+**What cannot be verified** is reported as `unverified`, with the reason, and never attributed:
+
+- a request recorded by another build: any change to the system prompt, the schemas, the tail's
+  notice or an encoder changes every body, so a session recorded before the working target
+  entered the tail does not verify under this build;
+- a configuration changed since: the system prompt, the context budget, the working target, the
+  step budget, or approval and sandbox states the origin did not record;
+- a host's own tools or the optional `read_video` tool, which this audit does not offer;
+- a handoff draft, which it does not prepare again;
+- any request whose previous request could not be verified, because there is nothing proven to
+  compare it with.
+
+**Legacy requests** record no intent and no digest. The audit rebuilds each one from the log before
+its `StepStart`, through the runner's own whole-turn fitter under the configuration. It compares
+rebuilt requests the same way and labels every answer that rests on one `rebuilt, not
+digest-verified` (`"basis": "rebuilt"`). A rebuilt request is what this configuration would have
+sent, not proof of what was. Legacy steps record no times, so their idle gaps are unknown.
+
+Each row says, in order: the turn and step; the kind (`managed`, `legacy` or `handoff`); the model;
+the prompt tokens; the cache read as recorded; the seconds since the previous request finished;
+the projection revision; whether it was verified (`digest`, `rebuilt` or `no`); and the
+attribution. The cache read is the provider's count when it reported one, zero included. Otherwise
+it is `not reported` (a `nanus.usage.v2` null), `0 or none` (a `nanus.usage.v1` null or a reply's
+usage, which cannot tell a reported zero from no report), or `-` when nothing was recorded. The
+attribution classes are:
+
+| Class | The row says | Whose |
+|---|---|---|
+| `first` | `first`: nothing earlier to read | — |
+| `prefix_changed` | `prefix changed at <byte> of <previous length> bytes (<causes>)` | nanus's |
+| `hit` | `prefix stable, hit`: the read is within `max(1024, 10 %)` tokens of the previous prompt | — |
+| `provider_miss_expired` | `prefix stable, provider read less: cache expired (idle … > lifetime …)` | the provider's, and expected |
+| `provider_miss_unexplained` | `prefix stable, provider read less: unexplained (idle … within lifetime …)` | the provider's |
+| `provider_miss_idle_unknown` | the same, for a request whose gap is not recorded | the provider's |
+| `stable_unmeasured` | `prefix stable`, but the read or the previous prompt was not reported | not known |
+| `not_sent` | refused before dispatch | — |
+| `unverified` | `unverified: <reason>` | no claim |
+
+A change's causes are what the log records between the two requests that changes a prefix:
+
+- a revision that hid or restored fragments, naming who made it;
+- a note change, which moves the working data;
+- a goal whose objective changed, which moves the working data too; a goal that only appears
+  extends the prefix;
+- a policy change, a seed or a compaction cut;
+- a model, effort or route change between the two intents;
+- for rebuilt legacy requests, the fitter leaving out more or fewer turns.
+
+A change with none of these says `no recorded cause`. The slack (`HIT_SHORTFALL_TOKENS`,
+`HIT_SHORTFALL_PERCENT` in `nanus_bundle::cache_audit`) is the layout working, not a miss. The
+tail is the request's last content, and every provider here ends its entries on units before it.
+
+The summary gives the requests, how many were verified, rebuilt or neither, the prompt and
+cache-read totals and their share over the requests that reported both, and each class's
+requests, prompt, read and unread tokens. Its verdict line puts the question in one line: `ours`
+is `prefix_changed`, and `theirs` is every `provider_miss_*`, with its expired and unexplained
+counts. `--json` writes the audit itself: `{session, requests, summary}`. Each request has `turn`,
+`step`, `kind`, `model`, `prompt_tokens`, `cache_read` (`state`, and `tokens` when reported),
+`idle_ms`, `lifetime_ms`, `revision`, `verification` (`basis`, and `retention` and `budget_hint` or
+`reason`) and `attribution` (`class` and its fields). The command exits non-zero only when the
+session cannot be read: an audit that finds misses has done its job. It writes nothing, takes no
+claim, and reads the session as `nanus sessions show` does, so a session an agent is holding is
+read as it stood on disk.
 
 ## Errors
 
@@ -1342,6 +1462,27 @@ three adapter crates' encoders and decoders, including OpenAI's Responses wire, 
   `nanus.usage.v2`, and reads them back as such. A `nanus.usage.v1` record keeps its totals and is
   never read as a reported zero. The recorded usage shape of an assistant message is byte-identical
   either way;
+- the cache audit (`nanus-bundle/tests/cache_audit.rs`, the stock routes' tests in
+  `nanus-bundle/src/compose/audit.rs`, and `nanus-cli/tests/cache_audit_cli.rs`). Sessions recorded
+  by the real runner and saved through the real store are prepared again to their digests:
+  - a stable three-step turn is a hit at every step after the first;
+  - an accepted hide parts inside the hidden fragment's first message, naming the revision;
+  - a goal that appears extends the prefix, and one whose objective changes moves the working
+    data;
+  - a reported zero after more than the stated lifetime is an expiry, and at exactly the lifetime
+    is unexplained;
+  - a reported zero and an unreported read are recorded and attributed apart;
+  - a runner configured otherwise, or a tampered digest, is unverified, and so is the request after
+    the tampered one;
+  - a legacy session's requests are rebuilt and labelled, and enabling managed context is the
+    first managed request's cause;
+  - the JSON form round-trips.
+
+  Through each stock adapter, with no key, a recorded turn verifies: `DeepSeek`, Inception, z.ai
+  and Anthropic through the stock runner with the reply scripted, and `OpenAI`'s Responses wire
+  through the real binary against a local listener. The binary's run is unverified when audited
+  against another endpoint. Each adapter's canonical encoding is its body without tail, markers or
+  key, three steps' encodings extend one another, and an edited history parts past the head;
 - the working target. The domain tests check its clamp to the allowance and its default. They also
   check the tail's `working_target` and pressure against it, and the hysteresis against the target
   (75 % to fire, below 60 % to re-arm, four steps apart) where the same estimates against a
@@ -1456,14 +1597,17 @@ Not verified, and not claimed:
   long sessions, across a pause between turns, or in a recorded session since the change. No claim
   is made about the subscription's hit rate beyond these runs.
 
-- **A cache miss is not attributed.** An attempt now says the provider reported a total miss, but
-  not whether the request's canonical prefix had changed since the previous request. Each
-  adapter's prefix-stability tests show the runner's requests are built stable. They do not show
-  that a given recorded step was. The comparison would be a new field of the attempt record, which
-  every reader of versions 3 to 6 parses strictly. So it needs a body version of its own, as an
-  attempt's `kind` did, and that has not been decided. Which counters each provider actually sends
-  on a total miss rests on the decoders' fixtures. Only `DeepSeek`'s recorded stream shows a
-  reported `prompt_cache_hit_tokens: 0`.
+- **A cache miss is attributed offline, and only where its request verifies.** No record says
+  whether a request's canonical prefix had changed, and none is added. `nanus sessions cache`
+  prepares each recorded request again and attributes a miss only between two requests whose
+  bodies reproduce their recorded digests ([the audit](#auditing-a-sessions-cache-reads)). A
+  request recorded by an earlier build, or under a configuration changed since, does not verify
+  and is not attributed. Every session recorded before this build's managed tail is such a
+  session, and none of those on the development machine verified. Legacy requests are rebuilt and
+  labelled, never proven. What a provider's cache did with a stable prefix is the provider's, and
+  an expiry is inferred from the lifetime the adapter states or an hour. Which counters each
+  provider actually sends on a total miss rests on the decoders' fixtures. Only `DeepSeek`'s
+  recorded stream shows a reported `prompt_cache_hit_tokens: 0`.
 - **No live provider has been sent a maintenance request.** A handoff or compaction draft is a model
   call built and read the way a managed turn's is. The tests show the request is built and its
   response is read and refused correctly; they do not show that a provider's summary is good, or

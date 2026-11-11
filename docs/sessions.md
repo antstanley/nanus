@@ -272,6 +272,24 @@ finishes, which is the reading somebody wants while watching. The command is the
 somebody wants afterwards, and the only one that works for a session the interface or a
 service produced.
 
+## Auditing its cache reads
+
+```sh
+nanus sessions cache nightly           # one row per model request, and whose each miss was
+nanus sessions cache --json nightly    # the same audit, for a script
+```
+
+The report above says how much of the prompt was read from the provider's cache. This says
+why the rest was not: for each model request, whether nanus changed the prefix the provider had
+cached, and at which byte, or the provider had it and read less, and whether the idle gap was
+longer than the cache lives. It prepares each request again from the log and claims an answer
+only when the body it prepared has the digest the session recorded, so it needs no model, no
+key and no network, and it writes nothing. The session is read as `show` reads one, without a
+claim, so auditing a session an agent is holding does not disturb it. A legacy session records
+no digests, so its requests are rebuilt and every answer about them says so.
+[Auditing a session's cache reads](context-management.md#auditing-a-sessions-cache-reads) is the
+whole of what it proves and what it does not.
+
 ## Resuming
 
 | Command | What it does |

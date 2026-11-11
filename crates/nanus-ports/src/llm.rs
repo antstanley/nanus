@@ -151,6 +151,19 @@ pub trait LlmPort {
         None
     }
 
+    /// The canonical encoding of `request` — the body this adapter would send for it with no tail
+    /// and no cache hints — as the ordered units a prefix cache reads.
+    ///
+    /// For a reader that compares two requests' prefixes, such as an audit of where a session's
+    /// cache reads were lost. The request is encoded by the same encoder that sends it, before
+    /// decoration, so for a request that was sent this is what its decorated body was made from.
+    /// `None`, the default, means the adapter does not state one, and nothing is compared. Local,
+    /// with no I/O and no credential.
+    fn canonical_encoding(&self, request: &ChatRequest) -> Option<crate::CanonicalEncoding> {
+        let _ = request;
+        None
+    }
+
     /// Prepares one managed request without performing any I/O.
     ///
     /// The returned call owns the admitted body: its estimate and digest are of exactly the bytes
@@ -487,6 +500,20 @@ impl ChatRequest {
     pub const fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
+    }
+
+    /// This request without what decoration reads: no tail, no cache retention and no cache key.
+    ///
+    /// What an adapter encodes for [`LlmPort::canonical_encoding`], because decoration is a pure
+    /// function of the canonical body, the tail and the retention: encoded without those, a
+    /// request is its canonical body, whichever wire carries it.
+    #[must_use]
+    pub fn undecorated(&self) -> Self {
+        let mut request = self.clone();
+        request.context_tail = None;
+        request.prompt_cache = PromptCacheRetention::None;
+        request.prompt_cache_key = None;
+        request
     }
 
     /// Whether the tail, when there is one, has a place: after a final user message or tool
